@@ -8,6 +8,26 @@ import sys
 
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import binding_parts
+from tools.convert.__main__ import _recipe_parts
+
+
+def test_recipe_parts_keeps_path_colons():
+    # A Windows drive colon is not the FILE[:function] separator.
+    assert _recipe_parts(r"C:\Users\Ian Ranson\temp\recipe.py") == (
+        r"C:\Users\Ian Ranson\temp\recipe.py",
+        "configure",
+    )
+    assert _recipe_parts(r"C:\Users\Ian Ranson\temp\recipe.py:custom") == (
+        r"C:\Users\Ian Ranson\temp\recipe.py",
+        "custom",
+    )
+    assert _recipe_parts("recipe.py") == ("recipe.py", "configure")
+    assert _recipe_parts("recipe.py:custom") == ("recipe.py", "custom")
+    # A colon inside a POSIX path component stays in the path too.
+    assert _recipe_parts("/tmp/col:oned/recipe.py") == (
+        "/tmp/col:oned/recipe.py",
+        "configure",
+    )
 
 
 def test_cli_custom_sources_method_template_and_shards(tmp_path):

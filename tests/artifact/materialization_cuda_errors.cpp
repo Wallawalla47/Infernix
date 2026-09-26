@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <iostream>
 #include <utility>
 
 namespace {
@@ -111,7 +112,10 @@ namespace ninfer::test {
 #ifdef _WIN32
 // Without the linker's --wrap rewriting the CUDA calls cannot be intercepted, so the fault
 // injection checks are skipped on Windows; the remaining materialization checks still run.
-void materialization_cuda_errors(DeviceContext&) {}
+void materialization_cuda_errors(DeviceContext&) {
+    std::cout << "SKIP: CUDA fault-injection materialization checks need GNU ld --wrap "
+                 "(they run in the Linux build)\n";
+}
 #else
 void materialization_cuda_errors(DeviceContext& device) {
     using namespace artifact;
