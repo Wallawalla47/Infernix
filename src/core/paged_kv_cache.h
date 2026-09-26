@@ -374,6 +374,7 @@ class KVExecutionTablePool {
 public:
     KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
                          const DeviceKVPagePool& pages);
+    ~KVExecutionTablePool();
 
     KVExecutionTablePool(const KVExecutionTablePool&)            = delete;
     KVExecutionTablePool& operator=(const KVExecutionTablePool&) = delete;
@@ -398,8 +399,22 @@ public:
 private:
     friend class KVExecutionRowLease;
 
+    // A publication's H2D copy reads its row's pinned shadow slice when the stream reaches it,
+    // not when it is enqueued. The fence records the entries a row's queued copies still read, so
+    // a later publication - by the same owner or by the next owner of a released row - waits for
+    // them before rewriting any of those entries. Disjoint entries are written without waiting.
+    struct RowFence {
+        cudaEvent_t event   = nullptr;
+        cudaStream_t stream = nullptr;
+        std::uint32_t begin = 0;
+        std::uint32_t end   = 0;
+    };
+
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
+    [[nodiscard]] std::int32_t* writable_shadow(KVExecutionRowHandle row,
+                                                std::uint32_t logical_begin, std::size_t count,
+                                                cudaStream_t stream);
     void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
                          std::span<const std::int32_t> indices, cudaStream_t stream);
 
@@ -409,6 +424,7 @@ private:
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
+    std::vector<RowFence> row_fences_;
 };
 
 } // namespace ninfer

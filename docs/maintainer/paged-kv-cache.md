@@ -708,6 +708,9 @@ consumer，且 replay in-flight期间不得改写同一 row。
 14. Growing-cache consumer只通过paged view和block table访问KV，不取得allocator或ownership authority。
 15. Kernel correctness不依赖physical page ID连续性，也不通过gather建立request-contiguous KV。
 16. Checkpoint可复用性由完整target continuation证明，KV page存在本身不构成hit。
+17. Block table publication的H2D在stream执行到它时才读取该execution row的pinned shadow。同一row的后续
+    publication（包括release后下一个owner的publication）改写与仍在队列中的copy重叠的shadow entries之前，
+    先等待该copy完成；不重叠的entries不等待。
 
 ---
 
