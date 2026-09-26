@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <new>
 #include <span>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -224,6 +226,77 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     } catch (const std::bad_alloc&) { bundle_failed = true; }
     failures += expect(bundle_failed, "impossible multi-pool reservation succeeded");
     failures += expect_size(pool.reserved_pages(), before, "failed bundle changed the first pool");
+    return failures;
+}
+
+void CUDART_CB hold_stream(void* milliseconds) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(*static_cast<int*>(milliseconds)));
+}
+
+// A publication's copy reads the row's pinned shadow when the stream reaches it. Work queued
+// behind it must see that publication even when the row is released and republished by its next
+// owner before the stream gets there (an abort mid-prefill followed by the next admission).
+int exercise_republish_while_copy_queued(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    PlannedCache plan = plan_cache(4, 4, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(3);
+    std::vector<ninfer::DeviceKVPageLease> pages;
+    pages.reserve(3);
+    pool.materialize(*reservation, 3, pages);
+    const std::vector<ninfer::DeviceKVPageHandle> first{pages[0].handle(), pages[1].handle()};
+    const std::vector<ninfer::DeviceKVPageHandle> second{pages[2].handle(), pages[0].handle()};
+
+    std::int32_t* observed = nullptr;
+    if (cudaMalloc(&observed, 2 * sizeof(std::int32_t)) != cudaSuccess) {
+        throw std::runtime_error("observation buffer allocation failed");
+    }
+    ninfer::KVExecutionRowLease owner = tables.acquire(0);
+    const ninfer::Tensor device_row   = tables.row(owner.handle());
+    int hold_ms                       = 300;
+    if (cudaLaunchHostFunc(context.stream, hold_stream, &hold_ms) != cudaSuccess) {
+        throw std::runtime_error("stream hold failed");
+    }
+    tables.publish(owner.handle(), 0, first, context.stream);
+    // Stands for the owner's queued kernels, which read the table in stream order.
+    if (cudaMemcpyAsync(observed, device_row.data, 2 * sizeof(std::int32_t),
+                        cudaMemcpyDeviceToDevice, context.stream) != cudaSuccess) {
+        throw std::runtime_error("table observation failed");
+    }
+    owner.release();
+    ninfer::KVExecutionRowLease next = tables.acquire(0);
+    tables.publish(next.handle(), 0, second, context.stream);
+    context.synchronize();
+
+    std::vector<std::int32_t> seen(2);
+    cudaMemcpy(seen.data(), observed, seen.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost);
+    cudaFree(observed);
+    failures += expect(seen == std::vector<std::int32_t>({0, 1}),
+                       "queued work saw the next owner's mapping instead of its own");
+    failures += expect(read_mapping(tables.row(next.handle()), 2) ==
+                           std::vector<std::int32_t>({2, 0}),
+                       "the next owner's publication did not land");
+
+    // A disjoint extension of a row with a copy still queued does not wait for it.
+    if (cudaLaunchHostFunc(context.stream, hold_stream, &hold_ms) != cudaSuccess) {
+        throw std::runtime_error("stream hold failed");
+    }
+    tables.publish(next.handle(), 0, second, context.stream);
+    const auto started = std::chrono::steady_clock::now();
+    tables.publish(next.handle(), 2, std::span<const ninfer::DeviceKVPageHandle>(first.data(), 1),
+                   context.stream);
+    const auto waited = std::chrono::steady_clock::now() - started;
+    context.synchronize();
+    failures += expect(waited < std::chrono::milliseconds(100),
+                       "a disjoint publication waited for an unrelated queued copy");
+    failures += expect(read_mapping(tables.row(next.handle()), 3) ==
+                           std::vector<std::int32_t>({2, 0, 0}),
+                       "disjoint extension did not land");
     return failures;
 }
 
@@ -502,6 +575,7 @@ int main() {
     try {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
+        failures += exercise_republish_while_copy_queued(context);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{
