@@ -175,6 +175,13 @@ int verify_dflash_load(const ninfer::Engine& engine) {
         std::cerr << "DFlash Engine has an invalid frozen memory layout\n";
         return 1;
     }
+    if (memory.cuda_graph_measured_bytes == 0 ||
+        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "DFlash Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
+                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
+                  << '\n';
+        return 1;
+    }
     return 0;
 }
 

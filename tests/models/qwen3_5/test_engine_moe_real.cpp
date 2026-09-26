@@ -84,6 +84,13 @@ int verify_loaded_product(const ninfer::Engine& engine) {
         std::cerr << "35B Engine construction has an invalid memory summary\n";
         return 1;
     }
+    if (memory.cuda_graph_measured_bytes == 0 ||
+        memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        std::cerr << "35B Engine CUDA Graphs used " << memory.cuda_graph_measured_bytes
+                  << " bytes against an allowance of " << memory.cuda_graph_allowance_bytes
+                  << '\n';
+        return 1;
+    }
     return 0;
 }
 

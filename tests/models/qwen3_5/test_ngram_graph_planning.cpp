@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string_view>
 
@@ -86,20 +87,14 @@ void verify_profiles() {
     }
 }
 
+// The CUDA Graph allowance at max concurrency 1: a fixed driver share plus a fixed share for each
+// executable, one per topology class of the one family captured.
 std::size_t expected_family_bytes(unsigned capacity, unsigned verify, unsigned neural) {
-    std::map<std::uint32_t, std::size_t> classes;
+    std::set<std::uint32_t> classes;
     for (const auto& profile : mtp_graph_profiles(capacity, verify, neural)) {
-        const auto visible = std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(profile.max) + verify + neural);
-        classes[profile.topology_class] = std::max<std::size_t>(
-            classes[profile.topology_class], (visible <= 4096 ? 12ULL : 82ULL) << 20);
+        classes.insert(profile.topology_class);
     }
-    std::size_t total = 0;
-    for (const auto& [identity, bytes] : classes) {
-        (void)identity;
-        total += bytes;
-    }
-    return total;
+    return (64ULL << 20) + classes.size() * (4ULL << 20);
 }
 
 void verify_real_plan(const char* artifact) {

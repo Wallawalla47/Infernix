@@ -513,12 +513,21 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     }
 
     logger_->debug("memory ledger | after weights {} | after startup {} | headroom {} | slack {} | "
-                   "CUDA graphs {}",
+                   "CUDA graphs {} allowed, {} used",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),
                    product::format_pretty_bytes(memory.available_after_startup_bytes),
                    product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
-                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+                   product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
+                   product::format_pretty_bytes(memory.cuda_graph_measured_bytes));
+    if (memory.cuda_graph_measured_bytes > memory.cuda_graph_allowance_bytes) {
+        // The KV pool was sized against the allowance, so the excess came out of the slack left
+        // beside it; with no headroom the next allocation can fail.
+        logger_->warn("CUDA graphs used {} but the KV sizing allowed {}; leave more room with "
+                      "--kv-headroom-mib or a smaller --kv-capacity",
+                      product::format_pretty_bytes(memory.cuda_graph_measured_bytes),
+                      product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
+    }
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
                    ninfer::context_cost_preset_source_name(context_cost.transfer_source),
                    ninfer::context_cost_preset_source_name(context_cost.prefill_source),

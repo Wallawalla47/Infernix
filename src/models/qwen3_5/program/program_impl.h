@@ -343,6 +343,9 @@ public:
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
+    // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
+    // launch of every executable), for comparison with graph_allowance_bytes.
+    std::size_t graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     DeviceArena persistent;

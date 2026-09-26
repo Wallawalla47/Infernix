@@ -172,6 +172,13 @@ const char* DeviceContext::sync_mode() const {
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+std::size_t DeviceContext::free_bytes() const {
+    std::size_t free  = 0;
+    std::size_t total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    return free;
+}
+
 void DeviceContext::flush() const {
     const cudaError_t status = cudaStreamQuery(stream);
     if (status == cudaErrorNotReady) {

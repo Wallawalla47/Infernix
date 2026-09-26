@@ -196,6 +196,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
