@@ -728,6 +728,207 @@ int test_incremental_embedded_parameter_markup() {
     return failures;
 }
 
+int test_claude_code_xml_markup_variants() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string standard_xml =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Initial setup\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_standard = fi::parse_qwen_tool_call_output(standard_xml, 128, contract);
+    failures += check(parsed_standard.is_tool_call_response &&
+                          parsed_standard.tool_calls.size() == 1 &&
+                          parsed_standard.tool_calls.front().name == "TaskCreate",
+                      "function name attribute syntax was not parsed");
+    if (parsed_standard.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_standard.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Initial setup",
+                          "function name attribute argument changed");
+    }
+
+    const std::string invoke_xml =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Create tasks\n</parameter>\n</invoke>\n</tool_call>";
+    const auto parsed_invoke = fi::parse_qwen_tool_call_output(invoke_xml, 128, contract);
+    failures += check(parsed_invoke.is_tool_call_response && parsed_invoke.tool_calls.size() == 1 &&
+                          parsed_invoke.tool_calls.front().name == "TaskCreate",
+                      "invoke tag syntax was not parsed");
+
+    const std::string function_calls_xml =
+        "<function_calls>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Function calls container\n</parameter>\n</invoke>\n</function_calls>";
+    const auto parsed_function_calls =
+        fi::parse_qwen_tool_call_output(function_calls_xml, 128, contract);
+    failures += check(parsed_function_calls.is_tool_call_response &&
+                          parsed_function_calls.tool_calls.size() == 1 &&
+                          parsed_function_calls.tool_calls.front().name == "TaskCreate",
+                      "function_calls container syntax was not parsed");
+
+    const std::string standalone_invoke =
+        "Plan is ready:\n<invoke name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Standalone invoke\n</param>\n</invoke>";
+    const auto parsed_standalone = fi::parse_qwen_tool_call_output(standalone_invoke, 128, contract);
+    failures += check(parsed_standalone.is_tool_call_response &&
+                          parsed_standalone.content == "Plan is ready:" &&
+                          parsed_standalone.tool_calls.size() == 1 &&
+                          parsed_standalone.tool_calls.front().name == "TaskCreate",
+                      "standalone invoke after plan was not parsed");
+
+    return failures;
+}
+
+int test_duplicate_parameters_keep_last_value() {
+    const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
+    int failures        = 0;
+
+    // A repeated identical parameter is the common agent-harness case: the second write leaves the
+    // value alone, and the repair is still counted.
+    const std::string identical_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nfirst\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_identical = fi::parse_qwen_tool_call_output(identical_dup, 64, contract);
+    failures += check(parsed_identical.is_tool_call_response &&
+                          parsed_identical.tool_calls.size() == 1,
+                      "duplicate identical parameter was not accepted");
+    if (parsed_identical.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_identical.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "first",
+                          "repeated identical parameter value changed");
+    }
+    failures += check(parsed_identical.diagnostics.duplicate_parameters_repaired == 1,
+                      "identical duplicate parameter repair was not recorded");
+
+    // A conflicting repeat keeps the last value, matching the JSON-object rule the `=<name>`
+    // markup already follows.
+    const std::string conflicting_dup =
+        "<tool_call>\n<function=configure>\n<parameter=value>\nfirst\n</parameter>\n"
+        "<parameter=value>\nsecond\n</parameter>\n</function>\n</tool_call>";
+    const auto parsed_conflicting = fi::parse_qwen_tool_call_output(conflicting_dup, 64, contract);
+    failures += check(parsed_conflicting.is_tool_call_response &&
+                          parsed_conflicting.tool_calls.size() == 1,
+                      "conflicting duplicate parameter fell back to text");
+    if (parsed_conflicting.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed_conflicting.tool_calls.front().arguments_json);
+        failures += check(args.at("value") == "second",
+                          "conflicting duplicate parameter did not keep the last value");
+    }
+    failures += check(parsed_conflicting.diagnostics.duplicate_parameters_repaired == 1,
+                      "conflicting duplicate parameter repair was not recorded");
+
+    return failures;
+}
+
+int test_attribute_token_boundary() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string text =
+        "<tool_call>\n<function filename=\"x\" name=\"TaskCreate\">\n"
+        "<parameter filename=\"ignored\" name=\"description\">\nCreate task\n</parameter>\n"
+        "</function>\n</tool_call>";
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 128, contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.tool_calls.front().name == "TaskCreate",
+                      "attribute token boundary failed to extract correct name");
+    if (parsed.tool_calls.size() == 1) {
+        const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+        failures += check(args.at("description") == "Create task",
+                          "parameter attribute token boundary failed");
+    }
+    return failures;
+}
+
+int test_mismatched_closing_tags_rejected() {
+    const auto contract =
+        contract_for("TaskCreate", Json{{"description", Json{{"type", "string"}}}});
+    int failures = 0;
+
+    const std::string fn_invoke_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</invoke>\n</tool_call>";
+    failures += check_rejected(fn_invoke_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "function opening with invoke closing tag was accepted");
+
+    const std::string invoke_fn_mismatch =
+        "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(invoke_fn_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "invoke opening with function closing tag was accepted");
+
+    const std::string param_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
+        "Value\n</param>\n</function>\n</tool_call>";
+    failures += check_rejected(param_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "parameter opening with param closing tag was accepted");
+
+    const std::string param_open_mismatch =
+        "<tool_call>\n<function name=\"TaskCreate\">\n<param name=\"description\">\n"
+        "Value\n</parameter>\n</function>\n</tool_call>";
+    failures += check_rejected(param_open_mismatch, contract,
+                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               "param opening with parameter closing tag was accepted");
+
+    return failures;
+}
+
+int test_claude_code_plan_and_task_create_exact_repro() {
+    const std::string task_create_def = tool_definition(
+        "TaskCreate",
+        Json{{"description", Json{{"type", "string"}}},
+             {"task_type", Json{{"type", "string"}}},
+             {"priority", Json{{"type", "integer"}}}});
+    const std::string task_update_def = tool_definition(
+        "TaskUpdate",
+        Json{{"taskId", Json{{"type", "string"}}}, {"status", Json{{"type", "string"}}}});
+    const auto contract = contract_from_definitions({task_create_def, task_update_def});
+
+    const std::string full_response =
+        "I have analyzed the repository requirements. Here is the implementation plan:\n\n"
+        "### Plan\n"
+        "1. Inspect existing CUDA kernels in `src/ops/softmax_attention/`\n"
+        "2. Add test coverage for long context attention splits\n"
+        "3. Update frontend tool call decoder\n\n"
+        "Let me create the first task in the tracking system now:\n\n"
+        "<tool_call>\n"
+        "<function name=\"TaskCreate\">\n"
+        "<parameter name=\"description\">\n"
+        "Implement split-KV page-safety and bounded loops\n"
+        "</parameter>\n"
+        "<parameter name=\"task_type\">\n"
+        "feature\n"
+        "</parameter>\n"
+        "<parameter name=\"priority\">\n"
+        "1\n"
+        "</parameter>\n"
+        "</function>\n"
+        "</tool_call>";
+
+    const auto parsed = fi::parse_qwen_tool_call_output(full_response, 128, *contract);
+    int failures      = 0;
+    failures += check(parsed.is_tool_call_response,
+                      "Claude Code Plan + TaskCreate failed to parse as tool call");
+    failures += check(parsed.tool_calls.size() == 1, "tool call count != 1");
+    failures += check(parsed.content.starts_with("I have analyzed"), "plan content prefix lost");
+    failures += check(parsed.content.ends_with("tracking system now:"), "plan content tail lost");
+
+    if (parsed.tool_calls.size() == 1) {
+        const auto& call = parsed.tool_calls.front();
+        failures += check(call.name == "TaskCreate", "tool name != TaskCreate");
+        const Json args = Json::parse(call.arguments_json);
+        failures += check(args.at("description") == "Implement split-KV page-safety and bounded loops",
+                          "TaskCreate description argument changed");
+        failures += check(args.at("task_type") == "feature", "TaskCreate task_type argument changed");
+        failures += check(args.at("priority") == 1, "TaskCreate priority argument changed");
+    }
+
+    return failures;
+}
+
 } // namespace
 
 int test_duplicate_parameter_keeps_last_value() {
@@ -774,6 +975,11 @@ int main() {
     failures += test_incremental_valid_and_boolean();
     failures += test_incremental_fallback_preserves_bytes();
     failures += test_incremental_embedded_parameter_markup();
+    failures += test_claude_code_xml_markup_variants();
+    failures += test_duplicate_parameters_keep_last_value();
+    failures += test_attribute_token_boundary();
+    failures += test_mismatched_closing_tags_rejected();
+    failures += test_claude_code_plan_and_task_create_exact_repro();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
