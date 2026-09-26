@@ -236,13 +236,20 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
         message["tool_calls"] = tool_calls_json(calls, false);
     }
 
+    // A truncated answer reports "length" even when it also emitted a tool call: the call can be
+    // cut mid-argument, and "tool_calls" would tell the client to act on it.
+    const bool output_limited = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
+                                outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
+    const char* reason_str =
+        output_limited ? "length"
+                       : (has_tool_calls ? "tool_calls" : finish_reason(outcome.finish_reason));
+
     Json payload       = base_payload(identity, "chat.completion");
     payload["choices"] = Json::array(
         {Json{{"index", 0},
               {"message", std::move(message)},
               {"logprobs", nullptr},
-              {"finish_reason",
-               has_tool_calls ? Json("tool_calls") : Json(finish_reason(outcome.finish_reason))}}});
+              {"finish_reason", reason_str}}});
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
     return payload.dump();
@@ -368,13 +375,22 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
                                include_usage_, output_timings));
     }
 
-    if (!outcome.tool_calls.empty()) {
+    const bool output_limited = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
+                                outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
+    if (!outcome.tool_calls.empty() && !output_limited) {
         const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
                                nullptr, include_usage_, output_timings));
         events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,
                                include_usage_ ? Json(nullptr) : final_timings));
     } else {
+        // A truncated answer still delivers the partial call, but the terminal chunk carries the
+        // truncation reason rather than claiming the call completed.
+        if (!outcome.tool_calls.empty()) {
+            const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+            events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
+                                   nullptr, include_usage_, output_timings));
+        }
         events.push_back(chunk(identity_, Json::object(), finish_reason(outcome.finish_reason),
                                include_usage_, include_usage_ ? Json(nullptr) : final_timings));
     }

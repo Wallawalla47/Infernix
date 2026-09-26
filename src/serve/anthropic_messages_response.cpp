@@ -58,6 +58,15 @@ struct StopPresentation {
 };
 
 StopPresentation stop_presentation(const GenerationOutcome& outcome) {
+    // A truncated answer reports as truncated even when it also emitted a tool call: the call can
+    // be cut mid-argument, and "tool_use" would tell the client to act on it. The matching switch
+    // cases below stay so the switch keeps covering every FinishReason.
+    if (outcome.finish_reason == ninfer::FinishReason::OutputLimit) {
+        return StopPresentation{.reason = "max_tokens"};
+    }
+    if (outcome.finish_reason == ninfer::FinishReason::ContextCapacity) {
+        return StopPresentation{.reason = "model_context_window_exceeded"};
+    }
     if (!outcome.tool_calls.empty()) { return StopPresentation{.reason = "tool_use"}; }
     switch (outcome.finish_reason) {
     case ninfer::FinishReason::OutputLimit:
