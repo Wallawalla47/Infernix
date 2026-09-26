@@ -6,6 +6,7 @@ namespace ninfer::models::qwen3_5 {
 struct RuntimeTypes {
     using Frontend          = qwen3_5::Frontend;
     using PreparedPrompt    = qwen3_5::PreparedPrompt;
+    using NgramArchive      = qwen3_5::NgramArchive;
     using OutputSession     = qwen3_5::OutputSession;
     using PublishedOutput   = qwen3_5::PublishedOutput;
     using SequencePlanner   = qwen3_5::SequencePlanner;

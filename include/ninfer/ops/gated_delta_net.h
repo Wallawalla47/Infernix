@@ -85,7 +85,8 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
  * without modifying any state. q/k are BF16 [128,Hq,T,B], v/out are BF16 [128,Hv,T,B], g/beta
  * are FP32 [Hv,T,B], and ssm_states is FP32 [128,128,Hv,S]. The ReplaySSM execution domain is
- * B=1..8 and T=2..16, with Hq=16 and Hv in {32,48}. scale is 1/sqrt(128).
+ * B=1..8 and T=2..16, plus B=1 and T=17..64, with Hq=16 and Hv in {32,48}.
+ * scale is 1/sqrt(128).
  *
  * valid_columns is empty for dense rows or device I32 [B], with every caller-supplied extent in
  * [1,T]. initial_state_slots is device I32 [B] containing absolute slots in [0,S). For each valid

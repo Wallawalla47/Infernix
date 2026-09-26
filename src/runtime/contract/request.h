@@ -20,6 +20,7 @@ struct ResolvedRequestOptions {
     ResolvedExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    NgramSessionHints ngram_session;
 };
 
 enum class ContinuationAction : std::uint8_t {

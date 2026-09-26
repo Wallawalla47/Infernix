@@ -79,6 +79,13 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // Optional target-verified copy proposals with MTP, DFlash or DFlash2, C1 only.
+    // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
+    std::uint32_t ngram_draft_tokens = 0;
+    std::uint32_t ngram_min_match    = 12;
+    // CPU-only retention, separate from KV. Zero keeps request-local drafting.
+    std::size_t ngram_archive_bytes = 0;
+    std::size_t ngram_session_bytes = 128ULL << 20;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -266,10 +273,22 @@ struct OutputOptions {
     bool tolerant_tool_calls = false;
 };
 
+struct NgramSessionHints {
+    // Explicit local conversation identity, at most 256 bytes. Never inferred from
+    // prompt similarity or the KV session key. Empty means request-local drafting.
+    std::string key;
+    bool reset = false;
+    std::string parent;
+    std::uint64_t parent_generation = 0;
+    // Retention-enabled requests mix the sampling seed with fresh request entropy:
+    // prior generated proposals must not reuse the random draws that produced them.
+};
+
 struct RequestOptions {
     ExecutionOptions execution;
     StopPolicy stop;
     OutputOptions output;
+    NgramSessionHints ngram_session;
 };
 
 enum class MediaKind : std::uint8_t {
@@ -786,6 +805,12 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    std::uint64_t ngram_rounds                  = 0;
+    std::uint64_t ngram_drafted_tokens          = 0;
+    std::uint64_t ngram_accepted_tokens         = 0;
+    std::uint64_t ngram_archive_rounds          = 0;
+    std::uint64_t ngram_archive_drafted_tokens  = 0;
+    std::uint64_t ngram_archive_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {
@@ -800,6 +825,18 @@ struct ThinkingBudgetStats {
 enum class PrefixReusePath : std::uint8_t {
     Root,
     Checkpoint,
+};
+
+struct NgramArchiveStats {
+    bool enabled              = false;
+    bool bound                = false;
+    bool published            = false;
+    std::uint64_t generation  = 0;
+    std::size_t sources       = 0;
+    std::size_t session_bytes = 0;
+    std::size_t total_bytes   = 0;
+    // Effective seed after request-domain separation; archive state is also needed for replay.
+    std::optional<std::uint64_t> sampling_seed;
 };
 
 struct GenerationResult {
@@ -823,6 +860,7 @@ struct GenerationResult {
     GenerationSchedulingStats scheduling;
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative;
+    NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
 };
 

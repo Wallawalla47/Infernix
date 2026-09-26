@@ -21,7 +21,9 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -352,7 +354,21 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-    if (width == 16 && rows == 8) {
+    if (width > 16) {
+        const std::array invalid_rows{fold_rows[0], fold_rows[0]};
+        bool rejected = false;
+        try {
+            fold_plan.execute(invalid_rows, nullptr);
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string_view(error.what()).find("active row count is out of range") !=
+                       std::string_view::npos;
+        }
+        if (!rejected) {
+            std::cerr << "wide replay fold did not reject multiple active rows\n";
+            return 1;
+        }
+    }
+    if ((width == 16 && rows == 8) || (width >= 32 && rows == 1)) {
         cuda_synchronize();
         DeviceBuffer original(state_bytes);
         cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
@@ -508,6 +524,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     return failures;
 }
 
+template <std::int32_t kWidth>
 int run_record_fold_rounds() {
     using ninfer::test::input_projection::DevicePackedWeight;
     using ninfer::test::input_projection::make_bf16_activation;
@@ -516,7 +533,6 @@ int run_record_fold_rounds() {
     constexpr std::int32_t kHidden       = 5120;
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
-    constexpr std::int32_t kWidth        = 16;
     constexpr std::int32_t kStateSlots   = kWidth + 1;
     constexpr std::int32_t kInitialSlot  = kWidth;
     constexpr std::int32_t kSnapshotBase = 0;
@@ -642,8 +658,12 @@ int run_record_fold_rounds() {
                  device_destinations = to_device(destination_steps);
 
     int failures = 0;
-    for (std::int32_t round = 0; round < 3; ++round) {
-        const std::int32_t commit = round == 0 ? 1 : round == 1 ? kWidth - 1 : kWidth;
+    const std::vector<std::int32_t> commits =
+        kWidth == 64   ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64}
+        : kWidth == 32 ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32}
+                       : std::vector<std::int32_t>{1, kWidth - 1, kWidth};
+    for (std::size_t round = 0; round < commits.size(); ++round) {
+        const std::int32_t commit = commits[round];
         std::vector<float> g_host(static_cast<std::size_t>(kProfile.value_heads) * kWidth);
         std::vector<float> beta_host(g_host.size());
         for (std::size_t index = 0; index < g_host.size(); ++index) {
@@ -696,7 +716,9 @@ int run_record_fold_rounds() {
                                                layer_records.gate, record_output, nullptr);
             cuda_synchronize();
 
-            const std::string label = "record-fold pair round=" + std::to_string(round) +
+            const std::string label = "record-fold pair width=" + std::to_string(kWidth) +
+                                      " commit=" + std::to_string(commit) +
+                                      " round=" + std::to_string(round) +
                                       " layer=" + std::to_string(layer);
             const auto compare_bf16 = [&](const DeviceBuffer& lhs, const DeviceBuffer& rhs,
                                           std::size_t elements, const char* field) {
@@ -747,6 +769,8 @@ int run_record_fold_rounds() {
             }
         }
     }
+    std::cout << "record-fold coupled width=" << kWidth << " rounds=" << commits.size()
+              << " exact=" << (failures == 0) << '\n';
     failures += qk_parent.verify_preserved("record-fold Q4 parent");
     failures += vz_parent.verify_preserved("record-fold Q5 parent");
     return failures;
@@ -754,13 +778,40 @@ int run_record_fold_rounds() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--wide-only") {
+        for (const int width : {33, 48, 64}) {
+            for (int commit = 0; commit <= width; ++commit) {
+                failures += run_case({48, 48, 10240}, width, 1, {commit}, 2200U + commit, true);
+                failures += run_case({30, 32, 8192}, width, 1, {commit}, 2300U + commit, true);
+            }
+        }
+        failures += run_record_fold_rounds<64>();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " wide gdn_replay_fold\n";
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc == 2 && std::string(argv[1]) == "--ngram-only") {
+        for (const int commit : {0, 1, 2, 7, 15, 16}) {
+            failures += run_case({48, 48, 10240}, 16, 1, {commit}, 1825U + commit, true);
+        }
+        for (const int commit : {0, 1, 4, 15, 16, 17, 30, 31, 32}) {
+            failures += run_case({48, 48, 10240}, 32, 1, {commit}, 1925U + commit, true);
+            failures += run_case({30, 32, 8192}, 32, 1, {commit}, 2025U + commit, true);
+        }
+        failures += run_record_fold_rounds<32>();
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " ngram gdn_replay_fold\n";
+        return failures == 0 ? 0 : 1;
+    }
+    if (argc != 1) {
+        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only]\n";
+        return 2;
+    }
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
@@ -768,11 +819,16 @@ int main() {
     failures += run_case({48, 48, 10240}, 16, 8, {0, 1, 2, 3, 7, 13, 15, 16}, 1825U, true);
     failures += run_case({48, 48, 10240}, 16, 1, {16}, 1827U, true);
     failures += run_case({48, 48, 10240}, 16, 1, {0}, 1829U, true);
+    for (const int commit : {0, 1, 4, 15, 16, 17, 30, 31, 32}) {
+        failures += run_case({48, 48, 10240}, 32, 1, {commit}, 1925U + commit, true);
+        failures += run_case({30, 32, 8192}, 32, 1, {commit}, 2025U + commit, true);
+    }
     failures += run_case({30, 32, 8192}, 2, 1, {2}, 1831U);
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
-    failures += run_record_fold_rounds();
+    failures += run_record_fold_rounds<16>();
+    failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
 }

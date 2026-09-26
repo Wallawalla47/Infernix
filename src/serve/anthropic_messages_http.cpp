@@ -41,8 +41,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     AnthropicMessagesRequest request;
     try {
         RequestLimits limits;
-        limits.default_max_tokens = options_.default_max_tokens;
-        request                   = parse_anthropic_messages_request(parse_json_body(req), limits);
+        limits.default_max_tokens        = options_.default_max_tokens;
+        const auto body                  = parse_json_body(req);
+        request                          = parse_anthropic_messages_request(body, limits);
+        request.generation.ngram_session = resolve_ngram_session(req, body, options_);
     } catch (const ApiException& exception) {
         write_anthropic_error(res, exception.error(), request_id);
         return;
@@ -115,6 +117,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         }
         lifecycle->done(outcome);
         try {
+            set_ngram_generation_header(res, outcome.metrics.ngram_archive);
             set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
                                    prepared.lifetime);
         } catch (const ApiException& exception) {
@@ -214,6 +217,10 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);
+                    if (auto comment = ngram_generation_comment(outcome.metrics.ngram_archive);
+                        !comment.empty()) {
+                        terminal.insert(terminal.begin(), std::move(comment));
+                    }
                 } catch (const std::exception& exception) {
                     lifecycle->response_failure(make_internal_request_failure(
                         RequestFailurePhase::ResponseRender, exception.what()));

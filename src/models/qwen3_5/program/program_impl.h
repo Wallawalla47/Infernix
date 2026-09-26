@@ -19,6 +19,7 @@
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -171,7 +172,13 @@ struct CaptureReservation {
 };
 
 struct RequestControl {
-    Lifecycle lifecycle = Lifecycle::Empty;
+    std::unique_ptr<NgramProposer> ngram;
+    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    std::uint64_t ngram_copy_source = 0;
+    std::uint32_t ngram_copy_offset = 0;
+    std::size_t ngram_copy_ledger   = 0;
+    std::size_t ngram_indexed       = 0;
+    Lifecycle lifecycle             = Lifecycle::Empty;
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     GenerationTimings timings;
@@ -322,6 +329,9 @@ public:
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
+    const std::uint32_t neural_draft_window;
+    const std::uint32_t ngram_draft_window;
+    const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;
     const KvCacheStorage kv_storage;
     const ProposalHead proposal_head;
@@ -366,6 +376,7 @@ public:
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
+    DecodeGraphFamily ngram_graphs;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -555,6 +566,8 @@ public:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
+    [[nodiscard]] NgramProposer::Match propose_ngram(std::span<const std::uint32_t> lanes,
+                                                     std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,

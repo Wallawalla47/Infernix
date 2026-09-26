@@ -11,6 +11,11 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 
+[[nodiscard]] inline bool wide_residual_verification(TextPhase phase, std::int32_t batch,
+                                                     std::int32_t first, std::int32_t last) {
+    return phase == TextPhase::Verify && batch == 1 && first > 16 && first <= last && last <= 64;
+}
+
 } // namespace ninfer::models::qwen3_5
 
 namespace ninfer::models::qwen3_5::detail {

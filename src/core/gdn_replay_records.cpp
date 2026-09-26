@@ -122,6 +122,20 @@ GdnReplayRecords::GdnReplayRecords(DeviceSpan backing, const GdnReplayRecordLayo
     validate_layout(layout);
 }
 
+GdnReplayRecordLayer GdnReplayRecordLayer::single_row_prefix(std::int32_t width) const {
+    if (width <= 0 || width > conv.ne[1] || conv.ne[2] != 1 || conv.ne[3] != 1 ||
+        !conv.is_contiguous()) {
+        throw std::invalid_argument("GDN replay prefix requires one packed row and a valid width");
+    }
+    for (const Tensor* tensor : {&key, &value, &gate}) {
+        if (tensor->ne[2] != conv.ne[1] || tensor->ne[3] != 1 || !tensor->is_contiguous()) {
+            throw std::invalid_argument("GDN replay prefix planes do not match the packed row");
+        }
+    }
+    return {conv.slice(1, 0, width), key.slice(2, 0, width), value.slice(2, 0, width),
+            gate.slice(2, 0, width)};
+}
+
 GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int32_t rows) const {
     validate_spec(spec);
     if (layer_index < 0 || layer_index >= spec.layers) {

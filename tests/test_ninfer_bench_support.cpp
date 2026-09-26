@@ -146,6 +146,44 @@ int test_cli_contract() {
         },
         "unsupported DFlash2 window");
     const auto defaults = qb::expand_tests(qb::BenchOptions{});
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer"})
+                               .speculative.ngram_draft_tokens == 0,
+                       "ngram is disabled by default");
+    for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
+        for (unsigned width = 0; width <= 63; ++width) {
+            for (const unsigned minimum : {4U, 12U, 64U}) {
+                const auto parsed_ngram = parse_for_test(
+                    {"ninfer_bench", "--weights", "model.ninfer", "--spec", backend,
+                     "--draft-tokens", "5", "--ngram-draft-tokens", std::to_string(width),
+                     "--ngram-min-match", std::to_string(minimum)});
+                failures += expect(parsed_ngram.speculative.draft_tokens == 5 &&
+                                       parsed_ngram.speculative.ngram_draft_tokens == width &&
+                                       parsed_ngram.speculative.ngram_min_match == minimum,
+                                   "independent neural and ngram benchmark options");
+            }
+        }
+    }
+    for (const auto arguments : std::vector<std::vector<std::string>>{
+             {"--ngram-draft-tokens", "1"},
+             {"--spec", "mtp", "--ngram-draft-tokens", "64"},
+             {"--spec", "mtp", "--ngram-draft-tokens", "-1"},
+             {"--spec", "mtp", "--ngram-draft-tokens", "1.5"},
+             {"--spec", "mtp", "--ngram-draft-tokens", "31", "--ngram-min-match", "3"},
+             {"--spec", "mtp", "--ngram-draft-tokens", "31", "--ngram-min-match", "65"},
+             {"--spec", "mtp", "--ngram-draft-tokens"}}) {
+        failures += expect_throws<std::invalid_argument>(
+            [&] {
+                std::vector<std::string> command{"ninfer_bench", "--weights", "model.ninfer"};
+                command.insert(command.end(), arguments.begin(), arguments.end());
+                (void)parse_for_test(std::move(command));
+            },
+            "invalid ngram benchmark options");
+    }
+    failures +=
+        expect(qb::usage_text("ninfer_bench").find("--ngram-draft-tokens") != std::string::npos &&
+                   qb::usage_text("ninfer_bench").find("--ngram-min-match") != std::string::npos &&
+                   qb::usage_text("ninfer_bench").find("copy proposals 1..63") != std::string::npos,
+               "benchmark help describes ngram options");
     failures +=
         expect(defaults.size() == 2 && defaults[0].label == "pp512" && defaults[1].label == "tg128",
                "default pp/tg matrix");
@@ -235,6 +273,35 @@ int test_measurement_contract() {
                            "DFlash2 full rounds fit the prime context");
     failures += expect_string(qb::decode_path_name(true, dflash2), "dflash2_cuda_graph",
                               "DFlash2 report route");
+    auto mtp_ngram                  = mtp5;
+    mtp_ngram.ngram_draft_tokens    = 31;
+    auto dflash_ngram               = dflash2;
+    dflash_ngram.ngram_draft_tokens = 31;
+    failures += expect_u32(qb::decode_graph_prime_output_tokens(mtp_ngram), 65,
+                           "wide MTP/ngram graph-prime output budget");
+    failures += expect_u32(qb::decode_graph_prime_required_context(mtp_ngram), 75,
+                           "wide MTP/ngram graph-prime context includes neural KV margin");
+    failures += expect_u32(qb::decode_graph_prime_required_context(dflash_ngram), 65,
+                           "wide DFlash2/ngram graph-prime context");
+    const std::vector<qb::BenchTest> tiny{{qb::TestKind::Decode, 0, 1, "tg1"}};
+    failures += expect_u32(qb::resolve_max_context(tiny, std::nullopt, mtp_ngram, true), 75,
+                           "tiny benchmark auto-sizing reserves the wide graph prime");
+    failures += expect_throws<std::invalid_argument>(
+        [&] { (void)qb::resolve_max_context(tiny, 74, mtp_ngram, true); },
+        "explicit benchmark capacity must fit the wide graph prime");
+    mtp_ngram.ngram_draft_tokens    = 63;
+    dflash_ngram.ngram_draft_tokens = 63;
+    failures += expect_u32(qb::decode_graph_prime_output_tokens(mtp_ngram), 129,
+                           "NG63 graph prime reserves two full verification rounds");
+    failures += expect_u32(qb::decode_graph_prime_required_context(mtp_ngram), 139,
+                           "NG63 MTP graph-prime context includes neural KV margin");
+    failures += expect_u32(qb::decode_graph_prime_required_context(dflash_ngram), 129,
+                           "NG63 DFlash2 graph-prime context");
+    failures += expect_u32(qb::resolve_max_context(tiny, std::nullopt, mtp_ngram, true), 139,
+                           "tiny benchmark reserves the NG63 graph prime");
+    failures += expect_throws<std::invalid_argument>(
+        [&] { (void)qb::resolve_max_context(tiny, 138, mtp_ngram, true); },
+        "explicit benchmark capacity must fit the NG63 graph prime");
     return failures;
 }
 
@@ -271,8 +338,11 @@ std::vector<qb::TestResult> sample_results() {
     tg.test = {qb::TestKind::Decode, 0, 3, "tg3"};
     tg.reps = {{timings(0.01, 0.1, 0.5, 0.62), speculative(1, 5, 5, 0, {1, 1, 1, 1, 1}), 4},
                {timings(0.02, 0.1, 1.0, 1.13), speculative(0, 0, 0, 3, {0, 0, 0, 0, 0}), 4}};
-    tg.workspace_peak_bytes           = 1024ULL * 1024ULL;
-    tg.workspace_allocator_peak_bytes = 512ULL * 1024ULL;
+    tg.workspace_peak_bytes                      = 1024ULL * 1024ULL;
+    tg.workspace_allocator_peak_bytes            = 512ULL * 1024ULL;
+    tg.reps[0].speculative.ngram_rounds          = 1;
+    tg.reps[0].speculative.ngram_drafted_tokens  = 5;
+    tg.reps[0].speculative.ngram_accepted_tokens = 5;
     return {std::move(pp), std::move(tg)};
 }
 
@@ -319,10 +389,12 @@ qb::BenchEnvironment sample_environment() {
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
     env.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     env.speculative.draft_tokens          = 5;
+    env.speculative.ngram_draft_tokens    = 31;
+    env.speculative.ngram_min_match       = 12;
     env.speculative.proposal_head         = ninfer::ProposalHead::Optimized;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
-    env.decode_graph_prime_output_tokens  = 13;
+    env.decode_graph_prime_output_tokens  = 65;
     env.repetitions                       = 2;
     env.warmup                            = 1;
     env.corpus_path                       = "bench/fixtures/bench_corpus.ids";
@@ -336,8 +408,10 @@ int test_report_contract() {
     const auto results             = sample_results();
     Json report;
     try {
-        report = Json::parse(qb::format_json(
-            env, "ninfer_bench --weights model.ninfer --spec mtp --draft-tokens 5", results));
+        report = Json::parse(qb::format_json(env,
+                                             "ninfer_bench --weights model.ninfer --spec mtp "
+                                             "--draft-tokens 5 --ngram-draft-tokens 31",
+                                             results));
     } catch (const nlohmann::json::exception& error) {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
@@ -348,6 +422,9 @@ int test_report_contract() {
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
+    failures += expect(report.at("config").at("ngram_draft_tokens") == 31 &&
+                           report.at("config").at("ngram_min_match") == 12,
+                       "report identifies ngram configuration independently");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("artifact").at("path") == "model.ninfer", "artifact path");
     failures +=
@@ -368,7 +445,7 @@ int test_report_contract() {
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
-    failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 13,
+    failures += expect(report.at("config").at("decode_graph_prime").at("output_tokens") == 65,
                        "graph prime output count");
 
     const Json& pp = report.at("tests").at(0);
@@ -376,6 +453,10 @@ int test_report_contract() {
         expect(pp.at("kind") == "pp" && pp.at("requested_output_tokens") == 1, "pp request shape");
     failures += expect_near(pp.at("prefill_tok_s_mean").get<double>(), 1536.0, "pp throughput");
     failures += expect(pp.at("decode_output_tok_s_mean").is_null(), "pp decode is null");
+    failures += expect(pp.at("speculative").at("ngram_rounds") == 0 &&
+                           pp.at("speculative").at("ngram_drafted_tokens") == 0 &&
+                           pp.at("speculative").at("ngram_accepted_tokens") == 0,
+                       "prefill does not invent ngram activity");
     failures += expect(pp.at("workspace_peak_bytes") == 5ULL * 1024ULL * 1024ULL * 1024ULL,
                        "pp workspace peak");
     failures += expect(pp.at("workspace_allocator_peak_bytes") == 4ULL * 1024ULL * 1024ULL,
@@ -389,6 +470,14 @@ int test_report_contract() {
     failures += expect_near(tg.at("decode_engine_tok_s_mean").get<double>(), 7.5,
                             "decode engine throughput");
     failures += expect(tg.at("speculative").at("rounds") == 1, "speculative rounds");
+    for (const std::string key :
+         {"ngram_rounds", "ngram_drafted_tokens", "ngram_accepted_tokens"}) {
+        const int expected = key == "ngram_rounds" ? 1 : 5;
+        failures += expect(tg.at("speculative").at(key) == expected &&
+                               tg.at("reps").at(0).at("speculative").at(key) == expected &&
+                               tg.at("reps").at(1).at("speculative").at(key) == 0,
+                           "ngram aggregate and per-repetition counters");
+    }
     failures += expect(tg.at("speculative").at("fallback_steps") == 3, "speculative fallbacks");
     failures += expect_near(tg.at("speculative").at("acceptance_rate").get<double>(), 1.0,
                             "speculative acceptance");
@@ -417,6 +506,11 @@ int test_human_and_csv_reports() {
     failures +=
         expect(table.find("decode eng t/s") != std::string::npos, "table engine throughput");
     failures += expect(table.find("work peak") != std::string::npos, "table workspace peak");
+    failures +=
+        expect(table.find("ngram_draft_tokens=31 ngram_min_match=12") != std::string::npos &&
+                   table.find("ngram acc/draft/round") != std::string::npos &&
+                   table.find("5/5/1") != std::string::npos,
+               "table separates ngram configuration and counters");
 
     auto csv_env            = env;
     csv_env.load.model_name = "trained, \"custom\"";
@@ -428,7 +522,8 @@ int test_human_and_csv_reports() {
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,architecture,prefill_signature"),
                        "CSV identity columns");
     for (const std::string_view field :
-         {"model_name", "artifact_path", "proposal_head", "kv_payload_bytes",
+         {"model_name", "artifact_path", "proposal_head", "ngram_draft_tokens", "ngram_min_match",
+          "ngram_rounds", "ngram_drafted_tokens", "ngram_accepted_tokens", "kv_payload_bytes",
           "load_host_to_device_bytes", "workspace_general_capacity_bytes",
           "vision_handoff_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",

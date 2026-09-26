@@ -26,6 +26,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,7 @@ public:
     using SequenceHandle     = typename ModelContract::SequenceHandle;
     using PendingBatch       = typename ModelContract::PendingBatch;
     using PreparedPrompt     = typename ModelContract::PreparedPrompt;
+    using NgramArchive       = typename ModelContract::NgramArchive;
     using PublishedOutput    = typename ModelContract::PublishedOutput;
     using Request            = RequestRecord<ModelContract>;
     using Scheduling         = Scheduler<Request>;
@@ -68,6 +70,11 @@ public:
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
+        if (options.speculative.ngram_archive_bytes != 0) {
+            ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
+                .session_bytes = options.speculative.ngram_session_bytes,
+                .total_bytes   = options.speculative.ngram_archive_bytes});
+        }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -185,6 +192,11 @@ public:
 
         std::shared_ptr<Request> request;
         try {
+            if (ngram_archive_ && !options.ngram_session.key.empty()) {
+                std::random_device entropy;
+                options.execution.sampling.seed ^=
+                    (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
+            }
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking);
             const std::uint32_t capacity_output =
@@ -677,6 +689,7 @@ private:
             observe_scheduling(request, GenerationSchedulingTransition::Terminal);
         }
         release_planning_state(request);
+        request->ngram_archive.reset();
         request->prompt      = {};
         request->model_state = EngineRequestState::ModelFinished;
         request->sequence.reset();
@@ -748,6 +761,26 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
+        if (request->ngram_archive) {
+            result.ngram_archive.bound = true;
+            if (reason != FinishReason::Cancelled &&
+                !request->cancelled.load(std::memory_order_acquire)) {
+                result.ngram_archive.published =
+                    ngram_archive_->publish(std::move(request->ngram_archive),
+                                            result.generated_token_ids, result.reasoning_tokens);
+            } else {
+                request->ngram_archive.reset();
+            }
+        }
+        if (ngram_archive_) {
+            auto stats      = ngram_archive_->stats(request->options.ngram_session.key);
+            stats.bound     = result.ngram_archive.bound;
+            stats.published = result.ngram_archive.published;
+            if (!request->options.ngram_session.key.empty()) {
+                stats.sampling_seed = request->options.execution.sampling.seed;
+            }
+            result.ngram_archive = stats;
+        }
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1299,6 +1332,12 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
+            // The proposal-only ngram view binds once, before the prompt moves into its plan;
+            // replay after a pause reuses the same snapshot.
+            if (ngram_archive_) {
+                request->ngram_archive =
+                    request->prompt.bind_ngram(*ngram_archive_, request->options.ngram_session);
+            }
             request->base_plan.emplace(instance_.program->plan_request(std::move(request->prompt),
                                                                        request->options.execution));
             const auto& summary = request->base_plan->summary();
@@ -2190,6 +2229,7 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
+    std::unique_ptr<NgramArchive> ngram_archive_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

@@ -30,6 +30,21 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.ngram_archive_bytes != 0 &&
+        (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
+         options.ngram_session_bytes > options.ngram_archive_bytes)) {
+        throw std::invalid_argument("ngram archive requires ngram drafting and session capacity "
+                                    "between 1 MiB and total archive capacity");
+    }
+    if (options.ngram_draft_tokens != 0 &&
+        ((options.backend != SpeculativeBackend::DFlash2 &&
+          options.backend != SpeculativeBackend::DFlash &&
+          options.backend != SpeculativeBackend::Mtp) ||
+         options.ngram_draft_tokens > 63 || options.ngram_min_match < 4 ||
+         options.ngram_min_match > 64)) {
+        throw std::invalid_argument(
+            "ngram requires --spec mtp|dflash|dflash2, drafts 1..63 and match 4..64");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

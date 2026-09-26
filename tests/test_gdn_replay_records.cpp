@@ -138,6 +138,42 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
     failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
 
+    auto wide_spec  = spec;
+    wide_spec.width = 64;
+    ninfer::LayoutBuilder wide_builder;
+    const auto wide_layout = ninfer::plan_gdn_replay_records(wide_builder, wide_spec);
+    const auto wide_bytes  = wide_builder.finish(256);
+    auto wide_backing      = make_backing(wide_bytes);
+    const ninfer::GdnReplayRecords wide({wide_backing.get(), wide_bytes}, wide_layout);
+    const auto row = wide.layer(2, 1);
+    for (int width = 1; width <= 64; ++width) {
+        const auto prefix = row.single_row_prefix(width);
+        failures += expect_shape(prefix.conv, 256, width, 1, 1, "prefix conv");
+        failures += expect_shape(prefix.key, 128, 2, width, 1, "prefix key");
+        failures += expect_shape(prefix.value, 128, 6, width, 1, "prefix value");
+        failures += expect_shape(prefix.gate, 2, 6, width, 1, "prefix gate");
+        failures +=
+            expect(prefix.conv.data == row.conv.data && prefix.key.data == row.key.data &&
+                       prefix.value.data == row.value.data && prefix.gate.data == row.gate.data,
+                   "prefix moved the record base");
+        failures += expect(prefix.conv.is_contiguous() && prefix.key.is_contiguous() &&
+                               prefix.value.is_contiguous() && prefix.gate.is_contiguous(),
+                           "single-row record prefix is not packed");
+    }
+    for (int width : {0, -1, 65}) {
+        failures +=
+            expect_throw([&] { (void)row.single_row_prefix(width); }, "invalid prefix width");
+    }
+    failures += expect_throw([&] { (void)wide.layer(1, 2).single_row_prefix(6); },
+                             "multi-row record prefix");
+    auto strided = row;
+    strided.key.nb[1] *= 2;
+    failures += expect_throw([&] { (void)strided.single_row_prefix(6); }, "strided record prefix");
+    auto mismatched       = row;
+    mismatched.gate.ne[2] = 32;
+    failures +=
+        expect_throw([&] { (void)mismatched.single_row_prefix(6); }, "mismatched record width");
+
     failures += expect_size(record_bytes({.layers          = 48,
                                           .record_capacity = 8,
                                           .width           = 6,

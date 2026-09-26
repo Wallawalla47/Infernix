@@ -2692,6 +2692,107 @@ int test_media_preparation_cancellation() {
     return check(false, "cancelled media preparation completed successfully");
 }
 
+int test_ngram_proposal_only_sources() {
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled        = false;
+    options.max_context           = 8192;
+    const Frontend plain          = make_frontend(resources(), options);
+    options.ngram_sources_enabled = true;
+    const Frontend enhanced       = make_frontend(resources(), options);
+    ninfer::PromptInput input;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+                          .text = "1: user text\n2: must not\n3: become a shadow\n"});
+    input.messages.push_back(user);
+    ninfer::ChatMessage tool;
+    tool.role = ninfer::ChatRole::Tool;
+    tool.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+                          .text = "40: def f():\n41:     x = 1\n42:     return x\n"});
+    input.messages.push_back(tool);
+    auto a             = plain.prepare(input);
+    auto b             = enhanced.prepare(input);
+    const auto& before = FrontendFactory::inspect(a);
+    const auto& after  = FrontendFactory::inspect(b);
+    int failures       = check(
+        before.token_ids == after.token_ids && before.positions == after.positions &&
+            before.token_types == after.token_types && before.rope_delta == after.rope_delta &&
+            before.starts_in_reasoning == after.starts_in_reasoning,
+        "ngram sources changed target input");
+    failures += check(before.ngram_sources.empty() && after.ngram_sources.size() == 1 &&
+                          after.ngram_sources[0] ==
+                              enhanced.tokenize_text("def f():\n    x = 1\n    return x\n"),
+                      "ngram tool sources lost provenance/indentation");
+    failures += check(!after.ngram_boundaries.empty(), "ngram special-token boundaries absent");
+    options.ngram_archive_enabled            = true;
+    const Frontend retaining                 = make_frontend(resources(), options);
+    auto retained_input                      = input;
+    retained_input.options.preserve_thinking = true;
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = "Private reasoning about the edit.";
+    assistant.parts.push_back(
+        {.kind = ninfer::MessagePartKind::Text, .text = "Final code goes here."});
+    retained_input.messages.push_back(assistant);
+    auto retained_prompt = retaining.prepare(retained_input);
+    const auto& retained = FrontendFactory::inspect(retained_prompt);
+    using namespace ninfer::models::qwen3_5;
+    const auto has_source = [&](std::string_view text, NgramSourceKind kind) {
+        const auto expected = retaining.tokenize_text(text);
+        return std::any_of(retained.ngram_archive_sources.begin(),
+                           retained.ngram_archive_sources.end(), [&](const auto& source) {
+                               return source.kind == kind &&
+                                      std::search(source.tokens.begin(), source.tokens.end(),
+                                                  expected.begin(),
+                                                  expected.end()) != source.tokens.end();
+                           });
+    };
+    failures +=
+        check(has_source("40: def f():", NgramSourceKind::Tool) &&
+                  has_source("Private reasoning about the edit.", NgramSourceKind::Reasoning) &&
+                  has_source("Final code goes here.", NgramSourceKind::Generated),
+              "archive source roles or reasoning classification lost");
+    failures += check(!has_source("assistant\n", NgramSourceKind::Generated),
+                      "archive indexed role header");
+    const auto target_tokens = retained.token_ids;
+    NgramArchive archive;
+    auto lease = retained_prompt.bind_ngram(archive, {.key = "frontend-session"});
+    failures +=
+        check(lease && retained.token_ids == target_tokens && archive.publish(std::move(lease)),
+              "archive binding changed target tokens or failed to publish");
+    auto compacted_prompt =
+        retaining.prepare_tokens(retaining.tokenize_text("New compacted summary."));
+    auto compacted = compacted_prompt.bind_ngram(archive, {.key = "frontend-session"});
+    failures += check(compacted && compacted->snapshot()->source_count() >= 4,
+                      "prepared source views did not survive compaction");
+    compacted.reset();
+    failures += check(!compacted_prompt.bind_ngram(archive, {}) &&
+                          !FrontendTestAccess::inspect(compacted_prompt).ngram_snapshot,
+                      "unbound prepared prompt retained a previous archive view");
+    options.max_context    = 128;
+    const Frontend bounded = make_frontend(resources(), options);
+    std::string oversized;
+    for (unsigned i = 1; i <= 1024; ++i) {
+        oversized += std::to_string(i) + ": value = 123456789\n";
+    }
+    input.messages.back().parts[0].text = std::move(oversized);
+    failures += check(throws_context_length([&] { (void)bounded.prepare(input); }),
+                      "proposal sources bypassed the target context limit");
+    std::atomic<unsigned> checks{0};
+    ninfer::PreparationControl control{
+        .deadline     = {},
+        .cancellation = ninfer::CancellationView([&] { return checks.fetch_add(1) >= 3; }),
+    };
+    try {
+        (void)bounded.prepare(input, control);
+        failures += check(false, "cancelled shadow-source tokenization completed");
+    } catch (const ninfer::RequestError& error) {
+        failures += check(error.kind() == ninfer::RequestErrorKind::Cancelled && checks.load() == 4,
+                          "shadow-source cancellation lost priority to the target context error");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -2699,6 +2800,7 @@ int main() {
     const Frontend frontend       = make_frontend(owned);
     int failures                  = 0;
     failures += test_declared_frontend_semantics();
+    failures += test_ngram_proposal_only_sources();
     failures += test_tokenizer_config_merge();
     failures += test_bpe_merge_order();
     failures += test_boundary_aware_tokenization();

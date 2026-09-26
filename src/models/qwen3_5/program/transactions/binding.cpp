@@ -63,7 +63,7 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     staged.initial_mtp_extent =
         staged.prepare_mtp
             ? std::min(
-                  {draft_window,
+                  {neural_draft_window,
                    plan.summary.effective_output_tokens > 1
                        ? plan.summary.effective_output_tokens - 2U
                        : 0U,
@@ -405,6 +405,8 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
                 DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, request.prefill->prompt, *request.prefill->vision_plan,
                 vision_handoff, vision_handoff_peak_bytes);
+            preencode_overlay_vision(*request.prefill->vision, request.prefill->prompt,
+                                     *request.prefill->vision_plan, request.prefill->cursor);
         }
         install_resume_sampling(state, request);
     } else {
@@ -419,6 +421,18 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         request.lifecycle             = Lifecycle::Prefilling;
         request.publish_continuation  = tx.base->summary.publish_continuation;
         install_sampling(state, request, tx.base->sampling);
+        if (ngram_draft_window != 0) {
+            // The copy proposer indexes the prompt once per request; a paused request keeps
+            // its proposer in the saved control and resumes with it.
+            const auto& prompt = *tx.base->prompt;
+            request.ngram      = std::make_unique<NgramProposer>();
+            request.ngram->set_boundaries(prompt.ngram_boundaries);
+            request.ngram->ingest(prompt.token_ids);
+            // Optional plain-text tool spans would otherwise be displaced by a large prompt.
+            for (const auto& source : prompt.ngram_sources) { request.ngram->ingest(source); }
+            request.ngram_indexed  = prompt.token_ids.size();
+            request.ngram_snapshot = prompt.ngram_snapshot;
+        }
     }
     refresh_state_views(state);
     request.permit   = tx.first_unit;

@@ -27,7 +27,7 @@ ServeOptions parse(std::vector<std::string> arguments) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures       = 0;
     failures += check(parse({"ninfer-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
                       "serving YaRN must default off");
     for (const auto* factor : {"1", "2.5", "4"}) {
@@ -50,8 +50,106 @@ int main() {
     failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
     failures += check(serve_usage_text("ninfer-serve").find("--rope-yarn-factor") != std::string::npos,
                       "serving help omits YaRN");
+    const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
+                                "--ngram-session-mib", "128", "--ngram-native-sessions"});
+    failures += check(archive.speculative.ngram_archive_bytes == (512ULL << 20) &&
+                          archive.speculative.ngram_session_bytes == (128ULL << 20) &&
+                          archive.ngram_native_sessions,
+                      "archive capacities or native opt-in not preserved");
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--ngram-native-sessions"},
+             {"--ngram-archive-mib", "64"},
+             {"--ngram-archive-mib", "512", "--ngram-session-mib", "0"},
+             {"--ngram-archive-mib", "18446744073709551615"}}) {
+        std::vector<std::string> args{"ninfer-serve",
+                                      "model.ninfer",
+                                      "--spec",
+                                      "mtp",
+                                      "--draft-tokens",
+                                      "5",
+                                      "--ngram-draft-tokens",
+                                      "63"};
+        args.insert(args.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try {
+            (void)parse(args);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid archive contract admitted");
+    }
+    const auto ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
+                              "5", "--ngram-draft-tokens", "15", "--ngram-min-match", "12"});
+    failures +=
+        check(ngram.speculative.ngram_draft_tokens == 15 && ngram.speculative.draft_tokens == 5 &&
+                  ngram.speculative.ngram_min_match == 12,
+              "ngram and neural widths were not kept separate");
+    for (const auto& tail : std::vector<std::vector<std::string>>{{"--ngram-draft-tokens", "64"},
+                                                                  {"--ngram-min-match", "3"},
+                                                                  {"--max-concurrency", "2"},
+                                                                  {"--spec", "none"}}) {
+        std::vector<std::string> arguments{"ninfer-serve",
+                                           "model.ninfer",
+                                           "--spec",
+                                           "dflash2",
+                                           "--draft-tokens",
+                                           "5",
+                                           "--ngram-draft-tokens",
+                                           "15"};
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unsupported ngram configuration admitted");
+    }
 
+    const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
+                                  "3", "--ngram-draft-tokens", "15"});
+    failures += check(mtp_ngram.speculative.draft_tokens == 3 &&
+                          mtp_ngram.speculative.ngram_draft_tokens == 15,
+                      "MTP and ngram widths were not kept separate");
+    for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
+        const int neural_limit = backend == "mtp" ? 5 : 15;
+        for (int neural = 1; neural <= neural_limit; ++neural) {
+            for (int lookup = 1; lookup <= 63; ++lookup) {
+                const auto options =
+                    parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens",
+                           std::to_string(neural), "--ngram-draft-tokens", std::to_string(lookup)});
+                failures += check(options.speculative.draft_tokens == neural &&
+                                      options.speculative.ngram_draft_tokens == lookup,
+                                  "valid neural/ngram width pair changed");
+            }
+        }
+        for (const auto& tail : std::vector<std::vector<std::string>>{
+                 {"--draft-tokens", std::to_string(neural_limit + 1)},
+                 {"--ngram-draft-tokens", "-1"},
+                 {"--ngram-draft-tokens", "64"},
+                 {"--ngram-min-match", "65"},
+                 {"--max-concurrency", "2"}}) {
+            std::vector<std::string> arguments{"ninfer-serve",
+                                               "model.ninfer",
+                                               "--spec",
+                                               backend,
+                                               "--draft-tokens",
+                                               "3",
+                                               "--ngram-draft-tokens",
+                                               "15"};
+            arguments.insert(arguments.end(), tail.begin(), tail.end());
+            bool rejected = false;
+            try {
+                (void)parse(arguments);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "unsupported neural/ngram pair admitted");
+        }
+        const auto disabled =
+            parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                   "--ngram-draft-tokens", "0", "--max-concurrency", "8"});
+        failures += check(disabled.speculative.ngram_draft_tokens == 0,
+                          "disabled ngram changed multi-slot configuration");
+    }
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.speculative.ngram_draft_tokens == 0,
+                      "ngram is unexpectedly enabled by default");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

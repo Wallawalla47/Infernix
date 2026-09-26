@@ -139,6 +139,11 @@ struct PrepareStats {
 };
 
 struct PreparedPromptData {
+    // Proposal-only sources, never part of target tokens, positions or cache identity.
+    std::vector<std::vector<TokenId>> ngram_sources;
+    std::vector<TokenId> ngram_boundaries;
+    std::vector<NgramSourceView> ngram_archive_sources;
+    std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;

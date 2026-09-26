@@ -9,6 +9,8 @@
 
 namespace ninfer::ops {
 
+inline constexpr int kSparseSpeculativeCandidates = 16;
+
 struct SpeculativeAcceptExecutionEnvelope {
     // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
     // the general route remains valid for any supported mixture of greedy and stochastic rows.
@@ -123,7 +125,8 @@ void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor&
  *   logits is BF16 [248320,K+1,B]; drafts is I32 [K,B]; candidate_ids is I32 [16,K,B];
  *   proposal_q is FP32 [16,K,B]. current_extents, round_lengths, round_anchors,
  *   licensed_counts, and accepted_drafts are I32 [B].
- *   The registered domain is token_domain=248077, K=1..15, B=1..8. Each live draft
+ *   The registered domain is token_domain=248077, K=1..31 at B=1..8, or K=32..63
+ *   at B=1. Each live draft
  *   position has distinct global candidate ids in [0,token_domain). proposal_q is the
  *   normalized FP32 distribution used to draw that draft; the draft occurs with positive q.
  *   For greedy rows without penalties, live target_tokens are the unpenalized target argmax

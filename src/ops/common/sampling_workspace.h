@@ -24,6 +24,7 @@ inline constexpr int kSamplerPartialsPerGroup    = 25;
 inline constexpr int kSamplerFastCandidates      = 20;
 inline constexpr int kSamplerCandidateCap        = kSamplerFastCandidates;
 inline constexpr int kSamplerMaxColumns          = 16;
+inline constexpr int kSpeculativeSamplerMaxColumns = 64;
 
 static_assert(kSamplerPartialsPerGroup * kSamplerCandidateCap <= kSamplerGroupTileItems,
               "group merge tile must hold one group's candidates");
@@ -33,13 +34,13 @@ __host__ __device__ inline int sampler_group_count(int partial_blocks) {
 }
 
 // The multi-block route is deliberately finite. A single final merge tile must
-// hold every group candidate and the registered sampling/speculative routes use at most sixteen
-// columns.
+// hold every group candidate. Ordinary sampling retains its 16-column route;
+// speculative verification explicitly opts into up to 64 columns.
 __host__ __device__ inline bool sampler_multiblock_ok(int vocab, int cols, int partial_blocks,
-                                                      int group_count) {
-    return vocab > kSamplerTileItems && cols > 0 && cols <= kSamplerMaxColumns &&
-           partial_blocks > 0 && group_count > 0 &&
-           (group_count * kSamplerCandidateCap) <= kSamplerGroupTileItems;
+                                                      int group_count,
+                                                      int max_columns = kSamplerMaxColumns) {
+    return vocab > kSamplerTileItems && cols > 0 && cols <= max_columns && partial_blocks > 0 &&
+           group_count > 0 && (group_count * kSamplerCandidateCap) <= kSamplerGroupTileItems;
 }
 
 struct SamplingWorkspace {
@@ -77,14 +78,17 @@ struct SamplingWorkspaceLayout {
     }
 };
 
-inline SamplingWorkspaceLayout make_sampling_workspace_layout(std::int32_t token_domain,
-                                                              std::int32_t columns) {
+inline SamplingWorkspaceLayout
+make_sampling_workspace_layout(std::int32_t token_domain, std::int32_t columns,
+                               std::int32_t max_columns = kSamplerMaxColumns) {
     SamplingWorkspaceLayout out;
     if (token_domain <= 0 || columns <= 0) { return out; }
 
     const std::int32_t partial_blocks = div_up(token_domain, kSamplerPartialTileItems);
     const std::int32_t groups         = sampler_group_count(partial_blocks);
-    if (!sampler_multiblock_ok(token_domain, columns, partial_blocks, groups)) { return out; }
+    if (!sampler_multiblock_ok(token_domain, columns, partial_blocks, groups, max_columns)) {
+        return out;
+    }
 
     out.multiblock     = true;
     out.partial_stride = partial_blocks + groups;

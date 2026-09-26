@@ -17,6 +17,11 @@
 
 namespace ninfer::serve {
 
+[[nodiscard]] NgramSessionHints resolve_ngram_session(const httplib::Request& request,
+                                                      const RequestJson& body,
+                                                      const ServeOptions& options);
+void set_ngram_generation_header(httplib::Response& response, const NgramArchiveStats& stats);
+[[nodiscard]] std::string ngram_generation_comment(const NgramArchiveStats& stats);
 class ResponseRenderFailure final : public std::runtime_error {
 public:
     explicit ResponseRenderFailure(const std::string& message) : std::runtime_error(message) {}

@@ -166,7 +166,13 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
+           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off);\n"
+           "                             above 15 requires --max-concurrency 1\n"
+           "  --ngram-min-match N        minimum ngram match length, 4-64\n"
+           "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
            "  --ngram-session-mib N      MiB session-scoped ngram source budget\n"
+           "  --ngram-native-sessions    retain ngram sources across compaction; requires\n"
+           "                             --ngram-archive-mib\n"
            "\n"
            "VISION (off by default)\n"
            "  --vision                   enable media and load the Vision GPU allocations\n"
@@ -220,6 +226,8 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "NOTES\n"
            "  --vision-offload on requires --vision.\n"
+           "  --ngram-draft-tokens above 15 requires --max-concurrency 1.\n"
+           "  --ngram-native-sessions requires --ngram-archive-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
            "  allowed ceiling only, not --max-context.\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
@@ -362,6 +370,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
+        } else if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
+            const auto mib = parse_u64(require_value(arg.c_str()), arg.c_str());
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("ngram archive capacity is out of range");
+            }
+            auto& bytes = arg == "--ngram-archive-mib" ? options.speculative.ngram_archive_bytes
+                                                       : options.speculative.ngram_session_bytes;
+            bytes       = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--ngram-native-sessions") {
+            options.ngram_native_sessions = true;
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -466,6 +490,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
+    }
+    if (options.speculative.ngram_draft_tokens != 0 && options.max_concurrency != 1) {
+        throw std::invalid_argument("ngram currently requires --max-concurrency 1");
+    }
+    if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
+        throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {

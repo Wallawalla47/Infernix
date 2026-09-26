@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 15
+REPORT_SCHEMA_VERSION = 16
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -292,6 +292,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "kv_cache": config.get("kv_cache"),
             "speculative_backend": config.get("speculative_backend"),
             "draft_tokens": config.get("draft_tokens"),
+            "ngram_draft_tokens": config.get("ngram_draft_tokens"),
+            "ngram_min_match": config.get("ngram_min_match"),
             "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
@@ -332,6 +334,9 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "spec_drafted_tokens": speculative.get("drafted_tokens"),
             "spec_accepted_tokens": speculative.get("accepted_tokens"),
             "spec_fallback_steps": speculative.get("fallback_steps"),
+            "ngram_rounds": speculative.get("ngram_rounds"),
+            "ngram_drafted_tokens": speculative.get("ngram_drafted_tokens"),
+            "ngram_accepted_tokens": speculative.get("ngram_accepted_tokens"),
             "spec_accepted_per_position": json.dumps(
                 speculative.get("accepted_per_position", []), separators=(",", ":")
             ),
@@ -377,7 +382,7 @@ def write_manifest(
 ) -> None:
     manifest = {
         "artifact_type": "ninfer_bench_matrix_run",
-        "schema_version": 4,
+        "schema_version": 5,
         "created_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "preset": args.preset,
         "primary_mtp_draft_tokens": 3,

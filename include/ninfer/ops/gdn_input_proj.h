@@ -173,8 +173,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 /**
  * Returns the transient capacity for the registered Q4/Q5 or Q8 record-producing profile.
  * `batch_size` is exact, and the inclusive T interval must lie within ReplaySSM's B=1..8,
- * T=2..16 execution domain. These profiles require no transient storage because materialized
- * projection writes directly to caller-owned conv_record.
+ * T=2..16 execution domain, extended to T=64 at B=1. These profiles require no transient storage
+ * because materialized projection writes directly to caller-owned conv_record.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
@@ -198,7 +198,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * newest history column to conv_record [C,T,B]. Query, key,
  * and value are zero in each row's invalid tail; z is projected for every physical column.
  *
- * The execution domain is B=1..8 and T=2..16. valid_columns is empty for dense input or device
+ * The execution domain is B=1..8 and T=2..16, plus B=1 and T=17..64.
+ * valid_columns is empty for dense input or device
  * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined. Outputs and valid

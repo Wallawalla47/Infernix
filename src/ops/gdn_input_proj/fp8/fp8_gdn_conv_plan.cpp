@@ -98,7 +98,8 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
 Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t width,
                                            std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN record");
-    if (width < 2 || width > 16 || batch_size <= 0 || batch_size > 8) {
+    if (width < 2 || width > 64 || batch_size <= 0 || batch_size > 8 ||
+        (batch_size > 1 && width > 16)) {
         throw std::invalid_argument("fp8 GDN record: invalid B/W domain");
     }
     // Record and snapshot must choose the same arithmetic for the same physical block.

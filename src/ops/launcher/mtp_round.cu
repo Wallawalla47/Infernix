@@ -1,5 +1,5 @@
 // Implements: include/ninfer/ops/mtp_round.h
-// Match: validated request-major K=1..5 MTP round transition.
+// Match: K=1..31 verified drafts (up to 63 at B=1), followed by N=1..5 MTP drafts.
 #include "ops/launcher/mtp_round.h"
 
 #include "core/device.h"
@@ -15,7 +15,8 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
                                    const Tensor& rope_deltas, Tensor& alignment_ids,
                                    Tensor& next_extents, Tensor& ar_positions,
                                    Tensor& ar_rope_positions, Tensor& ar_valid_columns,
-                                   std::int32_t max_context, cudaStream_t stream) {
+                                   std::int32_t max_context, std::int32_t next_k,
+                                   cudaStream_t stream) {
     constexpr int kBlock = 32;
     const int k          = verify_ids.ne[0] - 1;
     const int batch      = verify_ids.ne[1];
@@ -35,7 +36,7 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
         static_cast<std::int32_t*>(next_extents.data),
         static_cast<std::int32_t*>(ar_positions.data),
         static_cast<std::int32_t*>(ar_rope_positions.data),
-        static_cast<std::int32_t*>(ar_valid_columns.data), k, ar_step_stride, max_context);
+        static_cast<std::int32_t*>(ar_valid_columns.data), k, next_k, ar_step_stride, max_context);
     CUDA_CHECK(cudaGetLastError());
 }
 

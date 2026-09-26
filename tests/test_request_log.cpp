@@ -416,6 +416,17 @@ int main() {
     outcome.metrics.speculative_fallback_steps        = 2;
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
     outcome.metrics.engine_request_id                 = 991;
+    outcome.metrics.ngram_archive_rounds              = 7;
+    outcome.metrics.ngram_archive_drafted_tokens      = 441;
+    outcome.metrics.ngram_archive_accepted_tokens     = 400;
+    outcome.metrics.ngram_archive                     = {.enabled       = true,
+                                                         .bound         = true,
+                                                         .published     = true,
+                                                         .generation    = 3,
+                                                         .sources       = 12,
+                                                         .session_bytes = 1024,
+                                                         .total_bytes   = 4096,
+                                                         .sampling_seed = 0};
     outcome.metrics.scheduling                        = {
                                .preemptions          = 3,
                                .snapshot_restores    = 1,
@@ -486,6 +497,12 @@ int main() {
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
+                          done.at("speculative").at("ngram_archive").at("generation") == 3 &&
+                          done.at("speculative").at("ngram_archive").at("bound") == true &&
+                          done.at("speculative").at("ngram_archive").at("sampling_seed") == 0 &&
+                          done.at("speculative").at("ngram_archive").at("session_bytes") == 1024,
+                      "archive provenance or memory metrics missing");
     failures +=
         check(done.at("speculative").at("draft_window") == 3, "speculative draft window missing");
     failures += check(done.at("speculative").at("fallback_steps") == 2,
@@ -615,7 +632,8 @@ int main() {
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
             "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
-            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | thinking 256/256, control 19",
+            "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
+            "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
     GenerationOutcome normalized_tool_outcome = outcome;

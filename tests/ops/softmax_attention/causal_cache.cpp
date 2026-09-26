@@ -2714,6 +2714,43 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
     return failures;
 }
 
+// Ngram copy verification checks one request's drafts at widths 17-64, beyond the batched
+// verification domain. Dense and masked single-row calls, cached and appended, against the FP64
+// oracle, including loose envelopes whose visible keys still lie in the prompt-route region.
+int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (int width = 17; width <= 64; ++width) {
+            failures +=
+                run_batch_case(execution, geometry, storage,
+                               {width, {127}, {width}, {0}, MappingPattern::Fragmented,
+                                static_cast<unsigned>(1900 + width), false});
+        }
+        for (int width : {17, 24, 32, 33, 48, 64}) {
+            for (int valid : {0, 1, width - 1, width}) {
+                failures += run_batch_case(execution, geometry, storage,
+                                           {width, {2048}, {valid}, {0}, MappingPattern::Fragmented,
+                                            static_cast<unsigned>(2000 + width + valid), true});
+            }
+            failures += run_a1_case(
+                execution, geometry, storage,
+                {width, 8192, static_cast<unsigned>(8192 + width), 2101u, false, true},
+                MappingPattern::Fragmented);
+            failures += run_a3_case(
+                execution, geometry, storage,
+                {width, 8192, static_cast<unsigned>(8192 + width), 2102u, false, true},
+                MappingPattern::Fragmented);
+        }
+        for (int width : {17, 32, 33, 64, 65}) {
+            for (unsigned maximum : {256u, 257u, 320u, 321u, 640u, 641u, 1024u, 1025u}) {
+                failures += run_a3_case(execution, geometry, storage, {width, 31, maximum, 2103u},
+                                        MappingPattern::Offset);
+            }
+        }
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2749,6 +2786,24 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 }
 
 } // namespace
+
+int run_softmax_attention_wide_tests(std::optional<KvCacheStorage> selected) {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures = 0;
+    for (const auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        if (selected && storage != *selected) continue;
+        const int current = run_wide_copy_cases(execution, storage);
+        std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
+                  << cache_name(storage) << " wide copy verification\n";
+        failures += current;
+    }
+    return failures ? 1 : 0;
+}
 
 // --rope-yarn-factor raises the visible-key ceiling from 262,144 to 1,048,576. One single-token
 // read over 300,001 keys on fragmented pages per cache format, against the FP64 oracle.
