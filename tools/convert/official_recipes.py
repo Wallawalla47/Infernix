@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, grouped_mse, import_encoded
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -11,12 +11,12 @@ Q8 = "q8_g32_fp16"
 FP8 = "fp8_e4m3fn_row_bf16"
 
 
-def _assign(recipe, name, format, *, source=None):
-    method = grouped_absmax if format in (Q4, Q5, Q6, Q8) else cast_direct
+def _assign(recipe, name, format, *, source=None, method=grouped_absmax):
+    method = method if format in (Q4, Q5, Q6, Q8) else cast_direct
     recipe.assign(name, format=format, method=method, source=source)
 
 
-def _optional(model, recipe):
+def _optional(model, recipe, *, method=grouped_absmax):
     for name, parameter in model.parameters.items():
         if not parameter.projection:
             continue
@@ -31,7 +31,7 @@ def _optional(model, recipe):
                 format = Q4
             else:
                 format = Q5
-            _assign(recipe, name, format)
+            _assign(recipe, name, format, method=method)
         elif name.startswith(("mtp/", "dflash/", "dflash2/")):
             if name.endswith(
                 (
@@ -43,7 +43,7 @@ def _optional(model, recipe):
                 )
             ):
                 continue
-            _assign(recipe, name, Q8)
+            _assign(recipe, name, Q8, method=method)
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue
@@ -54,12 +54,12 @@ def _optional(model, recipe):
                 recipe.share(prefix + "context_" + role, prefix + role)
 
 
-def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4):
+def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4, *, method=grouped_absmax):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
-    _optional(model, recipe)
-    _assign(recipe, "text/token_embedding", vocabulary)
-    _assign(recipe, "text/output_head", vocabulary)
+    _optional(model, recipe, method=method)
+    _assign(recipe, "text/token_embedding", vocabulary, method=method)
+    _assign(recipe, "text/output_head", vocabulary, method=method)
     for name, parameter in model.parameters.items():
         if not name.startswith("text/layers/") or not parameter.projection:
             continue
@@ -79,7 +79,7 @@ def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4):
             format = Q4
         else:
             format = Q5
-        _assign(recipe, name, format)
+        _assign(recipe, name, format, method=method)
 
 
 def qwen3_6_27b(model, recipe, sources):
