@@ -2750,6 +2750,27 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
 
 } // namespace
 
+// --rope-yarn-factor raises the visible-key ceiling from 262,144 to 1,048,576. One single-token
+// read over 300,001 keys on fragmented pages per cache format, against the FP64 oracle.
+int run_softmax_attention_extended_tests(std::optional<KvCacheStorage> selected) {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures = 0;
+    for (const auto storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        if (selected && storage != *selected) continue;
+        const int current = run_a3_case(kGeometries[0], storage, {1, 300000, 300001, 1720u},
+                                        MappingPattern::Fragmented);
+        std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
+                  << cache_name(storage) << " 300001 visible keys\n";
+        failures += current;
+    }
+    return failures ? 1 : 0;
+}
+
 int run_softmax_attention_causal_cache_tests(std::optional<KvCacheStorage> selected) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";

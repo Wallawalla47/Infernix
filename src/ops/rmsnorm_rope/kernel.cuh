@@ -9,11 +9,11 @@
 namespace ninfer::ops {
 // A CTA owns eight heads of one token. Pair form uses four Q CTAs and one K CTA;
 // the single-K form uses one CTA. Each warp evaluates one complete head.
-template <bool Pair>
+template <bool Pair, class Coefficients = NativeRopeCoefficients>
 __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
-    __nv_bfloat16* __restrict__ k) {
+    __nv_bfloat16* __restrict__ k, Coefficients coefficients = {}) {
     constexpr int kPairs = 64;
     const int token      = blockIdx.x;
     const bool query     = Pair && blockIdx.y < 4;
@@ -27,7 +27,8 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     __shared__ __nv_bfloat162 weight_cache[kPairs];
     if (threadIdx.x < kPairs) {
         const int pair = threadIdx.x;
-        dflash_rope_sincos(positions, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        coefficients.template sincos<RopeKernelMode::DflashText1D>(
+            positions, 0, token, pair, &sin_cache[pair], &cos_cache[pair]);
         weight_cache[pair] = weight[pair];
     }
     __syncthreads();

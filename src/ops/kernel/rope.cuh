@@ -5,12 +5,15 @@
 // D/R=128/128, plus packed Vision 16Q/16K at D/R=72/72. One CTA owns one token and shares its
 // rotary coefficients across heads.
 
+#include "ops/launcher/rope.h"
+
 #include "ops/common/dflash_rope.cuh"
 
 #include <cuda_bf16.h>
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -83,10 +86,44 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
         __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads>
+// Empty native provider preserves the original coefficient arithmetic. Prepared values
+// occupy only kernel argument storage and specialize the same packed schedules.
+struct NativeRopeCoefficients {
+    template <RopeKernelMode Mode>
+    __device__ __forceinline__ void sincos(const std::int32_t* positions, int tokens,
+        int token, int pair, float* sine, float* cosine) const {
+        fixed_sincos<Mode>(positions, tokens, token, pair, sine, cosine);
+    }
+};
+
+struct PreparedRopeCoefficients {
+    PreparedRope prepared;
+    __device__ __forceinline__ void sincos_axis(const std::int32_t* positions, int tokens,
+        int token, int pair, int axis, float* sine, float* cosine) const {
+        // Same multiply-by-reciprocal reduction as dflash_rope_sincos: no double divide.
+        constexpr double kInvTwoPi = 1.59154943091895336e-01;
+        constexpr double kTwoPi    = 6.28318530717958648e+00;
+        const double angle = static_cast<double>(positions[static_cast<std::int64_t>(axis) * tokens + token]) *
+                             prepared.inverse[pair];
+        const double turns   = angle * kInvTwoPi;
+        const float reduced  = static_cast<float>(angle - nearbyint(turns) * kTwoPi);
+        sincosf(reduced, sine, cosine);
+        *sine   *= prepared.attention_scale;
+        *cosine *= prepared.attention_scale;
+    }
+    template <RopeKernelMode Mode>
+    __device__ __forceinline__ void sincos(const std::int32_t* positions, int tokens,
+        int token, int pair, float* sine, float* cosine) const {
+        sincos_axis(positions, tokens, token, pair, Mode == RopeKernelMode::TextMrope ? pair % 3 : 0,
+                    sine, cosine);
+    }
+};
+
+
+template <RopeKernelMode Mode, int QHeads, int KHeads, class Coefficients = NativeRopeCoefficients>
 __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* q, __nv_bfloat16* k,
                                   std::int32_t tokens, std::int64_t q_token_stride,
-                                  std::int64_t k_token_stride) {
+                                  std::int64_t k_token_stride, Coefficients coefficients = {}) {
     constexpr int kHeadDim = Mode == RopeKernelMode::Vision2D       ? 72
                              : Mode == RopeKernelMode::DflashText1D ? 128
                                                                     : 256;
@@ -100,7 +137,7 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
-        fixed_sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        coefficients.template sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
     }
     __syncthreads();
 
@@ -126,10 +163,12 @@ __global__ void rope_fixed_kernel(const std::int32_t* positions, __nv_bfloat16* 
     }
 }
 
-template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock>
+template <RopeKernelMode Mode, int QHeads, int KHeads, int HeadsPerBlock,
+          class Coefficients = NativeRopeCoefficients>
 __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bfloat16* q,
                                         __nv_bfloat16* k, std::int32_t tokens,
-                                        std::int64_t q_token_stride, std::int64_t k_token_stride) {
+                                        std::int64_t q_token_stride, std::int64_t k_token_stride,
+                                        Coefficients coefficients = {}) {
     static_assert(Mode == RopeKernelMode::DflashText1D);
     constexpr int kHeadDim       = 128;
     constexpr int kHalf          = 64;
@@ -143,7 +182,7 @@ __global__ void rope_fixed_split_kernel(const std::int32_t* positions, __nv_bflo
     __shared__ float sin_cache[kHalf];
     if (threadIdx.x < kHalf) {
         const int pair = static_cast<int>(threadIdx.x);
-        fixed_sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
+        coefficients.template sincos<Mode>(positions, tokens, token, pair, &sin_cache[pair], &cos_cache[pair]);
     }
     __syncthreads();
 
@@ -177,12 +216,13 @@ __device__ __forceinline__ void generic_axis_frequency(int axes, int head_dim, i
     }
 }
 
-static __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
+template <class Coefficients = NativeRopeCoefficients>
+__global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t axes,
                                            __nv_bfloat16* q, __nv_bfloat16* k,
                                            std::int32_t head_dim, std::int32_t rotary_dim,
                                            float theta, std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
-                                           std::int64_t k_token_stride) {
+                                           std::int64_t k_token_stride, Coefficients coefficients = {}) {
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -190,7 +230,10 @@ static __global__ void rope_generic_kernel(const std::int32_t* positions, std::i
     __shared__ float sin_cache[kRopeMaxHalf];
     if (threadIdx.x < static_cast<unsigned>(half)) {
         const int pair = static_cast<int>(threadIdx.x);
-        if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
+        if constexpr (std::is_same_v<Coefficients, PreparedRopeCoefficients>) {
+            coefficients.sincos_axis(positions, tokens, token, pair, axes == 3 ? pair % 3 : 0,
+                                     &sin_cache[pair], &cos_cache[pair]);
+        } else if (axes == 1 && head_dim == 128 && rotary_dim == 128 && theta == 1.0e7F) {
             fixed_sincos<RopeKernelMode::DflashText1D>(positions, tokens, token, pair,
                                                        &sin_cache[pair], &cos_cache[pair]);
         } else {

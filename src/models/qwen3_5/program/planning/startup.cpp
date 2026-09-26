@@ -748,11 +748,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             "loaded components do not match the requested execution options");
     }
     if (parameters.draft &&
-        options.max_context > parameters.model.config().draft->max_position_embeddings) {
+        options.max_context > rope_context_ceiling(
+            parameters.model.config().draft->max_position_embeddings, options.rope_yarn_factor)) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
     }
     if (options.max_context == 0 ||
-        options.max_context > parameters.model.config().text.max_position_embeddings) {
+        options.max_context > rope_context_ceiling(
+            parameters.model.config().text.max_position_embeddings, options.rope_yarn_factor)) {
         throw std::invalid_argument("max_context exceeds the configured position capacity");
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % kPrefillChunkAlignment != 0) {

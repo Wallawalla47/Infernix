@@ -207,6 +207,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
@@ -273,6 +274,12 @@ it does not override individual CUDA event creation flags.
 The official artifacts have a native context limit of 262,144 tokens. The practical allocation
 on one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
 The artifact describes its model configuration and weight representations;
+`--rope-yarn-factor F` opts into startup-fixed runtime YaRN with a finite factor in `[1,4]`
+(default `1`, native RoPE unchanged). It does not modify the artifact or converter. The factor
+extends the allowed context ceiling, but does not enlarge the default `--max-context` or KV pool;
+request a larger context explicitly. Memory and selected speculative-backend limits still apply.
+This is long-context extrapolation, not a guarantee of answer quality; evaluate your workload.
+
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to

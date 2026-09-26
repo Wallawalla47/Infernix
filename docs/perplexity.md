@@ -40,6 +40,15 @@ report is `report.json` under `profiles/perplexity/` unless `--output` supplies 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`.
 
+## Runtime YaRN override
+
+`--rope-yarn-factor F` accepts finite values in `[1,4]` (default `1`, native RoPE unchanged).
+This startup-fixed Engine override does not alter the artifact or converter. It only extends the
+allowed ceiling: request longer scoring windows explicitly with `--context`; the default remains
+4,096 tokens and the stride remains 2,048. Memory limits still apply. Long-context extrapolation
+is not a guarantee of quality. Keep the factor fixed when comparing other numerical settings;
+`report.json` records it as `rope_yarn_factor` in the execution configuration.
+
 ## Metric
 
 For a stream `x[0..N)`, every token after `x[0]` is scored exactly once. A window `[b,e)` with target
@@ -71,5 +80,5 @@ are runtime results from the current artifact tokenizer and are recorded in each
 contain unrounded NLL/PPL values for every window, stream, domain, and the token-weighted overall
 aggregate.
 
-The schema-v2 report identifies the artifact's architecture, public name, actual weight formats
+The schema-v3 report identifies the artifact's architecture, public name, actual weight formats
 and prefill signature alongside the workload and numerical results.

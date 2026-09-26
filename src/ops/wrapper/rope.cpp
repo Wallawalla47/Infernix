@@ -2,6 +2,7 @@
 
 #include "ops/launcher/rope.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -100,6 +101,17 @@ void require_model_mode(int axes, int rotary_dim, std::int32_t head_dim) {
     }
 }
 
+void require_scaling(const RopeScaling& scaling, float theta) {
+    if (!std::isfinite(scaling.factor) || scaling.factor < 1.0F || scaling.factor > 4.0F ||
+        scaling.original_max_positions == 0) {
+        throw std::invalid_argument("rope: YaRN requires factor in [1,4] and positive original positions");
+    }
+    if (scaling.factor != 1.0F && !(theta > 1.0F)) {
+        throw std::invalid_argument("rope: YaRN requires Text mode and theta>1");
+    }
+}
+
+
 } // namespace
 
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
@@ -143,6 +155,83 @@ void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
     require_positions_storage(positions);
     if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
     detail::rope_single_launch(positions, rotary_dim, theta, x, execution);
+}
+
+void rope(const Tensor& positions, const PreparedRope& prepared, Tensor& q, Tensor& k,
+          DeviceExecutionView execution) {
+    const int rotary_dim = prepared.rotary_dim;
+    const float theta    = prepared.theta;
+    if (prepared.factor == 1.0F) { return rope(positions, rotary_dim, theta, q, k, execution); }
+    if (positions.ne[1] == 2) {
+        throw std::invalid_argument("rope: YaRN does not support Vision");
+    }
+    require_common(positions, rotary_dim, theta, execution);
+    if (q.dtype != DType::BF16 || k.dtype != DType::BF16) {
+        throw std::invalid_argument("rope: q/k must be BF16");
+    }
+    (void)numel_allow_zero(positions, "positions");
+    const auto count = numel_allow_zero(q, "q");
+    (void)numel_allow_zero(k, "k");
+    const int axes = position_axes(positions, q.ne[2]);
+    require_model_mode(axes, rotary_dim, q.ne[0]);
+    require_tensor_layout(q, "q", q.ne[0], q.ne[1], q.ne[2]);
+    require_tensor_layout(k, "k", q.ne[0], k.ne[1], q.ne[2]);
+    if (count == 0) { return; }
+    require_positions_storage(positions);
+    if (q.data == nullptr || k.data == nullptr) {
+        throw std::invalid_argument("rope: q/k data must be non-null");
+    }
+    detail::rope_prepared_launch(positions, prepared, q, &k, execution);
+}
+
+void rope(const Tensor& positions, const PreparedRope& prepared, Tensor& x,
+          DeviceExecutionView execution) {
+    const int rotary_dim = prepared.rotary_dim;
+    const float theta    = prepared.theta;
+    if (prepared.factor == 1.0F) { return rope(positions, rotary_dim, theta, x, execution); }
+    if (positions.ne[1] == 2) {
+        throw std::invalid_argument("rope: YaRN does not support Vision");
+    }
+    require_common(positions, rotary_dim, theta, execution);
+    if (x.dtype != DType::BF16) { throw std::invalid_argument("rope: tensor must be BF16"); }
+    (void)numel_allow_zero(positions, "positions");
+    const auto count = numel_allow_zero(x, "tensor");
+    const int axes = position_axes(positions, x.ne[2]);
+    require_model_mode(axes, rotary_dim, x.ne[0]);
+    require_tensor_layout(x, "tensor", x.ne[0], x.ne[1], x.ne[2]);
+    if (count == 0) { return; }
+    require_positions_storage(positions);
+    if (x.data == nullptr) { throw std::invalid_argument("rope: tensor data must be non-null"); }
+    detail::rope_prepared_launch(positions, prepared, x, nullptr, execution);
+}
+
+
+PreparedRope prepare_rope(int rotary_dim, float theta, const RopeScaling& scaling) {
+    require_scaling(scaling, theta);
+    if (rotary_dim <= 0 || rotary_dim > 256 || (rotary_dim & 1) != 0 ||
+        !(theta > 0.0F) || !std::isfinite(theta)) {
+        throw std::invalid_argument("rope: preparation requires even R in [2,256] and finite positive theta");
+    }
+    PreparedRope prepared;
+    prepared.rotary_dim = rotary_dim;
+    prepared.theta = theta;
+    prepared.factor = scaling.factor;
+    if (scaling.factor == 1.0F) { return prepared; }
+    constexpr double two_pi = 6.283185307179586476925286766559;
+    const auto correction = [&](double beta) {
+        return rotary_dim * std::log(scaling.original_max_positions / (two_pi * beta)) /
+               (2.0 * std::log(static_cast<double>(theta)));
+    };
+    const double low = std::max(std::floor(correction(32.0)), 0.0);
+    double high = std::min(std::ceil(correction(1.0)), static_cast<double>(rotary_dim - 1));
+    if (low == high) { high += 0.001; }
+    prepared.attention_scale = static_cast<float>(1.0 + 0.1 * std::log(static_cast<double>(scaling.factor)));
+    for (int pair = 0; pair < rotary_dim / 2; ++pair) {
+        const double ramp = std::clamp((pair - low) / (high - low), 0.0, 1.0);
+        prepared.inverse[pair] = std::pow(static_cast<double>(theta), -2.0 * pair / rotary_dim) *
+                                ((1.0 - ramp) + ramp / scaling.factor);
+    }
+    return prepared;
 }
 
 } // namespace ninfer::ops

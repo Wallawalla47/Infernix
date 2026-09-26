@@ -20,6 +20,7 @@ struct Options {
     std::filesystem::path messages_path;
 
     std::uint32_t max_new        = 128;
+    float rope_yarn_factor       = 1.0F;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t prefill_chunk  = 1024;

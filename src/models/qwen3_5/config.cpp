@@ -1,6 +1,7 @@
 #include "models/qwen3_5/config.h"
 
 #include "artifact/schema.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -299,6 +300,15 @@ std::uint64_t VisionConfig::merger_width() const {
                                  hidden_size, "merger width");
 }
 
+std::uint32_t rope_context_ceiling(std::uint32_t native_positions, float factor) {
+    if (native_positions == 0 || !std::isfinite(factor) || factor < 1.0F || factor > 4.0F) {
+        throw std::invalid_argument("RoPE context requires positive native positions and finite factor in [1,4]");
+    }
+    return static_cast<std::uint32_t>(
+        std::min(double(native_positions) * double(factor),
+                 double(ops::kCausalAttentionMaximumVisibleKeys)));
+}
+
 Config parse_config(const artifact::Directory& directory, const LoadOptions& options) {
     try {
         if (options.purpose != EnginePurpose::Generation &&
@@ -317,9 +327,21 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.proposal_head != ProposalHead::Optimized) {
             throw ArtifactError("unknown proposal head selection");
         }
+        if (!std::isfinite(options.rope_yarn_factor) || options.rope_yarn_factor < 1.0F ||
+            options.rope_yarn_factor > 4.0F) {
+            throw ArtifactError("rope_yarn_factor must be finite and in [1,4]");
+        }
         Config out;
         out.mtp  = options.speculative == SpeculativeBackend::Mtp;
         out.text = text(directory.component("text").config, out.mtp);
+        if (out.text.rope_parameters) {
+            out.text.rope_parameters->yarn_factor = options.rope_yarn_factor;
+            if (options.rope_yarn_factor > 1.0F && out.text.rope_parameters->rope_theta <= 1.0F) {
+                throw ArtifactError("YaRN requires text rope_theta greater than one");
+            }
+        } else if (options.rope_yarn_factor != 1.0F) {
+            throw ArtifactError("YaRN requires a text RoPE configuration");
+        }
         if (options.vision) { out.vision = vision(companion(directory, "vision").config); }
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
@@ -334,6 +356,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.speculative == SpeculativeBackend::DFlash2) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
                               out.text, options.speculative == SpeculativeBackend::DFlash2);
+            out.draft->yarn_factor = options.rope_yarn_factor;
+            if (options.rope_yarn_factor > 1.0F && out.draft->rope_theta <= 1.0F) {
+                throw ArtifactError("YaRN requires draft rope_theta greater than one");
+            }
         }
         return out;
     } catch (const std::exception& error) {

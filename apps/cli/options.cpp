@@ -102,7 +102,9 @@ std::string usage_text(const char* argv0) {
            "thinking mode; flags override individual fields.\n"
            "\n"
            "CONTEXT\n"
-           "  --max-context N          max context tokens (default from the model)\n"
+           "  --max-context N          max context tokens (default 2048)\n"
+           "  --rope-yarn-factor F     startup-fixed YaRN, finite [1,4] (default 1);\n"
+           "                           extends allowed ceiling only, not --max-context\n"
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
@@ -181,6 +183,8 @@ Options parse_options(int argc, char** argv) {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {
             options.max_new = parse_u32(value(arg), "max-new");
+        } else if (arg == "--rope-yarn-factor") {
+            options.rope_yarn_factor = parse_float(value(arg), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
         } else if (arg == "--kv-capacity") {

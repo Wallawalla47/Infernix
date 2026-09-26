@@ -32,6 +32,27 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
+    failures += check(ninfer::EngineOptions{}.rope_yarn_factor == 1.0F,
+                      "Engine YaRN must default off");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).rope_yarn_factor == 1.0F,
+                      "CLI YaRN must default off");
+    for (const auto* factor : {"1", "2.5", "4"}) {
+        const auto yarn = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--rope-yarn-factor", factor});
+        failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 2048 &&
+                              yarn.kv_capacity.explicit_tokens == 2048,
+                          "YaRN must preserve factor without growing default context or KV");
+    }
+    for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--rope-yarn-factor", factor});
+        }), "invalid YaRN factor accepted");
+    }
+    failures += check(rejects([] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--rope-yarn-factor"});
+    }), "missing YaRN factor accepted");
+    failures += check(ninfer::cli::usage_text("ninfer").find("--rope-yarn-factor") != std::string::npos,
+                      "CLI help omits YaRN");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,

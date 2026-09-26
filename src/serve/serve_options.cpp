@@ -137,6 +137,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             startup; must match a template the target accepts\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
+           "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
+           "                             (default 1); startup-fixed, extends the allowed\n"
+           "                             ceiling only, not --max-context\n"
            "  --device N                 CUDA device ordinal (default 0)\n"
            "\n"
            "KV CACHE\n"
@@ -217,6 +220,8 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "NOTES\n"
            "  --vision-offload on requires --vision.\n"
+           "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
+           "  allowed ceiling only, not --max-context.\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n";
@@ -265,6 +270,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
             }
+        } else if (arg == "--rope-yarn-factor") {
+            options.rope_yarn_factor =
+                parse_float_in(require_value("--rope-yarn-factor"), "rope-yarn-factor", 1.0F, 4.0F);
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));

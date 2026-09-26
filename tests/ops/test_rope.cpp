@@ -32,6 +32,8 @@ struct Geometry {
     int axes;
     int tokens;
     float theta;
+    ops::RopeScaling scaling{};
+    bool scaled_api = false;
 };
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
@@ -93,13 +95,35 @@ std::vector<double> rope_oracle(const std::vector<float>& input, const std::vect
                     axis     = geometry.axes == 3 ? pair % 3 : 0;
                     exponent = -2.0 * static_cast<double>(pair) / geometry.rotary_dim;
                 }
-                const double frequency = std::pow(static_cast<double>(geometry.theta), exponent);
+                double frequency       = std::pow(static_cast<double>(geometry.theta), exponent);
+                double attention_scale = 1.0;
+                if (geometry.scaling.factor != 1.0F && geometry.axes != 2) {
+                    // Independent mathematical oracle: no production coefficient helpers,
+                    // tables, float arithmetic, phase reduction, or output rounding.
+                    const double pi = std::acos(-1.0);
+                    const double rotations_fast =
+                        geometry.scaling.original_max_positions / (64.0 * pi);
+                    const double rotations_slow =
+                        geometry.scaling.original_max_positions / (2.0 * pi);
+                    const double log_theta = std::log(static_cast<double>(geometry.theta));
+                    const double low =
+                        std::max(0.0, std::floor(half * std::log(rotations_fast) / log_theta));
+                    double high = std::min(static_cast<double>(geometry.rotary_dim - 1),
+                                           std::ceil(half * std::log(rotations_slow) / log_theta));
+                    if (high == low) { high += 0.001; }
+                    const double interpolation =
+                        std::min(1.0, std::max(0.0, (pair - low) / (high - low)));
+                    frequency = (1.0 - interpolation) * frequency +
+                                interpolation * frequency / geometry.scaling.factor;
+                    attention_scale =
+                        1.0 + 0.1 * std::log(static_cast<double>(geometry.scaling.factor));
+                }
                 const double phase =
                     static_cast<double>(
                         positions[static_cast<std::size_t>(axis) * geometry.tokens + token]) *
                     frequency;
-                const double cosine  = std::cos(phase);
-                const double sine    = std::sin(phase);
+                const double cosine  = attention_scale * std::cos(phase);
+                const double sine    = attention_scale * std::sin(phase);
                 const std::size_t lo = dense_index(geometry.head_dim, heads, token, head, pair);
                 const std::size_t hi =
                     dense_index(geometry.head_dim, heads, token, head, pair + half);
@@ -272,7 +296,16 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
     q_tensor.nb[2] = static_cast<std::int64_t>(q_stride) * sizeof(std::uint16_t);
     k_tensor.nb[2] = static_cast<std::int64_t>(k_stride) * sizeof(std::uint16_t);
 
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor, execution);
+    const auto prepared = ops::prepare_rope(geometry.rotary_dim, geometry.theta, geometry.scaling);
+    const auto launch   = [&](DeviceExecutionView launch_execution) {
+        if (geometry.scaled_api) {
+            ops::rope(position_tensor, prepared, q_tensor, k_tensor, launch_execution);
+        } else {
+            ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor,
+                      launch_execution);
+        }
+    };
+    launch(execution);
     cuda_synchronize();
 
     if (graph) {
@@ -281,8 +314,7 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor,
-                  execution.on_stream(stream));
+        launch(execution.on_stream(stream));
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
@@ -300,7 +332,10 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
 
     const auto q_got        = from_device<std::uint16_t>(q_device.data(), q_storage.size());
     const auto k_got        = from_device<std::uint16_t>(k_device.data(), k_storage.size());
-    const std::string label = geometry.label;
+    const std::string label = std::string(geometry.label) +
+                              " factor=" + std::to_string(geometry.scaling.factor) +
+                              " pos=" + std::to_string(first_position) +
+                              " axes=" + std::to_string(geometry.axes);
     int failures            = 0;
     failures += verify_rope_profile(
         label + " q", gather_dense(q_got, q_dense_per_token, q_stride, geometry.tokens), q_expected,
@@ -318,6 +353,19 @@ int run_pair_case(DeviceExecutionView execution, const Geometry& geometry, int q
         verify_padding(label + " k", k_got, k_dense_per_token, k_stride, geometry.tokens, kPadding);
     failures += verify_exact((label + " positions").c_str(),
                              from_device<int>(position_device.data(), positions.size()), positions);
+    if (geometry.scaled_api && geometry.scaling.factor == 1.0F) {
+        q_device.copy_from_host(q_storage.data(), q_device.bytes());
+        k_device.copy_from_host(k_storage.data(), k_device.bytes());
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, q_tensor, k_tensor,
+                  execution);
+        cuda_synchronize();
+        failures += verify_exact("factor1 pair q identity",
+                                 from_device<std::uint16_t>(q_device.data(), q_storage.size()),
+                                 q_got);
+        failures += verify_exact("factor1 pair k identity",
+                                 from_device<std::uint16_t>(k_device.data(), k_storage.size()),
+                                 k_got);
+    }
     failures += q_device.verify_guards((label + " q guards").c_str());
     failures += k_device.verify_guards((label + " k guards").c_str());
     failures += position_device.verify_guards((label + " position guards").c_str());
@@ -345,11 +393,19 @@ int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int
     Tensor position_tensor(position_device.data(), DType::I32, {geometry.tokens, geometry.axes});
     Tensor tensor(device.data(), DType::BF16, {geometry.head_dim, heads, geometry.tokens});
     tensor.nb[2] = static_cast<std::int64_t>(token_stride) * sizeof(std::uint16_t);
-    ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, execution);
+    const auto prepared = ops::prepare_rope(geometry.rotary_dim, geometry.theta, geometry.scaling);
+    if (geometry.scaled_api) {
+        ops::rope(position_tensor, prepared, tensor, execution);
+    } else {
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, execution);
+    }
     cuda_synchronize();
 
     const auto got          = from_device<std::uint16_t>(device.data(), storage.size());
-    const std::string label = std::string(geometry.label) + " single";
+    const std::string label = std::string(geometry.label) +
+                              " single factor=" + std::to_string(geometry.scaling.factor) +
+                              " pos=" + std::to_string(first_position) +
+                              " axes=" + std::to_string(geometry.axes);
     int failures            = 0;
     failures += verify_rope_profile(
         label, gather_dense(got, dense_per_token, token_stride, geometry.tokens), expected, input,
@@ -360,6 +416,13 @@ int run_single_case(DeviceExecutionView execution, const Geometry& geometry, int
         verify_padding(label, got, dense_per_token, token_stride, geometry.tokens, kPadding);
     failures += verify_exact((label + " positions").c_str(),
                              from_device<int>(position_device.data(), positions.size()), positions);
+    if (geometry.scaled_api && geometry.scaling.factor == 1.0F) {
+        device.copy_from_host(storage.data(), device.bytes());
+        ops::rope(position_tensor, geometry.rotary_dim, geometry.theta, tensor, execution);
+        cuda_synchronize();
+        failures += verify_exact("factor1 single identity",
+                                 from_device<std::uint16_t>(device.data(), storage.size()), got);
+    }
     failures += device.verify_guards((label + " guards").c_str());
     failures += position_device.verify_guards((label + " position guards").c_str());
     return failures;
@@ -443,6 +506,53 @@ int run_vision_packed_case(DeviceExecutionView execution) {
     return failures;
 }
 
+int run_scaling_validation(DeviceExecutionView execution) {
+    int failures = 0;
+    Tensor positions(nullptr, DType::I32, {1});
+    Tensor q(nullptr, DType::BF16, {256, 24, 1});
+    Tensor k(nullptr, DType::BF16, {256, 4, 1});
+    positions.ne[0] = q.ne[2] = k.ne[2] = 0;
+    for (const ops::RopeScaling scaling :
+         {ops::RopeScaling{0.0F, 262144},
+          {0.99F, 262144},
+          {4.01F, 262144},
+          {std::numeric_limits<float>::infinity(), 262144},
+          {std::numeric_limits<float>::quiet_NaN(), 262144},
+          {2.0F, 0},
+          {1.0F, 0}}) {
+        for (bool single : {false, true}) {
+            try {
+                if (single) {
+                    ops::rope(positions, ops::prepare_rope(64, kTextTheta, scaling), q, execution);
+                } else {
+                    ops::rope(positions, ops::prepare_rope(64, kTextTheta, scaling), q, k,
+                              execution);
+                }
+                std::cerr << "invalid YaRN scaling accepted\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+        }
+    }
+    for (float factor : {1.0F, 4.0F}) {
+        ops::rope(positions, ops::prepare_rope(64, kTextTheta, {factor, 262144}), q, k,
+                  execution);
+        ops::rope(positions, ops::prepare_rope(64, kTextTheta, {factor, 262144}), q, execution);
+    }
+    Tensor vision_positions(nullptr, DType::I32, {1, 2});
+    Tensor vision(nullptr, DType::BF16, {72, 16, 1});
+    vision_positions.ne[0] = vision.ne[2] = 0;
+    try {
+        ops::rope(vision_positions, ops::prepare_rope(72, kVisionTheta, {2.0F, 262144}), vision,
+                  execution);
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    try {
+        ops::rope(positions, ops::prepare_rope(64, 1.0F, {2.0F, 262144}), q, execution);
+        ++failures;
+    } catch (const std::invalid_argument&) {}
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -454,6 +564,15 @@ int main() {
     DeviceContext device;
     const auto execution = device.execution_view().on_stream(nullptr);
     int failures         = 0;
+
+    failures += run_scaling_validation(execution);
+    failures += run_pair_case(
+        execution, {"vision default identity", 72, 72, 2, 8, kVisionTheta, {1.0F, 262144}, true},
+        16, 16, 0);
+    failures += run_single_case(execution,
+                                {"vision single default identity", 72, 72, 2, 8, kVisionTheta,
+                                 {1.0F, 262144}, true},
+                                16, 0);
 
     // Text pair form: both registered checkpoint geometries, decode/prefill, and 1-D/MRoPE.
     for (int axes : {1, 3}) {
@@ -498,6 +617,65 @@ int main() {
                               8, 262'128);
     failures += run_single_case(execution, {"35b dflash context k", 128, 128, 1, 128, kTextTheta},
                                 8, 131'072, 16);
+
+    // YaRN: all public text modes, factor boundaries/interior, native and extended
+    // positions, prefill/decode, padded storage, single/pair calls and captured arguments.
+    for (float factor : {1.0F, 1.5F, 2.0F, 4.0F}) {
+        for (int axes : {1, 3}) {
+            for (int position : {0, 262143, 524288, 1048575}) {
+                // The unchanged FP32 default route is qualified at its original native context.
+                if (factor == 1.0F && position != 0) { continue; }
+                failures += run_pair_case(
+                    execution,
+                    {"yarn text", 256, 64, axes, 8, kTextTheta, {factor, 262144}, true}, 24, 4,
+                    position, 16, 8, 0, factor == 4.0F);
+                failures += run_single_case(
+                    execution,
+                    {"yarn single", 256, 64, axes, 7, kTextTheta, {factor, 262144}, true}, 2,
+                    position, 8);
+            }
+        }
+    }
+    failures += run_pair_case(
+        execution, {"yarn dflash", 128, 128, 1, 16, kTextTheta, {4.0F, 262144}, true}, 32, 8,
+        1048575);
+    failures += run_single_case(
+        execution, {"yarn full rotary", 256, 256, 1, 128, kTextTheta, {2.0F, 32768}, true}, 3,
+        65535, 1);
+    failures += run_pair_case(
+        execution, {"yarn narrow rotary", 256, 2, 1, 1, 10000.0F, {4.0F, 1}, true}, 3, 1,
+        -123456);
+    failures += run_single_case(
+        execution, {"yarn equal correction", 256, 2, 1, 1, kTextTheta, {2.0F, 262144}, true}, 1,
+        17);
+
+    // Qualify every reused fixed/split launch policy boundary against the same FP64 oracle,
+    // including both sides of the device's large-block residency boundary.
+    for (int tokens : {1, 6, 7, 16, 17, 400, 401, large_block_capacity, large_block_capacity + 1,
+                       1024, 1025}) {
+        for (int axes : {1, 3}) {
+            failures += run_pair_case(execution,
+                                      {"prepared tuned text", 256, 64, axes, tokens, kTextTheta,
+                                       {2.0F, 262144}, true},
+                                      24, 4, 524288);
+            failures += run_pair_case(execution,
+                                      {"prepared tuned moe", 256, 64, axes, tokens, kTextTheta,
+                                       {4.0F, 262144}, true},
+                                      16, 2, 1048575);
+        }
+        failures += run_pair_case(execution,
+                                  {"prepared tuned dflash", 128, 128, 1, tokens, kTextTheta,
+                                   {2.0F, 262144}, true},
+                                  32, 8, 524288);
+        failures += run_single_case(execution,
+                                    {"prepared tuned single", 128, 128, 1, tokens, kTextTheta,
+                                     {4.0F, 262144}, true},
+                                    8, 1048575);
+    }
+    failures += run_single_case(
+        execution,
+        {"prepared generic stride", 256, 64, 3, 7, kTextTheta, {2.0F, 262144}, true}, 4, 524288,
+        1);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

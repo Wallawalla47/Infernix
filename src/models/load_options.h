@@ -13,6 +13,7 @@ struct LoadOptions {
     std::uint32_t vision_max_merged_tokens = 32768;
     SpeculativeBackend speculative         = SpeculativeBackend::None;
     ProposalHead proposal_head             = ProposalHead::Full;
+    float rope_yarn_factor                 = 1.0F;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -59,12 +60,13 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-            .proposal_head              = options.speculative.proposal_head};
     return {.purpose                  = options.purpose,
             .vision                   = options.enable_vision,
             .vision_offload           = options.vision_offload,
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .speculative              = options.speculative.backend,
+            .proposal_head            = options.speculative.proposal_head,
+            .rope_yarn_factor         = options.rope_yarn_factor};
 }
 
 } // namespace ninfer::models

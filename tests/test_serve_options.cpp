@@ -28,6 +28,28 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).rope_yarn_factor == 1.0F,
+                      "serving YaRN must default off");
+    for (const auto* factor : {"1", "2.5", "4"}) {
+        const auto yarn = parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
+        failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 8192 &&
+                              yarn.kv_capacity.explicit_tokens == 8192,
+                          "YaRN must not grow serving context or KV defaults");
+    }
+    for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid serving YaRN factor accepted");
+    }
+    bool missing_yarn_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor"});
+    } catch (const std::invalid_argument&) { missing_yarn_rejected = true; }
+    failures += check(missing_yarn_rejected, "missing serving YaRN factor accepted");
+    failures += check(serve_usage_text("ninfer-serve").find("--rope-yarn-factor") != std::string::npos,
+                      "serving help omits YaRN");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
