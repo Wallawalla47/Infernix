@@ -59,6 +59,34 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
                                     cudaStream_t stream);
 
 /**
+ * Op: speculative_overlay_copy_proposals
+ *
+ * Math / indexing:
+ *   For row b with copy_rows[b] != 0, 0<=j<K and 0<=s<S:
+ *     drafts[j,b]       = copy_drafts[j,b];
+ *     candidates[s,j,b] = copy_candidates[s,j,b]   when the sparse planes are present;
+ *     proposal_q[s,j,b] = copy_q[s,j,b]            when the sparse planes are present.
+ *   Every element of a row with copy_rows[b] == 0 is left unchanged.
+ *
+ * Logical shapes:
+ *   All tensors are contiguous. copy_rows is I32 [B]; copy_drafts and drafts are I32 [K,B];
+ *   copy_candidates and candidates are I32 [S,K,B]; copy_q and proposal_q are FP32 [S,K,B], with
+ *   S = kSparseSpeculativeCandidates, K>=1 and B in [1,8]. The four sparse tensors are either all
+ *   empty (deterministic-draft verifiers) or all present. Inputs and outputs do not overlap.
+ *
+ * Effects:
+ *   Exact element copies; inputs remain unchanged. The row selection is read on the device, so one
+ *   captured launch serves every mixture of copied and neural rows.
+ *
+ * Workspace:
+ *   None.
+ */
+void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& copy_drafts,
+                                        const Tensor& copy_candidates, const Tensor& copy_q,
+                                        Tensor& drafts, Tensor& candidates, Tensor& proposal_q,
+                                        cudaStream_t stream);
+
+/**
  * Op: speculative_accept_greedy_drafts
  *
  * Algorithm:

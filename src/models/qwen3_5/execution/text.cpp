@@ -182,9 +182,9 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
-        if (batch_size == 1 && target.ne[1] != batch_width) {
-            target = target.slice(1, 0, batch_width);
-        }
+        // pending_features is lane-owned at the frame's native width; a narrower round fills
+        // the leading columns of each lane through the parent strides.
+        if (target.ne[1] != batch_width) { target = target.slice(1, 0, batch_width); }
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;

@@ -12,7 +12,7 @@ add_test(NAME ninfer_ngram_graph_planning_real
   COMMAND ninfer_ngram_graph_planning_test --real)
 set_tests_properties(ninfer_ngram_graph_planning_real PROPERTIES SKIP_RETURN_CODE 77)
 
-foreach(check lifecycle archive thinking stop_chat)
+foreach(check lifecycle archive thinking stop_chat concurrent)
   ninfer_add_test(ninfer_ngram_${check}_real
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_${check}_real.cpp"
     LIBRARIES ninfer_engine)

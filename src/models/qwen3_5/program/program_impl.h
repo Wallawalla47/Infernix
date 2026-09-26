@@ -79,6 +79,9 @@ struct PendingCandidate {
     std::uint32_t base_S        = 0;
     std::uint32_t prompt_tokens = 0;
     std::uint32_t produced      = 0;
+    // Draft columns the speculative round verified: its egress/frame row stride is this + 1 and
+    // its ReplaySSM records use the matching record view.
+    std::uint32_t verify_drafts = 0;
 };
 enum class Lifecycle : std::uint8_t {
     Empty,
@@ -360,6 +363,11 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // When the DFlash neural and ngram windows differ, rounds of the narrower family verify at
+    // their own width for every batch size. They record ReplaySSM transitions through a dense
+    // narrowed view of the same record storage and are replayed by the matching fold plan.
+    std::optional<GdnReplayRecords> narrow_replay_records;
+    std::optional<ops::GdnReplayFoldPlan> narrow_replay_fold;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -566,8 +574,14 @@ public:
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
-    [[nodiscard]] NgramProposer::Match propose_ngram(std::span<const std::uint32_t> lanes,
-                                                     std::span<const runtime::RoundBudget> budgets);
+    // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
+    [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
+    [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
+    [[nodiscard]] std::vector<NgramProposer::Match>
+    propose_ngram(std::span<const std::uint32_t> lanes,
+                  std::span<const runtime::RoundBudget> budgets);
+    [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
+                                                         const runtime::RoundBudget& budget);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,

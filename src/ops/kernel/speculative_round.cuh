@@ -38,6 +38,24 @@ __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anc
     }
 }
 
+// One block per row. Rows whose device flag is zero keep the proposal already in place.
+__global__ void speculative_overlay_copy_proposals_kernel(
+    const std::int32_t* copy_rows, const std::int32_t* copy_drafts,
+    const std::int32_t* copy_candidates, const float* copy_q, std::int32_t* drafts,
+    std::int32_t* candidates, float* proposal_q, std::int32_t k, std::int32_t slots) {
+    const int row = static_cast<int>(blockIdx.x);
+    if (copy_rows[row] == 0) { return; }
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        drafts[row * k + j] = copy_drafts[row * k + j];
+    }
+    if (candidates == nullptr) { return; }
+    const int plane = k * slots;
+    for (int i = threadIdx.x; i < plane; i += blockDim.x) {
+        candidates[row * plane + i] = copy_candidates[row * plane + i];
+        proposal_q[row * plane + i] = copy_q[row * plane + i];
+    }
+}
+
 template <typename T>
 __device__ inline T* speculative_workspace_offset(T* ptr, std::size_t byte_offset) {
     return ptr == nullptr

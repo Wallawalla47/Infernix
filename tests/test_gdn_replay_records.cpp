@@ -138,6 +138,34 @@ int main() {
     failures += expect_throw([&] { (void)records.layer(0, 0); }, "zero active rows");
     failures += expect_throw([&] { (void)records.layer(0, 6); }, "excess active rows");
 
+    for (int width = 1; width <= spec.width; ++width) {
+        const auto narrow = records.narrowed(width);
+        failures += expect(narrow.spec.width == width && narrow.spec.layers == spec.layers &&
+                               narrow.spec.record_capacity == spec.record_capacity,
+                           "narrowed spec differs");
+        failures += expect_shape(narrow.conv, 256, width, 15, 1, "narrowed conv plane");
+        failures += expect_shape(narrow.key, 128, 2, width, 15, "narrowed key plane");
+        failures += expect_shape(narrow.value, 128, 6, width, 15, "narrowed value plane");
+        failures += expect_shape(narrow.gate, 2, 6, width, 15, "narrowed gate plane");
+        failures += expect(narrow.conv.data == records.conv.data &&
+                               narrow.key.data == records.key.data &&
+                               narrow.value.data == records.value.data &&
+                               narrow.gate.data == records.gate.data,
+                           "narrowed view moved a plane base");
+        const auto narrow_layer = narrow.layer(2, 3);
+        failures += expect_shape(narrow_layer.key, 128, 2, width, 3, "narrowed layer key");
+        failures += expect(static_cast<std::byte*>(narrow_layer.key.data) -
+                                   static_cast<std::byte*>(records.key.data) ==
+                               static_cast<std::ptrdiff_t>(2 * spec.record_capacity *
+                                                           narrow.key.nb[3]),
+                           "narrowed layer offset is not dense at the narrowed width");
+        failures += expect(narrow_layer.key.is_contiguous() && narrow_layer.conv.is_contiguous(),
+                           "narrowed layer rows are not dense");
+    }
+    failures += expect_throw([&] { (void)records.narrowed(0); }, "zero narrowed width");
+    failures += expect_throw([&] { (void)records.narrowed(spec.width + 1); },
+                             "narrowed width above the storage width");
+
     auto wide_spec  = spec;
     wide_spec.width = 64;
     ninfer::LayoutBuilder wide_builder;

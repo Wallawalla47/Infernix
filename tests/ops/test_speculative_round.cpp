@@ -105,6 +105,100 @@ int prepare_verify_case(int k, int batch) {
     return failures;
 }
 
+// Exact oracle: a flagged row takes every copy element, an unflagged row keeps its own. One graph
+// capture replays every row mixture because the selection is read on the device.
+int overlay_case(int k, int batch, bool sparse) {
+    const int slots = ops::kSparseSpeculativeCandidates;
+    const int plane = sparse ? slots * k * batch : 0;
+    std::vector<std::int32_t> copy_drafts(k * batch), own_drafts(k * batch);
+    std::vector<std::int32_t> copy_candidates(plane), own_candidates(plane);
+    std::vector<float> copy_q(plane), own_q(plane);
+    for (int i = 0; i < k * batch; ++i) {
+        copy_drafts[i] = 100000 + 7 * i;
+        own_drafts[i]  = 200000 + 13 * i;
+    }
+    for (int i = 0; i < plane; ++i) {
+        copy_candidates[i] = 300000 + 3 * i;
+        own_candidates[i]  = 400000 + 5 * i;
+        copy_q[i]          = i % slots == 0 ? 1.0F : 0.0F;
+        own_q[i]           = 0.25F + static_cast<float>(i) * 1.0e-4F;
+    }
+    std::vector<std::int32_t> rows(batch, 0);
+    DeviceBuffer d_rows = to_device(rows), d_copy_drafts = to_device(copy_drafts);
+    DeviceBuffer d_copy_candidates, d_copy_q;
+    GuardedDeviceBuffer d_drafts(own_drafts.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_candidates(std::max<std::size_t>(1, plane) * sizeof(std::int32_t));
+    GuardedDeviceBuffer d_q(std::max<std::size_t>(1, plane) * sizeof(float));
+    if (sparse) {
+        d_copy_candidates = to_device(copy_candidates);
+        d_copy_q          = to_device(copy_q);
+    }
+    Tensor t_rows(d_rows.p, DType::I32, {batch});
+    Tensor t_copy_drafts(d_copy_drafts.p, DType::I32, {k, batch});
+    Tensor t_drafts(d_drafts.data(), DType::I32, {k, batch});
+    Tensor t_copy_candidates, t_copy_q, t_candidates, t_q;
+    if (sparse) {
+        t_copy_candidates = Tensor(d_copy_candidates.p, DType::I32, {slots, k, batch});
+        t_copy_q          = Tensor(d_copy_q.p, DType::FP32, {slots, k, batch});
+        t_candidates      = Tensor(d_candidates.data(), DType::I32, {slots, k, batch});
+        t_q               = Tensor(d_q.data(), DType::FP32, {slots, k, batch});
+    }
+    DeviceContext context;
+    const auto launch = [&] {
+        ops::speculative_overlay_copy_proposals(t_rows, t_copy_drafts, t_copy_candidates, t_copy_q,
+                                                t_drafts, t_candidates, t_q, context.stream);
+    };
+    DecodeGraphDefinition definition;
+    DecodeGraphExecutable graph;
+    definition.capture(context.stream, launch);
+    graph.instantiate(definition);
+
+    int failures = 0;
+    for (int mask = 0; mask < (1 << batch); mask += batch == 8 ? 37 : 1) {
+        d_drafts.copy_from_host(own_drafts.data(), own_drafts.size() * sizeof(std::int32_t));
+        if (sparse) {
+            d_candidates.copy_from_host(own_candidates.data(), plane * sizeof(std::int32_t));
+            d_q.copy_from_host(own_q.data(), plane * sizeof(float));
+        }
+        for (int b = 0; b < batch; ++b) rows[b] = (mask >> b) & 1 ? (b + 1) : 0;
+        CUDA_CHECK(cudaMemcpyAsync(d_rows.p, rows.data(), d_rows.bytes, cudaMemcpyHostToDevice,
+                                   context.stream));
+        graph.launch(context.stream);
+        context.synchronize();
+        std::vector<std::int32_t> expected_drafts = own_drafts;
+        std::vector<std::int32_t> expected_candidates = own_candidates;
+        std::vector<float> expected_q                 = own_q;
+        for (int b = 0; b < batch; ++b) {
+            if (rows[b] == 0) continue;
+            for (int j = 0; j < k; ++j) expected_drafts[b * k + j] = copy_drafts[b * k + j];
+            for (int i = 0; sparse && i < slots * k; ++i) {
+                expected_candidates[b * slots * k + i] = copy_candidates[b * slots * k + i];
+                expected_q[b * slots * k + i]          = copy_q[b * slots * k + i];
+            }
+        }
+        const std::string label = "overlay K=" + std::to_string(k) + " B=" + std::to_string(batch) +
+                                  (sparse ? " sparse" : " tokens") + " mask=" +
+                                  std::to_string(mask);
+        failures += verify_exact((label + " drafts").c_str(),
+                                 read<std::int32_t>(d_drafts, expected_drafts.size()),
+                                 expected_drafts);
+        if (sparse) {
+            failures += verify_exact((label + " candidates").c_str(),
+                                     read<std::int32_t>(d_candidates, expected_candidates.size()),
+                                     expected_candidates);
+            failures +=
+                verify_exact((label + " q").c_str(), read<float>(d_q, expected_q.size()), expected_q);
+        }
+    }
+    failures += verify_exact("overlay copy drafts unchanged",
+                             from_device<std::int32_t>(d_copy_drafts, copy_drafts.size()),
+                             copy_drafts);
+    failures += d_drafts.verify_guards("overlay drafts");
+    failures += d_candidates.verify_guards("overlay candidates");
+    failures += d_q.verify_guards("overlay q");
+    return failures;
+}
+
 struct AcceptExpected {
     std::vector<std::int32_t> sampled;
     std::int32_t num_sampled;
@@ -1252,6 +1346,9 @@ int transforms_conformance() {
     int failures = 0;
     for (int k = 1; k <= 31; ++k)
         for (int batch : {1, 8}) failures += prepare_verify_case(k, batch);
+    for (int k : {1, 7, 15})
+        for (int batch : {1, 2, 8})
+            for (bool sparse : {false, true}) failures += overlay_case(k, batch, sparse);
     for (int width = 2; width <= 32; ++width)
         for (int batch : {1, 8}) failures += batched_select_hidden_case(width, batch);
     failures += select_hidden_case(5120, 6, 0);

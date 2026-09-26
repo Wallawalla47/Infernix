@@ -85,7 +85,8 @@ int main() {
               "ngram and neural widths were not kept separate");
     for (const auto& tail : std::vector<std::vector<std::string>>{{"--ngram-draft-tokens", "64"},
                                                                   {"--ngram-min-match", "3"},
-                                                                  {"--max-concurrency", "2"},
+                                                                  {"--max-concurrency", "2",
+                                                                   "--ngram-draft-tokens", "63"},
                                                                   {"--spec", "none"}}) {
         std::vector<std::string> arguments{"ninfer-serve",
                                            "model.ninfer",
@@ -102,6 +103,25 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "unsupported ngram configuration admitted");
     }
+    // ngram with concurrency>1 is admitted for every backend when the width fits the batch>1
+    // graph domain: 1..63 at concurrency one, at most 15 above it, whatever the backend.
+    for (const std::string backend : {"mtp", "dflash", "dflash2"}) {
+        const auto concurrent =
+            parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                   "--ngram-draft-tokens", "15", "--max-concurrency", "4"});
+        failures += check(concurrent.speculative.ngram_draft_tokens == 15 &&
+                              concurrent.max_concurrency == 4,
+                          "ngram with concurrency>1 was not admitted");
+    }
+    const auto mtp_wide_concurrent = [&] {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+                         "--ngram-draft-tokens", "63", "--max-concurrency", "4"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        return rejected;
+    }();
+    failures += check(mtp_wide_concurrent, "wide MTP ngram with concurrency>1 was admitted");
 
     const auto mtp_ngram = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                   "3", "--ngram-draft-tokens", "15"});
@@ -124,8 +144,7 @@ int main() {
                  {"--draft-tokens", std::to_string(neural_limit + 1)},
                  {"--ngram-draft-tokens", "-1"},
                  {"--ngram-draft-tokens", "64"},
-                 {"--ngram-min-match", "65"},
-                 {"--max-concurrency", "2"}}) {
+                 {"--ngram-min-match", "65"}}) {
             std::vector<std::string> arguments{"ninfer-serve",
                                                "model.ninfer",
                                                "--spec",
@@ -141,6 +160,19 @@ int main() {
             } catch (const std::invalid_argument&) { rejected = true; }
             failures += check(rejected, "unsupported neural/ngram pair admitted");
         }
+        // The GDN conv-record workspace caps a multi-request verify at 16 columns, so any backend
+        // rejects an ngram width above 15 once concurrency exceeds one.
+        bool wide_rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                         "--ngram-draft-tokens", "63", "--max-concurrency", "2"});
+        } catch (const std::invalid_argument&) { wide_rejected = true; }
+        failures += check(wide_rejected, "wide ngram with concurrency>1 admitted");
+        const auto wide_single =
+            parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
+                   "--ngram-draft-tokens", "63", "--max-concurrency", "1"});
+        failures += check(wide_single.speculative.ngram_draft_tokens == 63,
+                          "wide ngram rejected at concurrency one");
         const auto disabled =
             parse({"ninfer-serve", "model.ninfer", "--spec", backend, "--draft-tokens", "3",
                    "--ngram-draft-tokens", "0", "--max-concurrency", "8"});
