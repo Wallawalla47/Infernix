@@ -2,3 +2,6 @@
 # default whitespace checks.
 /third_party/spdlog/include/** -whitespace
 /third_party/spdlog/src/** -whitespace
+
+# Chat template fixtures are acceptance-digested byte-exact content.
+/tests/fixtures/frontend/reasoning_effort_froggeric_v225_chat_template.jinja eol=lf
