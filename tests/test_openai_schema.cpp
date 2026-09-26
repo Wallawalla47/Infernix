@@ -857,14 +857,40 @@ int test_stream_observations() {
 }
 
 int test_common_objects() {
-    int failures      = 0;
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000));
+    int failures = 0;
+    const ninfer::ModelMetadata metadata{
+        .model_id       = "qwen3.8-27b",
+        .weights_id     = "nvfp4",
+        .vocab_size     = 248077,
+        .embedding_size = 5120,
+        .native_context = 262144,
+        .parameters     = 27000000000ULL,
+        .weight_bytes   = 17000000000ULL,
+    };
+    const Json models = Json::parse(make_models_list("qwen", 7, 240000, metadata));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000,
               "models list advertises the configured context limit");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000));
+    // n_ctx is the running instance's configured ceiling (max_model_len); n_ctx_train is the
+    // model's native context. The two must not be conflated.
+    const Json list_meta = models["data"][0]["meta"];
+    failures += check(list_meta["n_ctx"] == 240000 && list_meta["n_ctx_train"] == 262144,
+                      "models list separates configured context from native context");
+    failures += check(list_meta["n_vocab"] == 248077 && list_meta["n_embd"] == 5120 &&
+                          list_meta["n_params"] == 27000000000ULL &&
+                          list_meta["size"] == 17000000000ULL && list_meta["ftype"] == "nvfp4",
+                      "models list exposes the llama.cpp-compatible model meta");
+    const Json model = Json::parse(make_model_object("qwen", 7, 240000, metadata));
     failures += check(model["max_model_len"] == 240000,
                       "model lookup advertises the configured context limit");
+    failures += check(model["meta"]["n_ctx"] == 240000 && model["meta"]["n_ctx_train"] == 262144 &&
+                          model["meta"]["n_embd"] == 5120 && model["meta"]["ftype"] == "nvfp4",
+                      "model lookup exposes the llama.cpp-compatible model meta");
+    const Json empty = Json::parse(
+        make_models_list("qwen", 7, 240000, ninfer::ModelMetadata{}));
+    failures += check(empty["data"][0]["meta"]["n_ctx"] == 240000 &&
+                          empty["data"][0]["meta"]["n_ctx_train"] == 0,
+                      "empty model metadata still renders the configured context");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",

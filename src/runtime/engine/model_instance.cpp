@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <utility>
@@ -175,7 +176,39 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
-    return {std::move(instance), std::move(summary), std::move(context_cost.model)};
+
+    // Model metadata for /v1/models. The architecture owns the dimension facts; the Engine adds the
+    // registered identity and the artifact-measured element and payload totals. The effective
+    // context ceiling is a property of this instance, so it is not part of the model facts.
+    ModelMetadata metadata;
+    metadata.model_id       = instance->model->info().name;
+    metadata.vocab_size     = instance->model->config().text.vocab_size;
+    metadata.embedding_size = instance->model->config().text.hidden_size;
+    metadata.native_context = instance->model->config().text.max_position_embeddings;
+    // Total logical elements and encoded payload bytes over the artifact's distinct weight parents.
+    // Several logical weights (tied embeddings, packed projections) can share one encoded parent,
+    // so count each parent once. ftype is the format covering the most weights (a single
+    // llama.cpp-style name); the full format set stays in LoadSummary::weight_formats.
+    std::set<const WeightParent*> counted;
+    std::map<std::string, std::uint64_t> elements_by_format;
+    for (const auto& weight : instance->model->weight_data()) {
+        for (const auto& part : weight.view.parts) {
+            if (part.parent == nullptr || !counted.insert(part.parent).second) { continue; }
+            metadata.parameters += part.parent->geometry.elements;
+            metadata.weight_bytes += part.parent->geometry.bytes;
+            elements_by_format[std::string(artifact::format_name(part.parent->geometry.format))] +=
+                part.parent->geometry.elements;
+        }
+    }
+    std::uint64_t dominant_elements = 0;
+    for (const auto& [name, elements] : elements_by_format) {
+        if (elements > dominant_elements) {
+            dominant_elements   = elements;
+            metadata.weights_id = name;
+        }
+    }
+    return {std::move(instance), std::move(summary), std::move(metadata),
+            std::move(context_cost.model)};
 }
 
 } // namespace ninfer::runtime
