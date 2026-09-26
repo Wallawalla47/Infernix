@@ -61,6 +61,23 @@ qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
 
 int test_cli_contract() {
     int failures                  = 0;
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer"}).rope_yarn_factor == 1.0F,
+                       "benchmark YaRN defaults off");
+    for (const auto* factor : {"1", "2.5", "4"}) {
+        const auto yarn = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--rope-yarn-factor", factor});
+        failures += expect(yarn.rope_yarn_factor == std::stof(factor) && !yarn.max_context,
+                           "YaRN preserves factor without overriding benchmark auto-context");
+    }
+    for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
+        failures += expect_throws<std::invalid_argument>([&] {
+            (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--rope-yarn-factor", factor});
+        }, "invalid benchmark YaRN factor");
+    }
+    failures += expect_throws<std::invalid_argument>([] {
+        (void)parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--rope-yarn-factor"});
+    }, "missing benchmark YaRN factor");
+    failures += expect(qb::usage_text("ninfer_bench").find("--rope-yarn-factor") != std::string::npos,
+                       "benchmark help includes YaRN");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",
@@ -296,6 +313,7 @@ qb::BenchEnvironment sample_environment() {
     };
     env.memory.cuda_graph_allowance_bytes = 150000000ULL;
     env.memory.kv_payload_bytes           = 123456ULL;
+    env.rope_yarn_factor                  = 2.5F;
     env.max_context                       = 4096;
     env.prefill_chunk                     = 1024;
     env.kv_cache                          = ninfer::KvCacheStorage::Int8Group64;
@@ -324,7 +342,9 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 15, "report schema v15");
+    failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
+                       "report preserves runtime YaRN factor");
+    failures += expect(report.at("schema_version") == 17, "report schema v17");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");

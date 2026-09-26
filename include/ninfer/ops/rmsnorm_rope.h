@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h>
 
@@ -38,6 +39,14 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
                   cudaStream_t stream);
+
+// Same fused formula, replacing its RoPE coefficients by the Text 1-D YaRN formula in
+// rope.h (R=128, theta=1e7). No intermediate BF16 normalization boundary is introduced.
+// factor=1 delegates to the original exact implementation; no allocation or mutable state.
+void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
+                  const PreparedRope& prepared, Tensor& q, Tensor& k, cudaStream_t stream);
+void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const PreparedRope& prepared,
+                  Tensor& x, cudaStream_t stream);
 
 /**
  * Text form of the same fusion: wider heads, a narrower rotation, and out of place.

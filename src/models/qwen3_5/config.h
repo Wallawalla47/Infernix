@@ -39,6 +39,8 @@ struct RopeConfig {
     std::array<std::uint32_t, 3> mrope_section{};
     std::uint32_t rotary_dim = 0;
     std::vector<std::uint8_t> pair_axes;
+    // Startup override only; original positions remain TextConfig::max_position_embeddings.
+    float yarn_factor = 1.0F;
 };
 
 struct GdnConfig {
@@ -116,6 +118,7 @@ struct DraftConfig {
     std::uint32_t max_position_embeddings = 0;
     float rms_norm_eps                    = 0;
     float rope_theta                      = 0;
+    float yarn_factor                     = 1.0F;
     std::vector<DraftAttentionKind> layer_types;
     std::optional<std::uint32_t> sliding_window;
     std::vector<std::uint32_t> target_layer_ids;
@@ -144,6 +147,10 @@ struct Config {
     bool mtp = false;
     std::optional<DraftConfig> draft;
 };
+
+// Runtime position envelope; native max_position_embeddings remains artifact metadata.
+// The same ceiling bounds Text and each selected draft, without enlarging default context.
+[[nodiscard]] std::uint32_t rope_context_ceiling(std::uint32_t native_positions, float factor);
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 

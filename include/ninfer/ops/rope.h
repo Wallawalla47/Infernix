@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <cstdint>
 namespace ninfer::ops {
 
 /**
@@ -34,6 +35,40 @@ namespace ninfer::ops {
  * positive physical SM count; the count selects launch geometry, not the transformation.
  */
 void rope(const Tensor& positions, int rotary_dim, float theta, Tensor& q, Tensor& k,
+          DeviceExecutionView execution);
+
+/**
+ * Optional text YaRN scaling. factor must be finite in [1,4], original_max_positions positive.
+ * factor=1 delegates to the unscaled overload exactly (including Vision). factor>1 requires
+ * Text 1-D or MRoPE and theta>1. Vision scaling is not supported.
+ * For R=rotary_dim, define d(beta)=R*ln(original_max_positions/(2*pi*beta))/(2*ln(theta)),
+ * low=max(floor(d(32)),0), high=min(ceil(d(1)),R-1). If low==high, replace high by high+0.001.
+ * For pair i, ramp=clamp((i-low)/(high-low),0,1), and replace its inverse frequency by
+ * theta^(-2*i/R)*((1-ramp)+ramp/factor). Multiply both cosine and sine by
+ * 1+0.1*ln(factor). Axis selection, unrotated dimensions, BF16 output boundary and aliasing
+ * are unchanged. No allocation, workspace, mutable global state or persistent state is used.
+ */
+struct RopeScaling {
+    float factor                         = 1.0F;
+    std::uint32_t original_max_positions = 262144;
+};
+
+// Prepare once, store as immutable model data, and pass by const reference at execution.
+// Produced only by prepare_rope; callers must not modify fields after preparation. The plain
+// value contains no pointers/device allocations and is copied into CUDA graph launch arguments.
+struct PreparedRope {
+    double inverse[128]{};
+    float attention_scale = 1.0F;
+    int rotary_dim        = 0;
+    float theta           = 0.0F;
+    float factor          = 1.0F;
+};
+
+PreparedRope prepare_rope(int rotary_dim, float theta, const RopeScaling& scaling = {});
+
+void rope(const Tensor& positions, const PreparedRope& prepared, Tensor& q, Tensor& k,
+          DeviceExecutionView execution);
+void rope(const Tensor& positions, const PreparedRope& prepared, Tensor& x,
           DeviceExecutionView execution);
 
 // Single-tensor form with the same formula and storage contract. The head count comes directly

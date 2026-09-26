@@ -28,6 +28,7 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
+    float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::uint32_t max_concurrency      = 1;

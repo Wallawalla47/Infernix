@@ -81,6 +81,11 @@ ninfer_bench --weights <artifact.ninfer>
 
 With no `-p`, `-n`, or `-pg`, the matrix is `pp512` and `tg128`.
 
+`--rope-yarn-factor F` selects the startup-fixed runtime YaRN factor, finite `[1,4]`, default `1`
+(native RoPE). It extends only the allowed ceiling, not the context selected from the workload or
+`--max-ctx`, and does not modify the artifact. Long-context extrapolation is not a quality guarantee.
+The factor is included in table, JSON and CSV reports.
+
 Example:
 
 ```bash
@@ -109,6 +114,7 @@ For a DFlash2 companion artifact:
 The benchmark disables context retention because every repetition is an independent root request.
 Schema v15 records `speculative_backend`, `draft_tokens`, and the proposal head independently;
 JSON and CSV identify DFlash2 explicitly. MTP alone reserves its extra lookahead KV margin.
+Schema v17 records `rope_yarn_factor`, `speculative_backend`, `draft_tokens`, `ngram_draft_tokens`,
 
 ## Context-cost calibration
 
@@ -1144,7 +1150,7 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 15 records the public value objects directly:
+statistics. JSON schema version 17 records the public value objects directly:
 
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;

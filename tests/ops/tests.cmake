@@ -47,6 +47,11 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
   LIBRARIES ninfer_ops)
 
+# Beyond the native 262,144 visible keys that --rope-yarn-factor opens (up to 1,048,576).
+add_test(NAME ninfer_softmax_attention_extended_test
+  COMMAND ninfer_softmax_attention_test --extended)
+set_tests_properties(ninfer_softmax_attention_extended_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_op_test(ninfer_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
   LIBRARIES ninfer_ops)

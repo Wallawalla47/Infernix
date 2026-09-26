@@ -149,6 +149,9 @@ struct EngineOptions {
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
+    // Startup-fixed runtime YaRN override, finite [1,4]; 1 preserves native RoPE.
+    // Extends only the allowed ceiling, never max_context itself or artifact metadata.
+    float rope_yarn_factor             = 1.0F;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;

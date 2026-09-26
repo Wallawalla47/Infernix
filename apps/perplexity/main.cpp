@@ -2,6 +2,7 @@
 #include "corpus.h"
 #include "evaluation.h"
 
+#include "product/rope_yarn_options.h"
 #include "ninfer/engine.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
@@ -45,6 +46,7 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
@@ -57,6 +59,7 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
+           "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
@@ -96,6 +99,8 @@ Options parse_options(int argc, char** argv) {
             out.text = std::filesystem::path(value("--text"));
         } else if (option == "--quick") {
             out.quick = true;
+        } else if (option == "--rope-yarn-factor") {
+            out.rope_yarn_factor = ninfer::product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
@@ -219,6 +224,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
+    engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     engine_options.kv_cache         = options.kv;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
@@ -371,7 +377,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
 
     json report{
-        {"schema_version", 2},
+        {"schema_version", 3},
         {"metric",
          {{"name", "fixed-window truncated-context causal perplexity"}, {"log_base", "natural"}}},
         {"artifact",
@@ -389,6 +395,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
          {{"purpose", "causal_scoring"},
           {"device", options.device},
           {"context_tokens", options.context},
+          {"rope_yarn_factor", options.rope_yarn_factor},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},

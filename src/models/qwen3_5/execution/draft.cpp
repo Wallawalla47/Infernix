@@ -209,7 +209,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
                 ops::rope(layer_positions.view({layer_columns}),
-                          dimension(config.attention.head_dim), config.rope_theta, key,
+                          state.execution.parameters.draft->rope, key,
                           state.execution.device.execution_view());
                 Tensor key_batch =
                     key.view({dimension(config.attention.head_dim),
@@ -313,7 +313,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 ops::attn_input_proj(branch.prepared.view({dimension(target.hidden_size), columns}),
                                      layer.query_key_value.weight, query_flat, key_flat, value_flat,
                                      stream);
-                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, query, key, stream);
+                ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm,
+                                  weights.rope, query, key, stream);
                 Tensor attention = work.alloc(
                     DType::BF16, {dimension(config.attention.head_dim),
                                   dimension(config.attention.num_attention_heads), width, batch});
@@ -454,8 +455,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                              state.execution.device.stream);
                 ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
                              state.execution.device.stream);
-                ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
-                          config.rope_theta, query, key, state.execution.device.execution_view());
+                ops::rope(positions.view({columns}), state.execution.parameters.draft->rope,
+                          query, key, state.execution.device.execution_view());
                 Tensor query_batch = query.view({dimension(config.attention.head_dim),
                                                  dimension(config.attention.num_attention_heads),
                                                  width, batch_size});

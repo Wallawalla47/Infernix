@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
         engine_options.artifact_path = options.artifact_path;
         engine_options.device        = options.device;
         engine_options.max_context   = max_context;
+        engine_options.rope_yarn_factor = options.rope_yarn_factor;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
@@ -164,6 +165,7 @@ int main(int argc, char** argv) {
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
+        env.rope_yarn_factor         = options.rope_yarn_factor;
         env.prefill_chunk            = options.prefill_chunk;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;

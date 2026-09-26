@@ -4,6 +4,7 @@
 // and defined by the CUDA launcher.
 
 #include "core/device.h"
+#include "ninfer/ops/rope.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
@@ -15,5 +16,7 @@ void rope_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& q
 
 void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, Tensor& x,
                         DeviceExecutionView execution);
+void rope_prepared_launch(const Tensor& positions, const PreparedRope& prepared, Tensor& q,
+                          Tensor* k, DeviceExecutionView execution);
 
 } // namespace ninfer::ops::detail

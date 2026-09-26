@@ -235,6 +235,9 @@ public:
 
     DraftParameters draft(const DraftWeights& w) const {
         DraftParameters out;
+        const auto& config = *model_.config().draft;
+        out.rope = ops::prepare_rope(dimension(config.attention.head_dim), config.rope_theta,
+                                    {config.yarn_factor, config.max_position_embeddings});
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
@@ -282,6 +285,12 @@ private:
 Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
+    const auto& config   = model.config().text;
+    if (config.rope_parameters) {
+        const auto& rope = *config.rope_parameters;
+        text.rope = ops::prepare_rope(dimension(rope.rotary_dim), rope.rope_theta,
+                                     {rope.yarn_factor, config.max_position_embeddings});
+    }
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);
