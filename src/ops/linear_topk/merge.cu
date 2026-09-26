@@ -1,6 +1,7 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
@@ -27,6 +28,7 @@ __global__ __launch_bounds__(kMergeThreads, 2) void linear_topk_merge_kernel(
     const std::uint64_t* __restrict__ input_keys, std::uint64_t* __restrict__ output_keys,
     std::int32_t* __restrict__ group_done, std::int32_t* __restrict__ candidate_ids,
     float* __restrict__ candidate_scores, std::int32_t input_groups, std::int32_t output_groups) {
+    pdl::enter();
     const std::int32_t output_group = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t column       = static_cast<std::int32_t>(blockIdx.y);
     const int tid                   = static_cast<int>(threadIdx.x);
@@ -87,41 +89,58 @@ __global__ __launch_bounds__(kMergeThreads, 2) void linear_topk_merge_kernel(
     if (tid == 0) { group_done[column] = 0; }
 }
 
+// Zeroes the per-column completion counters. The last merging CTA of each column already returns
+// its counter to zero; this establishes it for arena bytes another call reused in between, as a
+// kernel so the round stays one chain of kernel nodes.
+__global__ void linear_topk_clear_done_kernel(std::int32_t* __restrict__ group_done,
+                                              std::int32_t count) {
+    pdl::enter();
+    for (int i = static_cast<int>(threadIdx.x); i < count; i += static_cast<int>(blockDim.x)) {
+        group_done[i] = 0;
+    }
+}
+
 } // namespace
 
 void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& candidate_ids,
                               Tensor& candidate_scores, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(workspace.group_done.data, 0, workspace.group_done.bytes(), stream));
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(1), dim3(128), 0, stream}, linear_topk_clear_done_kernel,
+        static_cast<std::int32_t*>(workspace.group_done.data),
+        static_cast<std::int32_t>(workspace.group_done.bytes() / sizeof(std::int32_t))));
     if (workspace.secondary_groups != 0) {
         const dim3 first_grid(static_cast<unsigned>(workspace.merge_groups),
                               static_cast<unsigned>(workspace.columns), 1U);
-        linear_topk_merge_kernel<false><<<first_grid, kMergeThreads, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(first_grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<false>,
             static_cast<const std::uint64_t*>(workspace.partial_keys.data),
             static_cast<std::uint64_t*>(workspace.group_keys.data), nullptr, nullptr, nullptr,
-            workspace.producer_groups, workspace.merge_groups);
+            workspace.producer_groups, workspace.merge_groups));
         CUDA_CHECK(cudaGetLastError());
 
         const dim3 final_grid(static_cast<unsigned>(workspace.secondary_groups),
                               static_cast<unsigned>(workspace.columns), 1U);
-        linear_topk_merge_kernel<true><<<final_grid, kMergeThreads, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(final_grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<true>,
             static_cast<const std::uint64_t*>(workspace.group_keys.data),
             static_cast<std::uint64_t*>(workspace.secondary_keys.data),
             static_cast<std::int32_t*>(workspace.group_done.data),
             static_cast<std::int32_t*>(candidate_ids.data),
             static_cast<float*>(candidate_scores.data), workspace.merge_groups,
-            workspace.secondary_groups);
+            workspace.secondary_groups));
         CUDA_CHECK(cudaGetLastError());
         return;
     }
 
     const dim3 grid(static_cast<unsigned>(workspace.merge_groups),
                     static_cast<unsigned>(workspace.columns), 1U);
-    linear_topk_merge_kernel<true><<<grid, kMergeThreads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(kMergeThreads), 0, stream}, linear_topk_merge_kernel<true>,
         static_cast<const std::uint64_t*>(workspace.partial_keys.data),
         static_cast<std::uint64_t*>(workspace.group_keys.data),
         static_cast<std::int32_t*>(workspace.group_done.data),
         static_cast<std::int32_t*>(candidate_ids.data), static_cast<float*>(candidate_scores.data),
-        workspace.producer_groups, workspace.merge_groups);
+        workspace.producer_groups, workspace.merge_groups));
     CUDA_CHECK(cudaGetLastError());
 }
 

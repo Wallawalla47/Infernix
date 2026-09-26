@@ -28,7 +28,8 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace worksp
     launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
         nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
         LinearBf16Output{static_cast<__nv_bfloat16*>(residual.data), weight.n},
-        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream);
+        LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}}, stream,
+        {}, pdl::Dependency::Programmatic);
 }
 
 template <class Geometry>

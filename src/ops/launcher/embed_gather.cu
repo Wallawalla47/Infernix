@@ -5,6 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/embed_gather.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -20,9 +21,10 @@ constexpr int kQ8RowBlock     = 256;
 template <int BlocksPerToken, int Threads>
 void launch_fp8(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream) {
     const int grid = ids.ne[0] * BlocksPerToken;
-    embed_gather_fp8_kernel<BlocksPerToken, Threads><<<grid, Threads, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(Threads), 0, stream}, embed_gather_fp8_kernel<BlocksPerToken, Threads>,
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint8_t*>(table.qdata),
-        static_cast<const __nv_bfloat16*>(table.scales), static_cast<__nv_bfloat16*>(out.data));
+        static_cast<const __nv_bfloat16*>(table.scales), static_cast<__nv_bfloat16*>(out.data)));
 }
 
 template <int Blocks, int Threads>

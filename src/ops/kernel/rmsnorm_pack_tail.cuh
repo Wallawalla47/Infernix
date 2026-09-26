@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/warp.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -38,6 +39,7 @@ template <int kBlock>
 __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
     __nv_bfloat162* __restrict__ output, int width) {
+    pdl::enter();
     constexpr int kPairsPerThread = kRmsnormPackTailPairsPerRow / kBlock;
     static_assert(kRmsnormPackTailPairsPerRow % kBlock == 0);
 

@@ -92,7 +92,8 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilogue,
-                         cudaStream_t stream, Rows rows = {}) {
+                         cudaStream_t stream, Rows rows = {},
+                         pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_nvfp4_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK ||
         p.k / Schedule::kBlockK < Schedule::kStages)
@@ -106,10 +107,11 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             constexpr auto kernel = nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
                 nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel>();
-            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.x_scales, p.codes, p.scales,
-                                                                p.rows, p.k, p.alpha, output,
-                                                                epilogue, rows, offset, count);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_with(
+                dependency,
+                {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel,
+                p.x, p.x_scales, p.codes, p.scales, p.rows, p.k, p.alpha, output, epilogue, rows,
+                offset, count));
         };
         if (count % Schedule::kBlockTokens == 0)
             launch.template operator()<true>();

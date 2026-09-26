@@ -45,7 +45,7 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, Columns, Exact>,
         Q8SlicedKIdentityRows>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
-                               stream);
+                               stream, {}, pdl::Dependency::Programmatic);
     CUDA_CHECK(cudaGetLastError());
 }
 

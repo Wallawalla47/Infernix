@@ -1,5 +1,6 @@
 #include "ops/context_kv_materialize/launch.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
@@ -390,13 +391,13 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
                     cudaStream_t stream) {
     constexpr auto kernel = context_kv_grouped_kernel<Columns, KWarps>;
     const int shared = q8_prepare_shared<GroupedSchedule<Columns, KWarps>::kSharedBytes, kernel>();
-    kernel<<<dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), KWarps * 32,
-             shared, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(64, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10), dim3(KWarps * 32),
+         static_cast<std::size_t>(shared), stream},
+        kernel, static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
         static_cast<const int*>(counts.data), static_cast<const int*>(slots.data), layers,
         static_cast<float*>(scratch.data), x.ne[1], x.ne[2], envelope.min_count,
-        envelope.max_count);
-    CUDA_CHECK(cudaGetLastError());
+        envelope.max_count));
 }
 
 __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
@@ -404,6 +405,7 @@ __global__ __launch_bounds__(256) void context_kv_key_post_kernel(
     const std::int32_t* __restrict__ counts, const std::int32_t* __restrict__ state_slots,
     DeviceLayers layers, std::int32_t batch_size, std::int32_t width, std::int32_t min_count,
     std::int32_t max_count) {
+    pdl::enter();
     const int packed_column   = static_cast<int>(blockIdx.x);
     const int physical_column = context_column(packed_column, width, max_count);
     const int layer_index     = static_cast<int>(blockIdx.y);
@@ -477,12 +479,12 @@ void context_kv_materialize_launch(
                                   key_scratch, stream);
         break;
     }
-    context_kv_key_post_kernel<<<dim3(envelope.max_count * context.ne[2], kLayers), 256, 0,
-                                 stream>>>(
-        static_cast<const float*>(key_scratch.data), static_cast<const int*>(positions.data),
-        static_cast<const int*>(counts.data), static_cast<const int*>(state_slots.data),
-        device_layers, context.ne[2], context.ne[1], envelope.min_count, envelope.max_count);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(envelope.max_count * context.ne[2], kLayers), dim3(256), 0, stream},
+        context_kv_key_post_kernel, static_cast<const float*>(key_scratch.data),
+        static_cast<const int*>(positions.data), static_cast<const int*>(counts.data),
+        static_cast<const int*>(state_slots.data), device_layers, context.ne[2], context.ne[1],
+        envelope.min_count, envelope.max_count));
 }
 
 } // namespace ninfer::ops::detail

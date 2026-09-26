@@ -26,7 +26,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
                                        Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous,
                                        1>;
                 launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, K, Tokens, true>>(
-                    operands, output, epilogue, stream);
+                    operands, output, epilogue, stream, {}, pdl::Dependency::Programmatic);
             };
             if (x.ne[1] == 2) return tiny.template operator()<2>();
             if (x.ne[1] == 3) return tiny.template operator()<3>();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/math.h"
+#include "core/pdl.cuh"
 
 // ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.
@@ -26,6 +27,7 @@ template <int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
                                  const __nv_bfloat16* scales, __nv_bfloat16* out) {
+    pdl::enter();
     static_assert(kEmbedGatherFp8D % BlocksPerToken == 0);
     constexpr int kValuesPerBlock = kEmbedGatherFp8D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);

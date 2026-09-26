@@ -1,5 +1,6 @@
 #pragma once
 // Warps share an output tile and partition K. FP32 fragments are reduced before the epilogue.
+#include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 
 namespace ninfer::ops::detail {
@@ -8,6 +9,9 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     Epilogue epilogue, int rows, int input_rows, int tokens, int token_offset) {
+    // Streams its weights through the K loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
     const int kHidden          = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int kMmaRows     = Schedule::kBlockRows;
     constexpr int kMmaK        = Schedule::kWarpK;
@@ -124,6 +128,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
             cp_commit();
         }
     }
+    pdl::trigger_dependents();
 
     if ((warp & 1) != 0) {
 #pragma unroll

@@ -24,11 +24,11 @@ void launch_bf16_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t
                                   LinearIdentityEpilogue{}, stream);
 }
 
-template <class Schedule>
+template <class Schedule, pdl::Dependency Dependency = pdl::Dependency::Serialized>
 void launch_bf16_sliced_k_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_bf16_a16_sliced_k_mma<Schedule>(
         bf16_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
-        LinearIdentityEpilogue{}, stream);
+        LinearIdentityEpilogue{}, stream, Dependency);
 }
 
 template <class Schedule>

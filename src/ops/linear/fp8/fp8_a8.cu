@@ -2,6 +2,7 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
@@ -29,6 +30,7 @@ __global__ __launch_bounds__(Threads,
     __shared__ float warp_maxima[warps];
     __shared__ float token_scale;
 
+    pdl::enter();
     const int token         = static_cast<int>(blockIdx.x);
     const int tid           = static_cast<int>(threadIdx.x);
     const int lane          = tid & 31;
@@ -71,9 +73,10 @@ __global__ __launch_bounds__(Threads,
 template <class ActivationGeometry>
 void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
     constexpr int kThreads = 256;
-    fp8_a8_quantize_kernel<ActivationGeometry, kThreads><<<x.ne[1], kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(x.ne[1]), dim3(kThreads), 0, stream},
+                                    fp8_a8_quantize_kernel<ActivationGeometry, kThreads>,
+                                    static_cast<const __nv_bfloat16*>(x.data), workspace.codes,
+                                    workspace.scales));
 }
 
 } // namespace

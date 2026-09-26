@@ -1,5 +1,6 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/sampling_device.cuh"
@@ -90,6 +91,7 @@ __device__ void score_row(const DeviceArgs& a, int column, SelectorShared& share
 }
 
 __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
+    pdl::enter();
     __shared__ SelectorShared shared;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, batch = blockIdx.x;
     if (tid == 0) {
@@ -115,6 +117,7 @@ __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
 }
 
 __global__ __launch_bounds__(512, 2) void selector_lattice_kernel(DeviceArgs a, float* edges) {
+    pdl::enter();
     const int column = blockIdx.x, p = blockIdx.y;
     const int step = column % a.steps, batch = column / a.steps;
     if (step == 0 && p != 0) return;
@@ -129,6 +132,7 @@ __global__ __launch_bounds__(512, 2) void selector_lattice_kernel(DeviceArgs a, 
 
 __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
                                                                    const float* edges) {
+    pdl::enter();
     const int lane = threadIdx.x, batch = blockIdx.x;
     const auto seed         = a.configs[batch].seed;
     const float temperature = a.configs[batch].temperature;
@@ -171,13 +175,16 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                           static_cast<float*>(proposal_q.data),
                           candidate_ids.ne[1]};
     if (route == SelectorRoute::Direct) {
-        selector_walk_kernel<<<candidate_ids.ne[2], 512, 0, stream>>>(args);
+        CUDA_CHECK(pdl::launch_consumer({dim3(candidate_ids.ne[2]), dim3(512), 0, stream},
+                                        selector_walk_kernel, args));
     } else {
         auto* edges = static_cast<float*>(workspace.edges.data);
-        selector_lattice_kernel<<<dim3(args.steps * candidate_ids.ne[2], kCandidates), 512, 0,
-                                  stream>>>(args, edges);
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(args.steps * candidate_ids.ne[2], kCandidates), dim3(512), 0, stream},
+            selector_lattice_kernel, args, edges));
         CUDA_CHECK(cudaGetLastError());
-        selector_lattice_walk_kernel<<<candidate_ids.ne[2], 32, 0, stream>>>(args, edges);
+        CUDA_CHECK(pdl::launch_consumer({dim3(candidate_ids.ne[2]), dim3(32), 0, stream},
+                                        selector_lattice_walk_kernel, args, edges));
     }
     CUDA_CHECK(cudaGetLastError());
 }

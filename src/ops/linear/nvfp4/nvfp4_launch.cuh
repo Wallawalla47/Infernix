@@ -55,7 +55,7 @@ void nvfp4_linear_a4_mma(const Weight& w, Tensor& y, Nvfp4A4Workspace workspace,
     launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
         nvfp4_a4_operands(w, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
         LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n}, LinearIdentityEpilogue{},
-        stream);
+        stream, {}, pdl::Dependency::Programmatic);
 }
 
 template <Nvfp4GeometryId Geometry, Nvfp4ScaleLayout Layout>

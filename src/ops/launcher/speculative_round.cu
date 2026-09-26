@@ -7,6 +7,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/speculative_round.cuh"
 #include "core/device.h"
+#include "core/pdl.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -22,12 +23,14 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
     const int batch      = drafts.ne[1];
     const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
                     static_cast<unsigned int>(batch));
-    speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(anchors.data),
-        static_cast<const std::int32_t*>(drafts.data),
-        static_cast<const std::int32_t*>(base_positions.data),
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), static_cast<std::int32_t*>(positions.data), k);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlock), 0, stream},
+                                    speculative_prepare_verify_inputs_kernel,
+                                    static_cast<const std::int32_t*>(anchors.data),
+                                    static_cast<const std::int32_t*>(drafts.data),
+                                    static_cast<const std::int32_t*>(base_positions.data),
+                                    static_cast<const std::int32_t*>(current_extents.data),
+                                    static_cast<std::int32_t*>(verify_ids.data),
+                                    static_cast<std::int32_t*>(positions.data), k));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -39,11 +42,12 @@ void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& 
     const int batch      = drafts.ne[1];
     const dim3 grid(static_cast<unsigned int>(div_up(k + 1, kBlock)),
                     static_cast<unsigned int>(batch));
-    speculative_prepare_verify_inputs_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(anchors.data),
-        static_cast<const std::int32_t*>(drafts.data), nullptr,
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(verify_ids.data), nullptr, k);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlock), 0, stream},
+                                    speculative_prepare_verify_inputs_kernel,
+                                    static_cast<const std::int32_t*>(anchors.data),
+                                    static_cast<const std::int32_t*>(drafts.data), nullptr,
+                                    static_cast<const std::int32_t*>(current_extents.data),
+                                    static_cast<std::int32_t*>(verify_ids.data), nullptr, k));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -54,13 +58,14 @@ void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Te
     constexpr int kBlock = 128;
     const int k          = drafts.ne[0];
     const int batch      = drafts.ne[1];
-    speculative_overlay_copy_proposals_kernel<<<batch, kBlock, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(batch), dim3(kBlock), 0, stream}, speculative_overlay_copy_proposals_kernel,
         static_cast<const std::int32_t*>(copy_rows.data),
         static_cast<const std::int32_t*>(copy_drafts.data),
         static_cast<const std::int32_t*>(copy_candidates.data),
         static_cast<const float*>(copy_q.data), static_cast<std::int32_t*>(drafts.data),
         static_cast<std::int32_t*>(candidates.data), static_cast<float*>(proposal_q.data), k,
-        kSparseSpeculativeCandidates);
+        kSparseSpeculativeCandidates));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -95,25 +100,26 @@ void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const 
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
+        speculative_sampling_partial_topk_kernel, static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(drafts.data),
         static_cast<const std::int32_t*>(current_extents.data), configs, token_domain,
-        physical_rows, cols, drafts.ne[0], scratch, layout.bytes);
+        physical_rows, cols, drafts.ne[0], scratch, layout.bytes));
     CUDA_CHECK(cudaGetLastError());
     const dim3 batched_group_grid(static_cast<unsigned int>(groups),
                                   static_cast<unsigned int>(cols),
                                   static_cast<unsigned int>(batch));
-    speculative_sampling_group_finalize_kernel<false>
-        <<<batched_group_grid, kSamplerGroupBlock, 0, stream>>>(
-            static_cast<const std::int32_t*>(target_tokens.data),
-            static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
-            static_cast<const std::int32_t*>(current_extents.data),
-            static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
-            static_cast<std::int32_t*>(licensed_tokens.data),
-            static_cast<std::int32_t*>(licensed_counts.data),
-            static_cast<std::int32_t*>(accepted.data), configs, token_domain, cols, partial_blocks,
-            groups, scratch, layout.bytes);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(batched_group_grid), dim3(kSamplerGroupBlock), 0, stream},
+        speculative_sampling_group_finalize_kernel<false>,
+        static_cast<const std::int32_t*>(target_tokens.data),
+        static_cast<const std::int32_t*>(drafts.data), nullptr, nullptr,
+        static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<std::int32_t*>(lengths.data), static_cast<std::int32_t*>(anchors.data),
+        static_cast<std::int32_t*>(licensed_tokens.data),
+        static_cast<std::int32_t*>(licensed_counts.data), static_cast<std::int32_t*>(accepted.data),
+        configs, token_domain, cols, partial_blocks, groups, scratch, layout.bytes));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -143,28 +149,31 @@ void speculative_accept_sparse_drafts_launch(
     const SamplingWorkspace scratch   = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(cols), static_cast<unsigned int>(batch));
-    speculative_sampling_partial_topk_kernel<<<partial_grid, kSamplerBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const std::int32_t*>(drafts.data),
-        static_cast<const std::int32_t*>(current_extents.data), configs, token_domain, logits.ne[0],
-        cols, k, scratch, layout.bytes);
+    CUDA_CHECK(pdl::launch_consumer({dim3(partial_grid), dim3(kSamplerBlock), 0, stream},
+                                    speculative_sampling_partial_topk_kernel,
+                                    static_cast<const __nv_bfloat16*>(logits.data),
+                                    static_cast<const std::int32_t*>(drafts.data),
+                                    static_cast<const std::int32_t*>(current_extents.data), configs,
+                                    token_domain, logits.ne[0], cols, k, scratch, layout.bytes));
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(cols),
                           static_cast<unsigned int>(batch));
 
-    speculative_sampling_group_finalize_kernel<true><<<group_grid, kSamplerGroupBlock, 0, stream>>>(
-        static_cast<const std::int32_t*>(target_tokens.data),
-        static_cast<const std::int32_t*>(drafts.data),
-        static_cast<const std::int32_t*>(candidate_ids.data),
-        static_cast<const float*>(proposal_q.data),
-        static_cast<const std::int32_t*>(current_extents.data),
-        static_cast<std::int32_t*>(round_lengths.data),
-        static_cast<std::int32_t*>(round_anchors.data),
-        static_cast<std::int32_t*>(licensed_tokens.data),
-        static_cast<std::int32_t*>(licensed_counts.data),
-        static_cast<std::int32_t*>(accepted_drafts.data), configs, token_domain, cols,
-        partial_blocks, groups, scratch, layout.bytes);
+    CUDA_CHECK(pdl::launch_consumer({dim3(group_grid), dim3(kSamplerGroupBlock), 0, stream},
+                                    speculative_sampling_group_finalize_kernel<true>,
+                                    static_cast<const std::int32_t*>(target_tokens.data),
+                                    static_cast<const std::int32_t*>(drafts.data),
+                                    static_cast<const std::int32_t*>(candidate_ids.data),
+                                    static_cast<const float*>(proposal_q.data),
+                                    static_cast<const std::int32_t*>(current_extents.data),
+                                    static_cast<std::int32_t*>(round_lengths.data),
+                                    static_cast<std::int32_t*>(round_anchors.data),
+                                    static_cast<std::int32_t*>(licensed_tokens.data),
+                                    static_cast<std::int32_t*>(licensed_counts.data),
+                                    static_cast<std::int32_t*>(accepted_drafts.data), configs,
+                                    token_domain, cols, partial_blocks, groups, scratch,
+                                    layout.bytes));
 
     CUDA_CHECK(cudaGetLastError());
 }
@@ -176,10 +185,11 @@ void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tenso
     const int batch      = hidden.ne[2];
     const dim3 grid(static_cast<unsigned int>(std::max(1, div_up(rows, kBlock))),
                     static_cast<unsigned int>(batch));
-    speculative_select_accepted_hidden_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(hidden.data),
-        static_cast<const std::int32_t*>(selectors.data), static_cast<__nv_bfloat16*>(out.data),
-        rows, hidden.ne[1]);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(kBlock), 0, stream},
+                                    speculative_select_accepted_hidden_kernel,
+                                    static_cast<const __nv_bfloat16*>(hidden.data),
+                                    static_cast<const std::int32_t*>(selectors.data),
+                                    static_cast<__nv_bfloat16*>(out.data), rows, hidden.ne[1]));
     CUDA_CHECK(cudaGetLastError());
 }
 

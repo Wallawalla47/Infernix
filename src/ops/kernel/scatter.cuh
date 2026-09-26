@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include "core/pdl.cuh"
 
 #include <cstdint>
 
@@ -8,6 +9,7 @@ namespace ninfer::ops {
 
 __global__ void scatter_bf16x8_kernel(const uint4* src, const std::int32_t* indices, uint4* dst,
                                       std::int32_t vectors_per_column) {
+    pdl::enter();
     const std::int32_t src_col  = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t dst_col  = indices[src_col];
     const std::int64_t src_base = static_cast<std::int64_t>(src_col) * vectors_per_column;
@@ -54,6 +56,7 @@ __launch_bounds__(kScatterBatchThreads) __global__
                                    uint4* __restrict__ destination, std::int32_t vectors_per_column,
                                    std::int32_t width, std::int64_t destination_column_stride,
                                    std::int64_t destination_lane_stride) {
+    pdl::enter();
     const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t batch  = static_cast<std::int32_t>(blockIdx.y);
     if (column >= valid_columns[batch]) return;

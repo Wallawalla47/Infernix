@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/common/bf16_vector.cuh"
+#include "core/pdl.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
@@ -676,9 +677,13 @@ template <bool Masked>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
-    const std::int32_t valid         = access.active_columns(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
+    // Verification leaves the persistent state unchanged: it was last written by the preceding
+    // round's fold, which completes before this round's graph starts, and its slot comes from the
+    // round's ingress. The tile therefore loads before waiting on the projection that feeds q/k/v.
     load_state_tile(state, access.state_read_base(coord), coord);
+    pdl::enter_streaming();
+    const std::int32_t valid = access.active_columns(coord);
     run_recurrent_sequence<true, RecordEffects>(state, access, coord, valid);
     zero_output_suffix(access, coord, valid, access.width);
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include "core/pdl.cuh"
 
 #include <cstdint>
 
@@ -14,6 +15,7 @@ __global__ void prepare_ragged_prefix_kernel(
     uint4* __restrict__ destination, std::int32_t* __restrict__ positions,
     std::int32_t* __restrict__ counts, std::int32_t vectors_per_column, std::int32_t width,
     std::int64_t source_column_stride, std::int64_t source_lane_stride) {
+    pdl::enter();
     const int feature_tile         = blockIdx.z;
     const std::int32_t column      = blockIdx.x;
     const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);

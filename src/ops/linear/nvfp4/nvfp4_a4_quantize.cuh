@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 
@@ -30,6 +31,9 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
     float input_scale_divisor) {
+    // A short kernel: it waits for the activation's producer (under CUDA Graph capture its launch
+    // is a programmatic dependent) before reading it.
+    pdl::enter();
     static_assert(Threads == 128 || Threads == 256 || Threads == 512);
     static_assert(Layout == Nvfp4ScaleLayout::RowMajor ||
                   (Geometry::kInputRows / 16) % kNvfp4ScaleTileGroups == 0);

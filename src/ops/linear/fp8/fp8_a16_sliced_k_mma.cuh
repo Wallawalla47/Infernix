@@ -6,6 +6,7 @@
 // codes are widened exactly to BF16 MMA operands; the represented BF16 row multiplier is applied
 // once to the complete FP32 dot product. The public activation is never quantized.
 
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
@@ -25,6 +26,9 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sliced_k_mma_kernel(
     Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_offset) {
+    // Streams its weights through the main loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
     const auto* __restrict__ x            = operands.x;
     const auto* __restrict__ weight_codes = operands.codes;
     const auto* __restrict__ row_scales   = operands.scales;
@@ -167,6 +171,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
             cp_commit();
         }
     }
+    pdl::trigger_dependents();
 
     __syncthreads();
     auto* partial = shared.partial;

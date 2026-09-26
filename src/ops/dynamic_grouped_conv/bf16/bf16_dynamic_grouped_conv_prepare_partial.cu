@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/rowsplit_mma.cuh"
@@ -25,6 +26,7 @@ __global__
 __launch_bounds__(Tile<Rows, Columns>::threads, 1) void dynamic_grouped_conv_prepare_partial_kernel(
     const __nv_bfloat16* __restrict__ input, const __nv_bfloat16* __restrict__ weight,
     float* __restrict__ partial, int tokens) {
+    pdl::enter_streaming();
     constexpr int threads         = Tile<Rows, Columns>::threads;
     constexpr int mmas            = Tile<Rows, Columns>::mmas;
     constexpr int tiles_per_split = kHidden / kBlockK / SplitK;
@@ -106,9 +108,11 @@ template <int R, int C, int S>
 void launch(const Tensor& input, const Weight& weight, float* partial, cudaStream_t stream) {
     const int tokens = input.ne[1] * input.ne[2];
     const dim3 grid(kCoefficientRows / R, (tokens + C - 1) / C, S);
-    dynamic_grouped_conv_prepare_partial_kernel<R, C, S><<<grid, Tile<R, C>::threads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(input.data),
-        static_cast<const __nv_bfloat16*>(weight.qdata), partial, tokens);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(Tile<R, C>::threads), 0, stream},
+                                    dynamic_grouped_conv_prepare_partial_kernel<R, C, S>,
+                                    static_cast<const __nv_bfloat16*>(input.data),
+                                    static_cast<const __nv_bfloat16*>(weight.qdata), partial,
+                                    tokens));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace

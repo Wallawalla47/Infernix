@@ -36,7 +36,8 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
 
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, Capacity, false>, RowPolicy>(
-        q8_linear_operands(x, weight), ignored_output, epilogue, stream);
+        q8_linear_operands(x, weight), ignored_output, epilogue, stream, RowPolicy{},
+        pdl::Dependency::Programmatic);
     CUDA_CHECK(cudaGetLastError());
 }
 

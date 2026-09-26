@@ -9,6 +9,6 @@ void launch_q8_a16_sliced(const Tensor& x, const Weight& weight, Tensor& out, cu
     launch_q8_a16_sliced_k_mma<Instance>(
         q8_linear_operands(x, weight),
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows},
-        LinearIdentityEpilogue{}, stream);
+        LinearIdentityEpilogue{}, stream, {}, pdl::Dependency::Programmatic);
 }
 } // namespace ninfer::ops::detail

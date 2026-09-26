@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
@@ -41,6 +42,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows, int k,
     int tokens, int padded_k, int token_begin, RowPolicy row_policy) {
+    // Streams its weights through the K loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
     constexpr int R  = Schedule::kBlockRows;
     constexpr int T  = Schedule::kBlockTokens;
     constexpr int W  = Schedule::kKWarps;
@@ -188,6 +192,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
             cp_commit();
         }
     }
+    pdl::trigger_dependents();
     cp_wait<0>();
     __syncthreads();
     constexpr bool kPairwise = Schedule::kReduction == Q4SlicedKReduction::Pairwise;

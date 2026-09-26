@@ -3,6 +3,7 @@
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
 
 #include "ops/common/math.cuh"
+#include "core/pdl.cuh"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
@@ -33,6 +34,7 @@ __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                     const __nv_bfloat162* z, __nv_bfloat162* out,
                                     std::int32_t input_d, std::int64_t rows, float eps) {
+    pdl::enter();
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
@@ -142,6 +144,7 @@ __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
                                    const __nv_bfloat162* z, __nv_bfloat162* out,
                                    std::int32_t input_d, std::int64_t rows, float eps) {
+    pdl::enter();
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);

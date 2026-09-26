@@ -17,7 +17,8 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
-        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
+        fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream, {},
+        pdl::Dependency::Programmatic);
 }
 
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
