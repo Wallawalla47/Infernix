@@ -882,35 +882,60 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
                                                  const ToolCallOutputContract& contract,
                                                  bool tolerant) {
-    const std::size_t first = find_first_tool_marker(text);
-    if (first == std::string::npos) { return fallback(text); }
+    const std::string_view source(text);
+    std::size_t candidate = find_first_tool_marker(source);
+    if (candidate == std::string::npos) { return fallback(text); }
 
     ParsedToolCallOutput out;
-    out.content                 = rtrim_format_whitespace(std::string_view(text).substr(0, first));
     out.diagnostics.marker_seen = true;
 
+    // Generated prose can quote a tool-call marker before the real turn. Try the first marker, then
+    // each later `<tool_call>` wrapper, and accept the first region that parses; earlier markers
+    // stay ordinary content. A truncated tail that still kept a complete call (tolerant mode) is a
+    // recovered region, not a failure.
     std::vector<RawToolCall> raw_calls;
-    const std::string_view tool_region = std::string_view(text).substr(first);
-    QwenToolRegionParser parser(tool_region, max_tool_name_length, contract, tolerant);
-    const FallbackReason failure = parser.parse(raw_calls);
-    if (failure == FallbackReason::TruncatedTail && !raw_calls.empty()) {
-        // A trailing suffix after a complete call was discarded, or a single truncated final
-        // call with at least one complete parameter was kept; the recovered calls stand.
-        // Record the reason for transparency without demoting the output to text.
-        out.diagnostics.fallback_reason = failure;
-    } else if (failure != FallbackReason::None) {
-        // A truncated tail that kept no call (a name cut before any parameter completed)
-        // carries no arguments: the region is returned as text with the reason recorded.
-        out.diagnostics.fallback_reason = failure;
+    std::size_t accepted                   = std::string::npos;
+    FallbackReason accepted_reason         = FallbackReason::None;
+    std::uint32_t duplicate_repairs        = 0;
+    FallbackReason first_failure           = FallbackReason::MalformedStructure;
+    bool first_failure_recorded            = false;
+    while (candidate != std::string::npos) {
+        std::vector<RawToolCall> calls;
+        QwenToolRegionParser parser(source.substr(candidate), max_tool_name_length, contract,
+                                    tolerant);
+        const FallbackReason failure = parser.parse(calls);
+        if (failure == FallbackReason::None ||
+            (failure == FallbackReason::TruncatedTail && !calls.empty())) {
+            accepted          = candidate;
+            accepted_reason   = failure;
+            duplicate_repairs = parser.duplicate_parameters_repaired();
+            raw_calls         = std::move(calls);
+            break;
+        }
+        if (!first_failure_recorded) {
+            first_failure          = failure;
+            first_failure_recorded = true;
+        }
+        // Retries move only to a later `<tool_call>` wrapper: the markup nested inside a failed
+        // region (its `<function=...>` or `<invoke>`) must not re-read a truncated call.
+        candidate = text.find(kToolOpen, candidate + 1);
+    }
+    if (accepted == std::string::npos) {
+        // No region parsed. A truncated tail that kept no call carries no arguments either, so
+        // the response is returned as text with the first region's reason recorded.
+        out.diagnostics.fallback_reason = first_failure;
         return fallback(text, out.diagnostics);
     }
+    // A recovered truncated tail keeps its reason for transparency without demoting the output.
+    out.diagnostics.fallback_reason = accepted_reason;
 
+    out.content = rtrim_format_whitespace(source.substr(0, accepted));
     out.tool_calls.reserve(raw_calls.size());
     for (const RawToolCall& raw : raw_calls) {
         out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
     }
 
-    out.diagnostics.duplicate_parameters_repaired = parser.duplicate_parameters_repaired();
+    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
     out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
     out.is_tool_call_response             = true;
     return out;
@@ -974,10 +999,13 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     ParsedToolCallOutput parsed =
         parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_, tolerant_);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
+        // The parser reports the held bytes before the accepted structured region, which are the
+        // bytes after an earlier quoted marker that this decoder has not published yet.
+        std::string content = std::move(parsed.content);
         trailing_whitespace_.clear();
         tool_region_.clear();
         pending_tag_.clear();
-        return Terminal{.content     = {},
+        return Terminal{.content     = std::move(content),
                         .tool_calls  = std::move(parsed.tool_calls),
                         .diagnostics = parsed.diagnostics};
     }
