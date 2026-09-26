@@ -17,4 +17,13 @@ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
                DeviceExecutionView execution);
 
+// Normalize q and k and rotate them. Where the fused Op covers the geometry this is one graph node
+// instead of three; everywhere else it is the three calls it replaces, which are the same
+// arithmetic bit for bit. It chooses a schedule, not a result.
+void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+                       const AttentionConfig& attention, float rms_norm_eps,
+                       const Tensor& q_norm_weight, const Tensor& k_norm_weight,
+                       const Tensor& query, const Tensor& key, Tensor& normalized_query,
+                       Tensor& normalized_key, DeviceExecutionView execution);
+
 } // namespace ninfer::models::qwen3_5::execution
