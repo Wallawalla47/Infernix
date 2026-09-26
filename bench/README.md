@@ -13,7 +13,10 @@ Engine directly.
 
 The serve-level A/B benchmark (upstream + Windows port vs this fork, black-box OpenAI
 API agentic workload; the headline numbers in the [fork README](../README.md)) is a
-standalone Python rig under [`ab/`](ab/README.md).
+standalone Python rig under [`ab/`](ab/README.md). The closed-loop agentic A/B suite under
+[`agentic_ab/`](agentic_ab/README.md) replays interleaved agent sessions, subagent fan-outs,
+compaction, retries and aborts shaped from the production request logs, and reports cache hits,
+TTFT, cold prefill and output rates for the same two builds.
 
 ## Benchmark inputs
 
