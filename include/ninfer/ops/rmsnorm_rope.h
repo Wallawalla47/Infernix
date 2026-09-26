@@ -71,6 +71,9 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, const Prep
  * rope(q_out, k_out) with the Offset epilogue. The outputs must not overlap each other, the
  * inputs, positions, or either norm weight; read-only operands may overlap each other. All
  * tensors are contiguous and 4-byte aligned. The Op owns no workspace or persistent state.
+ *
+ * The formula fixes theta = 1e7, epsilon = 1e-6 and an unscaled rotation; they are not operands.
+ * A caller dispatches here only when its model's RoPE theta and RMSNorm epsilon equal them.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                   const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,

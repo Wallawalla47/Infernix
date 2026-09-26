@@ -12,6 +12,7 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -117,7 +118,7 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--batches") {
             options.batches = parse_list(next("--batches requires a value"), 1, 8, "--batches");
         } else if (argument == "--tokens") {
-            options.tokens = parse_list(next("--tokens requires a value"), 1, 2048, "--tokens");
+            options.tokens = parse_list(next("--tokens requires a value"), 1, 8192, "--tokens");
         } else if (argument == "--execution") {
             const std::string_view value(next("--execution requires a value"));
             if (value == "eager")
@@ -135,6 +136,11 @@ Options parse_options(int argc, char** argv) {
         } else {
             usage("unknown argument");
         }
+    }
+    // The single form's Op takes at most 2048 tokens; the text form reaches prefill chunk widths.
+    if (options.form == Form::Single &&
+        std::any_of(options.tokens.begin(), options.tokens.end(), [](int t) { return t > 2048; })) {
+        usage("--form single takes --tokens up to 2048");
     }
     if (options.profile && ((options.form == Form::Pair &&
                              (options.batches.size() != 1 || options.widths.size() != 1)) ||

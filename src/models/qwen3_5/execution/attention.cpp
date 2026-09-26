@@ -22,17 +22,21 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 // The fused text form is registered for the two text head geometries with a one-dimensional
 // position axis. The MRoPE path and any other geometry take the three calls it replaces.
 //
-// It is also bounded in width. One warp owns one head, so the fused kernel stops gaining once a
-// width alone fills the machine, and past that the three separate kernels - each free to choose
-// its own shape - are ahead: measured on an RTX 5090, the fused form wins by 22 to 52 % through
-// 256 tokens and loses by up to 22 % at 1024. The bound sits a doubling below the crossover
-// because the two geometries cross at different widths. The Op itself is valid at any width; this
-// is a dispatch choice, and both branches are the same arithmetic bit for bit.
-constexpr std::int32_t kFusedTextQkNormRopeMaximumTokens = 256;
+// It serves every width. Measured on an RTX 5090 (graph-timed, both geometries), the fused form
+// is 44 to 48 % faster than the three calls at 256 tokens and still 13 to 20 % faster at the
+// 3584- and 4096-token prefill chunks: it reads and writes q and k once, where the three calls
+// pass over them twice. Both branches are the same arithmetic bit for bit.
+
+// The fused text Op's formula fixes the native schedule's constants rather than taking them as
+// operands; any other theta, epsilon or YaRN coefficient takes the three calls.
+constexpr float kFusedTextRopeTheta = 1.0e7F;
+constexpr float kFusedTextNormEpsilon = 1.0e-6F;
 
 bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
-                             const AttentionConfig& attention, std::int32_t tokens) {
-    return positions.ne[1] == 1 && tokens <= kFusedTextQkNormRopeMaximumTokens &&
+                             const AttentionConfig& attention, float rms_norm_eps,
+                             const ops::PreparedRope& prepared) {
+    return prepared.factor == 1.0F && prepared.theta == kFusedTextRopeTheta &&
+           rms_norm_eps == kFusedTextNormEpsilon && positions.ne[1] == 1 &&
            attention.head_dim == 256 && rope.rotary_dim == 64 &&
            ((attention.num_attention_heads == 16 && attention.num_key_value_heads == 2) ||
             (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4));
@@ -78,8 +82,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, DeviceExecutionView execution) {
     require_rope_axes(positions, rope);
-    if (prepared.factor == 1.0F &&
-        fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    if (fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, prepared)) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, execution.stream);
         return;
