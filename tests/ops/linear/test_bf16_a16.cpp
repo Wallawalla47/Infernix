@@ -257,6 +257,27 @@ int run_selector_linear() {
     return failures;
 }
 
+int run_general_bf16_linear() {
+    // Shapes outside the specialised table (14336/5120, 5120/6144, 256/5120) route to the general
+    // runtime-shape GEMM fallback. Cover the minimal tile, non-tile-aligned extents (the row/column
+    // boundary guards), multi-tile grids, and the QAT full-precision vocab head's real shape.
+    int failures = 0;
+    const std::vector<std::pair<int, int>> shapes = {
+        {32, 32},   // exactly one 32x32 tile
+        {50, 70},   // not a multiple of 32 in either extent
+        {63, 33},   // odd extents
+        {128, 256}, // multiple tiles
+        {248320, 5120},  // QAT bf16 lm_head [vocab, hidden]
+    };
+    for (const auto& [n, k] : shapes) {
+        DeviceWeight weight(make_patterned(n, k, 421U));
+        for (int tokens : {1, 2, 32, 33, 128}) {
+            failures += run_bf16_linear_case(weight, tokens);
+        }
+    }
+    return failures;
+}
+
 int run_bf16_linear() {
     int failures = 0;
     DeviceWeight attention_weight(make_patterned(14336, 5120, 401U));
@@ -274,6 +295,7 @@ int run_bf16_linear() {
         }
     }
     failures += run_selector_linear();
+    failures += run_general_bf16_linear();
     return failures;
 }
 
