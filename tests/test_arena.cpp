@@ -161,6 +161,20 @@ int main() {
     failures += expect_ptr(c.data, base, "allocation after reset pointer");
     failures += expect_size(arena.peak_used(), 4, "arena.peak after reset allocation");
 
+    // A scope that outlives a reset() must not rewind the next generation's live allocations.
+    {
+        auto stale_scope = arena.scope();
+        (void)arena.alloc(ninfer::DType::U8, {8});
+        arena.reset();
+        (void)arena.alloc(ninfer::DType::U8, {64}, 64);
+        (void)arena.alloc(ninfer::DType::U8, {64}, 64);
+    }
+    failures += expect_size(arena.used(), 128, "arena.used after a scope outlived reset");
+    arena.reset();
+    arena.reset_peak();
+    ninfer::Tensor after_generation = arena.alloc(ninfer::DType::U8, {4});
+    failures += expect_ptr(after_generation.data, base, "allocation after generation reset");
+
     ninfer::DeviceArena moved(std::move(arena));
     if (arena.base() != nullptr || arena.capacity() != 0 || arena.used() != 0) {
         ++failures;
