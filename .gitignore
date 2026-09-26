@@ -52,6 +52,18 @@ out/
 tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
+# Deploy bench/working files moved out of E:\NInfer-Deploy-V3 (never committed)
+/deploy-working/
+
+# A/B rig outputs and control build (bench/ab; the scripts and README are tracked)
+/bench/ab/ab_report.md
+/bench/ab/AB_DONE.txt
+/bench/ab/runner.log
+/bench/ab/watchdog.log
+/bench/ab/serve_*.log
+/bench/ab/arm_*.jsonl
+/bench/ab/control/
+
 # Editor / OS
 .vscode/
 .idea/
