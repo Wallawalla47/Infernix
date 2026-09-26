@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -373,13 +374,7 @@ int exercise_vision_dflash(const char* artifact, const std::vector<ninfer::Token
 
 } // namespace
 
-int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
-    if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
-        return 77;
-    }
-
+int run(const char* artifact) {
     const std::vector<ninfer::TokenId> prompt{
         248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
         1710,   248046, 198, 248045, 74455, 198,   248068, 198,
@@ -438,4 +433,20 @@ int main() {
 
     std::cout << "ok\n";
     return 0;
+}
+
+int main() {
+    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    if (artifact == nullptr || *artifact == '\0') {
+        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        return 77;
+    }
+    // An artifact without the DFlash component (a DFlash2-only build, for one) fails at Engine
+    // startup; report that rather than terminating on the uncaught exception.
+    try {
+        return run(artifact);
+    } catch (const std::exception& error) {
+        std::cerr << "uncaught exception: " << error.what() << '\n';
+        return 1;
+    }
 }
