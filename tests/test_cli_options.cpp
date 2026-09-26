@@ -94,6 +94,11 @@ int main() {
                       "CLI log level was not parsed");
     failures += check(help.find("--log-level") != std::string::npos,
                       "CLI help omits the log-level control");
+    const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
+                                             "SAMPLING", "VISION", "LOGGING"};
+    for (const char* section : cli_help_sections) {
+        failures += check(help.find(section) != std::string::npos, "CLI help omits a category");
+    }
     failures += check(rejects([] {
                           (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
                                        "--log-level", "verbose"});
