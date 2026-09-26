@@ -1,3 +1,4 @@
+#include "ninfer_build_id.h"
 #include "options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
@@ -247,6 +248,9 @@ int main(int argc, char** argv) {
          .level        = cli.log_level,
          .presentation = ninfer::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
+#ifdef NINFER_BUILD_ID
+    logger->info("build {}", NINFER_BUILD_ID);
+#endif
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
