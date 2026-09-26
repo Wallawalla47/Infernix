@@ -10,7 +10,7 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
+enum class Residency { Device, Host, Values, HostPinned };
 
 struct ParameterReference {
     std::string name;
@@ -46,16 +46,24 @@ public:
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
     void require_device(ObjectHandle object, std::uint64_t alignment = 256);
+    // Rank a device demand for the evictable arena suffix: higher ranks pack closer to the
+    // arena end and are evicted first. Requires the object to be a device demand.
+    void mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank);
+    void require_pinned(ObjectHandle object, std::uint64_t alignment = 256);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
-    [[nodiscard]] MaterializationPlan finish() &&;
+    // evictable_alignment (a power of two, typically EvictableWeightPool::kChunkBytes)
+    // chunk-aligns the first ranked object so the evictable suffix is chunk-aligned.
+    [[nodiscard]] MaterializationPlan finish(std::uint64_t evictable_alignment = 1) &&;
 
 private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool pinned             = false;
         std::uint64_t alignment = 256;
+        std::uint32_t evict_rank = 0;
         std::vector<std::byte> host_data;
     };
 

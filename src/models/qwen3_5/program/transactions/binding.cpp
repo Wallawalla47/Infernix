@@ -1,9 +1,11 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 #include "core/device.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -19,6 +21,31 @@ void ProgramImpl::initialize_captures(std::uint32_t lane, std::uint32_t from,
             request.capture_groups.push_back(group);
         }
     }
+}
+
+void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& session,
+                                           const PreparedPromptData& prompt,
+                                           const VisionPrefillPlan& plan, std::uint32_t base) {
+    if (!parameters.model.overlay_vision() || !plan.control) { return; }
+    // Overlay: the full tower is absent from VRAM. Items wholly inside the reused prefix are
+    // never encoded again; the rest are encoded through the evictable window now, once, and the
+    // session copies their embeddings in as prefill reaches them.
+    const auto item_count      = static_cast<std::uint32_t>(plan.control->items.size());
+    std::uint32_t first_needed = item_count;
+    for (const auto& use : plan.uses) {
+        if (use.end > base && use.prepared_item_index < first_needed) {
+            first_needed = use.prepared_item_index;
+        }
+    }
+    execution::VisionOverlayWindowStats window_stats;
+    std::vector<execution::PinnedVisionResult> preencoded;
+    if (first_needed < item_count) {
+        preencoded = execution::encode_items_overlay(device, parameters, prompt, plan,
+                                                     first_needed, &window_stats);
+    } else {
+        preencoded.resize(item_count);
+    }
+    session.set_preencoded(std::move(preencoded), window_stats);
 }
 
 void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
@@ -62,6 +89,7 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
                 DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, staged.prompt, vision, vision_handoff,
                 vision_handoff_peak_bytes);
+            preencode_overlay_vision(*staged.vision, staged.prompt, vision, base);
         }
     }
 }

@@ -61,6 +61,35 @@ int main() {
                           dflash_vision.speculative.backend == ninfer::SpeculativeBackend::DFlash &&
                           dflash_vision.speculative.draft_tokens == 7,
                       "CLI did not preserve the combined DFlash and Vision startup features");
+    const ninfer::cli::Options offload =
+        parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--vision-offload",
+               "on", "--vision-max-merged", "512"});
+    failures += check(offload.enable_vision && offload.vision_offload,
+                      "--vision-offload on did not reach CLI options");
+    failures += check(offload.vision_max_merged_tokens == 512,
+                      "--vision-max-merged did not preserve its value");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
+                              "--vision-offload", "on", "--vision-offload", "off"})
+                           .vision_offload,
+                      "--vision-offload off did not reach CLI options");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--vision-offload") != std::string::npos,
+              "CLI help omits --vision-offload");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--vision-offload", "overlay"});
+                      }),
+                      "--vision-offload accepted a value other than on or off");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--vision-max-merged", "33"});
+                      }),
+                      "--vision-max-merged below 64 was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--vision-max-merged", "40000"});
+                      }),
+                      "--vision-max-merged above 32768 was accepted");
     for (const auto k : {1U, 2U, 7U, 15U}) {
         const auto dflash2 = parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--spec",
                                     "dflash2", "--draft-tokens", std::to_string(k)});

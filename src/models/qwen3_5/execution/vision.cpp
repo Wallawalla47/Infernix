@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/vision.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 
 #include "core/device.h"
 #include "core/layout.h"
@@ -87,7 +88,8 @@ TensorRegion alias_tensor(const TensorRegion& storage, DType dtype,
 VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
                                              const VisionParameters& parameters,
                                              std::size_t patches64, std::size_t tokens64,
-                                             std::size_t handoff_offset_bytes) {
+                                             std::size_t handoff_offset_bytes,
+                                             std::size_t* encode_extent = nullptr) {
     if (patches64 == 0 || tokens64 == 0 ||
         patches64 != checked_mul(tokens64,
                                  dimension(std::uint64_t(config.spatial_merge_size) *
@@ -178,6 +180,7 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
             out.x, DType::BF16, {dimension(config.merger_width()), tokens}, "merger hidden");
     }
     out.bytes                = builder.finish(1, "vision workspace");
+    if (encode_extent != nullptr) { *encode_extent = out.bytes; }
     const auto final_scratch = std::max(std::size_t{1}, capacity(parameters.merger_fc2, 1, tokens));
     {
         LayoutBuilder finish;
@@ -225,6 +228,10 @@ VisionContext::VisionContext(DeviceContext& ctx, const Parameters& parameters)
     : ctx_(ctx), config_(parameters.model.config().vision.value()),
       parameters_(parameters.vision.value()) {}
 
+VisionContext::VisionContext(DeviceContext& ctx, const VisionConfig& config,
+                             const VisionParameters& parameters)
+    : ctx_(ctx), config_(config), parameters_(parameters) {}
+
 std::size_t VisionContext::workspace_bytes(const VisionConfig& config,
                                            const VisionParameters& parameters, std::size_t patches,
                                            std::size_t merged_tokens,
@@ -263,6 +270,37 @@ VisionWorkspacePlan VisionContext::plan_workspace(const VisionConfig& config,
     return out;
 }
 
+VisionWorkspacePlan VisionContext::plan_overlay_window(const VisionConfig& config,
+                                                       const VisionParameters& parameters,
+                                                       std::size_t max_patches,
+                                                       std::uint32_t max_merged_tokens) {
+    if (max_merged_tokens == 0 || max_patches == 0) {
+        throw std::invalid_argument("Vision overlay window extents must be positive");
+    }
+    // Place the output handoff after the encode tensors so the borrowed lease never aliases
+    // live activations; there is no general reservation in an overlay window.
+    std::size_t encode_extent = 0;
+    // A zero handoff offset is rejected, and the encode extent is captured before the handoff
+    // region is laid out, so measure the encode tensors with an aligned placeholder offset.
+    (void)build_workspace_layout(config, parameters, max_patches, max_merged_tokens,
+                                 kWorkspaceAlignment, &encode_extent);
+    const std::size_t handoff_offset = align_up(encode_extent, kWorkspaceAlignment,
+                                                "overlay handoff offset");
+    const auto layout =
+        build_workspace_layout(config, parameters, max_patches, max_merged_tokens, handoff_offset);
+    VisionWorkspacePlan out;
+    out.output_hidden          = parameters.merger_fc2.weight.n;
+    out.max_merged_tokens      = max_merged_tokens;
+    out.general_capacity_bytes = 0;
+    out.handoff_offset_bytes   = handoff_offset;
+    out.handoff_capacity_bytes = output_handoff_bytes(out.output_hidden, max_merged_tokens);
+    out.encode_peak_bytes      = layout.bytes;
+    out.capacity_bytes         = std::max(
+        out.encode_peak_bytes,
+        checked_add(out.handoff_offset_bytes, out.handoff_capacity_bytes, "window capacity"));
+    return out;
+}
+
 Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
                                   std::size_t merged_tokens) {
     if (backing.data == nullptr || backing.bytes < plan.capacity_bytes || merged_tokens == 0 ||
@@ -281,7 +319,7 @@ Tensor VisionContext::bind_output(DeviceSpan backing, const VisionWorkspacePlan&
 }
 
 void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                           const VisionWorkspacePlan& plan) const {
+                           const VisionWorkspacePlan& plan, VisionWeightStream* weight_stream) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_5::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
@@ -325,6 +363,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
                                       static_cast<std::uint64_t>(patches64));
         copy_host(control.position_ids.data(), position_ids, stream);
         copy_host(item.patches.data(), patch_bf16, stream);
+        if (weight_stream != nullptr) { weight_stream->prelude_ready(stream); }
         project(patch_bf16, parameters_.patch_embedding, x, layout.patch_scratch);
         ops::add_bias(parameters_.patch_embedding_bias, x, stream);
         // The artifact records the source table shape [rows,hidden], while Tensor's
@@ -339,6 +378,9 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
+        if (weight_stream != nullptr) {
+            weight_stream->arrive(static_cast<std::uint32_t>(layer), stream);
+        }
         const auto& block = parameters_.layers[layer];
         {
             nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
@@ -403,6 +445,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         }
     }
 
+    if (weight_stream != nullptr) { weight_stream->merger_ready(stream); }
     {
         nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(tokens64));
@@ -513,20 +556,37 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     Tensor output = VisionContext::bind_output(workspace_, workspace_plan_, control.merged_count);
 
     if (!owns_handoff() || !active_item_ || *active_item_ != active->prepared_item_index) {
-        const auto& payload = prompt_.media_payloads[active->prepared_item_index];
-        if (!payload) { throw std::logic_error("Vision replay lost its prepared media payload"); }
         if (handoff_.generation_ == std::numeric_limits<std::uint64_t>::max()) {
             throw std::overflow_error("Vision handoff generation exhausted");
         }
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        // Encoding scratch can overwrite the prior handoff before the final projection.
-        // Revoke that binding before enqueueing any work, including a failed encode.
-        handoff_.owner_ = nullptr;
-        ++handoff_.generation_;
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
-                        workspace_plan_);
-        timers_.back().record_stop();
+        if (!preencoded_.empty()) {
+            if (active->prepared_item_index >= preencoded_.size()) {
+                throw std::logic_error("Vision item has no preencoded overlay embeddings");
+            }
+            const PinnedVisionResult& ready = preencoded_[active->prepared_item_index];
+            const std::size_t output_bytes  = output.bytes();
+            if (ready.buffer == nullptr || ready.bytes != output_bytes) {
+                throw std::logic_error("preencoded vision embeddings do not match the item");
+            }
+            handoff_.owner_ = nullptr;
+            ++handoff_.generation_;
+            CUDA_CHECK(cudaMemcpyAsync(output.data, ready.buffer->data(), ready.bytes,
+                                       cudaMemcpyHostToDevice, device_.stream));
+        } else {
+            const auto& payload = prompt_.media_payloads[active->prepared_item_index];
+            if (!payload) {
+                throw std::logic_error("Vision replay lost its prepared media payload");
+            }
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            // Encoding scratch can overwrite the prior handoff before the final projection.
+            // Revoke that binding before enqueueing any work, including a failed encode.
+            handoff_.owner_ = nullptr;
+            ++handoff_.generation_;
+            context_.encode(VisionItemView{payload->span(), &control}, output, workspace_,
+                            workspace_plan_);
+            timers_.back().record_stop();
+        }
         handoff_.owner_       = this;
         active_generation_    = handoff_.generation_;
         active_item_          = active->prepared_item_index;
@@ -543,10 +603,20 @@ void VisionPrefillSession::retire_handoff() noexcept {
     active_handoff_bytes_ = 0;
 }
 
+void VisionPrefillSession::set_preencoded(std::vector<PinnedVisionResult> results,
+                                          const VisionOverlayWindowStats& stats) {
+    const std::size_t expected = plan_.control->prepared_item_begin + plan_.control->items.size();
+    if (results.size() != expected) {
+        throw std::invalid_argument("preencoded results must cover every prepared vision item");
+    }
+    preencoded_    = std::move(results);
+    overlay_stats_ = stats;
+}
+
 double VisionPrefillSession::elapsed_seconds() const {
     double milliseconds = 0.0;
     for (const CudaEventTimer& timer : timers_) { milliseconds += timer.elapsed_ms(); }
-    return milliseconds / 1000.0;
+    return milliseconds / 1000.0 + (overlay_stats_ ? overlay_stats_->window_seconds : 0.0);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

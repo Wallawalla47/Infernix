@@ -161,6 +161,11 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // Vision offload keeps the vision tower in pinned system RAM instead of device memory and
+    // streams it through borrowed evictable device staging per encode window.
+    bool vision_offload = false;
+    // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
+    std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
@@ -694,6 +699,13 @@ struct GenerationTimings {
     double prompt_wall_seconds     = 0.0;
     double generation_wall_seconds = 0.0;
     double total_seconds           = 0.0;
+    // Vision offload: duration and traffic of the encode window that streamed the vision tower
+    // from system RAM through borrowed device memory.
+    double vision_offload_window_seconds       = 0.0;
+    double vision_offload_evict_seconds        = 0.0;
+    double vision_offload_restore_seconds      = 0.0;
+    std::uint64_t vision_offload_evicted_bytes = 0;
+    std::uint64_t vision_offload_staged_bytes  = 0;
 };
 
 // Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency

@@ -720,6 +720,14 @@ int media_token_id(const Tokenizer& tokenizer, std::string_view text) {
 
 } // namespace
 
+std::uint64_t merged_token_image_pixels() {
+    return static_cast<std::uint64_t>(kFactor) * kFactor;
+}
+
+std::uint64_t merged_token_video_pixels() {
+    return static_cast<std::uint64_t>(kTemporal) * kFactor * kFactor;
+}
+
 std::string PreprocessStats::summary() const {
     std::ostringstream out;
     out << "media=" << media_items << " media_bytes=" << media_bytes << " patches=" << raw_patches

@@ -275,6 +275,24 @@ int run_general_bf16_linear() {
             failures += run_bf16_linear_case(weight, tokens);
         }
     }
+    // The quasar vision tower is stored BF16, so every vision projection routes here. Cover its
+    // real shapes (patch_embedding, fused qkv/attention output, mlp fc1/fc2, merger fc1/fc2) at the
+    // image patch counts (T up to a huge image), which the generic cases above never reach.
+    const std::vector<std::pair<int, int>> vision_shapes = {
+        {1152, 1536}, // patch_embedding  [hidden, 3*t*p*p]
+        {1152, 1152}, // attention query/key/value and output
+        {3456, 1152}, // fused qkv
+        {4304, 1152}, // mlp fc1
+        {1152, 4304}, // mlp fc2
+        {4608, 4608}, // merger fc1
+        {5120, 4608}, // merger fc2
+    };
+    for (const auto& [n, k] : vision_shapes) {
+        DeviceWeight weight(make_patterned(n, k, 422U));
+        for (int tokens : {1, 2, 32, 33, 256, 1024, 1025, 4096}) {
+            failures += run_bf16_linear_case(weight, tokens);
+        }
+    }
     return failures;
 }
 

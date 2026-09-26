@@ -552,6 +552,14 @@ public:
             std::min<std::uint64_t>(options.max_context, kMaximumPromptVisionTokens);
         processor.max_vision_tokens = vision_tokens;
         processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (options.vision_max_merged_tokens != 0) {
+            processor.image_max_pixels = std::min(
+                processor.image_max_pixels,
+                std::uint64_t(options.vision_max_merged_tokens) * fi::merged_token_image_pixels());
+            processor.video_max_pixels = std::min(
+                processor.video_max_pixels,
+                std::uint64_t(options.vision_max_merged_tokens) * fi::merged_token_video_pixels());
+        }
         if (vision_enabled) {
             const std::uint64_t minimum_live =
                 processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);

@@ -4,10 +4,12 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -51,13 +53,22 @@ public:
         return backing_.stats();
     }
 
+    // Overlay vision assets (evictable pool + pinned block + layout); present only when the
+    // model was loaded with vision offload on.
+    [[nodiscard]] const std::optional<VisionOverlayAssets>& overlay_vision() const noexcept {
+        return overlay_vision_;
+    }
+
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing);
+          FrontendResources resources, InstanceInfo info,
+          std::optional<VisionOverlayAssets> overlay_vision,
+          artifact::MaterializedArtifact backing);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
+    std::optional<VisionOverlayAssets> overlay_vision_;
     artifact::MaterializedArtifact backing_;
     Config config_;
     LoadOptions options_;

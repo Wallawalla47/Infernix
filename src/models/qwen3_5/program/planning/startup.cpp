@@ -720,10 +720,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                   out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
+        const std::uint64_t capped =
+            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens);
         const std::uint32_t merged = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(plan.capacity, kMaximumVisionItemTokens));
+            std::min(capped, static_cast<std::uint64_t>(plan.features.vision_max_merged_tokens)));
         out.vision = execution::VisionContext::plan_workspace(
             *parameters.model.config().vision, *parameters.vision, merged, out.general_capacity);
+        if (plan.features.overlay_vision()) {
+            // Overlay: the resident reservation carries only the output handoff; the encode
+            // workspace comes from the evicted weight tail during each overlay window.
+            out.vision->capacity_bytes =
+                out.vision->handoff_offset_bytes + out.vision->handoff_capacity_bytes;
+        }
         out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
     }
     return out;
