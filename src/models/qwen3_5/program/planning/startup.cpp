@@ -853,6 +853,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
+    impl->fast_prefill_kernel  = inputs.fast_prefill_kernel;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->ngram_draft_window   = inputs.ngram_draft_window;
@@ -918,6 +919,28 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 
 } // namespace
 
+namespace {
+// INT8 KV prefills with the fast prompt kernel unless the original kernel was selected.
+bool uses_fast_int8_prefill(const EngineOptions& options) {
+    return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
+}
+} // namespace
+
+// Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
+// is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
+// partial last wave.
+std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
+    if (!uses_fast_int8_prefill(options)) { return requested; }
+    const auto& attention = *parameters.model.config().text.attention;
+    const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
+        {static_cast<std::int32_t>(attention.head_dim),
+         static_cast<std::int32_t>(attention.num_attention_heads),
+         static_cast<std::int32_t>(attention.num_key_value_heads)}));
+    return requested < wave ? requested : requested / wave * wave;
+}
+
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
@@ -929,7 +952,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .ngram_min_match     = options.speculative.ngram_min_match,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
-        .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
+        .prefill_chunk       = effective_prefill_chunk(parameters, options),
+        .fast_prefill_kernel = uses_fast_int8_prefill(options),
         .draft_window =
             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
         .speculative_backend  = options.speculative.backend,

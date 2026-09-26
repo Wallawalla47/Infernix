@@ -58,6 +58,12 @@ void validate_options(const EngineOptions& options) {
     if (options.media_preprocess_threads > 64) {
         throw std::invalid_argument("Engine media_preprocess_threads must be in [0,64]");
     }
+    // The prompt-kernel choice exists only for INT8 KV; accepting it elsewhere would select a
+    // kernel that never runs.
+    if (options.original_int8_prefill_kernel && options.kv_cache != KvCacheStorage::Int8Group64) {
+        throw std::invalid_argument(
+            "the original INT8 prefill kernel requires the INT8 KV cache (--kv-dtype int8)");
+    }
 }
 
 std::size_t current_free_device_bytes() {

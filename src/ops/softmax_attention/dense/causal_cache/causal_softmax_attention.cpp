@@ -1,6 +1,7 @@
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 
+#include "core/device.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
@@ -28,6 +29,8 @@ constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens = 16;
 constexpr std::int32_t kMaximumBatchSize    = 8;
+// Query rows of one eight-warp fast INT8 prompt CTA (int8/fast_tiled_launch.cuh checks it).
+constexpr std::int32_t kPromptWaveRows = 128;
 
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
@@ -260,6 +263,18 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
 }
 
 } // namespace
+
+std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
+    require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
+    int device          = 0;
+    int multiprocessors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device));
+    // The fast prompt kernel runs one CTA per SM over at most kPromptWaveRows query rows of one
+    // head, and kPromptWaveRows is a multiple of the tiled kernel's 64-row query tile.
+    const std::int32_t row_blocks = std::max(1, multiprocessors / geometry.query_heads);
+    return row_blocks * kPromptWaveRows;
+}
 
 std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,

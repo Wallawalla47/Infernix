@@ -176,6 +176,14 @@ int run_tests() {
     failures +=
         check(help.find("nvfp4") != std::string::npos && help.find("k8v4") != std::string::npos,
               "CLI help omits a production KV storage mode");
+    failures += check(!k8v4.original_int8_prefill_kernel,
+                      "the CLI original INT8 prefill kernel must default off");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--kv-dtype",
+                             "int8", "--use-original-int8-prefill-kernel"})
+                          .original_int8_prefill_kernel,
+                      "--use-original-int8-prefill-kernel was not parsed");
+    failures += check(help.find("--use-original-int8-prefill-kernel") != std::string::npos,
+                      "CLI help omits --use-original-int8-prefill-kernel");
     const ninfer::cli::Options logging =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--log-level", "debug"});
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,

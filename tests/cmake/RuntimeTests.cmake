@@ -17,3 +17,9 @@ ninfer_add_test(ninfer_kv_capacity_test
 ninfer_add_test(ninfer_sampling_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_sampling_defaults.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+
+ninfer_add_test(ninfer_engine_options_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_engine_options.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(ninfer_engine_options_test PROPERTIES SKIP_RETURN_CODE 77)

@@ -657,6 +657,20 @@ int main() {
     failures += check(!secret_present, "startup argv retained the API key");
     failures += check(redaction_present, "startup argv omitted the API-key redaction marker");
 
+    failures += check(!archive.original_int8_prefill_kernel,
+                      "the original INT8 prefill kernel must default off");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--use-original-int8-prefill-kernel"})
+                          .original_int8_prefill_kernel,
+                      "--use-original-int8-prefill-kernel was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--use-original-int8-prefill-kernel") !=
+                          std::string::npos,
+                      "serve help omits --use-original-int8-prefill-kernel");
+    bool fast_flag_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"});
+    } catch (const std::invalid_argument&) { fast_flag_rejected = true; }
+    failures += check(fast_flag_rejected, "the removed --fast-prefill-kernel was accepted");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }
