@@ -12,6 +12,9 @@
 #    include <netinet/tcp.h>
 #    include <sys/socket.h>
 #    include <unistd.h>
+#elif defined(_WIN32)
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
 #endif
 
 namespace {
@@ -209,36 +212,58 @@ int test_prompt_json_member_order() {
         "HTTP request JSON changed prompt-bearing object member order");
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
+#    if defined(_WIN32)
+using NativeSocket               = SOCKET;
+using SocketLength               = int;
+constexpr NativeSocket kNoSocket = INVALID_SOCKET;
+void close_socket(NativeSocket socket) { ::closesocket(socket); }
+#    else
+using NativeSocket               = int;
+using SocketLength               = socklen_t;
+constexpr NativeSocket kNoSocket = -1;
+void close_socket(NativeSocket socket) { ::close(socket); }
+#    endif
+
 class Socket final {
 public:
-    explicit Socket(int descriptor = -1) : descriptor_(descriptor) {}
+    explicit Socket(NativeSocket descriptor = kNoSocket) : descriptor_(descriptor) {}
 
     ~Socket() {
-        if (descriptor_ >= 0) { ::close(descriptor_); }
+        if (valid()) { close_socket(descriptor_); }
     }
 
     Socket(const Socket&)            = delete;
     Socket& operator=(const Socket&) = delete;
 
-    [[nodiscard]] int get() const noexcept { return descriptor_; }
+    [[nodiscard]] NativeSocket get() const noexcept { return descriptor_; }
+    [[nodiscard]] bool valid() const noexcept { return descriptor_ != kNoSocket; }
 
 private:
-    int descriptor_ = -1;
+    NativeSocket descriptor_ = kNoSocket;
 };
 
 template <class T>
-bool socket_option_equals(int socket, int level, int option, T expected) {
+bool socket_option_equals(NativeSocket socket, int level, int option, T expected) {
     T actual{};
-    socklen_t size = sizeof(actual);
-    return ::getsockopt(socket, level, option, &actual, &size) == 0 && size == sizeof(actual) &&
-           actual == expected;
+    SocketLength size = sizeof(actual);
+    return ::getsockopt(socket, level, option, reinterpret_cast<char*>(&actual), &size) == 0 &&
+           size == static_cast<SocketLength>(sizeof(actual)) && actual == expected;
 }
 
 int test_inherited_socket_liveness() {
     int failures = 0;
+#    if defined(_WIN32)
+    WSADATA winsock{};
+    if (::WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
+        return check(false, "failed to start Winsock for the liveness test");
+    }
+    struct WinsockCleanup {
+        ~WinsockCleanup() { ::WSACleanup(); }
+    } cleanup;
+#    endif
     Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
-    if (listener.get() < 0) { return check(false, "failed to create HTTP listener test socket"); }
+    if (!listener.valid()) { return check(false, "failed to create HTTP listener test socket"); }
     ninfer::serve::configure_http_server_socket(listener.get());
 
     sockaddr_in address{};
@@ -249,19 +274,34 @@ int test_inherited_socket_liveness() {
         ::listen(listener.get(), 1) != 0) {
         return check(false, "failed to bind HTTP listener test socket");
     }
-    socklen_t address_size = sizeof(address);
+    SocketLength address_size = sizeof(address);
     if (::getsockname(listener.get(), reinterpret_cast<sockaddr*>(&address), &address_size) != 0) {
         return check(false, "failed to inspect HTTP listener test address");
     }
 
     Socket client(::socket(AF_INET, SOCK_STREAM, 0));
-    if (client.get() < 0 || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
-                                      sizeof(address)) != 0) {
+    if (!client.valid() || ::connect(client.get(), reinterpret_cast<const sockaddr*>(&address),
+                                     sizeof(address)) != 0) {
         return check(false, "failed to connect HTTP liveness test socket");
     }
     Socket accepted(::accept(listener.get(), nullptr, nullptr));
-    if (accepted.get() < 0) { return check(false, "failed to accept HTTP liveness test socket"); }
+    if (!accepted.valid()) { return check(false, "failed to accept HTTP liveness test socket"); }
 
+#    if defined(_WIN32)
+    // Windows reports SO_KEEPALIVE as a one-byte BOOLEAN and TCP_MAXRTMS stands for
+    // TCP_USER_TIMEOUT.
+    failures += check(socket_option_equals<char>(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
+                      "accepted HTTP socket did not inherit SO_KEEPALIVE");
+    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),
+                      "accepted HTTP socket did not inherit TCP_KEEPIDLE");
+    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPINTVL, 3),
+                      "accepted HTTP socket did not inherit TCP_KEEPINTVL");
+    failures += check(socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_KEEPCNT, 3),
+                      "accepted HTTP socket did not inherit TCP_KEEPCNT");
+    failures += check(
+        socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_MAXRTMS, 15000),
+        "accepted HTTP socket did not inherit TCP_MAXRTMS");
+#    else
     failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
                       "accepted HTTP socket did not inherit SO_KEEPALIVE");
     failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),
@@ -273,6 +313,7 @@ int test_inherited_socket_liveness() {
     failures += check(
         socket_option_equals<unsigned int>(accepted.get(), IPPROTO_TCP, TCP_USER_TIMEOUT, 15000U),
         "accepted HTTP socket did not inherit TCP_USER_TIMEOUT");
+#    endif
     return failures;
 }
 #endif
@@ -282,7 +323,7 @@ int test_inherited_socket_liveness() {
 int main() {
     int failures = test_ngram_identity() + test_ngram_generation() + test_sse_transport() +
                    test_sse_response_headers() + test_prompt_json_member_order();
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
     failures += test_inherited_socket_liveness();
 #endif
     if (failures == 0) { std::cout << "ok\n"; }
