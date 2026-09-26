@@ -153,6 +153,10 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    // Message the model receives when it hits its thinking budget, before the canonical
+    // </think> close the frontend appends when the message lacks it. Empty preserves the
+    // model's built-in end-of-thinking control suffix.
+    std::string thinking_budget_message;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.

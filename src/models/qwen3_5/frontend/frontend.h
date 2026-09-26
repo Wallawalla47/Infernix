@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -31,6 +32,10 @@ struct FrontendOptions {
     std::uint32_t vision_max_merged_tokens = 32768;
     bool ngram_sources_enabled             = false;
     bool ngram_archive_enabled             = false;
+    // End-of-thinking message injected when a request hits its thinking budget. Empty
+    // preserves the built-in canonical control suffix; a message lacking the canonical
+    // </think> close serialization gets it appended at startup.
+    std::string thinking_budget_message;
 };
 
 struct FrontendResources;

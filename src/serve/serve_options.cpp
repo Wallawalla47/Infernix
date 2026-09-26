@@ -131,6 +131,12 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
+           "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
+           "                             budget, replacing the built-in end-of-thinking notice\n"
+           "                             (wrap the message in double quotes, e.g.\n"
+           "                             --thinking-budget-message \"Time to stop thinking. I must "
+           "act\n"
+           "                             now:\")\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
@@ -420,6 +426,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--thinking-budget-message") {
+            options.thinking_budget_message = require_value("--thinking-budget-message");
+            if (options.thinking_budget_message.empty()) {
+                throw std::invalid_argument("--thinking-budget-message must not be empty");
+            }
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--vision-offload") {
