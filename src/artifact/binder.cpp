@@ -56,6 +56,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
         }
         if (residency == Residency::Device) {
             require_device(part.object);
+        } else if (residency == Residency::HostPinned) {
+            require_pinned(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
         }
@@ -82,6 +84,25 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     }
     auto& demand     = demands_.at(object.index);
     demand.device    = true;
+    demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+}
+
+void Binder::mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank) {
+    auto& demand = demands_.at(object.index);
+    if (!demand.device) {
+        throw ArtifactError("evictable rank requires a device demand");
+    }
+    demand.evict_rank = std::max(demand.evict_rank, evict_rank);
+}
+
+void Binder::require_pinned(ObjectHandle object, std::uint64_t alignment) {
+    reader_.validate_object(object);
+    const auto& geometry = reader_.geometry(object);
+    if (!alignment || (alignment & (alignment - 1))) {
+        throw ArtifactError("pinned alignment must be a power of two");
+    }
+    auto& demand     = demands_.at(object.index);
+    demand.pinned    = true;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
 }
 
@@ -154,7 +175,10 @@ HostValues Binder::values(const Binding& binding, std::optional<QType> format) {
     return out;
 }
 
-MaterializationPlan Binder::finish() && {
+MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
+    if (!evictable_alignment || (evictable_alignment & (evictable_alignment - 1))) {
+        throw ArtifactError("evictable alignment must be a power of two");
+    }
     MaterializationPlan plan;
     plan.source            = &reader_;
     plan.object_count      = demands_.size();
@@ -162,7 +186,7 @@ MaterializationPlan Binder::finish() && {
     plan.owned_value_bytes = owned_value_bytes_;
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         auto& demand = demands_[i];
-        if (demand.device) {
+        if (demand.device && demand.evict_rank == 0) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);
             const auto offset =
@@ -173,6 +197,45 @@ MaterializationPlan Binder::finish() && {
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
         }
+        if (demand.pinned) {
+            const ObjectHandle handle{i};
+            const auto& geometry = reader_.geometry(handle);
+            const auto offset =
+                align_up(plan.pinned_capacity_bytes, 256, "pinned offset");
+            plan.pinned_objects.push_back({handle, offset, geometry.bytes});
+            plan.pinned_capacity_bytes = checked_add(offset, geometry.bytes, "pinned capacity");
+        }
+    }
+    // Ranked device objects pack after the unranked prefix in ascending rank, so higher
+    // ranks sit closer to the arena end and are evicted first. Each is aligned to the
+    // evictable chunk so the evictable suffix is chunk-aligned.
+    std::vector<std::size_t> ranked;
+    for (std::size_t i = 0; i < demands_.size(); ++i) {
+        if (demands_[i].device && demands_[i].evict_rank != 0) { ranked.push_back(i); }
+    }
+    std::sort(ranked.begin(), ranked.end(), [this](std::size_t a, std::size_t b) {
+        if (demands_[a].evict_rank != demands_[b].evict_rank) {
+            return demands_[a].evict_rank < demands_[b].evict_rank;
+        }
+        return a < b;
+    });
+    std::uint64_t tail_begin   = 0;
+    bool first_ranked         = true;
+    for (std::size_t i : ranked) {
+        auto& demand = demands_[i];
+        const ObjectHandle handle{i};
+        const auto& geometry = reader_.geometry(handle);
+        const auto alignment = std::max(demand.alignment, evictable_alignment);
+        const auto offset = align_up(plan.device_capacity_bytes, alignment, "device offset");
+        if (first_ranked) {
+            tail_begin   = offset;
+            first_ranked = false;
+        }
+        plan.device_objects.push_back({handle, offset, geometry.bytes, alignment});
+        plan.device_capacity_bytes = checked_add(offset, geometry.bytes, "device capacity");
+    }
+    if (!first_ranked) {
+        plan.evictable_tail_bytes = plan.device_capacity_bytes - tail_begin;
     }
     return plan;
 }

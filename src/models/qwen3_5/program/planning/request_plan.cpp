@@ -139,6 +139,26 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             }
             previous_end = item.token_end;
         }
+        if (parameters.model.overlay_vision()) {
+            // The overlay window borrows staging + encode lease from the evictable weight tail;
+            // admit only requests whose borrow fits the ladder.
+            const auto& overlay = *parameters.model.overlay_vision();
+            std::size_t max_patches = 0;
+            std::uint32_t max_merged = 0;
+            for (std::size_t index = 0; index < vision->items.size(); ++index) {
+                const qwen3_5::VisionItemControlPlan& item = vision->items[index];
+                max_patches = std::max(max_patches, prompt.vision_items[index].patch_count);
+                max_merged  = std::max(max_merged, static_cast<std::uint32_t>(item.merged_count));
+            }
+            const auto window = execution::VisionContext::plan_overlay_window(
+                *parameters.model.config().vision, *parameters.vision, max_patches, max_merged);
+            const std::size_t borrow =
+                (overlay.layout.staging_bytes + 255) / 256 * 256 + window.capacity_bytes;
+            if (borrow > overlay.ladder_bytes) {
+                throw std::invalid_argument(
+                    "vision overlay window exceeds the evictable weight ladder");
+            }
+        }
         base->vision_control_plan = std::move(vision);
     }
 

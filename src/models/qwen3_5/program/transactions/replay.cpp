@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
 #include "ninfer/ops/sampling.h"
@@ -256,6 +257,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
                 DeviceSpan{workspace_storage.base(), workspace_storage.capacity()},
                 *workspace_plan.vision, replay.prompt, *replay.vision_plan, vision_handoff,
                 vision_handoff_peak_bytes);
+            preencode_overlay_vision(*replay.vision, replay.prompt, *replay.vision_plan, cursor);
         }
 
         if (bridge_mtp) {

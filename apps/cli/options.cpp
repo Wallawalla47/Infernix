@@ -92,7 +92,8 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--chat-template FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
-           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max] [--vision]\n"
+           "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
+           "       [--vision] [--vision-offload on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
@@ -143,6 +144,10 @@ std::string usage_text(const char* argv0) {
            "\n"
            "VISION (off by default)\n"
            "  --vision                 enable image/video input\n"
+           "  --vision-offload on|off  keep the vision tower in pinned system RAM instead of\n"
+           "                           VRAM (default off; on adds no steady-state VRAM)\n"
+           "  --vision-max-merged N    max merged vision tokens per item (default 32768);\n"
+           "                           oversized media downscales at preprocessing\n"
            "\n"
            "LOGGING\n"
            "  --log-level L            trace|debug|info|warning|error|critical|off\n"
@@ -205,6 +210,21 @@ Options parse_options(int argc, char** argv) {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-offload") {
+            const std::string_view mode = value(arg);
+            if (mode == "on") {
+                options.vision_offload = true;
+            } else if (mode == "off") {
+                options.vision_offload = false;
+            } else {
+                throw std::invalid_argument("--vision-offload accepts on or off");
+            }
+        } else if (arg == "--vision-max-merged") {
+            const std::uint32_t merged = parse_u32(value(arg), "vision-max-merged");
+            if (merged < 64 || merged > 32768) {
+                throw std::invalid_argument("--vision-max-merged must be in [64, 32768]");
+            }
+            options.vision_max_merged_tokens = merged;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--stop-token-id") {

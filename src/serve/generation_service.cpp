@@ -261,9 +261,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.enable_vision            = options_.enable_vision;
-    engine_options.use_cuda_graph           = options_.use_cuda_graph;
+    engine_options.kv_cache                  = options_.kv_cache;
+    engine_options.enable_vision             = options_.enable_vision;
+    engine_options.vision_offload            = options_.vision_offload;
+    engine_options.vision_max_merged_tokens  = options_.vision_max_merged_tokens;
+    engine_options.use_cuda_graph            = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
     engine_options.context_cache            = options_.context_cache;
     engine_options.context_cost.preset_path = options_.context_cost_presets;
@@ -459,10 +461,15 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.first_token_seconds - result.timings.prepare_seconds);
     outcome.metrics.vision_seconds          = result.timings.vision_seconds;
-    outcome.metrics.prefill_seconds         = result.timings.prefill_seconds;
-    outcome.metrics.decode_seconds          = result.timings.decode_seconds;
-    outcome.metrics.prompt_wall_seconds     = result.timings.prompt_wall_seconds;
-    outcome.metrics.generation_wall_seconds = result.timings.generation_wall_seconds;
+    outcome.metrics.prefill_seconds                = result.timings.prefill_seconds;
+    outcome.metrics.decode_seconds                 = result.timings.decode_seconds;
+    outcome.metrics.prompt_wall_seconds            = result.timings.prompt_wall_seconds;
+    outcome.metrics.generation_wall_seconds        = result.timings.generation_wall_seconds;
+    outcome.metrics.vision_offload_window_seconds  = result.timings.vision_offload_window_seconds;
+    outcome.metrics.vision_offload_evict_seconds   = result.timings.vision_offload_evict_seconds;
+    outcome.metrics.vision_offload_restore_seconds = result.timings.vision_offload_restore_seconds;
+    outcome.metrics.vision_offload_evicted_bytes   = result.timings.vision_offload_evicted_bytes;
+    outcome.metrics.vision_offload_staged_bytes    = result.timings.vision_offload_staged_bytes;
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);

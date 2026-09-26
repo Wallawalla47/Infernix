@@ -7,12 +7,18 @@
 namespace ninfer::models {
 
 struct LoadOptions {
-    EnginePurpose purpose          = EnginePurpose::Generation;
-    bool vision                    = false;
-    SpeculativeBackend speculative = SpeculativeBackend::None;
-    ProposalHead proposal_head     = ProposalHead::Full;
+    EnginePurpose purpose                  = EnginePurpose::Generation;
+    bool vision                            = false;
+    bool vision_offload                    = false;
+    std::uint32_t vision_max_merged_tokens = 32768;
+    SpeculativeBackend speculative         = SpeculativeBackend::None;
+    ProposalHead proposal_head             = ProposalHead::Full;
 
     bool operator==(const LoadOptions&) const = default;
+
+    // Vision offload keeps the vision tower in pinned system RAM and streams it through borrowed
+    // device memory per encode window; requires vision plus an evictable weight ladder.
+    [[nodiscard]] bool overlay_vision() const noexcept { return vision && vision_offload; }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
         return speculative != SpeculativeBackend::None;
@@ -53,10 +59,12 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-    return {.purpose       = options.purpose,
-            .vision        = options.enable_vision,
-            .speculative   = options.speculative.backend,
-            .proposal_head = options.speculative.proposal_head};
+            .proposal_head              = options.speculative.proposal_head};
+    return {.purpose                  = options.purpose,
+            .vision                   = options.enable_vision,
+            .vision_offload           = options.vision_offload,
+            .vision_max_merged_tokens = options.vision_max_merged_tokens,
+            .speculative              = options.speculative.backend,
 }
 
 } // namespace ninfer::models

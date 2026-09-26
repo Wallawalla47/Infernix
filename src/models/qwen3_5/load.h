@@ -27,6 +27,7 @@ public:
     [[nodiscard]] const ModelWeights& weights() const;
     [[nodiscard]] const FrontendResources& resources() const;
     [[nodiscard]] const artifact::MaterializationPlan& materialization() const;
+    [[nodiscard]] const std::optional<VisionOverlayLayout>& vision_overlay_layout() const;
     [[nodiscard]] const artifact::ParameterReference& parameter(WeightId id) const;
     [[nodiscard]] std::span<const WeightUse> uses(WeightId id) const;
 

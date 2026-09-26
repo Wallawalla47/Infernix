@@ -9,6 +9,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/vision_prefill.h"
+#include "models/qwen3_5/execution/vision_overlay.h"
 
 #include <array>
 #include <cstddef>
@@ -24,6 +25,10 @@ using detail::VisionPrefillPlan;
 using detail::VisionUseSpan;
 using detail::VisionHandoffState;
 
+class VisionWeightStream;
+struct PinnedVisionResult;
+struct VisionOverlayWindowStats;
+
 struct VisionItemView {
     std::span<const std::uint16_t> patches;
     const qwen3_5::VisionItemControl* control = nullptr;
@@ -32,6 +37,9 @@ struct VisionItemView {
 class VisionContext {
 public:
     VisionContext(DeviceContext& device, const execution::Parameters& parameters);
+    // Overlay windows bind against a rebased per-window weight view.
+    VisionContext(DeviceContext& device, const VisionConfig& config,
+                  const VisionParameters& parameters);
 
     [[nodiscard]] static std::size_t workspace_bytes(const VisionConfig& config,
                                                      const VisionParameters& parameters,
@@ -41,13 +49,22 @@ public:
                                                             const VisionParameters& parameters,
                                                             std::uint32_t max_merged_tokens,
                                                             std::size_t general_capacity_bytes);
+    // Window plan for an overlay encode: the output handoff is placed after the encode
+    // tensors (no general reservation), so the borrowed lease never aliases live
+    // activations. max_patches/max_merged_tokens bound every item the window encodes.
+    [[nodiscard]] static VisionWorkspacePlan plan_overlay_window(const VisionConfig& config,
+                                                                 const VisionParameters& parameters,
+                                                                 std::size_t max_patches,
+                                                                 std::uint32_t max_merged_tokens);
 
     [[nodiscard]] const VisionConfig& config() const noexcept { return config_; }
 
     [[nodiscard]] static Tensor bind_output(DeviceSpan backing, const VisionWorkspacePlan& plan,
                                             std::size_t merged_tokens);
+    // weight_stream, when set, gates each stage on the streamed uploads of an overlay window;
+    // resident execution passes nullptr.
     void encode(const VisionItemView& item, Tensor& output, DeviceSpan backing,
-                const VisionWorkspacePlan& plan) const;
+                const VisionWorkspacePlan& plan, VisionWeightStream* weight_stream = nullptr) const;
 
 private:
     DeviceContext& ctx_;
@@ -79,6 +96,13 @@ public:
     [[nodiscard]] std::size_t active_handoff_bytes() const noexcept {
         return owns_handoff() ? active_handoff_bytes_ : 0;
     }
+    // Install embeddings produced by an overlay window: prepare_chunk then uploads them
+    // instead of encoding, and the media payload becomes releasable immediately.
+    void set_preencoded(std::vector<PinnedVisionResult> results,
+                        const VisionOverlayWindowStats& stats);
+    [[nodiscard]] const std::optional<VisionOverlayWindowStats>& overlay_stats() const noexcept {
+        return overlay_stats_;
+    }
 
 private:
     [[nodiscard]] bool owns_handoff() const noexcept {
@@ -97,6 +121,8 @@ private:
     std::uint64_t active_generation_  = 0;
     std::size_t active_handoff_bytes_ = 0;
     std::vector<CudaEventTimer> timers_;
+    std::vector<PinnedVisionResult> preencoded_;
+    std::optional<VisionOverlayWindowStats> overlay_stats_;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

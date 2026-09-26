@@ -46,9 +46,11 @@ struct ServeOptions {
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;
-    bool enable_vision      = false;
-    bool use_cuda_graph     = true;
-    bool allow_prefix_reuse = true;
+    bool enable_vision                     = false;
+    bool vision_offload                    = false;
+    std::uint32_t vision_max_merged_tokens = 32768;
+    bool use_cuda_graph                    = true;
+    bool allow_prefix_reuse                = true;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     // Recover complete Qwen calls with malformed wrapper/suffix output (opt-in; strict by default).

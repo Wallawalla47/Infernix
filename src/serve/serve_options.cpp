@@ -167,6 +167,11 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "VISION (off by default)\n"
            "  --vision                   enable media and load the Vision GPU allocations\n"
+           "  --vision-offload on|off    keep the vision tower in pinned system RAM instead of\n"
+           "                             VRAM (default off); on adds no steady-state VRAM and\n"
+           "                             borrows device memory only while encoding an image;\n"
+           "                             requires --vision\n"
+           "  --vision-max-merged N      bound merged vision tokens, 64-32768 (default 32768)\n"
            "  --media-cache-mib N        retained decoded-media cache\n"
            "                             (default 1024; 0 disables)\n"
            "  --media-live-mib N         cap on live BF16 patch payloads (default 2048)\n"
@@ -211,6 +216,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             strict parsers that reject choices:[] accept it\n"
            "\n"
            "NOTES\n"
+           "  --vision-offload on requires --vision.\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n";
@@ -361,6 +367,22 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--vision-offload") {
+            const std::string_view value = require_value("--vision-offload");
+            if (value == "on") {
+                options.vision_offload = true;
+            } else if (value == "off") {
+                options.vision_offload = false;
+            } else {
+                throw std::invalid_argument("--vision-offload accepts on or off");
+            }
+        } else if (arg == "--vision-max-merged") {
+            const std::uint32_t merged =
+                parse_nonnegative_int(require_value("--vision-max-merged"), "vision-max-merged");
+            if (merged < 64 || merged > 32768) {
+                throw std::invalid_argument("--vision-max-merged must be in [64, 32768]");
+            }
+            options.vision_max_merged_tokens = merged;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (arg == "--no-prefix-reuse") {
@@ -434,6 +456,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.vision_offload && !options.enable_vision) {
+        throw std::invalid_argument("--vision-offload on requires --vision");
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

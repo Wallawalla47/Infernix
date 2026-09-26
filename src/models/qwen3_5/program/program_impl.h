@@ -490,6 +490,8 @@ public:
     void install_resume_sampling(SequenceState&, RequestControl&);
     void initialize_prefill(std::uint32_t lane, std::uint32_t base);
     void initialize_captures(std::uint32_t lane, std::uint32_t from, std::uint32_t through);
+    void preencode_overlay_vision(execution::VisionPrefillSession&, const PreparedPromptData&,
+                                  const VisionPrefillPlan&, std::uint32_t base);
     [[nodiscard]] SequenceHandle sequence_handle(std::uint32_t lane) const noexcept;
     void invalidate_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] SequenceState& active_sequence(std::uint32_t lane);
