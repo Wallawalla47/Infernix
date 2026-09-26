@@ -14,6 +14,10 @@ void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tenso
 void speculative_prepare_verify_ids_launch(const Tensor& anchors, const Tensor& drafts,
                                            const Tensor& current_extents, Tensor& verify_ids,
                                            cudaStream_t stream);
+void speculative_overlay_copy_proposals_launch(const Tensor& copy_rows, const Tensor& copy_drafts,
+                                               const Tensor& copy_candidates, const Tensor& copy_q,
+                                               Tensor& drafts, Tensor& candidates,
+                                               Tensor& proposal_q, cudaStream_t stream);
 
 void speculative_accept_greedy_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
                                              const Tensor& drafts, const Tensor& current_extents,

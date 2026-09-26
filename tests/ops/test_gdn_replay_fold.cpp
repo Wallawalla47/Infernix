@@ -82,9 +82,11 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     return slots;
 }
 
+// storage_width > width records and folds through a narrowed view of storage planned for the
+// wider width, as a decode frame shared by two draft windows does.
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false) {
+             bool distinct_destination = false, std::int32_t storage_width = 0) {
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
     if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
@@ -98,7 +100,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     const GdnReplayRecordSpec record_spec{
         .layers          = profile.layers,
         .record_capacity = kRecordCapacity,
-        .width           = width,
+        .width           = storage_width > width ? storage_width : width,
         .conv_channels   = profile.conv_channels,
         .qk_heads        = kQkHeads,
         .value_heads     = profile.value_heads,
@@ -113,7 +115,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     record_storage.fill(0xa5);
     void* record_base = offset_pointer(record_storage.p, kGuardBytes);
     cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
-    const GdnReplayRecords records({record_base, record_bytes}, record_layout);
+    const GdnReplayRecords storage_records({record_base, record_bytes}, record_layout);
+    const GdnReplayRecords records =
+        storage_width > width ? storage_records.narrowed(width) : storage_records;
 
     std::vector<std::uint16_t> conv_records(records.conv.numel(), 0xffffU);
     std::vector<std::uint16_t> key_records(records.key.numel(), 0xffffU);
@@ -827,6 +831,9 @@ int main(int argc, char** argv) {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    failures += run_case({48, 48, 10240}, 8, 2, {8, 3}, 1871U, false, 16);
+    failures += run_case({48, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1873U, true, 16);
+    failures += run_case({30, 32, 8192}, 8, 2, {5, 8}, 1875U, false, 16);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

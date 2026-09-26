@@ -170,7 +170,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             above 15 requires --max-concurrency 1\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
-           "  --ngram-session-mib N      MiB session-scoped ngram source budget\n"
+           "  --ngram-session-mib N      MiB session-scoped ngram source budget (default 128);\n"
+           "                             used only with --ngram-archive-mib\n"
            "  --ngram-native-sessions    retain ngram sources across compaction; requires\n"
            "                             --ngram-archive-mib\n"
            "\n"
@@ -491,8 +492,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.vision_offload && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
     }
-    if (options.speculative.ngram_draft_tokens != 0 && options.max_concurrency != 1) {
-        throw std::invalid_argument("ngram currently requires --max-concurrency 1");
+    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
+    // and cannot be narrowed for a multi-request batch. The GDN conv-record workspace admits at
+    // most 16 verification columns when the batch holds more than one request, so a wider ngram
+    // proposal is admitted only for a single active request.
+    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
+        throw std::invalid_argument("--ngram-draft-tokens above 15 requires --max-concurrency 1");
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");

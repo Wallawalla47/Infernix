@@ -6,7 +6,8 @@ a model quantization mode, or a change to thinking settings. The feature is disa
 
 ## Enable
 
-Add these options to an otherwise working single-request CLI or server configuration:
+Add these options to an otherwise working CLI or server configuration. Ngram drafting works at
+any `--max-concurrency`; `--max-concurrency 1` is the simplest starting point:
 
 ```sh
 --max-concurrency 1 --ngram-draft-tokens 15 --ngram-min-match 12
@@ -24,36 +25,46 @@ Keep the artifact, context capacity, KV format and other residency options appro
 your GPU. Wider target verification needs additional graph, replay and workspace memory.
 This example is not a memory-sizing recommendation.
 
-| Selected backend | Neural draft tokens | Ngram draft tokens |
-|---|---:|---:|
-| MTP | 1..5 | 1..63 |
-| DFlash | 1..15 | 1..63 |
-| DFlash2 | 1..15 | 1..63 |
+| Selected backend | Neural draft tokens | Ngram draft tokens (C=1) | Ngram draft tokens (C>1) |
+|---|---:|---:|---:|
+| MTP | 1..5 | 1..63 | 1..15 |
+| DFlash | 1..15 | 1..63 | 1..15 |
+| DFlash2 | 1..15 | 1..63 | 1..15 |
 
 The artifact must contain the selected drafter. Qwen3.6-35B-A3B uses original DFlash;
 that is distinct from the DFlash2 companion in supported Qwen3.8-27B artifacts.
-Ngram does not convert one drafter into another. Multiple active requests with ngram
-enabled are rejected. `--ngram-draft-tokens 0` disables the feature; the minimum match
-defaults to 12 and its supported enabled range is 4..64.
+Ngram does not convert one drafter into another. `--ngram-draft-tokens 0` disables the
+feature; the minimum match defaults to 12 and its supported enabled range is 4..64.
 
-Ngram width is a separate upper bound, not the neural drafter's step count.
-Larger widths can reduce target rounds on long copy spans but increase per-round
-attention, projection, replay and workspace costs. Measure both short and long
-contexts before choosing a width; the longest supported width need not be fastest.
-Each admitted provider keeps its configured physical verification width, including
-partial copy spans. Unused columns are masked; output budgets do not select a
-different ngram arithmetic shape. Source-ending admission can instead return the
-round to the ordinary neural provider, as described below. DFlash and DFlash2 retain
-an append buffer sized for the widest provider: even a narrow neural round must catch
-up target features from a preceding wide copy round. That padded append work is an
-additional cost when ngram is enabled.
+At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests.
+The GDN conv-record workspace behind the recurrent state admits at most 16 verification columns
+once the batch holds more than one request, so a verify width above 15 is admitted only at
+`--max-concurrency 1`. This caps the ngram width the same way for every backend;
+`--ngram-draft-tokens 15` is the widest value usable with concurrency.
+
+With DFlash and DFlash2 every round verifies at its provider's own window for any batch size: an
+all-neural round runs at the neural window, and a round in which at least one row has a copy
+proposal runs at the ngram window. The decode frame is allocated at the wider of the two windows
+and viewed densely at the round's width. In a multi-request ngram round the neural drafter also
+runs and each row with a copy proposal takes it, so a row without a match keeps its neural
+proposal for that round. The narrower window records GDN replay transitions through a narrowed
+view of the same record storage. DFlash and DFlash2 retain an append buffer sized for the widest
+provider: a narrow neural round must catch up target features from a preceding wide copy round.
+
+MTP verifies every round at the frame's native width (the wider of the neural and ngram windows);
+unused columns are masked, and a row with a copy proposal and a row without one each use their
+own proposal in the same round.
+
+Larger widths can reduce target rounds on long copy spans but increase per-round attention,
+projection, replay and workspace costs, so measure both short and long contexts; the longest
+supported width need not be fastest. Output budgets do not select a different ngram arithmetic
+shape.
 
 The mixed-FP8 27B target retains 16-bit activations for FP8 residual projections
 during 17..64-column single-request verification. Its ordinary narrow path uses
 that precision already; crossing the core's 22/25-column A8 thresholds otherwise
-adds another quantization change. Weight and KV formats, prefill, neural-only
-decoding and multi-request batches are unchanged. This does not promise identical
-floating-point results between different widths.
+adds another quantization change. Weight and KV formats and prefill are unchanged.
+This does not promise identical floating-point results between different widths.
 
 ## Operation
 
@@ -110,6 +121,9 @@ For a local single-owner server, opt in to a RAM-only archive:
 --ngram-archive-mib 512 --ngram-session-mib 128
 ```
 
+`--ngram-session-mib` (default 128) caps one conversation's share of the archive; without
+`--ngram-archive-mib` there is no archive and it has no effect.
+
 Requests identify a conversation with `X-NInfer-Draft-Session`. Without an identity,
 drafting remains request-local. Add `--ngram-native-sessions` to recognize Kilo's
 `x-session-affinity`, Codex's `client_metadata.thread_id`, and Claude's JSON-encoded
@@ -123,6 +137,13 @@ committed output after successful generation. Cancellation and failure discard t
 private overlay. Retention is independent of GPU/host prefix-cache survival. Retained
 tokens never enter the target prompt or KV: they can accelerate a continuation the
 target already considers likely, not recover knowledge absent from its context.
+
+Retention works at any `--max-concurrency`. Each request takes its own immutable snapshot at
+admission, and archive mutations stay serialized on the engine worker, so a concurrent request
+never observes another request's partial publication and unrelated identities never share sources.
+A single session admits one binding at a time: if two requests name the same conversation identity
+concurrently, one binds and the other falls back to request-local drafting; both still generate
+correctly.
 
 `X-NInfer-Draft-Reset: 1` clears the identified archive before a request and revokes
 its old views/cursors. Restarting the Engine clears all archives. A new identity starts
@@ -197,11 +218,14 @@ bit-identical fresh-prefill and cached output. That separate diagnostic may retu
 remain mandatory. It skips without the artifact environment variable.
 
 `ninfer_ngram_archive_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and takes the backend
-(`mtp`, `dflash` or `dflash2`) and optional graph mode (`0` or `1`). It exercises
-NG63/K5 source-absent regeneration, isolated and explicitly forked sessions, reset,
-cancellation/retry and publication generations with prefix reuse disabled. This
-greedy, thinking-disabled contract fixture is not an agent-performance benchmark.
-It skips without the artifact environment variable.
+(`mtp`, `dflash` or `dflash2`), optional graph mode (`0` or `1`) and optional
+concurrency (`1..8`). It exercises NG63/K5 source-absent regeneration, isolated and
+explicitly forked sessions, reset, cancellation/retry and publication generations with
+prefix reuse disabled. With concurrency above one it also runs concurrent requests on
+distinct sessions, two concurrent forks of one source, a same-identity concurrent pair
+(one binds, one falls back) and a multi-round concurrent soak, asserting exact output
+on every lane. This greedy, thinking-disabled contract fixture is not an
+agent-performance benchmark. It skips without the artifact environment variable.
 
 `ninfer_ngram_thinking_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and accepts a backend,
 neural draft size and ngram draft size, for example `mtp 5 15`. It checks output and
@@ -224,3 +248,16 @@ and finish-reason accounting. An optional `--strict-fresh` argument retains
 the separate fresh-prefill identity diagnostic; natural stop tokens are allowed to
 end an answer before its maximum output budget. `--no-cuda-graph` selects eager
 execution. This test also skips without an artifact.
+
+`ninfer_ngram_concurrent_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and takes a backend
+(`mtp`, `dflash` or `dflash2`), an ngram draft width, and a concurrency. For example,
+`dflash2 15 5` matches the shipped DFlash2 serving configuration. It checks that a
+single-lane run on a concurrency>1 engine is token-identical to a graph-mode
+single-request reference, that two concurrent copy lanes each reproduce an exact
+source prefix over a long soak, and that two concurrent free-form lanes stay
+non-degenerate over hundreds of tokens. Passing width `0` runs the free-form pair with
+ngram disabled as a baseline. Cross-lane token identity is deliberately not required:
+batched lanes are prefetched independently and need not share every round, so a
+batch-size change alone can move a greedy near-tie (the ngram-disabled baseline
+diverges the same way). `NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and
+`NINFER_NGRAM_TEST_NO_GRAPH` adjust the shared-GPU footprint and graph mode.

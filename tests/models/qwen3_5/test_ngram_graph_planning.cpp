@@ -45,7 +45,7 @@ void verify_profiles() {
              {ninfer::SpeculativeBackend::DFlash, ninfer::SpeculativeBackend::DFlash2}) {
             for (unsigned width = 1; width <= 63; ++width) {
                 const auto profiles =
-                    qwen::detail::dflash_graph_profiles(backend, capacity, width, 1);
+                    qwen::detail::dflash_graph_profiles(backend, capacity, width);
                 unsigned frontier = 0;
                 for (const auto& profile : profiles) {
                     require(profile.min == frontier && profile.max >= profile.min,
@@ -133,10 +133,13 @@ void verify_real_plan(const char* artifact) {
                     const auto pages = planner.capacity_curve().minimum_main_page_groups;
                     bytes[graphs] = std::move(planner).finalize(pages).device_reservation_bytes();
                 }
-                const auto expected = expected_family_bytes(capacity, neural, neural) +
-                                      (ngram ? expected_family_bytes(capacity, ngram, neural) : 0);
+                // One MTP family is captured at the frame's native width (the wider of the neural
+                // and ngram windows) with the frame's AR depth.
+                const unsigned draft_window = std::max(neural, ngram);
+                const unsigned ar_depth     = std::min(draft_window, 5U);
+                const auto expected = expected_family_bytes(capacity, draft_window, ar_depth);
                 require(bytes[1] >= bytes[0] && bytes[1] - bytes[0] == expected,
-                        "planned graph allowance does not cover both provider families");
+                        "planned graph allowance does not cover the native-width provider family");
                 ++cases;
             }
         }

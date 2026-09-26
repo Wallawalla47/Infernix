@@ -19,6 +19,7 @@ mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window, std::uint
 [[nodiscard]] execution::MtpCausalAttentionEnvelopes
 mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std::uint32_t capacity,
                                std::uint32_t next_k);
-[[nodiscard]] execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier);
+[[nodiscard]] execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
+                                                          std::uint32_t max_frontier);
 
 } // namespace ninfer::models::qwen3_5::detail

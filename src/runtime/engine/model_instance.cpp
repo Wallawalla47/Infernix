@@ -93,11 +93,21 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
-        (options.speculative.ngram_draft_tokens == 0 || options.max_concurrency != 1 ||
-         options.speculative.ngram_session_bytes < (1ULL << 20) ||
+        options.speculative.ngram_draft_tokens == 0) {
+        throw std::invalid_argument(
+            "the cross-request ngram archive requires ngram drafting; enable --ngram-draft-tokens");
+    }
+    if (options.speculative.ngram_archive_bytes != 0 &&
+        (options.speculative.ngram_session_bytes < (1ULL << 20) ||
          options.speculative.ngram_session_bytes > options.speculative.ngram_archive_bytes)) {
-        throw std::invalid_argument("ngram archive requires C1 ngram drafting and session capacity "
-                                    "between 1 MiB and total archive capacity");
+        throw std::invalid_argument("ngram session capacity must be between 1 MiB and the total "
+                                    "archive capacity");
+    }
+    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
+    // and cannot be narrowed for batch>1, and the GDN conv-record workspace admits at most 16
+    // verification columns for a multi-request batch.
+    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
+        throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
     cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);

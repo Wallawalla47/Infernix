@@ -830,10 +830,13 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
-         options.max_concurrency != 1 || options.speculative.ngram_draft_tokens > 63 ||
-         options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64)) {
+         options.speculative.ngram_draft_tokens > 63 ||
+         options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64 ||
+         (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
         throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, concurrency one, K1..63 and match 4..64");
+            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
+            "workspace admits at most 16 verification columns for a multi-request batch, so K "
+            "above 15 requires concurrency one");
     }
 }
 
@@ -882,27 +885,25 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            const auto family_allowance = [&](std::uint32_t drafts) {
-                const auto profiles =
-                    mtp_graph_profiles(impl->capacity, drafts, impl->neural_draft_window);
+            // One MTP family captured at the frame's native width (the wider of the neural and
+            // ngram windows) with the frame's AR depth.
+            const std::uint32_t drafts    = impl->draft_window;
+            const std::uint32_t ar_depth  = std::min(drafts, kMtpDecodeMaximumDrafts);
+            const auto family_allowance = [&](std::uint32_t draft_width, std::uint32_t next_k) {
+                const auto profiles = mtp_graph_profiles(impl->capacity, draft_width, next_k);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
                         const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity, static_cast<std::uint64_t>(profile.max) + drafts +
-                                                impl->neural_draft_window);
+                            impl->capacity, static_cast<std::uint64_t>(profile.max) +
+                                                draft_width + next_k);
                         return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
                     },
                     "MTP graph allowance");
             };
-            std::size_t per_batch_allowance = family_allowance(impl->neural_draft_window);
-            if (impl->ngram_draft_window != 0) {
-                per_batch_allowance =
-                    checked_add(per_batch_allowance, family_allowance(impl->ngram_draft_window),
-                                "MTP ngram graph allowance");
-            }
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(family_allowance(drafts, ar_depth), impl->max_concurrency,
+                            "MTP exact-b graph allowance");
         } else {
             const auto family_allowance = [&](std::uint32_t drafts) {
                 const auto profiles =

@@ -1,6 +1,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
+#include "ninfer/types.h"
 
 #include <algorithm>
 #include <limits>
@@ -144,6 +145,40 @@ void speculative_prepare_verify_ids(const Tensor& anchors, const Tensor& drafts,
     require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
     detail::speculative_prepare_verify_ids_launch(anchors, drafts, current_extents, verify_ids,
                                                   stream);
+}
+
+void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& copy_drafts,
+                                        const Tensor& copy_candidates, const Tensor& copy_q,
+                                        Tensor& drafts, Tensor& candidates, Tensor& proposal_q,
+                                        cudaStream_t stream) {
+    constexpr const char* op = "speculative_overlay_copy_proposals";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || batch < 1 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument(
+            "speculative_overlay_copy_proposals: K must be >=1 and B must be in [1,8]");
+    }
+    require_vector(copy_rows, DType::I32, batch, op, "copy_rows");
+    require_matrix(copy_drafts, DType::I32, k, batch, op, "copy_drafts");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    const bool sparse = candidates.data != nullptr;
+    if (sparse != (proposal_q.data != nullptr) || sparse != (copy_candidates.data != nullptr) ||
+        sparse != (copy_q.data != nullptr)) {
+        throw std::invalid_argument(
+            "speculative_overlay_copy_proposals: sparse planes must be all present or all empty");
+    }
+    if (sparse) {
+        require_tensor3(copy_candidates, DType::I32, kSparseSpeculativeCandidates, k, batch, op,
+                        "copy_candidates");
+        require_tensor3(candidates, DType::I32, kSparseSpeculativeCandidates, k, batch, op,
+                        "candidates");
+        require_tensor3(copy_q, DType::FP32, kSparseSpeculativeCandidates, k, batch, op, "copy_q");
+        require_tensor3(proposal_q, DType::FP32, kSparseSpeculativeCandidates, k, batch, op,
+                        "proposal_q");
+    }
+    detail::speculative_overlay_copy_proposals_launch(copy_rows, copy_drafts, copy_candidates,
+                                                      copy_q, drafts, candidates, proposal_q,
+                                                      stream);
 }
 
 void speculative_accept_greedy_drafts(const Tensor& target_tokens, const Tensor& logits,

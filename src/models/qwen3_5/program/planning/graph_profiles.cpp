@@ -98,7 +98,9 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
     return out;
 }
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier) {
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
+                                            std::uint32_t max_frontier) {
+    (void)min_frontier;
     return execution::DFlashEnvelopes{
         .local = {0, max_frontier},
         .full  = {0, max_frontier},

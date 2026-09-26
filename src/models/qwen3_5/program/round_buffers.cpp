@@ -350,30 +350,35 @@ MtpDecodeState MtpDecodeState::single_row_prefix(std::uint32_t k, std::uint32_t 
     return result;
 }
 
-DFlashDecodeState DFlashDecodeState::single_row_prefix(std::uint32_t k) const {
-    if (draft_tokens.ne[1] != 1 || k == 0 || k > static_cast<std::uint32_t>(draft_tokens.ne[0])) {
-        throw std::invalid_argument("DFlash prefix view requires C1 and an allocated draft width");
+DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t k) const {
+    if (k == 0 || k > static_cast<std::uint32_t>(draft_tokens.ne[0])) {
+        throw std::invalid_argument("DFlash narrowed view requires an allocated draft width");
     }
+    if (k == static_cast<std::uint32_t>(draft_tokens.ne[0])) { return *this; }
     auto result       = *this;
     const auto width  = static_cast<std::int32_t>(k + 1);
     const auto drafts = static_cast<std::int32_t>(k);
-    // C1 columns form dense prefixes; no other request's stride is reinterpreted.
+    const auto rows   = draft_tokens.ne[1];
+    // Every round tensor below is written and consumed within one round, and every host index
+    // into ingress/egress uses the round's own width, so a dense [k+1,C] reinterpretation of the
+    // native storage is exact for any row count.
     for (Tensor* tensor : {&result.target_rope_positions, &result.licensed_tokens,
                            &result.proposal_ids, &result.proposal_positions,
                            &result.verify_positions, &result.verify_ids, &result.target_argmax}) {
-        *tensor = Tensor(tensor->data, tensor->dtype, {width, 1});
+        *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
     }
-    result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, 1});
+    result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, rows});
     for (Tensor* tensor : {&result.target_hidden, &result.target_logits}) {
-        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, 1});
+        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, rows});
     }
     for (Tensor* tensor : {&result.candidate_ids, &result.proposal_q}) {
         if (tensor->data) {
-            *tensor =
-                Tensor(tensor->data, tensor->dtype, {ops::kSparseSpeculativeCandidates, drafts, 1});
+            *tensor = Tensor(tensor->data, tensor->dtype,
+                             {ops::kSparseSpeculativeCandidates, drafts, rows});
         }
     }
-    // The previous provider may require a wider context append.
+    // append_positions/append_counts keep the native width: the previous round's provider may
+    // require a wider context append, and pending_features is lane-owned at that width.
     return result;
 }
 
