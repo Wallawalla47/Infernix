@@ -11,6 +11,7 @@
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -232,6 +233,40 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      WorkspaceArena& workspace, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, policy, &workspace,
                            stream);
+}
+
+bool attn_input_proj_fused_rmsnorm_nvfp4_eligible(const Weight& weight, LinearPolicy policy,
+                                                  std::int32_t tokens) {
+    return policy == LinearPolicy::AllowA4 && detail::nvfp4_attn_input_tma_route(tokens) &&
+           weight.qtype == QType::NVFP4 && weight.layout == QuantLayout::BlockScaleK16M128x4 &&
+           weight.n == 14336 && weight.k == 5120;
+}
+
+void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& norm_weight,
+                                         float eps, const Weight& projection_weight, Tensor& q,
+                                         Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                         WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!attn_input_proj_fused_rmsnorm_nvfp4_eligible(projection_weight, policy, tokens)) {
+        throw std::invalid_argument("fused rmsnorm attn_input_proj: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument(
+            "fused rmsnorm attn_input_proj: eps must be positive and finite");
+    }
+    require_matrix(residual, 5120, tokens, "residual");
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 16)) {
+        throw std::invalid_argument("fused rmsnorm attn_input_proj: invalid norm weight");
+    }
+    require_matrix(q, 6144, tokens, "q");
+    require_matrix(gate, 6144, tokens, "gate");
+    require_matrix(k, 1024, tokens, "k");
+    require_matrix(v, 1024, tokens, "v");
+    detail::validate_nvfp4_weight(projection_weight, "fused rmsnorm attn_input_proj");
+    detail::nvfp4_attn_input_fused_rmsnorm_launch(residual, norm_weight, eps, projection_weight, q,
+                                                  gate, k, v, workspace, stream);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

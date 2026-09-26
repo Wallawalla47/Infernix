@@ -32,9 +32,6 @@ constexpr ReductionCriterion kAttnInputProjA16Tolerance{2.9e-3, 4.0e-3, 4.5e-3};
 // attention-input implementations' reduction profile.
 constexpr ReductionCriterion kFp8AttnInputProjA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 constexpr ReductionCriterion kAttnInputProjA8Tolerance{0.04, 1.0 / 256.0, 0.06};
-constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
-// Retain the original seven grid points while stabilizing the distribution-level A4 criterion.
-constexpr std::int32_t kA4SampleRows = 31;
 
 int verify_output(std::string_view label, const GuardedBf16Tensor& output,
                   const quantized_weight::PackedWeight& weight, std::int32_t weight_row_offset,

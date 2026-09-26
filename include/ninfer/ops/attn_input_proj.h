@@ -79,6 +79,31 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight,
                      WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
+ * Whether the single-parent NVFP4 [14336,5120] projection uses its AllowA4 TMA route.
+ * This is a host-side route predicate. A true result does not validate the weight payload.
+ */
+[[nodiscard]] bool attn_input_proj_fused_rmsnorm_nvfp4_eligible(const Weight& weight,
+                                                                LinearPolicy policy,
+                                                                std::int32_t tokens);
+
+/**
+ * Computes the Offset RMSNorm and single-parent NVFP4 Q/K/output-gate/V projection together.
+ * residual is contiguous BF16 [5120,T], norm_weight is contiguous BF16 [5120], and q/gate are
+ * contiguous BF16 [6144,T] while k/v are contiguous BF16 [1024,T]. T must be at least 1024.
+ * The parent must be NVFP4 BlockScaleK16M128x4 [14336,5120] under AllowA4. The input norm uses
+ * rsqrtf(sum(x*x)/5120 + eps) and multiplies each element by norm_weight + 1, rounding to BF16
+ * before activation quantization. The exact-byte oracle is Offset rmsnorm() into BF16 storage,
+ * then the Tiled NVFP4 quantizer and existing attention-input TMA projection. It uses the same
+ * caller-owned workspace capacity as attn_input_proj_workspace_capacity_bytes() for this parent
+ * and T; the workspace must not overlap any input, weight, or output. No hidden tensor is written.
+ * The Op has no persistent state side effect.
+ */
+void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& norm_weight,
+                                         float eps, const Weight& projection_weight, Tensor& q,
+                                         Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                         WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.
  */
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
