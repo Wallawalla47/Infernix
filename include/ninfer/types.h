@@ -253,6 +253,9 @@ struct OutputOptions {
     // Presentation constraint supplied by the protocol adapter. It bounds only Qwen's emitted
     // function-name grammar; it does not require the name to match a currently declared tool.
     std::uint32_t tool_name_max_length = 128;
+    // Opt-in recovery of complete Qwen calls whose wrapper or suffix markup is malformed; see the
+    // tool-call parser tolerant mode. Off preserves the strict all-or-nothing behavior.
+    bool tolerant_tool_calls = false;
 };
 
 struct RequestOptions {
@@ -301,6 +304,10 @@ enum class ToolCallParseFallbackReason : std::uint8_t {
     InvalidToolName,
     UndeclaredTool,
     TrailingContent,
+    // Tolerant recovery discarded a trailing suffix after an otherwise complete call, or kept a
+    // call whose closing tags were cut off at the region end. A structured response was still
+    // produced, so this is surfaced for transparency, not as a fallback-to-text failure.
+    TruncatedTail,
 };
 
 [[nodiscard]] inline constexpr const char*
@@ -318,6 +325,8 @@ tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcep
         return "undeclared_tool";
     case ToolCallParseFallbackReason::TrailingContent:
         return "trailing_content";
+    case ToolCallParseFallbackReason::TruncatedTail:
+        return "truncated_tail";
     }
     return "malformed_structure";
 }

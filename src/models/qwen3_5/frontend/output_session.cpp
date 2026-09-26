@@ -337,7 +337,7 @@ public:
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
-                           output.tool_name_max_length) {
+                           output.tool_name_max_length, output.tolerant_tool_calls) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }

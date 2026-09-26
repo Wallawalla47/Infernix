@@ -538,8 +538,9 @@ NormalizedParameter normalize_parameter(std::string_view encoded_value,
 class QwenToolRegionParser {
 public:
     QwenToolRegionParser(std::string_view text, std::size_t max_name_length,
-                         const Contract& contract)
-        : text_(text), max_name_length_(max_name_length), contract_(contract) {}
+                         const Contract& contract, bool tolerant)
+        : text_(text), max_name_length_(max_name_length), contract_(contract),
+          tolerant_(tolerant) {}
 
     [[nodiscard]] std::uint32_t duplicate_parameters_repaired() const noexcept {
         return duplicate_parameters_repaired_;
@@ -554,33 +555,37 @@ public:
             }
             if (starts_with_at(text_, pos, "<tool_call>")) {
                 RawToolCall call;
-                const FallbackReason failure = parse_tool_call(pos, call);
-                if (failure != FallbackReason::None) { return failure; }
-                calls.push_back(std::move(call));
+                const FallbackReason terminal = finish_call(calls, call, parse_tool_call(pos, call));
+                if (terminal != FallbackReason::None) { return terminal; }
             } else if (starts_with_at(text_, pos, "<function_calls>")) {
                 pos += 16;
                 bool had_calls = false;
                 for (;;) {
                     skip_format_whitespace(text_, pos);
                     if (consume(pos, "</function_calls>")) { break; }
-                    if (pos == text_.size()) { return FallbackReason::MalformedStructure; }
+                    if (pos == text_.size()) {
+                        // Tolerant: an unclosed wrapper after one or more complete calls is a
+                        // truncation; the strict parser keeps the hard structural failure.
+                        if (tolerant_ && had_calls) { return FallbackReason::TruncatedTail; }
+                        return FallbackReason::MalformedStructure;
+                    }
                     RawToolCall call;
-                    const FallbackReason failure = parse_function(pos, call);
-                    if (failure != FallbackReason::None) { return failure; }
-                    calls.push_back(std::move(call));
+                    const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
+                    if (terminal != FallbackReason::None) { return terminal; }
                     had_calls = true;
                 }
                 if (!had_calls) { return FallbackReason::MalformedStructure; }
             } else if (starts_with_at(text_, pos, "<function") || starts_with_at(text_, pos, "<invoke")) {
                 RawToolCall call;
-                const FallbackReason failure = parse_function(pos, call);
-                if (failure != FallbackReason::None) { return failure; }
-                calls.push_back(std::move(call));
+                const FallbackReason terminal = finish_call(calls, call, parse_function(pos, call));
+                if (terminal != FallbackReason::None) { return terminal; }
             } else {
+                // Tolerant: a trailing suffix after one or more complete calls is discarded
+                // rather than failing the whole output.
+                if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
                 return calls.empty() ? FallbackReason::MalformedStructure
                                      : FallbackReason::TrailingContent;
             }
-            calls.push_back(std::move(call));
         }
     }
 
@@ -591,13 +596,44 @@ private:
         return true;
     }
 
+    // True when nothing but trailing whitespace remains after `pos` in the tool region.
+    bool at_region_end(std::size_t pos) const {
+        std::size_t at = pos;
+        skip_format_whitespace(text_, at);
+        return at == text_.size();
+    }
+
+    // Applies tolerant recovery to a sub-parse result and reports whether parse() should
+    // terminate. In tolerant mode, a malformed suffix after one or more complete calls is
+    // discarded, and a single truncated final call whose name and at least one parameter are
+    // complete is retained; the recovered calls are never demoted to text. The strict parser
+    // returns the raw failure unchanged.
+    FallbackReason finish_call(std::vector<RawToolCall>& calls, RawToolCall& call,
+                               FallbackReason failure) {
+        if (failure == FallbackReason::None) {
+            calls.push_back(std::move(call));
+            return FallbackReason::None;
+        }
+        if (tolerant_ && !calls.empty()) { return FallbackReason::TruncatedTail; }
+        if (tolerant_ && failure == FallbackReason::TruncatedTail && calls.empty() &&
+            !call.parameters.empty()) {
+            calls.push_back(std::move(call));
+            return FallbackReason::TruncatedTail;
+        }
+        return failure;
+    }
+
     FallbackReason parse_tool_call(std::size_t& pos, RawToolCall& call) {
         if (!consume(pos, "<tool_call>")) { return FallbackReason::MalformedStructure; }
         skip_format_whitespace(text_, pos);
         const FallbackReason failure = parse_function(pos, call);
         if (failure != FallbackReason::None) { return failure; }
         skip_format_whitespace(text_, pos);
-        return consume(pos, "</tool_call>") ? FallbackReason::None : FallbackReason::MalformedStructure;
+        if (consume(pos, "</tool_call>")) { return FallbackReason::None; }
+        // Tolerant: a complete call may be followed by explanatory text, or the model may have
+        // stopped at the end of its budget before the closing tag. parse() resolves the terminal
+        // flag; the strict parser keeps the hard structural failure.
+        return tolerant_ ? FallbackReason::TruncatedTail : FallbackReason::MalformedStructure;
     }
 
     FallbackReason parse_function(std::size_t& pos, RawToolCall& call) {
@@ -609,11 +645,54 @@ private:
         } else if (starts_with_at(text_, pos, "<invoke")) {
             header_begin = pos + 7;
             fn_close = "</invoke>";
+        } else if (tolerant_) {
+            // Recover a malformed function opener: a dropped or doubled leading '<', a leaked
+            // ChatML turn marker, or a dropped 'function'/'invoke' keyword, followed by '=' or a
+            // name. A form that yields no valid name is rejected by valid_function_name below, so
+            // prose after a marker cannot pass.
+            std::size_t scan = pos;
+            while (scan < text_.size() && text_[scan] == '<') { ++scan; }
+            if (starts_with_at(text_, scan, "|im_start|>")) { scan += 11; }
+            std::size_t kw_len = 0;
+            if (starts_with_at(text_, scan, "function")) { kw_len = 8; }
+            else if (starts_with_at(text_, scan, "invoke")) { kw_len = 6; }
+            else { return FallbackReason::MalformedStructure; }
+            scan += kw_len;
+            if (scan >= text_.size() || (text_[scan] != '=' && !is_format_whitespace(text_[scan]))) {
+                return FallbackReason::MalformedStructure;
+            }
+            if (text_[scan] == '=') { ++scan; }
+            header_begin = scan;
+            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
         } else {
             return FallbackReason::MalformedStructure;
         }
 
-        const std::size_t tag_end = text_.find('>', header_begin);
+        std::size_t tag_end = text_.find('>', header_begin);
+        bool ws_boundary = false;
+        // Tolerant: the model sometimes drops the '>' after the function name (for example a name
+        // followed directly by a newline and a parameter tag). Recover by scanning the identifier
+        // run and accepting it when format whitespace separates it from the next '<' or end of
+        // region.
+        if (tolerant_) {
+            std::size_t scan = header_begin;
+            while (scan < text_.size() && text_[scan] == '=') { ++scan; }
+            const std::size_t ident_begin = scan;
+            while (scan < text_.size() && scan - header_begin < max_name_length_) {
+                const char byte = text_[scan];
+                if (!is_ascii_alphanumeric(byte) && byte != '_' && byte != '-') { break; }
+                ++scan;
+            }
+            if (scan > ident_begin && scan < text_.size() && is_format_whitespace(text_[scan]) &&
+                (tag_end == std::string_view::npos || scan < tag_end)) {
+                std::size_t after = scan;
+                while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
+                if (after >= text_.size() || text_[after] == '<') {
+                    tag_end     = scan;
+                    ws_boundary = true;
+                }
+            }
+        }
         if (tag_end == std::string_view::npos || tag_end == header_begin) {
             return FallbackReason::InvalidToolName;
         }
@@ -622,16 +701,25 @@ private:
         if (!valid_function_name(call.name, max_name_length_)) {
             return FallbackReason::InvalidToolName;
         }
-        if (contract_.enforce_declared_names &&
+        // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
+        // otherwise well-formed call structured and leaves the identity judgment to the consumer:
+        // leaking the raw region to content would turn a valid call into prose.
+        if (!tolerant_ && contract_.enforce_declared_names &&
             find_tool_contract(contract_, call.name) == nullptr) {
             return FallbackReason::UndeclaredTool;
         }
-        pos = tag_end + 1;
+        pos = ws_boundary ? tag_end : tag_end + 1;
 
         for (;;) {
             skip_format_whitespace(text_, pos);
             if (consume(pos, fn_close)) {
                 return FallbackReason::None;
+            }
+            // Tolerant: the region is exhausted after the last complete parameter, so a missing
+            // function close is a truncation, not a malformed structure. parse() retains the
+            // recovered parameters; the strict parser still requires the closing tag.
+            if (tolerant_ && at_region_end(pos)) {
+                return FallbackReason::TruncatedTail;
             }
             const FallbackReason failure = parse_parameter(pos, call);
             if (failure != FallbackReason::None) { return failure; }
@@ -665,6 +753,23 @@ private:
         std::size_t value_end         = 0;
         std::size_t close_len         = 0;
         if (!find_parameter_close(value_begin, value_end, close_len, param_close)) {
+            if (tolerant_) {
+                // Tolerant: the region ends before the closing tag, so the output budget cut the
+                // parameter value. Keep the value up to the cut (last occurrence wins, as with a
+                // complete parameter) and flag the tail; the strict parser keeps the hard
+                // structural failure.
+                const std::string_view partial = text_.substr(value_begin, text_.size() - value_begin);
+                const auto existing = std::find_if(call.parameters.begin(), call.parameters.end(),
+                                                   [&](const RawParameter& candidate) { return candidate.name == name; });
+                if (existing != call.parameters.end()) {
+                    existing->value = partial;
+                    ++duplicate_parameters_repaired_;
+                } else {
+                    call.parameters.push_back(RawParameter{.name = name, .value = partial});
+                }
+                pos = text_.size();
+                return FallbackReason::TruncatedTail;
+            }
             return FallbackReason::MalformedStructure;
         }
         const std::string_view value = text_.substr(value_begin, value_end - value_begin);
@@ -715,6 +820,7 @@ private:
     std::size_t max_name_length_;
     const Contract& contract_;
     std::uint32_t duplicate_parameters_repaired_ = 0;
+    bool tolerant_ = false;
 };
 
 GeneratedToolCall normalize_raw_tool_call(const RawToolCall& raw, const Contract& contract,
@@ -774,7 +880,8 @@ build_tool_call_output_contract(std::span<const std::string> tool_jsons, bool en
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                                                  std::size_t max_tool_name_length,
-                                                 const ToolCallOutputContract& contract) {
+                                                 const ToolCallOutputContract& contract,
+                                                 bool tolerant) {
     const std::size_t first = find_first_tool_marker(text);
     if (first == std::string::npos) { return fallback(text); }
 
@@ -784,9 +891,16 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 
     std::vector<RawToolCall> raw_calls;
     const std::string_view tool_region = std::string_view(text).substr(first);
-    QwenToolRegionParser parser(tool_region, max_tool_name_length, contract);
+    QwenToolRegionParser parser(tool_region, max_tool_name_length, contract, tolerant);
     const FallbackReason failure = parser.parse(raw_calls);
-    if (failure != FallbackReason::None) {
+    if (failure == FallbackReason::TruncatedTail && !raw_calls.empty()) {
+        // A trailing suffix after a complete call was discarded, or a single truncated final
+        // call with at least one complete parameter was kept; the recovered calls stand.
+        // Record the reason for transparency without demoting the output to text.
+        out.diagnostics.fallback_reason = failure;
+    } else if (failure != FallbackReason::None) {
+        // A truncated tail that kept no call (a name cut before any parameter completed)
+        // carries no arguments: the region is returned as text with the reason recorded.
         out.diagnostics.fallback_reason = failure;
         return fallback(text, out.diagnostics);
     }
@@ -803,8 +917,9 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
 }
 
 ToolCallOutputDecoder::ToolCallOutputDecoder(std::shared_ptr<const ToolCallOutputContract> contract,
-                                             std::size_t max_tool_name_length)
-    : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length) {}
+                                             std::size_t max_tool_name_length, bool tolerant)
+    : contract_(std::move(contract)), max_tool_name_length_(max_tool_name_length),
+      tolerant_(tolerant) {}
 
 std::string ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
@@ -857,7 +972,7 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
     if (!contract_) { return {}; }
 
     ParsedToolCallOutput parsed =
-        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
+        parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_, tolerant_);
     if (saw_tool_marker_ && parsed.is_tool_call_response) {
         trailing_whitespace_.clear();
         tool_region_.clear();
