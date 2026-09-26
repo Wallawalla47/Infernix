@@ -186,6 +186,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-thinking              disable the thinking mode (enabled by default)\n"
            "  --preserve-thinking        retain closed-turn assistant reasoning\n"
            "                             in later prompts\n"
+           "  --tolerant-tool-calls      recover complete Qwen calls with malformed wrapper or\n"
+           "                             suffix output, keep a final call cut by the output\n"
+           "                             budget and an undeclared name (strict all-or-nothing\n"
+           "                             by default)\n"
            "\n"
            "NETWORKING & RESOURCES\n"
            "  --host H                   listen address (default 127.0.0.1)\n"
@@ -362,6 +366,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--tolerant-tool-calls") {
+            options.tolerant_tool_calls = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {
