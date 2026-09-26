@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
 
 #include <algorithm>
@@ -9,11 +10,21 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::int32_t kSparseMaxDrafts    = 15;
-constexpr std::int32_t kSparseCandidates   = 16;
-constexpr std::int32_t kSparsePhysicalRows = 248320;
-constexpr std::int32_t kSparseTokenDomain  = 248077;
-constexpr std::int32_t kSparseMaxBatch     = 8;
+constexpr std::int32_t kSparseMaxDrafts        = 63;
+constexpr std::int32_t kSparseBatchedMaxDrafts = 31;
+constexpr std::int32_t kSparseCandidates       = 16;
+constexpr std::int32_t kSparsePhysicalRows     = 248320;
+constexpr std::int32_t kSparseTokenDomain      = 248077;
+constexpr std::int32_t kSparseMaxBatch         = 8;
+
+std::size_t speculative_workspace_row_bytes(std::int32_t token_domain, std::int32_t min_drafts,
+                                            std::int32_t max_drafts) {
+    if (min_drafts >= kSpeculativeSamplerMaxColumns) { return 0; }
+    return make_sampling_workspace_layout(token_domain,
+                                          std::min(max_drafts + 1, kSpeculativeSamplerMaxColumns),
+                                          kSpeculativeSamplerMaxColumns)
+        .bytes;
+}
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
     if (!t.is_contiguous()) {
@@ -76,7 +87,7 @@ std::size_t speculative_accept_greedy_drafts_workspace_capacity_bytes(std::int32
         throw std::invalid_argument("speculative accept workspace: invalid draft interval");
     }
     const std::size_t row_bytes =
-        sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+        speculative_workspace_row_bytes(token_domain, min_drafts, max_drafts);
     if (row_bytes != 0 &&
         static_cast<std::size_t>(max_batch) > std::numeric_limits<std::size_t>::max() / row_bytes) {
         throw std::overflow_error("speculative accept workspace capacity overflows size_t");
@@ -89,12 +100,12 @@ std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch) {
     if (token_domain != kSparseTokenDomain || min_drafts < 1 || max_drafts < min_drafts ||
         max_drafts > kSparseMaxDrafts || min_batch < 1 || max_batch < min_batch ||
-        max_batch > kSparseMaxBatch) {
+        max_batch > kSparseMaxBatch || (max_drafts > kSparseBatchedMaxDrafts && max_batch != 1)) {
         throw std::invalid_argument("sparse speculative accept workspace: unsupported profile");
     }
     if (envelope.all_rows_greedy_without_penalties) { return 0; }
     const std::size_t row_bytes =
-        sampling_workspace_capacity_bytes(token_domain, min_drafts + 1, max_drafts + 1);
+        speculative_workspace_row_bytes(token_domain, min_drafts, max_drafts);
     return row_bytes * static_cast<std::size_t>(max_batch);
 }
 
@@ -190,11 +201,14 @@ void speculative_accept_sparse_drafts(
     }
     const std::int32_t k = drafts.ne[0];
     if (k < 1 || k > kSparseMaxDrafts)
-        throw std::invalid_argument("speculative_accept_sparse_drafts: K must be 1..15");
+        throw std::invalid_argument("speculative_accept_sparse_drafts: K must be 1..63");
     const std::int32_t columns = k + 1;
     const std::int32_t batch   = drafts.ne[1];
     if (batch < 1 || batch > kSparseMaxBatch) {
         throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
+    }
+    if (k > kSparseBatchedMaxDrafts && batch != 1) {
+        throw std::invalid_argument("speculative_accept_sparse_drafts: K>31 requires B=1");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
     require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");

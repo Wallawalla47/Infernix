@@ -9,6 +9,7 @@
 #include "models/qwen3_5/frontend/test_access.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
+#include "models/qwen3_5/frontend/ngram_sources.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -575,6 +576,17 @@ public:
             throw std::invalid_argument(
                 "Frontend requires the parsed model tokenizer and public token domain");
         }
+        ngram_sources_enabled = options.ngram_sources_enabled;
+        ngram_archive_enabled = options.ngram_archive_enabled;
+        if (ngram_archive_enabled) {
+            ngram_think_open  = tokenizer->encode("<think>");
+            ngram_think_close = tokenizer->encode("</think>");
+        }
+        if (ngram_sources_enabled) {
+            for (int id = 0; id < static_cast<int>(tokenizer->vocab_size()); ++id) {
+                if (tokenizer->is_special_token(id)) { ngram_boundaries.push_back(id); }
+            }
+        }
         sampling = default_sampling(options.architecture);
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -613,6 +625,10 @@ public:
     StopPolicy defaults;
     ModelSamplingDefaults sampling;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
+    bool ngram_sources_enabled = false;
+    bool ngram_archive_enabled = false;
+    std::vector<TokenId> ngram_think_open, ngram_think_close;
+    std::vector<TokenId> ngram_boundaries;
     bool vision_enabled       = true;
     std::uint32_t max_context = 0;
 };
@@ -685,6 +701,34 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
     return *prompt.data_;
 }
 
+std::unique_ptr<NgramArchive::Request> PreparedPrompt::bind_ngram(NgramArchive& archive,
+                                                                  const NgramSessionHints& hints) {
+    if (!data_) { return {}; }
+    data_->ngram_snapshot.reset();
+    if (hints.key.empty()) { return {}; }
+    if (hints.reset) { archive.clear(hints.key); }
+    // Bounded proposal-only views. The archive owns copied/indexed spans; it never
+    // changes this prompt, its token positions, or its prefix-cache identity.
+    std::array<NgramSourceView, kNgramRequestSourceCapacity> sources;
+    std::size_t count = 0;
+    for (int priority = static_cast<int>(NgramSourceKind::Tool); priority >= 0; --priority) {
+        if (priority == static_cast<int>(NgramSourceKind::Tool)) {
+            for (const auto& source : data_->ngram_sources) {
+                if (count == sources.size()) { break; }
+                sources[count++] = {source, NgramSourceKind::Tool};
+            }
+        }
+        for (const auto& source : data_->ngram_archive_sources) {
+            if (count == sources.size()) { break; }
+            if (static_cast<int>(source.kind) == priority) { sources[count++] = source; }
+        }
+    }
+    auto request          = archive.begin(hints.key, std::span(sources).first(count),
+                                          data_->ngram_boundaries, hints.parent, hints.parent_generation);
+    data_->ngram_snapshot = request ? request->snapshot() : nullptr;
+    return request;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);
@@ -733,6 +777,27 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.tool_call_output    = tool_call_output;
+    if (impl_->ngram_sources_enabled) {
+        result.ngram_boundaries = impl_->ngram_boundaries;
+        std::size_t remaining   = impl_->max_context;
+        for (const auto& message : messages) {
+            if (remaining == 0) { break; }
+            if (message.role != ChatRole::Tool) { continue; }
+            for (const auto& part : message.parts) {
+                if (remaining == 0) { break; }
+                if (part.kind != fi::ChatPartKind::Text) { continue; }
+                fi::check_preparation_control(control, "ngram proposal sources");
+                for (const auto& source : fi::ngram_numbered_sources(part.text)) {
+                    fi::check_preparation_control(control, "ngram proposal sources");
+                    if (remaining == 0) { break; }
+                    auto tokens = impl_->tokenizer->encode(source, {.max_tokens = remaining});
+                    fi::check_preparation_control(control, "ngram proposal sources");
+                    remaining -= tokens.size();
+                    result.ngram_sources.push_back(std::move(tokens));
+                }
+            }
+        }
+    }
     std::vector<std::optional<std::uint32_t>> message_boundaries;
     std::vector<std::optional<std::uint32_t>> cache_boundaries;
     if (has_media) {
@@ -796,6 +861,58 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
+    if (impl_->ngram_archive_enabled) {
+        const std::span<const TokenId> tokens(result.token_ids);
+        auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {
+            if (static_cast<int>(kind) == priority && span.size() >= 4 &&
+                result.ngram_archive_sources.size() < kNgramRequestSourceCapacity) {
+                result.ngram_archive_sources.push_back({span, kind});
+            }
+        };
+        // Use already-encoded message frontiers, not re-tokenized rendered text.
+        // Views move with the owning token vector and never participate in KV identity.
+        for (int priority = static_cast<int>(NgramSourceKind::Tool); priority >= 0; --priority) {
+            for (std::size_t i = 0; i < message_roles.size() && i + 1 < message_boundaries.size();
+                 ++i) {
+                fi::check_preparation_control(control, "ngram archive sources");
+                const auto role = message_roles[i];
+                const auto kind = role == ChatRole::Tool        ? NgramSourceKind::Tool
+                                  : role == ChatRole::Assistant ? NgramSourceKind::Generated
+                                                                : NgramSourceKind::Text;
+                if ((static_cast<int>(kind) != priority &&
+                     !(role == ChatRole::Assistant && priority == 0)) ||
+                    !message_boundaries[i + 1] || (!message_boundaries[i] && i != 0)) {
+                    continue;
+                }
+                auto begin     = message_boundaries[i].value_or(0);
+                const auto end = *message_boundaries[i + 1];
+                if (begin >= end || end > tokens.size()) { continue; }
+                if (impl_->tokenizer->decode_token_bytes(tokens[begin]) == "<|im_start|>") {
+                    while (begin < end) {
+                        const auto bytes = impl_->tokenizer->decode_token_bytes(tokens[begin++]);
+                        if (bytes.find('\n') != std::string_view::npos) { break; }
+                    }
+                }
+                auto body = tokens.subspan(begin, end - begin);
+                if (role == ChatRole::Assistant && !impl_->ngram_think_open.empty() &&
+                    !impl_->ngram_think_close.empty()) {
+                    const auto& open  = impl_->ngram_think_open;
+                    const auto& close = impl_->ngram_think_close;
+                    const auto marker =
+                        std::search(body.begin(), body.end(), open.begin(), open.end());
+                    if (marker != body.end() && marker - body.begin() <= 4) {
+                        const auto reasoning = marker + open.size();
+                        const auto closure =
+                            std::search(reasoning, body.end(), close.begin(), close.end());
+                        add({reasoning, closure}, NgramSourceKind::Reasoning, priority);
+                        if (closure == body.end()) { continue; }
+                        body = {closure + close.size(), body.end()};
+                    }
+                }
+                add(body, kind, priority);
+            }
+        }
+    }
     result.identity.reusable = true;
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
@@ -868,6 +985,10 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
+    if (impl_->ngram_sources_enabled) { result.ngram_boundaries = impl_->ngram_boundaries; }
+    if (impl_->ngram_archive_enabled) {
+        result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
+    }
     assign_text_positions(result);
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.update_session_index = false;

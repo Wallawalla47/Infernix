@@ -46,6 +46,7 @@ struct ServeOptions {
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
     bool enable_vision                     = false;
     bool vision_offload                    = false;

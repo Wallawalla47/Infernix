@@ -34,11 +34,11 @@ void validate_spec(const RoundStateSpec& spec) {
     if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window == 0) {
         throw std::invalid_argument("RoundState cannot enable MTP with an empty draft window");
     }
-    if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window > kMtpDecodeMaximumDrafts) {
+    if (spec.backend == SpeculativeBackend::Mtp && spec.draft_window > kMtpVerifyMaximumDrafts) {
         throw std::invalid_argument("RoundState MTP draft window exceeds the decode frame domain");
     }
     if (is_masked_draft_backend(spec.backend) &&
-        (spec.draft_window == 0 || spec.draft_window > kDFlashDecodeMaximumDrafts)) {
+        (spec.draft_window == 0 || spec.draft_window > kDFlashVerifyMaximumDrafts)) {
         throw std::invalid_argument(
             "RoundState DFlash draft window exceeds the decode frame domain");
     }
@@ -133,9 +133,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
     };
     if (layout.spec.backend == SpeculativeBackend::Mtp) {
         layout.mtp.emplace();
-        const auto ar_steps =
-            checked_i32(std::max<std::uint64_t>(1ULL, layout.spec.draft_window - 1ULL),
-                        "RoundState MTP AR steps exceed int32");
+        const auto ar_steps = checked_i32(
+            std::max<std::uint64_t>(
+                1ULL,
+                std::min<std::uint64_t>(layout.spec.draft_window, kMtpDecodeMaximumDrafts) - 1ULL),
+            "RoundState MTP AR steps exceed int32");
         layout.mtp->position         = i32(1, "MTP prefill autoregressive position");
         layout.mtp->ar_hidden        = add_tensor(builder, DType::BF16, {layout.spec.hidden, 1},
                                                   "MTP prefill autoregressive hidden");
@@ -246,17 +248,19 @@ DFlashPrefillState::DFlashPrefillState(DeviceSpan backing, const DFlashPrefillSt
 MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
                                std::uint32_t batch_capacity, std::uint32_t draft_window) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
-        draft_window > kMtpDecodeMaximumDrafts) {
+        draft_window > kMtpVerifyMaximumDrafts) {
         throw std::invalid_argument("MTP decode state dimensions are outside the supported domain");
     }
     static_assert(std::is_standard_layout_v<MtpDecodeIngress>);
     static_assert(std::is_standard_layout_v<MtpDecodeEgress>);
-    const auto batch          = static_cast<std::int32_t>(batch_capacity);
-    const auto drafts         = static_cast<std::int32_t>(draft_window);
-    const auto width          = drafts + 1;
-    const auto steps          = std::max(drafts - 1, 1);
-    ingress                   = layout.ingress.bind(backing);
-    egress                    = layout.egress.bind(backing);
+    static_assert(offsetof(MtpDecodeIngress, sampling) % alignof(ops::SamplingConfig) == 0);
+    const auto batch         = static_cast<std::int32_t>(batch_capacity);
+    const auto drafts        = static_cast<std::int32_t>(draft_window);
+    const auto width         = drafts + 1;
+    const auto neural_drafts = std::min(drafts, static_cast<std::int32_t>(kMtpDecodeMaximumDrafts));
+    const auto steps         = std::max(neural_drafts - 1, 1);
+    ingress                  = layout.ingress.bind(backing);
+    egress                   = layout.egress.bind(backing);
     const auto ingress_tensor = [&](std::size_t offset, DType dtype,
                                     std::initializer_list<std::int32_t> shape) {
         return Tensor(static_cast<unsigned char*>(ingress.data) + offset, dtype, shape);
@@ -297,7 +301,7 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     accepted_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, accepted_drafts), DType::I32, {batch});
     next_drafts =
-        egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
+        egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, neural_drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
@@ -318,10 +322,65 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     }
 }
 
+MtpDecodeState MtpDecodeState::single_row_prefix(std::uint32_t k, std::uint32_t next_k) const {
+    if (current_drafts.ne[1] != 1 || k == 0 ||
+        k > static_cast<std::uint32_t>(current_drafts.ne[0]) || next_k == 0 ||
+        next_k > static_cast<std::uint32_t>(next_drafts.ne[1])) {
+        throw std::invalid_argument("MTP prefix requires C1 and allocated verify/proposal widths");
+    }
+    auto result      = *this;
+    const auto width = static_cast<std::int32_t>(k + 1);
+    for (Tensor* tensor :
+         {&result.target_rope_positions, &result.licensed_tokens, &result.verify_ids,
+          &result.target_positions, &result.target_argmax, &result.alignment_ids}) {
+        *tensor = Tensor(tensor->data, tensor->dtype, {width, 1});
+    }
+    result.current_drafts =
+        Tensor(current_drafts.data, DType::I32, {static_cast<std::int32_t>(k), 1});
+    for (Tensor* tensor :
+         {&result.target_hidden, &result.target_logits, &result.alignment_hidden}) {
+        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, 1});
+    }
+    const auto steps = static_cast<std::int32_t>(std::max(1U, next_k - 1U));
+    for (Tensor* tensor :
+         {&result.ar_positions, &result.ar_rope_positions, &result.ar_valid_columns}) {
+        *tensor = tensor->slice(1, 0, steps);
+    }
+    result.next_drafts = next_drafts.slice(1, 0, static_cast<std::int32_t>(next_k));
+    return result;
+}
+
+DFlashDecodeState DFlashDecodeState::single_row_prefix(std::uint32_t k) const {
+    if (draft_tokens.ne[1] != 1 || k == 0 || k > static_cast<std::uint32_t>(draft_tokens.ne[0])) {
+        throw std::invalid_argument("DFlash prefix view requires C1 and an allocated draft width");
+    }
+    auto result       = *this;
+    const auto width  = static_cast<std::int32_t>(k + 1);
+    const auto drafts = static_cast<std::int32_t>(k);
+    // C1 columns form dense prefixes; no other request's stride is reinterpreted.
+    for (Tensor* tensor : {&result.target_rope_positions, &result.licensed_tokens,
+                           &result.proposal_ids, &result.proposal_positions,
+                           &result.verify_positions, &result.verify_ids, &result.target_argmax}) {
+        *tensor = Tensor(tensor->data, tensor->dtype, {width, 1});
+    }
+    result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, 1});
+    for (Tensor* tensor : {&result.target_hidden, &result.target_logits}) {
+        *tensor = Tensor(tensor->data, tensor->dtype, {tensor->ne[0], width, 1});
+    }
+    for (Tensor* tensor : {&result.candidate_ids, &result.proposal_q}) {
+        if (tensor->data) {
+            *tensor =
+                Tensor(tensor->data, tensor->dtype, {ops::kSparseSpeculativeCandidates, drafts, 1});
+        }
+    }
+    // The previous provider may require a wider context append.
+    return result;
+}
+
 DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeStateLayout& layout,
                                      std::uint32_t batch_capacity, std::uint32_t draft_window) {
     if (batch_capacity == 0 || batch_capacity > kMaximumConcurrency || draft_window == 0 ||
-        draft_window > kDFlashDecodeMaximumDrafts) {
+        draft_window > kDFlashVerifyMaximumDrafts) {
         throw std::invalid_argument(
             "DFlash decode state dimensions are outside the supported domain");
     }

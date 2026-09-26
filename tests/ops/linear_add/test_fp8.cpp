@@ -90,7 +90,8 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
-int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed) {
+int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed,
+              bool wide_only) {
     std::vector<Invocation> invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
@@ -116,7 +117,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     }
     for (int columns : {31, 32, 33, 63, 64, 65, 127, 128, 129, 1024})
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
-    constexpr std::int32_t kMaximumTokens = 1025;
+    if (wide_only) {
+        // Ngram copy verification keeps the residual projections on A16 through width 64.
+        invocations.clear();
+        for (int columns = 33; columns <= 64; ++columns)
+            invocations.push_back({columns, ops::LinearPolicy::A16Only});
+    }
+    const std::int32_t kMaximumTokens = wide_only ? 64 : 1025;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
     const std::vector<std::int32_t> rows = sampled_indices(n);
@@ -250,14 +257,19 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
+    if (argc != 1 && !wide_only) {
+        std::cerr << "usage: " << argv[0] << " [--wide-only]\n";
+        return 2;
+    }
     if (ninfer::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     int failures = 0;
-    failures += run_shape(5120, 6144, 17, 861U);
-    failures += run_shape(5120, 17408, 20, 863U);
+    failures += run_shape(5120, 6144, 17, 861U, wide_only);
+    failures += run_shape(5120, 17408, 20, 863U, wide_only);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

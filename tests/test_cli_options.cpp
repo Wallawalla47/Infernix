@@ -30,7 +30,7 @@ int check(bool condition, const char* message) {
 
 } // namespace
 
-int main() {
+int run_tests() {
     int failures = 0;
     failures += check(ninfer::EngineOptions{}.rope_yarn_factor == 1.0F,
                       "Engine YaRN must default off");
@@ -53,6 +53,44 @@ int main() {
     }), "missing YaRN factor accepted");
     failures += check(ninfer::cli::usage_text("ninfer").find("--rope-yarn-factor") != std::string::npos,
                       "CLI help omits YaRN");
+    for (const auto* backend : {"mtp", "dflash", "dflash2"}) {
+        for (unsigned width = 0; width <= 63; ++width) {
+            const auto mixed =
+                parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
+                       "--draft-tokens", "5", "--ngram-draft-tokens", std::to_string(width)});
+            failures += check(mixed.speculative.draft_tokens == 5 &&
+                                  mixed.speculative.ngram_draft_tokens == width,
+                              "CLI failed to preserve independent neural/ngram widths");
+        }
+        failures +=
+            check(rejects([&] {
+                      (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
+                                   "--draft-tokens", "5", "--ngram-draft-tokens", "64"});
+                  }),
+                  "CLI admitted unsupported ngram width");
+    }
+    failures += check(ninfer::cli::usage_text("ninfer-cli").find("--ngram-draft-tokens 1..63") !=
+                          std::string::npos,
+                      "CLI help has a stale ngram width limit");
+    failures +=
+        check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-draft-tokens", "0"})
+                      .speculative.ngram_draft_tokens == 0,
+              "explicit ngram-off must not require a neural backend");
+    const auto ngram = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "dflash2",
+                              "--draft-tokens", "5", "--ngram-draft-tokens", "15"});
+    failures +=
+        check(ngram.speculative.ngram_draft_tokens == 15 && ngram.speculative.draft_tokens == 5,
+              "CLI ngram widths changed");
+    const auto mtp_ngram = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "5", "--ngram-draft-tokens", "1"});
+    failures += check(mtp_ngram.speculative.draft_tokens == 5 &&
+                          mtp_ngram.speculative.ngram_draft_tokens == 1,
+                      "CLI narrow ngram/wide MTP pair changed");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec",
+                                       "mtp", "--draft-tokens", "6", "--ngram-draft-tokens", "15"});
+                      }),
+                      "CLI admitted unsupported MTP neural width");
     const ninfer::cli::Options configured =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--thinking-budget", "37"});
     failures += check(configured.thinking_budget == 37,
@@ -160,4 +198,13 @@ int main() {
               }),
               "CLI accepted top_k beyond the executable candidate domain");
     return failures == 0 ? 0 : 1;
+}
+
+int main() {
+    try {
+        return run_tests();
+    } catch (const std::exception& error) {
+        std::cerr << "Unexpected CLI test exception: " << error.what() << '\n';
+        return 1;
+    }
 }

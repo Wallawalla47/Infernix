@@ -151,6 +151,9 @@ void test_decoder_layout() {
 }
 
 void test_round_layout() {
+    static_assert(offsetof(q36::DFlashDecodeIngress, anchors) % 16 == 0);
+    static_assert(offsetof(q36::DFlashDecodeIngress, execution_frontiers) % 16 == 0);
+    static_assert(offsetof(q36::DFlashDecodeIngress, sampling) % 16 == 0);
     ninfer::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
         builder, q36::RoundStateSpec{.hidden       = 32,
@@ -196,6 +199,83 @@ void test_round_layout() {
     expect(!scoring.ordinary && !scoring.mtp_decode && !scoring.dflash_decode &&
                scoring.token.region.bytes == 0 && scoring.logits.region.bytes == 0,
            "scoring does not reserve generation frames or sampled output");
+    ninfer::LayoutBuilder copy_builder;
+    auto copy_layout = q36::begin_round_state_layout(
+        copy_builder, {.hidden         = 32,
+                       .output_rows    = 128,
+                       .batch_capacity = 1,
+                       .draft_window   = 15,
+                       .backend        = ninfer::SpeculativeBackend::DFlash2});
+    q36::complete_round_state_layout(copy_builder, copy_layout);
+    const auto bytes = copy_builder.finish(256);
+    std::vector<std::byte> storage(bytes + 255);
+    auto address = reinterpret_cast<std::uintptr_t>(storage.data());
+    address      = (address + 255) & ~std::uintptr_t(255);
+    q36::RoundState copy({reinterpret_cast<void*>(address), bytes}, copy_layout);
+    for (std::uint32_t k = 1; k <= 15; ++k) {
+        const auto narrow = copy.dflash_decode->single_row_prefix(k);
+        expect(narrow.target_logits.ne[1] == static_cast<int>(k + 1) &&
+                   narrow.draft_tokens.ne[0] == static_cast<int>(k) &&
+                   narrow.candidate_ids.ne[1] == static_cast<int>(k),
+               "copy frame prefix shapes");
+        expect(narrow.target_logits.data == copy.dflash_decode->target_logits.data &&
+                   narrow.append_positions.ne[0] == 16,
+               "copy frame aliases and catch-up capacity");
+        expect(reinterpret_cast<std::uintptr_t>(narrow.anchors.data) % 16 == 0 &&
+                   reinterpret_cast<std::uintptr_t>(narrow.execution_frontiers.data) % 16 == 0,
+               "copy frame controls retain vector alignment");
+    }
+    for (std::uint32_t k : {0, 16}) {
+        bool rejected = false;
+        try {
+            (void)copy.dflash_decode->single_row_prefix(k);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "invalid copy frame width rejected");
+    }
+    ninfer::LayoutBuilder mtp_copy_builder;
+    auto mtp_copy_layout = q36::begin_round_state_layout(
+        mtp_copy_builder, {.hidden         = 32,
+                           .output_rows    = 128,
+                           .batch_capacity = 1,
+                           .draft_window   = 15,
+                           .backend        = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(mtp_copy_builder, mtp_copy_layout);
+    const auto mtp_bytes = mtp_copy_builder.finish(256);
+    std::vector<std::byte> mtp_storage(mtp_bytes + 255);
+    const auto mtp_address =
+        (reinterpret_cast<std::uintptr_t>(mtp_storage.data()) + 255) & ~std::uintptr_t(255);
+    q36::RoundState mtp_copy({reinterpret_cast<void*>(mtp_address), mtp_bytes}, mtp_copy_layout);
+    expect(mtp_copy.mtp_decode->ar_positions.ne[1] == 4 &&
+               mtp_copy.mtp_decode->ar_rope_positions.ne[1] == 4 &&
+               mtp_copy.mtp_decode->ar_valid_columns.ne[1] == 4,
+           "MTP wide copy frame allocates at most four neural AR steps");
+    for (std::uint32_t k = 1; k <= 15; ++k) {
+        for (std::uint32_t next_k = 1; next_k <= 5; ++next_k) {
+            const auto& base_frame = *mtp_copy.mtp_decode;
+            const auto frame       = base_frame.current_drafts.ne[0] == static_cast<int>(k) &&
+                                       base_frame.next_drafts.ne[1] == static_cast<int>(next_k)
+                                         ? base_frame
+                                         : base_frame.single_row_prefix(k, next_k);
+            expect(frame.target_logits.ne[1] == static_cast<int>(k + 1) &&
+                       frame.current_drafts.ne[0] == static_cast<int>(k) &&
+                       frame.alignment_ids.ne[0] == static_cast<int>(k + 1) &&
+                       frame.next_drafts.ne[1] == static_cast<int>(next_k) &&
+                       frame.ar_positions.ne[1] == static_cast<int>(std::max(1U, next_k - 1U)),
+                   "MTP copy verification and next proposal dimensions are independent");
+            expect(frame.target_hidden.data == mtp_copy.mtp_decode->target_hidden.data &&
+                       frame.target_logits.is_contiguous() &&
+                       frame.alignment_hidden.is_contiguous(),
+                   "MTP copy frame remains a dense prefix");
+        }
+    }
+    for (const auto [k, next_k] :
+         std::vector<std::pair<unsigned, unsigned>>{{0, 3}, {16, 3}, {15, 0}, {15, 6}}) {
+        bool rejected = false;
+        try {
+            (void)mtp_copy.mtp_decode->single_row_prefix(k, next_k);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "MTP invalid verify/proposal frame width rejected");
+    }
 }
 
 void test_mtp_alignment() {

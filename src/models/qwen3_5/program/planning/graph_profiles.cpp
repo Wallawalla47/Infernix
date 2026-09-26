@@ -42,17 +42,27 @@ std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacit
 }
 
 std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
-                                                      std::uint32_t draft_window) {
+                                                      std::uint32_t draft_window,
+                                                      std::uint32_t neural_drafts) {
     if (draft_window == 0 || capacity == 0) { return {}; }
     // The final AR call can see E+2K. Target verify and MTP attention are update-compatible
     // across all resource tiers, independently of the selected KV representation.
-    return causal_resource_profiles(capacity, 2 * draft_window);
+    auto profiles = causal_resource_profiles(capacity, 2 * draft_window);
+    if (draft_window != neural_drafts) {
+        // Unequal verification/next-draft widths cannot share equal-width graphs.
+        for (std::size_t i = 0; i < profiles.size(); ++i) {
+            profiles[i].topology_class = static_cast<std::uint32_t>(i);
+        }
+    }
+    return profiles;
 }
 
 std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                          std::uint32_t capacity,
                                                          std::uint32_t draft_window) {
-    if (capacity == 0 || draft_window == 0 || draft_window > 15) {
+    // Ngram copy verification widens the window up to 63 drafts; above 15 the Engine runs one
+    // request at a time, so the batch>1 graphs never see it.
+    if (capacity == 0 || draft_window == 0 || draft_window > 63) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
     if (backend == SpeculativeBackend::DFlash2) {
@@ -74,24 +84,24 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
 
 execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint32_t max_frontier,
                                                                       std::uint32_t k,
-                                                                      std::uint32_t capacity) {
+                                                                      std::uint32_t capacity,
+                                                                      std::uint32_t next_k) {
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     execution::MtpCausalAttentionEnvelopes out;
     out.target_verify = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + 1ULL)};
     out.batch         = out.target_verify;
-    for (std::uint32_t step = 0; step + 1 < k; ++step) {
+    for (std::uint32_t step = 0; step + 1 < next_k; ++step) {
         out.ar[step] = {1, visible(static_cast<std::uint64_t>(max_frontier) + k + step + 2ULL)};
     }
     return out;
 }
 
-execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier, std::uint32_t k) {
+execution::DFlashEnvelopes dflash_envelopes(std::uint32_t max_frontier) {
     return execution::DFlashEnvelopes{
-        .local  = {0, max_frontier},
-        .full   = {0, max_frontier},
-        .append = {0, k + 1},
+        .local = {0, max_frontier},
+        .full  = {0, max_frontier},
     };
 }
 

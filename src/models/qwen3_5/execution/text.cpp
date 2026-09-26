@@ -182,6 +182,9 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
         Tensor source = value.view({value.ne[0], batch_width, batch_size});
         Tensor target =
             batch_features->slice(0, static_cast<std::int32_t>(index) * value.ne[0], value.ne[0]);
+        if (batch_size == 1 && target.ne[1] != batch_width) {
+            target = target.slice(1, 0, batch_width);
+        }
         ops::scatter_bf16_batch(source, *batch_lanes, *batch_valid_columns, target, stream);
         captured_mask |= 1U << index;
         return;
@@ -722,7 +725,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            Tap& tap) {
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kDFlashVerifyMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
     }
@@ -807,7 +810,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
+    if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
@@ -933,7 +936,9 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     ops::sigmoid_mul(gate, a, s);
 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+                    residual_projection_policy(
+                        p.output, wide_residual_verification(ph, active_sequence_batch_, T, T)),
+                    work_, s);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -983,6 +988,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
                                   key_output, value_output, gate_output, work_, s);
@@ -1036,6 +1042,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
@@ -1068,7 +1075,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, ctx_.execution_view());
 
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
-                    p.output.policy, work_, s);
+                    residual_projection_policy(
+                        p.output, wide_residual_verification(ph, active_sequence_batch_, T, T)),
+                    work_, s);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1077,11 +1086,12 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
                                                  : ops::SparseMoeHints{};
 }
 
-void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
+void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
-    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view());
+    ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
+        ph == Phase::Verify && active_sequence_batch_ == 1 && x.ne[1] > 16 && x.ne[1] <= 64);
 }
 
 template <class Tap>

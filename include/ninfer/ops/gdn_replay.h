@@ -23,6 +23,7 @@ struct GdnReplayFoldRow {
  * updates the caller-selected absolute linear-attention destination state slot. rows[b] always maps
  * to physical record row b; rows are not filtered, compressed, or reordered. The active row count
  * is rows.size() and must be in [1,records.spec.record_capacity].
+ * Record width is 2..64; widths above 16 admit one active row only.
  *
  * source_state_slot and destination_state_slot are in [0,states.spec.slot_count). A row may be
  * in-place. Destinations are distinct and cannot overwrite another active row's source.

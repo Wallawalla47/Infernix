@@ -76,6 +76,7 @@ struct MtpBatchContext {
     const qwen3_5::MtpDecodeIngress& host_ingress;
     qwen3_5::MtpDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    std::uint32_t neural_proposal_drafts = 0;
 };
 
 struct DFlashBatchContext {
@@ -86,6 +87,8 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    bool ngram                           = false;
+    std::uint32_t neural_proposal_drafts = 0;
 };
 
 struct DFlashAppendContext {
@@ -102,7 +105,6 @@ struct MtpCausalAttentionEnvelopes {
 struct DFlashEnvelopes {
     ops::SlidingWindowAttentionExecutionEnvelope local;
     ops::ContextAttentionExecutionEnvelope full;
-    ops::KVCacheAppendPrefixExecutionEnvelope append;
 };
 
 struct TargetVerifyFrameView {

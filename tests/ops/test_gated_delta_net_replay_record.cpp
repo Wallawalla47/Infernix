@@ -12,7 +12,10 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -165,7 +168,8 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     launch_reference();
     launch_record();
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    if (width == 2 || width == 9 || width == 16) {
+    if (width == 2 || width == 9 || width == 16 || width == 17 || width == 31 || width == 32 ||
+        width > 32) {
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
@@ -285,11 +289,35 @@ int main() {
     }
 
     int failures = 0;
+    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {1, 1}}) {
+        Tensor q(nullptr, DType::BF16, {128, 16, width, batch});
+        Tensor v(nullptr, DType::BF16, {128, 48, width, batch});
+        Tensor empty;
+        bool rejected = false;
+        try {
+            ops::gated_delta_net_replay_record(q, q, v, empty, empty, 1.0F / std::sqrt(128.0F),
+                                               empty, empty, empty, empty, empty, empty, empty,
+                                               nullptr);
+        } catch (const std::invalid_argument& error) {
+            rejected = std::string_view(error.what()).find("unsupported geometry") !=
+                       std::string_view::npos;
+        }
+        if (!rejected) {
+            std::cerr << "replay record did not reject unsupported B/T geometry\n";
+            ++failures;
+        }
+    }
     failures += run_case(32, 2, 1, {}, 1701U);
     failures += run_case(32, 16, 1, {7}, 1711U);
     failures += run_case(32, 6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1721U);
-    for (int width = 2; width <= 16; ++width) {
+    for (int width = 2; width <= 64; ++width) {
         failures += run_case(48, width, 1, {}, 1730U + width);
+        if (width > 16) {
+            failures += run_case(48, width, 1, {width / 2}, 1830U + width);
+            failures += run_case(32, width, 1, {}, 1930U + width);
+            failures += run_case(32, width, 1, {width / 2}, 2030U + width);
+            continue;
+        }
         std::vector<std::int32_t> valid(8);
         for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (3 * b) % width;
         failures += run_case(48, width, 8, valid, 1760U + width);

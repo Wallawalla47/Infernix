@@ -101,6 +101,92 @@ int test_sse_transport() {
     return failures;
 }
 
+int test_ngram_identity() {
+    using namespace ninfer::serve;
+    int failures = 0;
+    ServeOptions options;
+    httplib::Request request;
+    request.set_header("x-session-affinity", "conversation-a");
+    const RequestJson empty = {{"store", false}};
+    failures += check(resolve_ngram_session(request, empty, options).key.empty(),
+                      "disabled archive bound identity");
+    options.speculative.ngram_archive_bytes = 512ULL << 20;
+    failures += check(resolve_ngram_session(request, empty, options).key.empty(),
+                      "native identity retained without explicit opt-in");
+    options.ngram_native_sessions = true;
+    failures += check(resolve_ngram_session(request, empty, options).key == "kilo:conversation-a",
+                      "native affinity was not bound");
+    request.set_header("x-ninfer-draft-reset", "1");
+    failures +=
+        check(resolve_ngram_session(request, empty, options).reset, "native reset was ignored");
+    request.headers.clear();
+    RequestJson codex = {{"store", false},
+                         {"client_metadata", {{"thread_id", "task-a"}, {"session_id", "task-a"}}}};
+    failures += check(resolve_ngram_session(request, codex, options).key == "codex:task-a",
+                      "Codex conversation was not bound");
+    codex["client_metadata"]["session_id"] = "task-b";
+    failures += check(resolve_ngram_session(request, codex, options).key.empty(),
+                      "contradictory Codex identity accepted");
+    const RequestJson claude = {
+        {"metadata", {{"user_id", R"({"device_id":"shared-device","session_id":"chat-a"})"}}}};
+    failures += check(resolve_ngram_session(request, claude, options).key == "claude:chat-a",
+                      "Claude conversation was not bound");
+    request.set_header("x-session-affinity", "other-task");
+    failures += check(resolve_ngram_session(request, claude, options).key.empty(),
+                      "ambiguous native identities merged");
+    request.headers.clear();
+    for (const RequestJson& body :
+         {RequestJson{{"prompt_cache_key", "shared"}},
+          RequestJson{{"metadata", {{"user_id", "shared-user"}}}},
+          RequestJson{{"metadata", {{"user_id", R"({"device_id":"shared-device"})"}}}}}) {
+        failures += check(resolve_ngram_session(request, body, options).key.empty(),
+                          "non-conversation metadata authorized retention");
+    }
+    options.ngram_native_sessions = false;
+    request.set_header("x-ninfer-draft-session", "fork");
+    request.set_header("x-ninfer-draft-parent", "root");
+    request.set_header("x-ninfer-draft-generation", "3");
+    auto hints = resolve_ngram_session(request, empty, options);
+    failures += check(hints.key == "explicit:fork" && hints.parent == "explicit:root" &&
+                          hints.parent_generation == 3,
+                      "explicit ancestor snapshot was not preserved");
+    request.set_header("x-ninfer-draft-session", "different");
+    failures += check(resolve_ngram_session(request, empty, options).key.empty(),
+                      "duplicate session header accepted");
+    request.headers.clear();
+    request.set_header("x-ninfer-draft-session", std::string(241, 'x'));
+    failures += check(resolve_ngram_session(request, empty, options).key.empty(),
+                      "unbounded session header accepted");
+    return failures;
+}
+
+int test_ngram_generation() {
+    using namespace ninfer;
+    using namespace ninfer::serve;
+    int failures = 0;
+    const NgramArchiveStats complete{
+        .enabled = true, .bound = true, .published = true, .generation = 9};
+    httplib::Response response;
+    set_ngram_generation_header(response, complete);
+    failures += check(response.get_header_value("X-NInfer-Draft-Generation") == "9",
+                      "completed archive generation header absent");
+    failures += check(ngram_generation_comment(complete) == ": ninfer-draft-generation: 9\n\n",
+                      "stream generation is not a standard SSE comment");
+    for (int missing = 0; missing < 4; ++missing) {
+        auto stats = complete;
+        if (missing == 0) { stats.enabled = false; }
+        if (missing == 1) { stats.bound = false; }
+        if (missing == 2) { stats.published = false; }
+        if (missing == 3) { stats.generation = 0; }
+        httplib::Response absent;
+        set_ngram_generation_header(absent, stats);
+        failures += check(!absent.has_header("X-NInfer-Draft-Generation") &&
+                              ngram_generation_comment(stats).empty(),
+                          "unpublished archive advertised a completed generation");
+    }
+    return failures;
+}
+
 int test_sse_response_headers() {
     httplib::Response response;
     ninfer::serve::prepare_sse_response(response);
@@ -194,8 +280,8 @@ int test_inherited_socket_liveness() {
 } // namespace
 
 int main() {
-    int failures =
-        test_sse_transport() + test_sse_response_headers() + test_prompt_json_member_order();
+    int failures = test_ngram_identity() + test_ngram_generation() + test_sse_transport() +
+                   test_sse_response_headers() + test_prompt_json_member_order();
 #if defined(__linux__)
     failures += test_inherited_socket_liveness();
 #endif

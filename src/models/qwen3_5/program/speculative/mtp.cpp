@@ -71,12 +71,19 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                            MtpCausalAttentionEnvelopes envelopes) {
     return [&state, batch_size, k, envelopes] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
-            k == 0 || k > kMtpDecodeMaximumDrafts) {
+            k == 0 || k > kMtpVerifyMaximumDrafts) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
 
-        qwen3_5::MtpDecodeState& frame = state.frame;
-        const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
+        const auto next_k = state.neural_proposal_drafts;
+        if (next_k == 0 || next_k > kMtpDecodeMaximumDrafts) {
+            throw std::logic_error("MTP neural proposal width is outside its supported domain");
+        }
+        auto frame = state.frame.current_drafts.ne[0] == static_cast<std::int32_t>(k) &&
+                             state.frame.next_drafts.ne[1] == static_cast<std::int32_t>(next_k)
+                         ? state.frame
+                         : state.frame.single_row_prefix(k, next_k);
+        const std::int32_t width = static_cast<std::int32_t>(k) + 1;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -151,11 +158,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
                                           static_cast<std::uint64_t>(k) * batch_size);
-            ops::mtp_prepare_next_round(verify_ids, anchors, accepted, frontiers, budgets,
-                                        licensed_counts, rope_deltas, alignment_ids, next_extents,
-                                        ar_positions, ar_rope_positions, ar_valid_columns,
-                                        static_cast<std::int32_t>(state.text_cache.max_context()),
-                                        state.execution.device.stream);
+            ops::mtp_prepare_next_round(
+                verify_ids, anchors, accepted, frontiers, budgets, licensed_counts, rope_deltas,
+                alignment_ids, next_extents, ar_positions, ar_rope_positions, ar_valid_columns,
+                static_cast<std::int32_t>(state.text_cache.max_context()),
+                static_cast<std::int32_t>(next_k), state.execution.device.stream);
             card.mtp_forward_decode_batch(alignment_ids, target_hidden, target_positions,
                                           target_rope, licensed_counts, mtp_rows, envelopes.batch,
                                           alignment_hidden);
@@ -165,7 +172,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             Tensor proposal_logits = frame.proposal_logits.slice(1, 0, batch_size);
             Tensor draft0          = next_drafts.slice(1, 0, 1).view({batch_size});
             card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
-            for (std::uint32_t step = 0; step + 1 < k; ++step) {
+            for (std::uint32_t step = 0; step + 1 < next_k; ++step) {
                 Tensor previous =
                     next_drafts.slice(1, static_cast<std::int32_t>(step), 1).view({batch_size});
                 Tensor next =

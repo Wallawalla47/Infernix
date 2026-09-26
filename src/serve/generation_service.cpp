@@ -326,10 +326,11 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    prepared.thinking_budget     = request_options.execution.thinking.budget;
-    prepared.reasoning_effort    = semantics.reasoning_effort;
-    prepared.preserve_thinking   = semantics.preserve_thinking;
-    const bool request_has_media = request.media_item_count() != 0;
+    request_options.ngram_session = request.ngram_session;
+    prepared.thinking_budget      = request_options.execution.thinking.budget;
+    prepared.reasoning_effort     = semantics.reasoning_effort;
+    prepared.preserve_thinking    = semantics.preserve_thinking;
+    const bool request_has_media  = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -474,19 +475,27 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.total_seconds =
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
-    outcome.metrics.engine_timing               = result.engine_timing;
-    outcome.metrics.first_output_timing         = std::move(result.first_output_timing);
-    outcome.metrics.scheduling                  = result.scheduling;
-    outcome.metrics.engine_request_id           = result.engine_request_id;
-    outcome.metrics.computed_prefill_tokens     = result.computed_prefill_tokens;
-    outcome.metrics.prefix_cache_hit_tokens     = result.reused_prompt_tokens;
-    outcome.metrics.prefix_reuse_path           = result.prefix_reuse_path;
-    outcome.metrics.speculative_backend         = result.speculative.backend;
-    outcome.metrics.speculative_draft_window    = result.speculative.draft_window;
-    outcome.metrics.speculative_rounds          = result.speculative.rounds;
-    outcome.metrics.speculative_draft_tokens    = result.speculative.drafted_tokens;
-    outcome.metrics.speculative_accepted_tokens = result.speculative.accepted_tokens;
-    outcome.metrics.speculative_fallback_steps  = result.speculative.fallback_steps;
+    outcome.metrics.engine_timing                = result.engine_timing;
+    outcome.metrics.first_output_timing          = std::move(result.first_output_timing);
+    outcome.metrics.scheduling                   = result.scheduling;
+    outcome.metrics.engine_request_id            = result.engine_request_id;
+    outcome.metrics.computed_prefill_tokens      = result.computed_prefill_tokens;
+    outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
+    outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
+    outcome.metrics.speculative_backend          = result.speculative.backend;
+    outcome.metrics.speculative_draft_window     = result.speculative.draft_window;
+    outcome.metrics.speculative_rounds           = result.speculative.rounds;
+    outcome.metrics.speculative_draft_tokens     = result.speculative.drafted_tokens;
+    outcome.metrics.speculative_accepted_tokens  = result.speculative.accepted_tokens;
+    outcome.metrics.speculative_fallback_steps   = result.speculative.fallback_steps;
+    outcome.metrics.ngram_rounds                 = result.speculative.ngram_rounds;
+    outcome.metrics.ngram_drafted_tokens         = result.speculative.ngram_drafted_tokens;
+    outcome.metrics.ngram_accepted_tokens        = result.speculative.ngram_accepted_tokens;
+    outcome.metrics.ngram_archive_rounds         = result.speculative.ngram_archive_rounds;
+    outcome.metrics.ngram_archive_drafted_tokens = result.speculative.ngram_archive_drafted_tokens;
+    outcome.metrics.ngram_archive_accepted_tokens =
+        result.speculative.ngram_archive_accepted_tokens;
+    outcome.metrics.ngram_archive = result.ngram_archive;
     outcome.metrics.speculative_accepted_per_position =
         std::move(result.speculative.accepted_per_position);
 

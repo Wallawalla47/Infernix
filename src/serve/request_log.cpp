@@ -333,7 +333,24 @@ Json speculative_json(const GenerationMetrics& metrics) {
                 {"drafted_tokens", metrics.speculative_draft_tokens},
                 {"accepted_tokens", metrics.speculative_accepted_tokens},
                 {"fallback_steps", metrics.speculative_fallback_steps},
-                {"accepted_per_position", metrics.speculative_accepted_per_position}};
+                {"accepted_per_position", metrics.speculative_accepted_per_position},
+                {"ngram_rounds", metrics.ngram_rounds},
+                {"ngram_drafted_tokens", metrics.ngram_drafted_tokens},
+                {"ngram_accepted_tokens", metrics.ngram_accepted_tokens},
+                {"ngram_archive_rounds", metrics.ngram_archive_rounds},
+                {"ngram_archive_drafted_tokens", metrics.ngram_archive_drafted_tokens},
+                {"ngram_archive_accepted_tokens", metrics.ngram_archive_accepted_tokens},
+                {"ngram_archive",
+                 {{"enabled", metrics.ngram_archive.enabled},
+                  {"bound", metrics.ngram_archive.bound},
+                  {"published", metrics.ngram_archive.published},
+                  {"generation", metrics.ngram_archive.generation},
+                  {"sources", metrics.ngram_archive.sources},
+                  {"session_bytes", metrics.ngram_archive.session_bytes},
+                  {"total_bytes", metrics.ngram_archive.total_bytes},
+                  {"sampling_seed", metrics.ngram_archive.sampling_seed
+                                        ? Json(*metrics.ngram_archive.sampling_seed)
+                                        : Json(nullptr)}}}};
 }
 
 Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
@@ -517,6 +534,11 @@ std::string format_server_start_json(
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
              {"speculative_draft_window", engine_options.speculative.draft_tokens},
+             {"ngram_draft_window", engine_options.speculative.ngram_draft_tokens},
+             {"ngram_min_match", engine_options.speculative.ngram_min_match},
+             {"ngram_archive_bytes", engine_options.speculative.ngram_archive_bytes},
+             {"ngram_session_bytes", engine_options.speculative.ngram_session_bytes},
+             {"ngram_native_sessions", options.ngram_native_sessions},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
              {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},

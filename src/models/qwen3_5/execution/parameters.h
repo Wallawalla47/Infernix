@@ -16,6 +16,14 @@ namespace ninfer::models::qwen3_5::execution {
 
 using LinearParameters = ops::SingleProjectionWeight;
 
+[[nodiscard]] inline ops::LinearPolicy residual_projection_policy(const LinearParameters& p,
+                                                                  bool wide_verification) {
+    // Keep the neural path's residual activation precision in wide copy verification.
+    return wide_verification && p.weight.qtype == QType::FP8_E4M3FN_ROW_BF16
+               ? ops::LinearPolicy::A16Only
+               : p.policy;
+}
+
 [[nodiscard]] inline std::int32_t dimension(std::uint64_t value) {
     if (value > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("model dimension exceeds the Tensor integer domain");

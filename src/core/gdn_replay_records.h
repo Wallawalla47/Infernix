@@ -37,6 +37,8 @@ struct GdnReplayRecordLayer {
     Tensor key;   // BF16 [key_dim, qk_heads, width, rows]
     Tensor value; // BF16 [value_dim, value_heads, width, rows]
     Tensor gate;  // FP32 [2, value_heads, width, rows], ordered {g, beta}
+
+    [[nodiscard]] GdnReplayRecordLayer single_row_prefix(std::int32_t width) const;
 };
 
 /**

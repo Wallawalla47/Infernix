@@ -79,10 +79,11 @@ ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
 ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
-    constexpr std::int32_t kMaximumWidth = 16;
+    constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
-    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
+    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch ||
+        (batch > 1 && width > 16)) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
     require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
@@ -243,9 +244,9 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
                                     std::int32_t max_width) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMinimumWidth = 2;
-    constexpr std::int32_t kMaximumWidth = 16;
+    constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
-        max_width < min_width || max_width > kMaximumWidth) {
+        max_width < min_width || max_width > kMaximumWidth || (batch_size > 1 && max_width > 16)) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid B/T domain");
     }
 }
@@ -675,7 +676,7 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
     require_record_nonoverlap(x, conv_weight, conv_states, valid_columns, initial_state_slots,
                               conv_record, query, key, value, z, workspace);
 
-    if (geometry.batch > 1) {
+    if (geometry.batch > 1 || geometry.width > 16) {
         compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                        query, key, value, z, geometry, workspace, stream,
                        [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
@@ -871,8 +872,8 @@ std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
             throw std::logic_error("ReplaySSM record planner admitted NVFP4 decode");
         }
         if (maximum_plan.schedule == detail::Nvfp4GdnConvScheduleId::SmallTFusedA16) { return 0; }
-        return detail::nvfp4_gdn_input_workspace_capacity_bytes(LinearPolicy::AllowA4,
-                                                                std::max(min_width, 4), max_width);
+        return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, std::max(min_width, 4),
+                                                                max_width);
     }
     return detail::nvfp4_gdn_input_workspace_capacity_bytes(policy, batch_size * min_width,
                                                             batch_size * max_width);

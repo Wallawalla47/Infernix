@@ -91,7 +91,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
 
-    ContextCacheOptions& cache      = options.context_cache;
+    ContextCacheOptions& cache = options.context_cache;
+    if (options.speculative.ngram_archive_bytes != 0 &&
+        (options.speculative.ngram_draft_tokens == 0 || options.max_concurrency != 1 ||
+         options.speculative.ngram_session_bytes < (1ULL << 20) ||
+         options.speculative.ngram_session_bytes > options.speculative.ngram_archive_bytes)) {
+        throw std::invalid_argument("ngram archive requires C1 ngram drafting and session capacity "
+                                    "between 1 MiB and total archive capacity");
+    }
     const std::uint32_t concurrency = options.max_concurrency;
     cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
     const std::uint64_t total_device_state_slots =
@@ -106,14 +113,17 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                              const EngineOptions& options)
     : model(std::move(source)), parameters(*model),
       frontend(models::qwen3_5::make_frontend(
-          model->resources(), {.chat_template_path       = options.chat_template_path,
-                               .architecture             = model->config().text.architecture,
-                               .vision_enabled           = options.enable_vision,
-                               .max_context              = options.max_context,
-                               .media_cache_bytes        = options.media_cache_bytes,
-                               .media_live_bytes         = options.media_live_bytes,
-                               .media_preprocess_threads = options.media_preprocess_threads,
-                               .vision_max_merged_tokens = options.vision_max_merged_tokens})),
+          model->resources(),
+          {.chat_template_path       = options.chat_template_path,
+           .architecture             = model->config().text.architecture,
+           .vision_enabled           = options.enable_vision,
+           .max_context              = options.max_context,
+           .media_cache_bytes        = options.media_cache_bytes,
+           .media_live_bytes         = options.media_live_bytes,
+           .media_preprocess_threads = options.media_preprocess_threads,
+           .vision_max_merged_tokens = options.vision_max_merged_tokens,
+           .ngram_sources_enabled    = options.speculative.ngram_draft_tokens != 0,
+           .ngram_archive_enabled    = options.speculative.ngram_archive_bytes != 0})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;

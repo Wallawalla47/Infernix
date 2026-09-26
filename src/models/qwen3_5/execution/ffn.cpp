@@ -12,7 +12,7 @@
 namespace ninfer::models::qwen3_5::execution {
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp) {
+                                std::int32_t last, bool mtp, bool wide_verification) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
@@ -49,7 +49,8 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
         {
             auto scope = layout.scope();
             (void)layout.alloc_bytes(ops::linear_add_workspace_capacity_bytes(
-                down.qtype, down.n, down.k, p.down.policy, first, last));
+                down.qtype, down.n, down.k, residual_projection_policy(p.down, wide_verification),
+                first, last));
         }
     }
     return layout.peak_bytes(1);
@@ -57,7 +58,7 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, DeviceExecutionView execution,
-         bool mtp) {
+         bool mtp, bool wide_verification) {
     const auto stream  = execution.stream;
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
@@ -95,7 +96,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         auto call = workspace.scope();
         ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
     }
-    ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+    ops::linear_add(activation, down, residual,
+                    residual_projection_policy(p.down, wide_verification), workspace, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

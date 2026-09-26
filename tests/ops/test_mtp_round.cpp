@@ -12,7 +12,7 @@ using namespace ninfer::test;
 
 namespace {
 
-int run_case(int k, const std::vector<std::int32_t>& accepted) {
+int run_case(int k, const std::vector<std::int32_t>& accepted, int next_k) {
     const int batch           = static_cast<int>(accepted.size());
     const int T               = k + 1;
     constexpr int max_context = 128;
@@ -25,7 +25,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     std::vector<std::int32_t> rope_deltas(static_cast<std::size_t>(batch));
     std::vector<std::int32_t> expected_alignment(static_cast<std::size_t>(T * batch));
     std::vector<std::int32_t> expected_extents(static_cast<std::size_t>(batch));
-    const int steps = std::max(k - 1, 1);
+    const int steps = std::max(next_k - 1, 1);
     std::vector<std::int32_t> expected_positions(static_cast<std::size_t>(batch * steps));
     std::vector<std::int32_t> expected_rope_positions(static_cast<std::size_t>(batch * steps));
     std::vector<std::int32_t> expected_valid(static_cast<std::size_t>(batch * steps));
@@ -51,7 +51,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
         const int context_extent =
             std::max(max_context - frontiers[static_cast<std::size_t>(b)] - 1, 0);
         expected_extents[static_cast<std::size_t>(b)] =
-            std::min({k, budget_extent, context_extent});
+            std::min({next_k, budget_extent, context_extent});
         for (int s = 0; s < steps; ++s) {
             const std::size_t offset   = static_cast<std::size_t>(s * batch + b);
             expected_positions[offset] = frontiers[static_cast<std::size_t>(b)] + s;
@@ -93,11 +93,36 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     Tensor t_valid(d_valid.data(), DType::I32, {batch, steps});
     ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets, t_licensed,
                                 t_rope_deltas, t_alignment, t_extents, t_positions,
-                                t_rope_positions, t_valid, max_context, nullptr);
+                                t_rope_positions, t_valid, max_context, next_k, nullptr);
     cuda_synchronize();
 
-    const std::string label =
-        "mtp next round K=" + std::to_string(k) + " B=" + std::to_string(batch);
+    int invalid_failures = 0;
+    if (((k == 15 && next_k == 3) || (k == 5 && next_k == 5)) && batch == 1 && accepted[0] == k) {
+        for (const int invalid_limit : {-1, 0, 6}) {
+            bool rejected = false;
+            try {
+                ops::mtp_prepare_next_round(t_verify, t_anchors, t_accepted, t_frontiers, t_budgets,
+                                            t_licensed, t_rope_deltas, t_alignment, t_extents,
+                                            t_positions, t_rope_positions, t_valid, max_context,
+                                            invalid_limit, nullptr);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) { ++invalid_failures; }
+        }
+        for (const int invalid_width : {1, 65}) {
+            auto invalid  = t_verify;
+            invalid.ne[0] = invalid_width;
+            bool rejected = false;
+            try {
+                ops::mtp_prepare_next_round(invalid, t_anchors, t_accepted, t_frontiers, t_budgets,
+                                            t_licensed, t_rope_deltas, t_alignment, t_extents,
+                                            t_positions, t_rope_positions, t_valid, max_context,
+                                            next_k, nullptr);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            if (!rejected) { ++invalid_failures; }
+        }
+    }
+    const std::string label = "mtp next round K=" + std::to_string(k) +
+                              " N=" + std::to_string(next_k) + " B=" + std::to_string(batch);
     int failures =
         verify_exact((label + " alignment").c_str(),
                      from_device<std::int32_t>(d_alignment.data(), expected_alignment.size()),
@@ -121,7 +146,7 @@ int run_case(int k, const std::vector<std::int32_t>& accepted) {
     failures += d_positions.verify_guards((label + " position guards").c_str());
     failures += d_rope_positions.verify_guards((label + " rope position guards").c_str());
     failures += d_valid.verify_guards((label + " valid guards").c_str());
-    return failures;
+    return failures + invalid_failures;
 }
 
 } // namespace
@@ -133,8 +158,14 @@ int main() {
     }
 
     int failures = 0;
-    failures += run_case(1, {0});
-    failures += run_case(5, {0, 2, 5});
+    failures += run_case(1, {0}, 1);
+    failures += run_case(5, {0, 2, 5}, 5);
+    for (int k = 1; k <= 63; ++k) {
+        for (int next_k = 1; next_k <= 5; ++next_k) {
+            for (int a = 0; a <= k; ++a) { failures += run_case(k, {a}, next_k); }
+            if (k <= 31) failures += run_case(k, {0, k / 2, k, 0, 1, k, k / 2, k}, next_k);
+        }
+    }
 
     if (failures != 0) {
         std::cerr << "mtp_round failures=" << failures << '\n';

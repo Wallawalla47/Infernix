@@ -1,3 +1,24 @@
+ninfer_add_test(ninfer_ngram_proposer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_proposer.cpp")
+
+ninfer_add_test(ninfer_ngram_archive_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
+
+ninfer_add_test(ninfer_ngram_graph_planning_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_graph_planning.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+add_test(NAME ninfer_ngram_graph_planning_real
+  COMMAND ninfer_ngram_graph_planning_test --real)
+set_tests_properties(ninfer_ngram_graph_planning_real PROPERTIES SKIP_RETURN_CODE 77)
+
+foreach(check lifecycle archive thinking stop_chat)
+  ninfer_add_test(ninfer_ngram_${check}_real
+    SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_${check}_real.cpp"
+    LIBRARIES ninfer_engine)
+  set_tests_properties(ninfer_ngram_${check}_real PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)
