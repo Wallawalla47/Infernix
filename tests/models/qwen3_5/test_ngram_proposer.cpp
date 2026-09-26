@@ -20,7 +20,7 @@ int main() {
         proposer.ingest(source);
         require(proposer.propose(source, 0).tokens.empty(), "zero budget cannot propose tokens");
         for (const auto [capacity, buckets] :
-             {std::pair<std::size_t, std::size_t>{63, 8}, {64, 0}, {64, 3}}) {
+             {std::pair<std::size_t, std::size_t>{63, 8}, {96, 8}, {64, 0}, {64, 3}}) {
             bool rejected = false;
             try {
                 NgramProposer invalid(capacity, buckets);
@@ -113,6 +113,48 @@ int main() {
                           << " hits=" << hits << '\n';
                 require(hits >= 1750, "default index lost old spans under long-context pressure");
             }
+        }
+
+        // Bulk ingest builds exactly the index token-by-token appends build: same proposals for
+        // every history, across boundary tokens, ring wrap-around and bucket collisions.
+        for (const auto [capacity, buckets] :
+             {std::pair<std::size_t, std::size_t>{1U << 20, 1U << 19}, {256, 16}}) {
+            std::mt19937 corpus_random(5501);
+            std::vector<int> corpus(20000);
+            for (std::size_t i = 0; i < corpus.size(); ++i) {
+                corpus[i] = i > 64 && corpus_random() % 3 == 0
+                                ? corpus[i - 17 - corpus_random() % 40]
+                                : static_cast<int>(corpus_random() % 50);
+            }
+            const std::vector<int> tool(corpus.begin() + 3000, corpus.begin() + 3400);
+            NgramProposer bulk(capacity, buckets), stepwise(capacity, buckets);
+            bulk.set_boundaries({7});
+            stepwise.set_boundaries({7});
+            bulk.ingest(corpus);
+            bulk.ingest(tool);
+            for (const auto& part : {std::span<const int>(corpus), std::span<const int>(tool)}) {
+                stepwise.boundary();
+                for (const int token : part) { stepwise.append(token); }
+                stepwise.boundary();
+            }
+            std::size_t proposed = 0;
+            const auto compare_at = [&](std::size_t end) {
+                const auto history =
+                    std::span<const int>(corpus).subspan(end - std::min<std::size_t>(end, 64),
+                                                         std::min<std::size_t>(end, 64));
+                const auto a = bulk.propose(history, 15, 4);
+                const auto b = stepwise.propose(history, 15, 4);
+                require(a.tokens == b.tokens && a.matched == b.matched,
+                        "bulk ingest built a different index than appends");
+                proposed += a.tokens.empty() ? 0 : 1;
+            };
+            for (std::size_t end = 16; end <= corpus.size(); end += 7) { compare_at(end); }
+            // The small ring still holds the tool span, so its histories must propose there.
+            for (std::size_t end = 3016; end <= 3400; ++end) { compare_at(end); }
+            std::cout << "bulk ingest ring=" << capacity << " proposals=" << proposed << '\n';
+            // The small ring keeps 64 bucket entries, so collisions leave it few live windows.
+            require(proposed >= (capacity > 256 ? 1000U : 10U),
+                    "bulk ingest comparison must exercise proposals");
         }
 
         // Independent live-ring oracle with forced hash collisions and repeated wrap-around.

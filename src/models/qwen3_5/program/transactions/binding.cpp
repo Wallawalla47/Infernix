@@ -421,18 +421,8 @@ void ProgramImpl::install_binding(ContextTransaction& tx) {
         request.lifecycle             = Lifecycle::Prefilling;
         request.publish_continuation  = tx.base->summary.publish_continuation;
         install_sampling(state, request, tx.base->sampling);
-        if (ngram_draft_window != 0) {
-            // The copy proposer indexes the prompt once per request; a paused request keeps
-            // its proposer in the saved control and resumes with it.
-            const auto& prompt = *tx.base->prompt;
-            request.ngram      = std::make_unique<NgramProposer>();
-            request.ngram->set_boundaries(prompt.ngram_boundaries);
-            request.ngram->ingest(prompt.token_ids);
-            // Optional plain-text tool spans would otherwise be displaced by a large prompt.
-            for (const auto& source : prompt.ngram_sources) { request.ngram->ingest(source); }
-            request.ngram_indexed  = prompt.token_ids.size();
-            request.ngram_snapshot = prompt.ngram_snapshot;
-        }
+        // A paused request keeps its proposer in the saved control and resumes with it.
+        if (ngram_draft_window != 0) { take_ngram_index(request, *tx.base); }
     }
     refresh_state_views(state);
     request.permit   = tx.first_unit;

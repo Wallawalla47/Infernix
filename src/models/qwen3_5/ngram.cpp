@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <utility>
 
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
 namespace ninfer::models::qwen3_5 {
 namespace {
 
@@ -73,6 +77,16 @@ std::uint64_t hash(std::span<const TokenId> tokens, std::uint64_t salt) {
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
     value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
     return value ^ (value >> 31);
+}
+
+void prefetch(const void* address) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(address), _MM_HINT_T0);
+#elif defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(address);
+#else
+    (void)address;
+#endif
 }
 
 bool better(const NgramMatch& candidate, const NgramMatch& current) {
@@ -185,7 +199,8 @@ struct Session {
     std::vector<Entry> entries;
     std::atomic<std::uint64_t> epoch{1};
     std::uint64_t generation = 0, seen = 0;
-    bool active = false;
+    // Cleared by a Request released on a client thread, read by the Engine worker.
+    std::atomic<bool> active{false};
 
     Session(Charge charge, std::shared_ptr<Budget> budget, std::string_view name,
             std::size_t capacity)
@@ -209,14 +224,32 @@ auto weakest(std::vector<Entry>& entries) {
 } // namespace
 
 struct NgramSnapshot::Impl {
+    // What a lookup reads of each source before touching it, kept contiguous: most sources miss
+    // on their 8-gram filter, so a round costs one filter word per source, not a source object.
+    struct Probe {
+        const Source* source;
+        const std::uint64_t* filter;
+        std::uint64_t filter_mask;
+        std::uint64_t id;
+        NgramSourceKind kind;
+    };
+
     Charge charge;
     std::shared_ptr<Session> session;
     std::uint64_t epoch, generation;
     std::vector<Entry> entries;
+    std::vector<Probe> probes;
 
     Impl(Charge charge, std::shared_ptr<Session> session)
         : charge(std::move(charge)), session(std::move(session)), epoch(this->session->epoch),
-          generation(this->session->generation), entries(this->session->entries) {}
+          generation(this->session->generation), entries(this->session->entries) {
+        probes.reserve(entries.size());
+        for (const Entry& entry : entries) {
+            const Source& source = *entry.source;
+            probes.push_back({&source, source.filter.get(), Source::filter_words(source.size) - 1,
+                              source.id, entry.kind});
+        }
+    }
 };
 
 NgramSnapshot::NgramSnapshot(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -237,9 +270,9 @@ NgramMatch NgramSnapshot::continue_copy(std::uint64_t source_id, std::uint32_t o
                                         std::span<const TokenId> history, std::uint32_t maximum,
                                         std::uint32_t minimum_match) const {
     if (!valid() || maximum == 0) { return {}; }
-    for (const auto& entry : impl_->entries) {
-        const auto& source = *entry.source;
-        if (source.id != source_id || offset >= source.size) { continue; }
+    for (const Impl::Probe& probe : impl_->probes) {
+        if (probe.id != source_id || offset >= probe.source->size) { continue; }
+        const auto& source = *probe.source;
         const auto matched = std::min<std::size_t>(offset, history.size());
         if (matched < minimum_match || !std::equal(history.end() - matched, history.end(),
                                                    source.tokens.get() + offset - matched)) {
@@ -250,7 +283,7 @@ NgramMatch NgramSnapshot::continue_copy(std::uint64_t source_id, std::uint32_t o
                 static_cast<std::uint32_t>(matched),
                 source.id,
                 offset,
-                entry.kind,
+                probe.kind,
                 true};
     }
     return {};
@@ -264,13 +297,36 @@ NgramMatch NgramSnapshot::propose(std::span<const TokenId> history, std::uint32_
     for (std::size_t w = 0; w < widths.size(); ++w) {
         if (history.size() >= widths[w]) { hashes[w] = hash(history.last(widths[w]), widths[w]); }
     }
-    // Most recently observed sources win otherwise equal matches.
-    for (auto it = impl_->entries.rbegin(); it != impl_->entries.rend(); ++it) {
-        auto match = it->source->propose(history, maximum, minimum_match, hashes);
+    // Any match of at least eight tokens contains the history's 8-gram suffix, so a source whose
+    // filter lacks it is skipped from the probe array alone (the same test Source::propose makes);
+    // filter words are fetched a few sources ahead because each lives in its own allocation.
+    const bool filtered        = minimum_match >= 8;
+    const std::uint64_t key    = hashes[1];
+    const std::uint64_t needed = Source::filter_mask(key);
+    const auto& probes         = impl_->probes;
+    constexpr std::size_t kLookahead = 8;
+    const auto word = [&](std::size_t index) {
+        return probes[index].filter + (key & probes[index].filter_mask);
+    };
+    if (filtered) {
+        for (std::size_t ahead = 0; ahead < std::min(kLookahead, probes.size()); ++ahead) {
+            prefetch(word(probes.size() - 1 - ahead));
+        }
+    }
+    // Most recently observed sources win otherwise equal matches, so the scan runs newest first
+    // and stops once a match cannot be beaten: full history matched, full window drafted.
+    for (std::size_t remaining = probes.size(); remaining != 0; --remaining) {
+        const std::size_t index = remaining - 1;
+        if (filtered) {
+            if (index >= kLookahead) { prefetch(word(index - kLookahead)); }
+            if ((*word(index) & needed) != needed) { continue; }
+        }
+        auto match = probes[index].source->propose(history, maximum, minimum_match, hashes);
         if (better(match, best)) {
-            match.kind     = it->kind;
+            match.kind     = probes[index].kind;
             match.archived = true;
             best           = std::move(match);
+            if (best.matched == history.size() && best.tokens.size() == maximum) { break; }
         }
     }
     return best;
