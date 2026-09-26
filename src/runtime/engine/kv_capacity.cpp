@@ -97,11 +97,15 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         }
         capacity_budget -= policy.automatic_headroom_bytes;
         if (capacity_budget < curve.minimum_device_reservation_bytes) {
+            const std::size_t required_total = checked_add(
+                curve.minimum_device_reservation_bytes, policy.automatic_headroom_bytes,
+                "automatic KV capacity requirement overflows size_t");
             throw std::invalid_argument(
-                "minimum Engine runtime reservation requires " +
-                std::to_string(curve.minimum_device_reservation_bytes) + " bytes in addition to " +
+                "automatic KV capacity requires " + std::to_string(required_total) +
+                " bytes total (" + std::to_string(curve.minimum_device_reservation_bytes) +
+                " bytes minimum Engine runtime reservation + " +
                 std::to_string(policy.automatic_headroom_bytes) +
-                " bytes of automatic headroom, but only " +
+                " bytes automatic headroom), but only " +
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
         if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
@@ -120,10 +124,13 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
 
     const std::size_t reservation = curve.reservation_bytes(pages);
     if (reservation > capacity_budget) {
+        // Explicit mode is the only reachable path here: automatic mode caps pages so that the
+        // reservation fits the budget by construction, and explicit mode carries no headroom, so
+        // the budget is the full after-weights allowance.
         throw std::invalid_argument("requested Engine runtime reservation requires " +
                                     std::to_string(reservation) + " bytes, but only " +
                                     std::to_string(capacity_budget) +
-                                    " bytes are available for runtime capacity");
+                                    " bytes are available after weights");
     }
 
     return KvCapacityResolution{
