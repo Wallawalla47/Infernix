@@ -11,6 +11,10 @@ prefix reuse and preemption. Its frozen request corpus is documented under
 [`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
 Engine directly.
 
+The serve-level A/B benchmark (upstream + Windows port vs this fork, black-box OpenAI
+API agentic workload; the headline numbers in the [fork README](../README.md)) is a
+standalone Python rig under [`ab/`](ab/README.md).
+
 ## Benchmark inputs
 
 Synthetic numerical inputs use reproducible pseudorandom values with distinct operand seeds,
