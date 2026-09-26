@@ -11,7 +11,20 @@ namespace ninfer::models::qwen3_5::execution {
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
-    const auto& p = parameters.packed;
+    if (!parameters.packed) {
+        // The fused packed path is unavailable; the row-split path projects K/V and Q/gate
+        // independently. Size the peak of the two independent projections.
+        const auto& rows = *parameters.rows;
+        const auto qgate = std::max(
+            ops::linear_workspace_capacity_bytes(rows[0].weight.qtype, rows[0].weight.n,
+                                                 rows[0].weight.k, rows[0].policy, first, last),
+            ops::linear_workspace_capacity_bytes(rows[2].weight.qtype, rows[2].weight.n,
+                                                 rows[2].weight.k, rows[2].policy, first, last));
+        const auto kv = ops::linear_pair_workspace_capacity_bytes(rows[1].weight, rows[3].weight,
+                                                                  first, last);
+        return std::max(qgate, kv);
+    }
+    const auto& p = *parameters.packed;
     const auto& w = p.weight;
     if (!parameters.rows) {
         return ops::attn_input_proj_workspace_capacity_bytes(w.qtype, w.n, w.k, p.policy, first,
@@ -59,7 +72,17 @@ std::size_t mtp_query_gate_workspace_bytes(const MtpProjectionParameters& parame
 void mtp_projection(const Tensor& hidden, const MtpProjectionParameters& parameters,
                     const AttentionConfig& config, Tensor& query, Tensor& gate, Tensor& key,
                     Tensor& value, WorkspaceArena& workspace, cudaStream_t stream) {
-    const auto& p = parameters.packed;
+    if (!parameters.packed) {
+        // The four attention weights do not share one contiguous parent region, so the fused
+        // packed / attn_input_proj path is unavailable. Project K/V and Q/gate independently.
+        if (!parameters.rows) {
+            throw std::invalid_argument("mtp_projection: no available projection");
+        }
+        mtp_query_gate_projection(hidden, parameters, config, query, gate, workspace, stream);
+        mtp_kv_projection(hidden, parameters, config, key, value, workspace, stream);
+        return;
+    }
+    const auto& p = *parameters.packed;
     if (!parameters.rows) {
         ops::attn_input_proj(hidden, p.weight, query, gate, key, value, p.policy, workspace,
                              stream);
