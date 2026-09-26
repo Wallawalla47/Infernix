@@ -848,7 +848,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -862,7 +861,16 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    const auto* single = std::get_if<LinearParameters>(&p.projection);
+    if (single != nullptr &&
+        ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight, single->policy, T)) {
+        ops::attn_input_proj_fused_rmsnorm_nvfp4(
+            x, w.input_norm, config_.rms_norm_eps, single->weight, q_flat, gate_flat, k_flat,
+            v_flat, single->policy, work_, s);
+    } else {
+        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+        attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =

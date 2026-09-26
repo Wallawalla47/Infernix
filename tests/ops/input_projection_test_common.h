@@ -18,6 +18,11 @@
 
 namespace ninfer::test::input_projection {
 
+// The complete NVFP4 A4 attention-input-projection criterion and its row sample (the original
+// seven grid points widened to stabilize the distribution-level verdict).
+inline constexpr ReductionCriterion kAttnInputProjA4Tolerance{0.16, 1.0 / 256.0, 0.16};
+inline constexpr std::int32_t kA4SampleRows = 31;
+
 inline std::vector<std::int32_t> sampled_rows(std::int32_t rows, std::int32_t sample_count = 7) {
     if (rows <= 0 || sample_count <= 0) {
         throw std::invalid_argument("sampled_rows requires positive extents");
