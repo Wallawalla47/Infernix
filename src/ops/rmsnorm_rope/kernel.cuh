@@ -74,10 +74,18 @@ __global__ __launch_bounds__(HeadsPerBlock * 32) void rmsnorm_rope_d256_text_ker
 #pragma unroll
     for (int k = 1; k < 4; ++k) { output[base + lane + k * 32] = normalized.pair[k]; }
 
-    const int coefficient_pair = (lane & (kHalfPair - 1)) * 2;
-    float s0 = 0.0F, c0 = 0.0F, s1 = 0.0F, c1 = 0.0F;
-    fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, coefficient_pair, &s0, &c0);
-    fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, coefficient_pair + 1, &s1, &c1);
+    // Lanes 16-31 rotate with the same two coefficient pairs as lanes 0-15. Each half computes one
+    // of the two and the partners swap them, so every lane runs one sincos instead of two.
+    const bool upper           = lane >= kHalfPair;
+    const int coefficient_pair = (lane & (kHalfPair - 1)) * 2 + (upper ? 1 : 0);
+    float s = 0.0F, c = 0.0F;
+    fixed_sincos<RopeKernelMode::Text1D>(positions, tokens, token, coefficient_pair, &s, &c);
+    const float s_partner = __shfl_xor_sync(0xffffffffu, s, kHalfPair);
+    const float c_partner = __shfl_xor_sync(0xffffffffu, c, kHalfPair);
+    const float s0        = upper ? s_partner : s;
+    const float c0        = upper ? c_partner : c;
+    const float s1        = upper ? s : s_partner;
+    const float c1        = upper ? c : c_partner;
     output[base + lane] =
         detail::rmsnorm_rope_d256_rotate(normalized.pair[0], c0, c1, s0, s1, lane);
 }

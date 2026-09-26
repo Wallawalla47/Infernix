@@ -99,3 +99,11 @@ set_tests_properties(
   ninfer_qwen3_5_context_store_test
   ninfer_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+ninfer_add_test(ninfer_qwen3_5_text_qk_norm_rope_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_qk_norm_rope.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
+set_tests_properties(
+  ninfer_qwen3_5_text_qk_norm_rope_test
+  PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
