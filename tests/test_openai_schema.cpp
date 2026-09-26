@@ -898,6 +898,54 @@ int test_common_objects() {
     return failures;
 }
 
+int test_assistant_continuation_mode() {
+    int failures = 0;
+
+    // A conversation that ends with a user turn asks for a new assistant turn.
+    const Json normal = Json{
+        {"model", "qwen"},
+        {"messages",
+         Json::array({Json{{"role", "system"}, {"content", "system prompt"}},
+                      Json{{"role", "user"}, {"content", "first question"}},
+                      Json{{"role", "assistant"}, {"content", "first answer"}},
+                      Json{{"role", "user"}, {"content", "second question"}}})}};
+    const auto normal_req = parse(normal);
+    failures +=
+        check(normal_req.generation.continuation == ninfer::PromptContinuationMode::NewAssistantTurn,
+              "conversation ending with user was not NewAssistantTurn");
+
+    // A trailing assistant turn is an assistant prefill, so the Engine continues it in place.
+    const Json trailing_assistant = Json{
+        {"model", "qwen"},
+        {"messages", Json::array({Json{{"role", "system"}, {"content", "system prompt"}},
+                                  Json{{"role", "user"}, {"content", "question"}},
+                                  Json{{"role", "assistant"}, {"content", "partial answer..."}}})}};
+    const auto cont_req = parse(trailing_assistant);
+    failures += check(cont_req.generation.continuation ==
+                          ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                      "conversation ending with assistant was not ContinueFinalAssistant");
+    const auto cont_prompt = prompt(cont_req.generation);
+    failures += check(cont_prompt.options.continuation ==
+                          ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                      "continuation mode did not reach PromptInput options");
+
+    // With thinking left to the server default the resolution must be concretely enabled, so
+    // the template's continuation guard refuses the mid-turn render (invalid_prompt) instead
+    // of letting the model finish the open turn with a one-token stop. Only an explicit
+    // thinking-disable may proceed as a continuation.
+    failures += check(semantics(cont_req.generation).enable_thinking == true,
+                      "trailing-assistant prefill with default thinking did not resolve enabled");
+    Json explicit_no_thinking = trailing_assistant;
+    explicit_no_thinking["enable_thinking"] = false;
+    const auto no_thinking_req = parse(explicit_no_thinking);
+    failures += check(no_thinking_req.generation.continuation ==
+                          ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+                      semantics(no_thinking_req.generation).enable_thinking == false,
+                      "explicit thinking-disable did not remain a valid text-only continuation");
+
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -914,6 +962,7 @@ int main() {
     failures += test_stream_response();
     failures += test_stream_observations();
     failures += test_common_objects();
+    failures += test_assistant_continuation_mode();
     if (failures == 0) { std::cout << "OpenAI Chat protocol tests passed\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -201,7 +201,11 @@ so an unmatched nested parameter opener or a standalone `</parameter>` cannot be
 unambiguously; either causes the complete tool-call region to fall back to ordinary content.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
-system/developer messages at their original positions.
+system/developer messages at their original positions. A final assistant message is an assistant
+prefill: generation continues that turn in place instead of opening a new assistant turn. Because
+a reasoning opener cannot be continued, a prefill that carries media or whose thinking is not
+explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
+`reasoning_effort: "none"`) is refused with `invalid_prompt`.
 
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
@@ -704,10 +708,10 @@ curl http://127.0.0.1:8080/v1/messages \
 The endpoint accepts top-level System text, ordered User/Assistant/System history, text and image
 blocks, Thinking history, tool-use history, tool results, user-defined tools, aggregate responses,
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
-Mid-conversation System messages retain their input position. A final text-only Assistant message
+Mid-conversation System messages retain their input position. A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
-Assistant prefill cannot contain media, Thinking, or tool calls and cannot start with Thinking
-enabled.
+Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
+output limit may carry reasoning content or tool calls.
 
 Claude Code may place its attribution metadata in the first block of a top-level System array. If
 that block is a text block beginning exactly with `x-anthropic-billing-header:`, NInfer consumes the

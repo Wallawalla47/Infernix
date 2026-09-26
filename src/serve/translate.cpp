@@ -150,8 +150,14 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         effort = nested;
     }
     kwargs.erase("reasoning_effort");
+    // Thinking resolves to enabled when neither the request nor the server says otherwise:
+    // to_request_options already budgets thinking for any value that is not explicitly false,
+    // and the family's chat template treats an absent enable_thinking as enabled. Keeping the
+    // resolution concrete is what makes the assistant-continuation guard in the template layer
+    // authoritative: a trailing-assistant request that would open a new thinking turn is
+    // refused as invalid_prompt instead of being rendered as a mid-turn continuation.
     ResolvedPromptSemantics result{
-        .enable_thinking           = thinking ? thinking : server.enable_thinking,
+        .enable_thinking           = thinking ? thinking : server.enable_thinking.value_or(true),
         .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
         .chat_template_kwargs_json = kwargs.dump(),
     };
@@ -185,11 +191,6 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             result.reasoning_effort = ninfer::ReasoningEffort::Max;
             break;
         }
-    }
-    if (request.continuation == ninfer::PromptContinuationMode::ContinueFinalAssistant &&
-        result.enable_thinking == true) {
-        invalid_prompt_option("assistant prefill cannot be combined with enabled thinking",
-                              "messages", "assistant_prefill_not_supported");
     }
     return result;
 }
