@@ -339,7 +339,8 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
                         pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
         };
     }
-    // The reason alone names the verdict, not the markup that earned it.
+    // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
+    // what earned it. Text before the first marker never appears.
     constexpr std::size_t kMarkupSnippetBytes = 240;
     std::string snippet;
     if (const std::size_t marker = outcome.text.find("<tool_call>");

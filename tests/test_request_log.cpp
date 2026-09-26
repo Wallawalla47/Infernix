@@ -685,6 +685,21 @@ int main() {
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+    // With returned markup, the warning shows at most 240 bytes of it from the first marker on,
+    // on one line, and none of the answer text before it.
+    fallback_outcome.text = "sentinel-answer-text\n<tool_call>\n<function=edit>\t" +
+                            std::string(400, 'x') + "</function>\n</tool_call>";
+    const std::optional<OperationalRecord> snippet_warning =
+        render_tool_call_fallback(context, fallback_outcome);
+    const std::string expected_snippet =
+        "<tool_call> <function=edit> " + std::string(240 - 28, 'x') + "...";
+    failures += check(snippet_warning &&
+                          snippet_warning->message ==
+                              "req#7 tool markup returned as text | duplicate parameter | " +
+                                  expected_snippet &&
+                          snippet_warning->message.find("sentinel-answer-text") ==
+                              std::string::npos,
+                      "tool-call fallback snippet is unbounded, multi-line or leaks prior text");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));
