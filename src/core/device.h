@@ -46,6 +46,8 @@ struct DeviceContext {
     // Device memory currently free on this device (cudaMemGetInfo).
     std::size_t free_bytes() const;
     const char* sync_mode() const;
+    // Waits for the compute stream only. Work on transfer_stream is ordered separately: callers
+    // that read what a transfer writes wait on its event or synchronize that stream themselves.
     void synchronize() const;
     // Submits queued work without waiting for it. On a batched driver model (WDDM) a launch can
     // otherwise sit in the command buffer until the next blocking call or launch.

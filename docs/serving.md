@@ -72,6 +72,19 @@ selected for this process.
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
 
+How failures end:
+
+- An out-of-memory condition or a failed internal check during one unit of work fails the requests
+  that unit involved, logs `worker out of memory: ... - recovering` or `worker recovering from a
+  failed request`, and the Engine carries on with its queue.
+- A failure after eight such recoveries in a row, with no successful unit between them, fails every
+  queued and running request and stops the Engine: `/health` then answers 503 and every request
+  fails until the server is restarted. Any other exception on the worker (`worker crash: ...`)
+  ends the Engine the same way.
+- A CUDA error other than out of memory (an illegal address, a lost device) cannot be recovered
+  in-process: the server prints `CUDA_CHECK(...) failed` with the error and exits, without final
+  request-log records for the requests in flight.
+
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
@@ -289,6 +302,10 @@ finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a
 and reasoning-token details; choices carry `logprobs: null` when log probabilities were not
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
+
+A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
+payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
+the connection closes without a finish-reason chunk, usage chunk or `[DONE]`.
 
 ### llama.cpp-compatible request observations
 
@@ -700,7 +717,9 @@ Resource behavior:
 `store:false` Responses cannot be retrieved or used as `previous_response_id`. LRU eviction and
 explicit deletion also make an ID unavailable. A single Response larger than the configured store
 capacity fails with `response_store_capacity_exceeded` rather than silently pretending it was
-stored.
+stored. Generation has finished by then, but its output is not returned: an aggregate request gets
+only the error and a streamed one ends with `response.failed`. Repeat it with `store:false` or a
+larger `--response-store-max-mib`.
 
 ### Responses input token count
 
@@ -746,7 +765,9 @@ and Anthropic SSE. Consecutive User or Assistant messages are joined without add
 Mid-conversation System messages retain their input position. A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
-output limit may carry reasoning content or tool calls.
+output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`
+needs its `tool_result` in the next User message, so a trailing one is rejected with
+`invalid_tool_history`, as the Anthropic API rejects it.
 
 Claude Code may place its attribution metadata in the first block of a top-level System array. If
 that block is a text block beginning exactly with `x-anthropic-billing-header:`, NInfer consumes the
@@ -955,10 +976,12 @@ Ratios and rates divide summed tokens by summed seconds, so each request weighs 
 title counts completed, failed, cancelled, and rejected requests and, while throughput reporting is
 enabled, the current running and waiting requests. The panel only reads the same outcomes as the
 `req#N done` records; it changes no request behavior. Pretty values use readable units and rounded rates; use the independent request JSONL for
-complete fields and full precision. Operational records never contain prompts, generated text,
-request bodies, credentials, or arbitrary client error messages.
-If a tool marker is returned to text because its structure or tool identity cannot be represented,
-Serve emits one warning with only the failure classification, never the generated markup.
+complete fields and full precision. Operational records never contain prompts, request bodies,
+credentials, or arbitrary client error messages, and carry generated text in one case only: if a
+tool marker is returned to text because its structure or tool identity cannot be represented,
+Serve emits one warning with the failure classification and the returned markup's first 240
+bytes from `<tool_call>` on (tabs and line breaks shown as spaces, `...` when cut), so a malformed
+call can be diagnosed from the console. The request JSONL records only the classification.
 
 ## Live metrics
 

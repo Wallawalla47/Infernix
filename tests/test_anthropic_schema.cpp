@@ -343,6 +343,16 @@ int test_tool_history() {
                           truncated.messages[1].role == ninfer::ChatRole::User,
                       "leading tool_result from a truncated history was rejected or reordered");
 
+    // A final Assistant message is a prefill, and a prefill cannot end in an unanswered tool_use.
+    body["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "first"}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "text"}, {"text", "calling"}},
+                                       tool_use("toolu_trailing")})}}});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history" &&
+                          api_param([&] { (void)parse(body); }) == "messages",
+                      "trailing assistant tool_use was accepted as a prefill");
+
     body["messages"] = Json::array(
         {Json{{"role", "user"}, {"content", "first"}},
          Json{{"role", "assistant"}, {"content", "ordinary"}},
