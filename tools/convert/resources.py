@@ -14,6 +14,21 @@ TEXT_RESOURCES = (
 )
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
+# Must stay byte-identical to kQwenSplitPattern in
+# src/models/qwen3_5/frontend/tokenizer.cpp: the runtime tokenizer validates
+# tokenizer.json's Split pattern for exact equality and rejects any artifact whose
+# pattern differs.
+STD_QWEN_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+"
+    r"|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+
+# Qwen3.5 tokenizer_config.json invariants the runtime frontend hard-requires
+# (src/models/qwen3_5/frontend/frontend.cpp validate_tokenizer_config): a missing
+# field defaults to the failing value, so each must be present and set to the
+# official Qwen3.5 value.
+KQWEN35_PAD_TOKEN = "<|endoftext|>"
+
 
 def token_domain(
     tokenizer: dict, config: dict, vocab_size: int
@@ -60,6 +75,89 @@ def token_domain(
     if not ids or set(ids) != set(range(max(ids) + 1)):
         raise ValueError("this tokenizer requires a contiguous public token ID domain")
     return len(ids), tuple(sorted(index for index, flag in special.items() if flag))
+
+
+def _dump_json(value: dict) -> bytes:
+    return (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _normalize_qwen_split(tokenizer: dict) -> bool:
+    """Normalize a drifted pre-tokenizer split pattern to the standard Qwen one.
+
+    The runtime tokenizer pre-tokenizes with its own hardcoded \\p{L}\\p{M} logic
+    (not the JSON regex) but validates the stored Split pattern for exact equality
+    against kQwenSplitPattern, so a drifted pattern (some third-party Qwen
+    checkpoints drop \\p{M}) makes the artifact unloadable without changing
+    tokenization. Rewriting it to the standard pattern is safe. Returns True if the
+    pattern changed.
+    """
+    pre = tokenizer.get("pre_tokenizer")
+    if not isinstance(pre, dict) or pre.get("type") != "Sequence":
+        return False
+    parts = pre.get("pretokenizers")
+    if not isinstance(parts, list) or len(parts) != 2:
+        return False
+    split = parts[0]
+    if not isinstance(split, dict) or split.get("type") != "Split":
+        return False
+    pattern = split.get("pattern")
+    if not isinstance(pattern, dict):
+        return False
+    if pattern.get("Regex") == STD_QWEN_SPLIT_PATTERN:
+        return False
+    pattern["Regex"] = STD_QWEN_SPLIT_PATTERN
+    split["behavior"] = "Isolated"
+    split["invert"] = False
+    return True
+
+
+def _normalize_added_decoder(tokenizer: dict, config: dict) -> bool:
+    """Ensure tokenizer_config.json carries an added_tokens_decoder object.
+
+    The runtime tokenizer requires the field to exist as an object and
+    cross-checks each entry against tokenizer.json's added_tokens for shared ids.
+    Third-party Qwen checkpoints frequently omit the field; rebuild it from
+    added_tokens (the canonical source) so the artifact loads and stays consistent.
+    Returns True if the field was built.
+    """
+    if isinstance(config.get("added_tokens_decoder"), dict):
+        return False
+    decoder: dict[str, dict] = {}
+    for token in tokenizer.get("added_tokens", []):
+        raw_id = token.get("id")
+        if type(raw_id) is not int:
+            continue
+        decoder[str(raw_id)] = {
+            "content": token["content"],
+            "single_word": token.get("single_word", False),
+            "lstrip": token.get("lstrip", False),
+            "rstrip": token.get("rstrip", False),
+            "normalized": token.get("normalized", False),
+            "special": token.get("special", False),
+        }
+    config["added_tokens_decoder"] = decoder
+    return True
+
+
+def _normalize_prefix_semantics(config: dict) -> bool:
+    """Ensure the Qwen3.5 prefix-semantics invariants in tokenizer_config.json.
+
+    The runtime frontend requires add_bos_token=false, add_prefix_space=false, and
+    pad_token=<|endoftext|>; a missing field defaults to the failing value and a
+    non-official pad token is rejected. Third-party Qwen checkpoints may omit or
+    mis-set these. Returns True if any field was set.
+    """
+    changed = False
+    if config.get("add_bos_token") is not False:
+        config["add_bos_token"] = False
+        changed = True
+    if config.get("add_prefix_space") is not False:
+        config["add_prefix_space"] = False
+        changed = True
+    if config.get("pad_token") != KQWEN35_PAD_TOKEN:
+        config["pad_token"] = KQWEN35_PAD_TOKEN
+        changed = True
+    return changed
 
 
 def load_resources(
@@ -110,7 +208,30 @@ def load_resources(
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data
-    count, special = token_domain(
-        parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size
-    )
+    tokenizer_json = parsed["tokenizer.json"]
+    tokenizer_config = parsed["tokenizer_config.json"]
+    if _normalize_qwen_split(tokenizer_json):
+        payloads["resource/text/tokenizer.json"] = _dump_json(tokenizer_json)
+        print(
+            "normalized tokenizer.json split pattern to the standard Qwen pattern",
+            flush=True,
+        )
+    config_changed = False
+    if _normalize_added_decoder(tokenizer_json, tokenizer_config):
+        print(
+            "built tokenizer_config.json added_tokens_decoder "
+            f"({len(tokenizer_config['added_tokens_decoder'])} tokens)",
+            flush=True,
+        )
+        config_changed = True
+    if _normalize_prefix_semantics(tokenizer_config):
+        print(
+            "normalized tokenizer_config.json prefix semantics "
+            "(add_bos_token/add_prefix_space=false, pad_token=<|endoftext|>)",
+            flush=True,
+        )
+        config_changed = True
+    if config_changed:
+        payloads["resource/text/tokenizer_config.json"] = _dump_json(tokenizer_config)
+    count, special = token_domain(tokenizer_json, tokenizer_config, vocab_size)
     return references, payloads, count, special
