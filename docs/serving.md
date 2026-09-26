@@ -1045,22 +1045,27 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
+| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, prompt-attention kernel and n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, CUDA Graph allowance, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_scheduling` | request identity, pause/restore/recovery transitions, Snapshot revocation, Engine observation time and cumulative global/request work counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
-| `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
+| `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges including Device KV growth leases, decode-round batch statistics, and hybrid prefix-cache gauges and counters when that cache is in use |
 
 `requested_reasoning_effort` and `preserve_thinking` record the explicit options, or `null` when
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
-preserved for consumer validation, and a stable text-fallback reason. Fallback reasons are `none`,
-`malformed_structure`, `duplicate_parameter`, `invalid_tool_name`, `undeclared_tool`, and
-`trailing_content`. These counters contain no tool arguments or generated text.
+preserved for consumer validation, `duplicate_parameters_repaired`, and a stable fallback reason.
+A parameter named more than once in one call keeps its last value, as in JSON object syntax, and
+counts once in `duplicate_parameters_repaired` for each repeat instead of demoting the call to text.
+Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
+`trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
+with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
+suffix or a call cut at the region end), and with none the region was returned as text. These
+counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
@@ -1083,15 +1088,43 @@ counters. Between two boundaries, subtract the request delta from the global del
 other requests' completed work. In particular, `restored` to `replay_complete` establishes whether
 other work advanced during Replay without relying on periodic scheduler gauges. Events are enabled
 only with request logging and add no per-token records.
+`ngram_rounds`, `ngram_drafted_tokens`, and `ngram_accepted_tokens` are the part of `rounds`,
+`drafted_tokens`, and `accepted_tokens` whose proposal came from n-gram copy drafting, and the
+`ngram_archive_rounds`, `ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` counters
+are the part of those whose copy source was the retained draft archive (see [n-gram
+drafting](ngram.md)). The `speculative.ngram_archive` object reports that archive at the end of the
+request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when the request was
+bound to a draft session, `published` when its input and output were published into it,
+`generation` as the session's latest completed generation, `sources` and `session_bytes` as the
+bound session's retained source count and bytes, `total_bytes` as the whole archive's bytes, and
+`sampling_seed` as the effective seed after request-domain separation for a request that named a
+session, otherwise `null`.
+
+`request_done.materialization.cached_prefix_tokens` and `restored_host_bytes` describe a hybrid
+prefix-cache admission and are `0` with `--use-original-prefix-caching`.
+`cached_prefix_tokens` is the longest prompt prefix held as cached KV blocks, whether or not it was
+reusable: reuse also needs a state snapshot inside it, so a gap to `prefix_cache_hit_tokens` is
+prefix lost to snapshot placement. `restored_host_bytes` is what the admission copied back from the
+Host tier; those copies overlap the request's first prefill pass, so their time is part of its
+prefill.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
+`host_state_image_bytes` is the Host size of one StateImage, the cost of one retained state
+checkpoint whatever prefix depth it resumes; `host_kv_page_group_bytes` is the Host KV size of one
+page group; and `host_cache_budget_bytes` is the `--host-cache-mib` budget those two are traded
 under, `0` when that budget is not in use. `cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
 the first.
+
+`server_start.engine.fast_prefill_kernel` records `--fast-prefill-kernel`. `ngram_draft_window` and
+`ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram drafting) and
+`--ngram-min-match`; `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
+from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and
+`ngram_native_sessions` records `--ngram-native-sessions`.
 
 `request_done.engine_timing` separates FIFO `queue_wait_seconds`, blocking
 `device_wait_exposed_seconds`, and five mutually exclusive Host-active exposure phases under
