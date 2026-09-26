@@ -222,7 +222,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     device.synchronize();
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        const std::size_t free_before = device.free_bytes();
         prepare_graphs();
+        device.synchronize();
+        const std::size_t free_after = device.free_bytes();
+        graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
         graph_phase.complete();
     }
     work.reset();
@@ -468,6 +472,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
+    out.cuda_graph_measured_bytes    = graph_measured_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
     if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
     if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }

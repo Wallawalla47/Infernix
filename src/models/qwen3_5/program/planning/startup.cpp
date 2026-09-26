@@ -69,28 +69,27 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-template <class ProfileAllowance>
-std::size_t graph_topology_allowance(const std::vector<GraphExecutionProfile>& profiles,
-                                     ProfileAllowance&& profile_allowance, const char* label) {
-    std::vector<std::pair<std::uint32_t, std::size_t>> classes;
+// Device memory the driver takes for CUDA Graph decode executables. Every topology class of a
+// graph family is instantiated as one executable per batch size, uploaded and launched once at
+// startup, so graph memory scales with the executable count. Measured on an RTX 5090 (CUDA 13.4,
+// Qwen3.8-27B NVFP4, as the drop in free Device memory after startup against --no-cuda-graph at
+// the same KV capacity): 2.2-2.9 MiB per executable for no speculation, MTP, DFlash2 and DFlash2
+// with n-gram drafting (16 MiB for DFlash2 at max concurrency 1, 274 MiB for DFlash2 with n-gram
+// at 8), rising to 4.1 MiB only where MTP verifies a 15-wide n-gram window at batch 4-8 (198 MiB
+// at max concurrency 8, the tightest case against this allowance). The allowance keeps 4 MiB per
+// executable plus a fixed 64 MiB for driver and module state.
+constexpr std::size_t kGraphExecutableAllowance = 4ULL * kMiB;
+constexpr std::size_t kGraphDriverAllowance     = 64ULL * kMiB;
+
+// Number of executables one family instantiates for one batch size: one per topology class.
+std::uint32_t graph_topology_classes(const std::vector<GraphExecutionProfile>& profiles) {
+    std::vector<std::uint32_t> classes;
     for (const GraphExecutionProfile profile : profiles) {
-        const std::size_t allowance = profile_allowance(profile);
-        const auto existing = std::find_if(classes.begin(), classes.end(), [&](const auto& entry) {
-            return entry.first == profile.topology_class;
-        });
-        if (existing == classes.end()) {
-            classes.emplace_back(profile.topology_class, allowance);
-        } else {
-            existing->second = std::max(existing->second, allowance);
+        if (std::find(classes.begin(), classes.end(), profile.topology_class) == classes.end()) {
+            classes.push_back(profile.topology_class);
         }
     }
-
-    std::size_t total = 0;
-    for (const auto& [topology_class, allowance] : classes) {
-        (void)topology_class;
-        total = checked_add(total, allowance, label);
-    }
-    return total;
+    return static_cast<std::uint32_t>(classes.size());
 }
 
 TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
@@ -879,53 +878,36 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->workspace = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
-        // each reachable node-topology class. These bounds cover the largest profile installed in
-        // each class and the driver/module state materialized while qualifying all definitions.
+        // each topology class, per batch size, of each family prepare_graphs() captures.
+        std::uint64_t executables = 0;
         if (impl->speculative_backend == SpeculativeBackend::None) {
-            impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
-                                                      "ordinary exact-b graph allowance");
+            executables = static_cast<std::uint64_t>(
+                              graph_topology_classes(ordinary_graph_profiles(impl->capacity))) *
+                          impl->max_concurrency;
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             // One MTP family captured at the frame's native width (the wider of the neural and
-            // ngram windows) with the frame's AR depth.
-            const std::uint32_t drafts    = impl->draft_window;
-            const std::uint32_t ar_depth  = std::min(drafts, kMtpDecodeMaximumDrafts);
-            const auto family_allowance = [&](std::uint32_t draft_width, std::uint32_t next_k) {
-                const auto profiles = mtp_graph_profiles(impl->capacity, draft_width, next_k);
-                return graph_topology_allowance(
-                    profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity, static_cast<std::uint64_t>(profile.max) +
-                                                draft_width + next_k);
-                        return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
-                    },
-                    "MTP graph allowance");
-            };
-            impl->graph_allowance_bytes =
-                checked_mul(family_allowance(drafts, ar_depth), impl->max_concurrency,
-                            "MTP exact-b graph allowance");
+            // ngram windows) with the frame's AR depth; an n-gram engine reuses it.
+            const std::uint32_t drafts   = impl->draft_window;
+            const std::uint32_t ar_depth = std::min(drafts, kMtpDecodeMaximumDrafts);
+            executables = static_cast<std::uint64_t>(graph_topology_classes(
+                              mtp_graph_profiles(impl->capacity, drafts, ar_depth))) *
+                          impl->max_concurrency;
         } else {
-            const auto family_allowance = [&](std::uint32_t drafts) {
-                const auto profiles =
-                    dflash_graph_profiles(impl->speculative_backend, impl->capacity, drafts);
-                return graph_topology_allowance(
-                    profiles,
-                    [&](GraphExecutionProfile profile) {
-                        const std::uint64_t final_visible = std::min<std::uint64_t>(
-                            impl->capacity, static_cast<std::uint64_t>(profile.max) + drafts + 1ULL);
-                        return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
-                    },
-                    "DFlash graph allowance");
-            };
-            std::uint64_t per_batch_allowance = family_allowance(impl->neural_draft_window);
-            if (impl->ngram_draft_window != 0) {
-                per_batch_allowance =
-                    checked_add(per_batch_allowance, family_allowance(impl->ngram_draft_window),
-                                "DFlash ngram graph allowance");
+            // Each DFlash family's profiles are captured at the family's own window for every
+            // batch size, on the one frame viewed at that width.
+            for (const std::uint32_t window :
+                 {impl->neural_draft_window, impl->ngram_draft_window}) {
+                if (window == 0) { continue; }
+                executables += static_cast<std::uint64_t>(graph_topology_classes(
+                                   dflash_graph_profiles(impl->speculative_backend,
+                                                         impl->capacity, window))) *
+                               impl->max_concurrency;
             }
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "DFlash exact-b graph allowance");
         }
+        impl->graph_allowance_bytes = checked_add(
+            kGraphDriverAllowance,
+            checked_mul(kGraphExecutableAllowance, executables, "CUDA Graph executable allowance"),
+            "CUDA Graph allowance");
     }
 
     impl->device_reservation_bytes = checked_add(
