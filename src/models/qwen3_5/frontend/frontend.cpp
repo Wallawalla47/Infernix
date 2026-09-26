@@ -322,6 +322,16 @@ std::uint32_t checked_token_count(std::size_t count) {
     return static_cast<std::uint32_t>(count);
 }
 
+// The request's live ngram index over its final prompt tokens and tool sources, built on the
+// preparing thread so the Engine worker only moves it into the admitted request.
+void build_ngram_index(PreparedPromptData& prompt) {
+    auto index = std::make_unique<detail::NgramProposer>();
+    index->set_boundaries(prompt.ngram_boundaries);
+    index->ingest(prompt.token_ids);
+    for (const auto& source : prompt.ngram_sources) { index->ingest(source); }
+    prompt.ngram_index.index = std::move(index);
+}
+
 void assign_text_positions(PreparedPromptData& prompt) {
     const std::size_t count = prompt.token_ids.size();
     prompt.token_types.assign(count, 0);
@@ -917,6 +927,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary);
+    if (impl_->ngram_sources_enabled) {
+        fi::check_preparation_control(control, "ngram index");
+        build_ngram_index(result);
+    }
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -985,7 +999,10 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
-    if (impl_->ngram_sources_enabled) { result.ngram_boundaries = impl_->ngram_boundaries; }
+    if (impl_->ngram_sources_enabled) {
+        result.ngram_boundaries = impl_->ngram_boundaries;
+        build_ngram_index(result);
+    }
     if (impl_->ngram_archive_enabled) {
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }

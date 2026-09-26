@@ -56,6 +56,10 @@ enum class MtpBridgeMode : std::uint8_t {
     AfterExactHit,
 };
 
+struct PreparedNgramIndex {
+    std::unique_ptr<NgramProposer> index;
+};
+
 struct RequestBasePlanImpl {
     std::shared_ptr<const PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
@@ -67,6 +71,9 @@ struct RequestBasePlanImpl {
     PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
+    // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
+    // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
+    std::shared_ptr<PreparedNgramIndex> ngram_index;
 
     [[nodiscard]] bool accepts_capture(std::uint32_t frontier) const noexcept;
     [[nodiscard]] CaptureGroup capture_group(std::uint32_t frontier) const;
@@ -585,6 +592,8 @@ public:
                   std::span<const runtime::RoundBudget> budgets);
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                           std::span<const runtime::RoundBudget> budgets,

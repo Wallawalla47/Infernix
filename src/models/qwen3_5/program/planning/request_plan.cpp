@@ -175,6 +175,10 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         }
         previous = frontier;
     }
+    if (prompt.ngram_index.index) {
+        base->ngram_index = std::make_shared<PreparedNgramIndex>(
+            PreparedNgramIndex{.index = std::move(prompt.ngram_index.index)});
+    }
     base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
     if (base->summary.publish_continuation) {
         const auto& prepared = *base->prompt;

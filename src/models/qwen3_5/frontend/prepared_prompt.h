@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <array>
 #include <cstddef>
@@ -138,12 +139,31 @@ struct PrepareStats {
     std::size_t reused_patch_bytes       = 0;
 };
 
+// The one-shot ngram index of a prepared prompt. Planning moves the index out before the prompt is
+// ever copied, so a copy carries no index instead of sharing a mutable one.
+struct PreparedNgramIndexSlot {
+    std::unique_ptr<detail::NgramProposer> index;
+
+    PreparedNgramIndexSlot() noexcept                                    = default;
+    PreparedNgramIndexSlot(PreparedNgramIndexSlot&&) noexcept            = default;
+    PreparedNgramIndexSlot& operator=(PreparedNgramIndexSlot&&) noexcept = default;
+    PreparedNgramIndexSlot(const PreparedNgramIndexSlot&) noexcept {}
+    PreparedNgramIndexSlot& operator=(const PreparedNgramIndexSlot&) noexcept {
+        index.reset();
+        return *this;
+    }
+    ~PreparedNgramIndexSlot() = default;
+};
+
 struct PreparedPromptData {
     // Proposal-only sources, never part of target tokens, positions or cache identity.
     std::vector<std::vector<TokenId>> ngram_sources;
     std::vector<TokenId> ngram_boundaries;
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
+    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    PreparedNgramIndexSlot ngram_index;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;

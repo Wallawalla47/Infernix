@@ -83,10 +83,14 @@ no GPU graph family. It is not a guarantee of correct file contents: every outpu
 still needs the same caller-side validation as ordinary generation.
 
 The index includes the prepared prompt and committed output, never rejected or pending
-verification columns. Known special tokens end source spans. The default index has about
-36 MiB of token and bucket storage per active request, plus bounded proposal-only sources
-in the prepared prompt. This index is released with the request. Optional session retention
-uses a separate bounded CPU archive, described below; unrelated clients never share it.
+verification columns. Known special tokens end source spans. Prompt preparation builds the
+prompt part on the calling thread, hashing each window once and prefetching its bucket, so
+admission on the Engine worker only moves the index into the request; the worker then indexes
+committed output as it is generated. The default index has about 36 MiB of token and bucket
+storage per prepared or active request (queued requests hold theirs too), plus bounded
+proposal-only sources in the prepared prompt. This index is released with the request.
+Optional session retention uses a separate bounded CPU archive, described below; unrelated
+clients never share it.
 The prompt is indexed before derived tool sources. The larger index retains useful old
 spans under diverse long-context pressure; bounded storage still does not guarantee a hit
 for every previous span.
