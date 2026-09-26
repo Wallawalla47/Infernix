@@ -37,6 +37,12 @@ render_tool_call_fallback(const RequestLogContext& context, const GenerationOutc
                                                         const RequestFailure& failure);
 [[nodiscard]] OperationalRecord render_throughput(const ThroughputReport& report);
 
+// Process-wide switch for colouring the operational stats lines. The serve sets this
+// from --log-colours (default off) before logging starts; the [timestamp] [level]
+// prefix rendered by the sink pattern stays plain.
+void set_operational_log_colours(bool enabled);
+[[nodiscard]] bool operational_log_colours_enabled();
+
 class OperationalLog {
 public:
     explicit OperationalLog(std::shared_ptr<spdlog::logger> logger);

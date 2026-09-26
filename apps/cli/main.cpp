@@ -3,15 +3,19 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/log_colour/log_colour.h"
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -95,13 +99,41 @@ std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
     return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
+// Stats colouring (stderr only). Each statistic gets a stable 256-colour ANSI
+// colour keyed by its name (see product/log_colour), so it keeps the same
+// colour on every line and can be tracked across the log as its value
+// changes. Colours are on by default when stderr is a terminal, so logs
+// captured to files stay plain; --log-colours on|off overrides either way.
+std::optional<bool> log_colours_flag; // set from --log-colours before any output
+
+bool stats_color_enabled() {
+    static const bool enabled = [] {
+        if (log_colours_flag.has_value()) { return *log_colours_flag; }
+        return ninfer::product::log_colour::stderr_is_console();
+    }();
+    return enabled;
+}
+
+std::string colorize(std::string_view text, std::string_view key) {
+    return ninfer::product::log_colour::colourize(text, key, stats_color_enabled());
+}
+
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
-    std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
-              << std::setw(12) << format_seconds(seconds) << '\n';
+    const std::string elapsed = format_seconds(seconds);
+    std::cerr << std::left << std::setw(12) << group << colorize(detail, detail);
+    const std::size_t detail_width = std::max<std::size_t>(detail.size(), 26);
+    for (std::size_t i = detail.size(); i < detail_width; ++i) { std::cerr << ' '; }
+    for (std::size_t i = elapsed.size(); i < std::max<std::size_t>(elapsed.size(), 12); ++i) {
+        std::cerr << ' ';
+    }
+    std::cerr << colorize(elapsed, detail) << '\n';
 }
 
 void print_metric(std::string_view label, std::string_view value) {
-    std::cerr << std::left << std::setw(12) << "summary" << std::setw(26) << label << value << '\n';
+    std::cerr << std::left << std::setw(12) << "summary" << colorize(label, label);
+    const std::size_t label_width = std::max<std::size_t>(label.size(), 26);
+    for (std::size_t i = label.size(); i < label_width; ++i) { std::cerr << ' '; }
+    std::cerr << colorize(value, label) << '\n';
 }
 
 class StreamingSink final : public ninfer::OutputSink {
@@ -243,6 +275,7 @@ int main(int argc, char** argv) {
         std::cout << ninfer::cli::usage_text(argv[0]);
         return 0;
     }
+    log_colours_flag = cli.log_colours;
 
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer",
@@ -255,7 +288,6 @@ int main(int argc, char** argv) {
     ninfer::product::StartupLogRenderer startup_log(logging);
 
     try {
-
         ninfer::PromptInput input =
             cli.messages_path.empty()
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)

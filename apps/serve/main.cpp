@@ -2,6 +2,7 @@
 
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
+#include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
 #include "serve/serve_options.h"
@@ -45,10 +46,16 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
-    ninfer::product::LoggingRuntime logging(
-        {.logger_name  = "ninfer-serve",
-         .level        = options.log_level,
-         .presentation = ninfer::product::LogPresentation::Service});
+    // Token/level colouring is opt-in (--log-colours on); the default keeps the log plain.
+    ninfer::serve::set_operational_log_colours(options.log_colours);
+
+    ninfer::product::LoggingOptions logging_options;
+    logging_options.logger_name  = "ninfer-serve";
+    logging_options.level        = options.log_level;
+    logging_options.presentation = ninfer::product::LogPresentation::Service;
+    logging_options.color        = options.log_colours ? ninfer::product::LogColorMode::Always
+                                                       : ninfer::product::LogColorMode::Never;
+    ninfer::product::LoggingRuntime logging(logging_options);
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
     ninfer::product::StartupLogRenderer startup_log(logging);
     ninfer::serve::OperationalLog operational_log(logger);

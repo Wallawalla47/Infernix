@@ -1,11 +1,13 @@
 #include "serve/operational_log.h"
 
+#include "product/log_colour/log_colour.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
 
 #include <algorithm>
+#include <atomic>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -13,6 +15,11 @@
 
 namespace ninfer::serve {
 namespace {
+
+std::atomic<bool>& colours_enabled() {
+    static std::atomic<bool> enabled{false};
+    return enabled;
+}
 
 const char* phase_name(RequestFailurePhase phase) noexcept {
     switch (phase) {
@@ -169,6 +176,10 @@ void append_failure_fields(std::ostringstream& out, const RequestFailure& failur
 }
 
 } // namespace
+
+void set_operational_log_colours(bool enabled) { colours_enabled().store(enabled); }
+
+bool operational_log_colours_enabled() { return colours_enabled().load(); }
 
 OperationalRecord render_request_start(const RequestLogContext& context) {
     std::ostringstream out;
@@ -434,15 +445,21 @@ OperationalLog::OperationalLog(std::shared_ptr<spdlog::logger> logger)
     : logger_(std::move(logger)) {}
 
 void OperationalLog::write(OperationalRecord record) const {
+    // Colour the message's key=value tokens when the serve was started with
+    // --log-colours on; the [timestamp] [level] prefix from the sink pattern
+    // stays plain.
+    const std::string message =
+        ninfer::product::log_colour::colourise_stats_line(record.message,
+                                                          operational_log_colours_enabled());
     switch (record.severity) {
     case OperationalSeverity::Info:
-        logger_->info("{}", record.message);
+        logger_->info("{}", message);
         return;
     case OperationalSeverity::Warning:
-        logger_->warn("{}", record.message);
+        logger_->warn("{}", message);
         return;
     case OperationalSeverity::Error:
-        logger_->error("{}", record.message);
+        logger_->error("{}", message);
         return;
     }
 }
