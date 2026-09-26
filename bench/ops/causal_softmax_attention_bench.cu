@@ -73,8 +73,12 @@ struct Options {
     int warmup       = 5;
     int repeat       = 30;
     bool profile     = false;
+    bool fast_prompt = false;
     std::string csv_out;
 };
+
+// --fast-prompt: every envelope asks for the fast INT8 prompt kernel.
+bool envelope_fast_prompt = false;
 
 struct Result {
     Entry entry;
@@ -116,7 +120,8 @@ struct Result {
                  "[--envelope-max N] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] "
-                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--csv-out PATH]\n",
+                 "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--fast-prompt] "
+                 "[--csv-out PATH]\n",
                  message);
     std::exit(2);
 }
@@ -250,6 +255,8 @@ Options parse_options(int argc, char** argv) {
             options.repeat = parse_i32(next("--repeat requires a value"), 1, 10000, "--repeat");
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--fast-prompt") {
+            options.fast_prompt = true;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -398,10 +405,13 @@ std::int32_t profile_visible(std::span<const std::int32_t> contexts,
 }
 
 ops::CausalAttentionExecutionEnvelope execution_envelope(int visible, int maximum) {
-    if (maximum == 0) return {static_cast<unsigned>(visible), static_cast<unsigned>(visible)};
-    if (maximum < visible)
+    if (maximum != 0 && maximum < visible)
         throw std::invalid_argument("--envelope-max is smaller than the visible input");
-    return {1, static_cast<unsigned>(maximum)};
+    ops::CausalAttentionExecutionEnvelope envelope{
+        maximum == 0 ? static_cast<unsigned>(visible) : 1U,
+        static_cast<unsigned>(maximum == 0 ? visible : maximum)};
+    envelope.fast_prompt_kernel = envelope_fast_prompt;
+    return envelope;
 }
 
 DeviceBuffer varied_values(std::size_t count, unsigned seed, float scale) {
@@ -862,6 +872,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
+        envelope_fast_prompt = options.fast_prompt;
         DeviceContext device;
         const auto execution = device.execution_view();
         const auto stream    = execution.stream;

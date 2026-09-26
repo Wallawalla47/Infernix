@@ -19,6 +19,11 @@ inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
+    // Run prompt-route launches over an INT8-G64 cache on the fast prompt kernel (each warp keeps
+    // its query rows, scores and output in registers; FP16 per-tile PV accumulation) instead of the
+    // tiled kernel. Other routes and cache formats ignore it, and it never changes the route or the
+    // workspace.
+    bool fast_prompt_kernel = false;
 };
 
 struct ContextAttentionExecutionEnvelope {
@@ -159,6 +164,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      CausalAttentionExecutionEnvelope envelope,
                                      WorkspaceArena& workspace, Tensor& out,
                                      DeviceExecutionView execution);
+
+/**
+ * Return the prompt-route width granule of one registered head geometry on the current device.
+ * A single-sequence call whose width is a multiple of the granule launches whole waves of fast
+ * prompt-kernel CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind
+ * a partial wave. The granule is a positive multiple of 128 tokens.
+ */
+[[nodiscard]] std::int32_t
+causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry);
 
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The

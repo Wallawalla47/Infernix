@@ -60,9 +60,8 @@ TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
                              os.path.join(HERE, "control", "build", "apps", "Release",
                                           "ninfer-serve.exe"))
-# Fork flags the launch bat does not already carry. --fast-prefill-kernel is in the
-# production (nvidia) launcher and is part of what this A/B measures.
-TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "--fast-prefill-kernel").split()
+# Fork flags the launch bat does not already carry.
+TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
 # Selects the fork's original checkpoint-catalog prefix cache instead of the default hybrid one.
 ORIGINAL_CACHE_FLAG = "--use-original-prefix-caching"
 # What the alt arm adds to the treatment's flags, and the build it runs (default the treatment's).

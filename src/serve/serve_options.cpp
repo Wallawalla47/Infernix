@@ -124,10 +124,15 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 1024)\n"
+           "  --use-original-int8-prefill-kernel\n"
+           "                             prefill INT8 KV with the original prompt kernel at\n"
+           "                             the requested chunk (default: the fast kernel, chunk\n"
+           "                             rounded down to whole attention waves)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
-           std::to_string(kDefaultMaxTokens) + ")\n"
+           std::to_string(kDefaultMaxTokens) +
+           ")\n"
            "  --default-thinking-budget N  cap model-origin thinking for enabled\n"
            "                             requests; control tokens count toward the\n"
            "                             request output limit\n"
@@ -323,6 +328,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--use-original-int8-prefill-kernel") {
+            options.original_int8_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

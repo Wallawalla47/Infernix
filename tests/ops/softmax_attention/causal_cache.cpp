@@ -131,6 +131,10 @@ struct AttentionCase {
     bool zero_q        = false;
     bool graph_replay  = false;
     float qk_amplitude = 0.25f;
+    // Envelope hint for the fast INT8 prompt kernel; V, new and cached, is drawn from
+    // +-value_amplitude.
+    bool fast_prompt_kernel = false;
+    float value_amplitude   = 1.0f;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -649,11 +653,13 @@ void encode_rotated_key_row(std::span<const float> source, std::size_t source_ba
 }
 
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
-                     std::uint32_t seed, float qk_amplitude = 0.25f) {
+                     std::uint32_t seed, float qk_amplitude = 0.25f,
+                     float value_amplitude = 1.0f) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
     std::vector<float> logical_k = make_bf16_values(elements, seed, -qk_amplitude, qk_amplitude);
-    std::vector<float> logical_v = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
+    std::vector<float> logical_v =
+        make_bf16_values(elements, seed + 1u, -value_amplitude, value_amplitude);
 
     HostCache cache{geometry, storage, max_context, logical_capacity};
     if (storage == KvCacheStorage::BFloat16) {
@@ -1703,6 +1709,10 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
            " keys=" + std::to_string(test_case.base + test_case.tokens) +
            " envelope_max=" + std::to_string(test_case.envelope_max) +
            " qk_amplitude=" + std::to_string(test_case.qk_amplitude) +
+           (test_case.value_amplitude != 1.0f
+                ? " value_amplitude=" + std::to_string(test_case.value_amplitude)
+                : std::string()) +
+           (test_case.fast_prompt_kernel ? " fast-prompt" : "") +
            (test_case.graph_replay ? " graph-replay" : "");
 }
 
@@ -1780,7 +1790,8 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k =
         make_bf16_values(kv_elements, test_case.seed + 1u, -amplitude, amplitude);
-    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
+    std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u,
+                                            -test_case.value_amplitude, test_case.value_amplitude);
     inject_codec_edges(geometry, test_case.tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -1788,9 +1799,10 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     }
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
+    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
 
-    const HostCache initial =
-        make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
+    const HostCache initial = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
+                                         amplitude, test_case.value_amplitude);
     HostCache expected = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference =
@@ -1909,11 +1921,12 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
-    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                                         test_case.envelope_max};
+    ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                                   test_case.envelope_max};
+    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
 
-    const HostCache cache_host =
-        make_cache(geometry, storage, total + 3, test_case.seed + 10u, amplitude);
+    const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
+                                            amplitude, test_case.value_amplitude);
     const std::vector<double> reference =
         ideal_attention(select_query_columns(q, kHeadDim * geometry.q_heads, oracle_queries),
                         cache_host, select_query_columns(positions, 1, oracle_queries));
@@ -1975,6 +1988,7 @@ struct BatchAttentionCase {
     bool graph_replay = false;
     // Optional per-replay contexts exercise large live-length changes with stable device views.
     std::vector<std::vector<std::int32_t>> replay_contexts;
+    bool fast_prompt_kernel = false;
 };
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
@@ -2036,6 +2050,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
     ops::CausalAttentionExecutionEnvelope envelope{
         test_case.graph_replay ? 1U : static_cast<unsigned>(maximum_visible),
         static_cast<unsigned>(std::max(maximum_visible, envelope_max))};
+    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
     const std::size_t columns            = std::size_t(width) * batch;
@@ -2751,6 +2766,66 @@ int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     return failures;
 }
 
+// The fast INT8 prompt kernel over prompt-route widths: partial row blocks, both CTA shapes (its
+// launcher picks four or eight warps from the width), V magnitudes on either side of its
+// FP16-partial scale limit, graph replay, and the production 3584-token prefill chunk as a first
+// chunk and after a long history.
+int run_int8_fast_prompt_cases(DeviceExecutionView execution) {
+    constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
+    int failures                     = 0;
+    const auto fast                  = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    const auto values = [&](AttentionCase test_case, float amplitude) {
+        test_case.value_amplitude = amplitude;
+        return fast(test_case);
+    };
+    const Geometry& h24 = kGeometries[0];
+    const Geometry& h16 = kGeometries[1];
+    failures += run_a1_case(execution, h24, storage, fast({300, 700, 1000, 901u}),
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, h24, storage, fast({300, 700, 1000, 902u}),
+                            MappingPattern::Identity);
+    failures += run_a1_case(execution, h24, storage, fast({1100, 0, 1100, 903u}),
+                            MappingPattern::Fragmented);
+    failures +=
+        run_a3_case(execution, h24, storage, fast({1057, 131, 1188, 904u}), MappingPattern::Offset);
+    failures += run_a1_case(execution, h16, storage, fast({1500, 500, 2000, 905u}),
+                            MappingPattern::Identity);
+    failures += run_a3_case(execution, h16, storage, fast({257, 2000, 2257, 906u}),
+                            MappingPattern::Fragmented);
+    // |V| up to 2048 puts group scales near 16, whose FP16 partials would overflow without the
+    // power-of-two rescale; |V| up to 900 keeps scales near 7, inside the unscaled path's margin.
+    failures += run_a1_case(execution, h24, storage, values({300, 1000, 1300, 907u}, 2048.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(execution, h24, storage, values({1100, 64, 1164, 908u}, 2048.0f),
+                            MappingPattern::Fragmented);
+    failures += run_a3_case(execution, h24, storage, values({640, 400, 1040, 909u}, 900.0f),
+                            MappingPattern::Identity);
+    failures += run_a1_case(execution, h24, storage, fast({600, 300, 900, 910u, false, true}),
+                            MappingPattern::Identity);
+    const std::array<int, 6> chunk_queries{0, 127, 128, 1791, 3456, 3583};
+    const auto chunk = [&](std::int32_t base, std::uint32_t seed) {
+        return fast({3584, base, static_cast<std::uint32_t>(base + 3584), seed});
+    };
+    failures += run_a1_case(execution, h24, storage, chunk(0, 912u), MappingPattern::Fragmented,
+                            chunk_queries);
+    failures += run_a1_case(execution, h24, storage, chunk(8192, 913u), MappingPattern::Fragmented,
+                            chunk_queries);
+    AttentionCase scaled   = chunk(1000, 914u);
+    scaled.value_amplitude = 2048.0f;
+    failures +=
+        run_a1_case(execution, h24, storage, scaled, MappingPattern::Identity, chunk_queries);
+    failures += run_a3_case(execution, h16, storage, chunk(2000, 915u), MappingPattern::Offset,
+                            chunk_queries);
+    // Inactive columns of a masked single-row prompt publish zeros.
+    BatchAttentionCase masked{300, {0}, {250}, {0}, MappingPattern::Identity, 916u};
+    masked.fast_prompt_kernel = true;
+    failures += run_batch_case(execution, h24, storage, masked);
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2765,6 +2840,8 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64)
         for (const auto& geometry : kGeometries)
             failures += run_geometry(execution, geometry, storage);
+    if (storage == KvCacheStorage::Int8Group64)
+        failures += run_int8_fast_prompt_cases(execution);
     if (storage != KvCacheStorage::BFloat16) {
         failures += run_quantized_causal_cases(execution, storage);
     } else {

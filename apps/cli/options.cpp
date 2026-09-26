@@ -119,8 +119,12 @@ std::string usage_text(const char* argv0) {
            "                           via --vram-headroom-mib)\n"
            "  --vram-headroom-mib N    VRAM headroom in MiB left by --kv-capacity auto\n"
            "                           (default " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) + ")\n"
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           ")\n"
            "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4\n"
+           "  --use-original-int8-prefill-kernel\n"
+           "                           prefill INT8 KV with the original prompt kernel\n"
+           "                           (default: the fast kernel)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -256,6 +260,8 @@ Options parse_options(int argc, char** argv) {
             options.vision_max_merged_tokens = merged;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--use-original-int8-prefill-kernel") {
+            options.original_int8_prefill_kernel = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

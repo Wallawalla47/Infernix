@@ -338,6 +338,7 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
+    const bool fast_prefill_kernel;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
     const std::uint32_t ngram_draft_window;

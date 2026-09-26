@@ -1265,7 +1265,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_cache(active_cache_positions_, positions);
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
-            const ops::CausalAttentionExecutionEnvelope chunk_envelope{visible, visible};
+            const ops::CausalAttentionExecutionEnvelope chunk_envelope{
+                .min_visible_keys   = visible,
+                .max_visible_keys   = visible,
+                .fast_prompt_kernel = fast_prefill_kernel_};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;

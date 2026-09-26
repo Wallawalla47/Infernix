@@ -96,6 +96,8 @@ public:
         prefill_split_frontier_ = position;
     }
 
+    // Route prefill prompt attention through the fast INT8-KV prompt kernel.
+    void set_fast_prefill_kernel(bool enabled) noexcept { fast_prefill_kernel_ = enabled; }
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
     }
@@ -226,6 +228,7 @@ private:
     // Borrowed from Program; every measured chunk retires before this pair is reused.
     CudaEventTimer* prefill_gpu_timer_ = nullptr;
     std::uint32_t prefill_chunk_;
+    bool fast_prefill_kernel_ = false;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

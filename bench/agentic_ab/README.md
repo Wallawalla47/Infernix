@@ -89,8 +89,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
   control built from an older upstream would credit the fork with upstream's own newer work.
 - **Same launch configuration.** The treatment runs the deploy folder's launch bat
   (`AB_LAUNCH_BAT`, default the official-artifact launcher) plus `AB_TREATMENT_EXTRA_FLAGS`
-  (default `--fast-prefill-kernel`, from the production launcher). The control runs the same
-  flags minus the ones its `--help` does not advertise.
+  (default none). The control runs the same flags minus the ones its `--help` does not
+  advertise.
 - **Same host RAM.** Upstream has no `--host-cache-mib`. The runner reads the split the fork
   resolved at startup (host state slots, host KV bytes, private continuations, long anchors,
   shared prefixes) and passes the control those exact values as explicit flags.
@@ -140,7 +140,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_MODEL` | the model path in the launch bat |
 | `AB_TREATMENT_EXE` | `build-windows\apps\Release\ninfer-serve.exe` in this checkout |
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
-| `AB_TREATMENT_EXTRA_FLAGS` | `--fast-prefill-kernel` |
+| `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |
 | `AB_ALT_EXE` | the treatment executable; another build puts a second fork build in the alt arm |
 | `AB_ALT_LABEL` | none (the report calls the alt arm "This fork, original prefix cache") |
