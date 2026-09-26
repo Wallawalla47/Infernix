@@ -219,6 +219,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
            "                             (default 5000; 0 disables)\n"
+           "  --log-colours on|off       colour the console stats lines (default off; on\n"
+           "                             colours the command-window log only, never file\n"
+           "                             logs)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
@@ -308,6 +311,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
+        } else if (arg == "--log-colours") {
+            const std::string_view value = require_value("--log-colours");
+            if (value == "on") {
+                options.log_colours = true;
+            } else if (value == "off") {
+                options.log_colours = false;
+            } else {
+                throw std::invalid_argument("--log-colours accepts on or off");
+            }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--max-request-mib"), "max-request-mib");

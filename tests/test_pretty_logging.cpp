@@ -130,6 +130,31 @@ int main() {
     failures += check(service_output.find("\x1b[") == std::string::npos,
                       "redirected service output contains ANSI escapes");
 
+    // Always mode on a redirected stderr must still deliver the line (plain),
+    // not drop it: the colour sink's WriteConsoleA path silently fails on a
+    // non-console handle.
+    std::string always_redirect_output;
+    {
+        StderrCapture capture;
+        {
+            ninfer::product::LoggingRuntime logging(
+                {.logger_name  = "ninfer-serve",
+                 .color        = ninfer::product::LogColorMode::Always,
+                 .presentation = ninfer::product::LogPresentation::Service});
+            logging.logger()->info("throughput | sample");
+            logging.flush();
+        }
+        always_redirect_output = capture.finish();
+    }
+    failures += check(
+        std::regex_match(
+            always_redirect_output,
+            std::regex(
+                R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
+        "Always mode dropped redirected service output");
+    failures += check(always_redirect_output.find("\x1b[") == std::string::npos,
+                      "redirected Always output contains ANSI escapes");
+
     std::string startup_output;
     {
         StderrCapture capture;

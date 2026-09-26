@@ -154,8 +154,14 @@ void report_logging_error(const std::string& message) noexcept {
 
 class ProgressAwareStderrSink final : public spdlog::sinks::sink {
 public:
+    // The Windows color sink writes messages that carry a colour range through
+    // WriteConsoleA, which silently fails on a redirected handle; with
+    // color_mode::always every such message would vanish from file/pipe logs.
+    // The formatter colours every service line's level, so any non-console
+    // stderr must fall back to plain (uncoloured) writes.
     explicit ProgressAwareStderrSink(spdlog::color_mode color)
-        : sink_(color), interactive_(log_colour::stderr_is_console()) {}
+        : sink_(log_colour::stderr_is_console() ? color : spdlog::color_mode::never),
+          interactive_(log_colour::stderr_is_console()) {}
 
     ~ProgressAwareStderrSink() override { clear(); }
 

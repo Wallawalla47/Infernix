@@ -35,17 +35,19 @@ namespace ninfer::product::log_colour {
 // types can't be confused. The block hue groups are maximally distant:
 //   General [0..15]  = red / orange / yellow / magenta (max-red, warm)
 //   Cache   [16..31] = blue / teal / cyan (low-red, cool)
-//   Done    [32..47] = green / lime
+//   Done    [32..47] = green / bright blue
 // (The earlier ordering mixed an olive green and an orange into the cache block,
 // so a host-cache line shared warm tones with a throughput line; that is fixed.)
+// The done block mixes greens with bright blues because a run of similar greens
+// is hard to tell apart; every blue stays bright enough on a black background.
 // All 48 stay bright enough on a black console background.
 constexpr std::array<std::uint16_t, 48> kPalette = {
     196, 197, 199, 201, 203, 205, 207, 208, // red / salmon / orange (general)
     210, 211, 214, 216, 220, 226, 227, 229, // orange / amber / yellow (general)
     20, 21, 26, 30, 31, 36, 41, 44, // blue / teal (cache)
     49, 51, 56, 61, 66, 71, 76, 86, // teal / cyan (cache)
-    46, 47, 48, 50, 77, 80, 82, 118, // green (done)
-    119, 120, 121, 154, 155, 156, 157, 159, // green / lime (done)
+    46, 47, 82, 76, 121, 118, 154, 159, // green (done)
+    33, 39, 45, 69, 75, 111, 117, 153, // bright blue (done)
 };
 
 // Basic 16-colour SGR foreground codes, one set per colourable family. On a
@@ -250,7 +252,7 @@ inline constexpr std::size_t kFamilySize        = kPalette.size() / kColorableFa
 // — the clause-opening name colours the whole clause, so a statistic keeps one
 // colour as its value changes. A key=value token anywhere names its own
 // statistic (a bare token after one inherits its colour), which keeps legacy
-// key=value tails such as the overlay window fields of a done line colourable.
+// key=value tails such as the vision offload fields of a done line colourable.
 // A line classified as LogFamily::None (a request-start "settings" line) is
 // returned entirely unchanged.
 [[nodiscard]] inline std::string colourise_stats_line(std::string_view line, bool enabled) {

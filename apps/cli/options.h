@@ -35,6 +35,7 @@ struct Options {
 
     bool raw_output      = false;
     bool print_token_ids = false;
+    std::optional<bool> log_colours; // --log-colours on|off (unset = on when stderr is a terminal)
     std::optional<bool> enable_thinking;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ReasoningEffort> reasoning_effort;

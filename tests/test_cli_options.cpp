@@ -182,6 +182,8 @@ int run_tests() {
                       "CLI log level was not parsed");
     failures += check(help.find("--log-level") != std::string::npos,
                       "CLI help omits the log-level control");
+    failures += check(help.find("--log-colours") != std::string::npos,
+                      "CLI help omits the log-colours control");
     const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
                                              "SAMPLING", "VISION", "LOGGING"};
     for (const char* section : cli_help_sections) {
