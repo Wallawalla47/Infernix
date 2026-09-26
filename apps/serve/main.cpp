@@ -1,6 +1,7 @@
 #include "ninfer_build_id.h"
 
 #include "product/logging/logging.h"
+#include "product/logging/engine_diagnostics.h"
 #include "product/logging/startup_log.h"
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
@@ -71,7 +72,8 @@ int main(int argc, char** argv) {
 #ifdef NINFER_BUILD_ID
         logger->info("build {}", NINFER_BUILD_ID);
 #endif
-        ninfer::serve::GenerationService service(options, startup_log.observer());
+        ninfer::serve::GenerationService service(
+            options, startup_log.observer(), ninfer::product::engine_diagnostic_observer(logger));
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
 

@@ -16,6 +16,7 @@ target_link_libraries(ninfer_product_prompt_input PRIVATE ninfer_media_acquire n
 add_library(ninfer_product_logging STATIC
   logging/logging.cpp
   logging/pretty_format.cpp
+  logging/engine_diagnostics.cpp
   logging/startup_log.cpp
 )
 ninfer_internal_includes(ninfer_product_logging)
