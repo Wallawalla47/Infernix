@@ -585,6 +585,11 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     for (std::size_t index = 0; index < messages.size(); ++index) {
         output.messages.push_back(parse_message(messages.at(index), index));
     }
+    // A trailing assistant message is an assistant prefill, matching the Anthropic endpoint: the
+    // client sends back a partial assistant turn and the Engine continues it in place.
+    if (!output.messages.empty() && output.messages.back().role == ChatRole::Assistant) {
+        output.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    }
 }
 
 void parse_tools(const Json& body, GenerationRequest& output) {

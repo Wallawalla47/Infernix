@@ -156,11 +156,14 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     Json context = template_parameters(options, special_tokens_);
     if (continuation) {
         const auto& final = messages.back();
+        // A final assistant turn may carry reasoning or tool calls: an agent client hands back the
+        // turn the output limit cut, and either part can be present. Thinking cannot be continued,
+        // because the template places the content inside an ambiguous reasoning opener, and media
+        // has no continuation position at all.
         if (final.role != ChatRole::Assistant || final.has_media() ||
-            !final.reasoning_content.empty() || !final.tool_calls.empty() ||
             context.value("enable_thinking", false)) {
-            throw std::invalid_argument("assistant continuation requires a final text-only "
-                                        "assistant message and disabled thinking");
+            throw std::invalid_argument("assistant continuation requires a final assistant message "
+                                        "without media and with thinking disabled");
         }
     }
     context["continue_final_message"] = continuation;

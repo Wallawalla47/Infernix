@@ -310,9 +310,8 @@ int main() {
     GenerationRequest request;
     request.max_tokens   = 1;
     const auto semantics = resolve_prompt_semantics(request, defaults);
-    failures += check(!semantics.reasoning_effort && !semantics.enable_thinking &&
-                          !semantics.reasoning_effort,
-                      "omitted reasoning effort did not resolve to the template default");
+    failures += check(!semantics.reasoning_effort && semantics.enable_thinking == true,
+                      "omitted thinking did not resolve to the enabled template default");
     failures +=
         check(to_request_options(request, defaults, semantics, true).execution.allow_prefix_reuse,
               "resolved read-write cache policy did not reach Engine options");
