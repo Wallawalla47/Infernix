@@ -30,8 +30,12 @@ void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& sess
     // Overlay: the full tower is absent from VRAM. Items wholly inside the reused prefix are
     // never encoded again; the rest are encoded through the evictable window now, once, and the
     // session copies their embeddings in as prefill reaches them.
-    const auto item_count      = static_cast<std::uint32_t>(plan.control->items.size());
-    std::uint32_t first_needed = item_count;
+    // Indices are absolute prepared-item indices, as use.prepared_item_index is: the plan's
+    // items start at control->prepared_item_begin inside the prepared prompt, and the session
+    // expects prepared_item_begin + items.size() entries.
+    const std::uint32_t item_end = plan.control->prepared_item_begin +
+                                   static_cast<std::uint32_t>(plan.control->items.size());
+    std::uint32_t first_needed = item_end;
     for (const auto& use : plan.uses) {
         if (use.end > base && use.prepared_item_index < first_needed) {
             first_needed = use.prepared_item_index;
@@ -39,11 +43,11 @@ void ProgramImpl::preencode_overlay_vision(execution::VisionPrefillSession& sess
     }
     execution::VisionOverlayWindowStats window_stats;
     std::vector<execution::PinnedVisionResult> preencoded;
-    if (first_needed < item_count) {
+    if (first_needed < item_end) {
         preencoded = execution::encode_items_overlay(device, parameters, prompt, plan,
                                                      first_needed, &window_stats);
     } else {
-        preencoded.resize(item_count);
+        preencoded.resize(item_end);
     }
     session.set_preencoded(std::move(preencoded), window_stats);
 }
