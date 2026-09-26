@@ -57,7 +57,10 @@ struct TextParameters {
 };
 
 struct MtpProjectionParameters {
-    LinearParameters packed;
+    // Set only when the four attention projections share one contiguous parent region,
+    // which the fused attn_input_proj / packed-linear path requires. Mixed-format
+    // artifacts (e.g. Q8 K/V with bf16 Q/gate) leave this empty.
+    std::optional<LinearParameters> packed;
     // Dense MTP projects K/V and Q/gate independently in its incremental path.
     // MoE MTP uses its existing complete-parent Attention projection.
     std::optional<std::array<LinearParameters, 4>> rows;
