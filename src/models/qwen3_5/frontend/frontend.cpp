@@ -605,24 +605,33 @@ public:
             }
             defaults.token_ids.push_back(token);
         }
-        std::vector<TokenId> encoded = tokenizer->encode(kThinkingControl);
+        std::string control_suffix(kThinkingControl);
+        const char* control_name = "canonical thinking control suffix";
+        if (!options.thinking_budget_message.empty()) {
+            control_name = "thinking budget message";
+            control_suffix = options.thinking_budget_message;
+            if (!control_suffix.ends_with(fi::kCanonicalReasoningCloseSerialization)) {
+                control_suffix += fi::kCanonicalReasoningCloseSerialization;
+            }
+        }
+        std::vector<TokenId> encoded = tokenizer->encode(control_suffix);
         if (encoded.empty()) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot encode the canonical thinking control suffix");
+            throw std::invalid_argument(std::string("Qwen tokenizer cannot encode the ") +
+                                        control_name);
         }
         const std::string exact =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = false});
         const std::string presented =
             tokenizer->decode(encoded, fi::DecodeOptions{.skip_special_tokens = true});
-        if (exact != kThinkingControl || presented.find(kThinkClose) == std::string::npos) {
-            throw std::invalid_argument(
-                "Qwen tokenizer cannot present the canonical thinking control suffix");
+        if (exact != control_suffix || presented.find(kThinkClose) == std::string::npos) {
+            throw std::invalid_argument(std::string("Qwen tokenizer cannot present the ") +
+                                        control_name);
         }
         for (const TokenId token : encoded) {
             if (std::find(defaults.token_ids.begin(), defaults.token_ids.end(), token) !=
                 defaults.token_ids.end()) {
-                throw std::invalid_argument(
-                    "canonical thinking control suffix contains a default terminal token");
+                throw std::invalid_argument(std::string(control_name) +
+                                            " contains a default terminal token");
             }
         }
         thinking_control_tokens = std::make_shared<const std::vector<TokenId>>(std::move(encoded));

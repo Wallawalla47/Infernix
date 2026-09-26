@@ -256,6 +256,19 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--default-thinking-budget", "0"});
     } catch (const std::invalid_argument&) { zero_thinking_budget_rejected = true; }
     failures += check(zero_thinking_budget_rejected, "zero --default-thinking-budget was accepted");
+    failures += check(defaults.thinking_budget_message.empty(),
+                      "thinking budget message is unexpectedly configured by default");
+    const ServeOptions thinking_message =
+        parse({"ninfer-serve", "model.ninfer", "--thinking-budget-message",
+               "Time to stop thinking. I must act now:"});
+    failures += check(thinking_message.thinking_budget_message ==
+                          "Time to stop thinking. I must act now:",
+                      "--thinking-budget-message did not preserve its value");
+    bool empty_thinking_message_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--thinking-budget-message", ""});
+    } catch (const std::invalid_argument&) { empty_thinking_message_rejected = true; }
+    failures += check(empty_thinking_message_rejected, "empty --thinking-budget-message accepted");
 
     bool empty_model_id_rejected = false;
     try {
@@ -575,6 +588,9 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--default-thinking-budget") !=
                           std::string::npos,
                       "serve help omits --default-thinking-budget");
+    failures += check(serve_usage_text("ninfer-serve").find("--thinking-budget-message") !=
+                          std::string::npos,
+                      "serve help omits --thinking-budget-message");
     failures += check(serve_usage_text("ninfer-serve").find("--vision") != std::string::npos,
                       "serve help omits --vision");
     failures += check(serve_usage_text("ninfer-serve").find("--usage-chunk-choice") !=

@@ -2336,6 +2336,69 @@ int test_thinking_budget_control(const Frontend& frontend) {
     return failures;
 }
 
+int test_thinking_budget_message() {
+    ninfer::models::qwen3_5::FrontendOptions message_options;
+    message_options.vision_enabled = false;
+    message_options.thinking_budget_message = "Time to act now:";
+    const std::string expected_control =
+        "Time to act now:" + std::string(fi::kCanonicalReasoningCloseSerialization);
+    const Frontend message_frontend = make_frontend(resources(), message_options);
+    int failures                     = 0;
+    auto session = message_frontend.make_output_session(
+        thinking_prompt(message_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const auto boundary = session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    failures +=
+        check(!boundary.finished() &&
+                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+              "custom message thinking boundary did not request target control");
+    (void)session.commit_preview();
+    const std::vector<ninfer::TokenId> control(session.pending_control_tokens().begin(),
+                                               session.pending_control_tokens().end());
+    const std::string control_text = fixture_tokenizer().decode(
+        control, fi::DecodeOptions{.skip_special_tokens = false});
+    failures += check(control_text == expected_control,
+                      "custom thinking budget message lost its canonical close");
+    const auto control_decision =
+        session.preview_control(control, static_cast<std::uint32_t>(control.size()) + 4U);
+    failures += check(control_decision.accepted_tokens == control.size() &&
+                          !control_decision.finished(),
+                      "custom thinking control was not accepted atomically");
+    const auto control_output = session.commit_preview();
+    // The reasoning channel keeps the message plus the leading newline of the canonical close
+    // (the serialization "\n</think>\n\n" starts with a newline); the trailing newlines after
+    // </think> are stripped from the content channel.
+    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+                          "Time to act now:\n" &&
+                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                      "custom thinking control was truncated or published to content");
+    failures += check(session.thinking_stats().injected_tokens == control.size() &&
+                          session.thinking_stats().applied,
+                      "custom thinking control accounting is incorrect");
+
+    ninfer::models::qwen3_5::FrontendOptions exact_options = message_options;
+    exact_options.thinking_budget_message = expected_control;
+    const Frontend exact_frontend = make_frontend(resources(), exact_options);
+    auto exact_session = exact_frontend.make_output_session(
+        thinking_prompt(exact_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    (void)exact_session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    (void)exact_session.commit_preview();
+    const std::vector<ninfer::TokenId> exact_tokens(
+        exact_session.pending_control_tokens().begin(),
+        exact_session.pending_control_tokens().end());
+    const std::string exact_text = fixture_tokenizer().decode(
+        exact_tokens, fi::DecodeOptions{.skip_special_tokens = false});
+    failures += check(exact_text == expected_control,
+                      "canonical close was appended to a message that already had it");
+
+    ninfer::models::qwen3_5::FrontendOptions terminal_options = message_options;
+    terminal_options.thinking_budget_message = "<eos>";
+    failures += check(
+        throws_invalid_argument([&] { (void)make_frontend(resources(), terminal_options); }),
+        "thinking budget message containing a terminal token was accepted");
+    return failures;
+}
+
 int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto prompt             = frontend.prepare_tokens({0});
     auto session            = frontend.make_output_session(prompt, {});
@@ -2840,6 +2903,7 @@ int main() {
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_thinking_budget_message();
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
