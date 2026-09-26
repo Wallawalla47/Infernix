@@ -261,10 +261,15 @@ public:
 
     std::size_t bytes() const noexcept { return payload_bytes_; }
 
+    // Both writes below run on the default stream, and both may return before the device has the
+    // bytes (a device memset, a pageable host-to-device copy). The Ops under test run on
+    // non-blocking streams that do not order against it, so each write settles the default stream
+    // first, as DeviceBuffer::copy_from_host does.
     void fill(int byte_value = 0) {
         if (payload_bytes_ != 0) {
             cuda_check(cudaMemset(data(), byte_value, payload_bytes_),
                        "cudaMemset guarded payload");
+            cuda_check(cudaStreamSynchronize(nullptr), "settle guarded payload fill");
         }
     }
 
@@ -274,6 +279,7 @@ public:
         auto* destination = static_cast<std::uint8_t*>(data()) + byte_offset;
         cuda_check(cudaMemcpy(destination, source, count, cudaMemcpyHostToDevice),
                    "cudaMemcpy host-to-guarded-device");
+        cuda_check(cudaStreamSynchronize(nullptr), "settle host-to-guarded-device copy");
     }
 
     void copy_to_host(void* destination, std::size_t count, std::size_t byte_offset = 0) const {

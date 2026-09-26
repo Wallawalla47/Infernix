@@ -89,6 +89,12 @@ void DeviceBuffer::fill(int byte_value) {
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaMemset failed", err));
     }
+    // A device memset may return before it completes; settle the default stream as
+    // copy_from_host does.
+    const cudaError_t settled = cudaStreamSynchronize(nullptr);
+    if (settled != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("device fill synchronization failed", settled));
+    }
 }
 
 void DeviceBuffer::copy_from_host(const void* source, std::size_t count, std::size_t byte_offset) {
