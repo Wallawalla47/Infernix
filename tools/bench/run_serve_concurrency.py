@@ -43,6 +43,12 @@ SATURATION_SEEDS = (
     1618033988749894848,
 )
 CORPUS_ORDER_SEED = 20260811
+SEED_SET_STRIDE = 0x9E3779B97F4A7C15
+
+
+def saturation_seed(index: int, seed_set: int) -> int:
+    """Seed of saturation request `index` in seed set `seed_set` (set 0 is the published set)."""
+    return (SATURATION_SEEDS[index] + seed_set * SEED_SET_STRIDE) % (1 << 63)
 POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
 SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
 SCHEMA_VERSION = 4
@@ -149,6 +155,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
     parser.add_argument("--kv-dtype", choices=tuple(corpus.KV_CACHE_NAMES), default="int8")
+    parser.add_argument(
+        "--seed-set",
+        type=int,
+        default=0,
+        metavar="N",
+        help="decode-saturation sampling seed set (default 0, the published seeds); other sets "
+        "sample different text, so several sets average out per-text speculative acceptance",
+    )
+    parser.add_argument(
+        "--serve-arg",
+        action="append",
+        default=[],
+        metavar="ARG",
+        help="extra ninfer-serve argument appended to every point's command; repeat for each "
+        "token (e.g. --serve-arg=--ngram-draft-tokens --serve-arg=15)",
+    )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
@@ -214,7 +236,7 @@ def build_points(
 
 
 def build_jobs(
-    point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int
+    point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int, seed_set: int = 0
 ) -> list[Job]:
     if point.suite == "decode-saturation":
         fixture = fixtures[SATURATION_FIXTURE]
@@ -223,7 +245,7 @@ def build_jobs(
                 index=index,
                 case_index=index,
                 fixture=fixture,
-                seed=SATURATION_SEEDS[index],
+                seed=saturation_seed(index, seed_set),
                 max_tokens=decode_tokens,
             )
             for index in range(point.concurrency)
@@ -325,6 +347,7 @@ def server_command(
                 "--lm-head-draft",
             ]
         )
+    command.extend(args.serve_arg)
     if point.sampling_mode == "greedy":
         command.append("--greedy")
     else:
@@ -548,6 +571,32 @@ def load_server_events(path: Path, server_instance_id: str) -> list[dict[str, An
     except (OSError, json.JSONDecodeError) as exc:
         raise corpus.CampaignError(f"failed to read serving events from {path}: {exc}") from exc
     return events
+
+
+def wait_for_final_throughput(
+    server_log: Path, server_instance_id: str, expected_requests: int
+) -> None:
+    """Waits until the throughput records account for every completed request's decode tokens.
+
+    The last stats interval of a point is written at the next interval tick after its final
+    request completes. A server stopped by a signal flushes it on shutdown, but on Windows
+    `terminate()` ends the process at once, so the point waits for that tick instead. A log that
+    never catches up is left to analyze_point's consistency check."""
+    deadline = time.monotonic() + 5.0 * STATS_INTERVAL_MS / 1000.0 + 2.0
+    while time.monotonic() < deadline:
+        try:
+            events = load_server_events(server_log, server_instance_id)
+        except corpus.CampaignError:
+            events = []  # a line being written; read again
+        done = [event for event in events if event.get("event") == "request_done"]
+        throughput = [event for event in events if event.get("event") == "throughput"]
+        if (
+            len(done) >= expected_requests
+            and sum_throughput(throughput)["committed_decode_tokens"]
+            >= sum_request_done(done)["decode_tokens"]
+        ):
+            return
+        time.sleep(0.1)
 
 
 def sum_request_done(events: Sequence[dict[str, Any]]) -> dict[str, int | float | None]:
@@ -787,7 +836,7 @@ def run_point(
     output_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    jobs = build_jobs(point, fixtures, args.decode_tokens)
+    jobs = build_jobs(point, fixtures, args.decode_tokens, args.seed_set)
     server_log = output_dir / "server" / f"{point.key}.jsonl"
     command = server_command(serve, point, server_log, args)
     print(
@@ -849,12 +898,14 @@ def run_point(
                 results, campaign_start, campaign_end = run_clients(point, jobs, args.port, enqueue)
                 for future in pending_records:
                     future.result()
+                wait_for_final_throughput(server_log, server_instance_id, len(jobs))
             rows = corpus.build_summary_rows(
                 records, (point.target,), (point.speculative_mode,), point.sampling_mode
             )
             corpus.write_summaries(rows, detail_dir)
         else:
             results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
+            wait_for_final_throughput(server_log, server_instance_id, len(jobs))
 
     events = load_server_events(server_log, server_instance_id)
     report = analyze_point(
@@ -1122,7 +1173,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dry_run:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
-            jobs = build_jobs(point, fixtures, args.decode_tokens)
+            jobs = build_jobs(point, fixtures, args.decode_tokens, args.seed_set)
             print(
                 f"# {point.key}: {len(jobs)} request(s), "
                 f"order={workload_order_label(point)}"

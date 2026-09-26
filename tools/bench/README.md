@@ -199,5 +199,19 @@ python3 tools/bench/run_serve_concurrency.py \
 ```
 
 Use `--kv-capacity auto` when the fixed corpus needs more shared KV than the default 262,144-token
-pool. A point is intentionally not resumable: combining fragments from separate server processes
-would not preserve either a steady interval or one continuous makespan.
+pool, or when the device cannot hold that pool beside the weights. A point is intentionally not
+resumable: combining fragments from separate server processes would not preserve either a steady
+interval or one continuous makespan. `--serve-arg` appends one token to every point's server
+command; repeat it for a flag and its value, for example
+`--serve-arg=--ngram-draft-tokens --serve-arg=15` to measure n-gram drafting.
+
+Steady decode tok/s is rounds per second times accepted tokens per round, and acceptance depends on
+the sampled text: two builds sample different text from the same seeds, so one seed set can differ
+by several percent in acceptance alone. `--seed-set N` selects another set of saturation seeds (set
+0 is the published one); compare builds on the decode rounds per second of the same point, or
+average several seed sets. Run the builds under comparison back to back and alternate their order:
+the same build measured hours apart drifted by 2-3 % on the RTX 5090 used for this suite.
+
+After the last request of a point completes, the runner waits for the throughput record that covers
+its final stats interval before stopping the server, because a server ended by `terminate()` on
+Windows cannot flush that interval on shutdown.
