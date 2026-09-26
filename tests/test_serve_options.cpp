@@ -413,6 +413,26 @@ int main() {
                           ("Host context MiB did not preserve exact bytes: " + mib).c_str());
     }
 
+    // --vram-headroom-mib sets the headroom automatic KV sizing leaves, and only with auto.
+    const ServeOptions headroom = parse(
+        {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
+    failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          headroom.kv_capacity.automatic_headroom_bytes == (2048ULL << 20),
+                      "--vram-headroom-mib did not reach the automatic KV capacity policy");
+    const ServeOptions no_headroom = parse(
+        {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "0"});
+    failures += check(no_headroom.kv_capacity.automatic_headroom_bytes == 0,
+                      "--vram-headroom-mib 0 must leave no sizing headroom");
+    for (const std::vector<std::string>& rejected :
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "512"},
+          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-capacity", "16384",
+                                   "--vram-headroom-mib", "512"}}) {
+        try {
+            (void)parse(rejected);
+            failures += check(false, "--vram-headroom-mib without --kv-capacity auto was accepted");
+        } catch (const std::invalid_argument&) {}
+    }
+
     constexpr std::size_t bytes_per_mib  = 1ULL << 20;
     constexpr std::size_t max_host_bytes = std::numeric_limits<std::size_t>::max();
     std::string maximum_host_mib         = std::to_string(max_host_bytes / bytes_per_mib);

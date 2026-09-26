@@ -184,6 +184,8 @@ int run_tests() {
                       "CLI help omits the log-level control");
     failures += check(help.find("--log-colours") != std::string::npos,
                       "CLI help omits the log-colours control");
+    failures += check(help.find("--vram-headroom-mib") != std::string::npos,
+                      "CLI help omits the VRAM headroom control");
     const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
                                              "SAMPLING", "VISION", "LOGGING"};
     for (const char* section : cli_help_sections) {
