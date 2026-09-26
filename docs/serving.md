@@ -921,9 +921,12 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
 readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-level debug` exposes
-internal startup and resource-planning detail. A terminal may use one transient line during startup,
-but Serve throughput is always a persistent record. Redirected stderr contains no terminal control
-sequences.
+internal startup and resource-planning detail. Engine runtime diagnostics are ordinary records
+prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
+that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
+are warnings or errors; the prefix-cache save at shutdown is `info`. A terminal may use one
+transient line during startup, but Serve throughput is always a persistent record. Redirected
+stderr contains no terminal control sequences.
 
 On an interactive terminal that accepts VT cursor control, and at `info` verbosity or more, Serve
 pins a session statistics panel beneath the scrolling records (`--log-stats-panel off` removes it).

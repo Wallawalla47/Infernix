@@ -9,6 +9,7 @@
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
 #include "runtime/engine/context_cache/resource_manager.h"
+#include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
 
@@ -75,6 +76,7 @@ public:
                 .session_bytes = options.speculative.ngram_session_bytes,
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
+        diagnostics_ = options.diagnostic_observer;
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -2230,6 +2232,7 @@ private:
     const std::chrono::milliseconds pending_timeout_;
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
+    DiagnosticObserver diagnostics_;
 
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;

@@ -119,7 +119,8 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
+    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
+                               DiagnosticObserver diagnostic_observer = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
