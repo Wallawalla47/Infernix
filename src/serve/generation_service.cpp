@@ -280,28 +280,36 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    count_capacity_ = std::make_shared<RequestCapacity>(
+        static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
 
 std::shared_ptr<RequestLifetime>
 GenerationService::acquire_request_lifetime(DeadlinePolicy deadline_policy) const {
+    return acquire_lifetime(request_capacity_, deadline_policy, "inference request queue is full");
+}
+
+std::shared_ptr<RequestLifetime>
+GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
+                                    DeadlinePolicy deadline_policy,
+                                    const char* full_message) const {
     const auto started = Clock::now();
     {
-        std::lock_guard lock(request_capacity_->mutex);
-        if (request_capacity_->active >= request_capacity_->maximum) {
-            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
-                                                     "inference request queue is full"));
+        std::lock_guard lock(capacity->mutex);
+        if (capacity->active >= capacity->maximum) {
+            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded, full_message));
         }
-        ++request_capacity_->active;
+        ++capacity->active;
     }
     try {
         const Clock::time_point deadline =
             deadline_policy == DeadlinePolicy::UnboundedStartup
                 ? Clock::time_point::max()
                 : started + std::chrono::milliseconds(options_.pending_timeout_ms);
-        return std::make_shared<RequestLifetime>(request_capacity_, started, deadline);
+        return std::make_shared<RequestLifetime>(capacity, started, deadline);
     } catch (...) {
-        std::lock_guard lock(request_capacity_->mutex);
-        --request_capacity_->active;
+        std::lock_guard lock(capacity->mutex);
+        --capacity->active;
         throw;
     }
 }
@@ -406,8 +414,9 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
     }
-    const Clock::time_point deadline =
-        Clock::now() + std::chrono::milliseconds(options_.pending_timeout_ms);
+    const std::shared_ptr<RequestLifetime> lifetime = acquire_lifetime(
+        count_capacity_, DeadlinePolicy::ClientPendingTimeout, "token count queue is full");
+    const Clock::time_point deadline        = lifetime->deadline;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =

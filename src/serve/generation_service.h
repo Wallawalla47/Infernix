@@ -180,10 +180,16 @@ private:
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+    [[nodiscard]] std::shared_ptr<RequestLifetime>
+    acquire_lifetime(const std::shared_ptr<RequestCapacity>& capacity,
+                     DeadlinePolicy deadline_policy, const char* full_message) const;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    // Token counting runs the whole preparation path on handler threads, so it has its own bound:
+    // a flood of counts is rejected before it can occupy the threads generation prepares on.
+    std::shared_ptr<RequestCapacity> count_capacity_;
 };
 
 } // namespace ninfer::serve
