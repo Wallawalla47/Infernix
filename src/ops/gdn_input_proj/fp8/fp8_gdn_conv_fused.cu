@@ -50,7 +50,7 @@ void launch_small_t(const Tensor& x, const Weight& weight, const Tensor& conv_we
         fp8_a16_operands(x, weight),
         make_gdn_conv_output<ActiveTokens>(conv_weight, conv_states, valid_columns, initial_slot,
                                            query, key, value, z, publish),
-        Fp8GdnConvEpilogue<ActiveTokens, Publish>{}, stream);
+        Fp8GdnConvEpilogue<ActiveTokens, Publish>{}, stream, {}, pdl::Dependency::Programmatic);
 }
 
 template <int ActiveTokens>

@@ -1,5 +1,6 @@
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include <cuda_bf16.h>
 
 namespace ninfer::ops::detail {
@@ -8,6 +9,7 @@ template <int Capacity>
 __global__ __launch_bounds__(Capacity * 16, 4) void dynamic_grouped_conv_prepare_reduce_kernel(
     const __nv_bfloat16* base, const float* partial, __nv_bfloat16* prepared, __nv_bfloat16* finish,
     int width, int batch_size, int splits) {
+    pdl::enter();
     __shared__ float projected[4][Capacity];
     __shared__ float normalized[Capacity][16];
     const int tid = threadIdx.x, group = blockIdx.x, batch = blockIdx.y;
@@ -45,10 +47,12 @@ template <int Capacity>
 void launch(DynamicConvPrepareRoute route, const Tensor& base, const float* partial,
             Tensor& prepared, Tensor& finish, cudaStream_t stream) {
     const dim3 grid(320, prepared.ne[2]);
-    dynamic_grouped_conv_prepare_reduce_kernel<Capacity><<<grid, Capacity * 16, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(base.data), partial,
-        static_cast<__nv_bfloat16*>(prepared.data), static_cast<__nv_bfloat16*>(finish.data),
-        prepared.ne[1], prepared.ne[2], route.split_k);
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(Capacity * 16), 0, stream},
+                                    dynamic_grouped_conv_prepare_reduce_kernel<Capacity>,
+                                    static_cast<const __nv_bfloat16*>(base.data), partial,
+                                    static_cast<__nv_bfloat16*>(prepared.data),
+                                    static_cast<__nv_bfloat16*>(finish.data), prepared.ne[1],
+                                    prepared.ne[2], route.split_k));
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace

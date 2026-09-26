@@ -8,6 +8,7 @@
 #include "ops/common/token_slices.h"
 #include "ops/kernel/argmax.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 
 #include <cstdint>
 
@@ -72,9 +73,10 @@ void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t 
                                    stream));
         const dim3 grid(static_cast<unsigned int>(tiled_blocks),
                         static_cast<unsigned int>(token_count));
-        argmax_tiled_atomic_kernel<<<grid, block, 0, stream>>>(
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(grid), dim3(block), 0, stream}, argmax_tiled_atomic_kernel,
             static_cast<const __nv_bfloat16*>(logits_slice.data),
-            static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows);
+            static_cast<std::int32_t*>(out_slice.data), valid_rows, physical_rows));
         CUDA_CHECK(cudaGetLastError());
     });
 }

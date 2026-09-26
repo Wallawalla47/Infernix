@@ -30,7 +30,8 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
             launch_fp8_a8_tma_mma<S>(operands, output, LinearIdentityEpilogue{}, stream,
                                        workspace.partials);
         else
-            launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream);
+            launch_fp8_a8_mma<S>(operands, output, LinearIdentityEpilogue{}, stream, {},
+                                 pdl::Dependency::Programmatic);
     };
     if (x.ne[1] <= 32) return launch.template operator()<Fp8A8T32R32K128>();
     if (x.ne[1] <= 96) return launch.template operator()<Fp8A8T32R128K128>();

@@ -1,6 +1,7 @@
 #include "ops/rmsnorm_rope/launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/rmsnorm_rope/kernel.cuh"
 
 #include <cstdint>
@@ -13,12 +14,13 @@ void launch_fixed(const Tensor& positions, const Tensor* q_norm_weight, const Te
                   Tensor* q, Tensor& k, std::int32_t tokens, cudaStream_t stream,
                   const Coefficients& coefficients = {}) {
     const dim3 grid(tokens, Pair ? 5 : 1);
-    rmsnorm_rope_d128_kernel<Pair, Coefficients><<<grid, 256, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(256), 0, stream}, rmsnorm_rope_d128_kernel<Pair, Coefficients>,
         static_cast<const std::int32_t*>(positions.data),
         q_norm_weight == nullptr ? nullptr : static_cast<const __nv_bfloat16*>(q_norm_weight->data),
         static_cast<const __nv_bfloat16*>(k_norm_weight.data),
         q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        static_cast<__nv_bfloat16*>(k.data), coefficients);
+        static_cast<__nv_bfloat16*>(k.data), coefficients));
 }
 
 // One warp per head, three heads per block. Measured optimum on sm_120a; the plateau is flat from
@@ -31,14 +33,15 @@ void launch_text(const Tensor& positions, const Tensor& q_norm_weight, const Ten
                  const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,
                  std::int32_t tokens, cudaStream_t stream) {
     constexpr int kGroups = (QHeads + KHeads + kTextHeadsPerBlock - 1) / kTextHeadsPerBlock;
-    rmsnorm_rope_d256_text_kernel<QHeads, KHeads, kTextHeadsPerBlock>
-        <<<static_cast<unsigned>(tokens * kGroups), kTextHeadsPerBlock * 32, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data),
-            static_cast<const __nv_bfloat162*>(q_norm_weight.data),
-            static_cast<const __nv_bfloat162*>(k_norm_weight.data),
-            static_cast<const __nv_bfloat162*>(q_in.data),
-            static_cast<const __nv_bfloat162*>(k_in.data), static_cast<__nv_bfloat162*>(q_out.data),
-            static_cast<__nv_bfloat162*>(k_out.data), tokens);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(tokens * kGroups)), dim3(kTextHeadsPerBlock * 32), 0, stream},
+        rmsnorm_rope_d256_text_kernel<QHeads, KHeads, kTextHeadsPerBlock>,
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const __nv_bfloat162*>(q_norm_weight.data),
+        static_cast<const __nv_bfloat162*>(k_norm_weight.data),
+        static_cast<const __nv_bfloat162*>(q_in.data),
+        static_cast<const __nv_bfloat162*>(k_in.data), static_cast<__nv_bfloat162*>(q_out.data),
+        static_cast<__nv_bfloat162*>(k_out.data), tokens));
 }
 
 } // namespace

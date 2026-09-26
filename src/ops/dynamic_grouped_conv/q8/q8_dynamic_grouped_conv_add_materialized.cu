@@ -48,7 +48,7 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
     launch_q8_a16_sliced_k_mma<
         typename Schedule::template with_problem<Geometry::kInputRows, TileColumns, false>,
         Q8SlicedKIdentityRows>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
-                               stream);
+                               stream, {}, pdl::Dependency::Programmatic);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -63,6 +63,7 @@ constexpr auto mlp       = make_launchers<17408>(std::make_index_sequence<11>{})
 
 __global__ void finish_kernel(const __nv_bfloat16* projected, const __nv_bfloat16* base,
                               const __nv_bfloat16* delta, __nv_bfloat16* residual, int width) {
+    pdl::enter();
     const int row = blockIdx.x * blockDim.x + threadIdx.x, col = blockIdx.y;
     if (row >= kRows) return;
     const int index = col * kRows + row;
@@ -88,11 +89,11 @@ void materialized(Q8DynamicConvAddSchedule schedule, const Tensor& x, const Weig
         break;
     }
     const dim3 grid((kRows + 255) / 256, tokens);
-    finish_kernel<<<grid, 256, 0, stream>>>(static_cast<const __nv_bfloat16*>(projected.data),
-                                            static_cast<const __nv_bfloat16*>(base.data),
-                                            static_cast<const __nv_bfloat16*>(delta.data),
-                                            static_cast<__nv_bfloat16*>(residual.data), x.ne[1]);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(256), 0, stream}, finish_kernel,
+                                    static_cast<const __nv_bfloat16*>(projected.data),
+                                    static_cast<const __nv_bfloat16*>(base.data),
+                                    static_cast<const __nv_bfloat16*>(delta.data),
+                                    static_cast<__nv_bfloat16*>(residual.data), x.ne[1]));
 }
 } // namespace
 

@@ -6,6 +6,7 @@
 // contiguous axis the public output-row axis. The epilogue stages BF16 pairs and emits aligned
 // output vectors, while the output policy remains replaceable by a fused semantic Op.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -27,6 +28,9 @@ template <class Schedule, bool FullTokens, class Epilogue, class Output, class R
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_mma_kernel(
     Fp8A8Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_offset, int count) {
+    // Streams its weights through the main loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
     constexpr bool PairRows                    = RowPolicy::kPaired;
     const auto* __restrict__ activation_codes  = operands.x;
     const auto* __restrict__ activation_scales = operands.x_scales;
@@ -125,6 +129,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             cp_commit();
         }
     }
+    pdl::trigger_dependents();
 
     fp8_finish_mma_tile<Schedule, FullTokens>(
         output, epilogue, row_policy, shared_raw, accumulators, activation_scales, weight_scales,

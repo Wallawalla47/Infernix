@@ -389,6 +389,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                          device.stream);
         }
 
+        // A terminal DFlash row appends its context through the pinned DFlash ingress, which the
+        // next round's submission rewrites; only that path needs the host to wait here.
+        bool host_ingress_in_flight = false;
         if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
@@ -407,12 +410,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
                     std::span<const std::uint32_t>(append_counts.data(), append_size));
+                host_ingress_in_flight = true;
             }
         }
 
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        if (host_ingress_in_flight) {
+            timing.begin_wait();
+            device.synchronize();
+            timing.end_wait();
+        } else {
+            // Every later consumer of the folded state is ordered behind the fold on this stream,
+            // and the host reads nothing the fold writes. Submit it now so it overlaps the next
+            // round's host preparation instead of waiting for that submission.
+            device.flush();
+        }
         work.reset();
     } catch (...) {
         try {

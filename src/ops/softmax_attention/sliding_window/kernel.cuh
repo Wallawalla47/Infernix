@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/softmax_attention/common/context_query.cuh"
+#include "core/pdl.cuh"
 
 namespace ninfer::ops {
 
@@ -43,6 +44,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         int padded_context, int window_mask, int max_context, int split_capacity, float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
+    pdl::enter_streaming();
     const int batch = static_cast<int>(blockIdx.z);
     const std::int64_t lane_elements =
         static_cast<std::int64_t>(kContextQueryHeadDim) * padded_context * kContextQueryKVHeads;
@@ -62,14 +64,12 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
 }
 
 template <int Tokens, int KeyBlock, int WarpsPerBlock>
-__launch_bounds__(WarpsPerBlock * 32, 2) __global__
-    void sliding_window_attention_reduce_kernel(const float* __restrict__ partial_acc,
-                                                const float* __restrict__ partial_m,
-                                                const float* __restrict__ partial_l,
-                                                const std::int32_t* __restrict__ positions,
-                                                const std::int32_t* __restrict__ valid_columns,
-                                                int window_mask, int max_context, int split_capacity,
-                                                __nv_bfloat16* __restrict__ out) {
+__launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attention_reduce_kernel(
+    const float* __restrict__ partial_acc, const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l, const std::int32_t* __restrict__ positions,
+    const std::int32_t* __restrict__ valid_columns, int window_mask, int max_context,
+    int split_capacity, __nv_bfloat16* __restrict__ out) {
+    pdl::enter();
     static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
     constexpr int MaxSplits = 32;
     constexpr unsigned Mask = 0xffffffffu;

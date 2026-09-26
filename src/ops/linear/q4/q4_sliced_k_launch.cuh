@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/common/epilogue.cuh"
@@ -10,7 +11,8 @@ namespace ninfer::ops::detail {
 template <class Schedule, class Output, class Epilogue,
           class RowPolicy = Q4IdentityRows<Schedule::kBlockRows>>
 void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
-                                cudaStream_t stream, RowPolicy row_policy = {}) {
+                                cudaStream_t stream, RowPolicy row_policy = {},
+                                pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_q4_operands(operands);
     if constexpr (Schedule::kStaticK > 0) {
         if (operands.k != Schedule::kStaticK || operands.padded_k != Schedule::kStaticK)
@@ -29,10 +31,12 @@ void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output,
                               0;
         const bool full_tokens = count % Schedule::kTokenCapacity == 0;
         const auto launch      = [&]<bool Full, bool FullTokens>() {
-            q4_a16_sliced_k_mma_kernel<Schedule, Full, FullTokens>
-                <<<grid, Schedule::kThreads, 0, stream>>>(
-                    x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
-                    count, operands.padded_k, offset, row_policy);
+            CUDA_CHECK(pdl::launch_with(
+                dependency,
+                {grid, dim3(Schedule::kThreads), 0, stream},
+                q4_a16_sliced_k_mma_kernel<Schedule, Full, FullTokens, Output, Epilogue, RowPolicy>,
+                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.k,
+                count, operands.padded_k, offset, row_policy));
         };
         if (full && full_tokens)
             launch.template operator()<true, true>();

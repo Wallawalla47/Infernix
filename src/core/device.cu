@@ -172,6 +172,16 @@ const char* DeviceContext::sync_mode() const {
 
 void DeviceContext::synchronize() const { CUDA_CHECK(cudaStreamSynchronize(stream)); }
 
+void DeviceContext::flush() const {
+    const cudaError_t status = cudaStreamQuery(stream);
+    if (status == cudaErrorNotReady) {
+        // Pending work is the expected answer; do not leave it as the thread's last error.
+        (void)cudaGetLastError();
+        return;
+    }
+    CUDA_CHECK(status);
+}
+
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx) : CudaEventTimer(ctx, ctx.stream) {}
 
 CudaEventTimer::CudaEventTimer(const DeviceContext& ctx, cudaStream_t stream) : stream_(stream) {

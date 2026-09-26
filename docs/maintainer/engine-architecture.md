@@ -240,6 +240,11 @@ membership、provisional token、每行 produced extent 和 accepted-prefix 执�
 Engine 使用 Frontend preview 形成每行 decision，再一次性 `Program::commit` 或 `abort_pending`。
 Program 提交或回滚对应 Main/backend KV、recurrent state、RNG 和 speculative state。
 
+投机轮的 recurrent fold 在 commit 中入队到 Program stream 后即返回，不等待设备完成：之后读写该 state
+的 decode、capture、transfer 与 prefill 都在同一 stream 上排在它之后，host 不读取 fold 的结果。只有
+terminal DFlash 行经 pinned ingress 追加 context 时才在 commit 内同步，因为下一轮提交会改写该 ingress。
+fold 的设备错误在下一次同步时作为执行失败报告。
+
 非取消行满足：
 
 ```text

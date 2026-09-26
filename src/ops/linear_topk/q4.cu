@@ -35,7 +35,8 @@ void launch_sliced(const Tensor& hidden, const Weight& head, const Tensor& row_t
                               static_cast<const std::int32_t*>(row_to_global_ids.data),
                               workspace.producer_groups};
     launch_q4_a16_sliced_k_mma<Schedule>(q4_linear_operands(hidden, head), output,
-                                         LinearIdentityEpilogue{}, stream);
+                                         LinearIdentityEpilogue{}, stream, {},
+                                         pdl::Dependency::Programmatic);
 }
 
 using Launch = void (*)(const Tensor&, const Weight&, const Tensor&, const LinearTopKWorkspace&,

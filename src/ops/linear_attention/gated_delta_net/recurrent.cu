@@ -1,6 +1,7 @@
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/linear_attention/gated_delta_net/recurrent.cuh"
 
 #include <cuda_bf16.h>
@@ -97,7 +98,8 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    CUDA_CHECK(
+        pdl::launch_consumer({grid, block, 0, stream}, recurrent_record_kernel<Masked>, access));
     CUDA_CHECK(cudaGetLastError());
 }
 

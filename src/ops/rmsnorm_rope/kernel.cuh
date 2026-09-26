@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/common/dflash_rope.cuh"
+#include "core/pdl.cuh"
 #include "ops/kernel/rope.cuh"
 #include "ops/rmsnorm_rope/d128.cuh"
 #include "ops/rmsnorm_rope/d256.cuh"
@@ -14,6 +15,7 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
     const __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k, Coefficients coefficients = {}) {
+    pdl::enter();
     constexpr int kPairs = 64;
     const int token      = blockIdx.x;
     const bool query     = Pair && blockIdx.y < 4;
@@ -49,6 +51,7 @@ __global__ __launch_bounds__(HeadsPerBlock * 32) void rmsnorm_rope_d256_text_ker
     const __nv_bfloat162* __restrict__ k_norm, const __nv_bfloat162* __restrict__ q_in,
     const __nv_bfloat162* __restrict__ k_in, __nv_bfloat162* __restrict__ q_out,
     __nv_bfloat162* __restrict__ k_out, std::int32_t tokens) {
+    pdl::enter();
     constexpr int kPairs    = 128;
     constexpr int kHalfPair = 16;
     constexpr int kCombined = QHeads + KHeads;

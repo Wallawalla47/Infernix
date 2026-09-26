@@ -5,6 +5,7 @@
 // pair across that token tile before advancing K. Output, epilogue, and row policies let fused
 // consumers retain their observable semantics without duplicating the contraction.
 
+#include "core/pdl.cuh"
 #include "ops/linear/fp8/fp8_a16_gemv.cuh"
 
 #include <cuda_bf16.h>
@@ -49,6 +50,9 @@ template <class Schedule, class Output, class Epilogue, class RowPolicy>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_simt_kernel(
     Fp8A16Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy) {
+    // Streams its weights through the main loop: wait for the producer first, and let dependents
+    // launch only once that loop is done.
+    pdl::enter_streaming();
     constexpr bool PairRows               = RowPolicy::kPaired;
     const auto* __restrict__ x            = operands.x;
     const auto* __restrict__ weight_codes = operands.codes;
@@ -169,6 +173,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
             __syncthreads();
         }
     }
+    pdl::trigger_dependents();
 
     const auto destination =
         linear_output_tile<kStoredRowsPerCta>(output, row_block * kStoredRowsPerCta);

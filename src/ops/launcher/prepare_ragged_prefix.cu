@@ -1,6 +1,7 @@
 #include "ops/launcher/prepare_ragged_prefix.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/kernel/prepare_ragged_prefix.cuh"
 
 #include <algorithm>
@@ -15,13 +16,14 @@ void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, con
     // Separate axes avoid per-CTA integer division. Grid stride preserves generic D when
     // feature tiles exceed CUDA's Z limit. Real feature widths use one vector per thread.
     const dim3 grid(source.ne[1], destination.ne[2], std::min(tiles, 65535));
-    prepare_ragged_prefix_kernel<<<grid, kRaggedPrefixVectorsPerBlock, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(grid), dim3(kRaggedPrefixVectorsPerBlock), 0, stream}, prepare_ragged_prefix_kernel,
         static_cast<const uint4*>(source.data), static_cast<const std::int32_t*>(lanes.data),
         static_cast<const std::int32_t*>(starts.data), static_cast<const std::int32_t*>(ends.data),
         static_cast<uint4*>(destination.data), static_cast<std::int32_t*>(positions.data),
         static_cast<std::int32_t*>(counts.data), source.ne[0] / 8, source.ne[1],
         source.nb[1] / static_cast<std::int64_t>(sizeof(uint4)),
-        source.nb[2] / static_cast<std::int64_t>(sizeof(uint4)));
+        source.nb[2] / static_cast<std::int64_t>(sizeof(uint4))));
     CUDA_CHECK(cudaGetLastError());
 }
 

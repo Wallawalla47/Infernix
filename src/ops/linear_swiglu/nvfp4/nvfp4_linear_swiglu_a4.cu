@@ -33,7 +33,8 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4A4Workspace workspace, 
     using S = Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>;
     launch_nvfp4_a4_mma<S>(nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
                            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-                           SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{});
+                           SwiGluTokenMajorMmaEpilogue{}, stream, SwiGluTokenMajorMmaRows<S>{},
+                           pdl::Dependency::Programmatic);
 }
 
 template <class Schedule>
