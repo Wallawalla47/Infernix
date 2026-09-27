@@ -68,6 +68,11 @@ selected for this process.
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
+`http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
+OpenAI-style base URL requests `/v1/v1/...`; every path above except `/health` also answers under
+that doubled prefix, with the same behavior, errors, and request IDs.
+
 `GET /health` returns HTTP 200 with `{"status":"ok"}` while the Engine can accept work. After an
 Engine-wide failure it returns HTTP 503 with `{"status":"unavailable"}`. Temporary queue
 saturation does not make the Engine unavailable. The endpoint remains unauthenticated.
