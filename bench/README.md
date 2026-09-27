@@ -11,12 +11,13 @@ prefix reuse and preemption. Its frozen request corpus is documented under
 [`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
 Engine directly.
 
-The serve-level A/B benchmark (upstream + Windows port vs this fork, black-box OpenAI
-API agentic workload; the headline numbers in the [fork README](../README.md)) is a
-standalone Python rig under [`ab/`](ab/README.md). The closed-loop agentic A/B suite under
-[`agentic_ab/`](agentic_ab/README.md) replays interleaved agent sessions, subagent fan-outs,
+The closed-loop agentic A/B suite under [`agentic_ab/`](agentic_ab/README.md) (upstream + Windows
+port vs this fork, black-box OpenAI API) replays interleaved agent sessions, subagent fan-outs,
 compaction, retries and aborts shaped from the production request logs, and reports cache hits,
-TTFT, cold prefill and output rates for the same two builds.
+TTFT, cold prefill and output rates. It and the decode-saturation suite of
+`tools/bench/run_serve_concurrency.py` produce the numbers in the
+[fork README](../README.md#performance-this-fork-vs-upstream). The older serve A/B rig
+under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
 ## Benchmark inputs
 

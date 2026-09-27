@@ -3,9 +3,11 @@
 Black-box A/B benchmark of two `ninfer-serve` builds serving the **same official NInfer
 Qwen3.8-27B NVFP4 artifact** (`qwen3_8_27b_nvfp4-official.ninfer`) over the OpenAI chat
 completions API, replaying a synthesized agentic workload and comparing avg TTFT,
-prefix-cache hit statistics, cold prefill tok/s and output tok/s. The headline numbers
-are in the [fork README](../../README.md) ("Inference performance" section); this
-directory contains the rig so the test can be replicated with your own builds and flags.
+prefix-cache hit statistics, cold prefill tok/s and output tok/s. It is the pre-merge
+rig: its last published run (below) predates the `e31bc99b` merge. The fork README's
+"Performance: this fork vs upstream" numbers come from [`../agentic_ab/`](../agentic_ab/README.md)
+and `tools/bench/run_serve_concurrency.py`. This directory keeps the rig so the test can be
+replicated with your own builds and flags.
 
 Metrics come from each serve's own request log (`--request-log-jsonl`, same schema as
 the production `log.json`) — no LLM is used at run time and no client-side timing is
