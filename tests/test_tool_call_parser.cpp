@@ -214,19 +214,61 @@ int test_string_values_preserve_embedded_tool_markup() {
     return failures;
 }
 
-int test_unrepresentable_parameter_delimiters_fall_back() {
-    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
-    const std::string unmatched_open =
-        tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
-    const std::string standalone_close = tool_call("bash", {{"command", "echo '</parameter>'"}});
+int test_parameter_delimiters_in_values() {
+    using Reason        = ninfer::ToolCallParseFallbackReason;
+    const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
+                                                    {"timeout", Json{{"type", "integer"}}}});
+    int failures        = 0;
 
-    int failures = 0;
-    failures += check_rejected(unmatched_open, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+    // A closer the grammar cannot continue from is text the value quotes: the call is kept whole,
+    // whether the quote is followed by a sibling parameter or ends the call.
+    for (const std::string command :
+         {std::string("echo '</parameter>'"), std::string("echo '</parameter>' && ls\n</param>")}) {
+        for (const bool sibling : {false, true}) {
+            const std::string text =
+                sibling ? tool_call("bash", {{"command", command}, {"timeout", "30"}})
+                        : tool_call("bash", {{"command", command}});
+            const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
+            failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1,
+                              "a value quoting a parameter closer lost its tool call");
+            if (parsed.tool_calls.size() != 1) { continue; }
+            const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
+            failures += check(args.at("command") == command,
+                              "a quoted parameter closer was not kept in the value");
+            failures += check(!sibling || args.at("timeout") == 30,
+                              "the parameter after a quoted closer was not parsed");
+        }
+    }
+
+    // Markup the grammar could continue from stays ambiguous, so those calls still fall back.
+    failures += check_rejected(tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}}),
+                               contract, Reason::MalformedStructure,
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_rejected(standalone_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
-                               "standalone parameter close was guessed to be string content");
+    failures += check_rejected(tool_call("bash", {{"command", "echo '</parameter></function>'"}}),
+                               contract, Reason::MalformedStructure,
+                               "a closer followed by a function closer was guessed to be text");
+
+    // Tolerant truncation: a closer at the region end still closes the value, and a quoted closer
+    // inside a value the budget cut stays part of the kept partial value.
+    const std::string open  = std::string("<") + "parameter=command>\n";
+    const std::string close = std::string("</") + "parameter>";
+    const std::string head  = "<tool_call>\n<function=bash>\n" + open;
+    const auto closed_cut =
+        fi::parse_qwen_tool_call_output(head + "ls\n" + close + "\n", 64, contract, true);
+    const auto quoted_cut = fi::parse_qwen_tool_call_output(
+        head + "echo '" + close + "' more", 64, contract, true);
+    for (const auto* cut : {&closed_cut, &quoted_cut}) {
+        failures += check(cut->is_tool_call_response && cut->tool_calls.size() == 1 &&
+                              cut->diagnostics.fallback_reason == Reason::TruncatedTail,
+                          "a tolerant cut call was not kept as a truncated tail");
+    }
+    if (closed_cut.tool_calls.size() == 1 && quoted_cut.tool_calls.size() == 1) {
+        const Json closed_args = Json::parse(closed_cut.tool_calls.front().arguments_json);
+        const Json quoted_args = Json::parse(quoted_cut.tool_calls.front().arguments_json);
+        failures += check(closed_args.at("command") == "ls" &&
+                              quoted_args.at("command") == "echo '" + close + "' more",
+                          "a tolerant cut call ended its value at the wrong closer");
+    }
     return failures;
 }
 
@@ -1215,7 +1257,7 @@ int main() {
     failures += test_multiple_calls();
     failures += test_declared_strings_preserve_text();
     failures += test_string_values_preserve_embedded_tool_markup();
-    failures += test_unrepresentable_parameter_delimiters_fall_back();
+    failures += test_parameter_delimiters_in_values();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();
