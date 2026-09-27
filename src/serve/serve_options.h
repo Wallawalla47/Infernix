@@ -64,6 +64,8 @@ struct ServeOptions {
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool log_colours       = false; // --log-colours on|off: colour the console stats lines
+    // --log-stats-panel on|off: pin the session statistics beneath the console log (terminal only).
+    bool log_stats_panel = true;
     // --usage-chunk-choice: emit the streaming usage chunk with a zero-delta choice instead of the
     // OpenAI-conformant empty choices array. Strict client parsers (GitHub Copilot) reject the
     // empty array as "Response contained no choices"; the extra choice is inert for other clients.

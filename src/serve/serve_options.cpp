@@ -229,6 +229,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --log-colours on|off       colour the console stats lines (default off; on\n"
            "                             colours the command-window log only, never file\n"
            "                             logs)\n"
+           "  --log-stats-panel on|off   pin session averages (TTFT, cache hit, prefill,\n"
+           "                             decode, MTP/DFlash and n-gram acceptance) beneath\n"
+           "                             the console log (default on; interactive\n"
+           "                             terminals only)\n"
            "  --log-level L              pretty stderr verbosity (trace|debug|info|warning|\n"
            "                             error|critical|off; default info)\n"
            "  --cors                     send permissive CORS headers for browser UIs\n"
@@ -335,6 +339,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.log_colours = false;
             } else {
                 throw std::invalid_argument("--log-colours accepts on or off");
+            }
+        } else if (arg == "--log-stats-panel") {
+            const std::string_view value = require_value("--log-stats-panel");
+            if (value == "on") {
+                options.log_stats_panel = true;
+            } else if (value == "off") {
+                options.log_stats_panel = false;
+            } else {
+                throw std::invalid_argument("--log-stats-panel accepts on or off");
             }
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =

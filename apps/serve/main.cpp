@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
     bool serving = false;
 
     try {
-        ninfer::serve::HttpServer server(options, logger);
+        ninfer::serve::HttpServer server(options, logger, logging.terminal_panel());
         if (!server.bind()) {
             operational_log.bind_failure(options.host, options.port);
             return 1;
