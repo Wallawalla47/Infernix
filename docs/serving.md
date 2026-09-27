@@ -753,7 +753,10 @@ completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, 
 `model_context_window_exceeded`.
 
 Thinking supports `disabled`, `adaptive`, and `enabled`. Enabled Thinking requires
-`budget_tokens >= 1024` and less than `max_tokens`, and that budget is passed to Engine. Visible
+`budget_tokens >= 1024`, and that budget is passed to Engine. Unlike the Anthropic API, a budget at
+or above `max_tokens` is accepted: the output limit ends thinking before the budget can, so the
+budget takes no effect. Clients such as Qwen Code send a fixed budget while shrinking `max_tokens`
+to the context left. Visible
 Thinking is returned with an opaque compatibility signature; SSE emits its `signature_delta`
 before closing the block. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history

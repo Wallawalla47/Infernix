@@ -484,9 +484,18 @@ int test_thinking_and_count_tokens() {
                              options.execution.thinking.budget == 1024,
                          "request Thinking budget did not reach Engine options");
 
-    body["thinking"]["budget_tokens"] = 4096;
+    // A budget at or above max_tokens is accepted and passed on; the output limit ends thinking
+    // first. Qwen Code sends a fixed budget while shrinking max_tokens to the context left.
+    for (const int budget : {4096, 128000}) {
+        body["thinking"]["budget_tokens"] = budget;
+        const GenerationRequest over      = parse(body).generation;
+        failures += check(over.enable_thinking == true && over.max_tokens == 4096 &&
+                              over.thinking_budget == static_cast<std::uint32_t>(budget),
+                          "Thinking budget at or above max_tokens was rejected or altered");
+    }
+    body["thinking"]["budget_tokens"] = 1023;
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
-                      "Thinking budget equal to max_tokens was accepted");
+                      "Thinking budget below 1024 was accepted");
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
