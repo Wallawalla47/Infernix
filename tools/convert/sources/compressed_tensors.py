@@ -28,6 +28,21 @@ def _divisor_word(store: SafetensorsSource, name: str) -> bytes:
     return raw
 
 
+def _reciprocal_f32_word(raw: bytes) -> bytes:
+    """Store the exact reciprocal (rounded to one FP32 word) of a source scale.
+
+    The v3 NVFP4 codec reconstructs values as ``code * block_scale /
+    weight_divisor``.  ModelOpt AutoQuant checkpoints instead store
+    *multiplicative* global scales, so their ``weight_scale_2`` /
+    ``input_scale`` scalars must be inverted before they can be consumed as
+    divisors.
+    """
+    word = struct.pack("<f", 1.0 / struct.unpack("<f", raw)[0])
+    if not valid_positive_fp32_word(struct.unpack("<I", word)[0]):
+        raise ValueError(f"reciprocal of {raw!r} is not finite and positive")
+    return word
+
+
 def compressed_matrix_source(
     store: SafetensorsSource, prefix: str, shape: tuple[int, int], format: str
 ) -> LogicalSource:
@@ -45,14 +60,29 @@ def compressed_matrix_source(
                 f"{name}: expected {dtype}{expected}, got {info.dtype}{info.shape}"
             )
 
-    def divisor(suffix: str) -> bytes:
-        return _divisor_word(store, f"{prefix}.{suffix}")
+    def divisor(suffix: str, reciprocal: bool = False) -> bytes:
+        raw = _divisor_word(store, f"{prefix}.{suffix}")
+        return _reciprocal_f32_word(raw) if reciprocal else raw
+
+    def nvfp4_names() -> tuple[str, str, str, bool]:
+        # GPTQ-style checkpoints keep the packed codes in weight_packed with
+        # the divisors in weight_global_scale/input_global_scale.  ModelOpt
+        # AutoQuant checkpoints store the packed codes in weight with
+        # multiplicative global scales in weight_scale_2/input_scale; the v3
+        # codec divides, so those are exposed as reciprocals (see the
+        # trailing flag).
+        if store.has(f"{prefix}.weight_packed"):
+            return "weight_packed", "weight_global_scale", "input_global_scale", False
+        if store.describe(f"{prefix}.weight").dtype == "U8":
+            return "weight", "weight_scale_2", "input_scale", True
+        raise ValueError(f"{prefix}: no NVFP4 encoded source found")
 
     def encoded(begin: int, end: int) -> EncodedRows:
         if not 0 <= begin < end <= n:
             raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
         if format == "nvfp4":
-            packed, scale = f"{prefix}.weight_packed", f"{prefix}.weight_scale"
+            packed_name, weight_divisor_name, _, reciprocal = nvfp4_names()
+            packed, scale = f"{prefix}.{packed_name}", f"{prefix}.weight_scale"
             signature(packed, (n, k // 2), "U8")
             signature(scale, (n, k // 16), "F8_E4M3")
             codes = store.read_flat(packed, begin * (k // 2), end * (k // 2)).reshape(
@@ -65,18 +95,33 @@ def compressed_matrix_source(
             )
             if bool((scales > 0x7E).any()):
                 raise ValueError(f"{scale}: expected nonnegative finite E4M3FN scales")
-            return EncodedRows(format, codes, scales, divisor("weight_global_scale"))
+            return EncodedRows(
+                format, codes, scales, divisor(weight_divisor_name, reciprocal))
         weight, scale = f"{prefix}.weight", f"{prefix}.weight_scale"
         signature(weight, shape, "F8_E4M3")
         info = store.describe(scale)
-        if info.dtype != "BF16" or prod(info.shape) != n:
-            raise ValueError(f"{scale}: expected one BF16 scale per row")
+        if info.dtype not in ("BF16", "F32"):
+            raise ValueError(f"{scale}: expected BF16 or F32 scales")
+        if prod(info.shape) not in (1, n):
+            raise ValueError(
+                f"{scale}: expected one scale per row or one global scale"
+            )
         codes = (
             store.read_flat(weight, begin * k, end * k)
             .view(torch.uint8)
             .reshape(end - begin, k)
         )
-        scales = store.read_flat(scale, begin, end)
+        if prod(info.shape) == n:
+            scales = store.read_flat(scale, begin, end)
+        else:
+            # Per-tensor FP8 (ModelOpt): replicate the global scale to every
+            # requested row, the only row-scaled FP8 representation in the v3
+            # container.
+            scales = store.read_flat(scale).repeat(end - begin)
+        if scales.dtype == torch.float32:
+            # The v3 row format stores BF16 scale words; ModelOpt checkpoints
+            # keep FP32 scales, so round them once at this boundary.
+            scales = scales.to(torch.bfloat16)
         validate_fp8_row_words(codes, scales)
         return EncodedRows(format, codes, scales)
 
@@ -128,8 +173,12 @@ def compressed_matrix_source(
         f"{store.path}:{prefix} ({format})",
         read,
         encoded,
-        (lambda: divisor("weight_global_scale")) if format == "nvfp4" else None,
-        (lambda: divisor("input_global_scale")) if format == "nvfp4" else None,
+        (lambda: divisor(nvfp4_names()[1], nvfp4_names()[3]))
+        if format == "nvfp4"
+        else None,
+        (lambda: divisor(nvfp4_names()[2], nvfp4_names()[3]))
+        if format == "nvfp4"
+        else None,
     )
 
 
@@ -148,6 +197,8 @@ def matrix_source(
         if resolved is None:
             actual = format
             if actual is None and store.has(prefix + ".weight_packed"):
+                actual = "nvfp4"
+            if actual is None and store.describe(name).dtype == "U8":
                 actual = "nvfp4"
             if actual is None and store.describe(name).dtype == "F8_E4M3":
                 actual = "fp8_e4m3fn_row_bf16"
