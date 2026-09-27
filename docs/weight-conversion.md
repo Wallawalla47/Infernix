@@ -44,8 +44,10 @@ python3 -m tools.convert \
 ```
 
 `--components` defaults to `text`. Include only the optional components you want to distribute.
-`--proposal` adds the indexed proposal head used by speculative decoding; it uses the repository's
-token ranking and defaults to 131,072 rows. The ordinary full-vocabulary output head is retained.
+`--proposal` adds the indexed proposal head used by speculative decoding. Its rows are the most
+frequent tokens of a token ranking, the repository's by default
+(`--ranking tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64`), and it keeps 131,072 of
+them by default (`--proposal-rows`). The ordinary full-vocabulary output head is retained.
 
 The built-in recipes are ordinary Python functions in
 [`official_recipes.py`](../tools/convert/official_recipes.py):
@@ -58,6 +60,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_27b_nvfp4_nvidia` | NVIDIA ModelOpt layout: imported NVFP4 MLP and FP8 attention/GDN projections, FP8 embedding from BF16, FP8 vocabulary weights re-quantized from the NVFP4 head | `quantized` |
+| `qwen3_8_27b_nvfp4_orcarouter` | orcarouter GPTQ layout: imported NVFP4 MLP for layers 0–55, imported FP8 for the last eight layers' MLP and every attention/GDN projection, FP8 embedding and vocabulary weights from BF16 | `quantized` |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;

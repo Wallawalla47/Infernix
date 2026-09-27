@@ -178,11 +178,86 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
+    """nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant) layout: every text MLP
+    projection is NVFP4; attention and GDN projections are per-row FP8. The
+    source output head is NVFP4, but the runtime registers the vocabulary
+    projection only for FP8, so it is dequantised and re-quantised there."""
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    quantized = sources["quantized"]
+    recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/") or name == "text/token_embedding":
+            continue
+        source = model.source(name, quantized)
+        if not parameter.projection or name.endswith(
+            ("/gdn/a_projection", "/gdn/b_projection")
+        ):
+            recipe.assign(name, source=source)
+            continue
+        if name == "text/output_head":
+            recipe.assign(
+                name,
+                format=FP8,
+                method=fp8_row_maxabs,
+                source=source,
+                activation_policy="AllowA8",
+            )
+            continue
+        format = (
+            "nvfp4"
+            if name.startswith("text/layers/") and "/mlp/" in name
+            else FP8
+        )
+        recipe.assign(
+            name,
+            format=format,
+            method=import_encoded,
+            source=model.source(name, quantized, format),
+            activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
+        )
+
+
+def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
+    """orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors)
+    layout: MLP projections of layers 0..55 are NVFP4 packed; the last eight
+    layers' MLP projections and every attention/GDN projection are per-row
+    FP8; the embedding and output head remain BF16 and are re-quantised."""
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    quantized = sources["quantized"]
+    recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
+    recipe.assign("text/output_head", format=FP8, method=fp8_row_maxabs)
+    for name, parameter in model.parameters.items():
+        if (
+            not name.startswith("text/layers/")
+            or not parameter.projection
+        ):
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.assign(name, source=model.source(name, quantized))
+            continue
+        layer = int(name.split("/")[2])
+        format = "nvfp4" if ("/mlp/" in name and layer < 56) else FP8
+        recipe.assign(
+            name,
+            format=format,
+            method=import_encoded,
+            source=model.source(name, quantized, format),
+            activation_policy="AllowA4" if format == "nvfp4" else "AllowA8",
+        )
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
+    "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
+    "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
 }

@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import torch
 
+from tools.convert.methods import fp8_row_maxabs, import_encoded
 from tools.convert.model import Model, Parameter
-from tools.convert.official_recipes import RECIPES, qwen3_8_27b, qwen3_8_27b_q6
+from tools.convert.official_recipes import (
+    RECIPES,
+    qwen3_8_27b,
+    qwen3_8_27b_nvfp4_nvidia,
+    qwen3_8_27b_q6,
+)
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
 
@@ -93,3 +99,64 @@ def test_q6_recipe_leaves_the_other_projections_alone() -> None:
     assert _single(formats, f"{LAYER}/attention/output") == Q5
     assert _single(formats, f"{LAYER}/gdn/output") == Q5
     assert _single(formats, f"{LAYER}/mlp/down") == Q5
+
+
+def _nvidia_model() -> Model:
+    model = Model({"text": {"config": {}}})
+    names = (
+        "text/token_embedding",
+        "text/output_head",
+        f"{LAYER}/gdn/a_projection",
+        f"{LAYER}/gdn/b_projection",
+        f"{LAYER}/gdn/query",
+        f"{LAYER}/gdn/output",
+        f"{LAYER}/attention/query",
+        f"{LAYER}/attention/output",
+        f"{LAYER}/mlp/gate",
+        f"{LAYER}/mlp/up",
+        f"{LAYER}/mlp/down",
+    )
+    for name in names:
+        inputs = () if name == "text/token_embedding" else ("input",)
+        source = array_source(torch.ones((4, 8), dtype=torch.bfloat16), name)
+        model.add(
+            Parameter(
+                name,
+                (4, 8),
+                source,
+                source_factory=lambda store, fmt, _source=source: _source,
+                inputs=inputs,
+            )
+        )
+    return model
+
+
+def test_nvidia_recipe_stores_the_head_as_fp8() -> None:
+    """The runtime's nvfp4 linear op has no vocabulary-shape kernel, so the
+    source's NVFP4 head must be dequantised and re-quantised to FP8."""
+    model = _nvidia_model()
+    recipe = Recipe(model)
+    qwen3_8_27b_nvfp4_nvidia(model, recipe, {"quantized": object()})
+
+    head = recipe.selections["text/output_head"]
+    assert len(head) == 1
+    assert head[0].format == "fp8_e4m3fn_row_bf16"
+    assert head[0].method is fp8_row_maxabs
+
+    assert _single(_selection_formats(recipe), f"{LAYER}/mlp/gate") == "nvfp4"
+    assert _single(_selection_formats(recipe), f"{LAYER}/mlp/down") == "nvfp4"
+    mlp_gate = recipe.selections[f"{LAYER}/mlp/gate"][0]
+    assert mlp_gate.method is import_encoded
+    assert _single(_selection_formats(recipe), f"{LAYER}/attention/query") == (
+        "fp8_e4m3fn_row_bf16"
+    )
+    assert _single(_selection_formats(recipe), f"{LAYER}/gdn/query") == (
+        "fp8_e4m3fn_row_bf16"
+    )
+
+
+def _selection_formats(recipe: Recipe) -> dict[str, set[str]]:
+    return {
+        name: {selection.format for selection in selections}
+        for name, selections in recipe.selections.items()
+    }
