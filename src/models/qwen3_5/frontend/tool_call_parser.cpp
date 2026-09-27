@@ -790,13 +790,25 @@ private:
         return FallbackReason::None;
     }
 
+    // After a parameter's closer the grammar continues with another parameter, the function's
+    // closer, or (for an output cut short) the region end. A closer followed by anything else is
+    // text the value quotes, such as a command that echoes tool markup.
+    bool closes_parameter(std::size_t pos) const {
+        skip_format_whitespace(text_, pos);
+        std::size_t tag_end = 0;
+        return pos >= text_.size() || is_param_open_at(text_, pos, tag_end) ||
+               starts_with_at(text_, pos, "</function>") || starts_with_at(text_, pos, "</invoke>");
+    }
+
     bool find_parameter_close(std::size_t value_begin, std::size_t& value_end,
                               std::size_t& close_len, std::string_view required_close) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         while (scan < text_.size()) {
             if (starts_with_at(text_, scan, required_close)) {
-                --depth;
+                // Closers of parameters the value quotes whole always balance their openers; only
+                // the outermost one must be followed by the grammar's next token.
+                if (depth != 1 || closes_parameter(scan + required_close.size())) { --depth; }
                 if (depth == 0) {
                     value_end = scan;
                     close_len = required_close.size();
