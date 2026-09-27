@@ -763,11 +763,15 @@ encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInf
 closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the
 selected template.
 
-User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
-`input_examples`. `tool_choice:auto` and `none` are executable. Forced or named choice,
-`strict:true`, active single-call enforcement, deferred tools, tools that exclude direct model
-calls, Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their
-required constraint or executor is absent. `tool_result` preserves text/image order and marks
+User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
+`tool_choice:auto` and `none` are executable. As on the OpenAI endpoints, `tool_choice` `any` and
+named `tool`, `strict:true`, and `disable_parallel_tool_use:true` are accepted as advisory: the
+Engine cannot force a call, constrain arguments to the schema, or limit the model to one call, so
+the tools stay offered under automatic selection. A named choice must name a declared tool, and
+`any` requires tools. Qwen Code sends `any` for its JSON side queries (permission classifier,
+session title, next-speaker check). Deferred tools, tools that exclude direct model calls,
+Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their executor
+is absent. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated

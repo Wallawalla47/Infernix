@@ -649,7 +649,6 @@ enum class ToolSelectionKind {
 struct ToolSelection {
     ToolSelectionKind kind = ToolSelectionKind::Auto;
     std::string name;
-    bool disable_parallel = false;
 };
 
 ToolSelection parse_tool_choice(const Json& body) {
@@ -672,7 +671,7 @@ ToolSelection parse_tool_choice(const Json& body) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
-    result.disable_parallel = optional_bool(choice, "disable_parallel_tool_use", false);
+    (void)optional_bool(choice, "disable_parallel_tool_use", false);
     return result;
 }
 
@@ -686,7 +685,6 @@ struct ParsedTool {
     ToolDefinition definition;
     ToolSource source = ToolSource::UserDefined;
     std::string source_type;
-    bool strict        = false;
     bool defer_loading = false;
     std::optional<std::vector<std::string>> allowed_callers;
 };
@@ -745,7 +743,6 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
-            parsed.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -781,19 +778,15 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    if (selection.kind == ToolSelectionKind::Named) {
-        if (std::none_of(definitions.begin(), definitions.end(), named)) {
-            bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
-        }
-        bad_request("tool_choice.type='tool' requires that exact tool to be called, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    // Forced choices are advisory, as on the OpenAI endpoints: the Engine cannot force a call, so a
+    // named choice is checked against the declared tools and automatic selection proceeds. Qwen
+    // Code, for one, sends tool_choice any for every JSON side query (docs/serving.md).
+    if (selection.kind == ToolSelectionKind::Named &&
+        std::none_of(definitions.begin(), definitions.end(), named)) {
+        bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
     }
-    if (selection.kind == ToolSelectionKind::Any) {
-        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
-        bad_request("tool_choice.type='any' requires at least one tool call, which NInfer cannot "
-                    "guarantee",
-                    "tool_choice", "tool_choice_not_supported");
+    if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
+        bad_request("tool_choice requires tools", "tool_choice");
     }
 
     request.tool_choice.mode =
@@ -818,11 +811,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "NInfer does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        if (tool.strict) {
-            bad_request("strict=true requires generated tool input to satisfy the declared JSON "
-                        "Schema, which NInfer cannot guarantee",
-                        "tools", "strict_tools_not_supported");
-        }
+        // strict=true is advisory: generation is not constrained to the declared JSON Schema.
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
                         "provide",
@@ -837,11 +826,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    if (selection.disable_parallel && !request.tools.empty()) {
-        bad_request("disable_parallel_tool_use=true requires at most one tool call, which NInfer "
-                    "cannot guarantee",
-                    "tool_choice", "parallel_tool_use_not_supported");
-    }
+    // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
