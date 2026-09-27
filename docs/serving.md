@@ -269,6 +269,15 @@ For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The
 interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
+Templates accept different subsets of those values: the official Qwen3.8 template raises for
+anything but `low`, `medium` and `xhigh`. NInfer renders each value once when the template loads,
+and a request for a value the template rejects renders with the nearest accepted value, a tie
+rounding up: on Qwen3.8, `high` and `max` render as `xhigh` and `minimal` as `low`. This applies to
+every endpoint and to `--reasoning-effort`. The values are tried on a one-message chat; a template
+that rejects every value, or cannot render that chat at all (one that requires a system message, for
+example), keeps the request's value and its error. Request logs record the effort the client asked
+for.
+
 `preserve_thinking` controls reasoning retention according to the selected template. Request
 options override server defaults set with `--no-thinking` and `--preserve-thinking`. Unspecified
 thinking, effort and preservation options use the template's defaults.
@@ -764,7 +773,7 @@ remains usable across serve restarts.
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the
-selected template.
+selected template, substituting the nearest value the template accepts as described above.
 
 User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
 `tool_choice:auto` and `none` are executable. As on the OpenAI endpoints, `tool_choice` `any` and

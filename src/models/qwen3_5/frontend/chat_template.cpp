@@ -5,6 +5,7 @@
 #include "text/unicode.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <stdexcept>
 
@@ -39,6 +40,59 @@ struct ContentSource {
     std::uint32_t reasoning_tag = 0;
 };
 
+// Thinking efforts in ascending order; bit i of an accepted-effort mask stands for entry i.
+constexpr std::array<std::string_view, 6> kThinkingEfforts = {"minimal", "low",   "medium",
+                                                             "high",    "xhigh", "max"};
+
+// Templates accept different effort sets (the official Qwen3.8 template only low, medium and
+// xhigh), while clients send the standard values. A rejected effort becomes the nearest accepted
+// one, and a tie rounds up so the request thinks at least as much as it asked: high and max
+// become xhigh there. A template that accepts none keeps the request's value and its error.
+std::string_view accepted_effort(std::string_view requested, std::uint8_t accepted) {
+    const auto found = std::find(kThinkingEfforts.begin(), kThinkingEfforts.end(), requested);
+    if (found == kThinkingEfforts.end() || accepted == 0) return requested;
+    const auto index = static_cast<std::size_t>(found - kThinkingEfforts.begin());
+    const auto has   = [&](std::size_t i) { return ((accepted >> i) & 1U) != 0; };
+    if (has(index)) return requested;
+    for (std::size_t distance = 1; distance < kThinkingEfforts.size(); ++distance) {
+        if (index + distance < kThinkingEfforts.size() && has(index + distance))
+            return kThinkingEfforts[index + distance];
+        if (index >= distance && has(index - distance)) return kThinkingEfforts[index - distance];
+    }
+    return requested;
+}
+
+std::uint8_t probe_accepted_efforts(const text::JinjaTemplate& compiled,
+                                    const Json& special_tokens) {
+    std::vector<std::string> control_variables;
+    for (const auto& item : special_tokens.items()) control_variables.push_back(item.key());
+    const text::TemplateRenderOptions execution{.control_variables = control_variables};
+    const Json messages = Json::array({Json{{"role", "user"}, {"content", "probe"}}});
+    const auto renders  = [&](std::optional<std::string_view> effort) {
+        Json context               = Json::object();
+        context["enable_thinking"] = true;
+        if (effort) context["reasoning_effort"] = *effort;
+        context["continue_final_message"] = false;
+        context["messages"]               = messages;
+        context["add_generation_prompt"]  = true;
+        context.update(special_tokens);
+        try {
+            (void)compiled.render(context, execution);
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    };
+    constexpr std::uint8_t kAll = (1U << kThinkingEfforts.size()) - 1U;
+    // A template that cannot render the probe at all says nothing about its efforts.
+    if (!renders(std::nullopt)) return kAll;
+    std::uint8_t accepted = 0;
+    for (std::size_t i = 0; i < kThinkingEfforts.size(); ++i) {
+        if (renders(kThinkingEfforts[i])) accepted |= static_cast<std::uint8_t>(1U << i);
+    }
+    return accepted;
+}
+
 void merge_option(Json& context, std::string_view key, const Json& value) {
     const std::string name(key);
     if (context.contains(name) && !context[name].is_null() && context[name] != value) {
@@ -47,7 +101,8 @@ void merge_option(Json& context, std::string_view key, const Json& value) {
     context[name] = value;
 }
 
-Json template_parameters(const ChatRenderOptions& options, const Json& special_tokens) {
+Json template_parameters(const ChatRenderOptions& options, const Json& special_tokens,
+                         std::uint8_t accepted_efforts) {
     Json context = options.chat_template_kwargs_json.empty()
                        ? Json::object()
                        : Json::parse(options.chat_template_kwargs_json);
@@ -91,8 +146,14 @@ Json template_parameters(const ChatRenderOptions& options, const Json& special_t
         if (context.contains("enable_thinking") && context["enable_thinking"] != thinking) {
             throw std::invalid_argument("reasoning_effort conflicts with enable_thinking");
         }
-        // The protocol's 'none' is an explicit disable. Other efforts retain template defaults.
-        if (!thinking) context["enable_thinking"] = false;
+        // The protocol's 'none' is an explicit disable. Other efforts retain template defaults and
+        // render as the nearest effort the template accepts.
+        if (!thinking) {
+            context["enable_thinking"] = false;
+        } else {
+            const std::string requested = effort.get<std::string>();
+            context["reasoning_effort"] = accepted_effort(requested, accepted_efforts);
+        }
     }
     context.update(special_tokens);
     return context;
@@ -142,8 +203,10 @@ bool ChatMessage::has_media() const noexcept {
 
 CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source, std::string source_name,
                                                    Json special_tokens) {
-    return CompiledChatTemplate(text::JinjaTemplate(std::string(source), std::move(source_name)),
+    CompiledChatTemplate result(text::JinjaTemplate(std::string(source), std::move(source_name)),
                                 std::move(special_tokens));
+    result.accepted_efforts_ = probe_accepted_efforts(result.compiled_, result.special_tokens_);
+    return result;
 }
 
 RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messages,
@@ -153,7 +216,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     check_preparation_control(control, "chat template");
     const bool continuation =
         options.continuation == PromptContinuationMode::ContinueFinalAssistant;
-    Json context = template_parameters(options, special_tokens_);
+    Json context = template_parameters(options, special_tokens_, accepted_efforts_);
     if (continuation) {
         const auto& final = messages.back();
         // A final assistant turn may carry reasoning or tool calls: an agent client hands back the
