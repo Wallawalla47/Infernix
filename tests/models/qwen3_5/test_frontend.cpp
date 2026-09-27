@@ -1100,6 +1100,77 @@ int test_literal_cache_boundary() {
     return failures;
 }
 
+int test_reasoning_effort_substitution() {
+    using ninfer::ReasoningEffort;
+    const std::vector<fi::ChatMessage> question{chat_message(ninfer::ChatRole::User, "question")};
+    const auto rendered_effort = [&](const fi::CompiledChatTemplate& compiled,
+                                     ReasoningEffort effort) {
+        return compiled.render(question, {.reasoning_effort = effort}).text;
+    };
+
+    // The official Qwen3.8 template accepts only low, medium and xhigh; the standard values it
+    // rejects render as the nearest one, a tie rounding up.
+    const auto qwen38    = fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    const auto effort_is = [](const std::string& text, std::string_view tier) {
+        return text.find("Reasoning effort is set to " + std::string(tier) + ".") !=
+               std::string::npos;
+    };
+    int failures = check(effort_is(rendered_effort(qwen38, ReasoningEffort::High), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::Max), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::XHigh), "xhigh"),
+                         "Qwen3.8 did not render high and max as its xhigh effort");
+    failures += check(effort_is(rendered_effort(qwen38, ReasoningEffort::Minimal), "low") &&
+                          effort_is(rendered_effort(qwen38, ReasoningEffort::Low), "low"),
+                      "Qwen3.8 did not render minimal as its low effort");
+    const std::string medium = rendered_effort(qwen38, ReasoningEffort::Medium);
+    failures += check(!effort_is(medium, "xhigh") && !effort_is(medium, "low"),
+                      "Qwen3.8 changed an effort it accepts");
+
+    // The nearest accepted effort wins in either direction; the substitute is what renders.
+    const auto sparse = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    failures += check(
+        rendered_effort(sparse, ReasoningEffort::High).ends_with("[medium]") &&
+            rendered_effort(sparse, ReasoningEffort::XHigh).ends_with("[max]") &&
+            rendered_effort(sparse, ReasoningEffort::Minimal).ends_with("[medium]") &&
+            sparse.render(question).text.ends_with("[unset]"),
+        "a rejected effort did not render as the nearest accepted one");
+
+    // A template that cannot render the probe (a lone user message) reveals nothing about its
+    // efforts, so none is substituted: an effort it rejects keeps the request's value and raises,
+    // where a probed template would have rendered the nearest accepted one.
+    const auto unprobed = fi::CompiledChatTemplate::resolve(
+        "{%- if messages[0].role != 'system' %}{{- raise_exception('needs a system message') }}"
+        "{%- endif %}"
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n"
+        "<|im_start|>user\n{{ messages[1].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    const std::vector<fi::ChatMessage> instructed{
+        chat_message(ninfer::ChatRole::System, "instructions"),
+        chat_message(ninfer::ChatRole::User, "question")};
+    failures += check(
+        unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::Medium})
+                .text.ends_with("[medium]") &&
+            throws_invalid_argument([&] {
+                (void)unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::High});
+            }),
+        "a template that fails the probe had an effort substituted");
+
+    // A template that rejects every effort keeps the request's value and raises as before.
+    const auto none = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined %}{{- raise_exception('no effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n");
+    failures += check(
+        throws_invalid_argument([&] { (void)rendered_effort(none, ReasoningEffort::High); }),
+        "an effort was invented for a template that accepts none");
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -2641,6 +2712,7 @@ int main() {
     failures += test_adjacent_tool_message_boundary();
     failures += test_literal_cache_boundary();
     failures += test_selected_template_recovery_boundary();
+    failures += test_reasoning_effort_substitution();
     failures += test_official_resource_guards();
     failures += test_template_file_execution();
     failures += test_invalid_public_part_enums(frontend);

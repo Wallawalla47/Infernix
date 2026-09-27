@@ -144,6 +144,10 @@ private:
 
     text::JinjaTemplate compiled_;
     nlohmann::ordered_json special_tokens_;
+    // One bit per thinking effort, minimal through max, that the template renders without
+    // raising, found by rendering each once at resolve. A rejected effort renders as the nearest
+    // accepted one. Every bit is set until probing ends and whenever the probe cannot render.
+    std::uint8_t accepted_efforts_ = 0x3f;
 };
 
 } // namespace ninfer::models::qwen3_5::frontend
