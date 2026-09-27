@@ -356,6 +356,8 @@ int main() {
                                            "8192",
                                            "--log-stats-interval-ms",
                                            "0",
+                                           "--log-stats-panel",
+                                           "off",
                                            "--preserve-thinking",
                                            "--media-cache-mib",
                                            "256",
@@ -388,6 +390,15 @@ int main() {
                       "--pending-timeout-ms did not reach serving options");
     failures += check(configured.log_stats_interval_ms == 0,
                       "--log-stats-interval-ms did not disable periodic reporting");
+    failures += check(!configured.log_stats_panel &&
+                          parse({"ninfer-serve", "model.ninfer"}).log_stats_panel,
+                      "--log-stats-panel did not reach serving options or is not on by default");
+    bool invalid_panel_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--log-stats-panel", "yes"});
+    } catch (const std::invalid_argument&) { invalid_panel_rejected = true; }
+    failures +=
+        check(invalid_panel_rejected, "--log-stats-panel accepted a value other than on|off");
     failures += check(configured.media_cache_bytes == (256ULL << 20) &&
                           configured.media_live_bytes == (512ULL << 20) &&
                           configured.media_preprocess_threads == 6,
@@ -599,6 +610,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--log-stats-interval-ms") != std::string::npos,
               "serve help omits --log-stats-interval-ms");
+    failures += check(serve_usage_text("ninfer-serve").find("--log-stats-panel") != std::string::npos,
+                      "serve help omits --log-stats-panel");
     failures += check(serve_usage_text("ninfer-serve").find("--log-level") != std::string::npos,
                       "serve help omits the log-level control");
     failures += check(serve_usage_text("ninfer-serve").find("--media-preprocess-threads") !=

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
 #include "serve/operational_log.h"
@@ -37,7 +38,10 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 
 class HttpServer {
 public:
-    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger);
+    // `panel` is the console panel for the session statistics; it is drawn only when enabled by
+    // the options and supported by the terminal, and may be null.
+    HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
+               std::shared_ptr<product::TerminalPanel> panel = nullptr);
 
     // Reserves the configured address before model loading. The service is attached only after its
     // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
@@ -109,6 +113,7 @@ private:
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;
     Metrics metrics_;
+    std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;
     std::atomic<std::uint64_t> request_seq_{0};
     std::mutex stats_mutex_;

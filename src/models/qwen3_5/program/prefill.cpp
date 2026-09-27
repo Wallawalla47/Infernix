@@ -435,6 +435,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     }
 
     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
+    const double tail_share   = tail_seconds / static_cast<double>(lanes.size());
     const std::uint32_t width = verify_drafts + 1U;
     try {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -487,6 +488,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
             request.pending = {};
             request.timings.decode_seconds += tail_seconds;
+            request.timings.decode_share_seconds += tail_share;
         }
     } catch (...) {
         clear_execution_failure_lanes(lanes);

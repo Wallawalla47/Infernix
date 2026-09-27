@@ -1,8 +1,10 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace spdlog {
 class logger;
@@ -63,6 +65,37 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// A multi-line panel pinned beneath the scrolling operational log. Persistent records scroll above
+// it; the panel is erased and redrawn around each record, so it stays at the bottom of the console.
+// It is enabled only when stderr is an interactive terminal with VT cursor control and the logger
+// shows info records; redirected output never contains it.
+class TerminalPanel {
+public:
+    ~TerminalPanel();
+
+    TerminalPanel(const TerminalPanel&)            = delete;
+    TerminalPanel& operator=(const TerminalPanel&) = delete;
+    TerminalPanel(TerminalPanel&&)                 = delete;
+    TerminalPanel& operator=(TerminalPanel&&)      = delete;
+
+    [[nodiscard]] bool enabled() const noexcept;
+    void update(std::vector<std::string> lines);
+    void clear() noexcept;
+
+private:
+    friend class LoggingRuntime;
+    struct Impl;
+    explicit TerminalPanel(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+};
+
+// Visible terminal columns of a line: ANSI CSI sequences occupy none and each UTF-8 code point one.
+[[nodiscard]] std::size_t terminal_display_width(std::string_view line) noexcept;
+// Truncate a line to at most `columns` visible columns, keeping its escape sequences intact and
+// resetting SGR attributes when a styled line is cut.
+[[nodiscard]] std::string fit_terminal_line(std::string_view line, std::size_t columns);
+
 // Application-owned operational logger lifetime. Construction does not mutate spdlog's global
 // default logger or registry; producers receive and retain the returned explicit shared handle.
 class LoggingRuntime {
@@ -77,6 +110,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<spdlog::logger> logger() const noexcept;
     [[nodiscard]] std::shared_ptr<TerminalProgress> terminal_progress() const noexcept;
+    [[nodiscard]] std::shared_ptr<TerminalPanel> terminal_panel() const noexcept;
     void flush() noexcept;
 
 private:

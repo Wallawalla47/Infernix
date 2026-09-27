@@ -466,6 +466,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.metrics.vision_seconds          = result.timings.vision_seconds;
     outcome.metrics.prefill_seconds                = result.timings.prefill_seconds;
     outcome.metrics.decode_seconds                 = result.timings.decode_seconds;
+    outcome.metrics.decode_share_seconds           = result.timings.decode_share_seconds;
     outcome.metrics.prompt_wall_seconds            = result.timings.prompt_wall_seconds;
     outcome.metrics.generation_wall_seconds        = result.timings.generation_wall_seconds;
     outcome.metrics.vision_offload_window_seconds  = result.timings.vision_offload_window_seconds;

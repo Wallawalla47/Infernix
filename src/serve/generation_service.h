@@ -30,6 +30,7 @@ struct GenerationMetrics {
     double vision_seconds                      = 0.0;
     double prefill_seconds                     = 0.0;
     double decode_seconds                      = 0.0;
+    double decode_share_seconds                = 0.0;
     double prompt_wall_seconds                 = 0.0;
     double generation_wall_seconds             = 0.0;
     double total_seconds                       = 0.0;

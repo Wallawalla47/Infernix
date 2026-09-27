@@ -330,8 +330,10 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             }
             trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
             settle_unit(lane);
-            request.timings.decode_seconds +=
-                std::chrono::duration<double>(Clock::now() - started).count();
+            // Forced tokens run one request at a time, so the request owns the whole interval.
+            const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+            request.timings.decode_seconds += seconds;
+            request.timings.decode_share_seconds += seconds;
         }
         return timing.finish();
     } catch (...) {
