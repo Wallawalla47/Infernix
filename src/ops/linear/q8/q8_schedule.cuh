@@ -104,10 +104,12 @@ enum class Q8ActivationStage : std::uint8_t {
     RuntimeActive, // Stage only live columns; the epilogue discards inactive columns.
 };
 
+// RowTiles 16-row MMA tiles share one CTA's staged activation and B fragments, halving the
+// activation's L2 re-reads per weight row where they outweigh the weight stream.
 template <int BlockTokens, int KWarps, int Stages, int MinBlocksPerSm, Q8ScaleAccess ScaleAccess,
           Cache ActivationCache = Cache::ca, Cache WeightCache = Cache::cg,
           Q8ActivationStage ActivationStage = Q8ActivationStage::ActiveOnly, int StaticK = 0,
-          int TokenCapacity = BlockTokens, bool ExactTokens = false>
+          int TokenCapacity = BlockTokens, bool ExactTokens = false, int RowTiles = 1>
 struct Q8A16SlicedKMmaSchedule {
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(BlockTokens >= 8 && BlockTokens % 8 == 0);
@@ -115,11 +117,14 @@ struct Q8A16SlicedKMmaSchedule {
     static_assert(MinBlocksPerSm > 0);
     static_assert(TokenCapacity > 0 && TokenCapacity <= BlockTokens);
     static_assert(StaticK == 0 || (StaticK > 0 && StaticK % (KWarps * 64) == 0));
+    static_assert(RowTiles == 1 || RowTiles == 2);
     template <int K, int Capacity, bool Exact = false>
     using with_problem =
         Q8A16SlicedKMmaSchedule<BlockTokens, KWarps, Stages, MinBlocksPerSm, ScaleAccess,
-                                ActivationCache, WeightCache, ActivationStage, K, Capacity, Exact>;
-    static constexpr int kBlockRows         = 16;
+                                ActivationCache, WeightCache, ActivationStage, K, Capacity, Exact,
+                                RowTiles>;
+    static constexpr int kRowTiles          = RowTiles;
+    static constexpr int kBlockRows         = 16 * RowTiles;
     static constexpr int kBlockTokens       = BlockTokens;
     static constexpr int kTokenCapacity     = TokenCapacity;
     static constexpr int kStaticK           = StaticK;
@@ -139,7 +144,7 @@ struct Q8A16SlicedKMmaSchedule {
     static constexpr int kStagingBytes =
         Stages * (kBlockRows * kBlockK + KWarps * BlockTokens * kWarpK * 2 +
                   kBlockRows * (ScaleAccess == Q8ScaleAccess::Shared ? kScaleBytesPerRow : 1));
-    static constexpr int kPartialBytes = KWarps * (BlockTokens / 8) * 32 * 16;
+    static constexpr int kPartialBytes = KWarps * RowTiles * (BlockTokens / 8) * 32 * 16;
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
     static_assert(kSharedBytes <= 99 * 1024);

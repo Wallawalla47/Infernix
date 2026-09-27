@@ -39,6 +39,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     constexpr int kTileK         = Schedule::kTileKPerWarp;
     constexpr int kWarps         = Schedule::kKWarps;
     constexpr int kBlockRows     = Schedule::kBlockRows;
+    constexpr int kRowTiles      = Schedule::kRowTiles;
+    static_assert(kRowTiles == 1 || !RowPolicy::kPaired, "two row tiles store unpaired rows only");
     constexpr int kBlockK        = Schedule::kBlockK;
     const int kGroups            = kHidden / kBlockK;
     constexpr int kBlockTokens   = Schedule::kBlockTokens;
@@ -53,7 +55,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
             __nv_bfloat16 activations[Schedule::kStages][kWarps][kBlockTokens * kTileK];
         } staging;
 
-        float partial[kWarps * kTokenMmas * 32 * 4];
+        float partial[kWarps * kRowTiles * kTokenMmas * 32 * 4];
     };
 
     static_assert(sizeof(SharedStorage) == Schedule::kSharedBytes);
@@ -116,7 +118,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     const int b_row                   = lane & 7;
     const int b_k_offset              = ((lane >> 3) & 1) << 3;
     const int warp_k0                 = warp * kTileK;
-    float accumulators[kTokenMmas][4] = {};
+    float accumulators[kRowTiles][kTokenMmas][4] = {};
 
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
@@ -143,10 +145,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
                 return static_cast<unsigned>(
                     *reinterpret_cast<const std::uint16_t*>(&code_shared[stage][row][offset]));
             };
-            const unsigned a0 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col));
-            const unsigned a1 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col));
-            const unsigned a2 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid, code_col + 8));
-            const unsigned a3 = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(gid + 8, code_col + 8));
+            unsigned a[kRowTiles][4];
+#pragma unroll
+            for (int tile = 0; tile < kRowTiles; ++tile) {
+                const int top = tile * 16 + gid;
+                a[tile][0]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top, code_col));
+                a[tile][1]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top + 8, code_col));
+                a[tile][2]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top, code_col + 8));
+                a[tile][3]    = fp8_e4m3x2_to_bf16x2_bits(load_code_pair(top + 8, code_col + 8));
+            }
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b0;
@@ -157,9 +164,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
                     smem_addr(
                         &x_shared[stage][warp][row * kTileK + fp8_a16_shared_col_64(
                                                                   row, k_step * 16 + b_k_offset)]));
-                mma_bf16(accumulators[token_mma][0], accumulators[token_mma][1],
-                         accumulators[token_mma][2], accumulators[token_mma][3], a0, a1, a2, a3, b0,
-                         b1);
+#pragma unroll
+                for (int tile = 0; tile < kRowTiles; ++tile) {
+                    mma_bf16(accumulators[tile][token_mma][0], accumulators[tile][token_mma][1],
+                             accumulators[tile][token_mma][2], accumulators[tile][token_mma][3],
+                             a[tile][0], a[tile][1], a[tile][2], a[tile][3], b0, b1);
+                }
             }
         }
 
@@ -174,30 +184,39 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     pdl::trigger_dependents();
 
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial            = shared.partial;
+    const auto partial_index = [&](int split, int tile, int token_mma) {
+        return (((split * kRowTiles + tile) * kTokenMmas + token_mma) * 32 + lane) * 4;
+    };
     if ((warp & 1) != 0) {
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                      make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                  accumulators[token_mma][2], accumulators[token_mma][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                const auto& acc = accumulators[tile][token_mma];
+                store_vec(partial + partial_index(warp, tile, token_mma),
+                          make_float4(acc[0], acc[1], acc[2], acc[3]));
+            }
         }
     }
     __syncthreads();
 
     if ((warp & 1) == 0) {
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            const float4 partner =
-                load_vec<float4>(partial + (((warp + 1) * kTokenMmas + token_mma) * 32 + lane) * 4);
-            accumulators[token_mma][0] += partner.x;
-            accumulators[token_mma][1] += partner.y;
-            accumulators[token_mma][2] += partner.z;
-            accumulators[token_mma][3] += partner.w;
-            if (warp != 0) {
-                store_vec(partial + ((warp * kTokenMmas + token_mma) * 32 + lane) * 4,
-                          make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                      accumulators[token_mma][2], accumulators[token_mma][3]));
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+#pragma unroll
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                auto& acc = accumulators[tile][token_mma];
+                const float4 partner =
+                    load_vec<float4>(partial + partial_index(warp + 1, tile, token_mma));
+                acc[0] += partner.x;
+                acc[1] += partner.y;
+                acc[2] += partner.z;
+                acc[3] += partner.w;
+                if (warp != 0) {
+                    store_vec(partial + partial_index(warp, tile, token_mma),
+                              make_float4(acc[0], acc[1], acc[2], acc[3]));
+                }
             }
         }
     }
@@ -206,54 +225,59 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     if (warp == 0) {
         const auto destination =
             linear_output_tile<kBlockRows / (RowPolicy::kPaired ? 2 : 1)>(output, row0);
-        unsigned lane_scale = 0;
-        if (lid < 2) {
-            lane_scale = static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(
-                row_scales)[row_policy.weight_row(row0, gid + lid * 8, operands.rows)]);
-        }
-        const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
-        const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
-        const float top_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
-        const float bottom_scale =
-            __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
+#pragma unroll
+        for (int tile = 0; tile < kRowTiles; ++tile) {
+            const int tile_row  = tile * 16;
+            unsigned lane_scale = 0;
+            if (lid < 2) {
+                lane_scale = static_cast<unsigned>(
+                    reinterpret_cast<const std::uint16_t*>(row_scales)[row_policy.weight_row(
+                        row0, tile_row + gid + lid * 8, operands.rows)]);
+            }
+            const unsigned top_scale_bits    = __shfl_sync(kMask, lane_scale, lane & ~3);
+            const unsigned bottom_scale_bits = __shfl_sync(kMask, lane_scale, (lane & ~3) + 1);
+            const float top_scale =
+                __bfloat162float(__ushort_as_bfloat16(static_cast<std::uint16_t>(top_scale_bits)));
+            const float bottom_scale = __bfloat162float(
+                __ushort_as_bfloat16(static_cast<std::uint16_t>(bottom_scale_bits)));
 
 #pragma unroll
-        for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
-            float4 sum = make_float4(accumulators[token_mma][0], accumulators[token_mma][1],
-                                     accumulators[token_mma][2], accumulators[token_mma][3]);
+            for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
+                const auto& acc = accumulators[tile][token_mma];
+                float4 sum      = make_float4(acc[0], acc[1], acc[2], acc[3]);
 #pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kTokenMmas + token_mma) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            const int local_token = token_mma * 8 + 2 * lid;
-            const int token0      = token_begin + local_token;
-            const int row_a       = row_policy.weight_row(row0, gid, operands.rows);
-            const int row_b       = row_policy.weight_row(row0, gid + 8, operands.rows);
-            if constexpr (RowPolicy::kPaired) {
-                if (local_token < live_columns)
-                    epilogue.apply_pair(destination, row_a, token0, sum.x * top_scale,
-                                        sum.z * bottom_scale);
-                if (local_token + 1 < live_columns)
-                    epilogue.apply_pair(destination, row_a, token0 + 1, sum.y * top_scale,
-                                        sum.w * bottom_scale);
-            } else {
-                if (local_token < live_columns) {
-                    destination.store(row_a, token0,
-                                      epilogue.apply(row_a, token0, sum.x * top_scale));
-                    destination.store(row_b, token0,
-                                      epilogue.apply(row_b, token0, sum.z * bottom_scale));
+                for (int split = 2; split < kWarps; split += 2) {
+                    const float4 value =
+                        load_vec<float4>(partial + partial_index(split, tile, token_mma));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
                 }
-                if (local_token + 1 < live_columns) {
-                    destination.store(row_a, token0 + 1,
-                                      epilogue.apply(row_a, token0 + 1, sum.y * top_scale));
-                    destination.store(row_b, token0 + 1,
-                                      epilogue.apply(row_b, token0 + 1, sum.w * bottom_scale));
+                const int local_token = token_mma * 8 + 2 * lid;
+                const int token0      = token_begin + local_token;
+                const int row_a = row_policy.weight_row(row0, tile_row + gid, operands.rows);
+                const int row_b = row_policy.weight_row(row0, tile_row + gid + 8, operands.rows);
+                if constexpr (RowPolicy::kPaired) {
+                    if (local_token < live_columns)
+                        epilogue.apply_pair(destination, row_a, token0, sum.x * top_scale,
+                                            sum.z * bottom_scale);
+                    if (local_token + 1 < live_columns)
+                        epilogue.apply_pair(destination, row_a, token0 + 1, sum.y * top_scale,
+                                            sum.w * bottom_scale);
+                } else {
+                    if (local_token < live_columns) {
+                        destination.store(row_a, token0,
+                                          epilogue.apply(row_a, token0, sum.x * top_scale));
+                        destination.store(row_b, token0,
+                                          epilogue.apply(row_b, token0, sum.z * bottom_scale));
+                    }
+                    if (local_token + 1 < live_columns) {
+                        destination.store(row_a, token0 + 1,
+                                          epilogue.apply(row_a, token0 + 1, sum.y * top_scale));
+                        destination.store(row_b, token0 + 1,
+                                          epilogue.apply(row_b, token0 + 1, sum.w * bottom_scale));
+                    }
                 }
             }
         }

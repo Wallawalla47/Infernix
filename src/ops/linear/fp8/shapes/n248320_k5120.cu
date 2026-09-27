@@ -11,9 +11,12 @@ namespace {
 template <int ActiveTokens>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Fp8N248320K5120;
+    // Above 16 columns each 16-row CTA re-reads more activation bytes from L2 than it streams
+    // weight bytes, so two row tiles share the staged activation (same split-K arithmetic).
     using Schedule =
         Fp8A16SlicedKMmaSchedule<(ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4)),
-                                 ActiveTokens, ActiveTokens <= 8 ? 1 : 2>;
+                                 ActiveTokens, ActiveTokens <= 8 ? 1 : 2, Cache::ca, Cache::cg,
+                                 Fp8ActivationStage::ActiveOnly, 1, (ActiveTokens > 16 ? 2 : 1)>;
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(

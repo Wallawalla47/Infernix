@@ -12,18 +12,21 @@ using C8 =
     Q8A16SlicedKMmaSchedule<8, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::RuntimeActive>;
 using C16 =
     Q8A16SlicedKMmaSchedule<16, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+// From 24 columns two row tiles share each CTA's staged activation, halving its L2 re-reads (40
+// columns measured faster with one). At 32 columns the two-tile staging fits static shared memory
+// only with four K warps.
 using C24 = Q8A16SlicedKMmaSchedule<24, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg,
-                                    Stage::RuntimeActive>;
-using C32 = Q8A16SlicedKMmaSchedule<32, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg,
-                                    Stage::RuntimeActive>;
+                                    Stage::RuntimeActive, 0, 24, false, 2>;
+using C32 = Q8A16SlicedKMmaSchedule<32, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive, 0, 32, false, 2>;
 using C40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg,
                                     Stage::RuntimeActive>;
-using C48 =
-    Q8A16SlicedKMmaSchedule<48, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C56 =
-    Q8A16SlicedKMmaSchedule<56, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using C64 =
-    Q8A16SlicedKMmaSchedule<64, 4, 1, 3, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+using C48 = Q8A16SlicedKMmaSchedule<48, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::ActiveOnly, 0, 48, false, 2>;
+using C56 = Q8A16SlicedKMmaSchedule<56, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::ActiveOnly, 0, 56, false, 2>;
+using C64 = Q8A16SlicedKMmaSchedule<64, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::ActiveOnly, 0, 64, false, 2>;
 } // namespace
 
 Q8Launch select_q8_n5120_k17408(std::int32_t tokens) {
