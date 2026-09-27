@@ -219,7 +219,11 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
+| `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-offload on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; takes effect only with `--vision` | `off` |
+| `--vision-max-merged N` | merged vision tokens per image or video, `64..32768`; larger media is downscaled during preprocessing | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
@@ -233,6 +237,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+| `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |
 
 When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture
 and rendered prompt mode. The current official models use:
@@ -262,6 +267,11 @@ and HTTP server. When unset, it defaults to `spin`, prioritizing low synchroniza
 the cost of CPU usage while waiting for the GPU. Use `blocking` to let the waiting thread sleep;
 the decode performance cost depends on the host. `yield` yields the CPU while waiting, and `auto`
 uses CUDA's scheduling heuristic, not an automatic performance benchmark.
+
+For example, `ninfer-serve` on an RTX 5090 under Windows, replaying an agentic workload at two
+concurrent requests, used 165 % of a CPU core on average with `spin`, 103 % with `yield` and 2 %
+with `blocking`. Against `spin`, output tok/s was 1.8 % lower with `yield` and 1.2 % lower with
+`blocking`, and mean time to first token moved by at most 0.5 %.
 
 ```bash
 NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
