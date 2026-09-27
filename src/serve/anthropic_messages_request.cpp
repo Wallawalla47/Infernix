@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <iterator>
 #include <optional>
 #include <string>
@@ -829,8 +828,7 @@ void lower_tools(const Json& body, GenerationRequest& request) {
     // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
-void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                    int effective_max_tokens) {
+void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
     if (!body.contains("thinking") || body.at("thinking").is_null()) { return; }
     const Json& thinking = body.at("thinking");
     if (!thinking.is_object() || !thinking.contains("type") || !thinking.at("type").is_string()) {
@@ -847,9 +845,9 @@ void parse_thinking(const Json& body, GenerationRequest& request, ParsePurpose p
         if (!budget || *budget < 1024) {
             bad_request("thinking.budget_tokens must be an integer of at least 1024", "thinking");
         }
-        if (purpose == ParsePurpose::Messages && *budget >= effective_max_tokens) {
-            bad_request("thinking.budget_tokens must be less than max_tokens", "thinking");
-        }
+        // Unlike the Anthropic API, a budget at or above max_tokens is accepted: the output limit
+        // is reached before the budget, so it never takes effect. Clients such as Qwen Code send
+        // a fixed budget while shrinking max_tokens to the context window left.
         request.thinking_budget = static_cast<std::uint32_t>(*budget);
     } else {
         bad_request("thinking.type must be 'disabled', 'adaptive', or 'enabled'", "thinking");
@@ -997,12 +995,11 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
-void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens) {
+void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose) {
     lower_tools(body, request);
     parse_system(body, request);
     parse_messages(body, request);
-    parse_thinking(body, request, purpose, effective_max_tokens);
+    parse_thinking(body, request, purpose);
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
@@ -1047,8 +1044,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
         result.generation.max_tokens = limits.default_max_tokens;
     }
 
-    parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens);
+    parse_common_prompt(body, result.generation, ParsePurpose::Messages);
     parse_generation_fields(body, result.generation);
     return result;
 }
@@ -1058,8 +1054,7 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
-    parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max());
+    parse_common_prompt(body, result.generation, ParsePurpose::CountTokens);
     return result;
 }
 

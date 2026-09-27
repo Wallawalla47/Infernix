@@ -2156,6 +2156,13 @@ int test_thinking_budget_control(const Frontend& frontend) {
         frontend.make_output_session(prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
     int failures = check(session.model_token_budget_remaining(20) == 2,
                          "thinking budget did not clamp the model round license");
+    // An output limit at or below the budget ends thinking first, so the budget takes no effect
+    // and needs no room for control.
+    failures += check(!throws_invalid_argument([&] {
+                          session.validate_generation_capacity(1);
+                          session.validate_generation_capacity(2);
+                      }),
+                      "planning rejected an output limit that the thinking budget never reaches");
 
     const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
     const auto boundary =
