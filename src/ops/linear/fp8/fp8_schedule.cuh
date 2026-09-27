@@ -208,13 +208,17 @@ struct Fp8A8TmaSplitKSchedule : TmaSchedule {
 
 enum class Fp8ActivationStage : std::uint8_t { ActiveOnly, PaddedZero };
 
+// RowTiles 16-row MMA tiles share one CTA's staged activation and B fragments, halving the
+// activation's L2 re-reads per weight row where they outweigh the weight stream.
 template <int KWarps, int TileTokens, int MinBlocksPerSm, Cache ActivationCache = Cache::ca,
           Cache WeightCache                  = Cache::cg,
-          Fp8ActivationStage ActivationStage = Fp8ActivationStage::ActiveOnly, int Stages = 1>
+          Fp8ActivationStage ActivationStage = Fp8ActivationStage::ActiveOnly, int Stages = 1,
+          int RowTiles = 1>
 struct Fp8A16SlicedKMmaSchedule {
     static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens > 0 && TileTokens % 8 == 0);
     static_assert(Stages == 1 || Stages == 2);
+    static_assert(RowTiles == 1 || RowTiles == 2);
     static_assert(MinBlocksPerSm > 0);
     static constexpr int kStaticK           = 0;
     static constexpr int kTokenCapacity     = TileTokens;
@@ -229,10 +233,12 @@ struct Fp8A16SlicedKMmaSchedule {
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kBlockK            = KWarps * kTileKPerWarp;
-    static constexpr int kBlockRows         = 16;
-    static constexpr int kRowsPerLoaderWarp = 16 / KWarps;
-    static constexpr int kStagingBytes = Stages * (16 * kBlockK + KWarps * TileTokens * 64 * 2);
-    static constexpr int kPartialBytes = KWarps * (TileTokens / 8) * 32 * 4 * 4;
+    static constexpr int kRowTiles          = RowTiles;
+    static constexpr int kBlockRows         = 16 * RowTiles;
+    static constexpr int kRowsPerLoaderWarp = kBlockRows / KWarps;
+    static constexpr int kStagingBytes =
+        Stages * (kBlockRows * kBlockK + KWarps * TileTokens * 64 * 2);
+    static constexpr int kPartialBytes = KWarps * RowTiles * (TileTokens / 8) * 32 * 4 * 4;
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
     static_assert(kSharedBytes <= 99 * 1024);

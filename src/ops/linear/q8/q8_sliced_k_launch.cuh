@@ -21,12 +21,15 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
         if (operands.tokens != Schedule::kTokenCapacity)
             throw std::invalid_argument("Q8 sliced-K exact tokens differ from the schedule");
     }
-    constexpr int ratio = Schedule::kBlockRows / RowPolicy::kOutputRowsPerCta;
+    // Row tiles cover consecutive identity rows; a paired row policy maps each CTA's weight rows
+    // onto fewer output rows.
+    constexpr int ratio = Schedule::kRowTiles > 1 ? 1 : Schedule::kBlockRows / RowPolicy::kOutputRowsPerCta;
+    constexpr int cta_rows = Schedule::kRowTiles > 1 ? Schedule::kBlockRows : RowPolicy::kOutputRowsPerCta;
     static_assert(Schedule::kBlockRows % RowPolicy::kOutputRowsPerCta == 0);
     if (operands.rows % ratio != 0)
         throw std::invalid_argument("Q8 sliced-K row mapping requires complete row pairs");
     for_each_token_slice(operands.tokens, Schedule::kTokenCapacity, [&](int offset, int count) {
-        const dim3 grid(div_up(operands.rows / ratio, RowPolicy::kOutputRowsPerCta),
+        const dim3 grid(div_up(operands.rows / ratio, cta_rows),
                         div_up(count, Schedule::kTokenCapacity));
         const auto launch = [&]<bool Full>() {
             constexpr auto kernel =

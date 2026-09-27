@@ -14,12 +14,13 @@ using C16 =
     Q8A16SlicedKMmaSchedule<16, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
 using C24 =
     Q8A16SlicedKMmaSchedule<24, 8, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+// From 32 columns two row tiles share each CTA's staged activation, halving its L2 re-reads.
 using C32 = Q8A16SlicedKMmaSchedule<32, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
-                                    Stage::RuntimeActive>;
+                                    Stage::RuntimeActive, 0, 32, false, 2>;
 using C40 = Q8A16SlicedKMmaSchedule<40, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
-                                    Stage::RuntimeActive>;
-using C56 =
-    Q8A16SlicedKMmaSchedule<56, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+                                    Stage::RuntimeActive, 0, 40, false, 2>;
+using C56 = Q8A16SlicedKMmaSchedule<56, 4, 1, 2, Access::Shared, Cache::ca, Cache::cg,
+                                    Stage::ActiveOnly, 0, 56, false, 2>;
 } // namespace
 
 Q8Launch select_q8_n34816_k5120(std::int32_t tokens) {
