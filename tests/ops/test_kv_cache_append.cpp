@@ -306,9 +306,25 @@ void encode_full_fp8_row(const std::array<float, kFullHeadDim>& values,
         scale_bits;
 }
 
+// One rounded FP32 product, never contracted into a following addition, as the device encoder's
+// explicit round-to-nearest operations are.
+float rounded_product(float a, float b) {
+    volatile float product = a * b;
+    return product;
+}
+
+float decode_e2m1_signed(std::uint8_t code) {
+    const float magnitude = decode_e2m1_positive(code);
+    return (code & 0x08U) == 0U ? magnitude : -magnitude;
+}
+
+// kv_cache_nvfp4_quantize_group16_warp operation by operation: the scale target (max -> 6, 4, 4.5,
+// 5, 5.5, in that order; the scale is E4M3(max * RN(1 / target))) with the least squared
+// reconstruction error wins, ties keeping the earlier target.
 void encode_full_nvfp4_row(const std::array<float, kFullHeadDim>& values,
                            std::vector<std::uint8_t>& codes, int head, int position,
                            int physical_page, int kv_heads, std::vector<std::uint8_t>& scales) {
+    constexpr std::array<float, 5> kTargets{6.0f, 4.0f, 4.5f, 5.0f, 5.5f};
     for (int group = 0; group < kFullNvfp4Groups; ++group) {
         const int d0 = group * kFullNvfp4Group;
         float absmax = 0.0f;
@@ -316,29 +332,42 @@ void encode_full_nvfp4_row(const std::array<float, kFullHeadDim>& values,
             absmax = std::max(absmax, std::abs(values[static_cast<std::size_t>(d0 + i)]));
         }
         std::uint8_t scale_code = 0;
-        float scale             = 0.0f;
+        std::array<std::uint8_t, kFullNvfp4Group> best{};
         if (absmax != 0.0f) {
-            const float raw_scale = absmax / 6.0f;
-            const float bounded   = std::clamp(raw_scale, std::ldexp(1.0f, -9), 448.0f);
-            scale_code            = encode_e4m3fn_rne_satfinite(bounded);
-            scale                 = decode_e4m3fn_positive(scale_code);
+            float best_error = 0.0f;
+            for (std::size_t target = 0; target < kTargets.size(); ++target) {
+                const float bounded = std::clamp(rounded_product(absmax, 1.0f / kTargets[target]),
+                                                 std::ldexp(1.0f, -9), 448.0f);
+                const std::uint8_t candidate = encode_e4m3fn_rne_satfinite(bounded);
+                const float scale            = decode_e4m3fn_positive(candidate);
+                const float inverse          = 1.0f / scale;
+                std::array<std::uint8_t, kFullNvfp4Group> nibbles{};
+                float error = 0.0f;
+                for (int i = 0; i < kFullNvfp4Group; ++i) {
+                    const float value = values[static_cast<std::size_t>(d0 + i)];
+                    nibbles[static_cast<std::size_t>(i)] =
+                        encode_e2m1_rne_satfinite(rounded_product(value, inverse));
+                    const float difference =
+                        value -
+                        rounded_product(decode_e2m1_signed(nibbles[static_cast<std::size_t>(i)]),
+                                        scale);
+                    error = error + rounded_product(difference, difference);
+                }
+                if (target == 0 || error < best_error) {
+                    best_error = error;
+                    scale_code = candidate;
+                    best       = nibbles;
+                }
+            }
         }
         scales[full_cache_index(kFullNvfp4Groups, group, head, position, physical_page, kv_heads)] =
             scale_code;
         for (int pair = 0; pair < kFullNvfp4Group / 2; ++pair) {
-            const int low_d  = d0 + 2 * pair;
-            const int high_d = low_d + 1;
-            const std::uint8_t low =
-                scale == 0.0f
-                    ? 0
-                    : encode_e2m1_rne_satfinite(values[static_cast<std::size_t>(low_d)] / scale);
-            const std::uint8_t high =
-                scale == 0.0f
-                    ? 0
-                    : encode_e2m1_rne_satfinite(values[static_cast<std::size_t>(high_d)] / scale);
-            const int byte                    = group * (kFullNvfp4Group / 2) + pair;
+            const int byte = group * (kFullNvfp4Group / 2) + pair;
             codes[full_cache_index(kFullNvfp4CodeBytes, byte, head, position, physical_page,
-                                   kv_heads)] = static_cast<std::uint8_t>(low | (high << 4));
+                                   kv_heads)] =
+                static_cast<std::uint8_t>(best[static_cast<std::size_t>(2 * pair)] |
+                                          (best[static_cast<std::size_t>(2 * pair + 1)] << 4));
         }
     }
 }
