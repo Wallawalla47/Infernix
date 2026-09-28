@@ -281,6 +281,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
+    // Prefill chunks run the selected prompt kernel, whose fast NVFP4 form may split keys into
+    // workspace (see execution/text.cpp).
+    const ops::CausalAttentionExecutionEnvelope prefill_envelope{
+        .min_visible_keys   = 1,
+        .max_visible_keys   = plan.capacity,
+        .fast_prompt_kernel = plan.fast_prefill_kernel};
     const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -450,7 +456,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
-                1, chunk, text_envelope);
+                1, chunk, prefill_envelope);
     if (!plan.causal_scoring) {
         scratch(text_prefill,
                 ops::sampling_workspace_capacity_bytes(
@@ -486,7 +492,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         WorkspaceLayoutBuilder mtp_prefill;
         text_common_root(mtp_prefill, chunk);
         target_body(mtp_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill,
-                    1, 1, chunk, text_envelope);
+                    1, 1, chunk, prefill_envelope);
         matrix(mtp_prefill, DType::I32, 1, chunk);
         if (plan.features.vision) {
             matrix(mtp_prefill, DType::BF16, dimension(config.hidden_size), chunk);
@@ -924,6 +930,13 @@ namespace {
 bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
+
+// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
+bool uses_fast_prefill_kernel(const EngineOptions& options) {
+    return uses_fast_int8_prefill(options) ||
+           (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+            !options.original_nvfp4_prefill_kernel);
+}
 } // namespace
 
 // Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
@@ -953,7 +966,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = uses_fast_int8_prefill(options),
+        .fast_prefill_kernel = uses_fast_prefill_kernel(options),
         .draft_window =
             std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
         .speculative_backend  = options.speculative.backend,

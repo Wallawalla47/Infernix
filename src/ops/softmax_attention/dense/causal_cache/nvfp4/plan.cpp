@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_plan.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -52,6 +53,12 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
+    // The fast prompt kernel may split a prompt-route launch's keys across CTAs.
+    if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth &&
+        nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+        maximum = std::max(maximum, rotated_fast_prompt_workspace_bytes(
+                                        heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
+                                        max_width, envelope.max_visible_keys));
     return maximum;
 }
 

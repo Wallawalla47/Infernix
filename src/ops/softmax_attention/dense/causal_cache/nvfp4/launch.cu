@@ -4,6 +4,8 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/template_launch.cuh"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_launch.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_plan.h"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -134,7 +136,10 @@ void nvfp4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
         const auto view =
             make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(cache, &valid, &rows);
-        if (plan.family == Nvfp4KvFamily::Tiled)
+        if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
+            nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+            nvfp4_kv_fast_tiled_attention(p, view, workspace, stream);
+        else if (plan.family == Nvfp4KvFamily::Tiled)
             nvfp4_kv_tiled_attention(p, view, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
@@ -154,7 +159,12 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto plan =
         make_nvfp4_kv_causal_plan(q.ne[1], q.ne[2], 1, envelope, execution.multiprocessor_count);
     const auto view = single_row_paged_kv_batch_view(cache);
-    if (plan.family == Nvfp4KvFamily::Tiled)
+    if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
+        nvfp4_fast_prompt_applies(envelope.max_visible_keys))
+        nvfp4_kv_fast_tiled_attention(
+            make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
+            make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), workspace, stream);
+    else if (plan.family == Nvfp4KvFamily::Tiled)
         nvfp4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
             make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), stream);

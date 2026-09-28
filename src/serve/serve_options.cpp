@@ -128,6 +128,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
            "                             rounded down to whole attention waves)\n"
+           "  --use-original-nvfp4-prefill-kernel\n"
+           "                             prefill NVFP4 KV with the tiled prompt kernel\n"
+           "                             (default: the fast kernel)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -330,6 +333,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--use-original-nvfp4-prefill-kernel") {
+            options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {

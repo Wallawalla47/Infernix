@@ -2826,6 +2826,46 @@ int run_int8_fast_prompt_cases(DeviceExecutionView execution) {
     return failures;
 }
 
+// The fast NVFP4 prompt kernel over prompt-route widths above 2048 visible keys: partial and full
+// row blocks, launches over enough key pages to split them across CTAs (including an envelope far
+// past the populated keys, so late splits own no visible key), V magnitudes whose group scales need
+// its FP16-partial rescale, a masked row, and the production prefill chunk after a long history.
+int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution) {
+    constexpr KvCacheStorage storage = KvCacheStorage::Nvfp4Group16;
+    int failures                     = 0;
+    const auto fast                  = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    const auto values = [&](AttentionCase test_case, float amplitude) {
+        test_case.value_amplitude = amplitude;
+        return fast(test_case);
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(execution, geometry, storage, fast({256, 4000, 4256, 920u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, geometry, storage, fast({300, 1900, 8192, 921u}),
+                                MappingPattern::Offset);
+        failures +=
+            run_a1_case(execution, geometry, storage, fast({1100, 3000, 4100, 922u, false, true}),
+                        MappingPattern::Identity);
+    }
+    const Geometry& h24 = kGeometries[0];
+    // |V| up to 900 gives rotated V group scales around 150-250, above the kernel's unscaled limit
+    // of 128; |V| up to 2048 reaches the largest UE4M3 scales.
+    failures += run_a1_case(execution, h24, storage, values({300, 2000, 2300, 923u}, 900.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(execution, h24, storage, values({400, 1800, 2200, 924u}, 2048.0f),
+                            MappingPattern::Fragmented);
+    const std::array<int, 6> chunk_queries{0, 63, 64, 2047, 4032, 4095};
+    failures += run_a1_case(execution, h24, storage, fast({4096, 8192, 8192 + 4096, 925u}),
+                            MappingPattern::Fragmented, chunk_queries);
+    BatchAttentionCase masked{300, {3000}, {211}, {0}, MappingPattern::Fragmented, 926u, true};
+    masked.fast_prompt_kernel = true;
+    failures += run_batch_case(execution, h24, storage, masked);
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2842,6 +2882,8 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
             failures += run_geometry(execution, geometry, storage);
     if (storage == KvCacheStorage::Int8Group64)
         failures += run_int8_fast_prompt_cases(execution);
+    if (storage == KvCacheStorage::Nvfp4Group16)
+        failures += run_nvfp4_fast_prompt_cases(execution);
     if (storage != KvCacheStorage::BFloat16) {
         failures += run_quantized_causal_cases(execution, storage);
     } else {

@@ -8,6 +8,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/int8/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/launch.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/fast_tiled_launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/k8v4/tiled_launch.cu"

@@ -191,6 +191,10 @@ struct EngineOptions {
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
     bool original_int8_prefill_kernel  = false;
+    // NVFP4 KV prefills over more than 2048 visible keys with the fast prompt-attention kernel
+    // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
+    // KV cache.
+    bool original_nvfp4_prefill_kernel = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
