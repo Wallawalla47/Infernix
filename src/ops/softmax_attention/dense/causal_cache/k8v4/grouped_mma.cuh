@@ -157,9 +157,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 #pragma unroll
             for (int r = 0; r < 8; ++r) append_scratch[warp * D + lane + 32 * r] = values[r];
             __syncwarp();
+            const auto quantized =
+                kv_cache_nvfp4_quantize_group16_warp(append_scratch + warp * D, lane);
             if (lane < kKVCacheNvfp4Groups) {
-                const auto quantized = kv_cache_nvfp4_quantize_group16(append_scratch + warp * D +
-                                                                       lane * kKVCacheNvfp4Group);
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, lane * kKVCacheNvfp4Group, page_offset);
                 store_vec(cache_v + code_offset,

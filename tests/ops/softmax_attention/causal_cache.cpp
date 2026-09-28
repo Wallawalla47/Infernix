@@ -563,6 +563,54 @@ void normalized_hadamard_d256(std::array<double, kHeadDim>& values) {
     }
 }
 
+// One rounded FP32 product, never contracted into a following addition, as the device encoder's
+// explicit round-to-nearest operations are.
+float rounded_product(float a, float b) {
+    volatile float product = a * b;
+    return product;
+}
+
+// kv_cache_nvfp4_quantize_group16_warp operation by operation, so the stored bytes match exactly:
+// the scale target (max -> 6, 4, 4.5, 5, 5.5, in that order; the scale is
+// E4M3(max * RN(1 / target))) with the least squared reconstruction error wins, ties keeping the
+// earlier target.
+void encode_nvfp4_group16(const float* values, std::uint8_t& scale_code, std::uint8_t* codes) {
+    constexpr std::array<float, 5> kTargets{6.0f, 4.0f, 4.5f, 5.0f, 5.5f};
+    float absmax = 0.0f;
+    for (std::int32_t i = 0; i < kNvfp4QuantGroup; ++i)
+        absmax = std::max(absmax, std::abs(values[i]));
+    scale_code = 0;
+    std::fill(codes, codes + kNvfp4QuantGroup / 2, std::uint8_t{0});
+    if (absmax == 0.0f) return;
+    float best_error = 0.0f;
+    for (std::size_t target = 0; target < kTargets.size(); ++target) {
+        const float bounded          = std::clamp(rounded_product(absmax, 1.0f / kTargets[target]),
+                                                  std::ldexp(1.0f, -9), 448.0f);
+        const std::uint8_t candidate = encode_e4m3fn_rne_satfinite(bounded);
+        const float scale            = decode_e4m3fn(candidate);
+        const float inverse          = 1.0f / scale;
+        std::array<std::uint8_t, kNvfp4QuantGroup> nibbles{};
+        float error = 0.0f;
+        for (std::int32_t i = 0; i < kNvfp4QuantGroup; ++i) {
+            nibbles[static_cast<std::size_t>(i)] =
+                encode_e2m1_rne_satfinite(rounded_product(values[i], inverse));
+            const float difference =
+                values[i] -
+                rounded_product(decode_e2m1(nibbles[static_cast<std::size_t>(i)]), scale);
+            error = error + rounded_product(difference, difference);
+        }
+        if (target == 0 || error < best_error) {
+            best_error = error;
+            scale_code = candidate;
+            for (std::int32_t pair = 0; pair < kNvfp4QuantGroup / 2; ++pair) {
+                codes[pair] = static_cast<std::uint8_t>(
+                    nibbles[static_cast<std::size_t>(2 * pair)] |
+                    (nibbles[static_cast<std::size_t>(2 * pair + 1)] << 4));
+            }
+        }
+    }
+}
+
 void encode_nvfp4_rotated_row(std::span<const float> source, std::size_t source_base,
                               std::vector<std::uint8_t>& codes, std::size_t code_base,
                               std::vector<std::uint8_t>& scales, std::size_t scale_base) {
@@ -572,35 +620,9 @@ void encode_nvfp4_rotated_row(std::span<const float> source, std::size_t source_
     }
     normalized_hadamard_d256(rotated);
     for (std::int32_t group = 0; group < kNvfp4QuantGroups; ++group) {
-        const std::int32_t d0 = group * kNvfp4QuantGroup;
-        float absmax          = 0.0f;
-        for (std::int32_t i = 0; i < kNvfp4QuantGroup; ++i) {
-            absmax = std::max(absmax, std::abs(rotated[static_cast<std::size_t>(d0 + i)]));
-        }
-        std::uint8_t scale_code = 0;
-        float represented_scale = 0.0f;
-        if (absmax != 0.0f) {
-            const float bounded = std::clamp(absmax / 6.0f, std::ldexp(1.0f, -9), 448.0f);
-            scale_code          = encode_e4m3fn_rne_satfinite(bounded);
-            represented_scale   = decode_e4m3fn(scale_code);
-        }
-        scales[scale_base + static_cast<std::size_t>(group)] = scale_code;
-        for (std::int32_t pair = 0; pair < kNvfp4QuantGroup / 2; ++pair) {
-            const std::int32_t low_d  = d0 + 2 * pair;
-            const std::int32_t high_d = low_d + 1;
-            const std::uint8_t low =
-                represented_scale == 0.0f
-                    ? 0
-                    : encode_e2m1_rne_satfinite(rotated[static_cast<std::size_t>(low_d)] /
-                                                represented_scale);
-            const std::uint8_t high =
-                represented_scale == 0.0f
-                    ? 0
-                    : encode_e2m1_rne_satfinite(rotated[static_cast<std::size_t>(high_d)] /
-                                                represented_scale);
-            codes[code_base + static_cast<std::size_t>(group * 8 + pair)] =
-                static_cast<std::uint8_t>(low | (high << 4));
-        }
+        encode_nvfp4_group16(rotated.data() + group * kNvfp4QuantGroup,
+                             scales[scale_base + static_cast<std::size_t>(group)],
+                             codes.data() + code_base + static_cast<std::size_t>(group * 8));
     }
 }
 

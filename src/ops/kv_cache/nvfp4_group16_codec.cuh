@@ -8,6 +8,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <math_constants.h>
 
 #include <cstdint>
 
@@ -49,32 +50,114 @@ struct KVCacheNvfp4QuantizedGroup16 {
     std::uint8_t scale     = 0;
 };
 
+// The group's largest magnitude maps to one of these E2M1 targets, tried in order; the scale whose
+// codes reconstruct the group with the least squared error wins, and ties keep the earlier target.
+// E2M1 steps widen toward 6, so a group whose large values fall between codes is often represented
+// better by scaling its maximum to 4-5.5 (Four Over Six, arXiv:2512.02010, generalized to five
+// targets). No target saturates the maximum: targets 6.5 and 7 lowered the squared error further
+// but made 4K-window perplexity worse. On rotated K rows of the 27B model this set lowers the
+// reconstruction error from 9.5 % to 8.5 % RMS. Decoding is unchanged.
+//
+// Every step is a single IEEE-rounded FP32 operation in a fixed order (no contraction), so a host
+// encoder reproduces the stored bytes exactly: scale = E4M3(clamp(max * RN(1 / target))), quotient
+// = value * RN(1 / scale), codes = RNE-satfinite E2M1, error = sum over the group in index order of
+// RN(RN(value - code * scale)^2).
+inline constexpr int kKVCacheNvfp4ScaleTargetCount = 5;
+
+__device__ __forceinline__ float kv_cache_nvfp4_scale_target_inverse(int index) {
+    switch (index) {
+    case 0:
+        return 1.0F / 6.0F;
+    case 1:
+        return 1.0F / 4.0F;
+    case 2:
+        return 1.0F / 4.5F;
+    case 3:
+        return 1.0F / 5.0F;
+    default:
+        return 1.0F / 5.5F;
+    }
+}
+
+// The best of targets [first, last) for a group of 16 values with a nonzero maximum. The first
+// target is taken unconditionally when `take_first` (so a non-finite group keeps the max -> 6
+// encoding); otherwise a target must have a smaller error than `error` on entry.
+__device__ __forceinline__ void
+kv_cache_nvfp4_group16_targets(const float (&values)[16], float max_abs, int first, int last,
+                               bool take_first, KVCacheNvfp4QuantizedGroup16& best, float& error) {
+#pragma unroll 1
+    for (int target = first; target < last; ++target) {
+        const float raw_scale = __fmul_rn(max_abs, kv_cache_nvfp4_scale_target_inverse(target));
+        const float bounded =
+            fminf(kKVCacheNvfp4ScaleMaximum, fmaxf(kKVCacheNvfp4ScaleMinimum, raw_scale));
+        const std::uint8_t scale_code = __nv_cvt_float_to_fp8(bounded, __NV_SATFINITE, __NV_E4M3);
+        const float scale             = detail::decode_nvfp4_e4m3(scale_code);
+        const float inverse           = __frcp_rn(scale);
+        float2 quotients[8];
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            quotients[pair] = make_float2(__fmul_rn(values[2 * pair], inverse),
+                                          __fmul_rn(values[2 * pair + 1], inverse));
+        }
+        std::uint32_t codes_lo = 0;
+        std::uint32_t codes_hi = 0;
+        detail::pack_nvfp4_e2m1x16(quotients, codes_lo, codes_hi);
+        float candidate = 0.0F;
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            const std::uint32_t word = pair < 4 ? codes_lo : codes_hi;
+            const float2 code =
+                detail::decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * (pair & 3))));
+            const float low  = __fsub_rn(values[2 * pair], __fmul_rn(code.x, scale));
+            const float high = __fsub_rn(values[2 * pair + 1], __fmul_rn(code.y, scale));
+            candidate        = __fadd_rn(candidate, __fmul_rn(low, low));
+            candidate        = __fadd_rn(candidate, __fmul_rn(high, high));
+        }
+        if ((take_first && target == first) || candidate < error) {
+            error         = candidate;
+            best.codes_lo = codes_lo;
+            best.codes_hi = codes_hi;
+            best.scale    = scale_code;
+        }
+    }
+}
+
+// Encodes the 16 groups of a D256 row held in `row` (FP32, shared or global) with a whole warp:
+// lanes 0-15 try the first three targets of group `lane`, lanes 16-31 the remaining ones of group
+// `lane - 16`, and the lower half keeps the better of the two (ties to the lower half, whose
+// targets come first), which is exactly the sequential rule above. All 32 lanes must call it; lanes
+// 0-15 hold the results.
 __device__ __forceinline__ KVCacheNvfp4QuantizedGroup16
-kv_cache_nvfp4_quantize_group16(const float* source) {
-    float2 values[8];
+kv_cache_nvfp4_quantize_group16_warp(const float* row, int lane) {
+    constexpr unsigned FullMask = 0xffffffffU;
+    const int group             = lane & (kKVCacheNvfp4Groups - 1);
+    const bool lower            = lane < kKVCacheNvfp4Groups;
+    float values[16];
     float max_abs = 0.0F;
 #pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-        values[pair] = make_float2(source[2 * pair], source[2 * pair + 1]);
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].x));
-        max_abs      = fmaxf(max_abs, fabsf(values[pair].y));
+    for (int i = 0; i < 16; ++i) {
+        values[i] = row[group * kKVCacheNvfp4Group + i];
+        max_abs   = fmaxf(max_abs, fabsf(values[i]));
     }
-
-    KVCacheNvfp4QuantizedGroup16 result{};
-    if (max_abs == 0.0F) return result;
-
-    const float raw_scale = __fdiv_rn(max_abs, kKVCacheNvfp4MaxFinite);
-    const float bounded =
-        fminf(kKVCacheNvfp4ScaleMaximum, fmaxf(kKVCacheNvfp4ScaleMinimum, raw_scale));
-    result.scale                  = __nv_cvt_float_to_fp8(bounded, __NV_SATFINITE, __NV_E4M3);
-    const float represented_scale = detail::decode_nvfp4_e4m3(result.scale);
-#pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-        values[pair].x = __fdiv_rn(values[pair].x, represented_scale);
-        values[pair].y = __fdiv_rn(values[pair].y, represented_scale);
+    KVCacheNvfp4QuantizedGroup16 best{};
+    float error = CUDART_INF_F;
+    if (max_abs != 0.0F) {
+        constexpr int Split = (kKVCacheNvfp4ScaleTargetCount + 1) / 2;
+        kv_cache_nvfp4_group16_targets(values, max_abs, lower ? 0 : Split,
+                                       lower ? Split : kKVCacheNvfp4ScaleTargetCount, lower, best,
+                                       error);
     }
-    detail::pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
-    return result;
+    const float upper_error = __shfl_xor_sync(FullMask, error, 16);
+    const auto upper_lo     = __shfl_xor_sync(FullMask, best.codes_lo, 16);
+    const auto upper_hi     = __shfl_xor_sync(FullMask, best.codes_hi, 16);
+    const auto upper_scale =
+        static_cast<std::uint8_t>(__shfl_xor_sync(FullMask, static_cast<unsigned>(best.scale), 16));
+    if (lower && max_abs != 0.0F && upper_error < error) {
+        best.codes_lo = upper_lo;
+        best.codes_hi = upper_hi;
+        best.scale    = upper_scale;
+    }
+    return best;
 }
 
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
