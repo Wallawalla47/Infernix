@@ -77,7 +77,7 @@ struct Options {
     std::string csv_out;
 };
 
-// --fast-prompt: every envelope asks for the fast INT8 prompt kernel.
+// --fast-prompt: every envelope asks for the fast INT8/NVFP4 prompt kernel.
 bool envelope_fast_prompt = false;
 
 struct Result {

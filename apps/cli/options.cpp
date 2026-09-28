@@ -125,6 +125,9 @@ std::string usage_text(const char* argv0) {
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
+           "  --use-original-nvfp4-prefill-kernel\n"
+           "                           prefill NVFP4 KV with the original prompt kernel\n"
+           "                           (default: the fast kernel)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -262,6 +265,8 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--use-original-nvfp4-prefill-kernel") {
+            options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

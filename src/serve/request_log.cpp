@@ -527,6 +527,7 @@ std::string format_server_start_json(
              {"pending_timeout_ms", engine_options.pending_timeout_ms},
              {"prefill_chunk", engine_options.prefill_chunk},
              {"original_int8_prefill_kernel", engine_options.original_int8_prefill_kernel},
+             {"original_nvfp4_prefill_kernel", engine_options.original_nvfp4_prefill_kernel},
              {"log_stats_interval_ms", options.log_stats_interval_ms},
              {"kv_cache", kv_cache_name(engine_options.kv_cache)},
              {"vision", engine_options.enable_vision},

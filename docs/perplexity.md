@@ -22,9 +22,11 @@ The default evaluation uses a 4,096-token context and a 2,048-token stride. Use 
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; unlike `ninfer` and
 `ninfer-serve`, which default to `bf16`, `ninfer-perplexity` defaults to `fp8`. `int8` scores with the fast
-prompt-attention kernel, as `ninfer-serve` prefills it by default;
-`--use-original-int8-prefill-kernel` scores it with the original kernel and requires `--kv-dtype int8`.
-`report.json` records it as `original_int8_prefill_kernel`.
+prompt-attention kernel, and `nvfp4` with its fast kernel over more than 2048 visible keys, as
+`ninfer-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
+`--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
+`--kv-dtype`. `report.json` records them as `original_int8_prefill_kernel` and
+`original_nvfp4_prefill_kernel`.
 
 ```bash
 ./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
