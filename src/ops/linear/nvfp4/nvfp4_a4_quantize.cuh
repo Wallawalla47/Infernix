@@ -26,7 +26,7 @@ __device__ __forceinline__ std::int64_t nvfp4_tiled_scale_offset(int token, int 
            (group - group_tile * kGroupsPerTile);
 }
 
-template <class Geometry, int Threads, Nvfp4ScaleLayout Layout>
+template <class Geometry, int Threads, Nvfp4ScaleLayout Layout, bool Reciprocal = false>
 __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kernel(
     const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
     std::uint8_t* __restrict__ scales, std::int32_t tokens, std::int32_t written_tokens,
@@ -59,7 +59,7 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
 
     const int token                   = task / kGroupsPerRow;
     const int group                   = task - token * kGroupsPerRow;
-    const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16(
+    const Nvfp4QuantizedK16 quantized = quantize_nvfp4_k16<Reciprocal>(
         input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
         input_scale_divisor);
     auto* code_destination =

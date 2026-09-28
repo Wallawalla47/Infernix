@@ -100,6 +100,12 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
 }
 
+// Reciprocal replaces the sixteen per-value divisions with one reciprocal plus multiplies.
+// Measured faster on latency-bound small grids (linear MMA route, T < 1024) and measurably
+// slower on the throughput-bound TMA route, so callers select it explicitly; the default keeps
+// historical behavior. The two formulations are algebraically identical and differ only in
+// floating-point rounding (~1 ulp); the resulting output error stays within the A4 allowance.
+template <bool Reciprocal = false>
 __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloat16* source,
                                                                 float input_scale_divisor) {
     const uint4 packed0                = load_vec<uint4>(source);
@@ -123,10 +129,19 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     if (result.scale == 0) { return result; }
 
     const float decoded_scale = decode_nvfp4_e4m3(result.scale);
+    if constexpr (Reciprocal) {
+        const float gain = input_scale_divisor * __fdiv_rn(1.0F, decoded_scale);
 #pragma unroll
-    for (int pair = 0; pair < 8; ++pair) {
-        values[pair].x = __fdiv_rn(values[pair].x * input_scale_divisor, decoded_scale);
-        values[pair].y = __fdiv_rn(values[pair].y * input_scale_divisor, decoded_scale);
+        for (int pair = 0; pair < 8; ++pair) {
+            values[pair].x = values[pair].x * gain;
+            values[pair].y = values[pair].y * gain;
+        }
+    } else {
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            values[pair].x = __fdiv_rn(values[pair].x * input_scale_divisor, decoded_scale);
+            values[pair].y = __fdiv_rn(values[pair].y * input_scale_divisor, decoded_scale);
+        }
     }
     pack_nvfp4_e2m1x16(values, result.codes_lo, result.codes_hi);
     return result;

@@ -58,8 +58,12 @@ inline std::size_t nvfp4_a4_workspace_capacity_bytes(std::int32_t tokens, std::i
     return layout.peak_bytes(1);
 }
 
+// reciprocal_quotient selects the reciprocal-multiply quotient formulation. It is measured
+// faster only on latency-bound small grids; callers opt in explicitly per measured route and
+// the default keeps historical division behavior.
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
-                              Nvfp4ScaleLayout layout, cudaStream_t stream);
+                              Nvfp4ScaleLayout layout, cudaStream_t stream,
+                              bool reciprocal_quotient = false);
 
 
 } // namespace ninfer::ops::detail
