@@ -13,12 +13,24 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 namespace {
 
 using namespace ninfer::serve;
 using Json = nlohmann::json;
+
+long long test_process_id() {
+#ifdef _WIN32
+    return _getpid();
+#else
+    return ::getpid();
+#endif
+}
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -830,8 +842,7 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(static_cast<long long>(::getpid())) +
-         ".jsonl");
+        ("ninfer-request-log-test-" + std::to_string(test_process_id()) + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());

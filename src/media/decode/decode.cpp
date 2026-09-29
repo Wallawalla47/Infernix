@@ -1,4 +1,5 @@
 #include "media/decode/decode.h"
+#include "media/decode/png_decode.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -562,6 +563,11 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+#ifdef NINFER_MEDIA_NATIVE_PNG
+    if (is_png(bytes)) {
+        return png_image_info(bytes, policy.max_decoded_pixels);
+    }
+#endif
     Decoder decoder(bytes, policy.max_decoded_pixels);
     int orientation = exif_orientation(bytes);
     if (orientation == 1) {
@@ -603,6 +609,13 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
+    // native path decodes png directly so those builds accept png images too.
+#ifdef NINFER_MEDIA_NATIVE_PNG
+    if (is_png(bytes)) {
+        return decode_png(bytes, policy.max_decoded_pixels);
+    }
+#endif
     Decoder decoder(bytes, policy.max_decoded_pixels);
     int orientation = exif_orientation(bytes);
     if (orientation == 1) {

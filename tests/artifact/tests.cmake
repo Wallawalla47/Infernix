@@ -6,6 +6,7 @@ ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_materialization.cpp" "${CMAKE_CURRENT_LIST_DIR}/materialization_cuda_errors.cpp"
   LIBRARIES ninfer_artifact)
 
+if(NOT WIN32)
 target_link_options(ninfer_artifact_materialization_test PRIVATE
   "LINKER:--wrap=cudaMalloc"
   "LINKER:--wrap=cudaMallocHost"
@@ -15,6 +16,7 @@ target_link_options(ninfer_artifact_materialization_test PRIVATE
   "LINKER:--wrap=cudaEventRecord"
   "LINKER:--wrap=cudaMemcpyAsync"
   "LINKER:--wrap=cudaStreamSynchronize")
+endif()
 
 add_test(NAME ninfer_artifact_writer_interop_test
   COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/writer_interop.py"

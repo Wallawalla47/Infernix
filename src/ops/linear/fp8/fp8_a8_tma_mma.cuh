@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -20,6 +21,16 @@ struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation;
     CUtensorMap weight;
 };
+
+#ifdef _WIN32
+// The single Windows descriptor staging for Fp8TmaDescriptors, shared by every FP8 A8 TMA launch
+// route (linear, linear-add, attention and GDN input projections, LinearSwiGLU). See
+// core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
+inline TmaDescriptorStaging<Fp8TmaDescriptors>& fp8_tma_descriptor_staging() {
+    static TmaDescriptorStaging<Fp8TmaDescriptors> staging;
+    return staging;
+}
+#endif
 
 struct Fp8TmaSplitKPlan {
     int full_tiles = 0;
@@ -100,9 +111,19 @@ template <class Schedule, bool FullTokens, class Output, class Epilogue, bool Sp
           class RowPolicy = Fp8IdentityRows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma_mma_kernel(
-    const __grid_constant__ Fp8TmaDescriptors descriptors, Fp8A8Operands operands, Output output,
-    Epilogue epilogue, RowPolicy row_policy, int token_offset, int count, Fp8TmaSplitKPlan plan,
-    float* partials) {
+#ifdef _WIN32
+    // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
+    // __grid_constant__ parameter (C2719), so on Windows the descriptors are pointer-passed from
+    // the staging buffer.
+    const Fp8TmaDescriptors* descriptors_pointer,
+#else
+    const __grid_constant__ Fp8TmaDescriptors descriptors,
+#endif
+    Fp8A8Operands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
+    int token_offset, int count, Fp8TmaSplitKPlan plan, float* partials) {
+#ifdef _WIN32
+    const Fp8TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
     constexpr int BT = Schedule::kBlockTokens, BR = Schedule::kBlockRows;
     constexpr int BK = Schedule::kBlockK, S = Schedule::kStages;
     const int k = Schedule::kStaticK ? Schedule::kStaticK : operands.k;
@@ -146,6 +167,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_tma
 
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
+#ifdef _WIN32
+            // A staged tensor map was written through the generic proxy; each 128-byte map needs
+            // its own acquire for the TMA (tensormap) proxy before its first use.
+            acquire_staged_tensor_map(&descriptors.activation);
+            acquire_staged_tensor_map(&descriptors.weight);
+#endif
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
@@ -290,6 +317,10 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
     const Fp8TmaDescriptors descriptors{
         fp8_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK),
         fp8_tma_map(p.codes, p.rows, p.k, weight_span, Schedule::kBlockK)};
+#ifdef _WIN32
+    // Staged once: every token-slice launch below reads the same copy, in stream order.
+    const Fp8TmaDescriptors* staged = fp8_tma_descriptor_staging().stage(descriptors, stream);
+#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
         const auto plan   = fp8_tma_split_k_plan<Schedule>(blocks, p.k);
@@ -300,8 +331,13 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
                 fp8_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             const int dynamic = fp8_prepare_shared<bytes, kernel, true>();
             const int grid    = Split ? plan.full_tiles + plan.split_ctas : blocks;
+#ifdef _WIN32
+            kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
+                staged, p, output, epilogue, row_policy, offset, count, plan, partials);
+#else
             kernel<<<grid, Schedule::kThreads, dynamic, stream>>>(
                 descriptors, p, output, epilogue, row_policy, offset, count, plan, partials);
+#endif
             CUDA_CHECK(cudaGetLastError());
             if constexpr (Split) {
                 fp8_a8_tma_split_k_reduce<Schedule>

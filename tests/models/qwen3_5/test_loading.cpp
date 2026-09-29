@@ -168,36 +168,42 @@ void logical_data_and_instances() {
     fixture.file.root["components"]["text"]["config"]["rope_parameters"]["partial_rotary_factor"] =
         0.4999999999;
     fixture.file.write();
-    artifact::Reader reader(fixture.file.entry);
-    auto plan = qwen::plan_load(reader);
-    require(plan.config().text.rope_parameters->partial_rotary_factor == 0.5F &&
-                plan.config().text.rope_parameters->rotary_dim == 4,
-            "rotary width was derived before normalizing the PositiveF32 config value");
-    require(plan.config().text.architecture == Architecture::Qwen3_5 &&
-                plan.config().text.hidden_size == 128,
-            "binding chose a checkpoint-specific geometry");
-    require(plan.resources().public_token_count == 265 &&
-                plan.resources().tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
-            "tokenizer_config added tokens were not included in the public domain");
-    const auto& attention = std::get<qwen::AttentionWeights>(plan.weights().text.layers[0].mixer);
-    const auto& query     = plan.parameter(attention.query);
-    const auto& gate      = plan.parameter(attention.gate);
-    require(query.binding.parts[0].object == gate.binding.parts[0].object &&
-                query.binding.parts[0].begin == 0 && gate.binding.parts[0].begin == 24 * 128,
-            "Q/gate logical row correspondence changed");
-    require(plan.uses(attention.query)[0].activation_input_divisor == 2.0F &&
-                plan.uses(attention.gate)[0].activation_input_divisor == 3.0F,
-            "shared-parent Uses contaminated one another");
-    require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
-                plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
-            "explicit shared embedding/head did not bind the same parent");
-    const auto capacity = plan.materialization().device_capacity_bytes;
-    require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
-            "unused Vision was required");
-    rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
-            "incomplete selected Vision was accepted");
-    rejects([&] { (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
-            "absent MTP was accepted");
+    std::uint64_t capacity = 0;
+    {
+        // The plan borrows its Reader, and a mapped file cannot be truncated while its section
+        // is open (ERROR_USER_MAPPED_FILE on Windows), so both must be gone before the rewrite.
+        artifact::Reader reader(fixture.file.entry);
+        auto plan = qwen::plan_load(reader);
+        require(plan.config().text.rope_parameters->partial_rotary_factor == 0.5F &&
+                    plan.config().text.rope_parameters->rotary_dim == 4,
+                "rotary width was derived before normalizing the PositiveF32 config value");
+        require(plan.config().text.architecture == Architecture::Qwen3_5 &&
+                    plan.config().text.hidden_size == 128,
+                "binding chose a checkpoint-specific geometry");
+        require(plan.resources().public_token_count == 265 &&
+                    plan.resources().tokenizer->encode("<|video_pad|>") == std::vector<int>{264},
+                "tokenizer_config added tokens were not included in the public domain");
+        const auto& attention =
+            std::get<qwen::AttentionWeights>(plan.weights().text.layers[0].mixer);
+        const auto& query     = plan.parameter(attention.query);
+        const auto& gate      = plan.parameter(attention.gate);
+        require(query.binding.parts[0].object == gate.binding.parts[0].object &&
+                    query.binding.parts[0].begin == 0 && gate.binding.parts[0].begin == 24 * 128,
+                "Q/gate logical row correspondence changed");
+        require(plan.uses(attention.query)[0].activation_input_divisor == 2.0F &&
+                    plan.uses(attention.gate)[0].activation_input_divisor == 3.0F,
+                "shared-parent Uses contaminated one another");
+        require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
+                    plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
+                "explicit shared embedding/head did not bind the same parent");
+        capacity = plan.materialization().device_capacity_bytes;
+        require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
+                "unused Vision was required");
+        rejects([&] { (void)qwen::plan_load(reader, {.vision = true}); },
+                "incomplete selected Vision was accepted");
+        rejects([&] { (void)qwen::plan_load(reader, {.speculative = SpeculativeBackend::Mtp}); },
+                "absent MTP was accepted");
+    }
 
     fixture.file.root["metadata"]["name"] = "another-training-run-and-recipe";
     fixture.file.root["components"]["text"]["config"]["num_hidden_layers"] = 2;

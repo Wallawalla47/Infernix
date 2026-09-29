@@ -1011,8 +1011,8 @@ private:
             return left.priority.last_demand < right.priority.last_demand;
         }
         if (!left.priority.reused) {
-            const auto a = static_cast<unsigned __int128>(left.loss) * right.units;
-            const auto b = static_cast<unsigned __int128>(right.loss) * left.units;
+            const auto a = uint128(left.loss) * right.units;
+            const auto b = uint128(right.loss) * left.units;
             if (a != b) { return a < b; }
         }
         return left.order < right.order;

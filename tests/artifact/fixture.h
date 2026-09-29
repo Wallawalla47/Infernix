@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -15,6 +16,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _WIN32
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::test::artifact_fixture {
 
@@ -46,12 +53,18 @@ struct Fixture {
     std::vector<std::byte> payload;
 
     Fixture() : payload(1344) {
-        auto pattern = (std::filesystem::temp_directory_path() / "ninfer-artifact-XXXXXX").string();
-        std::vector<char> buffer(pattern.begin(), pattern.end());
-        buffer.push_back('\0');
-        const char* path = ::mkdtemp(buffer.data());
-        if (!path) { throw std::runtime_error("cannot create fixture directory"); }
-        directory = path;
+        static std::atomic<std::uint64_t> counter{0};
+#ifdef _WIN32
+        const long long process = ::_getpid();
+#else
+        const long long process = static_cast<long long>(::getpid());
+#endif
+        const std::string name =
+            "ninfer-artifact-" + std::to_string(process) + "-" + std::to_string(counter.fetch_add(1));
+        directory = std::filesystem::temp_directory_path() / name;
+        std::error_code create_error;
+        std::filesystem::create_directories(directory, create_error);
+        if (create_error) { throw std::runtime_error("cannot create fixture directory"); }
         entry     = directory / "model.ninfer";
         root      = {
             {"components",

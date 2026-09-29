@@ -10,7 +10,7 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc
 add_library(ninfer_nvfp4_non_rdc STATIC)
 ninfer_internal_includes(ninfer_nvfp4_non_rdc)
 ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core ninfer_cuda_runtime CUDA::cuda_driver)
 
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")

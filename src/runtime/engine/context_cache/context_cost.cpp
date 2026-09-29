@@ -1,4 +1,5 @@
 #include "runtime/engine/context_cache/context_cost.h"
+#include "runtime/contract/int128.h"
 
 #include <nlohmann/json.hpp>
 
@@ -12,7 +13,11 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
+#ifdef _WIN32
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -23,7 +28,7 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
+using U128 = uint128;
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -294,7 +299,12 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+#ifdef _WIN32
+    const long process_id = _getpid();
+#else
+    const long process_id = ::getpid();
+#endif
+    temporary += ".tmp." + std::to_string(static_cast<long long>(process_id)) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

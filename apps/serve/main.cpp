@@ -1,3 +1,5 @@
+#include "ninfer_build_id.h"
+
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
 #include "serve/generation_service.h"
@@ -43,7 +45,6 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
-
     ninfer::product::LoggingRuntime logging(
         {.logger_name  = "ninfer-serve",
          .level        = options.log_level,
@@ -60,6 +61,9 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+#ifdef NINFER_BUILD_ID
+        logger->info("build {}", NINFER_BUILD_ID);
+#endif
         ninfer::serve::GenerationService service(options, startup_log.observer());
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);

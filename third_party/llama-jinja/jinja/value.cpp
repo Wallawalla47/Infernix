@@ -9,6 +9,17 @@
 #include <optional>
 #include <algorithm>
 
+#ifdef _WIN32
+#include <time.h>
+namespace {
+// localtime_r is a POSIX extension not provided by MSVC; emulate it with the
+// thread-safe localtime_s (note the reversed argument order).
+std::tm* localtime_r(const std::time_t* time, std::tm* result) {
+    return ::localtime_s(result, time) == 0 ? result : nullptr;
+}
+} // namespace
+#endif
+
 namespace jinja {
 
 // func_args method implementations
