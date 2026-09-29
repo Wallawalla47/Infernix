@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/context_kv_materialize.h"
 
+#include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "ops/quantized_weight.h"
@@ -81,9 +82,33 @@ std::vector<float> make_norm(int layer) {
     return result;
 }
 
+// A projection's stored codes decoded once to FP64 by the independent fixture decoder, row-major
+// [kRows, kHidden], so every oracle dot reads the same logical weights without decoding them again.
+std::vector<double> logical_weights(const quantized_weight::PackedWeight& weight) {
+    std::vector<double> logical(static_cast<std::size_t>(kRows) * kHidden);
+    parallel_ranges(kRows, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
+        for (auto row = static_cast<int>(begin); row < end; ++row)
+            for (int column = 0; column < kHidden; ++column)
+                logical[static_cast<std::size_t>(row) * kHidden + column] =
+                    quantized_weight::logical_weight_fp64(weight, row, column);
+    });
+    return logical;
+}
+
+// quantized_weight::dot_fp64 over the decoded weights, in the same column order.
+double logical_dot(const std::vector<double>& logical, int row, const float* input) {
+    const double* weights = logical.data() + static_cast<std::size_t>(row) * kHidden;
+    double acc            = 0.0;
+    for (int column = 0; column < kHidden; ++column)
+        acc += weights[column] * static_cast<double>(input[column]);
+    return acc;
+}
+
 struct LayerStorage {
     quantized_weight::PackedWeight key_host;
     quantized_weight::PackedWeight value_host;
+    std::vector<double> key_logical;
+    std::vector<double> value_logical;
     DeviceBuffer parent_device;
     std::vector<std::uint8_t> parent_host;
     std::vector<float> norm_host;
@@ -106,6 +131,8 @@ struct Fixture {
                 QType::Q8_G32_FP16, kRows, kHidden, 0x310U + 2U * layer, weight_options);
             target.value_host = quantized_weight::make_patterned_weight(
                 QType::Q8_G32_FP16, kRows, kHidden, 0x311U + 2U * layer, weight_options);
+            target.key_logical                 = logical_weights(target.key_host);
+            target.value_logical               = logical_weights(target.value_host);
             constexpr std::size_t parent_codes = 6144ULL * kHidden;
             target.parent_host.resize(parent_codes + 6144ULL * (kHidden / 32) * 2, 0x63);
             const auto put = [&](const quantized_weight::PackedWeight& weight, int row) {
@@ -159,9 +186,8 @@ struct Fixture {
     }
 };
 
-float represented_projection(const quantized_weight::PackedWeight& weight, int row,
-                             const float* input) {
-    const double dot = quantized_weight::dot_fp64(weight, row, input, kHidden);
+float represented_projection(const std::vector<double>& logical, int row, const float* input) {
+    const double dot = logical_dot(logical, row, input);
     // Round the FP64 mathematical dot directly to the semantic BF16 V boundary.
     // BF16 has eight significand bits and a minimum subnormal quantum of 2^-133.
     int exponent = 0;
@@ -176,8 +202,7 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
     double square_sum = 0.0;
     for (int dim = 0; dim < kHeadDim; ++dim) {
         const int row = head * kHeadDim + dim;
-        raw[static_cast<std::size_t>(dim)] =
-            quantized_weight::dot_fp64(layer.key_host, row, input, kHidden);
+        raw[static_cast<std::size_t>(dim)] = logical_dot(layer.key_logical, row, input);
         square_sum += raw[static_cast<std::size_t>(dim)] * raw[static_cast<std::size_t>(dim)];
     }
     const double inverse = 1.0 / std::sqrt(square_sum / kHeadDim + kEpsilon);
@@ -195,7 +220,25 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
     }
 }
 
-int verify_state_effect(const std::string& label, const Fixture& fixture,
+// Every layer's K and V rings, read back once per launch for both verifiers.
+struct CacheSnapshot {
+    std::array<std::vector<std::uint16_t>, kLayers> k;
+    std::array<std::vector<std::uint16_t>, kLayers> v;
+};
+
+CacheSnapshot read_caches(const Fixture& fixture) {
+    CacheSnapshot snapshot;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
+        snapshot.k[static_cast<std::size_t>(layer)] =
+            from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
+        snapshot.v[static_cast<std::size_t>(layer)] =
+            from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
+    }
+    return snapshot;
+}
+
+int verify_state_effect(const std::string& label, const CacheSnapshot& snapshot,
                         const std::vector<int>& positions, const std::vector<int>& counts,
                         const std::vector<int>& state_slots, int width) {
     std::vector<std::set<int>> written_slots(kLaneCapacity);
@@ -206,28 +249,39 @@ int verify_state_effect(const std::string& label, const Fixture& fixture,
         }
     }
 
-    int failures = 0;
-    for (int layer = 0; layer < kLayers; ++layer) {
-        const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
-        const auto cache_k = from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
-        const auto cache_v = from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
-        int first_bad      = -1;
-        for (int lane = 0; lane < kLaneCapacity && first_bad < 0; ++lane) {
-            for (int head = 0; head < kHeads && first_bad < 0; ++head) {
-                for (int slot = 0; slot < kPaddedCapacity && first_bad < 0; ++slot) {
-                    const bool written =
-                        written_slots[static_cast<std::size_t>(lane)].contains(slot);
-                    for (int dim = 0; dim < kHeadDim; ++dim) {
-                        const std::size_t index = cache_index(lane, head, slot, dim);
-                        const bool k_changed    = cache_k[index] != kSentinel;
-                        const bool v_changed    = cache_v[index] != kSentinel;
-                        if (k_changed != written || v_changed != written) {
-                            first_bad = static_cast<int>(index);
-                            break;
-                        }
+    // Each (layer, lane, head) ring row is scanned independently for its first bad element; the
+    // first one found per layer in row order is the element one ascending scan would report.
+    constexpr int kRingRows = kLayers * kLaneCapacity * kHeads;
+    std::vector<int> row_first_bad(kRingRows, -1);
+    parallel_ranges(kRingRows, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
+        for (auto ring = static_cast<int>(begin); ring < end; ++ring) {
+            const int layer     = ring / (kLaneCapacity * kHeads);
+            const int lane      = ring / kHeads % kLaneCapacity;
+            const int head      = ring % kHeads;
+            const auto& cache_k = snapshot.k[static_cast<std::size_t>(layer)];
+            const auto& cache_v = snapshot.v[static_cast<std::size_t>(layer)];
+            int& first_bad      = row_first_bad[static_cast<std::size_t>(ring)];
+            for (int slot = 0; slot < kPaddedCapacity && first_bad < 0; ++slot) {
+                const bool written = written_slots[static_cast<std::size_t>(lane)].contains(slot);
+                for (int dim = 0; dim < kHeadDim; ++dim) {
+                    const std::size_t index = cache_index(lane, head, slot, dim);
+                    const bool k_changed    = cache_k[index] != kSentinel;
+                    const bool v_changed    = cache_v[index] != kSentinel;
+                    if (k_changed != written || v_changed != written) {
+                        first_bad = static_cast<int>(index);
+                        break;
                     }
                 }
             }
+        }
+    });
+
+    int failures = 0;
+    for (int layer = 0; layer < kLayers; ++layer) {
+        int first_bad = -1;
+        for (int row = 0; row < kLaneCapacity * kHeads && first_bad < 0; ++row) {
+            first_bad =
+                row_first_bad[static_cast<std::size_t>(layer * kLaneCapacity * kHeads + row)];
         }
         if (first_bad >= 0) {
             std::cerr << label << " layer=" << layer
@@ -239,9 +293,9 @@ int verify_state_effect(const std::string& label, const Fixture& fixture,
 }
 
 int verify_numeric_samples(const std::string& label, const Fixture& fixture,
-                           const std::vector<float>& context, const std::vector<int>& positions,
-                           const std::vector<int>& counts, const std::vector<int>& state_slots,
-                           int width) {
+                           const CacheSnapshot& snapshot, const std::vector<float>& context,
+                           const std::vector<int>& positions, const std::vector<int>& counts,
+                           const std::vector<int>& state_slots, int width) {
     std::vector<std::pair<int, int>> samples;
     for (int batch = 0; batch < static_cast<int>(counts.size()); ++batch) {
         if (counts[static_cast<std::size_t>(batch)] == 0) continue;
@@ -252,30 +306,54 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
     }
 
     if (samples.empty()) return 0;
+    const std::vector<int> heads = (width == 1 || width == 8 || width == 16 || width > 16)
+                                       ? std::vector<int>{0, 3, 7}
+                                       : std::vector<int>{width % 8};
+    const std::array<int, 4> value_rows{0, 127, 511, 1023};
+    // Every (layer, sample, head) key oracle is independent: evaluate them all at once, then
+    // compare in the original layer, sample and head order.
+    const std::int64_t key_oracle_count =
+        static_cast<std::int64_t>(kLayers * samples.size() * heads.size());
+    std::vector<std::vector<double>> key_oracles(static_cast<std::size_t>(key_oracle_count));
+    const auto key_oracle_index = [&](int layer, std::size_t sample, std::size_t head_index) {
+        return (static_cast<std::size_t>(layer) * samples.size() + sample) * heads.size() +
+               head_index;
+    };
+    parallel_ranges(
+        key_oracle_count, host_thread_count(), [&](std::int64_t begin, std::int64_t end) {
+            for (std::int64_t item = begin; item < end; ++item) {
+                const auto head_index = static_cast<std::size_t>(item) % heads.size();
+                const auto sample = static_cast<std::size_t>(item) / heads.size() % samples.size();
+                const auto layer  = static_cast<std::size_t>(item) / heads.size() / samples.size();
+                const auto [batch, local] = samples[sample];
+                const int column          = batch * width + local;
+                append_key_oracle(fixture.storage[layer],
+                                  context.data() + static_cast<std::size_t>(column) * kHidden,
+                                  heads[head_index], positions[static_cast<std::size_t>(column)],
+                                  key_oracles[static_cast<std::size_t>(item)]);
+            }
+        });
+
     int failures = 0;
     for (int layer = 0; layer < kLayers; ++layer) {
         const LayerStorage& source = fixture.storage[static_cast<std::size_t>(layer)];
-        const auto cache_k_bits =
-            from_device<std::uint16_t>(source.cache_k.data(), cache_elements());
-        const auto cache_v_bits =
-            from_device<std::uint16_t>(source.cache_v.data(), cache_elements());
+        const auto& cache_k_bits   = snapshot.k[static_cast<std::size_t>(layer)];
+        const auto& cache_v_bits   = snapshot.v[static_cast<std::size_t>(layer)];
         std::vector<double> key_got;
         std::vector<double> key_expected;
         std::vector<double> value_got;
         std::vector<double> value_expected;
-        const std::vector<int> heads = (width == 1 || width == 8 || width == 16 || width > 16)
-                                           ? std::vector<int>{0, 3, 7}
-                                           : std::vector<int>{width % 8};
-        const std::array<int, 4> value_rows{0, 127, 511, 1023};
-        for (const auto [batch, local] : samples) {
-            const int column   = batch * width + local;
-            const int position = positions[static_cast<std::size_t>(column)];
-            const int slot     = position & (kCapacity - 1);
-            const int lane     = state_slots[static_cast<std::size_t>(batch)];
+        for (std::size_t sample = 0; sample < samples.size(); ++sample) {
+            const auto [batch, local] = samples[sample];
+            const int column          = batch * width + local;
+            const int position        = positions[static_cast<std::size_t>(column)];
+            const int slot            = position & (kCapacity - 1);
+            const int lane            = state_slots[static_cast<std::size_t>(batch)];
             const float* input = context.data() + static_cast<std::size_t>(column) * kHidden;
-            for (const int head : heads) {
-                std::vector<double> head_expected;
-                append_key_oracle(source, input, head, position, head_expected);
+            for (std::size_t head_index = 0; head_index < heads.size(); ++head_index) {
+                const int head = heads[head_index];
+                const std::vector<double>& head_expected =
+                    key_oracles[key_oracle_index(layer, sample, head_index)];
                 for (int pair = 0; pair < kHeadDim / 2; ++pair) {
                     const int first_dim  = pair;
                     const int second_dim = pair + kHeadDim / 2;
@@ -290,7 +368,7 @@ int verify_numeric_samples(const std::string& label, const Fixture& fixture,
             for (const int row : value_rows) {
                 const int head          = row / kHeadDim;
                 const int dim           = row - head * kHeadDim;
-                const float represented = represented_projection(source.value_host, row, input);
+                const float represented = represented_projection(source.value_logical, row, input);
                 const std::uint16_t expected_bits =
                     quantized_weight::detail::f32_to_f16(represented);
                 value_expected.push_back(quantized_weight::detail::f16_to_f32(expected_bits));
@@ -335,13 +413,14 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
     };
     launch(nullptr);
     cuda_synchronize();
-    int failures = verify_state_effect(label, fixture, positions, counts, state_slots, width);
+    const CacheSnapshot snapshot = read_caches(fixture);
+    int failures = verify_state_effect(label, snapshot, positions, counts, state_slots, width);
     failures += verify_exact("counts readonly", from_device<int>(counts_device, batch), counts);
     failures +=
         verify_exact("positions readonly", from_device<int>(positions_device, columns), positions);
     failures += verify_exact("slots readonly", from_device<int>(slots_device, batch), state_slots);
-    failures +=
-        verify_numeric_samples(label, fixture, context, positions, counts, state_slots, width);
+    failures += verify_numeric_samples(label, fixture, snapshot, context, positions, counts,
+                                       state_slots, width);
     failures += scratch.verify_guards(label + " workspace");
     if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) ++failures;
     fixture.observed_peak[batch] = std::max(fixture.observed_peak[batch], workspace.peak_used());
@@ -370,13 +449,14 @@ int run_case(Fixture& fixture, const std::string& label, int width, int batch,
                 positions_device.copy_from_host(next_positions.data(), columns * 4);
                 executable.launch(stream);
                 cuda_synchronize(stream);
+                const CacheSnapshot replayed = read_caches(fixture);
                 failures +=
-                    verify_state_effect(label + " replay " + std::to_string(replay), fixture,
+                    verify_state_effect(label + " replay " + std::to_string(replay), replayed,
                                         next_positions, next_counts, next_slots, width);
                 if (replay != 2)
                     failures +=
-                        verify_numeric_samples(label + " replay", fixture, context, next_positions,
-                                               next_counts, next_slots, width);
+                        verify_numeric_samples(label + " replay", fixture, replayed, context,
+                                               next_positions, next_counts, next_slots, width);
                 failures += scratch.verify_guards(label + " replay scratch");
                 failures += verify_exact("replay counts readonly",
                                          from_device<int>(counts_device, batch), next_counts);
