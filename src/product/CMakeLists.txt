@@ -20,4 +20,4 @@ add_library(ninfer_product_logging STATIC
   logging/startup_log.cpp
 )
 ninfer_internal_includes(ninfer_product_logging)
-target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog)
+target_link_libraries(ninfer_product_logging PUBLIC spdlog::spdlog PRIVATE ninfer_media_decode)

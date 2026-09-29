@@ -146,6 +146,55 @@ void test_issue_20_unaligned_jpeg() {
     }
 }
 
+// FFmpeg's swscaler reports the yuvj420p input of every such JPEG. With a handler installed the
+// line reaches it whole, without FFmpeg's "[name @ address]" prefix or line break, instead of
+// stderr; clearing the handler hands back the one installed.
+void test_library_log_routing() {
+    namespace decode = ninfer::media::decode;
+
+    struct CapturedLine {
+        decode::LibraryLogSeverity severity;
+        std::string source;
+        std::string message;
+    };
+
+    std::vector<CapturedLine> lines;
+    const decode::LibraryLogHandler previous =
+        decode::set_library_log_handler([&](const decode::LibraryLogLine& line) {
+            lines.push_back({line.severity, std::string(line.source), std::string(line.message)});
+        });
+    if (previous) {
+        throw std::runtime_error("an FFmpeg log handler was installed before the test");
+    }
+    try {
+        (void)decode::decode_image(decode_base64(issue_20_jpeg_base64), {});
+    } catch (...) {
+        (void)decode::set_library_log_handler({});
+        throw;
+    }
+    if (!decode::set_library_log_handler({})) {
+        throw std::runtime_error(
+            "clearing the FFmpeg log handler did not return the installed one");
+    }
+
+    bool deprecated_format = false;
+    for (const CapturedLine& line : lines) {
+        if (line.message.empty() || line.message.find_first_of("\r\n") != std::string::npos ||
+            line.message.front() == '[') {
+            throw std::runtime_error("FFmpeg log line is not one bare line: " + line.message);
+        }
+        deprecated_format =
+            deprecated_format ||
+            (line.severity == decode::LibraryLogSeverity::Warning && line.source == "swscaler" &&
+             line.message == "deprecated pixel format used, make sure you did set range "
+                             "correctly");
+    }
+    if (!deprecated_format) {
+        throw std::runtime_error(
+            "the swscaler deprecated-format warning did not reach the handler");
+    }
+}
+
 #ifdef NINFER_MEDIA_NATIVE_PNG
 
 // span over a generated C array fixture.
@@ -351,6 +400,7 @@ void test_png_row_width_guard() {
 int main() {
     try {
         test_issue_20_unaligned_jpeg();
+        test_library_log_routing();
 #ifdef NINFER_MEDIA_NATIVE_PNG
         test_png_decoders();
         test_png_row_width_guard();

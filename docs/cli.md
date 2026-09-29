@@ -26,8 +26,9 @@ throughput, GPU memory, token IDs when requested, and speculative-decoding stati
 stderr as unprefixed product output, so stdout can be redirected independently. On a terminal,
 weight materialization is one transient progress line followed by a compact Engine-ready summary.
 Redirected stderr contains persistent readable progress for long loads and no carriage returns or
-ANSI escapes. `--log-level debug` exposes every startup phase. Option and local prompt/message input
-failures remain direct command diagnostics:
+ANSI escapes. `--log-level debug` exposes every startup phase. FFmpeg's media-decoding messages are
+records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`. Option and
+local prompt/message input failures remain direct command diagnostics:
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \

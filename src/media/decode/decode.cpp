@@ -7,6 +7,7 @@ extern "C" {
 #include <libavutil/display.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 }
@@ -15,15 +16,19 @@ extern "C" {
 #include <array>
 #include <cerrno>
 #include <cmath>
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -558,6 +563,85 @@ VideoScan scan_video(std::span<const std::uint8_t> bytes, const Policy& policy,
     return scan;
 }
 
+std::mutex library_log_mutex;
+std::shared_ptr<const LibraryLogHandler> library_log_handler;
+
+std::shared_ptr<const LibraryLogHandler> current_library_log_handler() {
+    std::lock_guard lock(library_log_mutex);
+    return library_log_handler;
+}
+
+std::string_view library_log_source(void* context) noexcept {
+    if (context == nullptr) { return {}; }
+    const AVClass* av_class = *static_cast<const AVClass* const*>(context);
+    if (av_class == nullptr || av_class->item_name == nullptr) { return {}; }
+    const char* name = av_class->item_name(context);
+    return name == nullptr ? std::string_view{} : std::string_view(name);
+}
+
+LibraryLogSeverity library_log_severity(int level) noexcept {
+    if (level <= AV_LOG_ERROR) { return LibraryLogSeverity::Error; }
+    if (level <= AV_LOG_WARNING) { return LibraryLogSeverity::Warning; }
+    return LibraryLogSeverity::Info;
+}
+
+// FFmpeg may build one line from several calls, so each decoding thread assembles its own; the
+// line keeps the source of its first part and the most severe level of any part.
+struct PendingLibraryLine {
+    std::string text;
+    std::string source;
+    int level = AV_LOG_QUIET;
+};
+
+void forward_library_log(void* context, int level, const char* format, std::va_list args) {
+    const std::shared_ptr<const LibraryLogHandler> handler = current_library_log_handler();
+    if (!handler) {
+        // The default was restored between FFmpeg reading its callback and calling it.
+        av_log_default_callback(context, level, format, args);
+        return;
+    }
+    // The high byte carries FFmpeg's colour hint.
+    const int severity_level = level & 0xff;
+    if (severity_level > av_log_get_level()) { return; }
+    thread_local PendingLibraryLine pending;
+    try {
+        std::array<char, 1024> buffer;
+        std::va_list measured;
+        va_copy(measured, args);
+        const int length = std::vsnprintf(buffer.data(), buffer.size(), format, measured);
+        va_end(measured);
+        if (length < 0) { return; }
+        if (pending.text.empty()) {
+            pending.source = library_log_source(context);
+            pending.level  = severity_level;
+        } else {
+            pending.level = std::min(pending.level, severity_level);
+        }
+        if (static_cast<std::size_t>(length) < buffer.size()) {
+            pending.text.append(buffer.data(), static_cast<std::size_t>(length));
+        } else {
+            const std::size_t offset = pending.text.size();
+            pending.text.resize(offset + static_cast<std::size_t>(length));
+            std::vsnprintf(pending.text.data() + offset, static_cast<std::size_t>(length) + 1,
+                           format, args);
+        }
+        std::size_t start = 0;
+        for (std::size_t end = pending.text.find('\n'); end != std::string::npos;
+             start = end + 1, end = pending.text.find('\n', start)) {
+            std::string_view message(pending.text.data() + start, end - start);
+            if (message.ends_with('\r')) { message.remove_suffix(1); }
+            if (message.empty()) { continue; }
+            (*handler)(LibraryLogLine{.severity = library_log_severity(pending.level),
+                                      .source   = pending.source,
+                                      .message  = message});
+        }
+        pending.text.erase(0, start);
+    } catch (...) {
+        // An exception must not unwind through FFmpeg; the line is dropped.
+        pending.text.clear();
+    }
+}
+
 } // namespace
 
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
@@ -653,6 +737,20 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     out.height  = scan.first_frame.height;
     out.indices = std::move(plan.indices);
     return out;
+}
+
+LibraryLogHandler set_library_log_handler(LibraryLogHandler handler) {
+    std::shared_ptr<const LibraryLogHandler> installed;
+    if (handler) { installed = std::make_shared<const LibraryLogHandler>(std::move(handler)); }
+    std::shared_ptr<const LibraryLogHandler> previous;
+    {
+        // FFmpeg's callback changes under the same lock, so concurrent owners cannot leave it
+        // disagreeing with the installed handler.
+        std::lock_guard lock(library_log_mutex);
+        previous = std::exchange(library_log_handler, installed);
+        av_log_set_callback(installed ? forward_library_log : av_log_default_callback);
+    }
+    return previous ? *previous : LibraryLogHandler{};
 }
 
 } // namespace ninfer::media::decode

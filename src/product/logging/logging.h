@@ -67,8 +67,9 @@ private:
 
 // A multi-line panel pinned beneath the scrolling operational log. Persistent records scroll above
 // it; the panel is erased and redrawn around each record, so it stays at the bottom of the console.
-// It is enabled only when stderr is an interactive terminal with VT cursor control and the logger
-// shows info records; redirected output never contains it.
+// Output written to stderr other than through the logger lands inside the panel and leaves panel
+// rows in the scrollback. It is enabled only when stderr is an interactive terminal with VT cursor
+// control and the logger shows info records; redirected output never contains it.
 class TerminalPanel {
 public:
     ~TerminalPanel();
@@ -98,6 +99,8 @@ private:
 
 // Application-owned operational logger lifetime. Construction does not mutate spdlog's global
 // default logger or registry; producers receive and retain the returned explicit shared handle.
+// While it lives, FFmpeg's media-decoding lines are records of this logger prefixed "media |": its
+// errors are warnings and everything milder is debug. Destruction restores FFmpeg's previous route.
 class LoggingRuntime {
 public:
     explicit LoggingRuntime(LoggingOptions options);
