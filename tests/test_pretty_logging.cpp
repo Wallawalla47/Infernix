@@ -1,3 +1,4 @@
+#include "media/decode/decode.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
@@ -255,5 +256,49 @@ int main() {
                               std::string::npos,
                           "a warning Engine diagnostic must show at the default level");
     }
+
+    // FFmpeg's media-decoding lines are records of the runtime's logger rather than direct stderr
+    // writes that would land inside a terminal footer: an FFmpeg error is a warning and its
+    // warnings are debug detail. The runtime restores FFmpeg's previous route when it ends.
+    namespace decode = ninfer::media::decode;
+    for (const ninfer::product::LogLevel level :
+         {ninfer::product::LogLevel::Info, ninfer::product::LogLevel::Debug}) {
+        std::string output;
+        bool routed = false;
+        {
+            StderrCapture capture;
+            {
+                ninfer::product::LoggingRuntime logging(
+                    {.logger_name  = "ninfer",
+                     .level        = level,
+                     .color        = ninfer::product::LogColorMode::Never,
+                     .presentation = ninfer::product::LogPresentation::Tool});
+                const decode::LibraryLogHandler route = decode::set_library_log_handler({});
+                (void)decode::set_library_log_handler(route);
+                routed = static_cast<bool>(route);
+                if (routed) {
+                    route({.severity = decode::LibraryLogSeverity::Error,
+                           .source   = "mjpeg",
+                           .message  = "overread 8\x1b[2J"});
+                    route({.severity = decode::LibraryLogSeverity::Warning,
+                           .source   = "swscaler",
+                           .message  = "deprecated pixel format used"});
+                }
+                logging.flush();
+            }
+            output = capture.finish();
+        }
+        failures += check(routed, "the logging runtime did not route FFmpeg's log");
+        failures +=
+            check(output.find("warning: media | mjpeg: overread 8?[2J\n") != std::string::npos,
+                  "an FFmpeg error must be a sanitized warning record");
+        const bool debug_shown =
+            output.find("debug: media | swscaler: deprecated pixel format used\n") !=
+            std::string::npos;
+        failures += check(debug_shown == (level == ninfer::product::LogLevel::Debug),
+                          "an FFmpeg warning must be a debug record");
+    }
+    failures += check(!decode::set_library_log_handler({}),
+                      "the logging runtime left its FFmpeg route installed after it ended");
     return failures == 0 ? 0 : 1;
 }

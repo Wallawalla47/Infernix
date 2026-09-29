@@ -1,6 +1,8 @@
 #include "product/logging/logging.h"
 
+#include "media/decode/decode.h"
 #include "product/log_colour/log_colour.h"
+#include "product/logging/pretty_format.h"
 
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
@@ -151,6 +153,25 @@ spdlog::color_mode to_spdlog_color_mode(LogColorMode mode) {
         return spdlog::color_mode::never;
     }
     throw std::invalid_argument("LoggingOptions color mode is invalid");
+}
+
+// FFmpeg's lines concern client-supplied media and name no request, and a decode that fails also
+// fails its request, which reports that in its own record. FFmpeg's errors are therefore warnings,
+// and its warnings and notices, such as swscaler's "deprecated pixel format" notice on every JPEG,
+// are debug detail.
+media::decode::LibraryLogHandler media_log_handler(std::shared_ptr<spdlog::logger> logger) {
+    return [logger = std::move(logger)](const media::decode::LibraryLogLine& line) {
+        const spdlog::level::level_enum level =
+            line.severity == media::decode::LibraryLogSeverity::Error ? spdlog::level::warn
+                                                                      : spdlog::level::debug;
+        if (!logger->should_log(level)) { return; }
+        const std::string message = format_pretty_text(line.message);
+        if (line.source.empty()) {
+            logger->log(level, "media | {}", message);
+        } else {
+            logger->log(level, "media | {}: {}", format_pretty_text(line.source), message);
+        }
+    };
 }
 
 void report_logging_error(const std::string& message) noexcept {
@@ -537,11 +558,20 @@ struct LoggingRuntime::Impl {
             sink->clear();
             report_logging_error(message);
         });
+        // A library writing to stderr directly would land inside the terminal footer, and the
+        // next redraw would leave footer rows behind in the scrollback.
+        previous_media_log = media::decode::set_library_log_handler(media_log_handler(logger));
     }
+
+    ~Impl() { media::decode::set_library_log_handler(std::move(previous_media_log)); }
+
+    Impl(const Impl&)            = delete;
+    Impl& operator=(const Impl&) = delete;
 
     std::shared_ptr<spdlog::logger> logger;
     std::shared_ptr<TerminalProgress> progress;
     std::shared_ptr<TerminalPanel> panel;
+    media::decode::LibraryLogHandler previous_media_log;
 };
 
 LoggingRuntime::LoggingRuntime(LoggingOptions options)

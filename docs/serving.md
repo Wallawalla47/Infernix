@@ -924,7 +924,10 @@ readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-le
 internal startup and resource-planning detail. Engine runtime diagnostics are ordinary records
 prefixed `engine |`: a Device KV lease extended by releasing retained cache is `debug`; a lease
 that cannot grow, recovery from out of memory or a failed request, and a failed prefix-cache save
-are warnings or errors; the prefix-cache save at shutdown is `info`. A terminal may use one
+are warnings or errors; the prefix-cache save at shutdown is `info`. FFmpeg's media-decoding
+messages are records prefixed `media |`, so they never write inside the statistics panel: FFmpeg
+errors are warnings, and its warnings and notices, such as swscaler's `deprecated pixel format`
+notice for each JPEG, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
 

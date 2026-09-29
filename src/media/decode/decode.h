@@ -6,6 +6,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -78,5 +79,27 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames);
+
+enum class LibraryLogSeverity {
+    Error,
+    Warning,
+    Info,
+};
+
+// One complete FFmpeg diagnostic line. `source` names the FFmpeg component that reported it, such
+// as "swscaler" or "mjpeg", and is empty when none did; `message` carries no line break.
+struct LibraryLogLine {
+    LibraryLogSeverity severity = LibraryLogSeverity::Info;
+    std::string_view source;
+    std::string_view message;
+};
+
+using LibraryLogHandler = std::function<void(const LibraryLogLine& line)>;
+
+// FFmpeg reports through one process-wide callback whose default writes straight to stderr, past
+// whatever owns it. An installed handler receives instead each line that FFmpeg's own threshold
+// admits (info and more severe), on the decoding thread; an empty handler restores FFmpeg's stderr
+// output. Returns the handler it replaces, so a scoped owner can restore it.
+LibraryLogHandler set_library_log_handler(LibraryLogHandler handler);
 
 } // namespace ninfer::media::decode
