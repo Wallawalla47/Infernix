@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -262,22 +263,37 @@ struct SparseAcceptSuite {
         std::vector<double> probabilities;
     };
 
+    // `draft_counts` is caller scratch of kSparseTokenDomain zeros, returned zeroed: it holds how
+    // often each token occurs among the row's drafts before `column` while the distribution is
+    // built.
     TargetDistribution sparse_target_distribution(const std::vector<std::uint16_t>& logits, int row,
                                                   int column, const ops::SamplingConfig& config,
                                                   const std::vector<std::int32_t>& token_counts,
-                                                  const std::vector<std::int32_t>& drafts) {
+                                                  const std::vector<std::int32_t>& drafts,
+                                                  std::vector<std::int32_t>& draft_counts) {
+        const auto previous_drafts = [&](int delta) {
+            for (int previous = 0; previous < column; ++previous) {
+                const int token = drafts[static_cast<std::size_t>(row) * kSparseDrafts + previous];
+                if (token >= 0 && token < kSparseTokenDomain)
+                    draft_counts[static_cast<std::size_t>(token)] += delta;
+            }
+        };
+        previous_drafts(1);
         const auto adjusted = [&](int token) {
             double value = bf16_to_f32(logits[sparse_logit_index(row, column, token)]);
-            int count    = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
-            for (int previous = 0; previous < column; ++previous) {
-                if (drafts[static_cast<std::size_t>(row) * kSparseDrafts + previous] == token) {
-                    ++count;
-                }
-            }
+            const int count =
+                token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token] +
+                draft_counts[static_cast<std::size_t>(token)];
             if (count > 0) value -= config.presence_penalty;
             value -= config.frequency_penalty * static_cast<double>(count);
             return value;
         };
+
+        struct Restore {
+            const decltype(previous_drafts)& undo;
+
+            ~Restore() { undo(-1); }
+        } restore{previous_drafts};
         const auto better = [](const auto& lhs, const auto& rhs) {
             return lhs.first > rhs.first || (lhs.first == rhs.first && lhs.second < rhs.second);
         };
@@ -419,64 +435,70 @@ struct SparseAcceptSuite {
             .lengths         = initial_lengths,
             .anchors         = std::vector<std::int32_t>(kSparseBatch),
         };
-        for (int row = 0; row < kSparseBatch; ++row) {
-            const int extent = std::clamp(extents[static_cast<std::size_t>(row)], 0, kSparseDrafts);
-            int accepted_count = 0;
-            int terminal_token = 0;
-            for (int column = 0; column <= extent; ++column) {
-                const TargetDistribution target = sparse_target_distribution(
-                    logits, row, column, configs[static_cast<std::size_t>(row)], token_counts,
-                    drafts);
-                if (column == extent) {
+        // Rows are independent; each worker owns its draft-count scratch.
+        parallel_ranges(kSparseBatch, kSparseBatch, [&](std::int64_t begin, std::int64_t end) {
+            std::vector<std::int32_t> draft_counts(static_cast<std::size_t>(kSparseTokenDomain), 0);
+            for (auto row = static_cast<int>(begin); row < end; ++row) {
+                const int extent =
+                    std::clamp(extents[static_cast<std::size_t>(row)], 0, kSparseDrafts);
+                int accepted_count = 0;
+                int terminal_token = 0;
+                for (int column = 0; column <= extent; ++column) {
+                    const TargetDistribution target = sparse_target_distribution(
+                        logits, row, column, configs[static_cast<std::size_t>(row)], token_counts,
+                        drafts, draft_counts);
+                    if (column == extent) {
+                        const double uniform = oracle_uniform(
+                            configs[static_cast<std::size_t>(row)].seed,
+                            initial_lengths[static_cast<std::size_t>(row)] + extent + 1,
+                            ops::kSamplePurposeSpeculativeBonus);
+                        terminal_token = sample_target_distribution(target, uniform);
+                        break;
+                    }
+
+                    const int draft =
+                        drafts[static_cast<std::size_t>(row) * kSparseDrafts + column];
+                    if (!(configs[static_cast<std::size_t>(row)].temperature > 0.0f)) {
+                        if (target.ids.front() == draft) {
+                            ++accepted_count;
+                            continue;
+                        }
+                        terminal_token = target.ids.front();
+                        break;
+                    }
+
+                    const double p = distribution_probability(target, draft);
+                    const double q =
+                        sparse_proposal_probability(candidate_ids, proposal_q, row, column, draft);
                     const double uniform =
                         oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
-                                       initial_lengths[static_cast<std::size_t>(row)] + extent + 1,
-                                       ops::kSamplePurposeSpeculativeBonus);
-                    terminal_token = sample_target_distribution(target, uniform);
-                    break;
-                }
-
-                const int draft = drafts[static_cast<std::size_t>(row) * kSparseDrafts + column];
-                if (!(configs[static_cast<std::size_t>(row)].temperature > 0.0f)) {
-                    if (target.ids.front() == draft) {
+                                       initial_lengths[static_cast<std::size_t>(row)] + column + 1,
+                                       ops::kSamplePurposeSpeculativeAccept);
+                    if (p >= q || uniform * q < p) {
                         ++accepted_count;
                         continue;
                     }
-                    terminal_token = target.ids.front();
+                    const double correction_uniform =
+                        oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
+                                       initial_lengths[static_cast<std::size_t>(row)] + column + 1,
+                                       ops::kSamplePurposeSpeculativeCorrection);
+                    terminal_token = sample_sparse_residual(target, candidate_ids, proposal_q, row,
+                                                            column, correction_uniform);
                     break;
                 }
 
-                const double p = distribution_probability(target, draft);
-                const double q =
-                    sparse_proposal_probability(candidate_ids, proposal_q, row, column, draft);
-                const double uniform =
-                    oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
-                                   initial_lengths[static_cast<std::size_t>(row)] + column + 1,
-                                   ops::kSamplePurposeSpeculativeAccept);
-                if (p >= q || uniform * q < p) {
-                    ++accepted_count;
-                    continue;
+                const std::size_t row_base   = static_cast<std::size_t>(row) * kSparseColumns;
+                const std::size_t draft_base = static_cast<std::size_t>(row) * kSparseDrafts;
+                for (int item = 0; item < accepted_count; ++item) {
+                    expected.licensed_tokens[row_base + item] = drafts[draft_base + item];
                 }
-                const double correction_uniform =
-                    oracle_uniform(configs[static_cast<std::size_t>(row)].seed,
-                                   initial_lengths[static_cast<std::size_t>(row)] + column + 1,
-                                   ops::kSamplePurposeSpeculativeCorrection);
-                terminal_token = sample_sparse_residual(target, candidate_ids, proposal_q, row,
-                                                        column, correction_uniform);
-                break;
+                expected.licensed_tokens[row_base + accepted_count]     = terminal_token;
+                expected.licensed_counts[static_cast<std::size_t>(row)] = accepted_count + 1;
+                expected.accepted[static_cast<std::size_t>(row)]        = accepted_count;
+                expected.lengths[static_cast<std::size_t>(row)] += accepted_count + 1;
+                expected.anchors[static_cast<std::size_t>(row)] = terminal_token;
             }
-
-            const std::size_t row_base   = static_cast<std::size_t>(row) * kSparseColumns;
-            const std::size_t draft_base = static_cast<std::size_t>(row) * kSparseDrafts;
-            for (int item = 0; item < accepted_count; ++item) {
-                expected.licensed_tokens[row_base + item] = drafts[draft_base + item];
-            }
-            expected.licensed_tokens[row_base + accepted_count]     = terminal_token;
-            expected.licensed_counts[static_cast<std::size_t>(row)] = accepted_count + 1;
-            expected.accepted[static_cast<std::size_t>(row)]        = accepted_count;
-            expected.lengths[static_cast<std::size_t>(row)] += accepted_count + 1;
-            expected.anchors[static_cast<std::size_t>(row)] = terminal_token;
-        }
+        });
         return expected;
     }
 

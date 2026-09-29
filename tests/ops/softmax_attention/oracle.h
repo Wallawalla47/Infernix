@@ -1,13 +1,13 @@
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
+#include "ops/host_parallel.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
-#include <thread>
 #include <vector>
 
 namespace ninfer::test {
@@ -33,11 +33,15 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
     const auto run_rows = [&](std::int64_t first, std::int64_t last) {
         std::vector<double> scores(static_cast<std::size_t>(key_tokens));
         std::vector<double> numerators(static_cast<std::size_t>(geometry.head_dim));
+        std::vector<double> query_row(static_cast<std::size_t>(geometry.head_dim));
         for (auto row = first; row < last; ++row) {
             const int query      = row / geometry.query_heads;
             const int query_head = row % geometry.query_heads;
             const int kv_head    = query_head / group;
-            double maximum       = -std::numeric_limits<double>::infinity();
+            for (int d = 0; d < geometry.head_dim; ++d) {
+                query_row[static_cast<std::size_t>(d)] = query_value(d, query_head, query);
+            }
+            double maximum = -std::numeric_limits<double>::infinity();
             for (int key = 0; key < key_tokens; ++key) {
                 if (!visible(query, key)) {
                     scores[static_cast<std::size_t>(key)] =
@@ -46,7 +50,7 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
                 }
                 double dot = 0.0;
                 for (int d = 0; d < geometry.head_dim; ++d) {
-                    dot += query_value(d, query_head, query) * key_value(d, kv_head, key);
+                    dot += query_row[static_cast<std::size_t>(d)] * key_value(d, kv_head, key);
                 }
                 const double score                    = dot * scale;
                 scores[static_cast<std::size_t>(key)] = score;
