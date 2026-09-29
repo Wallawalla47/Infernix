@@ -143,13 +143,26 @@ void invalid_directories() {
         file.seekp(16);
         file.put(0);
     }
-    Reader wrong_part(fixture.entry);
-    rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
-            "foreign continuation accepted");
+    // A mapped file cannot be truncated or resized while its section is open (Windows returns
+    // ERROR_USER_MAPPED_FILE), so every rewrite happens with no Reader alive.
+    {
+        Reader wrong_part(fixture.entry);
+        rejects([&] { (void)wrong_part.read_object(wrong_part.find("q5")); },
+                "foreign continuation accepted");
+    }
     fixture.write();
+#ifdef _WIN32
+    std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
+    rejects([&] {
+        Reader shortened(fixture.entry);
+        (void)shortened.read_range(499, 1);
+    }, "truncated entry was accepted");
+#else
+    // POSIX permits resizing under an open mapping, so the read-time EOF check runs there.
     Reader shortened(fixture.entry);
     std::filesystem::resize_file(fixture.entry, std::filesystem::file_size(fixture.entry) - 1);
     rejects([&] { (void)shortened.read_range(499, 1); }, "premature EOF accepted");
+#endif
 }
 
 } // namespace

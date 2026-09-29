@@ -6,6 +6,7 @@
 #include "serve/request_log.h"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/logger.h>
 
 #include <chrono>
 #include <exception>

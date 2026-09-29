@@ -5,6 +5,12 @@
 #include <cstdint>
 #include <iostream>
 
+// The Windows SDK's minwindef.h defines `near` as an empty legacy compatibility
+// macro; drop it so the local helper below keeps its name.
+#ifdef _WIN32
+#undef near
+#endif
+
 namespace {
 
 int check(bool condition, const char* message) {

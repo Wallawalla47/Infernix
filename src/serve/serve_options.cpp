@@ -75,17 +75,17 @@ std::size_t parse_host_context_mib(const char* text) {
     if (fraction.size() > 20) {
         throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
     }
-    unsigned __int128 numerator = 0;
-    unsigned __int128 divisor   = 1;
-    for (const char character : fraction) {
-        numerator = numerator * 10 + static_cast<unsigned int>(character - '0');
-        divisor *= 10;
+    // Horner from the last digit: every partial value is below 10 MiB and, when the whole
+    // fraction resolves to whole bytes, every division is exact (5^k divides each suffix).
+    std::size_t fractional_bytes = 0;
+    for (auto it = fraction.rbegin(); it != fraction.rend(); ++it) {
+        const std::size_t scaled =
+            fractional_bytes + static_cast<std::size_t>(*it - '0') * bytes_per_mib;
+        if (scaled % 10 != 0) {
+            throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
+        }
+        fractional_bytes = scaled / 10;
     }
-    numerator *= bytes_per_mib;
-    if (numerator % divisor != 0) {
-        throw std::invalid_argument("--host-context-mib must resolve to a whole number of bytes");
-    }
-    const std::size_t fractional_bytes = static_cast<std::size_t>(numerator / divisor);
     const std::size_t whole_bytes      = whole_mib * bytes_per_mib;
     if (fractional_bytes > maximum - whole_bytes) {
         throw std::invalid_argument("--host-context-mib is out of range");

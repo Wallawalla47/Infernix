@@ -1092,7 +1092,7 @@ private:
         for (;;) {
             if (!*node) {
                 *node = std::make_shared<DirectoryNode>();
-            } else if (!node->unique()) {
+            } else if (node->use_count() != 1) {
                 *node = std::make_shared<DirectoryNode>(**node);
             }
             if (width == kDirectoryChunkPages) { return (*node)->pages[page]; }
@@ -1140,7 +1140,7 @@ private:
         }
         // A shared node contains only retained prefix pages: appending a suffix made its
         // changed path private. It needs no pruning when all removed pages lived elsewhere.
-        if (!node.unique()) { return; }
+        if (node.use_count() != 1) { return; }
         if (width == kDirectoryChunkPages) {
             std::fill(node->pages.begin() + count, node->pages.end(), LogicalKVPageHandle{});
         } else {

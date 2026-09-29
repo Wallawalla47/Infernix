@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/read_only_file.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -24,8 +26,12 @@ public:
 
 private:
     std::filesystem::path path_;
+#ifdef _WIN32
+    ninfer::ReadOnlyFile file_;
+#else
     int fd_                = -1;
     mutable int direct_fd_ = -1;
+#endif
     std::uint64_t bytes_   = 0;
 };
 

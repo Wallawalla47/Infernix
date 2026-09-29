@@ -3,7 +3,12 @@
 
 #include <spdlog/logger.h>
 
-#include <unistd.h>
+#ifdef _WIN32
+#    include <fcntl.h>
+#    include <io.h>
+#else
+#    include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -17,36 +22,59 @@
 
 namespace {
 
+#ifdef _WIN32
+constexpr int STDERR_FILENO = 2;
+// Text-mode pipe: the stdio layer emits \r\n for the stderr writes, and _read normalizes it
+// back to \n so the captured bytes match the POSIX expectation.
+inline int port_pipe(int fds[2])   { return _pipe(fds, 0, _O_TEXT); }
+inline int port_dup(int fd)        { return _dup(fd); }
+inline int port_dup2(int a, int b) { return _dup2(a, b); }
+inline int port_close(int fd)      { return _close(fd); }
+inline int port_read(int fd, void* buffer, unsigned long count) {
+    return _read(fd, buffer, static_cast<unsigned int>(count));
+}
+#else
+inline int port_pipe(int fds[2])   { return ::pipe(fds); }
+inline int port_dup(int fd)        { return ::dup(fd); }
+inline int port_dup2(int a, int b) { return ::dup2(a, b); }
+inline int port_close(int fd)      { return ::close(fd); }
+inline int port_read(int fd, void* buffer, std::size_t count) {
+    return static_cast<int>(::read(fd, buffer, count));
+}
+#endif
+
 class StderrCapture {
 public:
     StderrCapture() {
-        if (::pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
-        saved_ = ::dup(STDERR_FILENO);
-        if (saved_ < 0 || ::dup2(pipe_[1], STDERR_FILENO) < 0) {
+        if (port_pipe(pipe_) != 0) { throw std::runtime_error(std::strerror(errno)); }
+        saved_ = port_dup(STDERR_FILENO);
+        if (saved_ < 0 || port_dup2(pipe_[1], STDERR_FILENO) < 0) {
             throw std::runtime_error(std::strerror(errno));
         }
-        ::close(pipe_[1]);
+        port_close(pipe_[1]);
         pipe_[1] = -1;
     }
 
     ~StderrCapture() {
         if (saved_ >= 0) {
-            (void)::dup2(saved_, STDERR_FILENO);
-            ::close(saved_);
+            (void)port_dup2(saved_, STDERR_FILENO);
+            port_close(saved_);
         }
-        if (pipe_[0] >= 0) { ::close(pipe_[0]); }
+        if (pipe_[0] >= 0) { port_close(pipe_[0]); }
     }
 
     std::string finish() {
         std::fflush(stderr);
-        if (::dup2(saved_, STDERR_FILENO) < 0) { throw std::runtime_error(std::strerror(errno)); }
-        ::close(saved_);
+        if (port_dup2(saved_, STDERR_FILENO) < 0) {
+            throw std::runtime_error(std::strerror(errno));
+        }
+        port_close(saved_);
         saved_ = -1;
 
         std::string output;
         std::array<char, 4096> buffer{};
         for (;;) {
-            const ssize_t count = ::read(pipe_[0], buffer.data(), buffer.size());
+            const int count = port_read(pipe_[0], buffer.data(), buffer.size());
             if (count == 0) { break; }
             if (count < 0) {
                 if (errno == EINTR) { continue; }
@@ -54,7 +82,7 @@ public:
             }
             output.append(buffer.data(), static_cast<std::size_t>(count));
         }
-        ::close(pipe_[0]);
+        port_close(pipe_[0]);
         pipe_[0] = -1;
         return output;
     }
