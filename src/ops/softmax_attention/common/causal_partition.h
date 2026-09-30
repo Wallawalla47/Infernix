@@ -6,8 +6,8 @@
 
 namespace ninfer::ops::detail {
 
-// Capture reserves partials for the largest live row. Producer and merge use
-// the same live count; a wider capture never changes a row's work partition.
+// Capture reserves partials for the largest row window. Producer and merge use
+// the same row window; a wider capture never changes a row's work partition.
 struct CausalKvPartition {
     static constexpr int kMaxSplits = 256;
     int capacity                    = 1;
@@ -32,6 +32,16 @@ inline constexpr bool causal_query_tiles_underfill_sms(int independent_tiles,
 inline constexpr int causal_partition_target(std::int64_t cta_budget, int independent_tiles) {
     return static_cast<int>(
         std::clamp<std::int64_t>(cta_budget / independent_tiles, 1, CausalKvPartition::kMaxSplits));
+}
+
+// A row partitions KV as if all of its physical columns were live, so masking trailing columns
+// never moves the split boundaries of the live ones. Live positions are sequential from the
+// first, so a dense row's window is its last position plus one. The envelope bounds the window
+// only where the physical width reaches past the visible capacity.
+__host__ __device__ inline int causal_row_window(int first_position, int width,
+                                                 int visible_capacity) {
+    const int window = first_position + width;
+    return window < visible_capacity ? window : visible_capacity;
 }
 
 } // namespace ninfer::ops::detail

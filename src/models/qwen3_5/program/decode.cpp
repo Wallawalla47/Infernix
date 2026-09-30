@@ -784,9 +784,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             }
         }
     }
-    const std::uint32_t width           = verify_drafts + 1U;
-    std::uint32_t maximum_frontier      = 0;
-    std::uint32_t maximum_target_tokens = 1;
+    const std::uint32_t width      = verify_drafts + 1U;
+    std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
         if (lane >= max_concurrency ||
@@ -811,18 +810,15 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             sequence.prefix_digests.size() != sequence.ledger_frontier) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
-        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                ? budgets[row].generated_tokens_remaining - 1U
-                                                : 0U;
-        const bool row_copy = any_ngram && !matches[row].tokens.empty();
-        const std::uint32_t extent =
-            std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                               : (drafter_runs ? neural_draft_window : 0U),
-                      max_by_budget, capacity - sequence.execution_frontier - 1U});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
-        maximum_target_tokens =
-            std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
     }
+    // Verification attention partitions each row by its full window, so the envelope covers the
+    // window rather than the drafts a row actually carries.
+    const auto target_envelope_for = [&](std::uint32_t max_execution_frontier) {
+        return ops::CausalAttentionExecutionEnvelope{
+            1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                   capacity, static_cast<std::uint64_t>(max_execution_frontier) + width))};
+    };
 
     try {
         std::optional<nvtx::ScopedRange> submit_range;
@@ -830,7 +826,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable    = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier);
-        ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
+        auto target_envelope                 = target_envelope_for(maximum_frontier);
         if (use_cuda_graph) {
             DecodeGraphProfile& profile =
                 select_graph_profile(graph_family, static_cast<std::uint32_t>(lanes.size()),
@@ -838,10 +834,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             executable = &install_graph_profile(graph_family, profile, "DFlash/ngram batch");
             envelopes =
                 dflash_envelopes(profile.min_execution_frontier, profile.max_execution_frontier);
-            target_envelope = {
-                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                       capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     verify_drafts + 1ULL))};
+            target_envelope = target_envelope_for(profile.max_execution_frontier);
         }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {

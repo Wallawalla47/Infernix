@@ -95,7 +95,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(256) * Geometry::QHeads * column_base;
-    const int last_pos = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int last_pos  = pos[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first = pos[MultiBatch ? batch * full_width : 0];
     pos += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(256) * Geometry::KVHeads * column_base;
@@ -115,7 +116,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (valid_tokens == 0) return; // Merge writes exact zero for masked columns.
     if (pos[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles    = div_up(window, Bc);
@@ -123,6 +126,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
     const int split_start      = first_owned_tile * Bc;
     const int split_end        = min(end_owned_tile * Bc, window);
+    const int load_end         = min(split_end, live_end);
     const int first_tile       = split_start;
     const int key_blocks       = div_up(split_end - first_tile, Bc);
 
@@ -280,7 +284,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -296,7 +300,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
@@ -466,7 +470,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }

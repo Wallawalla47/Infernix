@@ -61,7 +61,8 @@ void launch_bf16_kv_grouped_mma(const CausalAttentionOperands& p, Bf16KvCacheVie
                         partition.capacity, p.batch);
         kernel<<<grid, S::kThreads, dynamic, stream>>>(
             p.q, input, p.positions, cache.keys, cache.values, cache.tables, cache.valid_columns,
-            cache.table_rows, cache.table_stride, p.width, p.scale, partition, partials);
+            cache.table_rows, cache.table_stride, p.width, p.visible_capacity, p.scale, partition,
+            partials);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -75,7 +76,7 @@ void launch_bf16_kv_merge(const CausalAttentionOperands& p, Bf16KvCacheView<Writ
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
     bf16_kv_merge_kernel<G, S, MultiBatch, Masked><<<grid, S::kThreads, 0, stream>>>(
         partials.acc, partials.maximum, partials.sum, p.positions, cache.valid_columns, p.width,
-        p.batch, partition, p.out);
+        p.batch, p.visible_capacity, partition, p.out);
     CUDA_CHECK(cudaGetLastError());
 }
 

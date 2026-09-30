@@ -88,6 +88,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
     const int global_last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first       = positions[MultiBatch ? batch * full_width : 0];
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -112,7 +113,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const std::int32_t last_pos  = ParallelQueries ? global_last_pos : positions[TokenTile - 1];
     if (first_pos < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
 
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
 
@@ -121,6 +124,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int end_owned_tile   = (split + 1) * logical_tiles / active_split_count;
     const int split_start      = first_owned_tile * Bc;
     const int split_end        = min(end_owned_tile * Bc, window);
+    const int load_end         = min(split_end, live_end);
     const int first_tile       = split_start;
     const int key_blocks       = div_up(split_end - first_tile, Bc);
     const int first_page       = first_tile >> kPagedKVPageShift;
@@ -248,7 +252,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
                 const int key                   = tile_k0 + key_l;
-                const int valid_keys            = max(0, min(8, split_end - key));
+                const int valid_keys            = max(0, min(8, load_end - key));
                 const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
                 cp_async_zfill<16, Cache::cg>(&k_scale_s[key_l], &cache_k_scale[scale_offset],
@@ -259,7 +263,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         } else {
             for (int key_l = tid; key_l < Bc; key_l += Threads) {
                 const int key = tile_k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const std::int64_t scale_offset = kv_cache_fp8_scale_index<Geometry>(
                         physical_page, kv_head, key & kPagedKVPageMask);
                     k_scale_s[key_l] = cache_k_scale[scale_offset];
@@ -277,7 +281,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -425,7 +429,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     store_vec(dst, fp8_kv_dequant_f16x8(&v_fp8[key_l * D + d], v_scale_s[key_l]));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
