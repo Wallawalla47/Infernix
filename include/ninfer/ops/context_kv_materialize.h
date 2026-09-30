@@ -37,7 +37,7 @@ struct ContextKVMaterializeExecutionEnvelope {
  *
  * context is contiguous BF16 [5120,W,B], positions is contiguous device I32 [W,B], and counts
  * and state_slots are contiguous device I32 [B]. The registered domains are context blocks
- * W=1..16,B=1..8 and single-request prefill B=1,W=1..2048. W is the physical context width,
+ * W=1..64,B=1..8 and single-request prefill B=1,W=1..2048. W is the physical context width,
  * independent of the draft width and the device-selected committed prefix. Each of the five layer
  * views contains independent RowSplit Q8_G32_FP16 key/value weights [1024,5120], a BF16 key norm
  * weight [128], and a capacity-2048 D128/H8 cyclic cache with BF16 K and FP16 V. All five caches
