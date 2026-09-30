@@ -25,7 +25,7 @@ namespace ninfer::ops {
  *   verify_ids/alignment_ids are distinct contiguous I32 [K+1,B]. ar_positions,
  *   ar_rope_positions, and ar_valid_columns are I32 [B,max(N-1,1)] with contiguous rows and one
  *   shared step stride at least B; this permits an exact-B prefix of a fixed-capacity frame. All
- *   other tensors are contiguous I32 [B]. B>=1, 1<=K<=31 (up to 63 at B=1),
+ *   other tensors are contiguous I32 [B]. B>=1, 1<=K<=63,
  *   1<=N<=5, 0<=accepted[b]<=K,
  *   where N is the explicit next_draft_limit.
  *   licensed_counts[b]=accepted[b]+1, updated_frontiers and remaining_budgets are non-negative,
