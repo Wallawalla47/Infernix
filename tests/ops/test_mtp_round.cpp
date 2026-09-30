@@ -163,7 +163,7 @@ int main() {
     for (int k = 1; k <= 63; ++k) {
         for (int next_k = 1; next_k <= 5; ++next_k) {
             for (int a = 0; a <= k; ++a) { failures += run_case(k, {a}, next_k); }
-            if (k <= 31) failures += run_case(k, {0, k / 2, k, 0, 1, k, k / 2, k}, next_k);
+            failures += run_case(k, {0, k / 2, k, 0, 1, k, k / 2, k}, next_k);
         }
     }
 

@@ -66,7 +66,8 @@ struct ConvGeometry {
 
 ConvGeometry require_snapshot_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
+    // A multi-request call admits the verification widths; one request also admits prefill.
+    constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
     if (width <= 0 || batch <= 0 || batch > kMaximumBatch || (batch > 1 && width > kMaximumWidth)) {
@@ -82,8 +83,7 @@ ConvGeometry require_record_input(const Tensor& x, std::int32_t hidden) {
     constexpr std::int32_t kMaximumWidth = 64;
     const std::int32_t width             = x.ne[1];
     const std::int32_t batch             = x.ne[2];
-    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch ||
-        (batch > 1 && width > 16)) {
+    if (width < kMinimumWidth || width > kMaximumWidth || batch <= 0 || batch > kMaximumBatch) {
         throw std::invalid_argument("gdn_input_proj_conv_record: unsupported B/T domain");
     }
     require_conv_tensor(x, hidden, width, batch, "gdn_input_proj_conv_record", "x");
@@ -233,7 +233,7 @@ void require_parent_nonoverlap(const Weight& weight,
 void require_snapshot_capacity_domain(std::int32_t batch_size, std::int32_t min_width,
                                       std::int32_t max_width) {
     constexpr std::int32_t kMaximumBatch = 8;
-    constexpr std::int32_t kMaximumWidth = 16;
+    constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width <= 0 || max_width < min_width ||
         (batch_size > 1 && max_width > kMaximumWidth)) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: invalid B/W domain");
@@ -246,7 +246,7 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
     constexpr std::int32_t kMinimumWidth = 2;
     constexpr std::int32_t kMaximumWidth = 64;
     if (batch_size <= 0 || batch_size > kMaximumBatch || min_width < kMinimumWidth ||
-        max_width < min_width || max_width > kMaximumWidth || (batch_size > 1 && max_width > 16)) {
+        max_width < min_width || max_width > kMaximumWidth) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: invalid B/T domain");
     }
 }

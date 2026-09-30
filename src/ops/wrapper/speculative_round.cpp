@@ -12,7 +12,6 @@ namespace ninfer::ops {
 namespace {
 
 constexpr std::int32_t kSparseMaxDrafts        = 63;
-constexpr std::int32_t kSparseBatchedMaxDrafts = 31;
 constexpr std::int32_t kSparseCandidates       = 16;
 constexpr std::int32_t kSparsePhysicalRows     = 248320;
 constexpr std::int32_t kSparseTokenDomain      = 248077;
@@ -101,7 +100,7 @@ std::size_t speculative_accept_sparse_drafts_workspace_capacity_bytes(
     std::int32_t max_drafts, std::int32_t min_batch, std::int32_t max_batch) {
     if (token_domain != kSparseTokenDomain || min_drafts < 1 || max_drafts < min_drafts ||
         max_drafts > kSparseMaxDrafts || min_batch < 1 || max_batch < min_batch ||
-        max_batch > kSparseMaxBatch || (max_drafts > kSparseBatchedMaxDrafts && max_batch != 1)) {
+        max_batch > kSparseMaxBatch) {
         throw std::invalid_argument("sparse speculative accept workspace: unsupported profile");
     }
     if (envelope.all_rows_greedy_without_penalties) { return 0; }
@@ -241,9 +240,6 @@ void speculative_accept_sparse_drafts(
     const std::int32_t batch   = drafts.ne[1];
     if (batch < 1 || batch > kSparseMaxBatch) {
         throw std::invalid_argument("speculative_accept_sparse_drafts: B must be 1..8");
-    }
-    if (k > kSparseBatchedMaxDrafts && batch != 1) {
-        throw std::invalid_argument("speculative_accept_sparse_drafts: K>31 requires B=1");
     }
     require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
     require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");

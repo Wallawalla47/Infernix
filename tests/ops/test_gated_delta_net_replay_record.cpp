@@ -289,7 +289,7 @@ int main() {
     }
 
     int failures = 0;
-    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {1, 1}}) {
+    for (const auto [batch, width] : {std::pair{2, 65}, {9, 16}, {1, 65}, {1, 1}}) {
         Tensor q(nullptr, DType::BF16, {128, 16, width, batch});
         Tensor v(nullptr, DType::BF16, {128, 48, width, batch});
         Tensor empty;
@@ -316,11 +316,16 @@ int main() {
             failures += run_case(48, width, 1, {width / 2}, 1830U + width);
             failures += run_case(32, width, 1, {}, 1930U + width);
             failures += run_case(32, width, 1, {width / 2}, 2030U + width);
-            continue;
         }
         std::vector<std::int32_t> valid(8);
         for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (3 * b) % width;
         failures += run_case(48, width, 8, valid, 1760U + width);
+    }
+    // Batched ngram copy rounds above 16 columns: dense and ragged pairs for both head layouts.
+    for (const int width : {17, 31, 32, 48, 63, 64}) {
+        failures += run_case(48, width, 2, {}, 2130U + width);
+        failures += run_case(32, width, 2, {width, width / 3}, 2230U + width);
+        failures += run_case(32, width, 4, {1, width, width / 2, 2}, 2330U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";

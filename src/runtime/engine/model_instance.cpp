@@ -113,12 +113,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram session capacity must be between 1 MiB and the total "
                                     "archive capacity");
     }
-    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
-    // and cannot be narrowed for batch>1, and the GDN conv-record workspace admits at most 16
-    // verification columns for a multi-request batch.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
-    }
     const std::uint32_t concurrency = options.max_concurrency;
     cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
     const std::uint64_t total_device_state_slots =

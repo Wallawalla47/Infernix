@@ -1640,8 +1640,19 @@ int main(int argc, char** argv) {
             std::cerr << "wide workspace interval mismatch\n";
             ++failures;
         }
+        // Batched ngram copy rounds above 31 drafts.
+        for (const auto [k, batch] : {std::pair{32, 2}, std::pair{47, 4}, std::pair{63, 8}}) {
+            SparseAcceptSuite suite(k, batch);
+            for (int variant = 0; variant < 4; ++variant) {
+                failures += suite.generated_general_case(false, false, variant);
+                failures += suite.generated_general_case(true, false, variant);
+                failures += suite.generated_general_case(true, true, variant);
+            }
+            failures += suite.repeated_history_case(false);
+            failures += suite.repeated_history_case(true);
+        }
         for (const bool greedy : {false, true}) {
-            for (const auto [k, batch] : {std::pair{32, 2}, std::pair{63, 8}, std::pair{64, 1}}) {
+            for (const auto [k, batch] : {std::pair{63, 9}, std::pair{64, 2}, std::pair{64, 1}}) {
                 try {
                     (void)ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                         kSparseTokenDomain, {greedy}, 1, k, 1, batch);
@@ -1789,8 +1800,8 @@ int main(int argc, char** argv) {
     for (bool raw : {false, true}) {
         try {
             (void)ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-                kSparseTokenDomain, {raw}, 1, 32, 1, 8);
-            std::cerr << "sparse query admitted K=32 at B=8\n";
+                kSparseTokenDomain, {raw}, 1, 64, 1, 8);
+            std::cerr << "sparse query admitted K=64 at B=8\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
     }

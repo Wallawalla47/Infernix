@@ -79,12 +79,9 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
     throw std::logic_error("fp8 GDN materialized projection received a fused plan");
 }
 
-Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t width,
-                                             std::int32_t batch_size) {
-    require_policy(policy, "fp8 GDN snapshot");
-    if (width <= 0 || batch_size <= 0 || batch_size > 8 || (batch_size > 1 && width > 16)) {
-        throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
-    }
+// Record and snapshot choose the same arithmetic for the same physical block.
+Fp8GdnConvPlan fp8_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t width,
+                                         std::int32_t batch_size) {
     if (batch_size == 1) {
         if (allows_a8(policy) && width >= 17) { return {Fp8GdnConvScheduleId::MaterializedA8}; }
         return b1_a16_plan(width);
@@ -95,15 +92,22 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
     return {Fp8GdnConvScheduleId::MaterializedA16};
 }
 
+Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t width,
+                                             std::int32_t batch_size) {
+    require_policy(policy, "fp8 GDN snapshot");
+    if (width <= 0 || batch_size <= 0 || batch_size > 8 || (batch_size > 1 && width > 64)) {
+        throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
+    }
+    return fp8_gdn_conv_resolve_plan(policy, width, batch_size);
+}
+
 Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t width,
                                            std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN record");
-    if (width < 2 || width > 64 || batch_size <= 0 || batch_size > 8 ||
-        (batch_size > 1 && width > 16)) {
+    if (width < 2 || width > 64 || batch_size <= 0 || batch_size > 8) {
         throw std::invalid_argument("fp8 GDN record: invalid B/W domain");
     }
-    // Record and snapshot must choose the same arithmetic for the same physical block.
-    return fp8_gdn_snapshot_resolve_plan(policy, width, batch_size);
+    return fp8_gdn_conv_resolve_plan(policy, width, batch_size);
 }
 
 } // namespace

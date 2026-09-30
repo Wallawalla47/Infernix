@@ -39,7 +39,7 @@ int main(int argc, char** argv) {
     }
     // --extended runs only the reads beyond the native visible-key ceiling (--rope-yarn-factor).
     if (extended) return run_softmax_attention_extended_tests(storage);
-    // --wide-only runs only the single-row ngram verification widths 17-64.
+    // --wide-only runs only the ngram verification widths 17-64, single-row and batched.
     if (wide) return run_softmax_attention_wide_tests(storage);
     const int causal = run_softmax_attention_causal_cache_tests(storage);
     if (causal == 77) return 77;

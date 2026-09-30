@@ -358,17 +358,18 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
-    if (width > 16) {
+    if (rows == 1) {
+        // Two active rows bound to the same state slots would race; any width rejects them.
         const std::array invalid_rows{fold_rows[0], fold_rows[0]};
         bool rejected = false;
         try {
             fold_plan.execute(invalid_rows, nullptr);
         } catch (const std::invalid_argument& error) {
-            rejected = std::string_view(error.what()).find("active row count is out of range") !=
-                       std::string_view::npos;
+            rejected =
+                std::string_view(error.what()).find("bindings overlap") != std::string_view::npos;
         }
         if (!rejected) {
-            std::cerr << "wide replay fold did not reject multiple active rows\n";
+            std::cerr << "replay fold did not reject overlapping active rows\n";
             return 1;
         }
     }
@@ -795,6 +796,15 @@ int main(int argc, char** argv) {
                 failures += run_case({48, 48, 10240}, width, 1, {commit}, 2200U + commit, true);
                 failures += run_case({30, 32, 8192}, width, 1, {commit}, 2300U + commit, true);
             }
+        }
+        // Batched ngram copy rounds above 16 columns.
+        for (const int width : {17, 32, 48, 64}) {
+            failures +=
+                run_case({48, 48, 10240}, width, 2, {width, width / 2}, 2400U + width, true);
+            failures += run_case({30, 32, 8192}, width, 4, {0, width, 1, width - 1}, 2450U + width);
+            failures +=
+                run_case({48, 48, 10240}, width, 8, {width, 0, 1, 2, width / 3, width - 1, 7, 16},
+                         2500U + width, true);
         }
         failures += run_record_fold_rounds<64>();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " wide gdn_replay_fold\n";

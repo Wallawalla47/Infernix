@@ -866,13 +866,9 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
           options.speculative.backend != SpeculativeBackend::DFlash &&
           options.speculative.backend != SpeculativeBackend::Mtp) ||
-         options.speculative.ngram_draft_tokens > 63 ||
-         options.speculative.ngram_min_match < 4 || options.speculative.ngram_min_match > 64 ||
-         (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1))) {
-        throw std::invalid_argument(
-            "ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64; the GDN conv-record "
-            "workspace admits at most 16 verification columns for a multi-request batch, so K "
-            "above 15 requires concurrency one");
+         options.speculative.ngram_draft_tokens > 63 || options.speculative.ngram_min_match < 4 ||
+         options.speculative.ngram_min_match > 64)) {
+        throw std::invalid_argument("ngram requires MTP/DFlash/DFlash2, K1..63 and match 4..64");
     }
 }
 
