@@ -176,26 +176,38 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
 
 const GdnReplayRecords* ProgramImpl::round_replay_records(std::uint32_t verify_drafts) const {
     if (!replay_records) { return nullptr; }
-    if (narrow_replay_records && verify_drafts + 1U == static_cast<std::uint32_t>(
-                                                           narrow_replay_records->spec.width)) {
-        return &*narrow_replay_records;
+    if (verify_drafts == draft_window) { return &*replay_records; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return &view.records;
+        }
     }
-    if (verify_drafts != draft_window) {
-        throw std::logic_error("speculative round width has no ReplaySSM record view");
-    }
-    return &*replay_records;
+    throw std::logic_error("speculative round width has no ReplaySSM record view");
 }
 
 const ops::GdnReplayFoldPlan& ProgramImpl::round_replay_fold(std::uint32_t verify_drafts) const {
     if (!replay_fold) { throw std::logic_error("speculative round has no ReplaySSM fold"); }
-    if (narrow_replay_fold && verify_drafts + 1U == static_cast<std::uint32_t>(
-                                                        narrow_replay_records->spec.width)) {
-        return *narrow_replay_fold;
+    if (verify_drafts == draft_window) { return *replay_fold; }
+    for (const NarrowReplayView& view : narrow_replay_views) {
+        if (view.records.spec.width == static_cast<std::int32_t>(verify_drafts + 1U)) {
+            return view.fold;
+        }
     }
-    if (verify_drafts != draft_window) {
-        throw std::logic_error("speculative round width has no ReplaySSM fold");
+    throw std::logic_error("speculative round width has no ReplaySSM fold");
+}
+
+SpeculativeRoundFamily& ProgramImpl::round_family(SpeculativeRoundKind kind, std::uint32_t drafts) {
+    SpeculativeRoundFamily* best = nullptr;
+    for (SpeculativeRoundFamily& family : round_families) {
+        if (family.shape.kind != kind || family.shape.verify_drafts < drafts) { continue; }
+        if (best == nullptr || family.shape.verify_drafts < best->shape.verify_drafts) {
+            best = &family;
+        }
     }
-    return *replay_fold;
+    if (best == nullptr) {
+        throw std::logic_error("speculative round has no family of the requested width");
+    }
+    return *best;
 }
 
 void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
@@ -522,7 +534,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     // equal the frame's next-drafts width for the same reason.
     const std::uint32_t verify_drafts = draft_window;
     const std::uint32_t mtp_ar_depth  = std::min(draft_window, kMtpDecodeMaximumDrafts);
-    auto& graph_family                = ngram_draft_window != 0 ? ngram_graphs : mtp_graphs;
+    auto& graph_family                = round_family(SpeculativeRoundKind::Neural).graphs;
     const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -736,9 +748,11 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // round replays the neural family (which runs the drafter). In a batch>1 ngram round the
     // drafter also runs and the per-row copy payload overlays it on the device, so a row without
     // a copy keeps its neural proposal (extent neural_draft_window) instead of decoding one token.
-    const std::uint32_t verify_drafts = any_ngram ? ngram_draft_window : neural_draft_window;
+    SpeculativeRoundFamily& family =
+        round_family(any_ngram ? SpeculativeRoundKind::Ngram : SpeculativeRoundKind::Neural);
+    const std::uint32_t verify_drafts = family.shape.verify_drafts;
     const bool drafter_runs           = !any_ngram || lanes.size() > 1;
-    auto& graph_family                = any_ngram ? ngram_graphs : dflash_graphs;
+    auto& graph_family                = family.graphs;
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;

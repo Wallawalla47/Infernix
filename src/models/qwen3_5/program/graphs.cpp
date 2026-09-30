@@ -364,7 +364,7 @@ void ProgramImpl::prepare_graphs() {
                                                        std::uint32_t batch_size) {
             prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
         };
-        auto& graph_family = ngram_draft_window != 0 ? ngram_graphs : mtp_graphs;
+        auto& graph_family          = round_family(SpeculativeRoundKind::Neural).graphs;
         const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
         execution::MtpBatchContext mtp_state{execution_core(),
@@ -404,13 +404,13 @@ void ProgramImpl::prepare_graphs() {
                                  device, prepare_family);
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        for (const bool ngram : {false, true}) {
-            if (ngram && ngram_draft_window == 0) { continue; }
+        for (SpeculativeRoundFamily& family : round_families) {
             // Every family verifies at its own window for every batch size, on the one frame
             // viewed at that width, and records ReplaySSM transitions through the record view of
             // the same width. A batch>1 ngram round also runs the drafter so rows without a copy
             // keep their neural proposal.
-            const std::uint32_t family_window = ngram ? ngram_draft_window : neural_draft_window;
+            const bool ngram                  = family.shape.kind == SpeculativeRoundKind::Ngram;
+            const std::uint32_t family_window = family.shape.verify_drafts;
             const auto prepare_family = [&](std::uint32_t frontier, std::uint32_t batch_size) {
                 prepare_representative(frontier, batch_size, family_window, family_window);
             };
@@ -419,7 +419,7 @@ void ProgramImpl::prepare_graphs() {
                 core.replay_records           = round_replay_records(family_window);
                 return core;
             };
-            auto& graph_family = ngram ? ngram_graphs : dflash_graphs;
+            auto& graph_family = family.graphs;
             const auto planned_profiles =
                 dflash_graph_profiles(speculative_backend, capacity, family_window);
             validate_graph_profiles(planned_profiles, capacity - 1, "DFlash");

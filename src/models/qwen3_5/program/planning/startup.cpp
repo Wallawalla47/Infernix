@@ -64,6 +64,25 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+// The speculative round families an engine captures. MTP verifies every round in one family at the
+// wider of its neural and n-gram windows. DFlash verifies neural rounds at the drafter's window and
+// n-gram copy rounds at the n-gram window.
+std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options) {
+    const SpeculativeOptions& spec = options.speculative;
+    std::vector<SpeculativeRoundShape> shapes;
+    if (spec.backend == SpeculativeBackend::None) { return shapes; }
+    if (spec.backend == SpeculativeBackend::Mtp) {
+        shapes.push_back(
+            {SpeculativeRoundKind::Neural, std::max(spec.draft_tokens, spec.ngram_draft_tokens)});
+        return shapes;
+    }
+    shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
+    if (spec.ngram_draft_tokens != 0) {
+        shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
+    }
+    return shapes;
+}
+
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
@@ -862,6 +881,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->fast_prefill_kernel  = inputs.fast_prefill_kernel;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
+    impl->round_shapes         = inputs.round_shapes;
     impl->ngram_draft_window   = inputs.ngram_draft_window;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
@@ -891,23 +911,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             executables = static_cast<std::uint64_t>(
                               graph_topology_classes(ordinary_graph_profiles(impl->capacity))) *
                           impl->max_concurrency;
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // One MTP family captured at the frame's native width (the wider of the neural and
-            // ngram windows) with the frame's AR depth; an n-gram engine reuses it.
-            const std::uint32_t drafts   = impl->draft_window;
-            const std::uint32_t ar_depth = std::min(drafts, kMtpDecodeMaximumDrafts);
-            executables = static_cast<std::uint64_t>(graph_topology_classes(
-                              mtp_graph_profiles(impl->capacity, drafts, ar_depth))) *
-                          impl->max_concurrency;
         } else {
-            // Each DFlash family's profiles are captured at the family's own window for every
-            // batch size, on the one frame viewed at that width.
-            for (const std::uint32_t window :
-                 {impl->neural_draft_window, impl->ngram_draft_window}) {
-                if (window == 0) { continue; }
-                executables += static_cast<std::uint64_t>(graph_topology_classes(
-                                   dflash_graph_profiles(impl->speculative_backend,
-                                                         impl->capacity, window))) *
+            // Each speculative round family's profiles are captured at the family's own width for
+            // every batch size, on the one frame viewed at that width.
+            const std::uint32_t ar_depth = std::min(impl->draft_window, kMtpDecodeMaximumDrafts);
+            for (const SpeculativeRoundShape& shape : impl->round_shapes) {
+                const auto profiles =
+                    impl->speculative_backend == SpeculativeBackend::Mtp
+                        ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
+                        : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
+                                                shape.verify_drafts);
+                executables += static_cast<std::uint64_t>(graph_topology_classes(profiles)) *
                                impl->max_concurrency;
             }
         }
@@ -958,17 +972,22 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
+    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(options);
+    std::uint32_t draft_window                            = 0;
+    for (const SpeculativeRoundShape& shape : round_shapes) {
+        draft_window = std::max(draft_window, shape.verify_drafts);
+    }
     SequencePlanningInputs inputs{
         .parameters          = &parameters,
         .neural_draft_window = options.speculative.draft_tokens,
+        .round_shapes        = round_shapes,
         .ngram_draft_window  = options.speculative.ngram_draft_tokens,
         .ngram_min_match     = options.speculative.ngram_min_match,
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel = uses_fast_prefill_kernel(options),
-        .draft_window =
-            std::max(options.speculative.draft_tokens, options.speculative.ngram_draft_tokens),
+        .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,

@@ -77,14 +77,28 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
-        if (is_masked_draft_backend(speculative_backend) && ngram_draft_window != 0 &&
-            neural_draft_window != ngram_draft_window) {
-            const std::uint32_t narrow = std::min(neural_draft_window, ngram_draft_window);
-            narrow_replay_records.emplace(
-                replay_records->narrowed(static_cast<std::int32_t>(narrow + 1U)));
-            narrow_replay_fold.emplace(*narrow_replay_records,
-                                       state_images->linear().all_layers_view());
+        narrow_replay_views.reserve(plan.round_shapes.size());
+        for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+            const auto width = static_cast<std::int32_t>(shape.verify_drafts + 1U);
+            if (shape.verify_drafts == draft_window ||
+                std::any_of(narrow_replay_views.begin(), narrow_replay_views.end(),
+                            [width](const NarrowReplayView& view) {
+                                return view.records.spec.width == width;
+                            })) {
+                continue;
+            }
+            GdnReplayRecords narrowed = replay_records->narrowed(width);
+            ops::GdnReplayFoldPlan fold(narrowed, state_images->linear().all_layers_view());
+            narrow_replay_views.push_back(NarrowReplayView{narrowed, std::move(fold)});
         }
+    }
+    round_families.reserve(plan.round_shapes.size());
+    for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+        round_families.push_back(SpeculativeRoundFamily{shape, {}});
+    }
+    if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
+        replay_fold.has_value() != replay_records.has_value()) {
+        throw std::logic_error("ReplaySSM records do not match the sequence plan");
     }
     if (plan.persistent.dflash) {
         auto* local = state_images->dflash_local();
