@@ -39,7 +39,7 @@ int test_record_capacity_domain() {
         std::cerr << "record workspace did not reject unsupported B/T domain\n";
         ++failures;
     };
-    for (const auto [batch, width] : {std::pair{2, 17}, {8, 32}, {2, 64}, {1, 65}, {1, 1}}) {
+    for (const auto [batch, width] : {std::pair{2, 65}, {9, 16}, {1, 65}, {1, 1}}) {
         for (int values : {4096, 6144}) {
             rejects([&] {
                 return ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
@@ -337,6 +337,11 @@ int run_q4_q5() {
         failures += run(width, 1, {}, 2400U + width);
         failures += run(width, 1, {width / 2}, 2450U + width);
     }
+    // Batched ngram copy rounds above 16 columns.
+    for (int width : {17, 32, 64}) {
+        failures += run(width, 2, {width, width / 3}, 2480U + width);
+        failures += run(width, 8, ragged(width, 8), 2490U + width);
+    }
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
     return failures;
@@ -381,6 +386,10 @@ int run_q8() {
     for (int width = 17; width <= 64; ++width) {
         failures += run(width, 1, {}, 2500U + width);
         failures += run(width, 1, {width / 2}, 2550U + width);
+    }
+    for (int width : {17, 48, 64}) {
+        failures += run(width, 2, {width, width / 3}, 2580U + width);
+        failures += run(width, 8, ragged(width, 8), 2590U + width);
     }
     failures += parent.verify_preserved("Q8 record parent weight");
     return failures;
@@ -435,6 +444,10 @@ int run_nvfp4() {
             failures += run(width, 1, {}, policy, 2600U + width);
             failures += run(width, 1, {width / 2}, policy, 2650U + width);
         }
+        for (int width : {17, 32, 64}) {
+            failures += run(width, 2, {width, width / 3}, policy, 2680U + width);
+            failures += run(width, 8, ragged(width, 8), policy, 2690U + width);
+        }
     }
     failures += parent.verify_preserved("NVFP4 record parent weight");
     return failures;
@@ -482,6 +495,10 @@ int run_fp8() {
         for (int width = 17; width <= 64; ++width) {
             failures += run_fp8_case(parent, width, 1, {}, policy, 2700U + width);
             failures += run_fp8_case(parent, width, 1, {width / 2}, policy, 2750U + width);
+        }
+        for (int width : {17, 32, 64}) {
+            failures += run_fp8_case(parent, width, 2, {width, width / 3}, policy, 2780U + width);
+            failures += run_fp8_case(parent, width, 8, ragged(width, 8), policy, 2790U + width);
         }
     }
     failures += parent.verify_preserved("FP8 record parent weight");

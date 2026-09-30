@@ -19,7 +19,8 @@ constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
 constexpr std::int32_t kCapacity   = 2048;
-constexpr std::int32_t kBlockWidth = 16;
+// The widest multi-request append: every row of an ngram copy round of 63 drafts.
+constexpr std::int32_t kBatchedWidth = 64;
 constexpr const char* kOp          = "context_kv_materialize";
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -55,7 +56,7 @@ void require_profile(std::int32_t width, std::int32_t batch) {
     if (batch < 1 || batch > 8 || width < 1) {
         throw std::invalid_argument("context_kv_materialize: invalid W/B");
     }
-    if (width <= kBlockWidth) return;
+    if (width <= kBatchedWidth) return;
     if (batch == 1 && width <= kCapacity) return;
     throw std::invalid_argument("context_kv_materialize: unsupported W/B profile");
 }
@@ -70,8 +71,8 @@ void require_interval(std::int32_t batch, std::int32_t min_width, std::int32_t m
         }
         return;
     }
-    if (max_width > kBlockWidth) {
-        throw std::invalid_argument("context_kv_materialize workspace: batched W exceeds 16");
+    if (max_width > kBatchedWidth) {
+        throw std::invalid_argument("context_kv_materialize workspace: batched W exceeds 64");
     }
 }
 

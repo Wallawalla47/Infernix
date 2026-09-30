@@ -53,9 +53,7 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
     constexpr const char* op = "mtp_prepare_next_round";
     const std::int32_t T     = verify_ids.ne[0];
     const std::int32_t batch = verify_ids.ne[1];
-    if (T < 2 || T > 64 || (T > 32 && batch != 1)) {
-        throw std::invalid_argument("mtp_prepare_next_round: T must be 2..32, or 33..64 at B=1");
-    }
+    if (T < 2 || T > 64) { throw std::invalid_argument("mtp_prepare_next_round: T must be 2..64"); }
     const auto next_k = next_draft_limit;
     if (next_k < 1 || next_k > 5) {
         throw std::invalid_argument("mtp_prepare_next_round: next draft limit must be in [1,5]");

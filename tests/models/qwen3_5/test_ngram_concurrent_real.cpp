@@ -157,8 +157,8 @@ int main(int argc, char** argv) {
         const auto parsed =
             std::from_chars(width_text.data(), width_text.data() + width_text.size(), width);
         require(parsed.ec == std::errc{} && parsed.ptr == width_text.data() + width_text.size() &&
-                    width <= 15,
-                "concurrent ngram width must be an integer in 0..15 (0 = baseline)");
+                    width <= 63,
+                "concurrent ngram width must be an integer in 0..63 (0 = baseline)");
         const bool baseline = width == 0;
         const std::string_view concurrency_text = argc > 3 ? argv[3] : "2";
         unsigned concurrency                    = 0;

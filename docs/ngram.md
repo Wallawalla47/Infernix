@@ -36,11 +36,11 @@ that is distinct from the DFlash2 companion in supported Qwen3.8-27B artifacts.
 Ngram does not convert one drafter into another. `--ngram-draft-tokens 0` disables the
 feature; the minimum match defaults to 12 and its supported enabled range is 4..64.
 
-At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests.
-The GDN conv-record workspace behind the recurrent state admits at most 16 verification columns
-once the batch holds more than one request, so a verify width above 15 is admitted only at
-`--max-concurrency 1`. This caps the ngram width the same way for every backend;
-`--ngram-draft-tokens 15` is the widest value usable with concurrency.
+At `--max-concurrency > 1` each round is a batch of up to `--max-concurrency` active requests,
+and every width up to 63 is available at any concurrency. A copy round verifies every row of the
+batch at its family's width, so a wide family costs each row of the round, including rows
+without a copy; the narrower copy families below keep short copies cheap. ReplaySSM records
+grow with the widest window times `--max-concurrency`.
 
 With DFlash and DFlash2 every round verifies at its provider's own window for any batch size: an
 all-neural round runs at the neural window, and a round in which at least one row has a copy

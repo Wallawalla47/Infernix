@@ -120,8 +120,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("unsupported backend");
         }
         options.speculative.draft_tokens        = 5;
-        // The GDN conv-record workspace caps a multi-request verify at 16 columns.
-        options.speculative.ngram_draft_tokens  = concurrency > 1 ? 15U : 63U;
+        options.speculative.ngram_draft_tokens  = 63;
         options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
         options.speculative.ngram_archive_bytes = 16ULL << 20;
         options.speculative.ngram_session_bytes = 4ULL << 20;

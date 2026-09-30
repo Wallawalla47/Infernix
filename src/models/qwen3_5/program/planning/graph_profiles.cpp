@@ -60,8 +60,7 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
 std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend backend,
                                                          std::uint32_t capacity,
                                                          std::uint32_t draft_window) {
-    // Ngram copy verification widens the window up to 63 drafts; above 15 the Engine runs one
-    // request at a time, so the batch>1 graphs never see it.
+    // Ngram copy verification widens the window up to 63 drafts for any batch size.
     if (capacity == 0 || draft_window == 0 || draft_window > 63) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }

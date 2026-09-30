@@ -27,7 +27,8 @@ namespace {
 
 constexpr std::int32_t kHeadDim             = 256;
 constexpr float kExpectedScale              = 0.0625f;
-constexpr std::int32_t kMaximumVerifyTokens = 16;
+// The widest verification a multi-request call admits (an ngram copy round of 63 drafts).
+constexpr std::int32_t kMaximumVerifyTokens = 64;
 constexpr std::int32_t kMaximumBatchSize    = 8;
 // Query rows of one eight-warp fast INT8 prompt CTA (int8/fast_tiled_launch.cuh checks it).
 constexpr std::int32_t kPromptWaveRows = 128;

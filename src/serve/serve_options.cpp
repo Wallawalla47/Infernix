@@ -181,8 +181,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
-           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off);\n"
-           "                             above 15 requires --max-concurrency 1\n"
+           "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off)\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
            "  --ngram-session-mib N      MiB session-scoped ngram source budget (default 128);\n"
@@ -250,7 +249,6 @@ std::string serve_usage_text(const char* argv0) {
            "NOTES\n"
            "  --vram-headroom-mib requires --kv-capacity auto.\n"
            "  --vision-offload on requires --vision.\n"
-           "  --ngram-draft-tokens above 15 requires --max-concurrency 1.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
            "  allowed ceiling only, not --max-context.\n"
@@ -555,13 +553,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
-    }
-    // A speculative decode frame is allocated at the wider of the neural and ngram draft windows
-    // and cannot be narrowed for a multi-request batch. The GDN conv-record workspace admits at
-    // most 16 verification columns when the batch holds more than one request, so a wider ngram
-    // proposal is admitted only for a single active request.
-    if (options.speculative.ngram_draft_tokens > 15 && options.max_concurrency != 1) {
-        throw std::invalid_argument("--ngram-draft-tokens above 15 requires --max-concurrency 1");
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");

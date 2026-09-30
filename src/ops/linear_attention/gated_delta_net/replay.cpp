@@ -105,8 +105,7 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
     const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
-    if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
-        (width > 16 && rows != 1)) {
+    if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
     }
     if (states.ne[3] <= 0) {
@@ -262,8 +261,7 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
 detail::gated_delta_net::GdnReplayFoldKernelRows
 validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                    std::span<const GdnReplayFoldRow> rows) {
-    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity) ||
-        (records.spec.width > 16 && rows.size() != 1)) {
+    if (rows.empty() || rows.size() > static_cast<std::size_t>(records.spec.record_capacity)) {
         throw std::invalid_argument("gdn_replay_fold: active row count is out of range");
     }
     detail::gated_delta_net::GdnReplayFoldKernelRows packed{};

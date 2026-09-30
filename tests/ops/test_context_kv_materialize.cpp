@@ -491,7 +491,11 @@ int main() {
         Fixture fixture;
         int failures = 0;
         const std::vector<int> widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-        for (int width : widths)
+        // Batched ngram copy rounds append up to 64 columns per request; with the per-request
+        // count pattern below they reach every route's largest scratch for each batch size.
+        std::vector<int> batched_widths = widths;
+        batched_widths.insert(batched_widths.end(), {17, 24, 32, 48, 64});
+        for (int width : batched_widths)
             for (int batch = 1; batch <= 8; ++batch) {
                 std::vector<int> counts(batch), slots(batch), positions(width * batch, -12345);
                 for (int b = 0; b < batch; ++b) {
@@ -540,7 +544,7 @@ int main() {
                              {-1, -1, -1, 2047, -1, -1, 262142, 262143, 262144}, 0, true, true);
         for (int batch = 1; batch <= 8; ++batch) {
             const auto capacity = ops::context_kv_materialize_workspace_capacity_bytes(
-                batch, 1, batch == 1 ? 2048 : 16);
+                batch, 1, batch == 1 ? 2048 : 64);
             if (capacity != fixture.observed_peak[batch]) {
                 std::cerr << "workspace interval peak mismatch B=" << batch << "\n";
                 ++failures;

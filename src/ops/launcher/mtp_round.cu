@@ -1,5 +1,5 @@
 // Implements: include/ninfer/ops/mtp_round.h
-// Match: K=1..31 verified drafts (up to 63 at B=1), followed by N=1..5 MTP drafts.
+// Match: K=1..63 verified drafts, followed by N=1..5 MTP drafts.
 #include "ops/launcher/mtp_round.h"
 
 #include "core/device.h"

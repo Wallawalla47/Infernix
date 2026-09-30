@@ -703,8 +703,37 @@ int run_q4_q5() {
                                               state, valid, initial, snapshot_base, q, k, v, z,
                                               workspace, nullptr);
         });
-    failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
-    failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
+    // A batched ngram copy round above 16 columns.
+    constexpr std::int32_t kWideWidth = 32;
+    constexpr std::int32_t kWideBatch = 2;
+    const std::vector<std::int32_t> wide_valid{32, 19};
+    const std::size_t wide_workspace_bytes =
+        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+            kQueryRows, kKeyRows, kValueRows, kWideBatch, kWideWidth, kWideWidth);
+    failures += run_batched_case(
+        "Q4/Q5 A16 B=2 W=32 masked", kHidden, kValueRows, kZRows, kWideWidth, kWideBatch,
+        wide_valid, conv_weight, wide_workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            const float* column =
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden;
+            if (row < kQueryRows + kKeyRows) {
+                return quantized_weight::dot_fp64(query_key.host, row, column, kHidden);
+            }
+            return quantized_weight::dot_fp64(value_z_weight.host, row - kQueryRows - kKeyRows,
+                                              column, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                value_z_weight.host, kValueRows + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
+                                              state, valid, initial, snapshot_base, q, k, v, z,
+                                              workspace, nullptr);
+        });
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
     failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
     return failures;
@@ -806,31 +835,36 @@ int run_q8() {
     constexpr std::int32_t kValueRows = 4096;
     constexpr std::int32_t kZRows     = 4096;
     constexpr std::int32_t kChannels  = 8192;
-    constexpr std::int32_t kWidth     = 16;
-    constexpr std::int32_t kBatch     = 2;
-    const std::vector<std::int32_t> valid_columns{16, 7};
-    const std::vector<float> conv_weight = make_conv_weight(kChannels, 733U);
-    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        kQueryRows, kKeyRows, kValueRows, kBatch, kWidth, kWidth);
-    failures += run_batched_case(
-        "Q8 A16 B=2 W=16 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, kChannels + row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
-            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, workspace, nullptr);
-        });
+    const auto run_batched = [&](std::int32_t width, std::int32_t batch,
+                                 std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, seed);
+        const std::size_t workspace_bytes =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                kQueryRows, kKeyRows, kValueRows, batch, width, width);
+        return run_batched_case(
+            "Q8 A16 B=" + std::to_string(batch) + " W=" + std::to_string(width) + " masked",
+            kHidden, kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
+            workspace_bytes, kGdnInputProjConvSnapshotA16Tolerance,
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z, workspace, nullptr);
+            });
+    };
+    failures += run_batched(16, 2, {16, 7}, 733U);
+    // A batched ngram copy round above 16 columns.
+    failures += run_batched(48, 2, {48, 29}, 739U);
     failures += parent.verify_preserved("batched Q8 parent weight");
     return failures;
 }
@@ -945,32 +979,43 @@ int run_nvfp4() {
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
     constexpr std::int32_t kChannels  = 10240;
-    constexpr std::int32_t kWidth     = 6;
-    constexpr std::int32_t kBatch     = 3;
-    const std::vector<std::int32_t> valid_columns{6, 3, 1};
-    const std::vector<float> conv_weight = make_conv_weight(kChannels, 829U);
-    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::NVFP4, kRows, kHidden, ops::LinearPolicy::AllowA4, kBatch, kWidth, kWidth);
-    failures += run_batched_case(
-        "NVFP4 A4 B=3 W=6 masked", kHidden, kValueRows, kZRows, kWidth, kBatch, valid_columns,
-        conv_weight, workspace_bytes, kGdnInputProjConvSnapshotA4Tolerance,
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
-            return quantized_weight::dot_fp64(
-                parent.host, kChannels + row,
-                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
-        },
-        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
-            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-            Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
-                                              workspace, nullptr);
-        });
+    const auto run_batched = [&](std::int32_t width, std::int32_t batch,
+                                 std::vector<std::int32_t> valid_columns, ops::LinearPolicy policy,
+                                 std::uint32_t seed) {
+        const std::vector<float> conv_weight = make_conv_weight(kChannels, seed);
+        const std::size_t workspace_bytes =
+            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(QType::NVFP4, kRows, kHidden,
+                                                                       policy, batch, width, width);
+        const bool a4 = policy == ops::LinearPolicy::AllowA4;
+        return run_batched_case(
+            std::string("NVFP4 ") + (a4 ? "A4" : "A16") + " B=" + std::to_string(batch) +
+                " W=" + std::to_string(width) + " masked",
+            kHidden, kValueRows, kZRows, width, batch, std::move(valid_columns), conv_weight,
+            workspace_bytes,
+            a4 ? kGdnInputProjConvSnapshotA4Tolerance : kGdnInputProjConvSnapshotA16Tolerance,
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+                return quantized_weight::dot_fp64(
+                    parent.host, kChannels + row,
+                    activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+            },
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                                  snapshot_base, q, k, v, z, policy, workspace,
+                                                  nullptr);
+            });
+    };
+    failures += run_batched(6, 3, {6, 3, 1}, ops::LinearPolicy::AllowA4, 829U);
+    // Batched ngram copy rounds above 16 columns.
+    failures += run_batched(32, 2, {32, 19}, ops::LinearPolicy::AllowA4, 831U);
+    failures += run_batched(64, 4, {64, 40, 17, 1}, ops::LinearPolicy::AllowA4, 833U);
+    failures += run_batched(32, 2, {32, 11}, ops::LinearPolicy::A16Only, 835U);
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
 }
@@ -1137,6 +1182,9 @@ int run_fp8() {
     };
     failures += run_batched(4, 2, {4, 2}, 937U);
     failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
+    // Batched ngram copy rounds above 16 columns.
+    failures += run_batched(32, 2, {32, 19}, 947U);
+    failures += run_batched(64, 4, {64, 40, 17, 1}, 953U);
     failures += parent.verify_preserved("batched FP8 parent weight");
     return failures;
 }

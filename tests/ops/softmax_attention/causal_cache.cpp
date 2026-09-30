@@ -1790,7 +1790,7 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
     return result;
 }
 
-int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries         = {},
                 std::span<const std::uint32_t> graph_limits = {}) {
@@ -1923,7 +1923,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     return failures;
 }
 
-int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a3_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries = {}) {
     const std::int32_t total       = test_case.base + test_case.tokens;
@@ -2049,7 +2049,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, int envelope_max = 0,
                    std::span<const std::uint32_t> graph_limits = {}) {
     const int batch = test_case.contexts.size(), width = test_case.width;
@@ -2280,7 +2280,7 @@ int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage stor
     failures +=
         run_batch_case(execution, kGeometries[1], storage,
                        {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented, seed + 1u});
-    failures += run_batch_case(
+    failures += run_batch_case(execution, 
         execution, kGeometries[0], storage,
         {6, {0, 63, 127, 2048}, {1, 6, 0, 3}, {2, 0, 3, 1}, MappingPattern::Fragmented, seed + 2u});
     failures += run_batch_case(execution, kGeometries[1], storage,
@@ -2370,11 +2370,11 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                     {7, 0, 5, 2, 6, 1, 4, 3},
                                     MappingPattern::Identity,
                                     502u});
-        failures += run_batch_case(
+        failures += run_batch_case(execution, 
             execution, kGeometries[0], storage,
             {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
     } else if (storage == KvCacheStorage::Fp8E4M3Row256) {
-        failures += run_batch_case(
+        failures += run_batch_case(execution, 
             execution, kGeometries[0], storage,
             {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
     }
@@ -2481,7 +2481,7 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
                                 MappingPattern::Fragmented);
         failures += run_a3_case(execution, geometry, storage, {13, 513, 8192, 609u, false, true},
                                 MappingPattern::Fragmented);
-        failures += run_batch_case(
+        failures += run_batch_case(execution, 
             execution, geometry, storage,
             {16, {17, 1025, 64}, {0, 7, 16}, {2, 0, 1}, MappingPattern::Fragmented, 610u, true});
         const std::array<int, 4> queries{0, 63, 64, 1023};
@@ -2508,13 +2508,13 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
                                 MappingPattern::Fragmented);
         failures += run_a3_case(execution, geometry, storage, {1, 0, 1, 613u, false, true},
                                 MappingPattern::Fragmented);
-        failures += run_batch_case(
+        failures += run_batch_case(execution, 
             execution, geometry, storage,
             {1, {0, 31, 63}, {0, 1, 1}, {2, 0, 1}, MappingPattern::Fragmented, 614u, true});
     }
     failures += run_a3_case(execution, kGeometries[1], storage, {7, 511, 8192, 615u, false, true},
                             MappingPattern::Fragmented);
-    failures += run_batch_case(
+    failures += run_batch_case(execution, 
         execution, kGeometries[1], storage,
         {7, {17, 4097, 64}, {0, 5, 7}, {2, 0, 1}, MappingPattern::Fragmented, 616u, true});
     // A long batch gives each grouped CTA more pages than the old staged table
@@ -2710,7 +2710,7 @@ int run_numerical_profile_cases(DeviceExecutionView execution, KvCacheStorage st
     for (const auto& geometry : kGeometries) {
         for (int width : {1, 16, 1024}) {
             const float amplitude = (width == 1 ? 1.0f : 1.8f) * std::sqrt(3.0f);
-            failures += run_a1_case(
+            failures += run_a1_case(execution, 
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 1201u, false, false, amplitude},
                 MappingPattern::Fragmented,
@@ -2749,9 +2749,9 @@ int run_small_prefill_cases(DeviceExecutionView execution, KvCacheStorage storag
     return failures;
 }
 
-// Ngram copy verification checks one request's drafts at widths 17-64, beyond the batched
-// verification domain. Dense and masked single-row calls, cached and appended, against the FP64
-// oracle, including loose envelopes whose visible keys still lie in the prompt-route region.
+// Ngram copy verification checks one request's drafts at widths 17-64. Dense and masked single-row
+// calls, cached and appended, against the FP64 oracle, including loose envelopes whose visible keys
+// still lie in the prompt-route region.
 int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
@@ -2767,11 +2767,11 @@ int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                            {width, {2048}, {valid}, {0}, MappingPattern::Fragmented,
                                             static_cast<unsigned>(2000 + width + valid), true});
             }
-            failures += run_a1_case(
+            failures += run_a1_case(execution, 
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 2101u, false, true},
                 MappingPattern::Fragmented);
-            failures += run_a3_case(
+            failures += run_a3_case(execution, 
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 2102u, false, true},
                 MappingPattern::Fragmented);
@@ -2784,6 +2784,45 @@ int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
         }
     }
     return failures;
+}
+
+// Ngram copy rounds above one request verify every row of the batch at widths 17-64: two and
+// eight requests, ragged valid prefixes and contexts, permuted table rows, a dense full batch and
+// graph replay, against the FP64 oracle.
+int run_wide_batch_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+        int failures = 0;
+        for (const Geometry& geometry : kGeometries) {
+            for (int width : {17, 24, 32, 33, 48, 63, 64}) {
+                failures += run_batch_case(execution, geometry, storage,
+                                           {width,
+                                            {2048, 127},
+                                            {width, width / 2},
+                                            {1, 0},
+                                            MappingPattern::Fragmented,
+                                            static_cast<unsigned>(2200 + width),
+                                            width == 32 || width == 64});
+            }
+            for (int width : {17, 32, 64}) {
+                std::vector<std::int32_t> valid(8);
+                for (int b = 0; b < 8; ++b) valid[b] = b == 0 ? width : 1 + (5 * b) % width;
+                failures += run_batch_case(execution, geometry, storage,
+                                           {width,
+                                            {8192, 1024, 127, 61, 1, 0, 2048, 300},
+                                            valid,
+                                            {7, 0, 5, 2, 6, 1, 4, 3},
+                                            MappingPattern::Fragmented,
+                                            static_cast<unsigned>(2300 + width),
+                                            true});
+                failures += run_batch_case(execution, geometry, storage,
+                                           {width,
+                                            {128, 64, 32, 8, 2, 17, 63, 127},
+                                            std::vector<std::int32_t>(8, width),
+                                            {7, 0, 5, 2, 6, 1, 4, 3},
+                                            MappingPattern::Fragmented,
+                                            static_cast<unsigned>(2400 + width)});
+            }
+        }
+        return failures;
 }
 
 // The fast INT8 prompt kernel over prompt-route widths: partial row blocks, both CTA shapes (its
@@ -2931,7 +2970,9 @@ int run_softmax_attention_wide_tests(std::optional<KvCacheStorage> selected) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    int failures = 0;
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    int failures         = 0;
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
@@ -2939,7 +2980,10 @@ int run_softmax_attention_wide_tests(std::optional<KvCacheStorage> selected) {
         const int current = run_wide_copy_cases(execution, storage);
         std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
                   << cache_name(storage) << " wide copy verification\n";
-        failures += current;
+        const int batched = run_wide_batch_copy_cases(execution, storage);
+        std::cout << (batched ? "FAIL" : "PASS") << " causal_softmax_attention "
+                  << cache_name(storage) << " wide batched copy verification\n";
+        failures += current + batched;
     }
     return failures ? 1 : 0;
 }
@@ -2951,12 +2995,14 @@ int run_softmax_attention_extended_tests(std::optional<KvCacheStorage> selected)
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    int failures = 0;
+    DeviceContext device;
+    const auto execution = device.execution_view();
+    int failures         = 0;
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
           KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         if (selected && storage != *selected) continue;
-        const int current = run_a3_case(kGeometries[0], storage, {1, 300000, 300001, 1720u},
+        const int current = run_a3_case(execution, kGeometries[0], storage, {1, 300000, 300001, 1720u},
                                         MappingPattern::Fragmented);
         std::cout << (current ? "FAIL" : "PASS") << " causal_softmax_attention "
                   << cache_name(storage) << " 300001 visible keys\n";

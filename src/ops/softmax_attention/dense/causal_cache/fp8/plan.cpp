@@ -13,7 +13,7 @@ Fp8KvCausalPlan make_fp8_kv_causal_plan(int heads, int width, int batch,
                                         CausalAttentionExecutionEnvelope envelope,
                                         int multiprocessor_count) {
     if (multiprocessor_count <= 0 || (heads != 24 && heads != 16) || width < 1 || batch < 1 ||
-        batch > 8 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+        batch > 8 || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("FP8 attention: invalid plan inputs");
