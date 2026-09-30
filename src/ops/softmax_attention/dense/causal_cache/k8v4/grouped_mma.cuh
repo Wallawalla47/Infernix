@@ -86,7 +86,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
-    const int last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int last_pos  = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first = positions[MultiBatch ? batch * full_width : 0];
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -106,12 +107,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (valid_tokens == 0) return;
     if (positions[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles = div_up(window, Bc);
     const int split_start   = (split * logical_tiles / active_split_count) * Bc;
     const int split_end     = min(((split + 1) * logical_tiles / active_split_count) * Bc, window);
+    const int load_end      = min(split_end, live_end);
     const int first_tile    = split_start;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
 
@@ -239,7 +243,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key             = tile_k0 + key_l;
             std::uint8_t* v_scale_dst = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
                     physical_page, kv_head, key & kPagedKVPageMask);
                 const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
@@ -258,7 +262,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
             std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_swizzle(key_l, dc * 8)) * 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -273,7 +277,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int d         = dc * 32;
             const int key       = tile_k0 + key_l;
             std::uint8_t* v_dst = &v_nvfp4[key_l * (D / 2) + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(v_dst, &cache_v[code_offset]);
@@ -418,7 +422,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_swizzle(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     store_vec(dst,
                               kv_cache_nvfp4_dequant_f16x8(
                                   &v_nvfp4[key_l * (D / 2) + d / 2],

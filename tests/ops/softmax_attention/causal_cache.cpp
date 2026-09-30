@@ -17,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -2925,6 +2926,113 @@ int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution) {
     return failures;
 }
 
+// Speculative verification caps a round's live drafts by its output budget while the physical
+// width stays the family's. The live columns of a masked row must not depend on that cap: each
+// pair shares inputs, cache history and envelope and differs only in valid_columns, and the
+// shorter call's live columns must be bit-identical to the same columns of the longer one.
+// Contexts sit just below key-tile and partition boundaries so that a partition following the
+// live length would move.
+int run_masked_prefix_invariance_case(const Geometry& geometry, KvCacheStorage storage,
+                                      std::int32_t width, const std::vector<std::int32_t>& contexts,
+                                      const std::vector<std::int32_t>& long_valid,
+                                      const std::vector<std::int32_t>& short_valid,
+                                      std::uint32_t seed) {
+    const int batch = static_cast<int>(contexts.size());
+    int maximum     = 1;
+    for (const int context : contexts) maximum = std::max(maximum, context + width);
+    const ops::CausalAttentionExecutionEnvelope envelope{1, static_cast<unsigned>(maximum)};
+    const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
+                      kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
+    const std::size_t columns            = std::size_t(width) * batch;
+    const auto q_bits =
+        to_bf16_bits(make_bf16_values(q_column_elements * columns, seed, -.5f, .5f));
+    const auto k_bits =
+        to_bf16_bits(make_bf16_values(kv_column_elements * columns, seed + 1u, -.5f, .5f));
+    const auto v_bits =
+        to_bf16_bits(make_bf16_values(kv_column_elements * columns, seed + 2u, -1.f, 1.f));
+    std::vector<HostCache> initial;
+    for (int row = 0; row < batch; ++row)
+        initial.push_back(make_cache(geometry, storage, maximum + 3, seed + 20u + 3u * row));
+    std::vector<std::int32_t> lanes(batch);
+    std::iota(lanes.begin(), lanes.end(), 0);
+    const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), storage, envelope, batch, width, width, execution);
+
+    const auto run = [&](const std::vector<std::int32_t>& valid) {
+        BatchDeviceCache cache(initial, MappingPattern::Fragmented, envelope.max_visible_keys);
+        GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
+            dp(columns * 4), dvalid(batch * 4), dlanes(batch * 4), dout(q_bits.size() * 2);
+        GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        std::vector<std::int32_t> positions(columns);
+        for (int b = 0; b < batch; ++b)
+            for (int j = 0; j < width; ++j)
+                positions[b * width + j] = contexts[b] + std::min(j, valid[b] - 1);
+        dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+        dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+        dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+        dp.copy_from_host(positions.data(), positions.size() * 4);
+        dvalid.copy_from_host(valid.data(), batch * 4);
+        dlanes.copy_from_host(lanes.data(), batch * 4);
+        dout.fill(0xff);
+        scratch.fill(0x5a);
+        cuda_synchronize();
+        Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+        Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
+            tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+        Tensor tp(dp.data(), DType::I32, {width, batch}),
+            tvalid(dvalid.data(), DType::I32, {batch}), tlanes(dlanes.data(), DType::I32, {batch});
+        Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+        DeviceContext device;
+        ops::causal_softmax_attention(tq, tk, tv, tp, tvalid, tlanes, op_geometry(geometry),
+                                      kAttentionScale, cache.view(), envelope, workspace, tout,
+                                      device.stream);
+        cuda_synchronize(device.stream);
+        return copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    };
+
+    const auto longer  = run(long_valid);
+    const auto shorter = run(short_valid);
+    int failures       = 0;
+    for (int b = 0; b < batch; ++b)
+        for (int j = 0; j < short_valid[b]; ++j) {
+            const std::size_t begin = (std::size_t(b) * width + j) * q_column_elements;
+            if (!std::equal(shorter.begin() + begin, shorter.begin() + begin + q_column_elements,
+                            longer.begin() + begin)) {
+                if (failures == 0)
+                    std::cerr << "masked prefix invariance " << geometry.name << ' '
+                              << cache_name(storage) << " W=" << width << " B=" << batch << ": row "
+                              << b << " column " << j << " (context " << contexts[b] << ", valid "
+                              << short_valid[b] << " vs " << long_valid[b] << ") differs\n";
+                ++failures;
+            }
+        }
+    return failures;
+}
+
+int run_masked_prefix_invariance_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    for (const Geometry& geometry : kGeometries) {
+        for (const int width : {8, 16, 32, 64})
+            for (const int shorter : {1, width / 2, width - 1})
+                failures += run_masked_prefix_invariance_case(
+                    geometry, storage, width, {8190}, {width}, {shorter},
+                    static_cast<unsigned>(3100 + width + shorter));
+        // BF16 switches to its long split target at 32768 visible keys.
+        for (const int width : {8, 64})
+            for (const int shorter : {1, width - 1})
+                failures += run_masked_prefix_invariance_case(
+                    geometry, storage, width, {40958}, {width}, {shorter},
+                    static_cast<unsigned>(3150 + width + shorter));
+        for (const int width : {16, 32, 64}) {
+            failures += run_masked_prefix_invariance_case(
+                geometry, storage, width, {8190, 30718, 4094, 127}, {width, width, width, width},
+                {1, width / 2, width - 1, 3}, static_cast<unsigned>(3200 + width));
+        }
+    }
+    return failures;
+}
+
 int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     int failures = verify_workspace_capacity_contract(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {
@@ -2958,6 +3066,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     failures += run_batch_cases(execution, storage);
     failures += run_graph_envelope_cases(execution, storage);
     failures += run_verify_width_cases(execution, storage);
+    failures += run_masked_prefix_invariance_cases(execution, storage);
     failures += run_numerical_profile_cases(execution, storage);
     failures += run_small_prefill_cases(execution, storage);
     return failures;

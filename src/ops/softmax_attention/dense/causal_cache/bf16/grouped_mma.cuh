@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
+#include "ops/softmax_attention/common/causal_partition.h"
 
 namespace ninfer::ops::detail {
 
@@ -47,8 +48,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
                                     typename Bf16KvCacheView<Input::writes_cache>::Value* cache_v,
                                     const int* tables, const int* validity, const int* table_rows,
-                                    int table_stride, int runtime_width, float scale,
-                                    Bf16KvPartition partition, CausalPartialView partial) {
+                                    int table_stride, int runtime_width, int visible_capacity,
+                                    float scale, Bf16KvPartition partition,
+                                    CausalPartialView partial) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -97,8 +99,10 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
         }
     };
     if (row_begin >= live * G::GroupSize) return;
-    const int first = positions[0], window = positions[live - 1] + 1;
-    const auto work = partition.live(window);
+    // Masked tail columns count toward the partition, but no key past the live ones is loaded.
+    const int first = positions[0], live_end = positions[live - 1] + 1;
+    const int window = causal_row_window(first, width, visible_capacity);
+    const auto work  = partition.live(window);
     if (split >= work.splits) return;
     const int start     = split * work.keys_per_split;
     const int stop      = min(window, start + work.keys_per_split);
@@ -119,8 +123,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             }
         }
     }
-    const int last_token = min(live, div_up(row_begin + M, G::GroupSize)) - 1;
-    const int end        = min(stop, positions[last_token] + 1);
+    const int last_token = min(width, div_up(row_begin + M, G::GroupSize)) - 1;
+    const int end        = min(stop, first + last_token + 1);
+    const int load_end   = min(end, live_end);
     if (start >= end) {
         neutral();
         return;
@@ -166,8 +171,8 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
             __syncthreads();
         }
         bf16_kv_load_grouped_tile<G, S>(k_s, v_s, cache_k, cache_v, input,
-                                        storage->pages[logical_page - page_window], head, k0, end,
-                                        first, tid);
+                                        storage->pages[logical_page - page_window], head, k0,
+                                        load_end, first, tid);
         cp_commit();
         cp_wait<0>();
         __syncthreads();

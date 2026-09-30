@@ -89,7 +89,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
-    const int last_pos = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int last_pos  = positions[(MultiBatch ? batch * full_width : 0) + full_width - 1];
+    const int row_first = positions[MultiBatch ? batch * full_width : 0];
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -109,12 +110,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 
     if (valid_tokens == 0) return;
     if (positions[0] < 0 || last_pos < 0 || last_pos >= logical_capacity) return;
-    const int window             = last_pos + 1;
+    // Masked tail columns repeat the last live position; no key past it is loaded.
+    const int live_end           = last_pos + 1;
+    const int window             = causal_row_window(row_first, full_width, logical_capacity);
     const int active_split_count = partition.active(window);
     if (split >= active_split_count) return;
     const int logical_tiles = div_up(window, Bc);
     const int split_start   = (split * logical_tiles / active_split_count) * Bc;
     const int split_end     = min(((split + 1) * logical_tiles / active_split_count) * Bc, window);
+    const int load_end      = min(split_end, live_end);
     const int first_tile    = split_start;
     const int key_blocks    = div_up(split_end - first_tile, Bc);
 
@@ -224,7 +228,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int key = tile_k0 + key_l;
             auto* k_dst   = k_scale_s + key_l * kKVCacheNvfp4Groups;
             auto* v_dst   = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 cp_async<16>(k_dst, cache_k_scale + scale_offset);
@@ -243,7 +247,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int physical_byte = nvfp4_kv_code_swizzle(key_l, dc * 16);
             std::uint8_t* k_dst     = &k_nvfp4[key_l * CodeRowBytes + physical_byte];
             std::uint8_t* v_dst     = &v_nvfp4[key_l * CodeRowBytes + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -270,7 +274,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const auto represented = kv_cache_nvfp4_dequant_f16x16(
                     &k_nvfp4[key_l * CodeRowBytes + nvfp4_kv_code_swizzle(key_l, d / 2)],
                     k_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -399,7 +403,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -424,7 +428,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);

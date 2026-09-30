@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
+#include "ops/softmax_attention/common/causal_partition.h"
 
 namespace ninfer::ops::detail {
 
@@ -40,8 +41,8 @@ __launch_bounds__(Schedule::kThreads) __global__
     void bf16_kv_merge_kernel(const float* partial_acc, const float* partial_m,
                               const float* partial_l, const std::int32_t* positions,
                               const std::int32_t* valid_columns, std::int32_t tokens,
-                              std::int32_t batch_size, Bf16KvPartition partition,
-                              __nv_bfloat16* out) {
+                              std::int32_t batch_size, std::int32_t visible_capacity,
+                              Bf16KvPartition partition, __nv_bfloat16* out) {
     const int split_count = partition.capacity;
     constexpr int DChunk  = Schedule::kDChunk;
     static_assert(DChunk <= Geometry::kHeadDim);
@@ -86,7 +87,7 @@ __launch_bounds__(Schedule::kThreads) __global__
         partial_l += partial_stat_row;
     }
 
-    const int window             = positions[live_columns - 1] + 1;
+    const int window             = causal_row_window(positions[0], tokens, visible_capacity);
     const int active_split_count = partition.live(window).splits;
 
     __shared__ float weights[Schedule::kThreads], warp_sums[Schedule::kWarps], scalars[2];

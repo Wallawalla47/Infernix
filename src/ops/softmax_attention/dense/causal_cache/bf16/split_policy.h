@@ -10,7 +10,7 @@ struct Bf16KvLivePartition {
 };
 
 // Capture fixes capacity; producer and merge derive the same partition from
-// the live row length, including ragged batches and Graph replay.
+// the row window (causal_row_window), including ragged batches and Graph replay.
 struct Bf16KvPartition {
     int capacity      = 1;
     int normal_target = 1;

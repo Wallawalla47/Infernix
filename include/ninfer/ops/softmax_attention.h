@@ -139,8 +139,10 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
  * With fixed tensor views, geometry and cache storage, calls with W<=16 remain CUDA Graph
- * update-compatible across valid envelopes. Live row lengths determine the KV work partition within
- * each capture. Inputs, output, every cache plane/table, and live workspace suballocations are
+ * update-compatible across valid envelopes. Within each capture, a row's KV work partition is
+ * determined by its first position, W and the envelope. For W<=256 it does not depend on Vb, so the
+ * result of a live column is bit-identical however many trailing columns are masked. Inputs,
+ * output, every cache plane/table, and live workspace suballocations are
  * pairwise non-overlapping. The Op overwrites every addressed cache row but owns no cache
  * allocation, frontier, request identity, or commit authority. `execution` supplies the stream and
  * positive physical SM count used for launch and workspace planning; capacity queries must use the
