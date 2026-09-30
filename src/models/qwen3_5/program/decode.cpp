@@ -465,12 +465,14 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
     auto& request        = requests[lane];
     const auto& sequence = active_sequence(lane);
     const auto& ledger   = sequence.ledger;
-    const auto remaining = budget.generated_tokens_remaining;
     const auto room =
         sequence.execution_frontier < capacity ? capacity - sequence.execution_frontier - 1U : 0U;
-    const auto maximum = std::min({ngram_draft_window, remaining > 1 ? remaining - 1U : 0U, room});
+    // The output budget does not size the copy: the round's kind and width follow from the copy
+    // alone, and the round verifies only the drafts the budget admits. A budget-limited final
+    // round therefore has the arithmetic of an unlimited one.
+    const auto maximum = std::min(ngram_draft_window, room);
     // The neural path still validates decode readiness. No draft fits an anchor-only tail.
-    if (maximum == 0) { return {}; }
+    if (maximum == 0 || budget.generated_tokens_remaining <= 1) { return {}; }
     if (!request.ngram || request.ngram_indexed > ledger.size()) {
         throw std::logic_error("ngram committed history is not initialized");
     }
