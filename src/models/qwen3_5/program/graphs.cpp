@@ -354,20 +354,23 @@ void ProgramImpl::prepare_graphs() {
         }
     }
 
-    if (speculative_backend == SpeculativeBackend::Mtp) {
-        // One family at the frame's native width. The frame is allocated once at plan.draft_window
-        // (the wider of the neural and ngram windows) and every round verifies at that width, so
-        // an ngram engine reuses this family for both copy and free-form rounds.
-        const std::uint32_t verify_drafts = draft_window;
-        const std::uint32_t ar_depth      = std::min(draft_window, kMtpDecodeMaximumDrafts);
+    for (SpeculativeRoundFamily& family : round_families) {
+        if (speculative_backend != SpeculativeBackend::Mtp) { break; }
+        // Each family verifies at its own window, on the frame viewed at that width, and records
+        // ReplaySSM transitions through the record view of the same width. Every round proposes
+        // the next round's drafts at the configured MTP depth.
+        const std::uint32_t verify_drafts = family.shape.verify_drafts;
+        const std::uint32_t ar_depth      = neural_draft_window;
         const auto prepare_family         = [&, verify_drafts](std::uint32_t frontier,
                                                        std::uint32_t batch_size) {
             prepare_representative(frontier, batch_size, verify_drafts, verify_drafts);
         };
-        auto& graph_family          = round_family(SpeculativeRoundKind::Neural).graphs;
+        auto& graph_family          = family.graphs;
         const auto planned_profiles = mtp_graph_profiles(capacity, verify_drafts, ar_depth);
         validate_graph_profiles(planned_profiles, capacity - 1, "MTP");
-        execution::MtpBatchContext mtp_state{execution_core(),
+        execution::ExecutionCore mtp_core = execution_core();
+        mtp_core.replay_records           = round_replay_records(verify_drafts);
+        execution::MtpBatchContext mtp_state{mtp_core,
                                              decoder->text_kv,
                                              *decoder->mtp_cache(),
                                              *io.mtp_decode,
@@ -400,8 +403,9 @@ void ProgramImpl::prepare_graphs() {
                     profile.definition);
             }
         }
-        instantiate_graph_family(graph_family, ngram_draft_window != 0 ? "ngram MTP" : "MTP",
-                                 device, prepare_family);
+        instantiate_graph_family(
+            graph_family, family.shape.kind == SpeculativeRoundKind::Ngram ? "ngram MTP" : "MTP",
+            device, prepare_family);
     }
     if (is_masked_draft_backend(speculative_backend)) {
         for (SpeculativeRoundFamily& family : round_families) {

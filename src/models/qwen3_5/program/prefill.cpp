@@ -367,7 +367,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             Tensor selected;
             Tensor destinations;
             if (speculative_backend == SpeculativeBackend::Mtp && io.mtp_decode) {
-                qwen3_5::MtpDecodeState& frame = *io.mtp_decode;
+                const qwen3_5::MtpDecodeState frame =
+                    io.mtp_decode->narrowed(verify_drafts, neural_draft_window);
                 selector_tensor                = frame.current_extents.slice(0, 0, batch);
                 hidden                         = frame.target_hidden.slice(2, 0, batch);
                 selected     = frame.target_continuation_hidden.slice(1, 0, batch);

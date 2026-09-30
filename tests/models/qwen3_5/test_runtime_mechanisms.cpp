@@ -265,11 +265,7 @@ void test_round_layout() {
            "MTP wide copy frame allocates at most four neural AR steps");
     for (std::uint32_t k = 1; k <= 15; ++k) {
         for (std::uint32_t next_k = 1; next_k <= 5; ++next_k) {
-            const auto& base_frame = *mtp_copy.mtp_decode;
-            const auto frame       = base_frame.current_drafts.ne[0] == static_cast<int>(k) &&
-                                       base_frame.next_drafts.ne[1] == static_cast<int>(next_k)
-                                         ? base_frame
-                                         : base_frame.single_row_prefix(k, next_k);
+            const auto frame = mtp_copy.mtp_decode->narrowed(k, next_k);
             expect(frame.target_logits.ne[1] == static_cast<int>(k + 1) &&
                        frame.current_drafts.ne[0] == static_cast<int>(k) &&
                        frame.alignment_ids.ne[0] == static_cast<int>(k + 1) &&
@@ -286,9 +282,39 @@ void test_round_layout() {
          std::vector<std::pair<unsigned, unsigned>>{{0, 3}, {16, 3}, {15, 0}, {15, 6}}) {
         bool rejected = false;
         try {
-            (void)mtp_copy.mtp_decode->single_row_prefix(k, next_k);
+            (void)mtp_copy.mtp_decode->narrowed(k, next_k);
         } catch (const std::invalid_argument&) { rejected = true; }
         expect(rejected, "MTP invalid verify/proposal frame width rejected");
+    }
+    // Above one request the narrowed MTP frame stays a dense [k+1,C] view of the native storage,
+    // and the step-major proposal tensors keep their row stride.
+    ninfer::LayoutBuilder mtp_batch_builder;
+    auto mtp_batch_layout = q36::begin_round_state_layout(
+        mtp_batch_builder, {.hidden         = 32,
+                            .output_rows    = 128,
+                            .batch_capacity = 3,
+                            .draft_window   = 15,
+                            .backend        = ninfer::SpeculativeBackend::Mtp});
+    q36::complete_round_state_layout(mtp_batch_builder, mtp_batch_layout);
+    const auto mtp_batch_bytes = mtp_batch_builder.finish(256);
+    std::vector<std::byte> mtp_batch_storage(mtp_batch_bytes + 255);
+    const auto mtp_batch_address =
+        (reinterpret_cast<std::uintptr_t>(mtp_batch_storage.data()) + 255) & ~std::uintptr_t(255);
+    q36::RoundState mtp_batch({reinterpret_cast<void*>(mtp_batch_address), mtp_batch_bytes},
+                              mtp_batch_layout);
+    for (const auto [k, next_k] :
+         std::vector<std::pair<unsigned, unsigned>>{{3, 3}, {7, 3}, {15, 3}, {5, 5}}) {
+        const auto frame = mtp_batch.mtp_decode->narrowed(k, next_k);
+        expect(frame.target_hidden.ne[1] == static_cast<int>(k + 1) &&
+                   frame.target_hidden.ne[2] == 3 &&
+                   frame.target_hidden.data == mtp_batch.mtp_decode->target_hidden.data &&
+                   frame.target_hidden.is_contiguous() &&
+                   frame.current_drafts.ne[0] == static_cast<int>(k) &&
+                   frame.current_drafts.ne[1] == 3 &&
+                   frame.verify_ids.ne[0] == static_cast<int>(k + 1) &&
+                   frame.next_drafts.ne[1] == static_cast<int>(next_k) &&
+                   frame.next_drafts.nb[1] == mtp_batch.mtp_decode->next_drafts.nb[1],
+               "MTP frame narrowed above one request");
     }
 }
 
