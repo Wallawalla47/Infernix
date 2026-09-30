@@ -211,7 +211,7 @@ Options parse_options(int argc, char** argv) {
                 parse_list(next("--row-contexts requires a value"), 0, 262144, "--row-contexts");
         } else if (argument == "--valid-columns") {
             options.valid_columns =
-                parse_list(next("--valid-columns requires a value"), 0, 16, "--valid-columns");
+                parse_list(next("--valid-columns requires a value"), 0, 64, "--valid-columns");
         } else if (argument == "--table-rows") {
             options.table_rows =
                 parse_list(next("--table-rows requires a value"), 0, 7, "--table-rows");
@@ -305,8 +305,8 @@ Options parse_options(int argc, char** argv) {
     }
     for (const std::int32_t batch : options.batches) {
         if (batch > 1 && std::any_of(options.tokens.begin(), options.tokens.end(),
-                                     [](std::int32_t width) { return width > 16; })) {
-            usage("B>1 only supports W<=16");
+                                     [](std::int32_t width) { return width > 64; })) {
+            usage("B>1 only supports W<=64");
         }
     }
     if (options.entry == Entry::Cached &&
