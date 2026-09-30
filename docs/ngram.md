@@ -262,9 +262,14 @@ execution. This test also skips without an artifact.
 single-lane run on a concurrency>1 engine is token-identical to a graph-mode
 single-request reference, that two concurrent copy lanes each reproduce an exact
 source prefix over a long soak, and that two concurrent free-form lanes stay
-non-degenerate over hundreds of tokens. Passing width `0` runs the free-form pair with
-ngram disabled as a baseline. Cross-lane token identity is deliberately not required:
-batched lanes are prefetched independently and need not share every round, so a
-batch-size change alone can move a greedy near-tie (the ngram-disabled baseline
-diverges the same way). `NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and
-`NINFER_NGRAM_TEST_NO_GRAPH` adjust the shared-GPU footprint and graph mode.
+non-degenerate over hundreds of tokens. Copy requests stop at the model's end of turn:
+on some artifacts ending the turn is a near-tie inside the synthetic file that moves with
+the verification width's rounding, so an early end of turn passes when the copy before it
+is an exact source prefix of at least 64 tokens (256 in the soak). An artifact whose model
+ends these copies sooner even without speculation fails on that length, not on a prefix
+mismatch. Passing width `0` runs the free-form pair with ngram disabled as a baseline.
+Cross-lane token identity is deliberately not required: batched lanes are prefetched
+independently and need not share every round, so a batch-size change alone can move a
+greedy near-tie (the ngram-disabled baseline diverges the same way).
+`NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and `NINFER_NGRAM_TEST_NO_GRAPH` adjust
+the shared-GPU footprint and graph mode.
