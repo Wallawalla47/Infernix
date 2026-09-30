@@ -532,11 +532,17 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     const auto matches   = propose_ngram(lanes, budgets);
     const bool any_ngram = std::any_of(matches.begin(), matches.end(),
                                        [](const auto& match) { return !match.tokens.empty(); });
-    // As for DFlash, a round with at least one copy proposal verifies at the n-gram window and an
-    // all-neural round at the MTP window, each on the frame viewed at that width. Every round
-    // proposes the next round's drafts at the configured MTP depth.
+    std::uint32_t longest_copy = 0;
+    for (const auto& match : matches) {
+        longest_copy = std::max(longest_copy, static_cast<std::uint32_t>(match.tokens.size()));
+    }
+    // As for DFlash, a round with at least one copy proposal verifies at the narrowest n-gram
+    // window that holds its longest copy and an all-neural round at the MTP window, each on the
+    // frame viewed at that width. Every round proposes the next round's drafts at the configured
+    // MTP depth.
     SpeculativeRoundFamily& family =
-        round_family(any_ngram ? SpeculativeRoundKind::Ngram : SpeculativeRoundKind::Neural);
+        any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+                  : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
     const std::uint32_t mtp_ar_depth  = neural_draft_window;
     auto& graph_family                = family.graphs;
@@ -738,22 +744,23 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("DFlash batch membership is invalid");
     }
 
-    const auto started = Clock::now();
-    const auto matches = propose_ngram(lanes, budgets);
-    bool any_ngram     = false;
+    const auto started         = Clock::now();
+    const auto matches         = propose_ngram(lanes, budgets);
+    bool any_ngram             = false;
+    std::uint32_t longest_copy = 0;
     for (const auto& row_match : matches) {
-        if (!row_match.tokens.empty()) {
-            any_ngram = true;
-            break;
-        }
+        any_ngram    = any_ngram || !row_match.tokens.empty();
+        longest_copy = std::max(longest_copy, static_cast<std::uint32_t>(row_match.tokens.size()));
     }
     // Every round verifies at its family's own window, on the frame viewed at that width for any
-    // batch size. A round with at least one copy proposal replays the ngram family; an all-neural
-    // round replays the neural family (which runs the drafter). In a batch>1 ngram round the
-    // drafter also runs and the per-row copy payload overlays it on the device, so a row without
-    // a copy keeps its neural proposal (extent neural_draft_window) instead of decoding one token.
+    // batch size. A round with at least one copy proposal replays the narrowest ngram family that
+    // holds its longest copy; an all-neural round replays the neural family (which runs the
+    // drafter). In a batch>1 ngram round the drafter also runs and the per-row copy payload
+    // overlays it on the device, so a row without a copy keeps its neural proposal (extent
+    // neural_draft_window) instead of decoding one token.
     SpeculativeRoundFamily& family =
-        round_family(any_ngram ? SpeculativeRoundKind::Ngram : SpeculativeRoundKind::Neural);
+        any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+                  : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
     const bool drafter_runs           = !any_ngram || lanes.size() > 1;
     const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
