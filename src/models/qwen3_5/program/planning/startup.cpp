@@ -64,18 +64,12 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
-// The speculative round families an engine captures. MTP verifies every round in one family at the
-// wider of its neural and n-gram windows. DFlash verifies neural rounds at the drafter's window and
-// n-gram copy rounds at the n-gram window.
+// The speculative round families an engine captures. Neural rounds verify at the drafter's window
+// and n-gram copy rounds at the n-gram window, for every backend.
 std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options) {
     const SpeculativeOptions& spec = options.speculative;
     std::vector<SpeculativeRoundShape> shapes;
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
-    if (spec.backend == SpeculativeBackend::Mtp) {
-        shapes.push_back(
-            {SpeculativeRoundKind::Neural, std::max(spec.draft_tokens, spec.ngram_draft_tokens)});
-        return shapes;
-    }
     shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
     if (spec.ngram_draft_tokens != 0) {
         shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
@@ -914,7 +908,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         } else {
             // Each speculative round family's profiles are captured at the family's own width for
             // every batch size, on the one frame viewed at that width.
-            const std::uint32_t ar_depth = std::min(impl->draft_window, kMtpDecodeMaximumDrafts);
+            // Every MTP round proposes the next round's drafts at the configured neural depth.
+            const std::uint32_t ar_depth = impl->neural_draft_window;
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
                 const auto profiles =
                     impl->speculative_backend == SpeculativeBackend::Mtp

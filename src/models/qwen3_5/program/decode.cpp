@@ -526,15 +526,18 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         throw std::invalid_argument("MTP batch membership is invalid");
     }
 
-    const auto started = Clock::now();
-    const auto matches = propose_ngram(lanes, budgets);
-    // The decode frame is allocated once at plan.draft_window (the wider of the neural and ngram
-    // windows). Every round verifies at that native width so the frame is consumed in place; a
-    // width-narrowed view is only valid for a batch-1 frame. The body's AR depth (next_k) must
-    // equal the frame's next-drafts width for the same reason.
-    const std::uint32_t verify_drafts = draft_window;
-    const std::uint32_t mtp_ar_depth  = std::min(draft_window, kMtpDecodeMaximumDrafts);
-    auto& graph_family                = round_family(SpeculativeRoundKind::Neural).graphs;
+    const auto started   = Clock::now();
+    const auto matches   = propose_ngram(lanes, budgets);
+    const bool any_ngram = std::any_of(matches.begin(), matches.end(),
+                                       [](const auto& match) { return !match.tokens.empty(); });
+    // As for DFlash, a round with at least one copy proposal verifies at the n-gram window and an
+    // all-neural round at the MTP window, each on the frame viewed at that width. Every round
+    // proposes the next round's drafts at the configured MTP depth.
+    SpeculativeRoundFamily& family =
+        round_family(any_ngram ? SpeculativeRoundKind::Ngram : SpeculativeRoundKind::Neural);
+    const std::uint32_t verify_drafts = family.shape.verify_drafts;
+    const std::uint32_t mtp_ar_depth  = neural_draft_window;
+    auto& graph_family                = family.graphs;
     const std::uint32_t width         = verify_drafts + 1;
     std::uint32_t maximum_frontier    = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -619,16 +622,15 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + mtp_ar_depth));
         }
 
-        execution::MtpBatchContext schedule_state{{device, parameters, work, state_images->linear(),
-                                                   replay_records ? &*replay_records : nullptr, io,
-                                                   prefill_hidden, prefill_chunk, proposal_head,
-                                                   fast_prefill_kernel},
-                                                  decoder->text_kv,
-                                                  *decoder->mtp_cache(),
-                                                  *io.mtp_decode,
-                                                  *mtp_host_ingress,
-                                                  *mtp_host_egress,
-                                                  state_images->continuation_hidden_store()};
+        execution::MtpBatchContext schedule_state{
+            {device, parameters, work, state_images->linear(), round_replay_records(verify_drafts),
+             io, prefill_hidden, prefill_chunk, proposal_head, fast_prefill_kernel},
+            decoder->text_kv,
+            *decoder->mtp_cache(),
+            *io.mtp_decode,
+            *mtp_host_ingress,
+            *mtp_host_egress,
+            state_images->continuation_hidden_store()};
         schedule_state.neural_proposal_drafts = mtp_ar_depth;
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),

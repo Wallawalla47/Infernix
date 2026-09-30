@@ -51,9 +51,9 @@ proposal for that round. The narrower window records GDN replay transitions thro
 view of the same record storage. DFlash and DFlash2 retain an append buffer sized for the widest
 provider: a narrow neural round must catch up target features from a preceding wide copy round.
 
-MTP verifies every round at the frame's native width (the wider of the neural and ngram windows);
-unused columns are masked, and a row with a copy proposal and a row without one each use their
-own proposal in the same round.
+MTP follows the same rule: an all-neural round verifies at `--draft-tokens`, a round with at
+least one copy proposal at the ngram window, and in a multi-request copy round a row without a
+copy verifies its MTP proposal. Every MTP round drafts the next round at `--draft-tokens`.
 
 Larger widths can reduce target rounds on long copy spans but increase per-round attention,
 projection, replay and workspace costs, so measure both short and long contexts; the longest

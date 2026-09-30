@@ -285,7 +285,10 @@ struct MtpDecodeState {
     MtpDecodeState() = default;
     MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& layout,
                    std::uint32_t batch_capacity, std::uint32_t draft_window);
-    [[nodiscard]] MtpDecodeState single_row_prefix(std::uint32_t k, std::uint32_t next_k) const;
+    // The frame viewed for a round that verifies k drafts per row and proposes next_k: every round
+    // tensor becomes a dense [k+1,C] (or [k,C]) view of the native storage and the step-major AR
+    // tensors keep their row stride.
+    [[nodiscard]] MtpDecodeState narrowed(std::uint32_t k, std::uint32_t next_k) const;
 };
 
 struct DFlashDecodeState {
