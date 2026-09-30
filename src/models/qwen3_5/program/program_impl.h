@@ -149,6 +149,18 @@ struct DecodeGraphFamily {
     std::vector<DecodeGraphTopology> topologies;
 };
 
+// A speculative round family (see SpeculativeRoundShape) and its captured graphs.
+struct SpeculativeRoundFamily {
+    SpeculativeRoundShape shape;
+    DecodeGraphFamily graphs;
+};
+
+// ReplaySSM records viewed densely at a width narrower than the frame's, with the fold bound to
+// that view. Rounds verified at the narrower width record and fold only through it.
+struct NarrowReplayView {
+    GdnReplayRecords records;
+    ops::GdnReplayFoldPlan fold;
+};
 struct SequenceState {
     std::shared_ptr<KVHistory> kv;
     ActiveStateBinding state;
@@ -374,11 +386,9 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
-    // When the DFlash neural and ngram windows differ, rounds of the narrower family verify at
-    // their own width for every batch size. They record ReplaySSM transitions through a dense
-    // narrowed view of the same record storage and are replayed by the matching fold plan.
-    std::optional<GdnReplayRecords> narrow_replay_records;
-    std::optional<ops::GdnReplayFoldPlan> narrow_replay_fold;
+    // One view per round-family width below draft_window: rounds of a narrower family verify at
+    // their own width for every batch size and record/fold through the dense view of that width.
+    std::vector<NarrowReplayView> narrow_replay_views;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
@@ -393,9 +403,9 @@ public:
     std::vector<CheckpointSlot> checkpoints;
 
     DecodeGraphFamily ordinary_graphs;
-    DecodeGraphFamily mtp_graphs;
-    DecodeGraphFamily dflash_graphs;
-    DecodeGraphFamily ngram_graphs;
+    // Speculative round families in plan order; fixed after construction, so references into it
+    // stay valid.
+    std::vector<SpeculativeRoundFamily> round_families;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -588,6 +598,9 @@ public:
     // ReplaySSM record view and fold plan for a speculative round verified at verify_drafts.
     [[nodiscard]] const GdnReplayRecords* round_replay_records(std::uint32_t verify_drafts) const;
     [[nodiscard]] const ops::GdnReplayFoldPlan& round_replay_fold(std::uint32_t verify_drafts) const;
+    // The narrowest family of `kind` that verifies at least `drafts` proposals per row.
+    [[nodiscard]] SpeculativeRoundFamily& round_family(SpeculativeRoundKind kind,
+                                                       std::uint32_t drafts = 0);
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);

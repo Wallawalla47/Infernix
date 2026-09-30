@@ -15,10 +15,23 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
+
+// Where a speculative round's proposals come from: the backend's neural drafter, or n-gram copies
+// (rows of a batched copy round without a copy keep their neural proposal).
+enum class SpeculativeRoundKind : std::uint8_t { Neural, Ngram };
+
+// One CUDA-Graph family of speculative decode rounds. Every round of the family verifies
+// verify_drafts proposals per row on the decode frame viewed at that width and records ReplaySSM
+// transitions through the record view of the same width.
+struct SpeculativeRoundShape {
+    SpeculativeRoundKind kind   = SpeculativeRoundKind::Neural;
+    std::uint32_t verify_drafts = 0;
+};
 inline constexpr std::uint32_t kCausalScoreTile = 1024;
 
 struct DFlashPersistentLayout {
@@ -72,6 +85,8 @@ struct WorkspacePlan {
 struct SequencePlanningInputs {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t neural_draft_window       = 0;
+    // Every speculative round family the engine captures; draft_window is their widest width.
+    std::vector<SpeculativeRoundShape> round_shapes;
     std::uint32_t ngram_draft_window        = 0;
     std::uint32_t ngram_min_match           = 12;
     std::uint32_t capacity                  = 0;
@@ -93,6 +108,7 @@ struct SequencePlanningInputs {
 struct SequencePlanImpl {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t neural_draft_window       = 0;
+    std::vector<SpeculativeRoundShape> round_shapes;
     std::uint32_t ngram_draft_window        = 0;
     std::uint32_t ngram_min_match           = 12;
     std::uint32_t capacity                  = 0;
