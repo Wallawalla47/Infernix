@@ -72,6 +72,14 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
     shapes.push_back({SpeculativeRoundKind::Neural, spec.draft_tokens});
     if (spec.ngram_draft_tokens != 0) {
+        // Copy rounds take the narrowest n-gram family that holds their longest copy, so short
+        // copies do not pay for the whole window. Narrower families lie strictly between the
+        // neural window (rows without a copy keep their neural proposal) and the n-gram window.
+        for (const std::uint32_t narrow : {7U, 15U, 31U}) {
+            if (narrow > spec.draft_tokens && narrow < spec.ngram_draft_tokens) {
+                shapes.push_back({SpeculativeRoundKind::Ngram, narrow});
+            }
+        }
         shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
     }
     return shapes;
