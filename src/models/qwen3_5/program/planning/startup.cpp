@@ -654,6 +654,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    // A proposal landing in another (wider) frame keeps the lattice's candidates
+                    // apart from the frame's column candidates.
+                    matrix(layout, DType::I32, dimension(draft->dflash2->selector_top_k),
+                           mask_columns);
                     matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
                            mask_columns);
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
@@ -666,6 +670,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
                                    mask_columns, mask_columns);
+                    // Staged chain drafts and laws before their copy into another frame.
+                    matrix(layout, DType::I32, 1, mask_columns);
+                    matrix(layout, DType::FP32, dimension(draft->dflash2->selector_top_k),
+                           mask_columns);
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
                                         proposal_drafts, proposal_drafts, batch, batch));
                     return finish(layout);
@@ -704,6 +712,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
+                // Staged drafts before their copy into another round's frame.
+                matrix(layout, DType::I32, 1, proposal_drafts * batch);
                 if (plan.proposal_head == ProposalHead::Optimized) {
                     matrix(layout, DType::BF16, dimension(parameters.proposal->rows),
                            proposal_drafts * batch);

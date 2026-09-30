@@ -46,8 +46,8 @@ With DFlash and DFlash2 every round verifies at its provider's own window for an
 all-neural round runs at the neural window, and a round in which at least one row has a copy
 proposal runs at the ngram window. The decode frame is allocated at the wider of the two windows
 and viewed densely at the round's width. In a multi-request ngram round the neural drafter also
-runs and each row with a copy proposal takes it, so a row without a match keeps its neural
-proposal for that round. The narrower window records GDN replay transitions through a narrowed
+runs, at its own width, and each row with a copy proposal takes it, so a row without a match keeps
+its neural proposal for that round. The narrower window records GDN replay transitions through a narrowed
 view of the same record storage. DFlash and DFlash2 retain an append buffer sized for the widest
 provider: a narrow neural round must catch up target features from a preceding wide copy round.
 

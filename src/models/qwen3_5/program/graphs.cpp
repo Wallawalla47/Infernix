@@ -224,7 +224,7 @@ void ProgramImpl::prepare_graphs() {
                 std::min(capture_proposal_drafts, capacity - frontier - 1U);
             const std::uint32_t width = capture_drafts + 1U;
             for (std::uint32_t row = 0; row < batch_size; ++row) {
-                for (std::uint32_t step = 0; step < capture_proposal_drafts; ++step) {
+                for (std::uint32_t step = 0; step < capture_drafts; ++step) {
                     const auto base = row * capture_drafts * ops::kSparseSpeculativeCandidates +
                                       step * ops::kSparseSpeculativeCandidates;
                     dflash_host_ingress->ngram_q[base] = 1.0F;
@@ -240,7 +240,10 @@ void ProgramImpl::prepare_graphs() {
                 dflash_host_ingress->context_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>(capture_proposal_drafts + 1U);
+                    static_cast<std::int32_t>((speculative_backend == SpeculativeBackend::DFlash2
+                                                   ? capture_proposal_drafts
+                                                   : std::min(extent, capture_proposal_drafts)) +
+                                              1U);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
@@ -415,8 +418,9 @@ void ProgramImpl::prepare_graphs() {
             // keep their neural proposal.
             const bool ngram                  = family.shape.kind == SpeculativeRoundKind::Ngram;
             const std::uint32_t family_window = family.shape.verify_drafts;
+            // The drafter always proposes at its own width.
             const auto prepare_family = [&](std::uint32_t frontier, std::uint32_t batch_size) {
-                prepare_representative(frontier, batch_size, family_window, family_window);
+                prepare_representative(frontier, batch_size, family_window, neural_draft_window);
             };
             const auto family_core = [&] {
                 execution::ExecutionCore core = execution_core();

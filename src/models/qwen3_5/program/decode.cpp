@@ -754,6 +754,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         round_family(any_ngram ? SpeculativeRoundKind::Ngram : SpeculativeRoundKind::Neural);
     const std::uint32_t verify_drafts = family.shape.verify_drafts;
     const bool drafter_runs           = !any_ngram || lanes.size() > 1;
+    const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
     auto& graph_family                = family.graphs;
     qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -851,8 +852,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 checked_i32(frontier, "DFlash batch frontier");
             dflash_host_ingress->context_frontiers[row] =
                 checked_i32(sequence.dflash_context_frontier, "DFlash context frontier");
-            dflash_host_ingress->proposal_valid_columns[row] =
-                static_cast<std::int32_t>(neural_draft_window + 1U);
+            // DFlash2 drafts its whole block; DFlash drafts the columns the row verifies.
+            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(
+                (dflash2_backend ? neural_draft_window : std::min(extent, neural_draft_window)) +
+                1U);
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
