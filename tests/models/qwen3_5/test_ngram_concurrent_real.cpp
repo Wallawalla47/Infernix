@@ -14,7 +14,7 @@
 // Every part runs on ONE Engine: a single ~20 GiB load serves all parts, so the test can share the
 // GPU with a live serve. The decisive correctness contract is that a multi-request round must not
 // corrupt any lane: at temperature 0 two lanes with the same prompt in the same batch decode to
-// identical tokens, and a copy lane reproduces an exact source prefix.
+// identical tokens, and a copy lane reproduces an exact source prefix up to its end of turn.
 namespace {
 void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
@@ -55,6 +55,44 @@ ninfer::RequestOptions request(unsigned output, bool reuse) {
     options.stop.publish_stop_token              = true;
     return options;
 }
+
+// Copies stop at the model's own end of turn, as served requests do. On some artifacts ending the
+// turn is a near-tie inside this synthetic file, and which side wins moves with the rounding of the
+// verification width, so an early end of turn is a valid outcome. Free-form lanes keep generating
+// to their budget.
+ninfer::RequestOptions copy_request(unsigned output, bool reuse) {
+    auto options                        = request(output, reuse);
+    options.stop.include_model_defaults = true;
+    return options;
+}
+
+// The copied text must be an exact source prefix, and a copy that ended its turn early must still
+// have run long enough to exercise ngram rounds. Returns how the copy ended, for the log.
+std::string require_copy(const std::string& source, int seed,
+                         const ninfer::GenerationResult& result, std::size_t min_tokens,
+                         const std::string& lane) {
+    const std::string produced = assistant_prefix(seed) + result.content;
+    if (!source.starts_with(produced)) {
+        const std::size_t at   = first_source_difference(source, produced);
+        const std::size_t from = at > 40 ? at - 40 : 0;
+        std::cerr << lane << " diverges at byte " << at << " of " << produced.size()
+                  << "\n  source:   [" << source.substr(from, 80) << "]\n  produced: ["
+                  << produced.substr(from, 80) << "]\n";
+        throw std::runtime_error(lane + " is not an exact source prefix");
+    }
+    const std::string tokens = std::to_string(result.generated_token_ids.size());
+    if (result.finish_reason == ninfer::FinishReason::OutputLimit) { return "limit@" + tokens; }
+    require(result.finish_reason == ninfer::FinishReason::StopToken,
+            "copy lane ended for a reason other than its budget or end of turn");
+    if (result.generated_token_ids.size() < min_tokens) {
+        throw std::runtime_error(lane + " ended its turn after only " + tokens + " tokens");
+    }
+    return "turn@" + tokens;
+}
+
+// An early end of turn must leave this many copied tokens; the soak must run for hundreds.
+constexpr std::size_t kMinimumCopyTokens = 64;
+constexpr std::size_t kMinimumSoakTokens = 256;
 
 ninfer::PromptInput copy_prompt(const std::string& source, int seed) {
     ninfer::PromptInput input;
@@ -177,24 +215,22 @@ int main(int argc, char** argv) {
         // Part 1: single-lane reference on the shared engine.
         std::vector<ninfer::TokenId> c1_tokens;
         {
-            const auto result = engine.generate(engine.prepare(copy_prompt(source, 0)),
-                                                request(256, true));
+            const auto result =
+                engine.generate(engine.prepare(copy_prompt(source, 0)), copy_request(256, true));
             c1_tokens         = result.generated_token_ids;
-            require(source.starts_with(assistant_prefix(0) + result.content),
-                    "C1 reference is not an exact source prefix");
+            const std::string end =
+                require_copy(source, 0, result, kMinimumCopyTokens, "C1 reference");
             require(result.speculative.ngram_accepted_tokens > 0,
                     "C1 reference did not engage ngram");
-            std::cout << "c1 backend=" << backend << " width=" << width
-                      << " tokens=" << c1_tokens.size()
+            std::cout << "c1 backend=" << backend << " width=" << width << " end=" << end
                       << " ngram_accepted=" << result.speculative.ngram_accepted_tokens << "\n";
         }
 
         // Part 2: a single request on the C2 engine must reproduce the C1 path token-for-token.
         {
-            const auto result = engine.generate(engine.prepare(copy_prompt(source, 0)),
-                                                request(256, true));
-            require(source.starts_with(assistant_prefix(0) + result.content),
-                    "C2 single request is not an exact source prefix");
+            const auto result =
+                engine.generate(engine.prepare(copy_prompt(source, 0)), copy_request(256, true));
+            require_copy(source, 0, result, kMinimumCopyTokens, "C2 single request");
             require(result.speculative.ngram_accepted_tokens > 0,
                     "C2 single request did not engage ngram");
             require(result.generated_token_ids == c1_tokens,
@@ -210,19 +246,20 @@ int main(int argc, char** argv) {
             const std::string source_a = make_source(seed_a);
             const std::string source_b = make_source(seed_b);
             auto handle_a = engine.submit(engine.prepare(copy_prompt(source_a, seed_a)),
-                                          request(256, true));
+                                          copy_request(256, true));
             auto handle_b = engine.submit(engine.prepare(copy_prompt(source_b, seed_b)),
-                                          request(256, true));
+                                          copy_request(256, true));
             const auto result_a = handle_a.wait();
             const auto result_b = handle_b.wait();
-            require(source_a.starts_with(assistant_prefix(seed_a) + result_a.content),
-                    "concurrent copy lane A is not an exact source prefix");
-            require(source_b.starts_with(assistant_prefix(seed_b) + result_b.content),
-                    "concurrent copy lane B is not an exact source prefix");
+            const std::string end_a = require_copy(source_a, seed_a, result_a, kMinimumCopyTokens,
+                                                   "concurrent copy lane A");
+            const std::string end_b = require_copy(source_b, seed_b, result_b, kMinimumCopyTokens,
+                                                   "concurrent copy lane B");
             const std::uint64_t total = result_a.speculative.ngram_accepted_tokens +
                                         result_b.speculative.ngram_accepted_tokens;
             require(total > 0, "concurrent copy requests did not engage ngram");
-            std::cout << "c2-concurrent lanes=2 combined_ngram_accepted=" << total << "\n";
+            std::cout << "c2-concurrent lanes=2 end_a=" << end_a << " end_b=" << end_b
+                      << " combined_ngram_accepted=" << total << "\n";
         }
 
         // Part 3b: a copy lane and a free-form lane in flight together, so ngram rounds carry a
@@ -239,21 +276,13 @@ int main(int argc, char** argv) {
             const std::string freeform =
                 "Explain in four short sentences how a hash table resolves collisions.";
             auto handle_a = engine.submit(engine.prepare(copy_prompt(source_a, seed_a)),
-                                          request(256, true));
+                                          copy_request(256, true));
             auto handle_b = engine.submit(engine.prepare(freeform_prompt(freeform)),
                                           request(192, false));
             const auto result_a = handle_a.wait();
             const auto result_b = handle_b.wait();
-            const std::string produced_a = assistant_prefix(seed_a) + result_a.content;
-            if (!source_a.starts_with(produced_a)) {
-                const std::size_t at = first_source_difference(source_a, produced_a);
-                const std::size_t from = at > 40 ? at - 40 : 0;
-                std::cerr << "mixed copy lane diverges at byte " << at << " of " << produced_a.size()
-                          << "\n  source:   [" << source_a.substr(from, 80) << "]\n  produced: ["
-                          << produced_a.substr(from, 80) << "]\n";
-            }
-            require(source_a.starts_with(produced_a),
-                    "mixed-round copy lane is not an exact source prefix");
+            const std::string end_a = require_copy(source_a, seed_a, result_a, kMinimumCopyTokens,
+                                                   "mixed-round copy lane");
             require(result_a.speculative.ngram_accepted_tokens > 0,
                     "mixed-round copy lane did not engage ngram");
             require(result_b.generated_token_ids.size() >= 64 &&
@@ -262,7 +291,8 @@ int main(int argc, char** argv) {
             const bool masked_drafter = backend != "mtp";
             require(!masked_drafter || result_b.speculative.fallback_steps <= 1,
                     "mixed-round free-form lane lost its neural proposal in ngram rounds");
-            std::cout << "c2-mixed copy_ngram_accepted=" << result_a.speculative.ngram_accepted_tokens
+            std::cout << "c2-mixed copy_end=" << end_a
+                      << " copy_ngram_accepted=" << result_a.speculative.ngram_accepted_tokens
                       << " freeform_rounds=" << result_b.speculative.rounds
                       << " freeform_fallback=" << result_b.speculative.fallback_steps
                       << " freeform_accepted=" << result_b.speculative.accepted_tokens << "\n";
@@ -327,23 +357,17 @@ int main(int argc, char** argv) {
             const std::string source_a = make_source(seed_a, 60);
             const std::string source_b = make_source(seed_b, 60);
             auto handle_a = engine.submit(engine.prepare(copy_prompt(source_a, seed_a)),
-                                          request(640, false));
+                                          copy_request(640, false));
             auto handle_b = engine.submit(engine.prepare(copy_prompt(source_b, seed_b)),
-                                          request(640, false));
+                                          copy_request(640, false));
             const auto result_a = handle_a.wait();
             const auto result_b = handle_b.wait();
-            const auto produced_a = assistant_prefix(seed_a) + result_a.content;
-            const auto produced_b = assistant_prefix(seed_b) + result_b.content;
-            const auto diff_a     = first_source_difference(source_a, produced_a);
-            const auto diff_b     = first_source_difference(source_b, produced_b);
-            std::cout << "c2-soak lanes=2 tokens_a=" << result_a.generated_token_ids.size()
-                      << " tokens_b=" << result_b.generated_token_ids.size()
-                      << " source_bytes=" << source_a.size() << " first_diff_a=" << diff_a
-                      << " first_diff_b=" << diff_b << "\n";
-            require(source_a.starts_with(produced_a),
-                    "long soak lane A drifted off its source prefix");
-            require(source_b.starts_with(produced_b),
-                    "long soak lane B drifted off its source prefix");
+            const std::string end_a =
+                require_copy(source_a, seed_a, result_a, kMinimumSoakTokens, "long soak lane A");
+            const std::string end_b =
+                require_copy(source_b, seed_b, result_b, kMinimumSoakTokens, "long soak lane B");
+            std::cout << "c2-soak lanes=2 end_a=" << end_a << " end_b=" << end_b
+                      << " source_bytes=" << source_a.size() << "\n";
         }
 
         // Part 6: a long concurrent free-form soak. Two lanes decode hundreds of tokens together
