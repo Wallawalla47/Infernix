@@ -27,6 +27,12 @@ struct CausalAttentionExecutionEnvelope {
     // route. Over NVFP4 it can change the workspace: the fast kernel may split a single-row launch's
     // keys across CTAs, so workspace planning and execution must use the same hint.
     bool fast_prompt_kernel = false;
+    // With fast_prompt_kernel over an INT8-G64 cache, run the fast prompt kernel's PV on 8-bit
+    // integer Tensor Cores: each probability times its key's V group scale is rounded to a u8 code
+    // against that row's largest such product in the 64-key tile, and the stored INT8 V codes are
+    // multiplied exactly with INT32 accumulation. This is an opt-in precision change of the
+    // probabilities; other routes and cache formats ignore it.
+    bool fast_prompt_pv8 = false;
 };
 
 struct ContextAttentionExecutionEnvelope {

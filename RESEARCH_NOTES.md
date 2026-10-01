@@ -260,3 +260,30 @@ The per-line form does land: Nsight shows the GDN out-projection at 17.9 us inst
 but the record kernel slowed from 9.7 to 11.2 us behind the prefetch traffic and the extra
 3.4 us node sits on the dependency chain. The remaining upside, under 1 % per round, needs the
 prefetch fused into the GDN kernels across Op ownership, and was not pursued.
+
+## 8-bit P×V in the fast INT8 prompt kernel (opt-in, `--int8-prefill-8bit-pv`)
+
+The fast INT8 prompt kernel accumulates P×V on FP16 Tensor Cores (FP32 accumulation, 209.5
+TFLOPS on RTX 5090). The opt-in variant multiplies P' = P × (V group scale), quantized per row,
+64-dimension group and 64-key tile to unsigned 8-bit codes (step = row maximum / 255, round to
+nearest), by the stored signed INT8 V codes on `mma.m16n8k32.u8.s8` (838 TOPS) and rescales the
+INT32 sums in FP32. SageAttention2 quantizes P to FP8 E4M3 instead; that needs V in FP8 too, and
+the INT8-G64 V codes are not exact in E4M3 above 16, so integer codes were chosen to keep V exact.
+
+RTX 5090, CUDA 13.4, `qwen3_8_27b_nvfp4-nvidia.ninfer`, INT8 KV. Per attention layer
+(`ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4 --tokens 3584
+--execution graph --cache cold`, two passes, medians): 584/564 µs at an empty context (-3.5 %),
+4990→4455 (-10.7 %), 9346→8332 (-10.8 %), 18263→16207 (-11.3 %) and 37064→34082 µs (-8.0 %) at
+16K/32K/64K/128K. End to end (`ninfer_bench -p 16384,65536 --prefill-chunk 4096`, two passes):
+prefill +1.5 % at 16K and +3.9 % at 64K. Perplexity on `ninfer-ppl-1m-v1` (full corpus):
+4.90771 → 4.90551 with 4096/2048 windows and 4.904120 → 4.851635 with 65536/32768
+(english_reference 7.42 → 7.26, code 1.849 → 1.810, Chinese and long-form within 0.03 %).
+
+The 64K change is far larger than the per-chunk error the random-data op test sees (relative L2
+0.0020 against 0.0017 for the FP16 path), and it grows with context. The likely cause, not
+isolated: real attention rows within a 64-key tile span many orders of magnitude, and every
+probability below half a code step of the tile's largest rounds to zero while the softmax
+denominator keeps it, so each tile's diffuse tail is dropped rather than averaged. Lower
+perplexity on this corpus does not make it more exact. Not tried: FP8 P with a split (hi/lo) V,
+or two u8 terms per probability (16-bit fixed point at half the INT8 rate, still twice the FP16
+rate), either of which would keep the tail.

@@ -62,6 +62,7 @@ struct BenchOptions {
     float rope_yarn_factor = 1.0F;
     std::optional<std::uint32_t> max_context;
     bool original_int8_prefill_kernel = false;
+    bool int8_prefill_8bit_pv         = false;
     bool original_nvfp4_prefill_kernel = false;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
@@ -108,6 +109,7 @@ struct BenchEnvironment {
     std::uint32_t max_context   = 0;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     bool original_int8_prefill_kernel = false;
+    bool int8_prefill_8bit_pv         = false;
     bool original_nvfp4_prefill_kernel = false;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

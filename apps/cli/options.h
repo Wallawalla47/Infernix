@@ -29,6 +29,7 @@ struct Options {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;
+    bool int8_prefill_8bit_pv         = false;
     bool original_nvfp4_prefill_kernel = false;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;

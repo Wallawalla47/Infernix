@@ -74,11 +74,14 @@ struct Options {
     int repeat       = 30;
     bool profile     = false;
     bool fast_prompt = false;
+    bool fast_prompt_pv8 = false;
     std::string csv_out;
 };
 
-// --fast-prompt: every envelope asks for the fast INT8/NVFP4 prompt kernel.
-bool envelope_fast_prompt = false;
+// --fast-prompt: every envelope asks for the fast INT8/NVFP4 prompt kernel; --fast-prompt-pv8
+// additionally selects the INT8 fast kernel's 8-bit PV form.
+bool envelope_fast_prompt     = false;
+bool envelope_fast_prompt_pv8 = false;
 
 struct Result {
     Entry entry;
@@ -121,6 +124,7 @@ struct Result {
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--fast-prompt] "
+                 "[--fast-prompt-pv8] "
                  "[--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -257,6 +261,9 @@ Options parse_options(int argc, char** argv) {
             options.profile = true;
         } else if (argument == "--fast-prompt") {
             options.fast_prompt = true;
+        } else if (argument == "--fast-prompt-pv8") {
+            options.fast_prompt     = true;
+            options.fast_prompt_pv8 = true;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -411,6 +418,7 @@ ops::CausalAttentionExecutionEnvelope execution_envelope(int visible, int maximu
         maximum == 0 ? static_cast<unsigned>(visible) : 1U,
         static_cast<unsigned>(maximum == 0 ? visible : maximum)};
     envelope.fast_prompt_kernel = envelope_fast_prompt;
+    envelope.fast_prompt_pv8    = envelope_fast_prompt_pv8;
     return envelope;
 }
 
@@ -872,7 +880,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         const Options options = parse_options(argc, argv);
-        envelope_fast_prompt = options.fast_prompt;
+        envelope_fast_prompt     = options.fast_prompt;
+        envelope_fast_prompt_pv8 = options.fast_prompt_pv8;
         DeviceContext device;
         const auto execution = device.execution_view();
         const auto stream    = execution.stream;
