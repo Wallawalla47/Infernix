@@ -1328,13 +1328,23 @@ int gdn_conv_case() {
     return failures;
 }
 
-int gdn_record_case(int value_heads, int max_paths) {
+// Rows whose walks nest: a two-level side branch and a four-child root (k=4), a three-level
+// nesting that overflows the walk's two state slots and rebuilds its innermost branch state (k=4),
+// a chain row, and a 16-column K=7 tree with two nested side branches.
+std::vector<ops::SpeculativeTreeRow> nested_gdn_rows() {
+    return {host_row({-1, 0, 1, 2, 3, 0, 0, 0, 2, 8, 8}, 4, true),
+            host_row({-1, 0, 1, 2, 3, 1, 5, 5, 7, 7}, 4, true), chain_row(2, 4),
+            host_row({-1, 0, 1, 2, 3, 4, 5, 6, 0, 8, 8, 10, 10, 12, 5, 14}, 7, true)};
+}
+
+int gdn_record_case(int value_heads, const std::vector<ops::SpeculativeTreeRow>& rows, int n) {
     constexpr int dim = 128, qk_heads = 16, slots = 4;
-    constexpr int k = 4, n = 9, batch = 3;
-    const auto rows = gdn_rows(k, n);
-    std::vector<int> valid;
-    for (const auto& row : rows) valid.push_back(row.nodes);
-    const std::vector<int> initial{1, 3, 2};
+    const int batch = static_cast<int>(rows.size());
+    std::vector<int> valid, initial;
+    for (const auto& row : rows) {
+        valid.push_back(row.nodes);
+        initial.push_back((static_cast<int>(initial.size()) * 3 + 1) % slots);
+    }
     const std::size_t qk_column = static_cast<std::size_t>(dim) * qk_heads;
     const std::size_t v_column  = static_cast<std::size_t>(dim) * value_heads;
     const std::size_t columns   = static_cast<std::size_t>(n) * batch;
@@ -1395,8 +1405,8 @@ int gdn_record_case(int value_heads, int max_paths) {
         Tensor tgr(gate_record.p, DType::FP32, {2, value_heads, width, rows_count});
         if (tree)
             ops::gated_delta_net_replay_record(tq, tk, tv, tg, tbeta, scale, tstates, tvalid, tinit,
-                                               rows_tensor(tree_rows, batch), max_paths, tkr, tvr,
-                                               tgr, tout, nullptr);
+                                               rows_tensor(tree_rows, batch), tkr, tvr, tgr, tout,
+                                               nullptr);
         else
             ops::gated_delta_net_replay_record(tq, tk, tv, tg, tbeta, scale, tstates, tvalid, tinit,
                                                tkr, tvr, tgr, tout, nullptr);
@@ -1410,7 +1420,7 @@ int gdn_record_case(int value_heads, int max_paths) {
     const auto tree = run(q, kv, v, g, beta, n, batch, valid, initial, true);
     int failures    = 0;
     const std::string label =
-        "tree record Hv=" + std::to_string(value_heads) + " paths=" + std::to_string(max_paths);
+        "tree record Hv=" + std::to_string(value_heads) + " width=" + std::to_string(n);
     for (int b = 0; b < batch; ++b) {
         const auto& t = rows[static_cast<std::size_t>(b)];
         for (int p = 0; p < t.paths; ++p) {
@@ -1501,8 +1511,9 @@ int main() {
         failures += selector_case(32, 8);
         failures += selector_case(24, 2);
         failures += gdn_conv_case();
-        failures += gdn_record_case(48, 4);
-        failures += gdn_record_case(32, 8);
+        failures += gdn_record_case(48, gdn_rows(4, 9), 9);
+        failures += gdn_record_case(32, gdn_rows(4, 9), 9);
+        failures += gdn_record_case(48, nested_gdn_rows(), 16);
     } catch (const std::exception& error) {
         std::cerr << "speculative tree test threw: " << error.what() << '\n';
         return 1;

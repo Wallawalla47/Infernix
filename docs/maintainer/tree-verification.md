@@ -50,10 +50,10 @@ a chain.
 |---|---|---|
 | `--draft-tree-nodes auto` | every all-neural round of up to four rows chooses chain verification or a tree of K+5 or K+9 columns from measured round time and acceptance ([Automatic widths](#automatic-widths)) | off |
 | `--draft-tree-nodes LIST` | fixed columns per tree row by batch size: entry c applies to rounds of c rows and the last entry to every larger batch; `0` keeps that batch size on chain verification; nonzero entries are `draft tokens + 2 .. 32` | off |
-| `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` (each path is one parallel GDN replay) | `8` |
+| `--draft-tree-paths N` | most root-to-leaf paths per tree row, `2..8` | `8` |
 
-A tree widens every target projection, the LM head, attention and the per-column target
-distribution of a row from K+1 to N columns, and the GDN replay to the row's path count. A column
+A tree widens every target projection, the LM head, attention, the GDN replay and the per-column
+target distribution of a row from K+1 to N columns. A column
 buys about the same acceptance at any batch size, but rows share the weight streaming of a round
 and not its per-column work, so a column costs more of each row's share of the round as the batch
 grows, and every column of a verification block wider than 8 costs attention time that grows with
@@ -150,13 +150,16 @@ plane, then the width-4 convolution). The tree convolution evaluates
 the row's ancestor chain. Where a chain round would select a fused projection-convolution
 schedule, tree rounds differ from it by the one intermediate BF16 rounding of the projection.
 
-**GDN recurrence (path-parallel replay).** The record kernel runs one CTA row per (request, path)
-up to `--draft-tree-paths`. Each path replays its column list from the request's initial state; a
-column shared by several paths is recomputed identically by each and written only by the path that
-owns it. Paths past a row's leaves exit at once. Replay is exact: a path computes the same
-sequence of operations a chain round of that path would. The persistent recurrent and convolution
-state is not modified by verification (ReplaySSM record mode), so rejected branches need no
-rollback.
+**GDN recurrence (tree walk).** The record kernel runs the chain kernel's grid, one CTA per
+(request, value head, state tile), and each CTA walks its row's tree once, depth first, so every
+live column is computed exactly once from its parent's state. A branch node's state tile goes to a
+shared-memory slot while its other subtrees run; the walk visits a node's later-drawn children
+before its first child (a main column's main-chain child), so a main column's slot is released when
+the walk returns to the main chain and a row with s side columns nests at most (s+1)/2 slots. Two
+slots cover every tree of up to four side columns (K+5 columns); a deeper nesting rebuilds the
+branch state from the initial state along its root path. Replay is exact: every column's state is
+the chain recurrence of its root path, bit for bit. The persistent recurrent and convolution state
+is not modified by verification (ReplaySSM record mode), so rejected branches need no rollback.
 
 A tree widens the verification block, which selects other GEMM tiles and attention routes, so the
 main-chain columns of a tree round are not bit-identical to those of a chain round, as ngram
@@ -260,7 +263,9 @@ Op tests (`tests/ops/test_speculative_tree.cpp`, `tests/ops/softmax_attention/ca
 3. Attention: random per-row trees, chain-masked and short rows, on every storage's grouped and
    parallel routes, direct and graph-replayed, against the ancestor-visibility FP64 oracle.
 4. GDN: every path of every tree row bit-identical to the chain convolution and record on that
-   path's columns; idle columns zero; records exact.
+   path's columns, for trees whose walks nest side branches two deep, give a node four children
+   and nest three deep (beyond the walk's two slots, so a branch state is rebuilt), up to 16
+   columns at K=7; idle columns zero; records exact.
 5. Compaction: record-plane columns and every KV storage's planes, exact.
 
 Host (`tests/models/qwen3_5/test_tree_width_controller.cpp`): the controller's same-text gains are
@@ -359,13 +364,28 @@ spread of the changes is the text.
 leaves, so 15 % of the rounds leave the main chain against 20-23 % with three or more. Eight paths
 cost no more per round than four, so the default is the maximum.
 
-**Where a round's time goes.** Nsight Systems (`--cuda-graph-trace node`), greedy one-request
-decode at short context, 12 columns against the chain on the same build, INT8 KV: +0.81 ms of
-kernel time per round (+5.5 %). The GDN record kernel (one replay per path) adds 0.31 ms and the
-tree convolution 0.11 ms; the projections, MLP, norms and LM head of the four extra columns add
-0.30 ms; attention adds 0.03 ms (a block wider than 8 takes the parallel grouped route, whose KV
-append is a separate kernel in every storage format); the builder, input preparation, acceptance
-and compaction add 0.05 ms together.
+**Where a round's time goes.** Nsight Systems (`--cuda-graph-trace node`) on `ninfer-serve`
+during the decode-saturation suite with one, two and four requests (DFlash2 K=7, INT8 KV, no
+n-gram so every round is a tree round, 2-4K tokens of context, 5 s windows of 140-320 rounds),
+wall time per round with overlapping kernels charged once, against chain rounds of the same build:
+
+| | 1 request | 2 requests | 4 requests |
+|---|---|---|---|
+| Chain, ms per round | 14.59 | 15.61 | 17.55 |
+| 12 columns | +4.5 % | +5.4 % | +10.8 % |
+| 16 columns | +8.9 % | +9.8 % | +16.6 % |
+| GDN record, ms: chain / 12 / 16 columns | 0.47 / 0.73 / 0.95 | 0.66 / 1.00 / 1.29 | 1.12 / 1.76 / 2.29 |
+
+The tree walk computes each column once, so its record time follows the column count; at one
+request it runs one CTA per state tile through 12 or 16 serial steps where the chain runs 8. The
+path-parallel replay it replaced, which ran every root-to-leaf path from the initial state on its
+own CTAs, took 0.81 / 1.28 / 2.12 ms at 12 columns and 1.00 / 1.65 / 2.91 ms at 16; the walk makes
+tree rounds 0.6 / 1.7 / 2.9 % faster at 12 columns and 0.4 / 2.0 / 4.0 % at 16. At 12 columns the
+other additions are the tree convolution (0.11-0.12 ms), attention (0.11-0.31 ms; a block wider
+than 8 takes the parallel grouped route, whose KV append is a separate kernel in every storage
+format), the builder, input preparation, acceptance and compaction (0.08-0.19 ms, measured before
+the walk), and at four requests the LM head over 48 columns (1.05 against 0.75 ms; 1.17 ms before
+its sliced-K route was extended to 64 columns).
 
 **Long context.** The suite above runs at 0-9K tokens of context. Greedy `ninfer_bench -pg P,512` on
 the bench corpus (INT8 KV, neural rounds only, one request) gives the extra round time against the
@@ -374,9 +394,10 @@ The corpus is too predictable under greedy decoding (6.9-7.6 tokens per round) f
 tokens, so these runs measure cost only. At 128K Nsight attributes 2.21 of the 2.82 ms a 12-column
 tree adds per round to verification attention (2.80 -> 5.01 ms): every query row's QK and P x V work
 grows with the context, and a 12-column block has half as many rows again as the chain's (reading
-the KV once for all columns does not help; see RESEARCH_NOTES). The GDN record kernel adds 0.40 ms.
-With the acceptance gain measured above (+12 % at 12 columns, +17 % at 16, which does not fall with
-context in production logs), trees gain about 5-6 % at 16K and 1-2 % at 64K, and lose 3-4 % at 128K.
+the KV once for all columns does not help; see RESEARCH_NOTES). The GDN record kernel added 0.40 ms
+with the path-parallel replay (the tree walk adds 0.27 ms at one request, at any context). With the
+acceptance gain measured above (+12 % at 12 columns, +17 % at 16, which does not fall with context
+in production logs), trees gain about 5-6 % at 16K and 1-2 % at 64K, and lose 3-4 % at 128K.
 
 **Automatic widths.** The decode-saturation suite, INT8 KV, seed sets 4 and 5, chain, the best
 fixed width and `auto` interleaved per pass; direct changes are the mean of the two per-pass
@@ -394,6 +415,12 @@ automatic widths stay 0.4-1.9 points behind the best fixed width at one to three
 spend about one round in 32 on the widest width and take narrower trees or the chain where the
 estimates are close (at three requests the acceptance gain is +9.7 % against the fixed 12
 columns' +12.7 %). At four requests they break even, as the fixed tables do.
+
+These runs predate the tree walk and the 64-column sliced-K LM head. A later pair of passes (seed
+sets 0 and 1, the same suite and flags) measured automatic widths against chain verification with
+the build before and after both: at three requests the same-text estimate rose from +1.9 and +2.0 %
+to +2.5 and +3.2 %, and at four from +0.1 and +0.4 % to +3.3 and +2.2 %, where automatic widths now
+verify trees in 95-99 % of the rounds instead of 14-56 %.
 
 **Automatic widths at long context.** One request, sampled (thinking on, the model's default
 sampling), 3072 output tokens after a 32K, 64K or 128K-token document (`long_niah` haystacks with a

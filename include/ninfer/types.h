@@ -101,7 +101,7 @@ struct SpeculativeOptions {
     // same-text acceptance favour at its batch size and context length. A target whose GDN input
     // projections cannot verify trees resolves this to false (chain verification).
     bool draft_tree_auto = false;
-    // Most root-to-leaf paths a tree row may hold (each one a parallel GDN replay), 2..8.
+    // Most root-to-leaf paths a tree row may hold, 2..8.
     std::uint32_t draft_tree_paths = 8;
     // CPU-only retention, separate from KV. Zero keeps request-local drafting.
     std::size_t ngram_archive_bytes = 0;

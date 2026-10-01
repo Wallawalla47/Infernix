@@ -18,7 +18,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         if (frame.proposal_q.data == nullptr || frame.feature_sink == nullptr) {
             throw std::logic_error("tree verification requires DFlash2 sparse acceptance");
         }
-        card.set_verification_tree(&frame.tree_rows, &frame.tree_masks, frame.tree_paths);
+        card.set_verification_tree(&frame.tree_rows, &frame.tree_masks);
     }
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
@@ -32,7 +32,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.target_tokens);
     }
     if (tree) {
-        card.set_verification_tree(nullptr, nullptr, 0);
+        card.set_verification_tree(nullptr, nullptr);
         const cudaStream_t stream = execution.device.stream;
         ops::speculative_accept_sparse_tree(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,

@@ -148,13 +148,6 @@ struct RecurrentCoordinates {
     std::uint32_t qk_head;
     std::uint32_t dv_base;
     std::uint32_t dqk_base;
-    // Verification-tree replay: the root path this CTA row replays, whether its request row is a
-    // tree row rather than a chain row of a tree round, the path's columns (one byte each, at most
-    // 16) and the first path position this path owns.
-    int path      = 0;
-    bool tree_row = false;
-    uint4 path_columns{};
-    int owned_from = 0;
 };
 
 __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t batch,
@@ -449,161 +442,6 @@ struct RecordAccess {
     }
 };
 
-// Path-parallel replay of per-row verification trees. CTA row y is (request row y / max_paths,
-// root path y % max_paths); a tree row's path walks its column list from the request's initial
-// state, so every column is computed by exactly the chain recurrence of its root path. Only the
-// path that owns a column (SpeculativeTreeRow::owned_from) writes its output and records. A chain
-// row of a tree round runs on path 0 as the chain record.
-struct TreeRecordAccess {
-    RecordAccess<true> base;
-    const SpeculativeTreeRow* trees;
-    std::int32_t max_paths;
-    float scale;
-
-    __device__ __forceinline__ RecurrentCoordinates coordinates() const {
-        const std::int32_t y = static_cast<std::int32_t>(blockIdx.y);
-        RecurrentCoordinates coord =
-            make_coordinates(y / max_paths, 0, static_cast<std::int32_t>(blockIdx.z), base.heads);
-        coord.path                     = y % max_paths;
-        const SpeculativeTreeRow& tree = trees[coord.batch];
-        coord.tree_row                 = tree.tree != 0;
-        if (coord.tree_row) {
-            // Every column lookup of the replay reads these registers, not the tree rows.
-            coord.path_columns = *reinterpret_cast<const uint4*>(tree.path_columns[coord.path]);
-            coord.owned_from   = tree.owned_from[coord.path];
-        }
-        return coord;
-    }
-
-    __device__ __forceinline__ std::int32_t
-    active_columns(const RecurrentCoordinates& coord) const {
-        const SpeculativeTreeRow& tree = trees[coord.batch];
-        if (coord.tree_row) { return coord.path < tree.paths ? tree.path_length[coord.path] : 0; }
-        return coord.path == 0 ? base.valid_columns[coord.batch] : 0;
-    }
-
-    __device__ __forceinline__ std::int32_t column_index(const RecurrentCoordinates& coord,
-                                                         std::int32_t token) const {
-        if (!coord.tree_row) { return token; }
-        const std::uint32_t word = token < 8
-                                       ? (token < 4 ? coord.path_columns.x : coord.path_columns.y)
-                                       : (token < 12 ? coord.path_columns.z : coord.path_columns.w);
-        return static_cast<std::int32_t>((word >> ((token & 3) * 8)) & 0xffU);
-    }
-
-    __device__ __forceinline__ std::int64_t column(const RecurrentCoordinates& coord,
-                                                   std::int32_t token) const {
-        return static_cast<std::int64_t>(coord.batch) * base.width + column_index(coord, token);
-    }
-
-    __device__ __forceinline__ bool owns(const RecurrentCoordinates& coord,
-                                         std::int32_t token) const {
-        return coord.tree_row ? token >= coord.owned_from : coord.path == 0;
-    }
-
-    __device__ __forceinline__ const float*
-    state_read_base(const RecurrentCoordinates& coord) const {
-        return base.state_read_base(coord);
-    }
-
-    __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
-                                                            std::int32_t token) const {
-        return base.k + (column(coord, token) * base.heads.H_qk + coord.qk_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
-                                                              std::int32_t token) const {
-        return base.v + (column(coord, token) * base.heads.H_v + coord.value_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
-                                                     std::int32_t token) const {
-        return load_source_gate(base.g, base.beta,
-                                column(coord, token) * base.heads.H_v + coord.value_head);
-    }
-
-    __device__ __forceinline__ const __nv_bfloat16* query_ptr(const RecurrentCoordinates& coord,
-                                                              std::int32_t token) const {
-        return base.q + (column(coord, token) * base.heads.H_qk + coord.qk_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ __nv_bfloat16* output_ptr(const RecurrentCoordinates& coord,
-                                                         std::int32_t token) const {
-        return base.out + (column(coord, token) * base.heads.H_v + coord.value_head) * kStateDim;
-    }
-
-    __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
-                                              const RawQkLane& raw) const {
-        if (!owns(coord, token)) { return; }
-        if (coord.state_tile == 0 && coord.warp == 0 &&
-            static_cast<int>(coord.value_head) % base.heads.group_size() == 0) {
-            __nv_bfloat16* destination =
-                base.key_record +
-                (column(coord, token) * base.heads.H_qk + coord.qk_head) * kStateDim;
-            store_vec(destination + coord.dqk_base, raw.bits);
-        }
-    }
-
-    __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
-                                                std::int32_t token, const RawValueLane& raw) const {
-        if (!owns(coord, token)) { return; }
-        if (coord.lane < kDvPerWarp) {
-            __nv_bfloat16* destination =
-                base.value_record +
-                (column(coord, token) * base.heads.H_v + coord.value_head) * kStateDim;
-            destination[coord.dv_base + coord.lane] = raw.bits;
-        }
-    }
-
-    __device__ __forceinline__ void store_gate(const RecurrentCoordinates& coord,
-                                               std::int32_t token, const RawGatePair& raw) const {
-        if (!owns(coord, token)) { return; }
-        if (coord.state_tile == 0 && coord.warp == 0 && coord.lane == 0) {
-            base.gate_record[column(coord, token) * base.heads.H_v + coord.value_head] = raw.bits;
-        }
-    }
-
-    // Zeroes the outputs of a row's columns that no path computes (past its live columns).
-    __device__ __forceinline__ void zero_inactive_outputs(const RecurrentCoordinates& coord) const {
-        if (coord.path != 0 || coord.lane >= kDvPerWarp) { return; }
-        const std::int32_t live =
-            coord.tree_row ? trees[coord.batch].nodes : base.valid_columns[coord.batch];
-        for (std::int32_t c = live < 0 ? 0 : live; c < base.width; ++c) {
-            base.out[((static_cast<std::int64_t>(coord.batch) * base.width + c) * base.heads.H_v +
-                      coord.value_head) *
-                         kStateDim +
-                     coord.dv_base + coord.lane] = __float2bfloat16(0.0f);
-        }
-    }
-};
-
-// Record effects for tree replay: outputs are written only by each column's owner path.
-struct TreeRecordEffects {
-    template <class Access>
-    __device__ __forceinline__ static void observe_key(const Access& access,
-                                                       const RecurrentCoordinates& coord,
-                                                       std::int32_t token, const RawQkLane& key) {
-        access.store_key(coord, token, key);
-    }
-
-    template <class Access>
-    __device__ __forceinline__ static void
-    observe_value_gate(const Access& access, const RecurrentCoordinates& coord, std::int32_t token,
-                       const RawValueLane& value, const RawGatePair& gate) {
-        access.store_value(coord, token, value);
-        access.store_gate(coord, token, gate);
-    }
-
-    template <bool NormalizeInputs, class Access>
-    __device__ __forceinline__ static void
-    publish_output(float (&state)[kDvPerWarp][kQkPerLane], const Access& access,
-                   const RecurrentCoordinates& coord, std::int32_t token) {
-        // Ownership is uniform across the CTA, so skipping keeps every shuffle converged.
-        if (!access.owns(coord, token)) { return; }
-        OutputEffects::publish_output<NormalizeInputs>(state, access, coord, token);
-    }
-};
-
 template <int Layers, int QkHeads, int ValueHeads, int ConvChannels>
 struct FoldGeometry {
     static constexpr int kLayers       = Layers;
@@ -851,19 +689,189 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     zero_output_suffix(access, coord, valid, access.width);
 }
 
-// Eight resident CTAs per SM: with 48 value heads (27B) and 8 state tiles, three live paths of
-// one row fill one wave of a 170-SM GPU; further paths and rows take further waves.
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 8)
-    recurrent_tree_record_kernel(const __grid_constant__ TreeRecordAccess access) {
+// One step of a verification-tree walk: the column it computes, where its starting state comes
+// from (the state the previous step left, a shared-memory slot, or the state after its parent
+// rebuilt from the initial state) and the slot that keeps its state for later children.
+struct TreeWalkStep {
+    std::int8_t column;
+    std::int8_t restore;
+    std::int8_t save;
+    std::int8_t unused;
+};
+
+inline constexpr std::int8_t kTreeWalkContinue = -1;
+inline constexpr std::int8_t kTreeWalkReplay   = -2;
+inline constexpr std::int8_t kTreeWalkNoSlot   = -1;
+
+// Orders a tree row's columns depth first, every node's later-drawn children before its first
+// child (a main column's main-chain child), so a branch node holds a slot only while its side
+// subtrees run: a main column's slot is released when the walk returns to the main chain, and a
+// row with s side columns nests at most (s+1)/2 slots. A branch node beyond the Slots free slots
+// is rebuilt from the initial state when the walk returns to it. Returns the step count (nodes).
+template <int Slots>
+__device__ int build_tree_walk(const SpeculativeTreeRow& row, TreeWalkStep* steps) {
+    struct Pending {
+        int node;
+        int next;
+        int slot;
+    };
+
+    // A pending node has an unvisited child, so it is an inner node with at least two children:
+    // a row has at most leaves-1 <= kSpeculativeTreeMaxPaths-1 of them.
+    Pending stack[kSpeculativeTreeMaxPaths];
+    int depth           = 0;
+    int count           = 0;
+    unsigned free_slots = (1U << Slots) - 1U;
+    int node            = 0;
+    std::int8_t restore = kTreeWalkContinue;
+    while (true) {
+        const int first  = row.first_child[node];
+        const int second = first >= 0 ? row.next_sibling[first] : -1;
+        TreeWalkStep step{static_cast<std::int8_t>(node), restore, kTreeWalkNoSlot, 0};
+        restore = kTreeWalkContinue;
+        if (second >= 0) {
+            int slot = kTreeWalkNoSlot;
+            if (free_slots != 0U) {
+                slot = __ffs(static_cast<int>(free_slots)) - 1;
+                free_slots &= free_slots - 1U;
+            }
+            step.save       = static_cast<std::int8_t>(slot);
+            steps[count++]  = step;
+            const int after = row.next_sibling[second];
+            stack[depth++]  = {node, after >= 0 ? after : first, slot};
+            node            = second;
+            continue;
+        }
+        steps[count++] = step;
+        if (first >= 0) {
+            node = first;
+            continue;
+        }
+        if (depth == 0) { return count; }
+        Pending& top = stack[depth - 1];
+        node         = top.next;
+        restore      = top.slot >= 0 ? static_cast<std::int8_t>(top.slot) : kTreeWalkReplay;
+        if (node == row.first_child[top.node]) {
+            // The last child: the slot is read by this step before any later step saves into it.
+            if (top.slot >= 0) { free_slots |= 1U << top.slot; }
+            --depth;
+        } else {
+            const int after = row.next_sibling[node];
+            top.next        = after >= 0 ? after : row.first_child[top.node];
+        }
+    }
+}
+
+template <int Slots>
+struct TreeWalkShared {
+    TreeWalkStep steps[kSpeculativeTreeMaxNodes];
+    int count;
+    // Slot s holds every thread's state tile, [s][r][thread] for row r of its tile.
+    float4 saved[Slots][kDvPerWarp][kWarpSize * kNumWarps];
+};
+
+__device__ __forceinline__ void save_state_tile(const float (&state)[kDvPerWarp][kQkPerLane],
+                                                float4 (&slot)[kDvPerWarp][kWarpSize * kNumWarps],
+                                                int thread) {
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        slot[r][thread] = make_float4(state[r][0], state[r][1], state[r][2], state[r][3]);
+    }
+}
+
+__device__ __forceinline__ void
+restore_state_tile(float (&state)[kDvPerWarp][kQkPerLane],
+                   const float4 (&slot)[kDvPerWarp][kWarpSize * kNumWarps], int thread) {
+#pragma unroll
+    for (int r = 0; r < kDvPerWarp; ++r) {
+        const float4 value = slot[r][thread];
+        state[r][0]        = value.x;
+        state[r][1]        = value.y;
+        state[r][2]        = value.z;
+        state[r][3]        = value.w;
+    }
+}
+
+// Rebuilds the state after `node` from the initial state along its root path: the same
+// transitions the walk applied there, without effects.
+__device__ void replay_root_path(float (&state)[kDvPerWarp][kQkPerLane],
+                                 const RecordAccess<true>& access,
+                                 const RecurrentCoordinates& coord, const SpeculativeTreeRow& row,
+                                 int node) {
+    int path[kSpeculativeTreeMaxPathLength];
+    int length = 0;
+    for (int at = node; at >= 0; at = row.parent[at]) { path[length++] = at; }
+    load_state_tile(state, access.state_read_base(coord), coord);
+    for (int i = length - 1; i >= 0; --i) {
+        RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, path[i]), coord.dqk_base);
+        normalize_qk_lane<true>(key.value, coord.lane);
+        const RawGatePair gate = access.load_gate(coord, path[i]);
+        const RawValueLane value =
+            load_value_lane(access.value_ptr(coord, path[i]), coord.lane, coord.dv_base);
+        apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+    }
+}
+
+// Verification-tree record: one CTA per (request row, value head, state tile) walks its row's tree
+// once (build_tree_walk), so every live column is computed exactly once, by the chain recurrence
+// of its root path from the row's initial state, and publishes its output and records. A chain
+// row of a tree round walks its valid prefix.
+template <int Slots>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 4)
+    recurrent_tree_walk_kernel(const __grid_constant__ RecordAccess<true> access,
+                               const SpeculativeTreeRow* __restrict__ trees) {
+    __shared__ TreeWalkShared<Slots> shared;
     const RecurrentCoordinates coord = access.coordinates();
-    const std::int32_t valid         = access.active_columns(coord);
-    // Paths past a row's leaves own nothing; path 0 is live in every row.
-    if (valid <= 0) { return; }
+    const SpeculativeTreeRow& row    = trees[coord.batch];
+    const int thread                 = coord.warp * kWarpSize + coord.lane;
+    // Tree rows and valid columns come from the round's ingress and tree build, which precede the
+    // verification forward, so the walk is ordered before waiting on the projection.
+    if (thread == 0) {
+        if (row.tree != 0) {
+            shared.count = build_tree_walk<Slots>(row, shared.steps);
+        } else {
+            const std::int32_t valid = access.valid_columns[coord.batch];
+            for (int c = 0; c < valid; ++c) {
+                shared.steps[c] = {static_cast<std::int8_t>(c), kTreeWalkContinue, kTreeWalkNoSlot,
+                                   0};
+            }
+            shared.count = valid < 0 ? 0 : valid;
+        }
+    }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
+    __syncthreads();
     pdl::enter_streaming();
-    run_recurrent_sequence<true, TreeRecordEffects>(state, access, coord, valid);
-    access.zero_inactive_outputs(coord);
+    const int count = shared.count;
+    if (count > 0) {
+        TreeWalkStep step = shared.steps[0];
+        RawQkLane key     = load_raw_qk_lane(access.key_ptr(coord, step.column), coord.dqk_base);
+        RecordEffects::observe_key(access, coord, step.column, key);
+        normalize_qk_lane<true>(key.value, coord.lane);
+        for (int i = 0; i < count; ++i) {
+            const int column = step.column;
+            if (step.restore >= 0) {
+                restore_state_tile(state, shared.saved[step.restore], thread);
+            } else if (step.restore == kTreeWalkReplay) {
+                replay_root_path(state, access, coord, row, row.parent[column]);
+            }
+            const RawGatePair gate = access.load_gate(coord, column);
+            const RawValueLane value =
+                load_value_lane(access.value_ptr(coord, column), coord.lane, coord.dv_base);
+            RecordEffects::observe_value_gate(access, coord, column, value, gate);
+            apply_gdn_transition(state, key.value, value.value, gate.g, gate.beta);
+            if (step.save >= 0) { save_state_tile(state, shared.saved[step.save], thread); }
+            if (i + 1 < count) {
+                step = shared.steps[i + 1];
+                key  = load_raw_qk_lane(access.key_ptr(coord, step.column), coord.dqk_base);
+                RecordEffects::observe_key(access, coord, step.column, key);
+                normalize_qk_lane<true>(key.value, coord.lane);
+            }
+            RecordEffects::publish_output<true>(state, access, coord, column);
+        }
+    }
+    const std::int32_t live = row.tree != 0 ? row.nodes : count;
+    zero_output_suffix(access, coord, live, access.width);
 }
 
 template <class Geometry>
