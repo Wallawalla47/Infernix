@@ -56,6 +56,9 @@ struct GenerationMetrics {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
+    std::uint64_t tree_rounds                   = 0;
+    std::uint64_t tree_side_rounds              = 0;
+    std::uint64_t tree_side_accepted_tokens     = 0;
     NgramArchiveStats ngram_archive;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;

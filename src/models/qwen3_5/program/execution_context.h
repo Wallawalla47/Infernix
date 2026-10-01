@@ -90,6 +90,10 @@ struct DFlashBatchContext {
     Tensor& continuation_hidden_store;
     bool ngram                           = false;
     std::uint32_t neural_proposal_drafts = 0;
+    // A DFlash2 tree round: the drafter's lattice becomes a per-row draft tree verified at the
+    // round's width, whose rows hold at most tree_paths root-to-leaf paths.
+    bool tree                = false;
+    std::uint32_t tree_paths = 0;
 };
 
 struct DFlashAppendContext {
@@ -132,6 +136,16 @@ struct TargetVerifyFrameView {
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
+    // Tree verification: each row's device-built tree (I32 [words,B]) and its ancestor masks
+    // (I32 [W,B]), the path cap, the accepted-path and branch outputs, and the lane-owned pending
+    // DFlash features compacted with the path. Empty tree_rows is chain verification.
+    Tensor tree_rows;
+    Tensor tree_masks;
+    std::uint32_t tree_paths = 0;
+    Tensor accepted_path;
+    Tensor accepted_branch;
+    Tensor active_lanes;
+    Tensor pending_features;
 };
 
 void configure_text_card(TextContext& card, const ExecutionCore& execution,

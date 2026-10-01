@@ -287,3 +287,57 @@ denominator keeps it, so each tile's diffuse tail is dropped rather than average
 perplexity on this corpus does not make it more exact. Not tried: FP8 P with a split (hi/lo) V,
 or two u8 terms per probability (16-bit fixed point at half the INT8 rate, still twice the FP16
 rate), either of which would keep the tail.
+
+## Static fan-out draft trees (superseded by per-round lattice trees)
+
+The first tree-verification build (`feat/tree-verification`, commit `062830eb`) verified one fixed
+topology per engine, the root fan-out: the main chain plus B-1 side branches of D proposals that all
+start at the anchor, with INT8 KV only. Measured on the decode-saturation suite (DFlash2 K=7 with
+the proposal head, n-gram 15/12, INT8 KV, two interleaved passes, against the same build with B=1):
+
+| C | B=2 D=3 ms/round | B=2 D=3 tok/s | B=3 D=3 ms/round | B=3 D=3 tok/s |
+|---|---:|---:|---:|---:|
+| 1 | +2.7 % | -1.8 % | +4.1 % | +3.8 % |
+| 2 | +4.5 % | +6.6 % | +7.1 % | +6.9 % |
+| 4 | +9.1 % | -0.8 % | +12.0 % | -1.8 % |
+| 8 | +14.6 % | -5.0 % | +23.8 % | -10.3 % |
+
+Two things limited it. Alternatives exist only for the first proposal, whatever the drafter's
+confidence there, while rejections are spread over every depth: in a one-request chain run of the
+same suite 26 % of the rounds end at the first proposal and 69 % at depths 2..7. And one width for
+every batch size makes the tree pay its full per-column cost at C=4 and C=8, where rounds are no
+longer bound by weight streaming. The replacement builds each row's tree per round from the
+drafter's lattice, best first by the probability that a column is reached and accepted, so side
+branches start at whichever depths the drafter is unsure of, and its width comes from a
+per-batch-size table or, with `--draft-tree-nodes auto`, from the measured cost and acceptance of
+each width per batch size and context ([tree verification](docs/maintainer/tree-verification.md)).
+
+## One KV stream for wide verification rows (not adopted)
+
+Verification blocks wider than 8 columns run the grouped attention kernels in 8-column token tiles,
+one CTA per tile, each reading the row's KV. At long context a 12- or 16-column tree's attention
+costs half as much again as the chain's, so serving every column of a block from one KV stream
+looked like the way to make trees pay there. Two INT8 forms of the pipelined kernel
+(`grouped_pipelined.cuh`, 24/4 geometry, same partition, bitwise-equal partials) were measured:
+one CTA of 96 rows (six QK row tiles, eight warps, one CTA per SM), and one CTA of two 48-row
+groups (16 warps, each group exactly an 8-token CTA, both reading the same double-buffered K/V
+tiles). Per layer call, append entry, cold cache, graph launches, one row, us (baseline / 96-row
+CTA / two groups):
+
+| Columns | 2K | 16K | 64K | 131K |
+|---|---|---|---|---|
+| 8 | 23.7 | 45.7 | 107.1 | 189.0 |
+| 12 | 27.8 / 31.3 / 27.2 | 56.4 / 58.4 / 55.9 | 154.2 / 141.9 / 148.0 | 293.4 / 259.2 / 273.0 |
+| 16 | 29.8 / 39.5 / 31.3 | 58.5 / 68.2 / 62.0 | 156.8 / 160.9 / 162.4 | 297.6 / 289.7 / 297.6 |
+| 24 (16-column tiles) | 32.0 / 41.6 / 35.4 | 72.8 / 94.8 / 92.8 | 221.5 / 275.0 / 289.9 | 414.3 / 518.8 / 549.5 |
+
+Reading the KV once leaves 16 columns as slow as before. The two 8-column CTAs of a split run
+together and the second one's KV reads hit the 96 MB L2 (two DRAM reads of a 131K INT8 row would
+need more bandwidth than the card has in 298 us). The extra time is the tile's own work, which
+grows with the rows: QK and above all P x V on FP16 Tensor Cores with FP32 accumulation (209.5
+TFLOPS); 16 columns at 131K are about 123 us of P x V at that peak. NVFP4 (QK and P x V on FP16)
+and K8V4 (FP8 QK, FP16 P x V) nearly double from 8 to 16 columns (209 to 406 us and 154 to 283 us
+at 131K), so they are compute-bound too. Both INT8 forms were reverted. What would still lower
+the cost of verification columns at long context: cheaper P x V arithmetic (FP16 accumulation per
+key tile, or 8-bit P as in `--int8-prefill-8bit-pv`; both change precision) or a warp-specialized
+kernel nearer the Tensor Core peak.

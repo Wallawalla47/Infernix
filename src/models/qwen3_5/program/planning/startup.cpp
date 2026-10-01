@@ -21,6 +21,7 @@
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_tree.h"
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
@@ -64,9 +65,50 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
+bool tree_table_enabled(const std::array<std::uint32_t, kMaximumConcurrency>& nodes) {
+    return std::any_of(nodes.begin(), nodes.end(), [](std::uint32_t n) { return n != 0; });
+}
+
+// Whether every GDN layer's input projection is a single FP8 or NVFP4 parent: tree convolution
+// reads each column's ancestors from that parent's materialized projection.
+bool tree_verification_supported(const execution::Parameters& parameters) {
+    for (const auto& block : parameters.text.layers) {
+        const auto* gdn = std::get_if<execution::GdnParameters>(&block.mixer);
+        if (gdn == nullptr) { continue; }
+        const auto* single = std::get_if<ops::SingleProjectionWeight>(&gdn->projection);
+        if (single == nullptr || (single->weight.qtype != QType::NVFP4 &&
+                                  single->weight.qtype != QType::FP8_E4M3FN_ROW_BF16)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The tree widths the options select: their fixed table, or the automatic widths for rounds of
+// up to kDraftTreeAutoMaxBatch rows. Automatic mode on a target that cannot verify trees resolves
+// to chain verification.
+TreeWidthPlan resolve_tree_widths(const execution::Parameters& parameters,
+                                  const EngineOptions& options) {
+    TreeWidthPlan plan{.fixed = options.speculative.draft_tree_nodes};
+    if (options.speculative.draft_tree_auto && tree_verification_supported(parameters)) {
+        const auto widths = draft_tree_auto_widths(options.speculative.draft_tokens);
+        plan.automatic.assign(widths.begin(), widths.end());
+        plan.automatic_max_batch = std::min(kDraftTreeAutoMaxBatch, options.max_concurrency);
+    }
+    return plan;
+}
+
+bool plan_has_tree(const SequencePlanImpl& plan) {
+    return std::any_of(plan.round_shapes.begin(), plan.round_shapes.end(),
+                       [](const SpeculativeRoundShape& shape) {
+                           return shape.kind == SpeculativeRoundKind::Tree;
+                       });
+}
+
 // The speculative round families an engine captures. Neural rounds verify at the drafter's window
 // and n-gram copy rounds at the n-gram window, for every backend.
-std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options) {
+std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions& options,
+                                                            const TreeWidthPlan& tree_widths) {
     const SpeculativeOptions& spec = options.speculative;
     std::vector<SpeculativeRoundShape> shapes;
     if (spec.backend == SpeculativeBackend::None) { return shapes; }
@@ -81,6 +123,15 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
             }
         }
         shapes.push_back({SpeculativeRoundKind::Ngram, spec.ngram_draft_tokens});
+    }
+    // One tree family per distinct tree width.
+    for (const std::uint32_t nodes : tree_widths.widths()) {
+        const SpeculativeRoundShape shape{SpeculativeRoundKind::Tree, nodes - 1U};
+        if (std::none_of(shapes.begin(), shapes.end(), [&](const SpeculativeRoundShape& other) {
+                return other.kind == shape.kind && other.verify_drafts == shape.verify_drafts;
+            })) {
+            shapes.push_back(shape);
+        }
     }
     return shapes;
 }
@@ -374,7 +425,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                             gdn, *config.gdn, batch_size, min_width, max_width));
                     } else if (path == GdnWorkspacePath::ReplayRecord) {
                         scratch(layout, execution::gdn_record_workspace_bytes(
-                                            gdn, *config.gdn, batch_size, min_width, max_width));
+                                            gdn, *config.gdn, batch_size, min_width, max_width,
+                                            plan_has_tree(plan)));
                     } else {
                         (void)workspace::gdn_prefill_conv(layout, config, last);
                         scratch(layout,
@@ -689,6 +741,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            mask_columns);
                     scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
                                         proposal_drafts, proposal_drafts, batch, batch));
+                    if (plan_has_tree(plan)) {
+                        // The tree build always runs over the full lattice.
+                        scratch(layout, ops::candidate_selector_tree_workspace_capacity_bytes(
+                                            proposal_drafts, batch, batch));
+                    }
                     return finish(layout);
                 }
                 {
@@ -749,7 +806,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
                 target_body(target, aggregate, aggregate, qwen3_5::TextPhase::Verify,
                             GdnWorkspacePath::ReplayRecord, batch, verify, verify, verify_envelope);
-                const std::size_t accept =
+                std::size_t accept =
                     draft->dflash2.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
@@ -757,6 +814,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), drafts,
                               drafts, batch, batch);
+                for (const SpeculativeRoundShape& shape : plan.round_shapes) {
+                    if (shape.kind != SpeculativeRoundKind::Tree) { continue; }
+                    accept = std::max(
+                        accept,
+                        ops::speculative_accept_sparse_tree_workspace_capacity_bytes(
+                            dimension(parameters.model.resources().public_token_count),
+                            static_cast<std::int32_t>(shape.verify_drafts + 1U), batch, batch));
+                }
                 const std::size_t proposal = dflash_proposal_capacity(
                     static_cast<std::int32_t>(plan.neural_draft_window) + 1, batch);
                 out.dflash_round =
@@ -864,6 +929,33 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    const bool tree_table = tree_table_enabled(options.speculative.draft_tree_nodes);
+    if (tree_table || options.speculative.draft_tree_auto) {
+        if (options.speculative.backend != SpeculativeBackend::DFlash2) {
+            throw std::invalid_argument("DFlash2 tree verification requires the DFlash2 backend");
+        }
+        if (tree_table && options.speculative.draft_tree_auto) {
+            throw std::invalid_argument("automatic DFlash2 tree widths take no fixed table");
+        }
+        std::vector<std::uint32_t> widths(options.speculative.draft_tree_nodes.begin(),
+                                          options.speculative.draft_tree_nodes.end());
+        if (options.speculative.draft_tree_auto) {
+            const auto automatic = draft_tree_auto_widths(options.speculative.draft_tokens);
+            widths.assign(automatic.begin(), automatic.end());
+        }
+        for (const std::uint32_t nodes : widths) {
+            if (nodes == 0) { continue; }
+            ops::validate_speculative_tree_shape(
+                {static_cast<std::int32_t>(nodes),
+                 static_cast<std::int32_t>(options.speculative.draft_tokens),
+                 static_cast<std::int32_t>(options.speculative.draft_tree_paths)});
+        }
+        // A fixed table needs trees; automatic mode falls back to chains (resolve_tree_widths).
+        if (tree_table && !tree_verification_supported(parameters)) {
+            throw std::invalid_argument("DFlash2 tree verification requires single FP8 or NVFP4 "
+                                        "GDN input projections");
+        }
+    }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
@@ -895,6 +987,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
+    impl->tree_widths          = inputs.tree_widths;
+    impl->draft_tree_paths     = inputs.draft_tree_paths;
     impl->ngram_draft_window   = inputs.ngram_draft_window;
     impl->ngram_min_match      = inputs.ngram_min_match;
     impl->speculative_backend  = inputs.speculative_backend;
@@ -935,8 +1029,17 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
                         : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
                                                 shape.verify_drafts);
-                executables += static_cast<std::uint64_t>(graph_topology_classes(profiles)) *
-                               impl->max_concurrency;
+                // A tree family serves only the batch sizes that may verify its width, and the
+                // plain neural family only those that may verify a chain.
+                std::uint32_t batch_sizes = 0;
+                for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
+                    batch_sizes += shape.kind == SpeculativeRoundKind::Tree
+                                       ? impl->tree_widths.tree(b, shape.verify_drafts + 1U)
+                                       : shape.kind == SpeculativeRoundKind::Ngram ||
+                                             impl->tree_widths.chain(b);
+                }
+                executables +=
+                    static_cast<std::uint64_t>(graph_topology_classes(profiles)) * batch_sizes;
             }
         }
         impl->graph_allowance_bytes = checked_add(
@@ -992,8 +1095,10 @@ std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
                            const EngineOptions& options) {
     validate_target_options(parameters, device, options);
-    const std::vector<SpeculativeRoundShape> round_shapes = speculative_round_shapes(options);
-    std::uint32_t draft_window                            = 0;
+    TreeWidthPlan tree_widths = resolve_tree_widths(parameters, options);
+    const std::vector<SpeculativeRoundShape> round_shapes =
+        speculative_round_shapes(options, tree_widths);
+    std::uint32_t draft_window = 0;
     for (const SpeculativeRoundShape& shape : round_shapes) {
         draft_window = std::max(draft_window, shape.verify_drafts);
     }
@@ -1001,6 +1106,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters          = &parameters,
         .neural_draft_window = options.speculative.draft_tokens,
         .round_shapes        = round_shapes,
+        .tree_widths         = std::move(tree_widths),
+        .draft_tree_paths    = options.speculative.draft_tree_paths,
         .ngram_draft_window  = options.speculative.ngram_draft_tokens,
         .ngram_min_match     = options.speculative.ngram_min_match,
         .capacity            = options.max_context,

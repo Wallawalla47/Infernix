@@ -25,21 +25,37 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         throw std::invalid_argument("INT8 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
-    constexpr auto kernel =
-        int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries>;
-    constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
-    if constexpr (S::kDynamicArena) {
-        static const auto status =
-            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-        CUDA_CHECK(status);
+    // Only verification rows carry a tree: masked rows of three or more columns on the
+    // grouped append route, or on the parallel route after a separate append.
+    constexpr bool TreeCapable =
+        Masked && (Input::writes_cache || ParallelQueries) && S::kTokenTile >= 3;
+    if (!TreeCapable && cache.tree_masks)
+        throw std::invalid_argument("INT8 grouped attention: this route has no tree");
+    const auto launch = [&]<bool Tree>() {
+        constexpr auto kernel =
+            int8_kv_grouped_mma_kernel<G, S, MultiBatch, Masked, Input, ParallelQueries, Tree>;
+        constexpr int bytes = S::kDynamicArena ? S::kArenaBytes : 0;
+        if constexpr (S::kDynamicArena) {
+            static const auto status =
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+            CUDA_CHECK(status);
+        }
+        const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
+                        partition.capacity, p.batch);
+        kernel<<<grid, S::kThreads, bytes, stream>>>(
+            p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
+            cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
+            p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
+            cache.tree_masks);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (TreeCapable) {
+        if (cache.tree_masks) {
+            launch.template operator()<true>();
+            return;
+        }
     }
-    const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
-                    partition.capacity, p.batch);
-    kernel<<<grid, S::kThreads, bytes, stream>>>(
-        p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
-        cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
-        p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
-    CUDA_CHECK(cudaGetLastError());
+    launch.template operator()<false>();
 }
 
 template <class G, int Tokens, bool MultiBatch, bool Masked, bool Writable, class Input,
@@ -60,18 +76,33 @@ void launch_int8_kv_grouped_pipelined(const CausalAttentionOperands& p,
         throw std::invalid_argument("INT8 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
-    constexpr auto kernel =
-        int8_kv_grouped_pipelined_kernel<G, Tokens, MultiBatch, Masked, Input, ParallelQueries>;
-    static const auto status = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
-    CUDA_CHECK(status);
-    const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, Tokens) : 1),
-                    partition.capacity, p.batch);
-    kernel<<<grid, Shape::kThreads, Shape::kArenaBytes, stream>>>(
-        p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
-        cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
-        p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
-    CUDA_CHECK(cudaGetLastError());
+    // Only verification rows carry a tree: masked rows of three or more columns on the
+    // grouped append route, or on the parallel route after a separate append.
+    constexpr bool TreeCapable = Masked && (Input::writes_cache || ParallelQueries) && Tokens >= 3;
+    if (!TreeCapable && cache.tree_masks)
+        throw std::invalid_argument("INT8 grouped attention: this route has no tree");
+    const auto launch = [&]<bool Tree>() {
+        constexpr auto kernel    = int8_kv_grouped_pipelined_kernel<G, Tokens, MultiBatch, Masked,
+                                                                    Input, ParallelQueries, Tree>;
+        static const auto status = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
+        CUDA_CHECK(status);
+        const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, Tokens) : 1),
+                        partition.capacity, p.batch);
+        kernel<<<grid, Shape::kThreads, Shape::kArenaBytes, stream>>>(
+            p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
+            cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
+            p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum,
+            cache.tree_masks);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if constexpr (TreeCapable) {
+        if (cache.tree_masks) {
+            launch.template operator()<true>();
+            return;
+        }
+    }
+    launch.template operator()<false>();
 }
 
 template <class G, class S>

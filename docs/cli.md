@@ -222,6 +222,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--draft-tree-nodes auto\|N` | DFlash2 tree verification: each round verifies a small tree of alternative drafts, built on the device from the drafter's candidate lattice, instead of a single draft, so more drafted tokens are accepted with the same output distribution; any `--kv-dtype`. `auto` (recommended) chooses the single draft or a tree of `draft tokens + 5` or `+ 9` tokens every round from measured speed and acceptance at the current context length, and keeps single drafts (with a warning) on an artifact without tree support; `N` fixes a tree of `draft tokens + 2..32` tokens and keeps seeded runs reproducible, which `auto` does not; see [tree verification](maintainer/tree-verification.md) | off |
+| `--draft-tree-paths N` | most branches (root-to-leaf paths) per tree, `2..8` | `8` |
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |

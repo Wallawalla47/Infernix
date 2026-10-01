@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "core/arena.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_tree.h"
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {

@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/round_buffers.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "models/load_options.h"
 #include <algorithm>
 #include <limits>
@@ -206,6 +207,11 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                 add_tensor(builder, DType::I32, {16, columns - 1, batch}, "DFlash2 candidate ids");
             decode.proposal_q = add_tensor(builder, DType::FP32, {16, columns - 1, batch},
                                            "DFlash2 sampled proposal q");
+            decode.tree_rows =
+                add_tensor(builder, DType::I32, {ops::kSpeculativeTreeRowWords, batch},
+                           "DFlash2 verification tree rows");
+            decode.tree_masks = add_tensor(builder, DType::I32, {columns, batch},
+                                           "DFlash2 verification tree ancestor masks");
         }
         decode.append_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
@@ -365,10 +371,14 @@ DFlashDecodeState DFlashDecodeState::narrowed(std::uint32_t k) const {
     // Every round tensor below is written and consumed within one round, and every host index
     // into ingress/egress uses the round's own width, so a dense [k+1,C] reinterpretation of the
     // native storage is exact for any row count.
-    for (Tensor* tensor : {&result.target_rope_positions, &result.licensed_tokens,
-                           &result.proposal_ids, &result.proposal_positions,
-                           &result.verify_positions, &result.verify_ids, &result.target_argmax}) {
+    for (Tensor* tensor :
+         {&result.target_rope_positions, &result.licensed_tokens, &result.proposal_ids,
+          &result.proposal_positions, &result.verify_positions, &result.verify_ids,
+          &result.target_argmax, &result.accepted_path}) {
         *tensor = Tensor(tensor->data, tensor->dtype, {width, rows});
+    }
+    if (tree_masks.data) {
+        result.tree_masks = Tensor(tree_masks.data, tree_masks.dtype, {width, rows});
     }
     result.draft_tokens = Tensor(draft_tokens.data, draft_tokens.dtype, {drafts, rows});
     for (Tensor* tensor : {&result.target_hidden, &result.target_logits}) {
@@ -440,6 +450,12 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_counts), DType::I32, {batch});
     accepted_drafts =
         egress_tensor(offsetof(DFlashDecodeEgress, accepted_drafts), DType::I32, {batch});
+    if (layout.tree_rows) { tree_rows = layout.tree_rows->bind(backing); }
+    if (layout.tree_masks) { tree_masks = layout.tree_masks->bind(backing); }
+    accepted_path =
+        egress_tensor(offsetof(DFlashDecodeEgress, accepted_path), DType::I32, {width, batch});
+    accepted_branch =
+        egress_tensor(offsetof(DFlashDecodeEgress, accepted_branch), DType::I32, {batch});
     proposal_ids               = layout.proposal_ids.bind(backing);
     proposal_positions         = layout.proposal_positions.bind(backing);
     append_positions           = layout.append_positions.bind(backing);

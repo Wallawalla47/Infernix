@@ -74,6 +74,15 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// Automatic DFlash2 tree verification considers, besides the chain, trees of these many columns
+// (anchor included) for all-neural rounds of at most kDraftTreeAutoMaxBatch rows.
+inline constexpr std::uint32_t kDraftTreeAutoMaxBatch = 4;
+
+[[nodiscard]] constexpr std::array<std::uint32_t, 2>
+draft_tree_auto_widths(std::uint32_t draft_tokens) noexcept {
+    return {draft_tokens + 5U, draft_tokens + 9U};
+}
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
@@ -83,6 +92,17 @@ struct SpeculativeOptions {
     // Zero disables the proposer; enabled draft width is 1..63 and minimum match 4..64.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // DFlash2 tree verification by batch size: entry c-1 is the column count (anchor included,
+    // draft_tokens+2..32) a neural round of c rows verifies per row as a draft tree built from the
+    // drafter's lattice; zero keeps that batch size on chain verification. All zero disables trees.
+    std::array<std::uint32_t, kMaximumConcurrency> draft_tree_nodes{};
+    // Automatic DFlash2 tree verification (draft_tree_nodes all zero): each all-neural round
+    // verifies a chain or one of draft_tree_auto_widths, whichever measured round time and
+    // same-text acceptance favour at its batch size and context length. A target whose GDN input
+    // projections cannot verify trees resolves this to false (chain verification).
+    bool draft_tree_auto = false;
+    // Most root-to-leaf paths a tree row may hold (each one a parallel GDN replay), 2..8.
+    std::uint32_t draft_tree_paths = 8;
     // CPU-only retention, separate from KV. Zero keeps request-local drafting.
     std::size_t ngram_archive_bytes = 0;
     std::size_t ngram_session_bytes = 128ULL << 20;
@@ -852,6 +872,11 @@ struct SpeculativeStats {
     std::uint64_t ngram_archive_rounds          = 0;
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
+    // Tree-verified rounds, those whose accepted path left the main chain, and the drafts those
+    // paths accepted after leaving it (what the main chain alone would not have accepted).
+    std::uint64_t tree_rounds               = 0;
+    std::uint64_t tree_side_rounds          = 0;
+    std::uint64_t tree_side_accepted_tokens = 0;
 };
 
 struct ThinkingBudgetStats {

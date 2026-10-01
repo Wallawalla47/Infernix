@@ -290,6 +290,11 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
             << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
     }
+    if (metrics.tree_rounds != 0) {
+        out << " | trees " << product::format_pretty_count(metrics.tree_rounds) << " rounds, "
+            << product::format_pretty_count(metrics.tree_side_accepted_tokens)
+            << " side-branch drafts";
+    }
     if (metrics.ngram_archive.enabled) {
         out << " | archive " << (metrics.ngram_archive.bound ? "bound" : "unbound");
         if (metrics.ngram_archive.bound) {
@@ -522,6 +527,12 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     logger_->info("context | history {} | {} active + {} extra device states | host {}",
                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
                   product::format_pretty_bytes(*cache.host_capacity_bytes));
+
+    if (product::draft_tree_enabled(engine.speculative)) {
+        logger_->info("draft trees | {} | up to {} paths",
+                      product::draft_tree_nodes_text(engine.speculative),
+                      engine.speculative.draft_tree_paths);
+    }
 
     if (service.options().enable_vision) {
         const ninfer::MediaCacheSummary media = service.media_cache_summary();

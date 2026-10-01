@@ -28,7 +28,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
       fast_prefill_kernel(plan.fast_prefill_kernel), draft_window(plan.draft_window),
-      neural_draft_window(plan.neural_draft_window), ngram_draft_window(plan.ngram_draft_window),
+      neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
+      draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
       kv_storage(plan.kv_storage), proposal_head(plan.proposal_head),
       vision_enabled(plan.features.vision), use_cuda_graph(plan.use_cuda_graph),
@@ -70,6 +71,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         (workspace_plan.vision &&
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.5 workspace plan does not match startup features");
+    }
+    if (tree_widths.automatic_mode()) {
+        std::array<std::vector<std::uint32_t>, kMaximumConcurrency> trees;
+        for (std::uint32_t b = 1; b <= max_concurrency; ++b) {
+            for (const std::uint32_t columns : tree_widths.automatic) {
+                if (tree_widths.tree(b, columns)) { trees[b - 1U].push_back(columns); }
+            }
+        }
+        tree_controller.emplace(neural_draft_window + 1U, trees);
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder      = std::make_unique<qwen3_5::DecoderState>(backing, plan.persistent.decoder);

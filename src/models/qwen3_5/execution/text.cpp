@@ -278,6 +278,32 @@ void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t 
     linear_state_destination_slot_ = destination_slot;
 }
 
+void TextContext::set_verification_tree(const Tensor* tree_rows, const Tensor* ancestor_masks,
+                                        std::uint32_t paths) {
+    if ((tree_rows == nullptr) != (ancestor_masks == nullptr) ||
+        (tree_rows != nullptr && (paths < 1 || paths > ops::kSpeculativeTreeMaxPaths))) {
+        throw std::logic_error("verification tree rows, masks and path cap go together");
+    }
+    verification_tree_   = tree_rows;
+    tree_ancestor_masks_ = ancestor_masks;
+    tree_paths_          = tree_rows != nullptr ? paths : 0;
+}
+
+void TextContext::compact_tree_kv(const Tensor& verify_positions, const Tensor& kv_table_rows,
+                                  const Tensor& accepted_path, const Tensor& accepted_drafts) {
+    if (batch_text_kv_ == nullptr) {
+        throw std::logic_error("tree KV compaction requires the batched Text KV cache");
+    }
+    std::vector<PagedKVBatchLayerView> layers;
+    layers.reserve(batch_text_kv_->layers());
+    for (std::uint32_t layer = 0; layer < batch_text_kv_->layers(); ++layer) {
+        layers.push_back(batch_text_kv_->batch_layer_view(layer));
+    }
+    ops::speculative_tree_compact_kv(layers.data(), static_cast<std::int32_t>(layers.size()),
+                                     verify_positions, kv_table_rows, accepted_path,
+                                     accepted_drafts, ctx_.stream);
+}
+
 void TextContext::set_gdn_state_action(GdnStateAction action,
                                        const GdnReplayRecords* replay_records) {
     if ((action == GdnStateAction::RecordForReplay) != (replay_records != nullptr)) {
@@ -915,8 +941,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                         active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        const Tensor tree_masks =
+            verification_tree_ != nullptr && ph == Phase::Verify ? *tree_ancestor_masks_ : Tensor{};
         ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows, tree_masks,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
@@ -991,7 +1019,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
             gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
                                   *active_linear_state_source_slots_, records.conv, query_output,
-                                  key_output, value_output, gate_output, work_, s);
+                                  key_output, value_output, gate_output, work_, s,
+                                  verification_tree_);
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1043,12 +1072,20 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             if (active_sequence_batch_ == 1) { records = records.single_row_prefix(width); }
-            ops::gated_delta_net_replay_record(
-                q_batch, k_batch, v_batch, g_batch, beta_batch,
-                static_cast<float>(
-                    1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-                recurrent_states, valid, *active_linear_state_source_slots_, records.key,
-                records.value, records.gate, out_batch, s);
+            const float scale = static_cast<float>(
+                1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim)));
+            if (verification_tree_ != nullptr) {
+                ops::gated_delta_net_replay_record(
+                    q_batch, k_batch, v_batch, g_batch, beta_batch, scale, recurrent_states, valid,
+                    *active_linear_state_source_slots_, *verification_tree_,
+                    static_cast<std::int32_t>(tree_paths_), records.key, records.value,
+                    records.gate, out_batch, s);
+            } else {
+                ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
+                                                   scale, recurrent_states, valid,
+                                                   *active_linear_state_source_slots_, records.key,
+                                                   records.value, records.gate, out_batch, s);
+            }
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,

@@ -60,9 +60,11 @@ ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
 }
 } // namespace
 
-// Optional K, Graph, optimized-head, B and KV codec arguments select representative integration
-// routes without multiplying test binaries. The artifact supplies the actual weight
-// representations.
+// Optional K, Graph, optimized-head, B, KV codec, Vision, state-slot and tree-table arguments
+// select representative integration routes without multiplying test binaries. The artifact
+// supplies the actual weight representations. A tree table ("16" or "16,12,10", see
+// --draft-tree-nodes) runs every round family through DFlash2 tree verification; "auto" lets the
+// automatic widths choose.
 int main(int argc, char** argv) {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -91,6 +93,22 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        const bool tree                     = argc > 8;
+        const bool tree_auto                = tree && std::string(argv[8]) == "auto";
+        options.speculative.draft_tree_auto = tree_auto;
+        if (tree && !tree_auto) {
+            std::string table = argv[8];
+            std::size_t entry = 0;
+            for (std::size_t begin = 0; begin <= table.size() && entry < 8; ++entry) {
+                const std::size_t end = std::min(table.find(',', begin), table.size());
+                options.speculative.draft_tree_nodes[entry] =
+                    static_cast<std::uint32_t>(std::stoul(table.substr(begin, end - begin)));
+                begin = end + 1;
+            }
+            for (; entry < 8; ++entry)
+                options.speculative.draft_tree_nodes[entry] =
+                    options.speculative.draft_tree_nodes[entry - 1];
+        }
         ninfer::Engine engine(options);
         require(engine.memory_summary().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");
@@ -98,7 +116,9 @@ int main(int argc, char** argv) {
             const ninfer::MemorySummary memory = engine.memory_summary();
             require(memory.cuda_graph_measured_bytes != 0 &&
                         memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
-                    "CUDA Graph memory exceeds its allowance");
+                    ("CUDA Graph memory " + std::to_string(memory.cuda_graph_measured_bytes) +
+                     " exceeds its allowance " + std::to_string(memory.cuda_graph_allowance_bytes))
+                        .c_str());
         }
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
@@ -106,6 +126,15 @@ int main(int argc, char** argv) {
         valid(first, 24);
         const auto& reference = first.generated_token_ids;
         require(first.speculative.accepted_tokens != 0, "real draft fixture accepted no proposal");
+        // Automatic widths time the widest tree first, so they verify trees from the start too.
+        require(!tree || (!tree_auto && options.speculative.draft_tree_nodes[0] == 0) ||
+                    first.speculative.tree_rounds != 0,
+                "a tree table did not verify tree rounds");
+        // Every side round accepts at least the draft where its path leaves the main chain.
+        require(first.speculative.tree_side_rounds <= first.speculative.tree_side_accepted_tokens &&
+                    first.speculative.tree_side_accepted_tokens <=
+                        first.speculative.accepted_tokens,
+                "inconsistent tree side-branch statistics");
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
 
@@ -143,7 +172,10 @@ int main(int argc, char** argv) {
         const auto sample1 = engine.generate(engine.prepare_tokens(prompt), sampled);
         const auto sample2 = engine.generate(engine.prepare_tokens(prompt), sampled);
         valid(sample1, 16);
-        require(sample1.generated_token_ids == sample2.generated_token_ids,
+        valid(sample2, 16);
+        // Automatic widths follow measured round time, so the two requests may verify different
+        // trees and sample different (equally distributed) text.
+        require(tree_auto || sample1.generated_token_ids == sample2.generated_token_ids,
                 "same DFlash2 seed and inputs did not reproduce the conditional path");
 
         // Terminal flush and fork must retain the consumed frontier for a later request.
@@ -237,6 +269,8 @@ int main(int argc, char** argv) {
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
+                  << " tree_rounds=" << first.speculative.tree_rounds
+                  << " side_rounds=" << first.speculative.tree_side_rounds
                   << " state_d2h=" << stats.state_d2h_count
                   << " state_h2d=" << stats.state_h2d_count << '\n';
     } catch (const std::exception& error) {

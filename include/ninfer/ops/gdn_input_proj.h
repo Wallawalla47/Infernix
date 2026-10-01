@@ -6,6 +6,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -230,6 +231,22 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);
+
+/**
+ * Verification-tree form of the single-parent record-producing Op (FP8 and NVFP4 parents) over a
+ * width T in [2,32]. tree_rows is I32 [kSpeculativeTreeRowWords,B]: column c of row b convolves
+ * the projected inputs of its three nearest ancestors in that row's tree (conv history past the
+ * anchor) and its own, in the chain form's order, so each column sees the inputs of its own root
+ * path and a chain row gets the chain form over its valid prefix. Records hold every column's
+ * projected input. Projection uses the Op's materialized routes; workspace follows the record
+ * capacity query.
+ */
+void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
+                                const Tensor& conv_weight, const Tensor& conv_states,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                const Tensor& tree_rows, Tensor& conv_record, Tensor& query,
+                                Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

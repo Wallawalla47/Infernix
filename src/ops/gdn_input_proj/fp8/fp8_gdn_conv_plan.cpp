@@ -164,11 +164,15 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
                                        initial_slot, snapshot_base_slot, query, key, value, stream);
 }
 
-void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                        const Tensor& conv_states, const Tensor& valid_columns,
-                        const Tensor& initial_slot, Tensor& conv_record, Tensor& query, Tensor& key,
-                        Tensor& value, Tensor& z, Fp8GdnConvPlan plan, WorkspaceArena& workspace,
-                        cudaStream_t stream) {
+void launch_record_plan(const Tensor* tree_rows, const Tensor& x, const Weight& weight,
+                        const Tensor& conv_weight, const Tensor& conv_states,
+                        const Tensor& valid_columns, const Tensor& initial_slot,
+                        Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                        Fp8GdnConvPlan plan, WorkspaceArena& workspace, cudaStream_t stream) {
+    // A tree convolves over ancestors, which the fused epilogue cannot address.
+    if (tree_rows != nullptr && plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
+        plan.schedule = Fp8GdnConvScheduleId::MaterializedA16;
+    }
     if (plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
         fp8_gdn_record_fused_launch(x, weight, conv_weight, conv_states, valid_columns,
                                     initial_slot, conv_record, query, key, value, z, stream);
@@ -183,6 +187,11 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
     Tensor record_flat(conv_record.data, DType::BF16, {kChannels, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {kZRows, aggregate_columns});
     launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
+    if (tree_rows != nullptr) {
+        gdn_projected_conv_record_tree_launch(conv_record, conv_weight, conv_states, valid_columns,
+                                              initial_slot, *tree_rows, query, key, value, stream);
+        return;
+    }
     gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
                                      initial_slot, query, key, value, stream);
 }
@@ -200,12 +209,13 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
         key, value, z, fp8_gdn_snapshot_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
 }
 
-void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
-                             const Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                             Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
-                             WorkspaceArena& workspace, cudaStream_t stream) {
-    launch_record_plan(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
+void fp8_gdn_record_dispatch(const Tensor* tree_rows, const Tensor& x, const Weight& weight,
+                             const Tensor& conv_weight, const Tensor& conv_states,
+                             const Tensor& valid_columns, const Tensor& initial_slot,
+                             Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                             Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                             cudaStream_t stream) {
+    launch_record_plan(tree_rows, x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                        conv_record, query, key, value, z,
                        fp8_gdn_record_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
 }

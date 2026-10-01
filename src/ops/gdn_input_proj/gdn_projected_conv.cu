@@ -70,6 +70,77 @@ __global__ void gdn_projected_conv_kernel(
     }
 }
 
+// One thread per channel of one row. Each column's window reads the projected inputs of its three
+// nearest ancestors (history past the anchor); the FMA order is the chain kernel's, so a chain row
+// (whose ancestors are the preceding columns) gets the chain result.
+template <int Channels, int QueryRows, int KeyRows, int ValueRows, int Threads>
+__global__ __launch_bounds__(Threads) void gdn_projected_conv_tree_kernel(
+    const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
+    const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
+    const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
+    __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value,
+    const SpeculativeTreeRow* __restrict__ trees, std::int32_t width) {
+    static_assert(Channels == QueryRows + KeyRows + ValueRows && Channels % Threads == 0);
+    static_assert(Threads >= kSpeculativeTreeMaxNodes);
+    const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
+    const int tid            = static_cast<int>(threadIdx.x);
+    __shared__ std::int8_t parent[kSpeculativeTreeMaxNodes];
+    __shared__ std::int8_t depth[kSpeculativeTreeMaxNodes];
+    // Each thread's own channel inputs of the row's columns: every column loads its projected
+    // input once and reads its ancestors' from here.
+    __shared__ float inputs[kSpeculativeTreeMaxNodes][Threads];
+    if (tid < kSpeculativeTreeMaxNodes) {
+        parent[tid] = trees[batch].parent[tid];
+        depth[tid]  = trees[batch].depth[tid];
+    }
+    __syncthreads();
+    const std::int32_t row             = static_cast<std::int32_t>(blockIdx.x) * Threads + tid;
+    std::int32_t valid                 = valid_columns[batch];
+    valid                              = valid < 0 ? 0 : (valid > width ? width : valid);
+    constexpr std::int64_t slot_stride = static_cast<std::int64_t>(Channels) * 3;
+    const std::int64_t initial_base =
+        static_cast<std::int64_t>(initial_state_slots[batch]) * slot_stride;
+    // history[0] is the oldest column, history[2] the newest.
+    const float history[3] = {__bfloat162float(state_read[initial_base + row]),
+                              __bfloat162float(state_read[initial_base + Channels + row]),
+                              __bfloat162float(state_read[initial_base + 2LL * Channels + row])};
+    const float w0         = __bfloat162float(conv_weight[row]);
+    const float w1         = __bfloat162float(conv_weight[Channels + row]);
+    const float w2         = __bfloat162float(conv_weight[2LL * Channels + row]);
+    const float w3         = __bfloat162float(conv_weight[3LL * Channels + row]);
+    const std::int64_t row_base = static_cast<std::int64_t>(batch) * width;
+
+    for (std::int32_t token = 0; token < width; ++token) {
+        const std::int64_t column = row_base + token;
+        __nv_bfloat16 output      = __float2bfloat16_rn(0.0F);
+        if (token < valid) {
+            const float p      = __bfloat162float(projected[column * Channels + row]);
+            inputs[token][tid] = p;
+            // source[j] is the input j+1 steps up the column's root path (ancestors precede it).
+            float source[3];
+            std::int32_t at = token;
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                at             = at >= 0 ? parent[at] : -1;
+                const int back = j + 1 - depth[token];
+                source[j]      = at >= 0 ? inputs[at][tid] : history[3 - back];
+            }
+            float conv = fmaf(w0, source[2], 0.0F);
+            conv       = fmaf(w1, source[1], conv);
+            conv       = fmaf(w2, source[0], conv);
+            conv       = fmaf(w3, p, conv);
+            output     = __float2bfloat16_rn(silu(conv));
+        }
+        if (row < QueryRows) {
+            query[column * QueryRows + row] = output;
+        } else if (row < QueryRows + KeyRows) {
+            key[column * KeyRows + row - QueryRows] = output;
+        } else {
+            value[column * ValueRows + row - QueryRows - KeyRows] = output;
+        }
+    }
+}
+
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, class Publish>
 void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& state_read,
             const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
@@ -142,6 +213,45 @@ void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& c
                                     static_cast<const std::int32_t*>(snapshot_base_slots.data),
                                     projected.ne[0]},
              stream);
+}
+
+void gdn_projected_conv_record_tree_launch(const Tensor& conv_record, const Tensor& conv_weight,
+                                           const Tensor& conv_states, const Tensor& valid_columns,
+                                           const Tensor& initial_state_slots,
+                                           const Tensor& tree_rows, Tensor& query, Tensor& key,
+                                           Tensor& value, cudaStream_t stream) {
+    const std::int32_t width = conv_record.ne[1];
+    if (width < 2 || width > kSpeculativeTreeMaxNodes || valid_columns.data == nullptr) {
+        throw std::invalid_argument(
+            "GDN projected-conv tree: width must be in [2,32] with valid columns");
+    }
+    const auto launch_tree = [&]<int Channels, int QueryRows, int KeyRows, int ValueRows>() {
+        // Narrow CTAs spread a single row's channels over the GPU.
+        constexpr int kThreads = 64;
+        const dim3 grid(Channels / kThreads, static_cast<unsigned>(conv_record.ne[2]));
+        gdn_projected_conv_tree_kernel<Channels, QueryRows, KeyRows, ValueRows, kThreads>
+            <<<grid, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(conv_record.data),
+                static_cast<const __nv_bfloat16*>(conv_weight.data),
+                static_cast<const __nv_bfloat16*>(conv_states.data),
+                static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(initial_state_slots.data),
+                static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+                static_cast<__nv_bfloat16*>(value.data),
+                static_cast<const SpeculativeTreeRow*>(tree_rows.data), width);
+        CUDA_CHECK(cudaGetLastError());
+    };
+    if (conv_record.ne[0] == 10240 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+        value.ne[0] == 6144) {
+        launch_tree.template operator()<10240, 2048, 2048, 6144>();
+        return;
+    }
+    if (conv_record.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
+        value.ne[0] == 4096) {
+        launch_tree.template operator()<8192, 2048, 2048, 4096>();
+        return;
+    }
+    throw std::invalid_argument("GDN projected-conv tree received an unregistered geometry");
 }
 
 void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& conv_weight,

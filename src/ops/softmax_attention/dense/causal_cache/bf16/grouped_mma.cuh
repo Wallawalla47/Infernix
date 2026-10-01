@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 #include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/common/causal_tree.cuh"
 
 namespace ninfer::ops::detail {
 
@@ -41,8 +42,9 @@ bf16_kv_load_grouped_tile(__nv_bfloat16* key_tile, __half* value_tile, const __n
 }
 
 // Packed-query tiles and KV partitions are independent grid axes. Each KV row
-// has one append owner; all query CTAs read new rows from the immutable inputs.
-template <class G, class S, bool MultiBatch, bool Masked, class Input>
+// has one append owner; all query CTAs read new rows from the immutable inputs. Tree instances
+// also apply the per-row ancestor masks of speculative verification trees.
+template <class G, class S, bool MultiBatch, bool Masked, class Input, bool Tree = false>
 __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     void bf16_kv_grouped_mma_kernel(const __nv_bfloat16* q, Input input, const int* positions,
                                     typename Bf16KvCacheView<Input::writes_cache>::Key* cache_k,
@@ -50,7 +52,7 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
                                     const int* tables, const int* validity, const int* table_rows,
                                     int table_stride, int runtime_width, int visible_capacity,
                                     float scale, Bf16KvPartition partition,
-                                    CausalPartialView partial) {
+                                    CausalPartialView partial, const std::uint32_t* tree_masks) {
     const int width = S::kFixedWidth ? S::kFixedWidth : runtime_width;
     constexpr int D = G::kHeadDim, M = S::kQueryRows, N = S::kKeyRows;
     constexpr int NK = N / S::kWarpsKV, QKNt = NK / 8, QKKs = D / 16;
@@ -159,6 +161,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     const int tokens[2] = {rows[0] / G::GroupSize, rows[1] / G::GroupSize};
     const int qabs[2]   = {tokens[0] < live ? positions[tokens[0]] : -1,
                          tokens[1] < live ? positions[tokens[1]] : -1};
+    const std::uint32_t tree[2] = {
+        tokens[0] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[0]) : ~0u,
+        tokens[1] < live ? causal_tree_mask<Tree>(tree_masks, batch, width, tokens[1]) : ~0u};
     int page_window = -Storage::kPageWindow;
     for (int k0 = start; k0 < end; k0 += N) {
         const int logical_page = k0 >> kPagedKVPageShift;
@@ -197,7 +202,9 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int key = k0 + warp_kv * NK + n * 8 + 2 * lid + (j & 1);
-                if (key >= end || key > qabs[j / 2]) score[n][j] = -CUDART_INF_F;
+                if (key >= end || key > qabs[j / 2] ||
+                    (Tree && !causal_tree_visible(key, first, tree[j / 2])))
+                    score[n][j] = -CUDART_INF_F;
                 maximum[j / 2] = fmaxf(maximum[j / 2], score[n][j]);
             }
         }

@@ -235,7 +235,9 @@ on all accept: bonus ~ p_P
 ```
 
 DFlash q is one-hot; DFlash2 q is the retained conditional distribution. This preserves the
-processed target distribution for the verify path. Different draft formats, shortlist heads or
+processed target distribution for the verify path. With `--draft-tree-nodes` a DFlash2 round
+instead verifies a tree of proposals built from the same lattice, whose main chain is this path
+([tree verification](tree-verification.md)). Different draft formats, shortlist heads or
 block widths can change acceptance and throughput; their logits need not match one another.
 
 ### Live widths

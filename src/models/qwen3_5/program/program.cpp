@@ -41,6 +41,10 @@ std::size_t SequencePlan::host_capacity_bytes() const noexcept {
     return impl_ ? impl_->context_cache.host_capacity_bytes.value_or(0) : 0;
 }
 
+bool SequencePlan::draft_tree_auto() const noexcept {
+    return impl_ != nullptr && impl_->tree_widths.automatic_mode();
+}
+
 SequencePlanner::SequencePlanner(std::unique_ptr<detail::SequencePlannerImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 

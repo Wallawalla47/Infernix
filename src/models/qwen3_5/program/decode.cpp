@@ -752,39 +752,6 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         any_ngram    = any_ngram || !row_match.tokens.empty();
         longest_copy = std::max(longest_copy, static_cast<std::uint32_t>(row_match.tokens.size()));
     }
-    // Every round verifies at its family's own window, on the frame viewed at that width for any
-    // batch size. A round with at least one copy proposal replays the narrowest ngram family that
-    // holds its longest copy; an all-neural round replays the neural family (which runs the
-    // drafter). In a batch>1 ngram round the drafter also runs and the per-row copy payload
-    // overlays it on the device, so a row without a copy keeps its neural proposal (extent
-    // neural_draft_window) instead of decoding one token.
-    SpeculativeRoundFamily& family =
-        any_ngram ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
-                  : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
-    const std::uint32_t verify_drafts = family.shape.verify_drafts;
-    const bool drafter_runs           = !any_ngram || lanes.size() > 1;
-    const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
-    auto& graph_family                = family.graphs;
-    qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
-    for (std::size_t row = 0; row < lanes.size(); ++row) {
-        dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;
-    }
-    for (std::size_t row = 0; any_ngram && row < lanes.size(); ++row) {
-        const std::uint32_t row_extent = static_cast<std::uint32_t>(matches[row].tokens.size());
-        for (std::uint32_t step = 0; step < verify_drafts; ++step) {
-            const auto token = step < row_extent ? matches[row].tokens[step] : 0;
-            dflash_host_ingress->ngram_tokens[row * verify_drafts + step] = token;
-            for (std::uint32_t slot = 0; slot < ops::kSparseSpeculativeCandidates; ++slot) {
-                const auto cand = row * verify_drafts * ops::kSparseSpeculativeCandidates +
-                                  step * ops::kSparseSpeculativeCandidates + slot;
-                dflash_host_ingress->ngram_candidates[cand] =
-                    (token + static_cast<TokenId>(slot)) %
-                    parameters.model.resources().public_token_count;
-                dflash_host_ingress->ngram_q[cand] = slot == 0 ? 1.0F : 0.0F;
-            }
-        }
-    }
-    const std::uint32_t width      = verify_drafts + 1U;
     std::uint32_t maximum_frontier = 0;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -812,6 +779,67 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
     }
+    // Every round verifies at its family's own window, on the frame viewed at that width for any
+    // batch size. A round with at least one copy proposal replays the narrowest ngram family that
+    // holds its longest copy; an all-neural round replays the tree family its batch size selects,
+    // or else the neural family (both run the drafter). In a batch>1 ngram round the drafter also
+    // runs and the per-row copy payload overlays it on the device, so a row without a copy keeps
+    // its neural proposal (extent neural_draft_window) instead of decoding one token. A tree round
+    // verifies a draft tree for every row whose whole main chain fits (extent K and room for every
+    // column); other rows verify their chain prefix. Automatic mode lets the controller pick the
+    // width of every all-neural round from its batch size and longest context.
+    const auto batch_rows    = static_cast<std::uint32_t>(lanes.size());
+    std::uint32_t tree_nodes = 0;
+    if (!any_ngram && tree_controller) {
+        const std::uint32_t columns = tree_controller->choose(batch_rows, maximum_frontier);
+        tree_nodes                  = columns == neural_draft_window + 1U ? 0U : columns;
+    } else if (!any_ngram) {
+        tree_nodes = tree_widths.fixed[batch_rows - 1U];
+    }
+    const bool tree_round = tree_nodes != 0U;
+    SpeculativeRoundFamily& family =
+        any_ngram    ? round_family(SpeculativeRoundKind::Ngram, longest_copy)
+        : tree_round ? round_family(SpeculativeRoundKind::Tree, tree_nodes - 1U)
+                     : round_family(SpeculativeRoundKind::Neural, neural_draft_window);
+    const std::uint32_t verify_drafts = family.shape.verify_drafts;
+    const bool drafter_runs           = !any_ngram || lanes.size() > 1;
+    const bool dflash2_backend        = speculative_backend == SpeculativeBackend::DFlash2;
+    auto& graph_family                = family.graphs;
+    qwen3_5::DFlashDecodeState& frame = *io.dflash_decode;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        dflash_host_ingress->copy_rows[row] = any_ngram && !matches[row].tokens.empty() ? 1 : 0;
+    }
+    for (std::size_t row = 0; any_ngram && row < lanes.size(); ++row) {
+        const std::uint32_t row_extent = static_cast<std::uint32_t>(matches[row].tokens.size());
+        for (std::uint32_t step = 0; step < verify_drafts; ++step) {
+            const auto token = step < row_extent ? matches[row].tokens[step] : 0;
+            dflash_host_ingress->ngram_tokens[row * verify_drafts + step] = token;
+            for (std::uint32_t slot = 0; slot < ops::kSparseSpeculativeCandidates; ++slot) {
+                const auto cand = row * verify_drafts * ops::kSparseSpeculativeCandidates +
+                                  step * ops::kSparseSpeculativeCandidates + slot;
+                dflash_host_ingress->ngram_candidates[cand] =
+                    (token + static_cast<TokenId>(slot)) %
+                    parameters.model.resources().public_token_count;
+                dflash_host_ingress->ngram_q[cand] = slot == 0 ? 1.0F : 0.0F;
+            }
+        }
+    }
+    const std::uint32_t width = verify_drafts + 1U;
+    const auto row_extent     = [&](std::size_t row, std::uint32_t frontier) {
+        const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
+                                                ? budgets[row].generated_tokens_remaining - 1U
+                                                : 0U;
+        const bool row_copy               = any_ngram && !matches[row].tokens.empty();
+        const std::uint32_t extent =
+            std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
+                               : (drafter_runs ? neural_draft_window : 0U),
+                      max_by_budget, capacity - frontier - 1U});
+        if (tree_round && extent == neural_draft_window &&
+            capacity - frontier - 1U >= verify_drafts) {
+            return verify_drafts;
+        }
+        return extent;
+    };
     // Verification attention partitions each row by its full window, so the envelope covers the
     // window rather than the drafts a row actually carries.
     const auto target_envelope_for = [&](std::uint32_t max_execution_frontier) {
@@ -841,14 +869,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
-            const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
-                                                    ? budgets[row].generated_tokens_remaining - 1U
-                                                    : 0U;
-            const bool row_copy = any_ngram && !matches[row].tokens.empty();
-            const std::uint32_t extent =
-                std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
-                                   : (drafter_runs ? neural_draft_window : 0U),
-                          max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent        = row_extent(row, frontier);
+            const bool tree_row               = tree_round && extent == verify_drafts;
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -861,7 +883,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {
-                const std::uint32_t position = frontier + std::min(column, extent);
+                // A tree row's columns take the anchor's position plus their depth, which the
+                // device adds once the round's tree is built.
+                const std::uint32_t position =
+                    frontier + (tree_row ? 0U : std::min(column, extent));
                 dflash_host_ingress->target_rope_positions[row * width + column] =
                     checked_i32(position, "DFlash target RoPE position") + sequence.rope_delta;
             }
@@ -891,6 +916,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         schedule_state.ngram                  = any_ngram;
         schedule_state.neural_proposal_drafts = neural_draft_window;
+        schedule_state.tree                   = tree_round;
+        schedule_state.tree_paths             = draft_tree_paths;
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        verify_drafts, envelopes, target_envelope, executable);
@@ -946,6 +973,25 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.speculative_stats.ngram_archive_accepted_tokens += accepted_i;
                 }
             }
+            if (tree_round && extent == verify_drafts) {
+                if (tree_controller) {
+                    tree_controller->observe_tree_row(
+                        std::span<const std::int32_t>(dflash_host_egress->accepted_path.data() +
+                                                          row * width,
+                                                      static_cast<std::size_t>(accepted_i) + 1U),
+                        width);
+                }
+                request.speculative_stats.tree_rounds += 1;
+                const std::int32_t branch = dflash_host_egress->accepted_branch[row];
+                if (branch > 0) {
+                    if (branch > accepted_i) {
+                        throw std::runtime_error("DFlash batch returned invalid row metadata");
+                    }
+                    request.speculative_stats.tree_side_rounds += 1;
+                    request.speculative_stats.tree_side_accepted_tokens +=
+                        static_cast<std::uint32_t>(accepted_i - branch + 1);
+                }
+            }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
                                  .kind          = PendingKind::Speculative,
@@ -958,6 +1004,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             request.lifecycle = Lifecycle::Pending;
             request.timings.decode_seconds += seconds;
             request.timings.decode_share_seconds += share;
+        }
+        if (tree_controller && !any_ngram) {
+            tree_controller->observe_round(batch_rows, maximum_frontier, width, seconds);
         }
         return runtime::BatchedGeneratedRound{
             .tokens     = std::span<const TokenId>(dflash_host_egress->licensed_tokens.data(),

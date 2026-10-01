@@ -184,6 +184,22 @@ std::string serve_usage_text(const char* argv0) {
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
            "  --draft-tokens N           draft tokens per round (mtp 1-5; dflash/dflash2 1-15)\n"
            "  --lm-head-draft            use the optimized proposal head\n"
+           "  --draft-tree-nodes auto|LIST\n"
+           "                             dflash2: verify a small tree of alternative drafts\n"
+           "                             each round instead of a single draft, so more drafted\n"
+           "                             tokens are accepted (same output distribution).\n"
+           "                             auto (recommended): measures speed while serving and\n"
+           "                             uses a tree only where it is faster, typically with\n"
+           "                             one to three active requests below ~64K context; its\n"
+           "                             choices follow timing, so seeded output can vary\n"
+           "                             between runs. Artifacts without tree support keep\n"
+           "                             single drafts (startup warning).\n"
+           "                             LIST: fixed tree sizes in tokens by number of active\n"
+           "                             requests, e.g. 16,12,12,0 = 16 for one request, 12\n"
+           "                             for two or three, single drafts from four; sizes are\n"
+           "                             draft tokens + 2 to 32, 0 = single draft (draft\n"
+           "                             tokens + 1)\n"
+           "  --draft-tree-paths N       most branches per tree, 2-8 (default 8)\n"
            "  --ngram-draft-tokens N     propose N verified ngram copies per round, 1-63 (0 off)\n"
            "  --ngram-min-match N        minimum ngram match length, 4-64\n"
            "  --ngram-archive-mib N      MiB of retained source archive for ngram proposals\n"
@@ -427,6 +443,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--draft-tree-nodes") {
+            product::apply_draft_tree_nodes(options.speculative,
+                                            require_value("--draft-tree-nodes"));
+        } else if (arg == "--draft-tree-paths") {
+            options.speculative.draft_tree_paths = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-tree-paths"), "draft-tree-paths"));
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));

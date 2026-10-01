@@ -424,6 +424,25 @@ which require `--use-original-prefix-caching`. Details:
   the engine worker. See [ngram copy proposals](docs/ngram.md).
   Commits: [`d2209f6`][c-ngram], [`c5e390b`][c-ngram-concurrency],
   [`c54dacb`][c-ngram-prep].
+- **DFlash2 tree verification** (opt-in, `--draft-tree-nodes auto` or a per-batch-size list):
+  instead of one proposal path, a round verifies a small tree of proposals that the GPU builds every
+  round from the DFlash2 drafter's candidate lattice, spending the extra columns where the drafter
+  is least sure. Sampling stays exact (recursive rejection sampling over each node's alternatives),
+  and the accepted path is moved onto the main-chain columns so the KV cache, GDN state and drafter
+  see an ordinary round. It works with every `--kv-dtype` on artifacts whose GDN input projections
+  are single FP8 or NVFP4 matrices. A column buys the same acceptance at any batch size but costs
+  more of the round as the batch and the context grow, so `auto` measures both while it runs: the
+  round time of each width per batch size and context length, and, from every tree round's accepted
+  path, the tokens each narrower tree and the chain would have emitted on the same text. Each round
+  then verifies the chain or a tree of K+5 or K+9 columns, whichever gives the most tokens per
+  second. On the decode-saturation suite (DFlash2 K=7, n-gram 15/12, INT8 KV) `auto` decodes an
+  estimated 6.9 % faster with one request, 4.4 % with two and 1.1 % with three, and breaks even with
+  four; at 128K tokens of context it loses 0.6-2.3 % in a fresh process (a fixed 16-column tree
+  loses 4.2-5.4 %), and on text the drafter already predicts it keeps chain verification. Below
+  about 64K tokens the fixed table `16,12,12,0` gains up to 2 points more (7-8.5 % with one request
+  and 4-5 % with two on INT8, K8V4 and NVFP4 KV) and keeps seeded one-request runs reproducible,
+  which `auto` does not, since its choice depends on measured time. See [tree
+  verification](docs/maintainer/tree-verification.md).
 - **NVFP4 KV groups pick the best of five scales** (NVFP4 K and V, K8V4 V): each 16-value group
   maps its largest magnitude to 6, 4, 4.5, 5 or 5.5 and keeps the scale with the least squared
   error (Four Over Six, arXiv:2512.02010, generalized). RMS error of the 27B model's rotated K rows

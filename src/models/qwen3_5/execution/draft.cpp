@@ -276,7 +276,9 @@ void copy_leading_columns(const Tensor& source, const Tensor& destination, std::
 
 // into is the frame that receives a proposal drafted at the drafter's own width when it differs
 // from the drafter's frame: the leading min(K, frame width) drafts (and their sparse laws) are
-// staged, then copied into it. nullptr keeps the proposal in the drafter's frame.
+// staged, then copied into it. nullptr keeps the proposal in the drafter's frame. A tree round
+// instead builds each row's draft tree from the lattice directly into `into` (its verification
+// frame), with its tree rows, ancestor masks and live column counts.
 void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
                            int k, DFlashEnvelopes envelopes, qwen3_5::DFlashDecodeState* into) {
     if (state.execution.parameters.model.config().draft->dflash2) {
@@ -397,6 +399,28 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         Tensor projected =
             work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
         project(hidden, weights.selector->hidden_projection, projected, work, stream);
+        if (state.tree) {
+            if (into == nullptr || !into->tree_rows.data || !into->tree_masks.data) {
+                throw std::logic_error("a DFlash2 tree round needs its verification frame");
+            }
+            Tensor drafts            = into->draft_tokens.slice(1, 0, batch);
+            Tensor column_candidates = into->candidate_ids.slice(2, 0, batch);
+            Tensor proposal_q        = into->proposal_q.slice(2, 0, batch);
+            Tensor tree_rows         = into->tree_rows.slice(1, 0, batch);
+            Tensor tree_masks        = into->tree_masks.slice(1, 0, batch);
+            Tensor extents           = into->proposal_extents.slice(0, 0, batch);
+            Tensor valid             = into->target_valid_columns.slice(0, 0, batch);
+            const ops::SpeculativeTreeShape shape{into->draft_tokens.ne[0] + 1, k,
+                                                  static_cast<std::int32_t>(state.tree_paths)};
+            ops::candidate_selector_tree(
+                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+                weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+                frontiers, extents, frame.sampling, shape, drafts, column_candidates, proposal_q,
+                tree_rows, tree_masks, valid, work, stream);
+            work.reset();
+            return;
+        }
         Tensor drafts =
             staged ? work.alloc(DType::I32, {k, batch}) : frame.draft_tokens.slice(1, 0, batch);
         Tensor proposal_q =
@@ -663,14 +687,21 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                             {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
 
         const auto proposal_k = state.neural_proposal_drafts;
+        // A tree round drafts its main chain at the drafter's width and verifies every tree node.
+        const bool tree_round = state.tree;
         if (proposal_k == 0 || proposal_k > kDFlashDecodeMaximumDrafts || proposal_k > k ||
-            (!state.ngram && proposal_k != k)) {
+            (!state.ngram && !tree_round && proposal_k != k) ||
+            (tree_round &&
+             (state.ngram || width > ops::kSpeculativeTreeMaxNodes || k < proposal_k + 1U))) {
             throw std::logic_error("neural proposal is outside its supported frame");
         }
         // The drafter always runs at its own width. A neural round verifies at that width; a
         // batch>1 ngram round takes the drafter's proposals into its wider frame for rows without
-        // a copy.
-        if (!state.ngram) {
+        // a copy, and a tree round builds each row's draft tree into its own wider frame.
+        if (state.tree) {
+            auto draft_frame = state.frame.narrowed(proposal_k);
+            propose_batch_impl(state, draft_frame, batch_size, proposal_k, envelopes, &frame);
+        } else if (!state.ngram) {
             propose_batch_impl(state, frame, batch_size, k, envelopes);
         } else if (batch_size > 1) {
             auto draft_frame = state.frame.narrowed(proposal_k);
@@ -708,8 +739,14 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                     drafts, candidates, proposal_q,
                                                     state.execution.device.stream);
         }
-        ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
-                                               target_positions, state.execution.device.stream);
+        if (tree_round) {
+            ops::speculative_prepare_tree_verify_inputs(
+                anchors, drafts, frontiers, frame.tree_rows.slice(1, 0, batch_size), verify_ids,
+                target_positions, target_rope, state.execution.device.stream);
+        } else {
+            ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
+                                                   target_positions, state.execution.device.stream);
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
@@ -749,6 +786,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .replay_records  = state.execution.replay_records,
                     .sampling        = frame.sampling,
                     .feature_sink    = &sink,
+                    .tree_rows  = tree_round ? frame.tree_rows.slice(1, 0, batch_size) : Tensor{},
+                    .tree_masks = tree_round ? frame.tree_masks.slice(1, 0, batch_size) : Tensor{},
+                    .tree_paths = state.tree_paths,
+                    .accepted_path    = frame.accepted_path.slice(1, 0, batch_size),
+                    .accepted_branch  = frame.accepted_branch.slice(0, 0, batch_size),
+                    .active_lanes     = active_lanes,
+                    .pending_features = dflash_state(state).pending_features,
                 },
                 target_envelope);
         }
