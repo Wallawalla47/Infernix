@@ -1,4 +1,5 @@
 #pragma once
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/dense/causal_cache/fp8/tile_io.cuh"
 
 #include "ops/softmax_attention/dense/causal_cache/fp8/schedule.cuh"
@@ -485,6 +486,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         if (has_next) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
+    // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
+    pdl::trigger_dependents();
 
     if (warp < RowTiles && lid == 0) {
         const int row0 = warp * 16 + gid;

@@ -1,5 +1,6 @@
 #pragma once
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
 
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
@@ -47,6 +48,8 @@ __launch_bounds__(256) __global__
     static_assert(Geometry::kHeadDim == kCausalHeadDim);
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
     static_assert(!InverseRotation || DChunk == kCausalHeadDim);
+    // Every path, including the masked-column early exit, follows the producer's completion.
+    pdl::wait_for_dependencies();
     const int q_head      = static_cast<int>(blockIdx.x);
     const int d_start     = static_cast<int>(blockIdx.y) * DChunk;
     const int flat_column = static_cast<int>(blockIdx.z);
@@ -115,11 +118,14 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
                                  CausalPartialView partial, cudaStream_t stream) {
     static_assert(S::kThreads == 256);
     const dim3 grid(G::QHeads, div_up(G::kHeadDim, S::kDChunk), p.width * p.batch);
-    causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>
-        <<<grid, S::kThreads, 0, stream>>>(partial.acc, partial.maximum, partial.sum, p.positions,
-                                           valid_columns, p.width, p.batch, p.visible_capacity,
-                                           partition, p.out);
-    CUDA_CHECK(cudaGetLastError());
+    // A captured merge launches as a programmatic dependent of the attention kernel, which
+    // triggers it once its KV loop ends; the merge waits for the partials before any access.
+    CUDA_CHECK(pdl::launch_consumer(
+        pdl::LaunchConfig{grid, dim3(S::kThreads), 0, stream},
+        causal_natural_merge_kernel<G, S::kDChunk, MultiBatch, Masked, InverseRotation>,
+        static_cast<const float*>(partial.acc), static_cast<const float*>(partial.maximum),
+        static_cast<const float*>(partial.sum), p.positions, valid_columns, p.width, p.batch,
+        p.visible_capacity, partition, p.out));
 }
 
 } // namespace ninfer::ops::detail
