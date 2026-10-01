@@ -121,6 +121,10 @@ struct DFlashDecodeEgress {
     std::array<TokenId, kMaximumConcurrency * kDFlashVerifyMaximumWidth> licensed_tokens{};
     std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
     std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    // Tree rounds: the accepted root path's columns (row stride = the round width, -1 beyond A)
+    // and the depth at which it left the main chain (0 when it stayed on it, -1 for a chain row).
+    std::array<std::int32_t, kMaximumConcurrency * kDFlashVerifyMaximumWidth> accepted_path{};
+    std::array<std::int32_t, kMaximumConcurrency> accepted_branch{};
 };
 
 struct OrdinaryDecodeStateLayout {
@@ -178,6 +182,10 @@ struct DFlashDecodeStateLayout {
     TensorRegion target_logits;
     TensorRegion target_hidden;
     TensorRegion target_continuation_hidden;
+    // DFlash2 tree rounds: each row's device-built tree (ops::SpeculativeTreeRow) and its I32
+    // [W,B] ancestor masks.
+    std::optional<TensorRegion> tree_rows;
+    std::optional<TensorRegion> tree_masks;
 };
 
 struct RoundStateLayout {
@@ -310,6 +318,10 @@ struct DFlashDecodeState {
     Tensor licensed_tokens;
     Tensor licensed_counts;
     Tensor accepted_drafts;
+    Tensor tree_rows;
+    Tensor tree_masks;
+    Tensor accepted_path;
+    Tensor accepted_branch;
     Tensor proposal_ids;
     Tensor proposal_positions;
     Tensor verify_positions;

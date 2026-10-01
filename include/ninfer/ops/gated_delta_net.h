@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -103,5 +104,22 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
+
+/**
+ * Verification-tree form of gated_delta_net_replay_record. tree_rows is I32
+ * [kSpeculativeTreeRowWords,B] (one SpeculativeTreeRow per row), the physical width T is at most
+ * kSpeculativeTreeMaxNodes, valid_columns is required and max_paths (1..8) bounds every row's
+ * path count. In a tree row (tree != 0) the output of column c is the chain replay of the root
+ * path that owns c, from the row's initial state, bit-identical to the chain Op evaluated on that
+ * path's columns alone, and each column's records are the raw copies of its own inputs. A chain
+ * row is the chain Op over its valid prefix. Outputs past a row's live columns are zero. The
+ * execution domain is the chain Op's.
+ */
+void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, const Tensor& tree_rows,
+                                   std::int32_t max_paths, Tensor& key_record, Tensor& value_record,
+                                   Tensor& gate_record, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

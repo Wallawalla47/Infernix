@@ -19,6 +19,7 @@
 #include <limits>
 #include <numeric>
 #include <optional>
+#include <random>
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include <span>
@@ -904,8 +905,11 @@ void rotate_query_rows(std::vector<double>& values, const Geometry& geometry, in
     });
 }
 
+// tree_masks, when given, holds one ancestor mask per column: a key at or after positions[0]
+// is visible to a column only when its offset from positions[0] is a set bit of that mask.
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
-                                    const std::vector<std::int32_t>& positions) {
+                                    const std::vector<std::int32_t>& positions,
+                                    const std::uint32_t* tree_masks = nullptr) {
     const Geometry& geometry = cache.geometry;
     const int tokens = positions.size(), visible = positions.back() + 1;
     const bool rotate_q = cache.storage != KvCacheStorage::BFloat16;
@@ -944,7 +948,12 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
         [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
         [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
         [&](int d, int head, int pos) { return values[index(d, head, pos)]; },
-        [&](int token, int pos) { return pos <= positions[token]; },
+        [&](int token, int pos) {
+            if (pos > positions[token]) return false;
+            const int offset = pos - positions[0];
+            return tree_masks == nullptr || offset < 0 ||
+                   ((tree_masks[token] >> offset) & 1U) != 0U;
+        },
         [&](int d, int head, int token, double value) {
             output[q_index(geometry, head, d, token)] = value;
         },
@@ -2014,6 +2023,9 @@ struct BatchAttentionCase {
     std::vector<std::vector<std::int32_t>> replay_contexts;
     bool fast_prompt_kernel = false;
     bool fast_prompt_pv8    = false;
+    // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
+    // row); empty is the causal Op.
+    std::vector<std::uint32_t> tree_masks;
 };
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
@@ -2096,7 +2108,10 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
     if (test_case.graph_replay)
         control.emplace(initial, test_case.mapping, envelope.max_visible_keys);
     GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
-        dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2);
+        dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2), dtree(width * batch * 4);
+    const bool tree = !test_case.tree_masks.empty();
+    if (tree) dtree.copy_from_host(test_case.tree_masks.data(), width * batch * 4);
+    Tensor ttree = tree ? Tensor(dtree.data(), DType::I32, {width, batch}) : Tensor{};
     Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
     Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
         tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
@@ -2107,11 +2122,12 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
         op_geometry(geometry), storage, envelope, batch, width, width, execution);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    const bool masked = test_case.graph_replay ||
+    // Tree rows always carry their live column counts.
+    const bool masked = test_case.graph_replay || tree ||
                         std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](int count) { return count != width; });
     const auto launch = [&] {
-        ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+        ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes, ttree,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
                                       envelope, workspace, tout, execution);
     };
@@ -2159,8 +2175,10 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
                 auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
                 auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
                 append_cache(expected[lanes[b]], row_k, row_v, row_positions);
-                insert_request_columns(ideal_attention(row_q, expected[lanes[b]], row_positions),
-                                       q_column_elements, width, b, reference);
+                insert_request_columns(
+                    ideal_attention(row_q, expected[lanes[b]], row_positions,
+                                    tree ? test_case.tree_masks.data() + b * width : nullptr),
+                    q_column_elements, width, b, reference);
             }
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
@@ -2180,9 +2198,10 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
         else
             launch();
         cuda_synchronize(execution.stream);
-        const std::string label = std::string("causal batch ") + geometry.name + " " +
-                                  cache_name(storage) + " W=" + std::to_string(width) +
-                                  " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
+        const std::string label = std::string(tree ? "causal tree batch " : "causal batch ") +
+                                  geometry.name + " " + cache_name(storage) +
+                                  " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+                                  " phase=" + std::to_string(phase);
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
@@ -2350,6 +2369,76 @@ int run_verify_width_cases(DeviceExecutionView execution, KvCacheStorage storage
                         MappingPattern::Fragmented);
     }
 
+    return failures;
+}
+
+// Ancestor masks of a random verification tree: the main chain 0..main_depth, then side columns
+// hung below random earlier columns of depth < main_depth (bit a of column c: a is c or one of its
+// ancestors).
+std::vector<std::uint32_t> random_tree_masks(int width, int main_depth, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<int> parent(static_cast<std::size_t>(width), -1), depth(parent.size(), 0);
+    for (int c = 1; c < width; ++c) {
+        if (c <= main_depth) {
+            parent[c] = c - 1;
+        } else {
+            do {
+                parent[c] = static_cast<int>(rng() % static_cast<std::uint32_t>(c));
+            } while (depth[parent[c]] >= main_depth);
+        }
+        depth[c] = depth[parent[c]] + 1;
+    }
+    std::vector<std::uint32_t> masks(static_cast<std::size_t>(width));
+    for (int c = 0; c < width; ++c)
+        for (int a = c; a >= 0; a = parent[a]) masks[c] |= 1U << a;
+    return masks;
+}
+
+// Verification-tree masks on every storage's grouped routes (W<=8 grouped, wider parallel
+// grouped): rows with different random trees, chain-masked rows and short rows of the same
+// round, fresh and page-crossing bases, direct and graph-replayed launches, against the
+// ancestor-visibility FP64 oracle.
+int run_tree_mask_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    constexpr int order[]{7, 0, 4, 2, 6, 1, 5, 3};
+    int failures   = 0;
+    const auto run = [&](const Geometry& geometry, int main_depth, int width, int batch, int base,
+                         bool graph) {
+        BatchAttentionCase c{width,
+                             {},
+                             {},
+                             {},
+                             MappingPattern::Fragmented,
+                             static_cast<unsigned>(4100 + width + 31 * batch + base),
+                             graph};
+        for (int b = 0; b < batch; ++b) {
+            c.contexts.push_back(base + (b % 3 == 0 ? 0 : b % 3 == 1 ? 17 : 61));
+            c.valid_columns.push_back(b % 4 == 3 ? main_depth + 1 : b % 4 == 2 ? 1 : width);
+            c.table_rows.push_back(order[b]);
+            // Rows 3 mod 4 are chain rows of the round: their masks are the causal triangle.
+            const auto masks = b % 4 == 3 ? std::vector<std::uint32_t>{}
+                                          : random_tree_masks(width, main_depth, c.seed + b);
+            for (int j = 0; j < width; ++j)
+                c.tree_masks.push_back(masks.empty() ? (2U << j) - 1U : masks[j]);
+        }
+        return run_batch_case(execution, geometry, storage, c);
+    };
+    failures += run(kGeometries[0], 3, 6, 1, 0, false);
+    failures += run(kGeometries[0], 3, 8, 8, 40, false);
+    failures += run(kGeometries[0], 5, 12, 4, 62, false);
+    failures += run(kGeometries[0], 7, 14, 8, 0, false);
+    failures += run(kGeometries[0], 7, 16, 2, 127, true);
+    failures += run(kGeometries[0], 7, 24, 8, 2048, true);
+    failures += run(kGeometries[0], 15, 32, 1, 61, false);
+    failures += run(kGeometries[0], 15, 32, 1, 4000, true);
+    failures += run(kGeometries[1], 4, 7, 3, 70, false);
+    failures += run(kGeometries[1], 7, 20, 4, 300, false);
+    // A causal-triangle mask reproduces the causal Op.
+    {
+        BatchAttentionCase c{16, {5, 70}, {16, 9}, {1, 0}, MappingPattern::Fragmented, 4199u};
+        for (int b = 0; b < 2; ++b)
+            for (int j = 0; j < 16; ++j) c.tree_masks.push_back((2U << j) - 1U);
+        failures += run_batch_case(execution, kGeometries[0], storage, c);
+    }
     return failures;
 }
 
@@ -2992,11 +3081,10 @@ int run_masked_prefix_invariance_case(const Geometry& geometry, KvCacheStorage s
         Tensor tp(dp.data(), DType::I32, {width, batch}),
             tvalid(dvalid.data(), DType::I32, {batch}), tlanes(dlanes.data(), DType::I32, {batch});
         Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
-        DeviceContext device;
         ops::causal_softmax_attention(tq, tk, tv, tp, tvalid, tlanes, op_geometry(geometry),
                                       kAttentionScale, cache.view(), envelope, workspace, tout,
-                                      device.stream);
-        cuda_synchronize(device.stream);
+                                      execution);
+        cuda_synchronize(execution.stream);
         return copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     };
 
@@ -3060,6 +3148,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
         failures += run_int8_fast_prompt_cases(execution, false);
         failures += run_int8_fast_prompt_cases(execution, true);
     }
+    failures += run_tree_mask_cases(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16)
         failures += run_nvfp4_fast_prompt_cases(execution);
     if (storage != KvCacheStorage::BFloat16) {

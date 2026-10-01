@@ -1,10 +1,12 @@
 #include "ninfer/ops/candidate_selector.h"
 
+#include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -88,6 +90,81 @@ std::size_t candidate_selector_path_workspace_capacity_bytes(int min_steps, int 
                 layout, detail::candidate_selector_path_route(k, b), k, b);
         }
     return layout.peak_bytes();
+}
+
+std::size_t candidate_selector_tree_workspace_capacity_bytes(std::int32_t main_depth,
+                                                             std::int32_t min_batch,
+                                                             std::int32_t max_batch) {
+    if (main_depth < 1 || main_depth > 15 || min_batch < 1 || max_batch > 8 ||
+        max_batch < min_batch)
+        throw std::invalid_argument("selector tree workspace: invalid K/B interval");
+    WorkspaceLayoutBuilder layout;
+    for (int b = min_batch; b <= max_batch; ++b) {
+        auto scope = layout.scope();
+        (void)detail::allocate_selector_workspace(layout, detail::SelectorRoute::Lattice,
+                                                  main_depth, b);
+    }
+    return layout.peak_bytes();
+}
+
+void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                             const Tensor& base_positions, const Tensor& current_extents,
+                             const SamplingConfig* configs, SpeculativeTreeShape shape,
+                             Tensor& drafts, Tensor& column_candidates, Tensor& proposal_q,
+                             Tensor& tree_rows, Tensor& tree_masks, Tensor& valid_columns,
+                             WorkspaceArena& workspace, cudaStream_t stream) {
+    validate_speculative_tree_shape(shape);
+    const std::int32_t batch_size = candidate_ids.ne[2];
+    const std::int32_t kSteps     = candidate_ids.ne[1];
+    const std::int32_t columns    = shape.nodes - 1;
+    if (kSteps != shape.main_depth) {
+        throw std::invalid_argument("candidate_selector_tree: K must equal the tree's main depth");
+    }
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_selector_tree: B must be in [1,8]");
+    }
+    require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
+    require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
+    require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
+    require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
+    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "successor_codebook");
+    require_tensor(base_positions, DType::I32, batch_size, 1, 1, 1, "base_positions");
+    require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
+    require_tensor(drafts, DType::I32, columns, batch_size, 1, 1, "drafts");
+    require_tensor(column_candidates, DType::I32, kCandidates, columns, batch_size, 1,
+                   "column_candidates");
+    require_tensor(proposal_q, DType::FP32, kCandidates, columns, batch_size, 1, "proposal_q");
+    validate_speculative_tree_rows(tree_rows, batch_size, "candidate_selector_tree");
+    require_tensor(tree_masks, DType::I32, shape.nodes, batch_size, 1, 1, "tree_masks");
+    require_tensor(valid_columns, DType::I32, batch_size, 1, 1, 1, "valid_columns");
+    if (!aligned_to(configs, alignof(SamplingConfig))) {
+        throw std::invalid_argument("candidate_selector_tree: invalid configs");
+    }
+    require_nonoverlap(candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
+                       successor_codebook, base_positions, configs, drafts, proposal_q);
+    for (const Tensor* written : std::initializer_list<const Tensor*>{
+             &column_candidates, &tree_rows, &tree_masks, &valid_columns}) {
+        const Range range{written->data, written->bytes(), "output"};
+        for (const Tensor* other :
+             std::initializer_list<const Tensor*>{&candidate_ids, &drafts, &proposal_q,
+                                                  &base_positions, &anchors, &current_extents}) {
+            if (overlaps(range, Range{other->data, other->bytes(), "operand"})) {
+                throw std::invalid_argument("candidate_selector_tree: outputs overlap operands");
+            }
+        }
+    }
+    auto scope         = workspace.scope();
+    const auto scratch = detail::allocate_selector_workspace(
+        workspace, detail::SelectorRoute::Lattice, kSteps, batch_size);
+    detail::candidate_selector_tree_launch(
+        candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
+        successor_codebook, base_positions, current_extents, configs, shape, drafts,
+        column_candidates, proposal_q, tree_rows, tree_masks, valid_columns, scratch, stream);
 }
 
 void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_scores,

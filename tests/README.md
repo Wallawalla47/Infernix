@@ -283,7 +283,29 @@ NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16`, `int8`,
-`fp8`, `nvfp4`, or `k8v4`), Vision enabled, and extra Device StateImage slots. Defaults are
-`15 1 1 8 bf16 0 3`. Run GPU integration tests serially. The individual Op suites remain the
-numerical/state-transition oracle; the fixed Engine fixture does not define bit parity across
-arbitrary floating-point routes.
+`fp8`, `nvfp4` or `k8v4`), Vision enabled, and extra Device StateImage slots. Defaults are
+`15 1 1 8 bf16 0 3`. An optional eighth argument, a `--draft-tree-nodes` table such as
+`16,12,12,10` or `auto`, runs the fixture through DFlash2 tree verification (with `auto`, the
+same-seed replay check is skipped because the chosen widths follow measured round time); CTest
+runs a table on INT8, K8V4 and NVFP4 as `ninfer_qwen3_5_dflash2_tree_<kv>_real_test`. Run GPU
+integration tests serially. The
+individual Op suites remain the numerical/state-transition oracle; the fixed Engine fixture does
+not define bit parity across arbitrary floating-point routes.
+
+The tree greedy test decodes six prompts greedily (160 tokens each) with a 16-column tree and
+compares every committed token with a fresh one-token greedy prefill of the exact committed prefix,
+scoring each disagreement on a CausalScoring Engine. A context built by decode rounds rounds
+differently from one prefill, so chain decoding disagrees with this oracle too (about 3 % of the
+positions, at low-confidence tokens). A state or compaction error after a side branch would leave
+the target's choice at most later positions; the test fails above 10 % disagreements or when a
+committed token is more than 6 nats below the oracle's.
+
+```bash
+cmake --build build -j --target ninfer_qwen3_5_dflash2_tree_greedy_real_test
+NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/ninfer_qwen3_5_dflash2_tree_greedy_real_test int8 16
+```
+
+Arguments are the target KV, the tree table (`auto` for automatic widths, `0` runs chain decoding
+against the same oracle), output tokens per prompt and K; defaults are `int8 16 160 7`. CTest
+runs it on INT8, K8V4 and NVFP4.

@@ -59,10 +59,11 @@ void grouped_instance(const CausalAttentionOperands& p, Int8KvCacheView<Writable
 template <class Input>
 void execute_grouped(const Tensor& q, const Tensor& positions, float scale,
                      PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
-                     Input input, const Int8KvCausalPlan& plan, WorkspaceArena& workspace,
-                     Tensor& out, cudaStream_t stream) {
-    const auto view =
+                     const std::uint32_t* tree_masks, Input input, const Int8KvCausalPlan& plan,
+                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    auto view =
         make_quantized_causal_cache_view<Int8KvCacheView<Input::writes_cache>>(cache, valid, rows);
+    view.tree_masks    = tree_masks;
     auto scope         = workspace.scope();
     const auto partial = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                                   plan.partition.capacity, plan.batch);
@@ -137,23 +138,26 @@ void tiled(const CausalAttentionOperands& p, Int8KvReadView cache,
 
 void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid, const Tensor& rows,
-                              float scale, PagedKVBatchLayerView cache,
+                              const Tensor& tree_masks, float scale, PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_int8_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
+    const auto* tree = static_cast<const std::uint32_t*>(tree_masks.data);
+    if (tree != nullptr && plan.family == Int8KvFamily::Tiled)
+        throw std::invalid_argument("INT8 attention: a verification tree needs the grouped route");
     if (plan.family != Int8KvFamily::Grouped) {
         kv_cache_append_batch_launch(k, v, positions, valid, rows, cache, stream);
         const auto p = make_causal_operands(q, positions, out, scale, envelope.max_visible_keys);
-        const auto view =
-            make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        auto view = make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
+        view.tree_masks = tree;
         if (plan.family == Int8KvFamily::Tiled)
             tiled(p, view, envelope, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
     } else {
-        execute_grouped(q, positions, scale, cache, &valid, &rows,
+        execute_grouped(q, positions, scale, cache, &valid, &rows, tree,
                         CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
                                           static_cast<const __nv_bfloat16*>(v.data)},
                         plan, workspace, out, stream);
@@ -176,8 +180,8 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                          make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), plan,
                          workspace, stream);
     else
-        execute_grouped(q, positions, scale, view, nullptr, nullptr, CausalCachedInput{}, plan,
-                        workspace, out, stream);
+        execute_grouped(q, positions, scale, view, nullptr, nullptr, nullptr, CausalCachedInput{},
+                        plan, workspace, out, stream);
 }
 
 } // namespace ninfer::ops::detail

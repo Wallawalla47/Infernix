@@ -258,6 +258,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+        if (speculative.tree_rounds != 0) {
+            print_metric(backend + " tree rounds", std::to_string(speculative.tree_rounds));
+            print_metric(backend + " tree side rounds",
+                         std::to_string(speculative.tree_side_rounds));
+            print_metric(backend + " tree side drafts",
+                         std::to_string(speculative.tree_side_accepted_tokens));
+        }
     }
 }
 

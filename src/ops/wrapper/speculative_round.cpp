@@ -1,4 +1,5 @@
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
 #include "ninfer/types.h"
@@ -264,6 +265,90 @@ void speculative_accept_sparse_drafts(
         target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
         round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
         envelope.all_rows_greedy_without_penalties, scratch, stream);
+}
+
+std::size_t speculative_accept_sparse_tree_workspace_capacity_bytes(std::int32_t token_domain,
+                                                                    std::int32_t width,
+                                                                    std::int32_t min_batch,
+                                                                    std::int32_t max_batch) {
+    if (token_domain != kSparseTokenDomain || min_batch < 1 || max_batch < min_batch ||
+        max_batch > kSparseMaxBatch || width < 2 || width > kSpeculativeTreeMaxNodes) {
+        throw std::invalid_argument("sparse speculative tree workspace: unsupported profile");
+    }
+    const std::size_t row_bytes =
+        make_sampling_workspace_layout(token_domain, width, kSpeculativeSamplerMaxColumns).bytes;
+    return row_bytes * static_cast<std::size_t>(max_batch);
+}
+
+void speculative_prepare_tree_verify_inputs(const Tensor& anchors, const Tensor& drafts,
+                                            const Tensor& base_positions, const Tensor& tree_rows,
+                                            Tensor& verify_ids, Tensor& positions,
+                                            Tensor& rope_positions, cudaStream_t stream) {
+    constexpr const char* op = "speculative_prepare_tree_verify_inputs";
+    const std::int32_t k     = drafts.ne[0];
+    const std::int32_t batch = drafts.ne[1];
+    if (k < 1 || k + 1 > kSpeculativeTreeMaxNodes || batch < 1 ||
+        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        throw std::invalid_argument(
+            "speculative_prepare_tree_verify_inputs: drafts must be [W-1,B] with W<=32, B<=8");
+    }
+    require_vector(anchors, DType::I32, batch, op, "anchors");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_vector(base_positions, DType::I32, batch, op, "base_positions");
+    validate_speculative_tree_rows(tree_rows, batch, op);
+    require_matrix(verify_ids, DType::I32, k + 1, batch, op, "verify_ids");
+    require_matrix(positions, DType::I32, k + 1, batch, op, "positions");
+    require_matrix(rope_positions, DType::I32, k + 1, batch, op, "rope_positions");
+    detail::speculative_prepare_tree_verify_inputs_launch(
+        anchors, drafts, base_positions, tree_rows, verify_ids, positions, rope_positions, stream);
+}
+
+void speculative_accept_sparse_tree(const Tensor& target_tokens, const Tensor& logits,
+                                    const Tensor& drafts, const Tensor& candidate_ids,
+                                    const Tensor& proposal_q, const Tensor& current_extents,
+                                    const Tensor& tree_rows, Tensor& round_lengths,
+                                    Tensor& round_anchors, Tensor& licensed_tokens,
+                                    Tensor& licensed_counts, Tensor& accepted_drafts,
+                                    Tensor& accepted_path, Tensor& accepted_branch,
+                                    std::int32_t token_domain, const SamplingConfig* configs,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_sparse_tree";
+    if (token_domain != kSparseTokenDomain) {
+        throw std::invalid_argument("speculative_accept_sparse_tree: token_domain must be 248077");
+    }
+    const std::int32_t columns = logits.ne[1];
+    const std::int32_t k       = columns - 1;
+    const std::int32_t batch   = drafts.ne[1];
+    if (k < 1 || columns > kSpeculativeTreeMaxNodes || drafts.ne[0] != k || batch < 1 ||
+        batch > kSparseMaxBatch) {
+        throw std::invalid_argument(
+            "speculative_accept_sparse_tree: drafts must be [W-1,B] with W<=32 and B in [1,8]");
+    }
+    require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
+    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_tensor3(candidate_ids, DType::I32, kSparseCandidates, k, batch, op, "candidate_ids");
+    require_tensor3(proposal_q, DType::FP32, kSparseCandidates, k, batch, op, "proposal_q");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    validate_speculative_tree_rows(tree_rows, batch, op);
+    require_vector(round_lengths, DType::I32, batch, op, "round_lengths");
+    require_vector(round_anchors, DType::I32, batch, op, "round_anchors");
+    require_matrix(licensed_tokens, DType::I32, columns, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted_drafts, DType::I32, batch, op, "accepted_drafts");
+    require_matrix(accepted_path, DType::I32, columns, batch, op, "accepted_path");
+    require_vector(accepted_branch, DType::I32, batch, op, "accepted_branch");
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_sparse_tree: configs must be non-null");
+    }
+    auto scratch_scope      = workspace.scope();
+    const std::size_t bytes = speculative_accept_sparse_tree_workspace_capacity_bytes(
+        token_domain, columns, batch, batch);
+    const DeviceSpan scratch = workspace.alloc_bytes(bytes);
+    detail::speculative_accept_sparse_tree_launch(
+        target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, tree_rows,
+        round_lengths, round_anchors, licensed_tokens, licensed_counts, accepted_drafts,
+        accepted_path, accepted_branch, token_domain, configs, false, scratch, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

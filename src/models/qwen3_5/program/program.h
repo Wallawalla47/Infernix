@@ -65,6 +65,8 @@ public:
     [[nodiscard]] std::size_t device_reservation_bytes() const noexcept;
     [[nodiscard]] std::size_t workspace_capacity_bytes() const noexcept;
     [[nodiscard]] std::size_t host_capacity_bytes() const noexcept;
+    // Whether automatic DFlash2 tree widths are active: requested and verifiable by the target.
+    [[nodiscard]] bool draft_tree_auto() const noexcept;
 
 private:
     explicit SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept;

@@ -6,10 +6,12 @@
 #include "core/host_kv_arena.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
@@ -353,6 +355,12 @@ public:
     const PromptAttentionKernel fast_prefill_kernel;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
+    // DFlash2 tree verification: the tree widths each batch size may verify and the most
+    // root-to-leaf paths a tree row holds. In automatic mode tree_controller picks each
+    // all-neural round's width.
+    const TreeWidthPlan tree_widths;
+    const std::uint32_t draft_tree_paths;
+    std::optional<TreeWidthController> tree_controller;
     const std::uint32_t ngram_draft_window;
     const std::uint32_t ngram_min_match;
     const SpeculativeBackend speculative_backend;

@@ -81,6 +81,9 @@ struct QuantizedCausalCacheView {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     int table_stride, kv_heads;
+    // Optional per-row ancestor masks of speculative verification trees, [B][W]: bit a of
+    // tree_masks[b*W+j] admits row b's block key at position pos(0,b)+a to its column j.
+    const std::uint32_t* tree_masks = nullptr;
 };
 
 template <class View>

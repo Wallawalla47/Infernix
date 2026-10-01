@@ -6,12 +6,13 @@
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
+#include "ops/softmax_attention/common/causal_tree.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 
 namespace ninfer::ops::detail {
 
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
-          bool ParallelQueries = false>
+          bool ParallelQueries = false, bool Tree = false>
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     void fp8_kv_grouped_mma_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -22,7 +23,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t logical_capacity, CausalKvPartition partition, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        float* partial_acc, float* partial_m, float* partial_l, const std::uint32_t* tree_masks) {
     constexpr int TokenTile = Schedule::kTokenTile, WarpsPerCta = Schedule::kWarps;
     constexpr int KeyBlock             = Schedule::kKeyRows;
     constexpr bool DynamicArena        = Schedule::kDynamicArena;
@@ -351,6 +352,15 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 causal_row_to_qt<Geometry>(row1, kv_head, q_head1, token1);
                 const int qabs0 = row0 < RowCount && token0 < valid_tokens ? positions[token0] : -1;
                 const int qabs1 = row1 < RowCount && token1 < valid_tokens ? positions[token1] : -1;
+                // Tree rows admit only a query column's ancestors among the block keys.
+                const std::uint32_t tree0 =
+                    qabs0 >= 0 ? causal_tree_mask<Tree>(tree_masks, batch, full_width,
+                                                        column_begin + token0)
+                               : ~0u;
+                const std::uint32_t tree1 =
+                    qabs1 >= 0 ? causal_tree_mask<Tree>(tree_masks, batch, full_width,
+                                                        column_begin + token1)
+                               : ~0u;
                 float bm0       = -CUDART_INF_F;
                 float bm1       = -CUDART_INF_F;
 #pragma unroll
@@ -358,22 +368,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                     const int col0 = nt * 8 + 2 * lid;
                     const int key0 = k0 + col0;
                     const int key1 = key0 + 1;
-                    score[nt][0] =
-                        row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
-                            ? score[nt][0] * attention_scale
-                            : -CUDART_INF_F;
-                    score[nt][1] =
-                        row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
-                            ? score[nt][1] * attention_scale
-                            : -CUDART_INF_F;
-                    score[nt][2] =
-                        row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
-                            ? score[nt][2] * attention_scale
-                            : -CUDART_INF_F;
-                    score[nt][3] =
-                        row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
-                            ? score[nt][3] * attention_scale
-                            : -CUDART_INF_F;
+                    score[nt][0]   = row0 < RowCount && key0 >= split_start && key0 < split_end &&
+                                             key0 <= qabs0 &&
+                                             (!Tree || causal_tree_visible(key0, row_first, tree0))
+                                         ? score[nt][0] * attention_scale
+                                         : -CUDART_INF_F;
+                    score[nt][1]   = row0 < RowCount && key1 >= split_start && key1 < split_end &&
+                                             key1 <= qabs0 &&
+                                             (!Tree || causal_tree_visible(key1, row_first, tree0))
+                                         ? score[nt][1] * attention_scale
+                                         : -CUDART_INF_F;
+                    score[nt][2]   = row1 < RowCount && key0 >= split_start && key0 < split_end &&
+                                             key0 <= qabs1 &&
+                                             (!Tree || causal_tree_visible(key0, row_first, tree1))
+                                         ? score[nt][2] * attention_scale
+                                         : -CUDART_INF_F;
+                    score[nt][3]   = row1 < RowCount && key1 >= split_start && key1 < split_end &&
+                                             key1 <= qabs1 &&
+                                             (!Tree || causal_tree_visible(key1, row_first, tree1))
+                                         ? score[nt][3] * attention_scale
+                                         : -CUDART_INF_F;
                     bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                     bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
                 }

@@ -42,13 +42,19 @@ std::size_t gdn_snapshot_workspace_bytes(const GdnParameters& parameters, const 
 
 std::size_t gdn_record_workspace_bytes(const GdnParameters& parameters, const GdnConfig& config,
                                        std::int32_t batch, std::int32_t first_width,
-                                       std::int32_t last_width) {
+                                       std::int32_t last_width, bool tree) {
     const auto* single = std::get_if<LinearParameters>(&parameters.projection);
     std::size_t bytes;
     if (single && single->weight.qtype != QType::Q8_G32_FP16) {
         const auto& w = single->weight;
         bytes         = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             w.qtype, w.n, w.k, single->policy, batch, first_width, last_width);
+        // A verification tree projects through the materialized projection at every width.
+        if (tree) {
+            bytes = std::max(bytes, ops::gdn_input_proj_workspace_capacity_bytes(
+                                        w.qtype, w.n, w.k, single->policy, first_width * batch,
+                                        last_width * batch));
+        }
     } else {
         bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             static_cast<std::int32_t>(config.key_width()),
@@ -107,10 +113,21 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
                            Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
+                           const Tensor* tree_rows) {
     auto scope = workspace.scope();
-    WorkspaceArena scratch(workspace.alloc_bytes(
-        gdn_record_workspace_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
+    WorkspaceArena scratch(workspace.alloc_bytes(gdn_record_workspace_bytes(
+        parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1], tree_rows != nullptr)));
+    if (tree_rows != nullptr) {
+        const auto* single = std::get_if<LinearParameters>(&parameters.projection);
+        if (single == nullptr) {
+            throw std::invalid_argument("DFlash2 tree verification needs a single GDN parent");
+        }
+        ops::gdn_input_proj_conv_record(hidden, single->weight, parameters.convolution, conv_states,
+                                        valid_columns, initial_slots, *tree_rows, conv_record,
+                                        query, key, value, z, single->policy, scratch, stream);
+        return;
+    }
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,

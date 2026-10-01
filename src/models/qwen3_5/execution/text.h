@@ -10,6 +10,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -108,6 +109,15 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+    // Verification-tree binding for batched verification: attention uses each row's ancestor
+    // masks (I32 [W,B]) and GDN convolves over and replays each row's tree (I32 [words,B], at most
+    // `paths` root-to-leaf paths per row). nullptr restores the chain.
+    void set_verification_tree(const Tensor* tree_rows, const Tensor* ancestor_masks,
+                               std::uint32_t paths);
+    // Moves each row's accepted tree path onto the main-chain KV cache positions of every
+    // full-attention layer (ops::speculative_tree_compact_kv).
+    void compact_tree_kv(const Tensor& verify_positions, const Tensor& kv_table_rows,
+                         const Tensor& accepted_path, const Tensor& accepted_drafts);
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -251,6 +261,9 @@ private:
     std::int32_t linear_state_destination_slot_                                    = 0;
     GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
     const GdnReplayRecords* replay_records_   = nullptr;
+    const Tensor* verification_tree_          = nullptr;
+    const Tensor* tree_ancestor_masks_        = nullptr;
+    std::uint32_t tree_paths_                 = 0;
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;

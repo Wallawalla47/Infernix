@@ -178,7 +178,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
     }
     options.context_cache.host_capacity_bytes = sequence.host_capacity_bytes();
-    instance->kv_capacity_resolution          = resolution;
+    // Automatic tree widths on a target that cannot verify trees resolve to chain verification.
+    options.speculative.draft_tree_auto = sequence.draft_tree_auto();
+    instance->kv_capacity_resolution    = resolution;
     planning.complete();
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),

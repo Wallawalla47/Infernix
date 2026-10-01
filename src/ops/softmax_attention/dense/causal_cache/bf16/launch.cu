@@ -66,13 +66,14 @@ void tiled(const CausalAttentionOperands& p, Bf16KvReadView cache, const Bf16KvC
 template <class Input>
 void execute_grouped(const Tensor& q, Input input, const Tensor& positions, float scale,
                      PagedKVBatchLayerView cache, const Tensor* valid, const Tensor* rows,
-                     const Bf16KvCausalPlan& plan, WorkspaceArena& workspace, Tensor& out,
-                     cudaStream_t stream) {
+                     const std::uint32_t* tree_masks, const Bf16KvCausalPlan& plan,
+                     WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     auto scope   = workspace.scope();
     auto storage = allocate_causal_partials(workspace, plan.query_heads, plan.width,
                                             plan.partition.capacity, plan.batch);
     const auto p = make_causal_operands(q, positions, out, scale, plan.envelope.max_visible_keys);
-    const auto view    = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
+    auto view          = bf16_kv_cache_view<Input::writes_cache>(cache, valid, rows);
+    view.tree_masks    = tree_masks;
     const auto partial = storage.view();
     if (p.query_heads == 24)
         grouped_instance<CausalD256H24Kv4>(p, view, input, plan, partial, stream);
@@ -83,12 +84,16 @@ void execute_grouped(const Tensor& q, Input input, const Tensor& positions, floa
 
 void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
+                              const Tensor& table_rows, const Tensor& tree_masks, float scale,
+                              PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution) {
     const cudaStream_t stream = execution.stream;
     const auto plan           = make_bf16_kv_causal_plan(q.ne[1], q.ne[2], q.ne[3], envelope,
                                                          execution.multiprocessor_count);
+    const auto* tree = static_cast<const std::uint32_t*>(tree_masks.data);
+    if (tree != nullptr && !plan.grouped())
+        throw std::invalid_argument("BF16 attention: a verification tree needs the grouped route");
     if (!plan.grouped()) {
         kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
@@ -97,8 +102,8 @@ void bf16_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         execute_grouped(q,
                         CausalAppendInput{static_cast<const __nv_bfloat16*>(k.data),
                                           static_cast<const __nv_bfloat16*>(v.data)},
-                        positions, scale, cache, &valid_columns, &table_rows, plan, workspace, out,
-                        stream);
+                        positions, scale, cache, &valid_columns, &table_rows, tree, plan, workspace,
+                        out, stream);
     }
 }
 
@@ -114,8 +119,8 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
               bf16_kv_cache_view<false>(view), plan, stream);
     } else {
-        execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, plan,
-                        workspace, out, stream);
+        execute_grouped(q, CausalCachedInput{}, positions, scale, view, nullptr, nullptr, nullptr,
+                        plan, workspace, out, stream);
     }
 }
 } // namespace ninfer::ops::detail

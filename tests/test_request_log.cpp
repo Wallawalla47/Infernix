@@ -186,6 +186,11 @@ int main() {
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
+    failures +=
+        check(server.at("engine").at("draft_tree_nodes") == Json::array({0, 0, 0, 0, 0, 0, 0, 0}) &&
+                  server.at("engine").at("draft_tree_auto") == false &&
+                  server.at("engine").at("draft_tree_paths") == 8,
+              "tree verification table missing");
     options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
     memory.kv_cache         = options.kv_cache;
@@ -420,6 +425,7 @@ int main() {
     outcome.metrics.speculative_accepted_per_position = {290, 240, 190};
     outcome.metrics.engine_request_id                 = 991;
     outcome.metrics.ngram_archive_rounds              = 7;
+    outcome.metrics.tree_side_accepted_tokens         = 11;
     outcome.metrics.ngram_archive_drafted_tokens      = 441;
     outcome.metrics.ngram_archive_accepted_tokens     = 400;
     outcome.metrics.ngram_archive                     = {.enabled       = true,
@@ -500,6 +506,9 @@ int main() {
         check(done.at("timings_seconds").at("ttft").get<double>() == outcome.metrics.ttft_seconds,
               "TTFT missing or lost precision");
     failures += check(done.at("speculative").at("backend") == "mtp", "speculative backend missing");
+    failures += check(done.at("speculative").at("tree_side_accepted_tokens") == 11 &&
+                          done.at("speculative").at("tree_rounds") == 0,
+                      "speculative tree counters missing");
     failures += check(done.at("speculative").at("ngram_archive_accepted_tokens") == 400 &&
                           done.at("speculative").at("ngram_archive").at("generation") == 3 &&
                           done.at("speculative").at("ngram_archive").at("bound") == true &&

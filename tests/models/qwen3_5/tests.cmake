@@ -5,6 +5,10 @@ ninfer_add_test(ninfer_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
 
+ninfer_add_test(ninfer_qwen3_5_tree_width_controller_test SOURCES
+  "${CMAKE_CURRENT_LIST_DIR}/test_tree_width_controller.cpp"
+  "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/tree_width_controller.cpp")
+
 ninfer_add_test(ninfer_ngram_graph_planning_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_graph_planning.cpp"
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
@@ -72,6 +76,29 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_real.cpp"
   LIBRARIES ninfer_engine)
 
+# DFlash2 tree verification at K=7 over every batch-size route, on the INT8, K8V4 and NVFP4 caches.
+foreach(kv IN ITEMS int8 k8v4 nvfp4)
+  add_test(NAME ninfer_qwen3_5_dflash2_tree_${kv}_real_test
+    COMMAND ninfer_qwen3_5_dflash2_real_test 7 1 1 4 ${kv} 0 3 16,12,12,10)
+  list(APPEND ninfer_qwen3_5_tree_real_tests ninfer_qwen3_5_dflash2_tree_${kv}_real_test)
+endforeach()
+add_test(NAME ninfer_qwen3_5_dflash2_tree_auto_real_test
+  COMMAND ninfer_qwen3_5_dflash2_real_test 7 1 1 4 int8 0 3 auto)
+
+# Greedy tree-decoded streams against the target's own greedy choice at every position.
+ninfer_add_test(ninfer_qwen3_5_dflash2_tree_greedy_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_tree_greedy_real.cpp"
+  LIBRARIES ninfer_engine)
+
+foreach(kv IN ITEMS k8v4 nvfp4)
+  add_test(NAME ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test
+    COMMAND ninfer_qwen3_5_dflash2_tree_greedy_real_test ${kv})
+  list(APPEND ninfer_qwen3_5_tree_real_tests ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test)
+endforeach()
+set_tests_properties(${ninfer_qwen3_5_tree_real_tests}
+  ninfer_qwen3_5_dflash2_tree_auto_real_test
+  ninfer_qwen3_5_dflash2_tree_greedy_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
   LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/gdn_replay_records.h"
+#include "ninfer/ops/speculative_tree.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 
@@ -42,6 +43,14 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream);
+
+// Verification-tree replay (see TreeRecordAccess); valid_columns is required.
+void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& ssm_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots, const Tensor& tree_rows,
+                                  std::int32_t max_paths, Tensor& key_record, Tensor& value_record,
+                                  Tensor& gate_record, Tensor& out, cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

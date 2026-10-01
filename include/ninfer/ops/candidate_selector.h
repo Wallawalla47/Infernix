@@ -3,6 +3,7 @@
 #include "core/tensor.h"
 #include "core/arena.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -49,5 +50,46 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                              cudaStream_t stream);
+
+/**
+ * Op: candidate_selector_tree
+ *
+ * Builds each row's verification tree over the K-position lattice of candidate_selector_path
+ * (K in [1,15], B in [1,8], inputs as candidate_selector_path; shape.main_depth == K). W =
+ * shape.nodes is the round's verification width. For a node v at depth i-1 the law of its
+ * children over the 16 candidates of position i is q_v = softmax(edge(v's rank, .)/temperature),
+ * the path walk's conditional law (the anchor row for v = 0).
+ *
+ * Every row first draws the main chain exactly as candidate_selector_path does (columns 1..K, bit
+ * for bit). A row with current_extents[b] == W-1 is a tree row: it then adds side columns K+1..
+ * best first until it holds W columns or no node can take another child. The next child of node
+ * v has priority score(v) * E[law value of that child], where score(v) is the product of the law
+ * values along v's path and the expectation is taken over the child's draw given v's earlier
+ * children (the best untaken rank for greedy rows, which score with the temperature-1 law). The
+ * winner's next child is drawn without replacement from q_v restricted to its untaken ranks with
+ * counter key (seed, base+i-1, kSamplePurposeDFlash2Proposal, ((v+1) << 5) | j) for sibling j;
+ * greedy rows take the best untaken rank. A child never exceeds depth K and a row never exceeds
+ * shape.paths leaves. Since a child's priority is fixed before it is drawn, the tree's shape never
+ * depends on a column's own token, which keeps recursive rejection sampling exact.
+ *
+ * Outputs: drafts I32 [W-1,B]; column_candidates I32 [16,W-1,B] (the lattice candidates of the
+ * column's position); proposal_q FP32 [16,W-1,B] holding the full q of the column's parent (a
+ * one-hot of the drawn rank for greedy rows); tree_rows I32 [kSpeculativeTreeRowWords,B] (one
+ * SpeculativeTreeRow per row: a chain row's nodes are its extent+1 chain columns); tree_masks I32
+ * [W,B] (ancestor masks: bit a of column c is set iff a is c or an ancestor of c; columns past a
+ * row's nodes see only themselves); valid_columns I32 [B] is set to each tree row's node count.
+ */
+void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                             const Tensor& base_positions, const Tensor& current_extents,
+                             const SamplingConfig* configs, SpeculativeTreeShape shape,
+                             Tensor& drafts, Tensor& column_candidates, Tensor& proposal_q,
+                             Tensor& tree_rows, Tensor& tree_masks, Tensor& valid_columns,
+                             WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t candidate_selector_tree_workspace_capacity_bytes(std::int32_t main_depth,
+                                                                           std::int32_t min_batch,
+                                                                           std::int32_t max_batch);
 
 } // namespace ninfer::ops

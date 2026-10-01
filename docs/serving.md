@@ -907,6 +907,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--draft-tree-nodes auto\|LIST` | DFlash2 tree verification, each row's tree built on the device from the drafter's candidate lattice; works with every `--kv-dtype`. `auto` (recommended) lets every all-neural round of up to four rows choose the chain or a tree of `draft tokens + 5` or `+ 9` columns from measured round time and acceptance at its batch size and context length; on an artifact whose GDN input projections cannot verify trees it keeps chain verification and logs a warning. A LIST fixes the column count by batch size: entry *c* (anchor included, `draft tokens + 2..32`) applies to rounds of *c* rows, the last entry repeats for larger batches and `0` keeps chain verification; see [tree verification](maintainer/tree-verification.md) | off |
+| `--draft-tree-paths N` | most root-to-leaf paths per tree row (each one a parallel GDN replay), `2..8` | `8` |
 | `--ngram-draft-tokens N` | verified n-gram copy proposals per round beside the `--spec` drafter, `1..63`; `0` disables; see [ngram copy proposals](ngram.md) | `0` |
 | `--ngram-min-match N` | minimum matched tokens for an n-gram proposal, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps n-gram sources across the requests of a conversation; requires `--ngram-draft-tokens`; `0` keeps drafting request-local | `0` |
@@ -1106,7 +1108,10 @@ only with request logging and add no per-token records.
 `drafted_tokens`, and `accepted_tokens` whose proposal came from n-gram copy drafting, and the
 `ngram_archive_rounds`, `ngram_archive_drafted_tokens`, and `ngram_archive_accepted_tokens` counters
 are the part of those whose copy source was the retained draft archive (see [n-gram
-drafting](ngram.md)). The `speculative.ngram_archive` object reports that archive at the end of the
+drafting](ngram.md)). With DFlash2 tree verification (`--draft-tree-nodes`), `tree_rounds` counts
+rounds that verified a tree, `tree_side_rounds` those whose accepted path left the main chain, and
+`tree_side_accepted_tokens` the drafts those paths accepted after leaving it, which a chain round
+would not have accepted; `drafted_tokens` counts every verified tree column. The `speculative.ngram_archive` object reports that archive at the end of the
 request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when the request was
 bound to a draft session, `published` when its input and output were published into it,
 `generation` as the session's latest completed generation, `sources` and `session_bytes` as the
@@ -1136,7 +1141,10 @@ the first.
 
 `server_start.engine.original_int8_prefill_kernel`, `int8_prefill_8bit_pv` and
 `original_nvfp4_prefill_kernel` record `--use-original-int8-prefill-kernel`,
-`--int8-prefill-8bit-pv` and `--use-original-nvfp4-prefill-kernel`. `ngram_draft_window` and
+`--int8-prefill-8bit-pv` and `--use-original-nvfp4-prefill-kernel`. `draft_tree_nodes` (eight
+entries, one per batch size, all zero for `auto`), `draft_tree_auto` and `draft_tree_paths`
+record `--draft-tree-nodes` and `--draft-tree-paths`; `draft_tree_auto` is the resolved value,
+false when the artifact cannot verify trees. `ngram_draft_window` and
 `ngram_min_match` record `--ngram-draft-tokens` (`0` disables n-gram drafting) and
 `--ngram-min-match`; `ngram_archive_bytes` and `ngram_session_bytes` are the draft-archive budgets
 from `--ngram-archive-mib` (`0` keeps drafting request-local) and `--ngram-session-mib`; and

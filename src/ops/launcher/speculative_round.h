@@ -2,6 +2,7 @@
 
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
@@ -32,6 +33,20 @@ void speculative_accept_sparse_drafts_launch(
     const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
+    bool raw_greedy, DeviceSpan workspace, cudaStream_t stream);
+
+void speculative_prepare_tree_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
+                                                   const Tensor& base_positions,
+                                                   const Tensor& tree_rows, Tensor& verify_ids,
+                                                   Tensor& positions, Tensor& rope_positions,
+                                                   cudaStream_t stream);
+
+void speculative_accept_sparse_tree_launch(
+    const Tensor& target_tokens, const Tensor& logits, const Tensor& drafts,
+    const Tensor& candidate_ids, const Tensor& proposal_q, const Tensor& current_extents,
+    const Tensor& tree_rows, Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens,
+    Tensor& licensed_counts, Tensor& accepted_drafts, Tensor& accepted_path,
+    Tensor& accepted_branch, std::int32_t token_domain, const SamplingConfig* configs,
     bool raw_greedy, DeviceSpan workspace, cudaStream_t stream);
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,

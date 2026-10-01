@@ -99,6 +99,11 @@ ninfer_add_op_test(ninfer_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_speculative_tree_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_speculative_tree_test PROPERTIES TIMEOUT 600)
+
 ninfer_add_op_test(ninfer_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)

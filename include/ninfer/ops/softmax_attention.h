@@ -162,6 +162,24 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               Tensor& out, DeviceExecutionView execution);
 
 /**
+ * Speculative verification-tree form of the append-and-attend Op above, for every KV storage.
+ *
+ * tree_masks is either empty (the causal Op above) or contiguous device I32 [W,B], 2<=W<=32,
+ * valid_columns non-empty. Row b's first column sits at F = positions[0,b]; its column j attends
+ * cache row r in [0,positions[j,b]] only when r<F or bit r-F of tree_masks[j,b] is set: bit a
+ * admits the block row appended by column a. A tree names each column's ancestors and itself
+ * (ninfer/ops/speculative_tree.h); the chain triangle is the causal Op. Grouped and parallel
+ * verification routes apply the masks; a width on the prompt (tiled) route rejects them.
+ */
+void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                              const Tensor& positions, const Tensor& valid_columns,
+                              const Tensor& kv_table_rows, const Tensor& tree_masks,
+                              AttentionHeadGeometry geometry, float scale,
+                              PagedKVBatchLayerView cache,
+                              CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
+                              Tensor& out, DeviceExecutionView execution);
+
+/**
  * Read-only single-sequence causal attention over an already populated cache.
  *
  * q/out are contiguous BF16 [256,24|16,T], positions is contiguous sequential device I32 [T],

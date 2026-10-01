@@ -1,6 +1,9 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <array>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -161,6 +164,51 @@ int main() {
                    "--ngram-draft-tokens", "0", "--max-concurrency", "8"});
         failures += check(disabled.speculative.ngram_draft_tokens == 0,
                           "disabled ngram changed multi-slot configuration");
+    }
+    // DFlash2 tree table: entry c applies to rounds of c rows and the last entry to larger batches.
+    using TreeTable  = std::array<std::uint32_t, ninfer::kMaximumConcurrency>;
+    const auto table = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens",
+                              "7", "--draft-tree-nodes", "20,12,10,0", "--max-concurrency", "8"});
+    failures += check(table.speculative.draft_tree_nodes == TreeTable{20, 12, 10, 0, 0, 0, 0, 0} &&
+                          table.speculative.draft_tree_paths == 8,
+                      "tree table or default path cap changed");
+    const auto single =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--draft-tree-nodes", "9", "--draft-tree-paths", "2"});
+    failures += check(single.speculative.draft_tree_nodes == TreeTable{9, 9, 9, 9, 9, 9, 9, 9} &&
+                          single.speculative.draft_tree_paths == 2,
+                      "a single tree entry did not apply to every batch size");
+    const auto tree_auto = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                  "--draft-tokens", "7", "--draft-tree-nodes", "auto"});
+    failures += check(tree_auto.speculative.draft_tree_auto &&
+                          tree_auto.speculative.draft_tree_nodes == TreeTable{},
+                      "auto did not select automatic tree widths");
+    const auto replaced =
+        parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "7",
+               "--draft-tree-nodes", "auto", "--draft-tree-nodes", "12"});
+    failures += check(!replaced.speculative.draft_tree_auto &&
+                          replaced.speculative.draft_tree_nodes ==
+                              TreeTable{12, 12, 12, 12, 12, 12, 12, 12},
+                      "a later tree table did not replace auto");
+    for (const auto& tail : std::vector<std::vector<std::string>>{
+             {"--draft-tree-nodes", "8"}, // below draft tokens + 2
+             {"--draft-tree-nodes", "33"},
+             {"--draft-tree-nodes", "12,,0"},
+             {"--draft-tree-nodes", "12,12,12,12,12,12,12,12,12"},
+             {"--draft-tree-nodes", "12x"},
+             {"--draft-tree-nodes", "12", "--draft-tree-paths", "1"},
+             {"--draft-tree-nodes", "12", "--draft-tree-paths", "9"},
+             {"--draft-tree-nodes", "12", "--spec", "dflash"},
+             {"--draft-tree-nodes", "auto", "--spec", "dflash"},
+             {"--draft-tree-nodes", "Auto"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer",   "--spec",
+                                           "dflash2",      "--draft-tokens", "7"};
+        arguments.insert(arguments.end(), tail.begin(), tail.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "unsupported tree table admitted");
     }
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
     failures += check(defaults.speculative.ngram_draft_tokens == 0,

@@ -15,6 +15,9 @@ struct Bf16KvCacheView {
     int table_stride;
     int head_dim;
     int kv_heads;
+    // Optional per-row ancestor masks of speculative verification trees ([B][W]; see
+    // causal_softmax_attention).
+    const std::uint32_t* tree_masks = nullptr;
 };
 
 using Bf16KvReadView  = Bf16KvCacheView<false>;
