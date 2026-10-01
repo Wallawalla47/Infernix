@@ -61,9 +61,10 @@ int run_fp8_a16() {
         Invocation{289, CallForm::Policy, ops::LinearPolicy::A16Only},
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA4},
     };
-    for (int t = 1; t <= 41; ++t)
+    // Every width of the sliced-K route.
+    for (int t = 1; t <= 64; ++t)
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only});
-    for (int t : {7, 25, 41, 65, 128})
+    for (int t : {7, 25, 41, 48, 56, 64, 65, 128})
         vocabulary_invocations.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
     failures += run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
                           {248320, 5120, 823U, Comparison::Sampled, true, vocabulary_invocations});

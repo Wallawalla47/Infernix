@@ -412,6 +412,12 @@ which require `--use-original-prefix-caching`. Details:
   INT8 KV) rounds are 1.6 % shorter with one request (+1.2 % tokens/s) and 0.2 % shorter with four
   (tokens/s within noise). Acceptance moved by -0.35 % on 24 sampled agent prompts and -0.4 %
   (tokens per round) on the suite. Existing artifacts must be reconverted to use it.
+- **FP8 LM head for 42-64 tokens per round**: rounds of 42-64 verified tokens (three or four
+  requests verifying 16-column n-gram or tree blocks, four verifying 12-column trees) ran the FP8 LM
+  head on its 64-token MMA schedule; they now stay on the sliced-K kernel, with two K warps and a
+  double-buffered stage above 48 tokens. The LM head is 17-21 % faster at 42-48 tokens, 12-15 % at
+  49-56 and 3-8 % at 57-64, and unchanged at other widths (it saves 0.12 ms per 12-column tree round
+  with four requests). Logits at those widths round in a different order.
 - **Reciprocal NVFP4 activation quantizer on the Linear MMA route** (upstream #327 by
   [DuncanBetts](https://github.com/DuncanBetts)): 2-5 % faster at 8-64 tokens; the other A4 routes
   keep the divisions, because opting them in changed the generated text.

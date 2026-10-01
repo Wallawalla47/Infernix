@@ -341,3 +341,26 @@ at 131K), so they are compute-bound too. Both INT8 forms were reverted. What wou
 the cost of verification columns at long context: cheaper P x V arithmetic (FP16 accumulation per
 key tile, or 8-bit P as in `--int8-prefill-8bit-pv`; both change precision) or a warp-specialized
 kernel nearer the Tensor Core peak.
+
+## FP8 LM head schedules at 42-64 columns
+
+The [248320,5120] FP8 LM head took the 64-column MMA schedule from 42 columns (1145-1150 us at
+42-64 against 818-820 us at 40), which tree rounds of 12 columns at four requests and 16-column n-gram
+or tree rounds at three or four requests hit. The sliced-K route now runs to 64 columns. RTX 5090,
+`ninfer_linear_bench --qtype FP8 --n 248320 --k 5120`, graph execution, cold cache, median us;
+variants are (K warps, minimum blocks per SM, stages, row tiles) of `Fp8A16SlicedKMmaSchedule`.
+The variants were measured in two sweeps; 4,2,1,2 and 2,2,1,2, measured in both, moved by up to
+5 % between them, and the table shows the second sweep, which also measured 2,2,2,2:
+
+| Columns | MMA schedule | 4,2,1,2 | 8,1,1,2 | 4,2,1,1 | 8,2,1,1 | 4,1,2,2 | 2,2,1,2 | 2,2,2,2 | 2,4,1,2 | 2,1,1,2 | 2,2,1,1 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 42 | 1148 | 902 | | | | | 920 | 919 | 918 | 920 | 1240 |
+| 48 | 1145 | 949 | | | | | 967 | 964 | 966 | 967 | 1358 |
+| 49 | 1146 | 1037 | 1195 | 1367 | 1703 | 1013 | 1018 | 963 | 1016 | 1018 | 1474 |
+| 56 | 1148 | 1148 | 1285 | 1504 | 1860 | 1255 | 1090 | 994 | 1078 | 1088 | 1603 |
+| 57 | 1148 | 1203 | 1373 | 1717 | 2013 | 1354 | 1098 | 1059 | 1090 | 1092 | 1689 |
+| 64 | 1150 | 1283 | 1434 | 1848 | 2083 | 1361 | 1162 | 1109 | 1166 | 1170 | 1807 |
+
+Up to 48 columns the existing four-warp tile stays (two K warps are 0-2 % slower from 25 to 48
+columns); from 49 two K warps with a double-buffered stage are fastest at every width. Above 64
+columns the 96- and 128-column MMA schedules are unchanged.
