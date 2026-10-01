@@ -32,7 +32,16 @@ Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
     CausalKvPartition partition{1, causal_partition_target(budget, independent_tiles)};
     // Bound partial traffic by keeping enough KV work in each split.
     partition.key_shift = (width == 1 ? 7 : 8) - (heads == 16 ? 1 : 0);
-    partition.capacity  = partition.active(envelope.max_visible_keys);
+    // Multi-column rows of the 24/4 geometry may split down to 64 keys, so short rows fill
+    // the GPU; the live count is then balanced to the fewest splits that keep the largest
+    // number of 32-key tiles per split. Rows long enough to saturate the target at the
+    // 256-key minimum keep its count (and so its partition).
+    if (heads == 24 && width > 1) {
+        partition.key_shift     = 6;
+        partition.balance_shift = 5;
+        partition.balance_limit = partition.target << 8;
+    }
+    partition.capacity  = partition.bound(envelope.max_visible_keys);
     return {family, heads, width, batch, envelope, partition};
 }
 

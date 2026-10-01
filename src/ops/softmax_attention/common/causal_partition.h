@@ -13,10 +13,25 @@ struct CausalKvPartition {
     int capacity                    = 1;
     int target                      = 1;
     int key_shift                   = 6; // log2 of the minimum KV keys per split
+    // log2 of the producer's key tile. Nonzero balances a row's split count down to the fewest
+    // splits that keep the same largest number of key tiles per split; rows of at least
+    // balance_limit keys keep the plain count.
+    int balance_shift = 0;
+    int balance_limit = 0;
 
-    __host__ __device__ int active(int visible) const {
+    // The plain count: the live count of any row window up to `visible` is at most this, so
+    // capture sizes partials and grids with it.
+    __host__ __device__ int bound(int visible) const {
         const int count = (visible + (1 << key_shift) - 1) >> key_shift;
         return count < target ? count : target;
+    }
+
+    __host__ __device__ int active(int visible) const {
+        const int count = bound(visible);
+        if (balance_shift == 0 || count <= 1 || visible >= balance_limit) return count;
+        const int tiles     = (visible + (1 << balance_shift) - 1) >> balance_shift;
+        const int per_split = (tiles + count - 1) / count;
+        return (tiles + per_split - 1) / per_split;
     }
 };
 
