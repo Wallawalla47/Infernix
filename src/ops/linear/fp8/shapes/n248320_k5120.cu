@@ -8,15 +8,14 @@
 
 namespace ninfer::ops::detail {
 namespace {
-template <int ActiveTokens>
+template <int ActiveTokens, int KWarps, int Stages>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Fp8N248320K5120;
     // Above 16 columns each 16-row CTA re-reads more activation bytes from L2 than it streams
     // weight bytes, so two row tiles share the staged activation (same split-K arithmetic).
-    using Schedule =
-        Fp8A16SlicedKMmaSchedule<(ActiveTokens <= 8 ? 16 : (ActiveTokens <= 24 ? 8 : 4)),
-                                 ActiveTokens, ActiveTokens <= 8 ? 1 : 2, Cache::ca, Cache::cg,
-                                 Fp8ActivationStage::ActiveOnly, 1, (ActiveTokens > 16 ? 2 : 1)>;
+    using Schedule = Fp8A16SlicedKMmaSchedule<KWarps, ActiveTokens, ActiveTokens <= 8 ? 1 : 2,
+                                              Cache::ca, Cache::cg, Fp8ActivationStage::ActiveOnly,
+                                              Stages, (ActiveTokens > 16 ? 2 : 1)>;
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, ActiveTokens>>(
@@ -24,22 +23,28 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
         pdl::Dependency::Programmatic);
 }
 
+// Up to 64 columns the sliced-K schedules stream the weight faster than the MMA schedules: on the
+// RTX 5090 they beat the 64-column MMA schedule by 17-21 % at 42-48 columns, 13-16 % at 49-56 and
+// 4-8 % at 57-64. Above 48 columns two K warps with a double-buffered stage beat four.
+constexpr int kSlicedKTokens = 64;
+
 void launch_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     const int tokens = x.ne[1];
-    if (tokens <= 8) return launch_tile<8>(x, weight, out, stream);
-    if (tokens <= 16) return launch_tile<16>(x, weight, out, stream);
-    if (tokens <= 24) return launch_tile<24>(x, weight, out, stream);
-    if (tokens <= 32) return launch_tile<32>(x, weight, out, stream);
-    if (tokens <= 40) return launch_tile<40>(x, weight, out, stream);
-    if (tokens <= 48) return launch_tile<48>(x, weight, out, stream);
+    if (tokens <= 8) return launch_tile<8, 16, 1>(x, weight, out, stream);
+    if (tokens <= 16) return launch_tile<16, 8, 1>(x, weight, out, stream);
+    if (tokens <= 24) return launch_tile<24, 8, 1>(x, weight, out, stream);
+    if (tokens <= 32) return launch_tile<32, 4, 1>(x, weight, out, stream);
+    if (tokens <= 40) return launch_tile<40, 4, 1>(x, weight, out, stream);
+    if (tokens <= 48) return launch_tile<48, 4, 1>(x, weight, out, stream);
+    if (tokens <= 56) return launch_tile<56, 2, 2>(x, weight, out, stream);
+    if (tokens <= kSlicedKTokens) return launch_tile<64, 2, 2>(x, weight, out, stream);
     throw std::logic_error("fp8 K-split exceeds shape capacity");
 }
 
-// Measured schedules for [248320,5120]. The 128-token
-// schedule is the large-T computation core. The 64- and 96-token schedules avoid executing a
-// mostly empty final token tile; dispatch emits at most one such tail launch.
+// Measured schedules for [248320,5120]. The 128-token schedule is the large-T computation core.
+// The 96-token schedule avoids executing a mostly empty final token tile; dispatch emits at most
+// one tail launch, sliced-K up to 64 columns.
 using Main128 = Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>;
-using Tail64  = Fp8A16MmaSchedule<128, 64, 64, 64, 16, 2, 2>;
 using Tail96  = Fp8A16MmaSchedule<64, 96, 64, 64, 16, 2, 2>;
 
 template <class Schedule>
@@ -51,23 +56,17 @@ void launch_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 }
 
 void launch_tail(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] < 42) {
+    if (x.ne[1] <= kSlicedKTokens) {
         launch_ksplit(x, weight, out, stream);
-    } else if (x.ne[1] <= Tail64::kBlockTokens) {
-        launch_schedule<Tail64>(x, weight, out, stream);
     } else {
         launch_schedule<Tail96>(x, weight, out, stream);
     }
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] < 42) return launch_ksplit(x, weight, out, stream);
+    if (x.ne[1] <= kSlicedKTokens) return launch_ksplit(x, weight, out, stream);
 
     const std::int32_t tokens = x.ne[1];
-    if (tokens <= Tail64::kBlockTokens) {
-        launch_schedule<Tail64>(x, weight, out, stream);
-        return;
-    }
     if (tokens <= Tail96::kBlockTokens) {
         launch_schedule<Tail96>(x, weight, out, stream);
         return;
