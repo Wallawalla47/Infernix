@@ -382,6 +382,16 @@ which require `--use-original-prefix-caching`. Details:
   tokens), and two 16-row tiles sharing each staged activation in the FP8 head and the Q8 DFlash2
   drafter.
   Commits: [`5db3795`][c-nvfp4-linear-add], [`5db53c7`][c-row-tiles].
+- **Faster split-KV attention for verification rows** (DFlash2/MTP drafts and n-gram copies):
+  short rows split their keys into more, balanced KV splits so they fill the GPU; the split merge
+  launches as a programmatic dependent of the attention kernel; and INT8 KV rows of 2-16 columns
+  use a kernel that decodes V in registers and keeps the next K/V tile in flight. 8-column INT8
+  rows spend 3 % less time in attention at 131K keys and up to 47 % less at 2K, 16-column rows
+  21-39 % less at every length, and FP8, K8V4 and NVFP4 rows 9-35 % less at 512-2K keys. Output
+  is unchanged except for rows shorter than about 11K-22K keys, whose split merge now rounds in a
+  different order. On the NVIDIA artifact a single ~100K-token request decodes 2.4 % faster with
+  identical output.
+  Commits: [`88df116`][c-split-balance], [`fad95fa`][c-merge-pdl], [`8777710`][c-int8-pipelined].
 - **Reciprocal NVFP4 activation quantizer on the Linear MMA route** (upstream #327 by
   [DuncanBetts](https://github.com/DuncanBetts)): 2-5 % faster at 8-64 tokens; the other A4 routes
   keep the divisions, because opting them in changed the generated text.
@@ -618,6 +628,9 @@ well, and for the work this branch builds on.
 [c-pdl]: https://github.com/Wallawalla47/ninfer-custom/commit/0c59ca61b00a641f9164174a868b26402ef0841f
 [c-nvfp4-linear-add]: https://github.com/Wallawalla47/ninfer-custom/commit/5db37954cce4689cb7fcfe90ba2b4c93c4243fea
 [c-row-tiles]: https://github.com/Wallawalla47/ninfer-custom/commit/5db53c7991dfe420a7b4072a24ef6ad0a0f4c112
+[c-split-balance]: https://github.com/Wallawalla47/ninfer-custom/commit/88df116fe8e7b07b77180815b590fd935db3ab44
+[c-merge-pdl]: https://github.com/Wallawalla47/ninfer-custom/commit/fad95faa79707ce7e513c805a7ee361a8c28793e
+[c-int8-pipelined]: https://github.com/Wallawalla47/ninfer-custom/commit/8777710b8e0e5206d32d519b3d7325c0650140b8
 [c-pr327]: https://github.com/Wallawalla47/ninfer-custom/commit/58808ee2d2d0ce35aa8f989d64b9a9e4a251c47d
 [c-ngram]: https://github.com/Wallawalla47/ninfer-custom/commit/d2209f60ad3a520ffb1886fe6329183bf66c389b
 [c-ngram-concurrency]: https://github.com/Wallawalla47/ninfer-custom/commit/c5e390b1bcc4b25e0ea9d649b7db0e11d1956160
