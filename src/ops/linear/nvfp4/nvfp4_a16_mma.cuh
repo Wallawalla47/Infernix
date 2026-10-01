@@ -220,6 +220,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
         epilogue.template finish_tile<Schedule, FullTokens>(destination, shared_raw, accumulators,
                                                             row_begin, token_begin, M, tokens);
+    } else if constexpr (requires { RowPolicy::kThreadPaired; }) {
+        // Each m16 tile pairs C-fragment rows g (gate) and g+8 (up) of one output row.
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int out_row = row_policy.output_row(row_begin, wm * WM + mi * 16 + gid);
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int token0 = token_begin + wn * WN + ni * 8 + 2 * lid;
+                const auto& v    = accumulators[mi][ni];
+                if (FullTokens || token0 < tokens) {
+                    epilogue.apply_pair(destination, out_row, token0, v[0] * alpha, v[2] * alpha);
+                }
+                if (FullTokens || token0 + 1 < tokens) {
+                    epilogue.apply_pair(destination, out_row, token0 + 1, v[1] * alpha,
+                                        v[3] * alpha);
+                }
+            }
+        }
     } else {
         static_assert(!RowPolicy::kPaired, "paired rows require a collective epilogue");
 #pragma unroll

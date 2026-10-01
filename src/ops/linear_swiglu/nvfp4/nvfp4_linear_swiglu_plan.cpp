@@ -27,8 +27,7 @@ Nvfp4LinearSwiGluRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
-        if (tokens <= 16) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }
-        throw std::invalid_argument("nvfp4 linear_swiglu A16 is registered only through T=16");
+        return Nvfp4LinearSwiGluRoute::SmallTFusedA16;
     }
     if (tokens == 1) { return Nvfp4LinearSwiGluRoute::DecodeFusedA16; }
     if (tokens <= 4) { return Nvfp4LinearSwiGluRoute::SmallTFusedA16; }

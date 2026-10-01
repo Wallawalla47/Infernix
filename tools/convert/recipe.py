@@ -22,6 +22,8 @@ from .methods import (
     grouped_mse,
     fp8_row_maxabs,
     import_encoded,
+    nvfp4_absmax,
+    nvfp4_mse,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -386,6 +388,8 @@ class Recipe:
             grouped_mse,
             fp8_row_maxabs,
             import_encoded,
+            nvfp4_absmax,
+            nvfp4_mse,
         )
         for names in self.model.packing_groups:
             if any(

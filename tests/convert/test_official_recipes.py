@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from tools.convert.methods import fp8_row_maxabs, import_encoded
+from tools.convert.methods import fp8_row_maxabs, grouped_absmax, import_encoded, nvfp4_mse
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
@@ -160,3 +160,38 @@ def _selection_formats(recipe: Recipe) -> dict[str, set[str]]:
         name: {selection.format for selection in selections}
         for name, selections in recipe.selections.items()
     }
+
+
+def test_nvidia_recipe_stores_the_dflash2_gate_up_as_nvfp4() -> None:
+    model = _nvidia_model()
+    model.components["dflash2"] = {"config": {"num_hidden_layers": 1}}
+    for name in (
+        "dflash2/layers/0/attention/key",
+        "dflash2/layers/0/attention/value",
+        "dflash2/layers/0/attention/context_key",
+        "dflash2/layers/0/attention/context_value",
+        "dflash2/layers/0/mlp/gate",
+        "dflash2/layers/0/mlp/up",
+        "dflash2/layers/0/mlp/down",
+    ):
+        source = array_source(torch.ones((128, 64), dtype=torch.bfloat16), name)
+        model.add(
+            Parameter(
+                name,
+                (128, 64),
+                source,
+                source_factory=lambda store, fmt, _source=source: _source,
+                inputs=("input",),
+            )
+        )
+    recipe = Recipe(model)
+    qwen3_8_27b_nvfp4_nvidia(model, recipe, {"quantized": object()})
+
+    for role in ("gate", "up"):
+        selection = recipe.selections[f"dflash2/layers/0/mlp/{role}"][0]
+        assert selection.format == "nvfp4"
+        assert selection.method is nvfp4_mse
+        assert recipe.policies[(f"dflash2/layers/0/mlp/{role}", "input")] == "A16Only"
+    down = recipe.selections["dflash2/layers/0/mlp/down"][0]
+    assert down.format == Q8
+    assert down.method is grouped_absmax

@@ -209,3 +209,54 @@ meaning) was measured the same way, on the build with the adopted round changes:
 | s = 0.5 | 207.5 | 31.71 % |
 
 Sharpening does not raise acceptance; at 0.5 it lowers it. Neither form was kept.
+
+## 16-bit activations for the NVFP4 gate/up projection at decode widths (not adopted)
+
+Measured on the RTX 5090 with the NVIDIA NVFP4 artifact (`qwen3_8_27b_nvfp4-nvidia.ninfer`),
+DFlash2 K=7 with the proposal head, INT8 KV, CUDA 13.4 on Windows, master `2ca38d1d`.
+
+The NVFP4 MLP routes use 4-bit activations (A4) from 5 columns (gate/up) and 8 columns (down). As
+complete public Ops on cold L2, the fused A16 gate/up kernel was faster than A4 through 8 columns
+and slower above, while the A16 down projection was far slower from 5 columns:
+
+| Op, T (us, median) | A4 | A16 |
+|---|---:|---:|
+| SwiGLU gate/up 34816x5120, T=5 / 8 / 9 / 16 | 66.1 / 66.1 / 66.1 / 66.1 | 62.0 / 64.1 / 76.4 / 88.7 |
+| LinearAdd down 5120x17408, T=4 / 6 / 8 | 36.2 / 58.1 (A16 route) / 37.5 | 36.1 / 58.1 / 58.1 |
+
+Only the gate/up projection was therefore tried with A16 at up to 8 columns (every C=1 neural
+round). In the decode graph it was slower, not faster: the A4 MMA kernel stages its weights before
+its PDL wait and was charged 60.3 us per call, the A16 kernel 63.6 us (Nsight, 16K context). Greedy
+`ninfer_bench -pg 16384,512`, three interleaved passes: 14.957 against 14.764 ms per round (+1.3 %).
+Sampled acceptance (`acc_ab.py`: 24 prompts x 2 seed sets x 1536 tokens, temperature 1.0, top_p
+0.95, top_k 20, thinking on, about 66K tokens per arm): 3.468 against 3.443 tokens per round
+(+0.7 %, within the spread of this test) and 15.13 against 14.90 ms per round (+1.5 %); output
+tok/s 228.1 against 230.1. The 4-bit activation rounding of the gate/up input does not cost
+measurable acceptance, so the slower A16 kernel does not pay.
+
+## L2 weight prefetch of the next projection during latency-bound kernels (not adopted)
+
+Same configuration. Idea: the 31.5 MB FP8 output projection of each GDN layer follows about 14 us
+of conv, record and gating kernels that leave DRAM mostly idle, and fits the 96 MB L2. With its
+weights L2-resident the out-projection Op takes 16.6 us instead of 23.9 us at T=8 (cold vs warm
+L2, complete Op), so a perfect prefetch would save at most about 0.35 ms per round (2.4 %).
+
+A prefetch kernel issued after the GDN projection, as a PDL consumer that issues its prefetches
+before waiting for the producer, was measured in three forms (greedy `-pg 16384,512`, identical
+token streams, ms per round against 14.764):
+
+| Form | ms/round | change |
+|---|---:|---:|
+| `cp.async.bulk.prefetch.L2` from 2 CTAs, after the projection | 18.33 | +24.1 % |
+| same, before the GDN norm/gating | 18.51 | +25.4 % |
+| same, attention layers before the attention kernel | 15.39 | +4.2 % |
+| `prefetch.global.L2::evict_last` per line, 64 CTAs, after the projection | 14.817 | +0.36 % |
+| same, 16 / 170 CTAs | 15.046 / 14.833 | +1.9 % / +0.47 % |
+| same, before the norm/gating | 14.802 | +0.26 % |
+| same, attention layers | 14.786 | +0.15 % |
+
+A bulk prefetch holds its grid until the transfer drains, so the next kernel waits for all of it.
+The per-line form does land: Nsight shows the GDN out-projection at 17.9 us instead of 21.4 us,
+but the record kernel slowed from 9.7 to 11.2 us behind the prefetch traffic and the extra
+3.4 us node sits on the dependency chain. The remaining upside, under 1 % per round, needs the
+prefetch fused into the GDN kernels across Op ownership, and was not pursued.

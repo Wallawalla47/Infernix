@@ -392,6 +392,13 @@ which require `--use-original-prefix-caching`. Details:
   different order. On the NVIDIA artifact a single ~100K-token request decodes 2.4 % faster with
   identical output.
   Commits: [`88df116`][c-split-balance], [`fad95fa`][c-merge-pdl], [`8777710`][c-int8-pipelined].
+- **NVFP4 DFlash2 drafter MLP** (`qwen3_8_27b_nvfp4_nvidia` recipe): the drafter's MLP gate/up
+  projections are stored as NVFP4 (new `nvfp4_mse` quantizer) instead of Q8 and run with 16-bit
+  activations through the fused SwiGLU kernel, which now covers every width (sliced kernels to 32
+  tokens, a Tensor Core route above). On the decode-saturation suite (DFlash2 K=7, n-gram 15/12,
+  INT8 KV) rounds are 1.6 % shorter with one request (+1.2 % tokens/s) and 0.2 % shorter with four
+  (tokens/s within noise). Acceptance moved by -0.35 % on 24 sampled agent prompts and -0.4 %
+  (tokens per round) on the suite. Existing artifacts must be reconverted to use it.
 - **Reciprocal NVFP4 activation quantizer on the Linear MMA route** (upstream #327 by
   [DuncanBetts](https://github.com/DuncanBetts)): 2-5 % faster at 8-64 tokens; the other A4 routes
   keep the divisions, because opting them in changed the generated text.
@@ -484,6 +491,9 @@ which require `--use-original-prefix-caching`. Details:
   with DFlash2 heads and an indexed proposal head; **third-party tokenizer settings** rebuilt during
   conversion. Commits: [`33afed8`][c-modelopt], [`de4623a`][c-quasar],
   [`5b73bba`][c-tokenizer].
+- **`nvfp4_absmax` and `nvfp4_mse` conversion methods** quantize BF16 sources to NVFP4 for
+  16-bit-activation parents (`nvfp4_mse` picks each 16-value group's best of five scale targets
+  by squared error); the NVIDIA recipe uses them for the DFlash2 drafter MLP.
 - **A `qwen3_8_27b_q6` recipe** and a `grouped_mse` scale-search method for groupwise
   quantisation; **Q8 MTP** and a **general BF16 GEMM fallback** for shapes without a dedicated
   kernel. Commits: [`a4c112f`][c-pr284], [`afb274c`][c-grouped-mse],
