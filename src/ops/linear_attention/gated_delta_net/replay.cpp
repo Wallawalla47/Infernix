@@ -308,19 +308,18 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, const Tensor& tree_rows,
-                                   std::int32_t max_paths, Tensor& key_record, Tensor& value_record,
-                                   Tensor& gate_record, Tensor& out, cudaStream_t stream) {
-    if (valid_columns.data == nullptr || q.ne[2] < 2 || q.ne[2] > kSpeculativeTreeMaxNodes ||
-        max_paths < 1 || max_paths > kSpeculativeTreeMaxPaths) {
-        throw std::invalid_argument("gated_delta_net_replay_record: a tree needs valid columns, "
-                                    "a width of at most 32 and 1..8 paths");
+                                   Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                                   Tensor& out, cudaStream_t stream) {
+    if (valid_columns.data == nullptr || q.ne[2] < 2 || q.ne[2] > kSpeculativeTreeMaxNodes) {
+        throw std::invalid_argument("gated_delta_net_replay_record: a tree needs valid columns "
+                                    "and a width of at most 32");
     }
     validate_speculative_tree_rows(tree_rows, q.ne[3], "gated_delta_net_replay_record");
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
                            key_record, value_record, gate_record, out);
     detail::gated_delta_net::launch_recurrent_tree_record(
         q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, tree_rows,
-        max_paths, key_record, value_record, gate_record, out, stream);
+        key_record, value_record, gate_record, out, stream);
 }
 
 GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,

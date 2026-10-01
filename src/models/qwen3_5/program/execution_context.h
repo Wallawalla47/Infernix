@@ -137,11 +137,10 @@ struct TargetVerifyFrameView {
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
     // Tree verification: each row's device-built tree (I32 [words,B]) and its ancestor masks
-    // (I32 [W,B]), the path cap, the accepted-path and branch outputs, and the lane-owned pending
-    // DFlash features compacted with the path. Empty tree_rows is chain verification.
+    // (I32 [W,B]), the accepted-path and branch outputs, and the lane-owned pending DFlash
+    // features compacted with the path. Empty tree_rows is chain verification.
     Tensor tree_rows;
     Tensor tree_masks;
-    std::uint32_t tree_paths = 0;
     Tensor accepted_path;
     Tensor accepted_branch;
     Tensor active_lanes;

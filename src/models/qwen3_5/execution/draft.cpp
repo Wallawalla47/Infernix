@@ -788,7 +788,6 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .feature_sink    = &sink,
                     .tree_rows  = tree_round ? frame.tree_rows.slice(1, 0, batch_size) : Tensor{},
                     .tree_masks = tree_round ? frame.tree_masks.slice(1, 0, batch_size) : Tensor{},
-                    .tree_paths = state.tree_paths,
                     .accepted_path    = frame.accepted_path.slice(1, 0, batch_size),
                     .accepted_branch  = frame.accepted_branch.slice(0, 0, batch_size),
                     .active_lanes     = active_lanes,

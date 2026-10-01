@@ -193,39 +193,36 @@ void launch_recurrent_tree_record(const Tensor& q, const Tensor& k, const Tensor
                                   const Tensor& g, const Tensor& beta, float scale,
                                   const Tensor& ssm_states, const Tensor& valid_columns,
                                   const Tensor& initial_state_slots, const Tensor& tree_rows,
-                                  std::int32_t max_paths, Tensor& key_record, Tensor& value_record,
-                                  Tensor& gate_record, Tensor& out, cudaStream_t stream) {
+                                  Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                                  Tensor& out, cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
-    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3] * max_paths),
+    const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const TreeRecordAccess access{
-        RecordAccess<true>{
-            static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const __nv_bfloat16*>(k.data),
-            static_cast<const __nv_bfloat16*>(v.data),
-            static_cast<const float*>(g.data),
-            static_cast<const float*>(beta.data),
-            static_cast<const float*>(ssm_states.data),
-            static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<const std::int32_t*>(initial_state_slots.data),
-            static_cast<__nv_bfloat16*>(key_record.data),
-            static_cast<__nv_bfloat16*>(value_record.data),
-            reinterpret_cast<uint2*>(gate_record.data),
-            static_cast<__nv_bfloat16*>(out.data),
-            heads,
-            q.ne[2],
-            state_slot_stride,
-            scale,
-        },
-        static_cast<const SpeculativeTreeRow*>(tree_rows.data),
-        max_paths,
+    const RecordAccess<true> access{
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data),
+        static_cast<const float*>(ssm_states.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(initial_state_slots.data),
+        static_cast<__nv_bfloat16*>(key_record.data),
+        static_cast<__nv_bfloat16*>(value_record.data),
+        reinterpret_cast<uint2*>(gate_record.data),
+        static_cast<__nv_bfloat16*>(out.data),
+        heads,
+        q.ne[2],
+        state_slot_stride,
         scale,
     };
-    CUDA_CHECK(
-        pdl::launch_consumer({grid, block, 0, stream}, recurrent_tree_record_kernel, access));
+    // Two slots hold every branch nesting of a tree with at most four side columns (K+5 columns
+    // at K=7); deeper nestings rebuild their branch state.
+    CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_tree_walk_kernel<2>, access,
+                                    static_cast<const SpeculativeTreeRow*>(tree_rows.data)));
     CUDA_CHECK(cudaGetLastError());
 }
 

@@ -441,13 +441,17 @@ which require `--use-original-prefix-caching`. Details:
   round time of each width per batch size and context length, and, from every tree round's accepted
   path, the tokens each narrower tree and the chain would have emitted on the same text. Each round
   then verifies the chain or a tree of K+5 or K+9 columns, whichever gives the most tokens per
-  second. On the decode-saturation suite (DFlash2 K=7, n-gram 15/12, INT8 KV) `auto` decodes an
-  estimated 6.9 % faster with one request, 4.4 % with two and 1.1 % with three, and breaks even with
-  four; at 128K tokens of context it loses 0.6-2.3 % in a fresh process (a fixed 16-column tree
-  loses 4.2-5.4 %), and on text the drafter already predicts it keeps chain verification. Below
-  about 64K tokens the fixed table `16,12,12,0` gains up to 2 points more (7-8.5 % with one request
-  and 4-5 % with two on INT8, K8V4 and NVFP4 KV) and keeps seeded one-request runs reproducible,
-  which `auto` does not, since its choice depends on measured time. See [tree
+  second. Each round computes every tree column's GDN recurrence once, in one depth-first walk per
+  row, so 12- and 16-column tree rounds cost 0.4-0.6 % less than replaying every root-to-leaf path
+  with one request, 1.7-2.0 % with two and 2.9-4.0 % with four. On the decode-saturation suite
+  (DFlash2 K=7, n-gram 15/12, INT8 KV) `auto` decodes an estimated 6.9 % faster with one request and
+  4.4 % with two (measured before the walk), and about 2.9 % with three and 2.7 % with four (from
+  2.0 % and 0.3 % before the walk and the LM head change above, in the same runs); at 128K tokens of
+  context it loses 0.6-2.3 % in a fresh process (a fixed 16-column tree loses 4.2-5.4 %), and on
+  text the drafter already predicts it keeps chain verification. Below about 64K tokens the fixed
+  table `16,12,12,0` gains up to 2 points more (7-8.5 % with one request and 4-5 % with two on INT8,
+  K8V4 and NVFP4 KV) and keeps seeded one-request runs reproducible, which `auto` does not, since
+  its choice depends on measured time. See [tree
   verification](docs/maintainer/tree-verification.md).
 - **NVFP4 KV groups pick the best of five scales** (NVFP4 K and V, K8V4 V): each 16-value group
   maps its largest magnitude to 6, 4, 4.5, 5 or 5.5 and keeps the scale with the least squared

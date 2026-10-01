@@ -278,15 +278,12 @@ void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t 
     linear_state_destination_slot_ = destination_slot;
 }
 
-void TextContext::set_verification_tree(const Tensor* tree_rows, const Tensor* ancestor_masks,
-                                        std::uint32_t paths) {
-    if ((tree_rows == nullptr) != (ancestor_masks == nullptr) ||
-        (tree_rows != nullptr && (paths < 1 || paths > ops::kSpeculativeTreeMaxPaths))) {
-        throw std::logic_error("verification tree rows, masks and path cap go together");
+void TextContext::set_verification_tree(const Tensor* tree_rows, const Tensor* ancestor_masks) {
+    if ((tree_rows == nullptr) != (ancestor_masks == nullptr)) {
+        throw std::logic_error("verification tree rows and masks go together");
     }
     verification_tree_   = tree_rows;
     tree_ancestor_masks_ = ancestor_masks;
-    tree_paths_          = tree_rows != nullptr ? paths : 0;
 }
 
 void TextContext::compact_tree_kv(const Tensor& verify_positions, const Tensor& kv_table_rows,
@@ -1077,9 +1074,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             if (verification_tree_ != nullptr) {
                 ops::gated_delta_net_replay_record(
                     q_batch, k_batch, v_batch, g_batch, beta_batch, scale, recurrent_states, valid,
-                    *active_linear_state_source_slots_, *verification_tree_,
-                    static_cast<std::int32_t>(tree_paths_), records.key, records.value,
-                    records.gate, out_batch, s);
+                    *active_linear_state_source_slots_, *verification_tree_, records.key,
+                    records.value, records.gate, out_batch, s);
             } else {
                 ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                                    scale, recurrent_states, valid,
