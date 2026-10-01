@@ -64,10 +64,13 @@ Output budgets do not select a different ngram arithmetic shape: a copy is sized
 drafts the round then verifies.
 
 The mixed-FP8 27B target retains 16-bit activations for FP8 residual projections
-during 17..64-column single-request verification. Its ordinary narrow path uses
-that precision already; crossing the core's 22/25-column A8 thresholds otherwise
-adds another quantization change. Weight and KV formats and prefill are unchanged.
-This does not promise identical floating-point results between different widths.
+in 17..64-column verification rows, whether the round verifies one request or
+several. Its ordinary narrow single-request path uses that precision already;
+crossing the core's 22/25-column A8 thresholds would otherwise change a row's
+quantization with the round it shares, and the error a shared 8-bit round leaves in
+the KV and GDN state can flip a later greedy near-tie. Narrower multi-request rounds
+still cross those thresholds. Weight and KV formats and prefill are unchanged. This
+does not promise identical floating-point results between different widths.
 
 ## Operation
 

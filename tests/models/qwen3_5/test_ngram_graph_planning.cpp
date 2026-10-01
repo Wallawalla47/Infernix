@@ -58,14 +58,12 @@ void verify_profiles() {
         }
     }
     for (const auto phase : {qwen::TextPhase::Prefill, qwen::TextPhase::Verify}) {
-        for (int batch : {0, 1, 2, 4, 8}) {
-            for (int first : {1, 6, 16, 17, 21, 22, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96}) {
-                for (int last : {first, 64, 65}) {
-                    const bool expected = phase == qwen::TextPhase::Verify && batch == 1 &&
-                                          first >= 17 && first <= last && last <= 64;
-                    require(qwen::wide_residual_verification(phase, batch, first, last) == expected,
-                            "wide residual precision escaped its phase/batch/width domain");
-                }
+        for (int first : {1, 6, 16, 17, 21, 22, 24, 25, 31, 32, 33, 48, 63, 64, 65, 96}) {
+            for (int last : {first, 64, 65}) {
+                const bool expected = phase == qwen::TextPhase::Verify && first >= 17 &&
+                                      first <= last && last <= 64;
+                require(qwen::wide_residual_verification(phase, first, last) == expected,
+                        "wide residual precision escaped its phase/width domain");
             }
         }
     }

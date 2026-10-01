@@ -331,18 +331,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                ops::linear_add_workspace_capacity_bytes(
-                    p.weight.qtype, p.weight.n, p.weight.k,
-                    execution::residual_projection_policy(p, wide_verification), first, last));
+        // A round's narrower families may resolve the ordinary policy at the same columns.
+        const auto bytes = [&](bool wide) {
+            return ops::linear_add_workspace_capacity_bytes(
+                p.weight.qtype, p.weight.n, p.weight.k,
+                execution::residual_projection_policy(p, wide), first, last);
+        };
+        scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
-        const bool wide_verification =
-            wide_residual_verification(phase, batch_size, min_width, max_width);
+        const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
         for (const auto& block : parameters.text.layers) {
             {
                 auto stage = layout.scope();
@@ -390,8 +392,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                           wide_verification));
+            scratch(layout,
+                    std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                            wide_verification),
+                             execution::ffn_workspace_bytes(block.ffn, first, last, false, false)));
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
