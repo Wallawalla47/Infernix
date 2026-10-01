@@ -29,6 +29,13 @@ namespace {
 
 using Json = nlohmann::json;
 
+// The log is a text-mode stream: each '\n' is written as "\r\n" on Windows.
+#ifdef _WIN32
+constexpr std::uint64_t kLineTerminatorBytes = 2;
+#else
+constexpr std::uint64_t kLineTerminatorBytes = 1;
+#endif
+
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
     return current >= previous ? current - previous : T{};
@@ -880,17 +887,42 @@ ServerLogEnvironment query_server_log_environment(int device) {
 
 JsonlRequestLog::JsonlRequestLog(const std::string& path,
                                  const std::string& protected_artifact_path,
-                                 std::shared_ptr<spdlog::logger> logger)
-    : path_(path), logger_(std::move(logger)) {
+                                 std::shared_ptr<spdlog::logger> logger,
+                                 RequestLogRotation rotation)
+    : path_(path), logger_(std::move(logger)), rotation_(rotation) {
     if (path_.empty()) { return; }
-    if (!protected_artifact_path.empty() &&
-        normalized_absolute_path(path_) == normalized_absolute_path(protected_artifact_path)) {
-        throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
+    if (rotation_.keep > kMaximumRequestLogKeep) {
+        throw std::invalid_argument("request JSONL log keeps too many rotated files");
+    }
+    if (!protected_artifact_path.empty()) {
+        const std::filesystem::path artifact = normalized_absolute_path(protected_artifact_path);
+        if (normalized_absolute_path(path_) == artifact) {
+            throw std::invalid_argument("request JSONL log must not overwrite the model artifact");
+        }
+        for (std::uint32_t index = 1; rotation_.max_bytes != 0 && index <= rotation_.keep;
+             ++index) {
+            if (normalized_absolute_path(rotated_path(index)) == artifact) {
+                throw std::invalid_argument(
+                    "a rotated request JSONL log must not overwrite the model artifact");
+            }
+        }
     }
     server_instance_id_ = new_server_instance_id();
     output_.open(path_, std::ios::out | std::ios::app);
     if (!output_) {
         throw std::runtime_error("failed to open request JSONL log for append: " + path_);
+    }
+    enabled_ = true;
+    std::error_code error;
+    const std::uintmax_t existing = std::filesystem::file_size(path_, error);
+    written_bytes_                = error ? 0 : static_cast<std::uint64_t>(existing);
+    // An existing file already at the limit is rotated before this server writes to it.
+    if (rotation_.max_bytes != 0 && written_bytes_ >= rotation_.max_bytes) {
+        const std::string warning = rotate_locked();
+        if (!warning.empty() && logger_ != nullptr) { logger_->warn("{}", warning); }
+        if (failed_) {
+            throw std::runtime_error("failed to reopen request JSONL log after rotation: " + path_);
+        }
     }
 }
 
@@ -905,9 +937,14 @@ void JsonlRequestLog::write_server_start(const ServeOptions& options,
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
     const std::optional<std::uint64_t> artifact_size =
         error ? std::nullopt : std::optional<std::uint64_t>(size);
-    append(format_server_start_json(server_instance_id_, unix_time_ms(), options, engine_options,
-                                    sampling_defaults, public_model_id, load, memory,
-                                    query_server_log_environment(options.device), artifact_size));
+    std::string record = format_server_start_json(
+        server_instance_id_, unix_time_ms(), options, engine_options, sampling_defaults,
+        public_model_id, load, memory, query_server_log_environment(options.device), artifact_size);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        server_start_record_ = record;
+    }
+    append(std::move(record));
 }
 
 void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
@@ -947,6 +984,7 @@ void JsonlRequestLog::write_throughput(const ThroughputReport& report) {
 
 void JsonlRequestLog::append(std::string record) {
     bool report_failure = false;
+    std::string rotation_warning;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) { return; }
@@ -955,12 +993,66 @@ void JsonlRequestLog::append(std::string record) {
         if (!output_) {
             failed_        = true;
             report_failure = true;
+        } else {
+            written_bytes_ += record.size() + kLineTerminatorBytes;
+            if (rotation_.max_bytes != 0 && written_bytes_ >= rotation_.max_bytes) {
+                rotation_warning = rotate_locked();
+                report_failure   = failed_;
+            }
         }
     }
+    if (!rotation_warning.empty() && logger_ != nullptr) { logger_->warn("{}", rotation_warning); }
     if (report_failure && logger_ != nullptr) {
         logger_->error("request log disabled | write failed | {}",
                        product::format_pretty_text(path_));
     }
+}
+
+std::string JsonlRequestLog::rotated_path(std::uint32_t index) const {
+    return path_ + '.' + std::to_string(index);
+}
+
+std::string JsonlRequestLog::rotate_locked() {
+    output_.close();
+    std::error_code error;
+    if (rotation_.keep == 0) {
+        std::filesystem::remove(path_, error);
+    } else {
+        // Shift PATH.(keep-1) .. PATH.1 up by one, overwriting the oldest, then retire PATH.
+        for (std::uint32_t index = rotation_.keep - 1; index >= 1; --index) {
+            std::error_code shift_error;
+            if (!std::filesystem::exists(rotated_path(index), shift_error)) { continue; }
+            std::filesystem::remove(rotated_path(index + 1), shift_error);
+            std::filesystem::rename(rotated_path(index), rotated_path(index + 1), shift_error);
+        }
+        std::error_code remove_error;
+        std::filesystem::remove(rotated_path(1), remove_error);
+        std::filesystem::rename(path_, rotated_path(1), error);
+    }
+    std::string warning;
+    if (error) {
+        // Typically another process holds the file open without delete sharing (Windows). Keep
+        // appending to it and try again once another max_bytes have been written.
+        warning = "request log rotation failed | " + product::format_pretty_text(path_) + " | " +
+                  error.message() + " | appending to the current file";
+    }
+    output_.clear();
+    output_.open(path_, std::ios::out | std::ios::app);
+    written_bytes_ = 0;
+    if (!output_) {
+        failed_ = true;
+        return warning;
+    }
+    if (!error && !server_start_record_.empty()) {
+        output_ << server_start_record_ << '\n';
+        output_.flush();
+        if (!output_) {
+            failed_ = true;
+            return warning;
+        }
+        written_bytes_ = server_start_record_.size() + kLineTerminatorBytes;
+    }
+    return warning;
 }
 
 } // namespace ninfer::serve

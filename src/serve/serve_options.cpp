@@ -248,6 +248,10 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-pending-requests N   max queued requests (default 16)\n"
            "  --pending-timeout-ms N     queue timeout in ms (default 30000)\n"
            "  --request-log-jsonl FILE   append full-precision server/request records\n"
+           "  --request-log-max-mib N    rotate FILE when it reaches N MiB: it becomes\n"
+           "                             FILE.1, older files shift up (default: one file\n"
+           "                             without a size limit)\n"
+           "  --request-log-keep N       rotated files kept, 0-1000 (default 4)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
@@ -269,6 +273,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --vram-headroom-mib requires --kv-capacity auto.\n"
            "  --vision-offload on requires --vision.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
+           "  --request-log-max-mib requires --request-log-jsonl, and --request-log-keep\n"
+           "  requires --request-log-max-mib.\n"
            "  --rope-yarn-factor is startup-fixed, finite [1,4] (default 1); it extends the\n"
            "  allowed ceiling only, not --max-context.\n"
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
@@ -291,6 +297,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
+    bool request_log_keep_explicit = false;
     std::optional<std::size_t> vram_headroom_mib;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
@@ -419,6 +426,21 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--request-log-max-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--request-log-max-mib"), "request-log-max-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::uint64_t>::max() >> 20) {
+                throw std::invalid_argument("--request-log-max-mib is out of range");
+            }
+            options.request_log_rotation.max_bytes = mib << 20;
+        } else if (arg == "--request-log-keep") {
+            const int keep =
+                parse_nonnegative_int(require_value("--request-log-keep"), "request-log-keep");
+            if (keep > static_cast<int>(kMaximumRequestLogKeep)) {
+                throw std::invalid_argument("--request-log-keep must be in [0,1000]");
+            }
+            options.request_log_rotation.keep = static_cast<std::uint32_t>(keep);
+            request_log_keep_explicit         = true;
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
@@ -583,6 +605,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
+    }
+    if (options.request_log_rotation.max_bytes != 0 && options.request_log_jsonl.empty()) {
+        throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
+    }
+    if (request_log_keep_explicit && options.request_log_rotation.max_bytes == 0) {
+        throw std::invalid_argument("--request-log-keep requires --request-log-max-mib");
     }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
