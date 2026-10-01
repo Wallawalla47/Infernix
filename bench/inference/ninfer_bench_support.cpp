@@ -311,6 +311,7 @@ std::string usage_text(std::string_view program) {
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
+        << "  --int8-prefill-8bit-pv      8-bit P*V in the fast INT8-KV prompt kernel\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
@@ -373,6 +374,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--int8-prefill-8bit-pv") {
+            options.int8_prefill_8bit_pv = true;
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--spec") {
@@ -624,6 +627,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
+        << " int8_prefill_8bit_pv=" << (env.int8_prefill_8bit_pv ? "on" : "off")
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
@@ -751,6 +755,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"original_int8_prefill_kernel\": "
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"int8_prefill_8bit_pv\": " << (env.int8_prefill_8bit_pv ? "true" : "false")
+        << ",\n"
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

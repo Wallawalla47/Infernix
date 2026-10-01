@@ -191,6 +191,11 @@ struct EngineOptions {
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
     bool original_int8_prefill_kernel  = false;
+    // Opt-in: the fast INT8 prompt kernel runs its P*V on 8-bit integer Tensor Cores, rounding
+    // each probability (times its key's V group scale) to 8 bits per 64-key tile and multiplying
+    // the stored V codes exactly. Faster long-prompt prefill with a small precision change of the
+    // probabilities. Requires the INT8 KV cache and the fast kernel.
+    bool int8_prefill_8bit_pv          = false;
     // NVFP4 KV prefills over more than 2048 visible keys with the fast prompt-attention kernel
     // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
     // KV cache.

@@ -64,6 +64,11 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument(
             "the original INT8 prefill kernel requires the INT8 KV cache (--kv-dtype int8)");
     }
+    if (options.int8_prefill_8bit_pv && (options.kv_cache != KvCacheStorage::Int8Group64 ||
+                                         options.original_int8_prefill_kernel)) {
+        throw std::invalid_argument("8-bit INT8 prefill P*V requires the INT8 KV cache (--kv-dtype "
+                                    "int8) and the fast INT8 prefill kernel");
+    }
     if (options.original_nvfp4_prefill_kernel && options.kv_cache != KvCacheStorage::Nvfp4Group16) {
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");

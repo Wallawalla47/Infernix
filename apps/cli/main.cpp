@@ -314,6 +314,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
+        engine_options.int8_prefill_8bit_pv         = cli.int8_prefill_8bit_pv;
         engine_options.original_nvfp4_prefill_kernel = cli.original_nvfp4_prefill_kernel;
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;

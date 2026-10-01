@@ -22,6 +22,13 @@
 //     the FP32 output accumulator once per tile. Every probability is at most one, so a partial is
 //     bounded by 64 * 127 * max_scale; a tile whose largest V scale could exceed the FP16 range
 //     decodes V with its scales divided by an exact power of two and multiplies the partial back.
+//   * The 8-bit PV form (Pv8, CausalAttentionExecutionEnvelope::fast_prompt_pv8) instead runs PV
+//     on u8 x s8 Tensor Cores with exact INT32 accumulation over the stored V codes, which are
+//     never decoded. Per 64-dimension V group it scales each FP16 probability by its key's group
+//     scale and rounds the products to u8 codes against their row maximum over the tile
+//     (255 = that maximum); the INT32 partial times that row's step joins the FP32 accumulator.
+//     The k32 MMA consumes each lane's own QK keys in a fixed permuted key order, matched by the
+//     V fragments, so no probability crosses lanes.
 //   * CTAs are issued longest-first so a causal prompt's heaviest row blocks do not form the tail.
 
 #include <cuda_bf16.h>
@@ -81,6 +88,21 @@ __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+__device__ __forceinline__ void causal_prompt_i8_fast_mma_u8s8(int& c0, int& c1, int& c2, int& c3,
+                                                               unsigned a0, unsigned a1,
+                                                               unsigned a2, unsigned a3,
+                                                               unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Exact for |value| < 2^22: the integer lands in the mantissa of 1.5 * 2^23.
+__device__ __forceinline__ float causal_prompt_i8_fast_small_int_to_float(int value) {
+    return __int_as_float(value + 0x4B400000) - 12582912.0f;
+}
+
 // One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
 // {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}. Returns the FP16 B-fragment halves
 // {V[k][d], V[k+1][d]} and {V[k][d+1], V[k+1][d+1]}, each code widened exactly and multiplied
@@ -99,7 +121,7 @@ __device__ __forceinline__ void causal_prompt_i8_fast_decode_v_pair(unsigned cod
     odd                   = load_vec<unsigned>(&vo);
 }
 
-template <typename Geometry, typename Metadata, int Warps>
+template <typename Geometry, typename Metadata, int Warps, bool Pv8>
 __global__ __launch_bounds__(
     CausalPromptI8FastShape<Warps>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
@@ -290,7 +312,7 @@ __global__ __launch_bounds__(
         const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(base);
         const __half* ks_s =
             reinterpret_cast<const __half*>(base + 2 * kCausalPromptI8FastTileBytes);
-        const __half* vs_s = ks_s + Bc * Groups;
+        [[maybe_unused]] const __half* vs_s = ks_s + Bc * Groups;
 
         float score[QKNt][4];
 #pragma unroll
@@ -386,100 +408,214 @@ __global__ __launch_bounds__(
         // Every probability is at most one, so a 64-key FP16 partial is bounded by
         // 64 * 127 * max_scale. A tile whose largest V scale exceeds the limit decodes V with its
         // scales divided by an exact power of two and multiplies the partial back at promotion.
-        static_assert(Bc * Groups == 32 * 8);
-        const uint4 v8 = load_vec<uint4>(&vs_s[8 * lane]);
-        const __half2 vmax2 =
-            __hmax2(__hmax2(__habs2(load_vec<__half2>(&v8.x)), __habs2(load_vec<__half2>(&v8.y))),
-                    __hmax2(__habs2(load_vec<__half2>(&v8.z)), __habs2(load_vec<__half2>(&v8.w))));
-        const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
-        tile_shift       = 0;
-        if (vmax > kCausalPromptI8FastF16PartialScaleLimit) {
-            while (ldexpf(vmax, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
-                ++tile_shift;
+        // The 8-bit form accumulates exact INT32 partials and needs no rescale.
+        if constexpr (!Pv8) {
+            static_assert(Bc * Groups == 32 * 8);
+            const uint4 v8 = load_vec<uint4>(&vs_s[8 * lane]);
+            const __half2 vmax2 = __hmax2(
+                __hmax2(__habs2(load_vec<__half2>(&v8.x)), __habs2(load_vec<__half2>(&v8.y))),
+                __hmax2(__habs2(load_vec<__half2>(&v8.z)), __habs2(load_vec<__half2>(&v8.w))));
+            const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
+            tile_shift       = 0;
+            if (vmax > kCausalPromptI8FastF16PartialScaleLimit) {
+                while (ldexpf(vmax, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
+                    ++tile_shift;
+                }
             }
         }
         tile_live = true;
     };
 
-    const auto pv = [&](int kb) {
-        if (!tile_live) { return; }
+    // 8-bit PV. The lane's probabilities pa[j] cover keys 16j + {2t, 2t+1} (registers 0/1: rows
+    // g and g+8) and 16j + {8+2t, 9+2t} (registers 2/3). A k32 step s takes the keys of steps
+    // j = 2s and 2s+1 in the order {2t, 2t+1, 8+2t, 9+2t} (+16 for the second half), which is
+    // exactly what this lane owns, so A packs with byte permutes; B gathers the same keys of V.
+    const auto pv8 = [&](int kb) {
         const std::int8_t* v_s =
             reinterpret_cast<const std::int8_t*>(stage_base(kb & 1)) + kCausalPromptI8FastTileBytes;
         const __half* vs_s =
             reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
-        const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
-        const float unscale = ldexpf(1.0f, tile_shift);
+        const __half2 code_origin = __float2half2_rn(1024.0f);
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
-            // Group scales of the keys each lane supplies: (2t, 2t+1) and (8+2t, 9+2t) per k-step.
-            unsigned vsc[PVKs][2];
+            __half2 product[PVKs][4];
+            __half2 max0 = __float2half2_rn(0.0f);
+            __half2 max1 = max0;
 #pragma unroll
             for (int j = 0; j < PVKs; ++j) {
                 const int key = j * 16 + 2 * lid;
-                __half2 lo =
+                const __half2 lo =
                     __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
-                __half2 hi =
+                const __half2 hi =
                     __halves2half2(vs_s[(key + 8) * Groups + grp], vs_s[(key + 9) * Groups + grp]);
-                if (tile_shift != 0) {
-                    lo = __hmul2(lo, mul);
-                    hi = __hmul2(hi, mul);
+                product[j][0] = __hmul2(load_vec<__half2>(&pa[j][0]), lo);
+                product[j][1] = __hmul2(load_vec<__half2>(&pa[j][1]), lo);
+                product[j][2] = __hmul2(load_vec<__half2>(&pa[j][2]), hi);
+                product[j][3] = __hmul2(load_vec<__half2>(&pa[j][3]), hi);
+                max0          = __hmax2(max0, __hmax2(product[j][0], product[j][2]));
+                max1          = __hmax2(max1, __hmax2(product[j][1], product[j][3]));
+            }
+            const float row_max0 =
+                warp_max<4>(fmaxf(__low2float(max0), __high2float(max0)), FullMask);
+            const float row_max1 =
+                warp_max<4>(fmaxf(__low2float(max1), __high2float(max1)), FullMask);
+            // Codes are rint(product * inverse) with the represented FP16 inverse rounded down, so
+            // none exceeds 255; the step that reconstructs them is its exact reciprocal.
+            const __half inverse0 = __float2half_rd(row_max0 > 0.0f ? 255.0f / row_max0 : 0.0f);
+            const __half inverse1 = __float2half_rd(row_max1 > 0.0f ? 255.0f / row_max1 : 0.0f);
+            const float step0 =
+                __hgt(inverse0, __float2half(0.0f)) ? 1.0f / __half2float(inverse0) : 0.0f;
+            const float step1 =
+                __hgt(inverse1, __float2half(0.0f)) ? 1.0f / __half2float(inverse1) : 0.0f;
+            const __half2 inv0 = __half2half2(inverse0);
+            const __half2 inv1 = __half2half2(inverse1);
+            // FP16 1024 + n has the integer n in its low byte for n in [0, 1023].
+            unsigned a[2][4];
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                unsigned q[2][4];
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int j = 2 * s + h;
+                    const __half2 c0 = __hfma2(product[j][0], inv0, code_origin);
+                    const __half2 c1 = __hfma2(product[j][1], inv1, code_origin);
+                    const __half2 c2 = __hfma2(product[j][2], inv0, code_origin);
+                    const __half2 c3 = __hfma2(product[j][3], inv1, code_origin);
+                    q[h][0]          = load_vec<unsigned>(&c0);
+                    q[h][1]          = load_vec<unsigned>(&c1);
+                    q[h][2]          = load_vec<unsigned>(&c2);
+                    q[h][3]          = load_vec<unsigned>(&c3);
                 }
-                vsc[j][0] = load_vec<unsigned>(&lo);
-                vsc[j][1] = load_vec<unsigned>(&hi);
+                a[s][0] = __byte_perm(q[0][0], q[0][2], 0x6420);
+                a[s][1] = __byte_perm(q[0][1], q[0][3], 0x6420);
+                a[s][2] = __byte_perm(q[1][0], q[1][2], 0x6420);
+                a[s][3] = __byte_perm(q[1][1], q[1][3], 0x6420);
             }
 #pragma unroll
-            for (int pass = 0; pass < GroupDBlocks / PassDBlocks; ++pass) {
-                const int db0 = grp * GroupDBlocks + pass * PassDBlocks;
-                unsigned h[PassDBlocks][2][2];
+            for (int b = 0; b < GroupDBlocks; ++b) {
+                const int db = grp * GroupDBlocks + b;
+                int even[4]  = {0, 0, 0, 0};
+                int odd[4]   = {0, 0, 0, 0};
 #pragma unroll
-                for (int b = 0; b < PassDBlocks; ++b) {
-#pragma unroll
-                    for (int p = 0; p < 2; ++p) { h[b][p][0] = h[b][p][1] = 0u; }
+                for (int s = 0; s < 2; ++s) {
+                    // Matrices: keys 32s + 0..7, 8..15, 16..23 and 24..31 of this 16-dimension
+                    // block. Lane (g, t) receives keys {2t, 2t+1} at dimensions {2g, 2g+1}.
+                    const int key = s * 32 + (a_mat << 3) + a_rin;
+                    unsigned r[4];
+                    ldmatrix_x4_t(r[0], r[1], r[2], r[3],
+                                  smem_addr(&v_s[key * D + ((db ^ (key & 7)) << 4)]));
+                    causal_prompt_i8_fast_mma_u8s8(
+                        even[0], even[1], even[2], even[3], a[s][0], a[s][1], a[s][2], a[s][3],
+                        __byte_perm(r[0], r[1], 0x6420), __byte_perm(r[2], r[3], 0x6420));
+                    causal_prompt_i8_fast_mma_u8s8(
+                        odd[0], odd[1], odd[2], odd[3], a[s][0], a[s][1], a[s][2], a[s][3],
+                        __byte_perm(r[0], r[1], 0x7531), __byte_perm(r[2], r[3], 0x7531));
                 }
+                float (&e)[4] = acc[db][0];
+                float (&o)[4] = acc[db][1];
+                e[0] = __fmaf_rn(e[0], tile_alpha0,
+                                 step0 * causal_prompt_i8_fast_small_int_to_float(even[0]));
+                e[1] = __fmaf_rn(e[1], tile_alpha0,
+                                 step0 * causal_prompt_i8_fast_small_int_to_float(even[1]));
+                e[2] = __fmaf_rn(e[2], tile_alpha1,
+                                 step1 * causal_prompt_i8_fast_small_int_to_float(even[2]));
+                e[3] = __fmaf_rn(e[3], tile_alpha1,
+                                 step1 * causal_prompt_i8_fast_small_int_to_float(even[3]));
+                o[0] = __fmaf_rn(o[0], tile_alpha0,
+                                 step0 * causal_prompt_i8_fast_small_int_to_float(odd[0]));
+                o[1] = __fmaf_rn(o[1], tile_alpha0,
+                                 step0 * causal_prompt_i8_fast_small_int_to_float(odd[1]));
+                o[2] = __fmaf_rn(o[2], tile_alpha1,
+                                 step1 * causal_prompt_i8_fast_small_int_to_float(odd[2]));
+                o[3] = __fmaf_rn(o[3], tile_alpha1,
+                                 step1 * causal_prompt_i8_fast_small_int_to_float(odd[3]));
+            }
+        }
+    };
+
+    const auto pv = [&](int kb) {
+        if (!tile_live) { return; }
+        if constexpr (Pv8) {
+            pv8(kb);
+        } else {
+            const std::int8_t* v_s =
+                reinterpret_cast<const std::int8_t*>(stage_base(kb & 1)) + kCausalPromptI8FastTileBytes;
+            const __half* vs_s =
+                reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
+            const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
+            const float unscale = ldexpf(1.0f, tile_shift);
+#pragma unroll
+            for (int grp = 0; grp < Groups; ++grp) {
+                // Group scales of the keys each lane supplies: (2t, 2t+1) and (8+2t, 9+2t) per k-step.
+                unsigned vsc[PVKs][2];
 #pragma unroll
                 for (int j = 0; j < PVKs; ++j) {
-#pragma unroll
-                    for (int q2 = 0; q2 < PassDBlocks / 2; ++q2) {
-                        // Matrices: keys 16j+0..7 and 16j+8..15 of d-block db, then of db + 1.
-                        const int db    = db0 + 2 * q2;
-                        const int key   = j * 16 + ((a_mat & 1) << 3) + a_rin;
-                        const int chunk = db + (a_mat >> 1);
-                        unsigned r[4];
-                        ldmatrix_x4_t(r[0], r[1], r[2], r[3],
-                                      smem_addr(&v_s[key * D + ((chunk ^ (key & 7)) << 4)]));
-#pragma unroll
-                        for (int b = 0; b < 2; ++b) {
-                            unsigned even_lo, odd_lo, even_hi, odd_hi;
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc[j][0], even_lo,
-                                                                odd_lo);
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
-                                                                odd_hi);
-                            unsigned (&he)[2] = h[2 * q2 + b][0];
-                            unsigned (&ho)[2] = h[2 * q2 + b][1];
-                            causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],
-                                                              pa[j][2], pa[j][3], even_lo, even_hi);
-                            causal_prompt_i8_fast_mma_f16_acc(ho[0], ho[1], pa[j][0], pa[j][1],
-                                                              pa[j][2], pa[j][3], odd_lo, odd_hi);
-                        }
+                    const int key = j * 16 + 2 * lid;
+                    __half2 lo =
+                        __halves2half2(vs_s[key * Groups + grp], vs_s[(key + 1) * Groups + grp]);
+                    __half2 hi =
+                        __halves2half2(vs_s[(key + 8) * Groups + grp], vs_s[(key + 9) * Groups + grp]);
+                    if (tile_shift != 0) {
+                        lo = __hmul2(lo, mul);
+                        hi = __hmul2(hi, mul);
                     }
+                    vsc[j][0] = load_vec<unsigned>(&lo);
+                    vsc[j][1] = load_vec<unsigned>(&hi);
                 }
 #pragma unroll
-                for (int b = 0; b < PassDBlocks; ++b) {
+                for (int pass = 0; pass < GroupDBlocks / PassDBlocks; ++pass) {
+                    const int db0 = grp * GroupDBlocks + pass * PassDBlocks;
+                    unsigned h[PassDBlocks][2][2];
 #pragma unroll
-                    for (int p = 0; p < 2; ++p) {
-                        float (&a)[4] = acc[db0 + b][p];
-                        float2 r0     = __half22float2(load_vec<__half2>(&h[b][p][0]));
-                        float2 r1     = __half22float2(load_vec<__half2>(&h[b][p][1]));
-                        if (tile_shift != 0) {
-                            r0.x *= unscale;
-                            r0.y *= unscale;
-                            r1.x *= unscale;
-                            r1.y *= unscale;
+                    for (int b = 0; b < PassDBlocks; ++b) {
+#pragma unroll
+                        for (int p = 0; p < 2; ++p) { h[b][p][0] = h[b][p][1] = 0u; }
+                    }
+#pragma unroll
+                    for (int j = 0; j < PVKs; ++j) {
+#pragma unroll
+                        for (int q2 = 0; q2 < PassDBlocks / 2; ++q2) {
+                            // Matrices: keys 16j+0..7 and 16j+8..15 of d-block db, then of db + 1.
+                            const int db    = db0 + 2 * q2;
+                            const int key   = j * 16 + ((a_mat & 1) << 3) + a_rin;
+                            const int chunk = db + (a_mat >> 1);
+                            unsigned r[4];
+                            ldmatrix_x4_t(r[0], r[1], r[2], r[3],
+                                          smem_addr(&v_s[key * D + ((chunk ^ (key & 7)) << 4)]));
+#pragma unroll
+                            for (int b = 0; b < 2; ++b) {
+                                unsigned even_lo, odd_lo, even_hi, odd_hi;
+                                causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc[j][0], even_lo,
+                                                                    odd_lo);
+                                causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
+                                                                    odd_hi);
+                                unsigned (&he)[2] = h[2 * q2 + b][0];
+                                unsigned (&ho)[2] = h[2 * q2 + b][1];
+                                causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],
+                                                                  pa[j][2], pa[j][3], even_lo, even_hi);
+                                causal_prompt_i8_fast_mma_f16_acc(ho[0], ho[1], pa[j][0], pa[j][1],
+                                                                  pa[j][2], pa[j][3], odd_lo, odd_hi);
+                            }
                         }
-                        a[0] = __fmaf_rn(a[0], tile_alpha0, r0.x);
-                        a[1] = __fmaf_rn(a[1], tile_alpha0, r0.y);
-                        a[2] = __fmaf_rn(a[2], tile_alpha1, r1.x);
-                        a[3] = __fmaf_rn(a[3], tile_alpha1, r1.y);
+                    }
+#pragma unroll
+                    for (int b = 0; b < PassDBlocks; ++b) {
+#pragma unroll
+                        for (int p = 0; p < 2; ++p) {
+                            float (&a)[4] = acc[db0 + b][p];
+                            float2 r0     = __half22float2(load_vec<__half2>(&h[b][p][0]));
+                            float2 r1     = __half22float2(load_vec<__half2>(&h[b][p][1]));
+                            if (tile_shift != 0) {
+                                r0.x *= unscale;
+                                r0.y *= unscale;
+                                r1.x *= unscale;
+                                r1.y *= unscale;
+                            }
+                            a[0] = __fmaf_rn(a[0], tile_alpha0, r0.x);
+                            a[1] = __fmaf_rn(a[1], tile_alpha0, r0.y);
+                            a[2] = __fmaf_rn(a[2], tile_alpha1, r1.x);
+                            a[3] = __fmaf_rn(a[3], tile_alpha1, r1.y);
+                        }
                     }
                 }
             }

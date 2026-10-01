@@ -128,6 +128,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
            "                             rounded down to whole attention waves)\n"
+           "  --int8-prefill-8bit-pv     INT8 KV: run the fast prompt kernel's P*V on 8-bit\n"
+           "                             integer Tensor Cores (faster long-prompt prefill;\n"
+           "                             probabilities rounded to 8 bits per 64-key tile)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                             prefill NVFP4 KV with the tiled prompt kernel\n"
            "                             (default: the fast kernel)\n"
@@ -331,6 +334,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
+        } else if (arg == "--int8-prefill-8bit-pv") {
+            options.int8_prefill_8bit_pv = true;
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {

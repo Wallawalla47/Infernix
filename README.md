@@ -25,7 +25,9 @@ for creating NInfer!
    original too complex and fragile)
 4. prefills INT8 and NVFP4 KV with faster prompt-attention kernels by default (a third to two
    thirds less prompt-attention time on long prompts); `--use-original-int8-prefill-kernel` and
-   `--use-original-nvfp4-prefill-kernel` select upstream's kernels
+   `--use-original-nvfp4-prefill-kernel` select upstream's kernels, and `--int8-prefill-8bit-pv`
+   opts in to an 8-bit P×V version of the INT8 one (about a tenth less prompt-attention time at
+   long context, at a small numerical cost)
 5. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
    which greatly speeds up copy-heavy workloads, with more than one concurrent request
 6. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
@@ -347,6 +349,17 @@ which require `--use-original-prefix-caching`. Details:
   original INT8 kernel (4K windows: 4.8986 against 4.9027, BF16 KV 4.8948).
   `--use-original-int8-prefill-kernel` keeps upstream's kernel.
   Commit: [`4c9a949`][c-fast-int8].
+- **8-bit P×V in the fast INT8 prompt kernel** (opt-in, `--int8-prefill-8bit-pv`): the kernel
+  multiplies P×V on INT8 Tensor Cores (4× the FP16 rate with FP32 accumulation on RTX 5090). Each
+  row's probabilities, scaled by the V group scale, are quantized to 8-bit codes per 64-key tile and
+  group against the stored INT8 V codes, which stay exact. Per attention layer, 3584-token chunks
+  take 3.5 % less time from an empty context and 8-11 % less from 16K to 128K; end to end, prefill
+  is 1.5 % faster at a 16K-token prompt and 3.9 % at 64K. It is not a free speed-up: probabilities
+  below half a code step of their tile's largest round to zero. Perplexity on the full
+  `ninfer-ppl-1m-v1` corpus moved from 4.90771 to 4.90551 with 4K windows and from 4.90412 to
+  4.85164 (-1.1 %) with 64K windows; the 64K change is larger than any other kernel change here
+  and is a systematic deviation from exact attention, even though it lowers perplexity on this
+  corpus. Off by default.
 - **Fast NVFP4 prompt attention** (default for `--kv-dtype nvfp4` over more than 2048 cached keys):
   QK runs on block-scaled FP4 Tensor Cores (8× the FP16 rate on RTX 5090) straight from the stored
   K codes, with Q as two NVFP4 terms (0.9 % RMS error); a single chunk whose rows alone would leave

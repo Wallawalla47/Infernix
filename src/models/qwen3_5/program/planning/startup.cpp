@@ -307,7 +307,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
         .min_visible_keys   = 1,
         .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel};
+        .fast_prompt_kernel = plan.fast_prefill_kernel != PromptAttentionKernel::Original,
+        .fast_prompt_pv8    = plan.fast_prefill_kernel == PromptAttentionKernel::FastPv8};
     const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -958,11 +959,17 @@ bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
 
-// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
-bool uses_fast_prefill_kernel(const EngineOptions& options) {
-    return uses_fast_int8_prefill(options) ||
-           (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
-            !options.original_nvfp4_prefill_kernel);
+// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected;
+// the INT8 fast kernel runs its PV in 8 bits when requested.
+PromptAttentionKernel prompt_attention_kernel(const EngineOptions& options) {
+    if (uses_fast_int8_prefill(options)) {
+        return options.int8_prefill_8bit_pv ? PromptAttentionKernel::FastPv8
+                                            : PromptAttentionKernel::Fast;
+    }
+    return options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+                   !options.original_nvfp4_prefill_kernel
+               ? PromptAttentionKernel::Fast
+               : PromptAttentionKernel::Original;
 }
 } // namespace
 
@@ -999,7 +1006,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel = uses_fast_prefill_kernel(options),
+        .fast_prefill_kernel  = prompt_attention_kernel(options),
         .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

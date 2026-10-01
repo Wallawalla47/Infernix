@@ -25,7 +25,8 @@ KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; unlike `ninfe
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 2048 visible keys, as
 `ninfer-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
-`--kv-dtype`. `report.json` records them as `original_int8_prefill_kernel` and
+`--kv-dtype`; `--int8-prefill-8bit-pv` scores `int8` with the fast kernel's 8-bit P×V variant.
+`report.json` records them as `original_int8_prefill_kernel`, `int8_prefill_8bit_pv` and
 `original_nvfp4_prefill_kernel`.
 
 ```bash

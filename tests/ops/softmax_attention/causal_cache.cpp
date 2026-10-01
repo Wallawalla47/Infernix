@@ -137,6 +137,8 @@ struct AttentionCase {
     // +-value_amplitude.
     bool fast_prompt_kernel = false;
     float value_amplitude   = 1.0f;
+    // With fast_prompt_kernel over INT8 KV: run the kernel's 8-bit PV form.
+    bool fast_prompt_pv8 = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1732,6 +1734,7 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
                 ? " value_amplitude=" + std::to_string(test_case.value_amplitude)
                 : std::string()) +
            (test_case.fast_prompt_kernel ? " fast-prompt" : "") +
+           (test_case.fast_prompt_pv8 ? " pv8" : "") +
            (test_case.graph_replay ? " graph-replay" : "");
 }
 
@@ -1819,6 +1822,7 @@ int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geomet
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
 
     const HostCache initial = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                          amplitude, test_case.value_amplitude);
@@ -1943,6 +1947,7 @@ int run_a3_case(execution, DeviceExecutionView execution, const Geometry& geomet
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
 
     const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                             amplitude, test_case.value_amplitude);
@@ -2008,6 +2013,7 @@ struct BatchAttentionCase {
     // Optional per-replay contexts exercise large live-length changes with stable device views.
     std::vector<std::vector<std::int32_t>> replay_contexts;
     bool fast_prompt_kernel = false;
+    bool fast_prompt_pv8    = false;
 };
 
 std::vector<float> extract_request_columns(const std::vector<float>& source,
@@ -2070,6 +2076,7 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
         test_case.graph_replay ? 1U : static_cast<unsigned>(maximum_visible),
         static_cast<unsigned>(std::max(maximum_visible, envelope_max))};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
     const std::size_t columns            = std::size_t(width) * batch;
@@ -2830,11 +2837,12 @@ int run_wide_batch_copy_cases(DeviceExecutionView execution, KvCacheStorage stor
 // launcher picks four or eight warps from the width), V magnitudes on either side of its
 // FP16-partial scale limit, graph replay, and the production 3584-token prefill chunk as a first
 // chunk and after a long history.
-int run_int8_fast_prompt_cases(DeviceExecutionView execution) {
+int run_int8_fast_prompt_cases(DeviceExecutionView execution, bool pv8) {
     constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
     int failures                     = 0;
-    const auto fast                  = [](AttentionCase test_case) {
+    const auto fast                  = [pv8](AttentionCase test_case) {
         test_case.fast_prompt_kernel = true;
+        test_case.fast_prompt_pv8    = pv8;
         return test_case;
     };
     const auto values = [&](AttentionCase test_case, float amplitude) {
@@ -2882,6 +2890,7 @@ int run_int8_fast_prompt_cases(DeviceExecutionView execution) {
     // Inactive columns of a masked single-row prompt publish zeros.
     BatchAttentionCase masked{300, {0}, {250}, {0}, MappingPattern::Identity, 916u};
     masked.fast_prompt_kernel = true;
+    masked.fast_prompt_pv8    = pv8;
     failures += run_batch_case(execution, h24, storage, masked);
     return failures;
 }
@@ -3047,8 +3056,10 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     if (storage == KvCacheStorage::BFloat16 || storage == KvCacheStorage::Int8Group64)
         for (const auto& geometry : kGeometries)
             failures += run_geometry(execution, geometry, storage);
-    if (storage == KvCacheStorage::Int8Group64)
-        failures += run_int8_fast_prompt_cases(execution);
+    if (storage == KvCacheStorage::Int8Group64) {
+        failures += run_int8_fast_prompt_cases(execution, false);
+        failures += run_int8_fast_prompt_cases(execution, true);
+    }
     if (storage == KvCacheStorage::Nvfp4Group16)
         failures += run_nvfp4_fast_prompt_cases(execution);
     if (storage != KvCacheStorage::BFloat16) {

@@ -31,18 +31,18 @@ inline bool int8_kv_fast_tiled_prefers_narrow(int tokens, int q_heads) {
 }
 
 // The fast prompt kernel takes the same operands as launch_int8_kv_tiled_mma: one complete query
-// row whose K/V are already in the paged cache.
+// row whose K/V are already in the paged cache. pv8 selects its 8-bit PV form.
 template <class G>
-void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
+void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache, bool pv8,
                                    cudaStream_t stream) {
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument(
             "INT8 fast prompt attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        const auto launch = [&]<int Warps>() {
+        const auto launch = [&]<int Warps, bool Pv8>() {
             using Shape           = CausalPromptI8FastShape<Warps>;
-            constexpr auto kernel = causal_attention_prompt_i8_fast_kernel<G, Metadata, Warps>;
+            constexpr auto kernel = causal_attention_prompt_i8_fast_kernel<G, Metadata, Warps, Pv8>;
             static const auto status = cudaFuncSetAttribute(
                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
             CUDA_CHECK(status);
@@ -52,10 +52,17 @@ void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadV
                 p.positions, p.scale, p.out, p.width);
             CUDA_CHECK(cudaGetLastError());
         };
-        if (int8_kv_fast_tiled_prefers_narrow(p.width, G::QHeads))
-            launch.template operator()<4>();
-        else
-            launch.template operator()<8>();
+        const bool narrow = int8_kv_fast_tiled_prefers_narrow(p.width, G::QHeads);
+        if (pv8) {
+            if (narrow)
+                launch.template operator()<4, true>();
+            else
+                launch.template operator()<8, true>();
+        } else if (narrow) {
+            launch.template operator()<4, false>();
+        } else {
+            launch.template operator()<8, false>();
+        }
     };
     if (!cache.table_rows)
         invoke(PagedKVDirectMetadata{cache.tables});

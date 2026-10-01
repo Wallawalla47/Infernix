@@ -1269,7 +1269,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const ops::CausalAttentionExecutionEnvelope chunk_envelope{
                 .min_visible_keys   = visible,
                 .max_visible_keys   = visible,
-                .fast_prompt_kernel = fast_prefill_kernel_};
+                .fast_prompt_kernel = fast_prefill_kernel_ != PromptAttentionKernel::Original,
+                .fast_prompt_pv8    = fast_prefill_kernel_ == PromptAttentionKernel::FastPv8};
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
