@@ -171,6 +171,10 @@ private:
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
+    // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
+    [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
+        return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
+    }
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);

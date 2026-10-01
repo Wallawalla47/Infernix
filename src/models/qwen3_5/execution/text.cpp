@@ -937,7 +937,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
                     residual_projection_policy(
-                        p.output, wide_residual_verification(ph, active_sequence_batch_, T, T)),
+                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
                     work_, s);
 }
 
@@ -1076,7 +1076,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
 
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,
                     residual_projection_policy(
-                        p.output, wide_residual_verification(ph, active_sequence_batch_, T, T)),
+                        p.output, wide_residual_verification(ph, row_width(T), row_width(T))),
                     work_, s);
 }
 
@@ -1090,8 +1090,9 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase ph,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
+    const std::int32_t width = row_width(x.ne[1]);
     ffn(h, weights.ffn, x, hints, work_, ctx_.execution_view(), false,
-        ph == Phase::Verify && active_sequence_batch_ == 1 && x.ne[1] > 16 && x.ne[1] <= 64);
+        wide_residual_verification(ph, width, width));
 }
 
 template <class Tap>
