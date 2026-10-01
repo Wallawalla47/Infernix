@@ -13,8 +13,12 @@ void grouped(const CausalAttentionOperands& p, Int8KvCacheView<Writable> cache, 
              CausalKvPartition partition, CausalPartialView partial, cudaStream_t stream) {
     using Instance    = Int8KvGroupedInstance<G, Tokens>;
     const auto invoke = [&]<bool MultiBatch, bool Masked>() {
-        launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked>(
-            p, cache, input, partition, partial, stream);
+        if constexpr (Instance::kPipelined)
+            launch_int8_kv_grouped_pipelined<G, Tokens, MultiBatch, Masked>(
+                p, cache, input, partition, partial, stream);
+        else
+            launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked>(
+                p, cache, input, partition, partial, stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };
@@ -74,9 +78,14 @@ void parallel_grouped(const CausalAttentionOperands& p, Int8KvReadView cache,
                       CausalKvPartition partition, CausalPartialView partial, cudaStream_t stream) {
     using Instance    = Int8KvGroupedInstance<G, Tokens>;
     const auto invoke = [&]<bool MultiBatch, bool Masked>() {
-        launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, false,
-                                   CausalCachedInput, true>(p, cache, {}, partition, partial,
-                                                            stream);
+        if constexpr (Instance::kPipelined)
+            launch_int8_kv_grouped_pipelined<G, Tokens, MultiBatch, Masked, false,
+                                             CausalCachedInput, true>(p, cache, {}, partition,
+                                                                      partial, stream);
+        else
+            launch_int8_kv_grouped_mma<G, typename Instance::Schedule, MultiBatch, Masked, false,
+                                       CausalCachedInput, true>(p, cache, {}, partition, partial,
+                                                                stream);
         launch_causal_natural_merge<G, typename Instance::Merge, MultiBatch, Masked, false>(
             p, cache.valid_columns, partition, partial, stream);
     };

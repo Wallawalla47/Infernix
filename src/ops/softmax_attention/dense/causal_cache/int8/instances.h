@@ -8,6 +8,9 @@ template <class G, int Tokens>
 struct Int8KvGroupedInstance {
     static_assert(Tokens > 0 && Tokens * G::GroupSize <= 64);
     static constexpr int kRowTiles  = (Tokens * G::GroupSize + 15) / 16;
+    // Rows of two or more columns of the 24/4 geometry use grouped_pipelined.cuh (in-register V
+    // decode, double-buffered K/V, bitwise equal); single-column rows keep the staged kernel.
+    static constexpr bool kPipelined = G::QHeads == 24 && Tokens >= 2;
     static constexpr bool kWideKeys = G::GroupSize == 8 && kRowTiles >= 3;
     using Schedule                  = Int8KvGroupedMmaSchedule<Tokens,
                                               kWideKeys        ? 4 * kRowTiles
