@@ -167,10 +167,15 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
         const int token0 =
             token_begin + warp_token * Schedule::kWarpTokens + mma_token * 16 + accumulator_token;
         const int token1 = token0 + 8;
+        // A16 tiles carry unscaled activations and pass no per-token scales.
         const float activation_scale0 =
-            (FullTokens || token0 < tokens) ? __ldg(activation_scales + token0) : 0.0F;
+            activation_scales == nullptr
+                ? 1.0F
+                : ((FullTokens || token0 < tokens) ? __ldg(activation_scales + token0) : 0.0F);
         const float activation_scale1 =
-            (FullTokens || token1 < tokens) ? __ldg(activation_scales + token1) : 0.0F;
+            activation_scales == nullptr
+                ? 1.0F
+                : ((FullTokens || token1 < tokens) ? __ldg(activation_scales + token1) : 0.0F);
 #pragma unroll
         for (int mma_row = 0; mma_row < Schedule::kMmaRows; ++mma_row) {
             const int local_row0  = warp_row * Schedule::kWarpRows + mma_row * 8 + accumulator_row;

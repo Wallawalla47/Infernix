@@ -206,6 +206,57 @@ struct Fp8A8TmaSplitKSchedule : TmaSchedule {
                   0);
 };
 
+// TMA-staged A16 GEMM. One producer warp streams E4M3 weight tiles (BlockK codes per row) and BF16
+// activation tiles (BlockK values per row, staged as 64-value 128-byte halves) through a
+// Stages-deep mbarrier ring. Consumer warps widen the codes to BF16 B fragments in registers and
+// accumulate complete K in FP32.
+template <int BlockTokens, int BlockRows, int WarpsTokens, int WarpsRows, int Stages,
+          int MinBlocksPerSm, int BlockK = 128, Fp8MmaRaster Raster = Fp8MmaRaster::TokenFast>
+struct Fp8A16TmaMmaSchedule {
+    static constexpr bool kTmaSwizzle     = true;
+    static constexpr int kStaticK         = 0;
+    static constexpr int kBlockTokens     = BlockTokens;
+    static constexpr int kBlockRows       = BlockRows;
+    static constexpr int kBlockK          = BlockK;
+    static constexpr int kWarpsTokens     = WarpsTokens;
+    static constexpr int kWarpsRows       = WarpsRows;
+    static constexpr int kStages          = Stages;
+    static constexpr int kMinBlocksPerSm  = MinBlocksPerSm;
+    static constexpr Fp8MmaRaster kRaster = Raster;
+    static constexpr int kRasterGroupRows = 1;
+    static constexpr int kWarps           = WarpsTokens * WarpsRows;
+    static constexpr int kConsumerWarps   = kWarps;
+    static constexpr int kProducerThreads = 32;
+    static constexpr int kThreads         = kProducerThreads + kWarps * 32;
+    static constexpr int kWarpTokens      = BlockTokens / WarpsTokens;
+    static constexpr int kWarpRows        = BlockRows / WarpsRows;
+    static constexpr int kMmaTokens       = kWarpTokens / 16;
+    static constexpr int kMmaRows         = kWarpRows / 8;
+    static constexpr int kMmaK            = kBlockK / 16;
+    // E4M3 weight rows are kBlockK bytes under the matching TMA swizzle.
+    static constexpr int kSegmentsPerRow = kBlockK / 16;
+    // Each 64-value activation half is one 128-byte swizzle span per token row.
+    static constexpr int kActivationHalves     = kBlockK / 64;
+    static constexpr int kActivationRowBytes   = 128;
+    static constexpr int kActivationHalfBytes  = BlockTokens * kActivationRowBytes;
+    static constexpr int kActivationStageBytes = kActivationHalves * kActivationHalfBytes;
+    static constexpr int kWeightStageBytes     = BlockRows * kBlockK;
+    static constexpr int kStageBytes           = kActivationStageBytes + kWeightStageBytes;
+    static constexpr int kOutputStagingBytes   = BlockTokens * (BlockRows + 8) * 2;
+    static constexpr int kPipelineBytes        = Stages * kStageBytes;
+    static constexpr int kStorageBytes =
+        kPipelineBytes > kOutputStagingBytes ? kPipelineBytes : kOutputStagingBytes;
+    static constexpr int kBarrierBytes = Stages * 2 * sizeof(std::uint64_t);
+    static constexpr int kSharedBytes  = kStorageBytes + kBarrierBytes;
+
+    static_assert(kWarpTokens % 16 == 0 && kWarpRows % 8 == 0);
+    static_assert(BlockTokens % WarpsTokens == 0 && BlockRows % WarpsRows == 0);
+    static_assert(BlockTokens <= 256 && BlockRows <= 256);
+    static_assert(BlockK == 64 || BlockK == 128);
+    static_assert(Stages >= 2 && MinBlocksPerSm >= 1);
+    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+};
+
 enum class Fp8ActivationStage : std::uint8_t { ActiveOnly, PaddedZero };
 
 // RowTiles 16-row MMA tiles share one CTA's staged activation and B fragments, halving the

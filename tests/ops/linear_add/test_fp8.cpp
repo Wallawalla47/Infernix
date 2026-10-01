@@ -115,7 +115,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     for (int columns = 2; columns <= 24; ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
-    for (int columns : {31, 32, 33, 63, 64, 65, 127, 128, 129, 1024})
+    // Every wide A16 route and its boundaries, including the 257..384 return to 32-column tiles.
+    for (int columns : {31,  32,  33,  63,  64,  65,  127, 128, 129, 191,
+                        192, 193, 255, 256, 257, 383, 384, 385, 512, 1024})
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     if (wide_only) {
         // Ngram copy verification keeps the residual projections on A16 through width 64.
@@ -152,6 +154,9 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
         const bool replay_changed_input =
             invocation.tokens == 4 || invocation.tokens == 128 ||
+            (invocation.policy == ops::LinearPolicy::A16Only &&
+             (invocation.tokens == 64 || invocation.tokens == 192 || invocation.tokens == 256 ||
+              invocation.tokens == 384)) ||
             (invocation.policy == ops::LinearPolicy::AllowA8 &&
              (invocation.tokens == 193 || invocation.tokens == 257 || invocation.tokens == 512 ||
               invocation.tokens == 513 || invocation.tokens == 1025));

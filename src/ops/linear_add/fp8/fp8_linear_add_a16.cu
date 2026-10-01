@@ -7,6 +7,7 @@
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_a16_simt.cuh"
+#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 
 #include <stdexcept>
 
@@ -41,19 +42,20 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         if (x.ne[1] <= 8) return sliced.template operator()<8, 8, 2>();
     }
     if (x.ne[1] <= 16) return sliced.template operator()<16, 8, 2>();
-    if constexpr (K == 6144) {
-        if (x.ne[1] <= 32) return sliced.template operator()<16, 4, 2>();
-        if (x.ne[1] <= 64) return sliced.template operator()<32, 4, 1>();
-    } else {
-        if (x.ne[1] <= 32) return sliced.template operator()<32, 8, 1>();
-        if (x.ne[1] <= 64) return sliced.template operator()<64, 2, 2>();
-    }
-    if (x.ne[1] <= 128)
-        return launch_fp8_a16_mma<
-            Fp8ScheduleInstance<Fp8A16MmaSchedule<64, 64, 128, 32, 16, 2, 2>, K>>(operands, output,
-                                                                                  epilogue, stream);
-    launch_fp8_a16_mma<Fp8ScheduleInstance<Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, K>>(
-        operands, output, epilogue, stream);
+    // Wider verification rows stream both operands through TMA. 32-column tiles keep every SM busy
+    // through 192 columns, where the stream rather than BF16 Tensor Core work sets the time; the
+    // 64-column tile then holds the Tensor Core limit beyond 192, except where its tile count
+    // would add a wave (257..384 columns).
+    const auto tma = [&]<class Schedule>() {
+        launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, K>>(operands, output, epilogue,
+                                                                 stream);
+    };
+    const int tokens = x.ne[1];
+    if (tokens <= 64) return tma.template operator()<Fp8A16TmaT32R64>();
+    if (tokens <= 128 || (tokens > 256 && tokens <= 384))
+        return tma.template operator()<Fp8A16TmaT32R128>();
+    if (tokens <= 192) return tma.template operator()<Fp8A16TmaT32R64S3>();
+    tma.template operator()<Fp8A16TmaT64R128>();
 }
 
 void fp8_linear_add_matrix_launch(const Tensor& x, const Weight& weight, Tensor& residual,
