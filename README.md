@@ -45,7 +45,8 @@ for creating NInfer!
     (mostly based on the work of others credited below); `--tolerant-tool-calls` recovers some
     broken tool calls
 13. improves the console: optional colours (`--log-colours on`), a statistics panel at the bottom
-    (`--log-stats-panel off` removes it) and a `--help` screen organised by category
+    (`--log-stats-panel off` removes it) and a `--help` screen organised by category, and can
+    rotate the request log by size (`--request-log-max-mib N`)
 14. contains various other fixes and improvements, including upstream pull requests merged before
     upstream did
 
@@ -518,11 +519,13 @@ which require `--use-original-prefix-caching`. Details:
 - **Smaller fixes:** a workspace scope opened before an arena reset no longer rolls the next
   phase's allocations back; a request an idle engine can never admit gets 503 instead of 500;
   token-count requests are bounded like generation requests; Windows servers detect clients that
-  vanish without closing the connection; and a vision overlay suffix is encoded at the right
-  position (fork PR #1 by Yunado).
+  vanish without closing the connection; a vision overlay suffix is encoded at the right
+  position (fork PR #1 by Yunado); and an Anthropic stream whose client leaves while it is still
+  queued is logged as a disconnect (499) instead of an internal error (500), by Gideon Zenz in
+  the gzenz/ninfer fork.
   Commits: [`f67a284`][c-arena-scope], [`edc9785`][c-idle-503],
   [`7936838`][c-count-bound], [`f6af07f`][c-win-keepalive],
-  [`22e6ef1`][c-pr1].
+  [`22e6ef1`][c-pr1], [`bcac0a8`][c-queued-cancel].
 
 ### Models, conversion and vision
 
@@ -578,6 +581,11 @@ which require `--use-original-prefix-caching`. Details:
   warns if the graphs ever use more. Commit: [`61e082f`][c-graph-allowance].
 - **`--thinking-budget-message S`** sets the message inserted when a request reaches its
   `--default-thinking-budget N`. Commit: [`f3aaad7`][c-thinking-message].
+- **`--request-log-max-mib N`** rotates the `--request-log-jsonl` file once it reaches `N` MiB,
+  keeping `--request-log-keep K` older files (default 4); each new file starts with a copy of the
+  server's start record. Based on the rotation by
+  [Gideon Zenz (gzenz)](https://github.com/gzenz) in the gzenz/ninfer fork.
+  Commit: [`80d73bb`][c-log-rotation].
 
 ### Kept in sync with upstream
 
@@ -734,6 +742,8 @@ well, and for the work this branch builds on.
 [c-vram-headroom]: https://github.com/Wallawalla47/ninfer-custom/commit/1684538e4cba676dc8e4832b253bdd0f25246f4f
 [c-graph-allowance]: https://github.com/Wallawalla47/ninfer-custom/commit/61e082f37a5aba0a23477e1698075daa82e47eb7
 [c-thinking-message]: https://github.com/Wallawalla47/ninfer-custom/commit/f3aaad7c3a8e0d6a66746aa6558e5cb05ceeba57
+[c-log-rotation]: https://github.com/Wallawalla47/ninfer-custom/commit/80d73bb9ee5d83fa88a4ced068a1ec792bf2bc22
+[c-queued-cancel]: https://github.com/Wallawalla47/ninfer-custom/commit/bcac0a84e115341c78ece01e905c9831c95b712e
 
 ---
 
