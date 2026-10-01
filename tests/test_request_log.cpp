@@ -38,6 +38,15 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
+std::vector<Json> read_records(const std::filesystem::path& path) {
+    std::vector<Json> records;
+    std::ifstream input(path);
+    for (std::string line; std::getline(input, line);) {
+        if (!line.empty()) { records.push_back(Json::parse(line)); }
+    }
+    return records;
+}
+
 } // namespace
 
 int main() {
@@ -920,6 +929,115 @@ int main() {
     }
     input.close();
     std::filesystem::remove(log_path);
+
+    // Size-based rotation keeps the newest files, each starting with the server's start record.
+    const std::filesystem::path rotation_dir =
+        std::filesystem::temp_directory_path() /
+        ("ninfer-request-log-rotation-" + std::to_string(test_process_id()));
+    const std::filesystem::path rotation_log = rotation_dir / "requests.jsonl";
+    const auto rotated                       = [&](int index) {
+        return std::filesystem::path(rotation_log.string() + '.' + std::to_string(index));
+    };
+    const auto reset_rotation_dir = [&] {
+        std::filesystem::remove_all(rotation_dir);
+        std::filesystem::create_directories(rotation_dir);
+    };
+    const auto write_server_start = [&](JsonlRequestLog& writer) {
+        writer.write_server_start(options, engine_options, sampling_defaults, "deployment-alias",
+                                  load, memory);
+    };
+    const auto write_request = [&](JsonlRequestLog& writer, std::uint64_t id) {
+        RequestLogContext numbered = context;
+        numbered.id                = id;
+        writer.write_request_start(numbered);
+    };
+    const auto file_bytes = [](const std::filesystem::path& path) -> std::optional<std::uintmax_t> {
+        std::error_code error;
+        const std::uintmax_t bytes = std::filesystem::file_size(path, error);
+        return error ? std::nullopt : std::optional<std::uintmax_t>(bytes);
+    };
+    const auto request_ids = [](const std::vector<Json>& records) {
+        std::vector<std::uint64_t> ids;
+        for (std::size_t index = 1; index < records.size(); ++index) {
+            ids.push_back(records[index].at("request").at("request_id").get<std::uint64_t>());
+        }
+        return ids;
+    };
+
+    reset_rotation_dir();
+    std::uint64_t server_start_bytes = 0;
+    std::uint64_t request_bytes      = 0;
+    {
+        JsonlRequestLog probe(rotation_log.string());
+        write_server_start(probe);
+        server_start_bytes = std::filesystem::file_size(rotation_log);
+        write_request(probe, 1);
+        request_bytes = std::filesystem::file_size(rotation_log) - server_start_bytes;
+    }
+    // Each file reaches the limit with its third request.
+    const std::uint64_t limit = server_start_bytes + 2 * request_bytes + request_bytes / 2;
+    reset_rotation_dir();
+    {
+        JsonlRequestLog writer(rotation_log.string(), {}, {},
+                               RequestLogRotation{.max_bytes = limit, .keep = 2});
+        write_server_start(writer);
+        for (std::uint64_t id = 1; id <= 9; ++id) { write_request(writer, id); }
+    }
+    const std::vector<Json> oldest  = read_records(rotated(2));
+    const std::vector<Json> newer   = read_records(rotated(1));
+    const std::vector<Json> current = read_records(rotation_log);
+    failures += check(!std::filesystem::exists(rotated(3)) && oldest.size() == 4 &&
+                          newer.size() == 4 && current.size() == 1,
+                      "rotation did not keep exactly the two newest full files");
+    if (oldest.size() == 4 && newer.size() == 4 && current.size() == 1) {
+        failures += check(oldest[0].at("event") == "server_start" && oldest[0] == newer[0] &&
+                              oldest[0] == current[0],
+                          "a rotated-in file does not start with the server_start record");
+        failures += check(request_ids(oldest) == std::vector<std::uint64_t>{4, 5, 6} &&
+                              request_ids(newer) == std::vector<std::uint64_t>{7, 8, 9},
+                          "rotation lost, reordered or kept the wrong records");
+        const std::uintmax_t newer_bytes = file_bytes(rotated(1)).value_or(0);
+        failures += check(newer_bytes >= limit && newer_bytes - request_bytes < limit,
+                          "a file did not rotate at the record that reached the limit");
+    }
+
+    // A file already at the limit is rotated before the new server writes to it.
+    reset_rotation_dir();
+    {
+        std::ofstream previous(rotation_log);
+        previous << std::string(1024, 'x') << '\n';
+    }
+    {
+        JsonlRequestLog reopened(rotation_log.string(), {}, {},
+                                 RequestLogRotation{.max_bytes = 1024, .keep = 1});
+        failures += check(file_bytes(rotated(1)).value_or(0) > 1024 &&
+                              file_bytes(rotation_log) == std::uintmax_t{0},
+                          "a log already at its limit was not rotated at startup");
+    }
+
+    // keep 0 deletes the full file instead of retaining it.
+    reset_rotation_dir();
+    {
+        JsonlRequestLog unkept(
+            rotation_log.string(), {}, {},
+            RequestLogRotation{.max_bytes = server_start_bytes + request_bytes / 2, .keep = 0});
+        write_server_start(unkept);
+        write_request(unkept, 1);
+    }
+    const std::vector<Json> unkept_records = read_records(rotation_log);
+    failures += check(!std::filesystem::exists(rotated(1)) && unkept_records.size() == 1 &&
+                          unkept_records[0].at("event") == "server_start",
+                      "keep 0 retained a rotated file or lost the server_start record");
+
+    bool rotated_artifact_rejected = false;
+    try {
+        JsonlRequestLog unsafe_rotation((rotation_dir / "model.jsonl").string(),
+                                        (rotation_dir / "model.jsonl.2").string(), {},
+                                        RequestLogRotation{.max_bytes = 1, .keep = 2});
+    } catch (const std::invalid_argument&) { rotated_artifact_rejected = true; }
+    failures += check(rotated_artifact_rejected,
+                      "request log rotation accepted the model artifact as a rotated file");
+    std::filesystem::remove_all(rotation_dir);
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

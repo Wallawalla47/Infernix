@@ -219,8 +219,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
                                                             options_.response_store_max_bytes),
-      operational_log_(logger),
-      request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger)) {
+      operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
+                                               std::move(logger), options_.request_log_rotation) {
     if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
         console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel));
     }

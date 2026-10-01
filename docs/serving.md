@@ -901,6 +901,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
 | `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
 | `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
+| `--request-log-max-mib N` | rotate the request log once it reaches `N` MiB ([Structured request log](#structured-request-log)); requires `--request-log-jsonl` | one file without a size limit |
+| `--request-log-keep N` | rotated request-log files kept (`0..1000`); requires `--request-log-max-mib` | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
@@ -1052,6 +1054,18 @@ the JSONL log. Monitoring tools with engine-specific metric names need an NInfer
 in append mode and flushes every event, so successive model or MTP blocks may share one campaign
 file. The parent directory must already exist. Failure to open the file aborts startup; the log path
 is also rejected if it resolves to the model artifact.
+
+`--request-log-max-mib N` rotates the file by size; without it the file grows without limit. When
+`FILE` reaches `N` MiB (at the record that crosses the limit, so a file can exceed it by one record)
+it is renamed `FILE.1`, older files move up to `FILE.2` .. `FILE.K` for `--request-log-keep K`
+(default `4`), the oldest beyond `K` is deleted, and a new `FILE` is started; with `K = 0` the full
+file is deleted instead. A file already at the limit when the server starts is rotated before it
+writes. Every new file begins with a verbatim copy of this server's `server_start` record (same
+`server_instance_id` and timestamp), so each retained file can be read on its own; a reader that
+combines files should count one start per `server_instance_id`. If the rename fails, for example
+because another process holds `FILE` open without delete sharing on Windows, the server logs a
+warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
+checked against the model artifact path.
 
 Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within

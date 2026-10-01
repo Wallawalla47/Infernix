@@ -679,6 +679,37 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    failures += check(logged.request_log_rotation.max_bytes == 0 &&
+                          logged.request_log_rotation.keep == kDefaultRequestLogKeep,
+                      "the request log must not rotate unless --request-log-max-mib is given");
+    const ServeOptions rotating =
+        parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl", "requests.jsonl",
+               "--request-log-max-mib", "256", "--request-log-keep", "0"});
+    failures += check(rotating.request_log_rotation.max_bytes == (256ULL << 20) &&
+                          rotating.request_log_rotation.keep == 0,
+                      "--request-log-max-mib/--request-log-keep did not set the rotation");
+    for (const std::vector<std::string>& arguments : std::vector<std::vector<std::string>>{
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "0"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "-1"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "17592186044416"},
+             {"--request-log-max-mib", "64"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-keep", "2"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "64",
+              "--request-log-keep", "1001"},
+             {"--request-log-jsonl", "requests.jsonl", "--request-log-max-mib", "64",
+              "--request-log-keep", "two"}}) {
+        std::vector<std::string> command{"ninfer-serve", "model.ninfer"};
+        command.insert(command.end(), arguments.begin(), arguments.end());
+        bool rejected = false;
+        try {
+            (void)parse(command);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an invalid request-log rotation option was accepted");
+    }
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--request-log-max-mib") != std::string::npos &&
+                  serve_usage_text("ninfer-serve").find("--request-log-keep") != std::string::npos,
+              "serve help omits the request-log rotation options");
     bool secret_present    = false;
     bool redaction_present = false;
     for (const std::string& argument : logged.startup_argv) {

@@ -68,16 +68,20 @@ ServerLogEnvironment query_server_log_environment(int device);
 
 // Opens in append mode so one campaign file can contain multiple independently started MTP/model
 // blocks. Every line carries server_instance_id because request ids restart at one per process.
+// With rotation, the file that reaches `max_bytes` becomes `PATH.1` (older files shift to
+// `PATH.2` .. `PATH.keep`, the oldest is deleted) and a new `PATH` starts with a copy of this
+// server's `server_start` record, so every retained file can be read on its own.
 class JsonlRequestLog {
 public:
     explicit JsonlRequestLog(const std::string& path,
                              const std::string& protected_artifact_path = {},
-                             std::shared_ptr<spdlog::logger> logger     = {});
+                             std::shared_ptr<spdlog::logger> logger     = {},
+                             RequestLogRotation rotation                = {});
 
     JsonlRequestLog(const JsonlRequestLog&)            = delete;
     JsonlRequestLog& operator=(const JsonlRequestLog&) = delete;
 
-    [[nodiscard]] bool enabled() const noexcept { return output_.is_open(); }
+    [[nodiscard]] bool enabled() const noexcept { return enabled_; }
 
     [[nodiscard]] const std::string& server_instance_id() const noexcept {
         return server_instance_id_;
@@ -98,13 +102,20 @@ public:
 
 private:
     void append(std::string record);
+    // Caller holds mutex_. Returns a warning to log after the lock is released, or empty.
+    [[nodiscard]] std::string rotate_locked();
+    [[nodiscard]] std::string rotated_path(std::uint32_t index) const;
 
     std::string path_;
     std::string server_instance_id_;
     std::ofstream output_;
     std::mutex mutex_;
     std::shared_ptr<spdlog::logger> logger_;
-    bool failed_ = false;
+    RequestLogRotation rotation_;
+    std::string server_start_record_;
+    std::uint64_t written_bytes_ = 0; // bytes in the current file
+    bool enabled_                = false;
+    bool failed_                 = false;
 };
 
 } // namespace ninfer::serve
