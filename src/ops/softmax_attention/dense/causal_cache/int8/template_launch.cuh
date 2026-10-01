@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/grouped_mma.cuh"
+#include "ops/softmax_attention/dense/causal_cache/int8/grouped_pipelined.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/tiled_mma.cuh"
 #include "ops/softmax_attention/common/causal_merge.cuh"
 #include <stdexcept>
@@ -35,6 +36,38 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
     const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, S::kTokenTile) : 1),
                     partition.capacity, p.batch);
     kernel<<<grid, S::kThreads, bytes, stream>>>(
+        p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
+        cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
+        p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class G, int Tokens, bool MultiBatch, bool Masked, bool Writable, class Input,
+          bool ParallelQueries = false>
+void launch_int8_kv_grouped_pipelined(const CausalAttentionOperands& p,
+                                      Int8KvCacheView<Writable> cache, Input input,
+                                      CausalKvPartition partition, CausalPartialView partial,
+                                      cudaStream_t stream) {
+    using Shape = Int8KvGroupedPipelinedShape;
+    static_assert(Writable == Input::writes_cache);
+    validate_quantized_causal_operands<G>(p, cache);
+    if ((!ParallelQueries && p.width != Tokens) || MultiBatch != (p.batch > 1) ||
+        Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
+        partition.target > CausalKvPartition::kMaxSplits || partition.target < 1 ||
+        partition.key_shift < 6 || partition.key_shift > 12 ||
+        partition.capacity != partition.bound(p.visible_capacity) || !partial.acc ||
+        !partial.maximum || !partial.sum)
+        throw std::invalid_argument("INT8 grouped attention: invalid schedule/partials");
+    if constexpr (Input::writes_cache)
+        if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
+    constexpr auto kernel =
+        int8_kv_grouped_pipelined_kernel<G, Tokens, MultiBatch, Masked, Input, ParallelQueries>;
+    static const auto status = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::kArenaBytes);
+    CUDA_CHECK(status);
+    const dim3 grid(G::KVHeads * (ParallelQueries ? div_up(p.width, Tokens) : 1),
+                    partition.capacity, p.batch);
+    kernel<<<grid, Shape::kThreads, Shape::kArenaBytes, stream>>>(
         p.q, input, p.positions, cache.keys, cache.values, cache.key_scales, cache.value_scales,
         cache.tables, cache.valid_columns, cache.table_rows, cache.table_stride, p.width,
         p.visible_capacity, partition, p.scale, partial.acc, partial.maximum, partial.sum);
