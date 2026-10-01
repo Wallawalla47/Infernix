@@ -57,9 +57,16 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
     else if (x.ne[1] <= 8)
         launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 5120>>(
             p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
-    else
+    else if (x.ne[1] <= 16)
         launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 5120>>(
             p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
+    else if (x.ne[1] <= 32)
+        launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<8>{});
+    else
+        launch_nvfp4_a16_mma<
+            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>, 5120>>(
+            p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
 }
 
 } // namespace ninfer::ops::detail

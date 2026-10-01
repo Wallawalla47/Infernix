@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, grouped_mse, import_encoded
+from .methods import (
+    cast_direct,
+    fp8_row_maxabs,
+    grouped_absmax,
+    grouped_mse,
+    import_encoded,
+    nvfp4_mse,
+)
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -52,6 +59,20 @@ def _optional(model, recipe, *, method=grouped_absmax):
             prefix = f"{backend}/layers/{layer}/attention/"
             for role in ("key", "value"):
                 recipe.share(prefix + "context_" + role, prefix + role)
+
+
+def _dflash2_nvfp4_gate_up(model, recipe):
+    """Store each DFlash2 layer's MLP gate/up parent as NVFP4 with 16-bit activations."""
+    if "dflash2" not in model.components:
+        return
+    layers = model.components["dflash2"]["config"]["num_hidden_layers"]
+    for layer in range(layers):
+        recipe.assign(
+            [f"dflash2/layers/{layer}/mlp/gate", f"dflash2/layers/{layer}/mlp/up"],
+            format="nvfp4",
+            method=nvfp4_mse,
+            activation_policy="A16Only",
+        )
 
 
 def _dense_groupwise(model, recipe, vocabulary, gate_up=Q4, *, method=grouped_absmax):
@@ -182,10 +203,13 @@ def qwen3_8_27b_nvfp4_nvidia(model, recipe, sources):
     """nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant) layout: every text MLP
     projection is NVFP4; attention and GDN projections are per-row FP8. The
     source output head is NVFP4, but the runtime registers the vocabulary
-    projection only for FP8, so it is dequantised and re-quantised there."""
+    projection only for FP8, so it is dequantised and re-quantised there.
+    The DFlash2 drafter's MLP gate/up is quantized to NVFP4 (A16), the rest of
+    the drafter to Q8."""
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
     _optional(model, recipe)
+    _dflash2_nvfp4_gate_up(model, recipe)
     quantized = sources["quantized"]
     recipe.assign("text/token_embedding", format=FP8, method=fp8_row_maxabs)
     for name, parameter in model.parameters.items():
