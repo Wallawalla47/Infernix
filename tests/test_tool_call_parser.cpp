@@ -1074,8 +1074,16 @@ int test_tolerant_recovery() {
                       "tolerant suffix lost the recovered call");
     failures += check(tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
                       "tolerant suffix was not flagged as a truncated tail");
+    failures += check(tolerant.diagnostics.tolerant_recovered,
+                      "tolerant suffix recovery was not reported as tolerant_recovered");
+    const auto clean = fi::parse_qwen_tool_call_output(tool_call("configure", {{"value", "x"}}), 64,
+                                                       contract, true);
+    failures += check(clean.is_tool_call_response && !clean.diagnostics.tolerant_recovered,
+                      "a well-formed call in tolerant mode was reported as tolerant_recovered");
     const auto strict = fi::parse_qwen_tool_call_output(suffixed, 64, contract);
     failures += check(!strict.is_tool_call_response, "strict suffix was recovered instead of text");
+    failures +=
+        check(!strict.diagnostics.tolerant_recovered, "strict mode reported tolerant_recovered");
     failures += check(strict.tool_calls.empty(), "strict suffix retained the recovered call");
     failures += check(strict.diagnostics.fallback_reason == Reason::TrailingContent,
                       "strict suffix was not flagged as trailing content");
@@ -1103,7 +1111,8 @@ int test_tolerant_recovery() {
                       "tolerant increment leaked recovered bytes to visible content");
     failures += check(terminal.tool_calls.size() == 1,
                       "tolerant increment did not commit the recovered call");
-    failures += check(terminal.diagnostics.fallback_reason == Reason::TruncatedTail,
+    failures += check(terminal.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          terminal.diagnostics.tolerant_recovered,
                       "tolerant increment lost the truncated-tail diagnostic");
     return failures;
 }
@@ -1183,6 +1192,8 @@ int test_tolerant_missing_function_close_bracket() {
     }
     failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
                       "tolerant recovery of a missing bracket reported a spurious fallback reason");
+    failures += check(tolerant.diagnostics.tolerant_recovered,
+                      "a repaired missing bracket was not reported as tolerant_recovered");
     const auto strict = fi::parse_qwen_tool_call_output(text, 64, *contract);
     failures += check(!strict.is_tool_call_response,
                       "strict mode recovered a call with a missing closing bracket after the function name");
@@ -1209,6 +1220,8 @@ int test_tolerant_undeclared_and_value_cut() {
                       "tolerant mode did not keep the undeclared-name call structured");
     failures += check(tolerant.diagnostics.fallback_reason == Reason::None,
                       "tolerant undeclared call reported a fallback reason");
+    failures += check(tolerant.diagnostics.tolerant_recovered,
+                      "a kept undeclared-name call was not reported as tolerant_recovered");
     const auto strict = fi::parse_qwen_tool_call_output(undeclared, 64, *contract);
     failures += check(!strict.is_tool_call_response &&
                           strict.diagnostics.fallback_reason == Reason::UndeclaredTool,
@@ -1227,8 +1240,9 @@ int test_tolerant_undeclared_and_value_cut() {
         failures += check(args.at("filePath").get<std::string>() == "/tmp/out",
                           "tolerant mode lost the partial value-cut argument");
     }
-    failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
-                      "tolerant value-cut was not flagged as a truncated tail");
+    failures += check(cut_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          cut_tolerant.diagnostics.tolerant_recovered,
+                      "tolerant value-cut was not flagged as a recovered truncated tail");
     const auto cut_strict = fi::parse_qwen_tool_call_output(value_cut, 64, *contract);
     failures += check(!cut_strict.is_tool_call_response &&
                           cut_strict.diagnostics.fallback_reason == Reason::MalformedStructure,
@@ -1241,8 +1255,9 @@ int test_tolerant_undeclared_and_value_cut() {
     const auto name_tolerant = fi::parse_qwen_tool_call_output(name_only, 64, *contract, true);
     failures += check(!name_tolerant.is_tool_call_response && name_tolerant.tool_calls.empty(),
                       "tolerant mode kept a zero-parameter truncated call");
-    failures += check(name_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail,
-                      "zero-parameter truncation was not flagged as a truncated tail");
+    failures += check(name_tolerant.diagnostics.fallback_reason == Reason::TruncatedTail &&
+                          !name_tolerant.diagnostics.tolerant_recovered,
+                      "zero-parameter truncation was not a truncated tail returned as text");
     const auto name_strict = fi::parse_qwen_tool_call_output(name_only, 64, *contract);
     failures += check(!name_strict.is_tool_call_response &&
                           name_strict.diagnostics.fallback_reason == Reason::MalformedStructure,

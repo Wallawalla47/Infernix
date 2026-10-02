@@ -1104,7 +1104,10 @@ counts once in `duplicate_parameters_repaired` for each repeat instead of demoti
 Fallback reasons are `none`, `malformed_structure`, `invalid_tool_name`, `undeclared_tool`,
 `trailing_content`, and `truncated_tail`. `truncated_tail` occurs only with `--tolerant-tool-calls`:
 with a nonzero `structured_call_count` the recovered calls were returned structurally (a discarded
-suffix or a call cut at the region end), and with none the region was returned as text. These
+suffix or a call cut at the region end), and with none the region was returned as text.
+`tolerant_recovered` is true when `--tolerant-tool-calls` turned output the strict parser rejects
+into structured calls: a recovered `truncated_tail`, or a kept call whose opener (a dropped `<` or
+keyword, a missing `>` after the name) was repaired or whose name is not a declared tool. These
 counters contain no tool arguments or generated text.
 
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
