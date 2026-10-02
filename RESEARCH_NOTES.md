@@ -364,3 +364,52 @@ The variants were measured in two sweeps; 4,2,1,2 and 2,2,1,2, measured in both,
 Up to 48 columns the existing four-warp tile stays (two K warps are 0-2 % slower from 25 to 48
 columns); from 49 two K warps with a double-buffered stage are fastest at every width. Above 64
 columns the 96- and 128-column MMA schedules are unchanged.
+
+## NVFP4 MLP schedules at decode widths
+
+At 8-32 tokens the NVFP4 A4 down projection ([5120,17408]) takes about 37.5 us and the fused
+gate/up + SwiGLU ([34816,5120]) about 66 us, 1.34 and 1.52 TB/s of weight streaming. The down
+projection's 32x64 tiles give only 80 CTAs on 170 SMs, so smaller tiles looked like a gain. RTX
+5090, `ninfer_nvfp4_linear_add_bench --n 5120 --k 17408 --policy a4` and
+`ninfer_nvfp4_linear_swiglu_bench --policy a4`, cold weights (256 MiB flush), median of 30
+repeats, mean of two passes in opposite variant order, us. Variants are (block tokens, block rows,
+block K, token warps, row warps, stages, minimum blocks per SM) of `Nvfp4A4MmaSchedule`; every
+variant keeps each output's K order, so all are bit-identical. The bench's medians move in steps of
+about 0.7 us.
+
+| Down projection, tokens | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 32,64,256,2,4,3,2 (routed to 64) | 37.5 | 38.2 | 38.1 | 38.2 | 38.1 | 38.0 | 38.2 |
+| 32,32,256,2,4,3,2 | 37.5 | 37.9 | 37.8 | 37.5 | 38.0 | 44.0 | 50.4 |
+| 32,32,256,2,2,3,2 | 37.5 | 37.6 | 38.1 | 37.9 | 37.7 | 44.3 | 48.5 |
+| 32,32,256,2,2,4,3 | 37.5 | 38.2 | 37.6 | 37.6 | 37.9 | 44.0 | 48.1 |
+| 32,64,256,2,4,4,2 | 37.5 | 38.2 | 37.9 | 38.2 | 38.0 | 37.9 | 38.1 |
+| 32,32,512,2,2,3,2 | 36.2 | 37.8 | 37.9 | 38.2 | 38.1 | 54.6 | 58.3 |
+| 32,32,256,2,1,4,4 | 36.9 | 37.9 | 38.1 | 37.9 | 38.2 | 44.4 | 48.4 |
+
+Twice the CTAs left the time unchanged: the projection streams at the same rate from 80 or 160
+CTAs, at about 75 % of DRAM peak, so the memory system rather than idle SMs limits it. Only 512 K
+per stage, which issues longer contiguous weight reads per CTA, helped, at 8 tokens; six
+interleaved passes of 50 repeats measured 36.6 against 37.6 us (-2.6 %) at 8 tokens and no change
+at 12 and 16 (-0.1 %, -0.5 %), so the [5120,17408] projection takes it up to 8 tokens. The attention output projection ([5120,6144], 17.8-19.7 us) gained
+nothing from any variant.
+
+| Gate/up, tokens | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 32,128,256,2,4,2,1 to 32; 64,128,256,4,4,2,1 to 64 (routed) | 65.4 | 66.1 | 66.1 | 66.1 | 65.4 | 68.1 | 66.1 |
+| 64 rows, 4 row warps, 2 stages, 2 blocks per SM | 70.2 | 69.5 | 70.1 | 69.5 | 70.1 | 66.1 | 66.0 |
+| 64 rows, 2 row warps, 2 stages, 2 blocks per SM | 70.3 | 69.5 | 71.2 | 70.3 | 71.3 | 66.1 | 66.2 |
+| 128 rows, 4 row warps, 3 stages, 1 block per SM | 65.4 | 66.1 | 66.1 | 66.2 | 66.1 | 68.2 | 66.1 |
+| 64 rows, 4 row warps, 3 stages, 2 blocks per SM | 64.7 | 65.4 | 65.3 | 65.4 | 65.3 | 72.2 | 72.3 |
+| 64 rows, 2 row warps, 3 stages, 3 blocks per SM | 66.1 | 66.1 | 66.1 | 66.1 | 66.1 | 74.3 | 71.6 |
+
+Each variant row uses 32-token blocks with 2 token warps up to 32 tokens and 64-token blocks with
+4 token warps above. 64-row tiles with a third stage at two CTAs per SM, over six interleaved
+passes: 65.3 against 66.1 us at 8 tokens (-1.3 %), 64.9 against 66.1 at 12 (-1.8 %) and 66.06
+against 66.14 at 16 (-0.1 %); they are routed up to 32 tokens. Above 32 tokens the same tiles are
+6-9 % slower, but with two stages they are not: six interleaved passes of 64-token tiles
+(64,64,256,4,2,2,2 and 64,64,256,4,4,2,2 against the routed 64,128,256,4,4,2,1) measured 66.1
+against 68.0-68.2 us at 33, 40, 47, 48 and 49 tokens (-2.4 to -3.0 %), 66.2 against 66.2 at 56,
+66.1 against 66.8 at 63 and equal at 64. The 128-row tile takes 68.2 us in most passes at 33-49
+tokens, the 64-row tiles 66.1 in every pass; the eight-warp 64,64,256,4,2,2,2 is routed for 33-64
+tokens.
