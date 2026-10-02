@@ -44,7 +44,8 @@ ninfer_stage_runtime_dlls(ninfer-serve)
 add_executable(ninfer-perplexity
   perplexity/main.cpp
   perplexity/corpus.cpp
-  perplexity/evaluation.cpp)
+  perplexity/evaluation.cpp
+  perplexity/distribution.cpp)
 ninfer_internal_includes(ninfer-perplexity)
 target_include_directories(ninfer-perplexity PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party

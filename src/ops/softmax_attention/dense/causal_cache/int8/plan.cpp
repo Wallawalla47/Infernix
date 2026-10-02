@@ -63,7 +63,8 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
     if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth)
         maximum = std::max(maximum, int8_fast_prompt_workspace_bytes(
                                         heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
-                                        max_width, envelope.max_visible_keys));
+                                        max_width, envelope.max_visible_keys,
+                                        envelope.prompt_split_workspace_bytes));
     return maximum;
 }
 

@@ -22,7 +22,8 @@ inline constexpr std::int32_t kInt8FastPromptMaxSplits = 8;
 // within 0.14 % of the fastest on average and 3.8 % at worst; the shape and split count planned
 // without the split cost were up to 54 % slower over a few thousand keys.
 inline FastPromptPlan int8_fast_prompt_plan(std::int32_t q_heads, std::int32_t width,
-                                            std::uint32_t max_visible_keys) {
+                                            std::uint32_t max_visible_keys,
+                                            std::size_t split_budget) {
     constexpr double kNarrowSweep      = 0.8;
     constexpr double kSplitPerColumn   = 0.5 / 24.0;
     const std::int64_t multiprocessors = fast_prompt_multiprocessors();
@@ -35,7 +36,7 @@ inline FastPromptPlan int8_fast_prompt_plan(std::int32_t q_heads, std::int32_t w
         static_cast<double>(div_up(narrow_ctas, multiprocessors)) * kNarrowSweep * keys;
     const std::int64_t ctas = static_cast<std::int64_t>(div_up(width, 128)) * q_heads;
     for (std::int32_t splits = 1; splits <= kInt8FastPromptMaxSplits; ++splits) {
-        if (!fast_prompt_split_admissible(q_heads, width, pages, splits)) break;
+        if (!fast_prompt_split_admissible(q_heads, width, pages, splits, split_budget)) break;
         double cost = static_cast<double>(div_up(ctas * splits, multiprocessors)) * keys / splits;
         if (splits > 1) cost += kSplitPerColumn * width * splits * q_heads;
         if (cost < best_cost) {
@@ -51,10 +52,12 @@ inline FastPromptPlan int8_fast_prompt_plan(std::int32_t q_heads, std::int32_t w
 // count, so fewer keys never select more splits: the plan at max_visible_keys bounds every launch.
 inline std::size_t int8_fast_prompt_workspace_bytes(std::int32_t q_heads, std::int32_t first,
                                                     std::int32_t last,
-                                                    std::uint32_t max_visible_keys) {
+                                                    std::uint32_t max_visible_keys,
+                                                    std::size_t split_budget) {
     std::size_t maximum = 0;
     for (std::int32_t width = first; width <= last; ++width) {
-        const FastPromptPlan plan = int8_fast_prompt_plan(q_heads, width, max_visible_keys);
+        const FastPromptPlan plan =
+            int8_fast_prompt_plan(q_heads, width, max_visible_keys, split_budget);
         maximum = std::max(maximum, fast_prompt_split_bytes(q_heads, width, plan.splits));
     }
     return maximum;

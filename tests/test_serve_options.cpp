@@ -735,6 +735,32 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("--use-original-nvfp4-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --use-original-nvfp4-prefill-kernel");
+    failures += check(archive.prefill_8bit_pv == ninfer::PrefillPv8::Auto,
+                      "8-bit prefill P*V must default to auto");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--no-prefill-8bit-pv"}).prefill_8bit_pv ==
+                          ninfer::PrefillPv8::Off,
+                      "--no-prefill-8bit-pv was not preserved");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-8bit-pv"}).prefill_8bit_pv ==
+                          ninfer::PrefillPv8::On,
+                      "--prefill-8bit-pv was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--no-prefill-8bit-pv") !=
+                              std::string::npos &&
+                          serve_usage_text("ninfer-serve").find("--prefill-8bit-pv") !=
+                              std::string::npos,
+                      "serve help omits the 8-bit prefill P*V flags");
+    failures += check(archive.prefill_split_workspace_mib == ninfer::kDefaultPrefillSplitWorkspaceMiB,
+                      "the prompt split workspace must default to its product default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-split-workspace-mib", "0"})
+                              .prefill_split_workspace_mib == 0,
+                      "--prefill-split-workspace-mib 0 was not preserved");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-split-workspace-mib") !=
+                          std::string::npos,
+                      "serve help omits --prefill-split-workspace-mib");
+    bool split_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--prefill-split-workspace-mib", "16385"});
+    } catch (const std::invalid_argument&) { split_rejected = true; }
+    failures += check(split_rejected, "a prompt split workspace above 16384 MiB was accepted");
     bool fast_flag_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"});

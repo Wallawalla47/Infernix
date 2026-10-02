@@ -143,8 +143,8 @@ int main(int argc, char** argv) {
                 with_committed.push_back(d.committed);
                 auto with_oracle = d.prefix;
                 with_oracle.push_back(d.oracle);
-                const float committed = scorer.score_tokens(with_committed, first).at(0);
-                const float oracle    = scorer.score_tokens(with_oracle, first).at(0);
+                const float committed = scorer.score_tokens(with_committed, first).logprobs.at(0);
+                const float oracle    = scorer.score_tokens(with_oracle, first).logprobs.at(0);
                 const float margin    = oracle - committed;
                 worst                 = std::max(worst, margin);
                 above_half += margin > 0.5F ? 1U : 0U;

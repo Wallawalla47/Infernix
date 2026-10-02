@@ -48,6 +48,16 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// FP16 accumulation: the full FP16 Tensor Core rate on RTX 5090, where FP32 accumulation runs
+// at half of it. c0 holds row g's columns {2t, 2t+1} and c1 row g+8's, each as a half2.
+__device__ __forceinline__ void mma_f16_f16acc(unsigned& c0, unsigned& c1, unsigned a0, unsigned a1,
+                                               unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                 : "+r"(c0), "+r"(c1)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
                                        unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -56,13 +66,12 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
-// UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
-// existing row scales in FP32 after the MMA. No operand repacking is needed.
-__device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
-                                             unsigned a0, unsigned a1, unsigned a2, unsigned a3,
-                                             unsigned b0, unsigned b1) {
-    constexpr unsigned kUnitScale8          = 0x7Fu;
+// Block-scaled E4M3 with FP32 accumulation, the full FP8 rate on RTX 5090. sfa and sfb are
+// UE8M0 scales (byte 0, 0x7f is exactly 1) applied to every row of A and column of B.
+__device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float& c2, float& c3,
+                                                    unsigned a0, unsigned a1, unsigned a2,
+                                                    unsigned a3, unsigned b0, unsigned b1,
+                                                    unsigned sfa, unsigned sfb) {
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
     asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X."
@@ -70,9 +79,18 @@ __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, fl
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, "
                  "{%10}, {%11,%12}, {%13}, {%14,%15};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(kUnitScale8),
-                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(kUnitScale8), "h"(kScaleBlockId),
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
+                   "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+}
+
+// On RTX 5090, block-scaled FP8 avoids the plain form's half-rate FP32 accumulation.
+// UE8M0 0x7f is exactly 1: preserve the raw E4M3 dot product and keep the callers'
+// existing row scales in FP32 after the MMA. No operand repacking is needed.
+__device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
+                                             unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                             unsigned b0, unsigned b1) {
+    mma_fp8_e4m3_scaled(c0, c1, c2, c3, a0, a1, a2, a3, b0, b1, 0x7Fu, 0x7Fu);
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,

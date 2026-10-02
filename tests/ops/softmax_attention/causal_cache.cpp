@@ -77,6 +77,17 @@ constexpr ReductionCriterion kAttentionK8V4Criterion{
     /*gross_relative_to_max_reference*/ 1.1e-1,
 };
 
+// The 8-bit PV form of NVFP4 and K8V4 rounds every probability and every decoded V value once to
+// E4M3 (three fraction bits: relative error at most 2^-4 each). Independent uniform rounding of
+// both factors gives each product a relative RMS error of sqrt(2) * 2^-4 / sqrt(3), about 0.051,
+// and at most (1 + 2^-4)^2 - 1, about 0.129; the storage's own criterion applies where it is
+// looser.
+constexpr ReductionCriterion kAttentionE4m3PvCriterion{
+    /*relative_l2*/ 5.0e-2,
+    /*gross_absolute*/ 5.0e-3,
+    /*gross_relative_to_max_reference*/ 1.3e-1,
+};
+
 struct TestVectorLayout {
     DType code_dtype;
     std::int32_t code_extent;
@@ -140,6 +151,8 @@ struct AttentionCase {
     float value_amplitude   = 1.0f;
     // With fast_prompt_kernel over INT8 KV: run the kernel's 8-bit PV form.
     bool fast_prompt_pv8 = false;
+    // Envelope bound on the FP32 partials of a prompt launch's key splits.
+    std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1719,13 +1732,29 @@ const char* cache_name(KvCacheStorage storage) {
     return "unknown";
 }
 
-ReductionCriterion attention_criterion(KvCacheStorage storage) {
+ReductionCriterion storage_attention_criterion(KvCacheStorage storage) {
     if (storage == KvCacheStorage::BFloat16) return kAttentionBf16Criterion;
     if (storage == KvCacheStorage::Int8Group64) return kAttentionInt8Criterion;
     if (storage == KvCacheStorage::Fp8E4M3Row256) return kAttentionFp8Criterion;
     if (storage == KvCacheStorage::Nvfp4Group16) return kAttentionNvfp4Criterion;
     if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kAttentionK8V4Criterion;
     throw std::logic_error("unregistered causal-attention test storage");
+}
+
+// pv8 selects the 8-bit PV form; INT8's keeps V exact and meets the INT8 criterion.
+ReductionCriterion attention_criterion(KvCacheStorage storage, bool pv8 = false) {
+    ReductionCriterion criterion = storage_attention_criterion(storage);
+    if (pv8 && (storage == KvCacheStorage::Nvfp4Group16 ||
+                storage == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        criterion.relative_l2 =
+            std::max(criterion.relative_l2, kAttentionE4m3PvCriterion.relative_l2);
+        criterion.gross_absolute =
+            std::max(criterion.gross_absolute, kAttentionE4m3PvCriterion.gross_absolute);
+        criterion.gross_relative_to_max_reference =
+            std::max(criterion.gross_relative_to_max_reference,
+                     kAttentionE4m3PvCriterion.gross_relative_to_max_reference);
+    }
+    return criterion;
 }
 
 int verify_attention(const std::string& label, const std::vector<double>& actual,
@@ -1804,7 +1833,7 @@ std::vector<T> select_query_columns(const std::vector<T>& values, std::size_t st
     return result;
 }
 
-int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries         = {},
                 std::span<const std::uint32_t> graph_limits = {}) {
@@ -1831,8 +1860,9 @@ int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geomet
     }
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
-    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
-    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
+    envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
+    envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
 
     const HostCache initial = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                          amplitude, test_case.value_amplitude);
@@ -1901,7 +1931,8 @@ int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geomet
                 verify_attention(std::string(cache_name(storage)) + " attention envelope update",
                                  bf16_bits_to_double(select_query_columns(
                                      actual, kHeadDim * geometry.q_heads, oracle_queries)),
-                                 reference, attention_criterion(storage));
+                                 reference,
+                                 attention_criterion(storage, test_case.fast_prompt_pv8));
         }
     }
 
@@ -1913,7 +1944,8 @@ int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geomet
                    verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference,
+                                    attention_criterion(storage, test_case.fast_prompt_pv8));
     failures += verify_cache(label, cache.snapshot(), expected);
     if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         DeviceCache standalone(initial, mapping, max_context);
@@ -1938,7 +1970,7 @@ int run_a1_case(execution, DeviceExecutionView execution, const Geometry& geomet
     return failures;
 }
 
-int run_a3_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                 const AttentionCase& test_case, MappingPattern mapping,
                 std::span<const int> oracle_queries = {}) {
     const std::int32_t total       = test_case.base + test_case.tokens;
@@ -1956,8 +1988,9 @@ int run_a3_case(execution, DeviceExecutionView execution, const Geometry& geomet
     }
     ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                    test_case.envelope_max};
-    envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
-    envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
+    envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
+    envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
+    envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
 
     const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                             amplitude, test_case.value_amplitude);
@@ -1998,7 +2031,8 @@ int run_a3_case(execution, DeviceExecutionView execution, const Geometry& geomet
     int failures = verify_attention(label,
                                     bf16_bits_to_double(select_query_columns(
                                         output_bits, kHeadDim * geometry.q_heads, oracle_queries)),
-                                    reference, attention_criterion(storage));
+                                    reference,
+                                    attention_criterion(storage, test_case.fast_prompt_pv8));
     failures += verify_cache(label + " cache unchanged", cache.snapshot(), cache_host);
     failures += verify_input(label + " q unchanged", dq, q_bits);
     failures += verify_positions(label + " positions unchanged", dp, positions);
@@ -2069,7 +2103,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
     return failures;
 }
 
-int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
+int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                    const BatchAttentionCase& test_case, int envelope_max = 0,
                    std::span<const std::uint32_t> graph_limits = {}) {
     const int batch = test_case.contexts.size(), width = test_case.width;
@@ -2205,7 +2239,7 @@ int run_batch_case(execution, DeviceExecutionView execution, const Geometry& geo
                                   " phase=" + std::to_string(phase);
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
-                                     attention_criterion(storage));
+                                     attention_criterion(storage, test_case.fast_prompt_pv8));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
         BatchDeviceCache::Bytes after = cache.snapshot_bytes();
         failures += cache.verify(label, expected, after);
@@ -2308,7 +2342,7 @@ int run_quantized_batch_cases(DeviceExecutionView execution, KvCacheStorage stor
     failures +=
         run_batch_case(execution, kGeometries[1], storage,
                        {6, {61, 127}, {6, 3}, {1, 0}, MappingPattern::Fragmented, seed + 1u});
-    failures += run_batch_case(execution, 
+    failures += run_batch_case(
         execution, kGeometries[0], storage,
         {6, {0, 63, 127, 2048}, {1, 6, 0, 3}, {2, 0, 3, 1}, MappingPattern::Fragmented, seed + 2u});
     failures += run_batch_case(execution, kGeometries[1], storage,
@@ -2468,11 +2502,11 @@ int run_batch_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                     {7, 0, 5, 2, 6, 1, 4, 3},
                                     MappingPattern::Identity,
                                     502u});
-        failures += run_batch_case(execution, 
+        failures += run_batch_case(
             execution, kGeometries[0], storage,
             {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
     } else if (storage == KvCacheStorage::Fp8E4M3Row256) {
-        failures += run_batch_case(execution, 
+        failures += run_batch_case(
             execution, kGeometries[0], storage,
             {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 505u});
     }
@@ -2579,7 +2613,7 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
                                 MappingPattern::Fragmented);
         failures += run_a3_case(execution, geometry, storage, {13, 513, 8192, 609u, false, true},
                                 MappingPattern::Fragmented);
-        failures += run_batch_case(execution, 
+        failures += run_batch_case(
             execution, geometry, storage,
             {16, {17, 1025, 64}, {0, 7, 16}, {2, 0, 1}, MappingPattern::Fragmented, 610u, true});
         const std::array<int, 4> queries{0, 63, 64, 1023};
@@ -2606,13 +2640,13 @@ int run_quantized_causal_cases(DeviceExecutionView execution, KvCacheStorage sto
                                 MappingPattern::Fragmented);
         failures += run_a3_case(execution, geometry, storage, {1, 0, 1, 613u, false, true},
                                 MappingPattern::Fragmented);
-        failures += run_batch_case(execution, 
+        failures += run_batch_case(
             execution, geometry, storage,
             {1, {0, 31, 63}, {0, 1, 1}, {2, 0, 1}, MappingPattern::Fragmented, 614u, true});
     }
     failures += run_a3_case(execution, kGeometries[1], storage, {7, 511, 8192, 615u, false, true},
                             MappingPattern::Fragmented);
-    failures += run_batch_case(execution, 
+    failures += run_batch_case(
         execution, kGeometries[1], storage,
         {7, {17, 4097, 64}, {0, 5, 7}, {2, 0, 1}, MappingPattern::Fragmented, 616u, true});
     // A long batch gives each grouped CTA more pages than the old staged table
@@ -2808,7 +2842,7 @@ int run_numerical_profile_cases(DeviceExecutionView execution, KvCacheStorage st
     for (const auto& geometry : kGeometries) {
         for (int width : {1, 16, 1024}) {
             const float amplitude = (width == 1 ? 1.0f : 1.8f) * std::sqrt(3.0f);
-            failures += run_a1_case(execution, 
+            failures += run_a1_case(
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 1201u, false, false, amplitude},
                 MappingPattern::Fragmented,
@@ -2865,11 +2899,11 @@ int run_wide_copy_cases(DeviceExecutionView execution, KvCacheStorage storage) {
                                            {width, {2048}, {valid}, {0}, MappingPattern::Fragmented,
                                             static_cast<unsigned>(2000 + width + valid), true});
             }
-            failures += run_a1_case(execution, 
+            failures += run_a1_case(
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 2101u, false, true},
                 MappingPattern::Fragmented);
-            failures += run_a3_case(execution, 
+            failures += run_a3_case(
                 execution, geometry, storage,
                 {width, 8192, static_cast<unsigned>(8192 + width), 2102u, false, true},
                 MappingPattern::Fragmented);
@@ -2996,15 +3030,17 @@ int run_int8_fast_prompt_cases(DeviceExecutionView execution, bool pv8) {
         return failures;
 }
 
-// The fast NVFP4 prompt kernel over prompt-route widths above 2048 visible keys: partial and full
+// The fast NVFP4 prompt kernel over prompt-route widths above 768 visible keys: partial and full
 // row blocks, launches over enough key pages to split them across CTAs (including an envelope far
 // past the populated keys, so late splits own no visible key), V magnitudes whose group scales need
 // its FP16-partial rescale, a masked row, and the production prefill chunk after a long history.
-int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution) {
+// pv8 runs the kernel's 8-bit (E4M3) PV form.
+int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution, bool pv8) {
     constexpr KvCacheStorage storage = KvCacheStorage::Nvfp4Group16;
     int failures                     = 0;
-    const auto fast                  = [](AttentionCase test_case) {
+    const auto fast                  = [pv8](AttentionCase test_case) {
         test_case.fast_prompt_kernel = true;
+        test_case.fast_prompt_pv8    = pv8;
         return test_case;
     };
     const auto values = [&](AttentionCase test_case, float amplitude) {
@@ -3032,7 +3068,65 @@ int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution) {
                             MappingPattern::Fragmented, chunk_queries);
     BatchAttentionCase masked{300, {3000}, {211}, {0}, MappingPattern::Fragmented, 926u, true};
     masked.fast_prompt_kernel = true;
+    masked.fast_prompt_pv8    = pv8;
     failures += run_batch_case(execution, h24, storage, masked);
+    return failures;
+}
+
+// The MXFP8 tiled prompt kernel of FP8 and K8V4 KV (widths above 80) accumulates each 64-key PV
+// tile in FP16 under a per-tile power-of-two V shift. V magnitudes sit on either side of that
+// limit: FP8 row scales (|V| / 448) just under 2 at 800 and past it at 900 and 2048; K8V4 group
+// scales past 128 at 900 and up to the largest UE4M3 values at 2048. The production prefill chunk
+// runs after a history, unscaled and scaled. pv8 runs K8V4's 8-bit (E4M3) PV form, whose V shift
+// brings each tile's largest scale into [32, 64) from either side.
+int run_mxfp8_tiled_prompt_cases(DeviceExecutionView execution, KvCacheStorage storage, bool pv8) {
+    int failures          = 0;
+    const std::uint32_t s = storage == KvCacheStorage::Fp8E4M3Row256 ? 1200u : 1220u;
+    const auto values     = [pv8](AttentionCase test_case, float amplitude) {
+        test_case.value_amplitude = amplitude;
+        test_case.fast_prompt_pv8 = pv8;
+        return test_case;
+    };
+    const Geometry& h24 = kGeometries[0];
+    const Geometry& h16 = kGeometries[1];
+    failures += run_a1_case(execution, h24, storage, values({300, 1000, 1300, s + 1}, 800.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(execution, h24, storage, values({640, 400, 1040, s + 2}, 900.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(execution, h24, storage, values({1100, 64, 1164, s + 3}, 2048.0f),
+                            MappingPattern::Fragmented);
+    failures += run_a1_case(execution, h16, storage, values({300, 1900, 8192, s + 4}, 2048.0f),
+                            MappingPattern::Offset);
+    const std::array<int, 6> chunk_queries{0, 127, 128, 1791, 3456, 3583};
+    const auto chunk = [&](std::int32_t base, std::uint32_t seed) {
+        return values(AttentionCase{3584, base, static_cast<std::uint32_t>(base + 3584), seed},
+                      1.0f);
+    };
+    failures +=
+        run_a1_case(execution, h24, storage, chunk(8192, s + 5), MappingPattern::Fragmented, chunk_queries);
+    failures += run_a1_case(execution, h24, storage, values(chunk(1000, s + 6), 2048.0f),
+                            MappingPattern::Identity, chunk_queries);
+    // Small V: scales far below 32 are shifted up into the E4M3 range.
+    failures += run_a3_case(execution, h24, storage, values({300, 700, 1000, s + 8}, 0.05f),
+                            MappingPattern::Fragmented);
+    failures +=
+        run_a3_case(execution, h16, storage, chunk(2000, s + 7), MappingPattern::Offset, chunk_queries);
+    return failures;
+}
+
+// A 1024-column follow-up over a long history splits its keys across CTAs by default; a 64 MiB
+// split workspace bounds it to fewer splits and none leaves one split. Every count meets the
+// storage's criterion.
+int run_prompt_split_budget_cases(DeviceExecutionView execution, KvCacheStorage storage) {
+    int failures = 0;
+    const std::array<int, 4> queries{0, 511, 512, 1023};
+    for (const std::size_t mib : {std::size_t{0}, std::size_t{64}}) {
+        AttentionCase test_case{1024, 20000, 21024, 1300u + static_cast<std::uint32_t>(mib)};
+        test_case.fast_prompt_kernel    = true;
+        test_case.split_workspace_bytes = mib << 20;
+        failures += run_a1_case(execution, kGeometries[0], storage, test_case, MappingPattern::Fragmented,
+                                queries);
+    }
     return failures;
 }
 
@@ -3042,7 +3136,7 @@ int run_nvfp4_fast_prompt_cases(DeviceExecutionView execution) {
 // shorter call's live columns must be bit-identical to the same columns of the longer one.
 // Contexts sit just below key-tile and partition boundaries so that a partition following the
 // live length would move.
-int run_masked_prefix_invariance_case(const Geometry& geometry, KvCacheStorage storage,
+int run_masked_prefix_invariance_case(DeviceExecutionView execution, const Geometry& geometry, KvCacheStorage storage,
                                       std::int32_t width, const std::vector<std::int32_t>& contexts,
                                       const std::vector<std::int32_t>& long_valid,
                                       const std::vector<std::int32_t>& short_valid,
@@ -3124,17 +3218,17 @@ int run_masked_prefix_invariance_cases(DeviceExecutionView execution, KvCacheSto
     for (const Geometry& geometry : kGeometries) {
         for (const int width : {8, 16, 32, 64})
             for (const int shorter : {1, width / 2, width - 1})
-                failures += run_masked_prefix_invariance_case(
+                failures += run_masked_prefix_invariance_case(execution, 
                     geometry, storage, width, {8190}, {width}, {shorter},
                     static_cast<unsigned>(3100 + width + shorter));
         // BF16 switches to its long split target at 32768 visible keys.
         for (const int width : {8, 64})
             for (const int shorter : {1, width - 1})
-                failures += run_masked_prefix_invariance_case(
+                failures += run_masked_prefix_invariance_case(execution, 
                     geometry, storage, width, {40958}, {width}, {shorter},
                     static_cast<unsigned>(3150 + width + shorter));
         for (const int width : {16, 32, 64}) {
-            failures += run_masked_prefix_invariance_case(
+            failures += run_masked_prefix_invariance_case(execution, 
                 geometry, storage, width, {8190, 30718, 4094, 127}, {width, width, width, width},
                 {1, width / 2, width - 1, 3}, static_cast<unsigned>(3200 + width));
         }
@@ -3161,8 +3255,17 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
         failures += run_int8_fast_prompt_cases(execution, true);
     }
     failures += run_tree_mask_cases(execution, storage);
-    if (storage == KvCacheStorage::Nvfp4Group16)
-        failures += run_nvfp4_fast_prompt_cases(execution);
+    if (storage == KvCacheStorage::Nvfp4Group16) {
+        failures += run_nvfp4_fast_prompt_cases(execution, false);
+        failures += run_nvfp4_fast_prompt_cases(execution, true);
+    }
+    if (storage == KvCacheStorage::Fp8E4M3Row256)
+        failures += run_mxfp8_tiled_prompt_cases(execution, storage, false);
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        failures += run_mxfp8_tiled_prompt_cases(execution, storage, false);
+        failures += run_mxfp8_tiled_prompt_cases(execution, storage, true);
+    }
+    if (storage != KvCacheStorage::BFloat16) failures += run_prompt_split_budget_cases(execution, storage);
     if (storage != KvCacheStorage::BFloat16) {
         failures += run_quantized_causal_cases(execution, storage);
     } else {

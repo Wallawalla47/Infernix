@@ -217,8 +217,10 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
 | `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
-| `--int8-prefill-8bit-pv` | run the fast INT8 prompt kernel's P×V on 8-bit codes (INT8 Tensor Cores); faster at long context with a measurable numerical deviation (see the README); requires `--kv-dtype int8` without `--use-original-int8-prefill-kernel` | off |
-| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 2048 visible keys |
+| `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels and K8V4's); INT8 only overrides its default, FP16 P×V, which is up to 5 % slower on long prompts but has about half the KL divergence from a BF16 KV reference | INT8 only |
+| `--no-prefill-8bit-pv` | force FP16 P×V for NVFP4 and K8V4 KV too, without their default 8-bit E4M3 form (5-7 % more end-to-end long-prompt prefill time; the 8-bit form's KL divergence from BF16 KV stays within 1.1x FP16's) | NVFP4, K8V4 |
+| `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 768 visible keys |
+| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, for splitting one prompt-attention launch's keys across SMs (INT8, NVFP4, FP8 and K8V4 KV); less frees KV cache but slows 1-2K-token chunks over long context (`64`: 17-25 % slower attention over 32K-128K keys; `128`: 2-5 %; `192` and up: under 1 %); `0` turns splitting off. See [serving](serving.md) | `256` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |

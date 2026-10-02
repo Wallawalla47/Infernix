@@ -1,6 +1,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_plan.h"
+#include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_prompt_launch.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -62,12 +63,14 @@ std::size_t nvfp4_kv_workspace_bytes(int heads, int batch, int min_width, int ma
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
-    // The fast prompt kernel may split a prompt-route launch's keys across CTAs.
+    // The fast prompt kernel publishes FP32 split partials for the merge.
     if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth &&
         nvfp4_fast_prompt_applies(envelope.max_visible_keys))
-        maximum = std::max(maximum, nvfp4_fast_prompt_workspace_bytes(
+        maximum = std::max(maximum, mxfp8_tiled_workspace_bytes(
                                         heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
-                                        max_width, envelope.max_visible_keys));
+                                        max_width, envelope.max_visible_keys,
+                                        multiprocessor_count,
+                                        envelope.prompt_split_workspace_bytes));
     return maximum;
 }
 

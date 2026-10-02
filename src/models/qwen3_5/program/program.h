@@ -385,8 +385,8 @@ public:
     Program& operator=(Program&&)      = delete;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                                const runtime::ResolvedExecutionOptions& options);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
-                                                  std::uint32_t first_target);
+    [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                    bool consume_private                             = false,

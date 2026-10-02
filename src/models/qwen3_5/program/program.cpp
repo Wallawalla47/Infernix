@@ -128,8 +128,10 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     return impl_->plan_request(PreparedPromptAccess::take(std::move(prompt)), options);
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), target);
+ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                  const ScoreOptions& options) {
+    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target,
+                               options);
 }
 
 std::optional<SourceCandidate>

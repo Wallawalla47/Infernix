@@ -12,13 +12,14 @@ namespace ninfer::ops {
  * Op: Target token log-probabilities
  *
  * Math / indexing:
- *   Let l[r,c] be the exact real value represented by logits[r,c]. For every column c,
+ *   Let l[r,c] be the exact real value represented by logits[r,c]. For every column c and each
+ *   of its T targets t,
  *
- *     ideal[c] = l[target_ids[c],c]
- *                - log(sum_{r=0..valid_rows-1} exp(l[r,c])).
+ *     ideal[t,c] = l[target_ids[t,c],c]
+ *                  - log(sum_{r=0..valid_rows-1} exp(l[r,c])).
  *
  * Logical shapes:
- *   logits is [physical_rows,C], target_ids is [C], and output is [C], with C>0 and
+ *   logits is [physical_rows,C], and target_ids and output are [T,C], with C>0, T>0 and
  *   1<=valid_rows<=physical_rows. Values in target_ids are in [0,valid_rows). Physical rows
  *   [valid_rows,physical_rows) do not participate in either the denominator or target lookup.
  *

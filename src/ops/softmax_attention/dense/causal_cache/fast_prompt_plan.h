@@ -1,15 +1,16 @@
 #pragma once
 
-// Host side of the fast INT8 and NVFP4 prompt kernels' key splits: the launch shape, the FP32
-// partials a split launch publishes, their budget and the workspace they need. Both kernels use
-// 128- and 64-row CTAs of one query head at one CTA per SM, and a split launch merges its
-// partial rows with causal_attention_prompt_fast_merge_kernel (fast_prompt_common.cuh). Each
-// kernel chooses its own shape and split count (int8/fast_tiled_plan.h, nvfp4/fast_tiled_plan.h).
+// Host side of the fast INT8 prompt kernel's key splits: the launch shape, the FP32 partials a
+// split launch publishes, their budget and the workspace they need. The kernel uses 128- and
+// 64-row CTAs of one query head at one CTA per SM, and a split launch merges its partial rows with
+// causal_attention_prompt_fast_merge_kernel (fast_prompt_common.cuh); int8/fast_tiled_plan.h
+// chooses the shape and split count.
 
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "ops/common/math.h"
+#include "ops/softmax_attention/common/causal_partition.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,8 +47,9 @@ inline std::size_t fast_prompt_split_bytes(std::int32_t q_heads, std::int32_t wi
     return layout.peak_bytes(1);
 }
 
-// Split partials may use at most 64 MiB, and every split keeps at least eight 64-key pages.
-inline constexpr std::size_t kFastPromptSplitBudgetBytes  = std::size_t{64} << 20;
+// Split partials stay within the launch's split workspace
+// (CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes), and every split keeps at least
+// eight 64-key pages.
 inline constexpr std::int32_t kFastPromptMinPagesPerSplit = 8;
 
 inline std::int32_t fast_prompt_pages(std::uint32_t visible_keys) {
@@ -57,10 +59,10 @@ inline std::int32_t fast_prompt_pages(std::uint32_t visible_keys) {
 
 // Whether a launch of this width over this many key pages may use this many splits.
 inline bool fast_prompt_split_admissible(std::int32_t q_heads, std::int32_t width,
-                                         std::int32_t pages, std::int32_t splits) {
-    return splits <= 1 ||
-           (pages >= splits * kFastPromptMinPagesPerSplit &&
-            fast_prompt_split_bytes(q_heads, width, splits) <= kFastPromptSplitBudgetBytes);
+                                         std::int32_t pages, std::int32_t splits,
+                                         std::size_t split_budget) {
+    return splits <= 1 || (pages >= splits * kFastPromptMinPagesPerSplit &&
+                           fast_prompt_split_bytes(q_heads, width, splits) <= split_budget);
 }
 
 inline int fast_prompt_multiprocessors() {

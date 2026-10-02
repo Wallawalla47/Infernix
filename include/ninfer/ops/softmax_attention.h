@@ -15,24 +15,34 @@
 namespace ninfer::ops {
 
 inline constexpr std::uint32_t kCausalAttentionMaximumVisibleKeys = 1048576;
+// Default CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes.
+inline constexpr std::size_t kCausalPromptSplitWorkspaceDefaultBytes = std::size_t{256} << 20;
 
 struct CausalAttentionExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
     std::uint32_t max_visible_keys = 0;
     // Run prompt-route launches over an INT8-G64 or NVFP4-G16 cache on the fast prompt kernel
-    // (each warp keeps its query rows, scores and output in registers; FP16 per-tile PV
-    // accumulation; NVFP4 also decodes V in registers and runs QK on block-scaled FP4 Tensor Cores
-    // with a two-term NVFP4 Q) instead of the storage's tiled kernel. NVFP4 takes it only over more
-    // than 2048 visible keys. Other routes and cache formats ignore it, and it never changes the
-    // route. Over NVFP4 it can change the workspace: the fast kernel may split a single-row launch's
-    // keys across CTAs, so workspace planning and execution must use the same hint.
+    // (INT8: each warp keeps its query rows, scores and output in registers with FP16 per-tile PV
+    // accumulation; NVFP4: the MXFP8 tiled kernel with block-scaled FP4 QK on a two-term NVFP4 Q)
+    // instead of the storage's tiled kernel. NVFP4 takes it only over more than 768 visible keys.
+    // Other routes and cache formats ignore it, and it never changes the route.
     bool fast_prompt_kernel = false;
-    // With fast_prompt_kernel over an INT8-G64 cache, run the fast prompt kernel's PV on 8-bit
-    // integer Tensor Cores: each probability times its key's V group scale is rounded to a u8 code
-    // against that row's largest such product in the 64-key tile, and the stored INT8 V codes are
-    // multiplied exactly with INT32 accumulation. This is an opt-in precision change of the
-    // probabilities; other routes and cache formats ignore it.
+    // Run prompt-route PV on 8-bit Tensor Cores, a precision change:
+    //   * INT8-G64 with fast_prompt_kernel: each probability times its key's V group scale is
+    //     rounded to a u8 code against that row's largest such product in the 64-key tile, and the
+    //     stored INT8 V codes are multiplied exactly with INT32 accumulation.
+    //   * NVFP4-G16 with fast_prompt_kernel (over more than 768 visible keys) and K8V4's tiled
+    //     kernel: probabilities are rounded to E4M3 against the tile's own row maximum, V decodes
+    //     to E4M3 under a per-tile power-of-two shift, and PV accumulates in FP32 on block-scaled
+    //     E4M3 Tensor Cores.
+    // Other routes and cache formats ignore it.
     bool fast_prompt_pv8 = false;
+    // Workspace the FP32 split partials of one prompt-route launch of the fast INT8 or NVFP4
+    // prompt kernel, or FP8 or K8V4's tiled kernel, may take. These kernels split a launch's keys
+    // across CTAs when its row blocks alone would leave SMs idle; a launch whose split count would
+    // need more runs fewer splits. The split count changes only rounding. It sizes the workspace,
+    // so workspace planning and execution must use the same value.
+    std::size_t prompt_split_workspace_bytes = kCausalPromptSplitWorkspaceDefaultBytes;
 };
 
 struct ContextAttentionExecutionEnvelope {

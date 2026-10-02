@@ -75,13 +75,15 @@ struct Options {
     bool profile     = false;
     bool fast_prompt = false;
     bool fast_prompt_pv8 = false;
+    std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
     std::string csv_out;
 };
 
 // --fast-prompt: every envelope asks for the fast INT8/NVFP4 prompt kernel; --fast-prompt-pv8
-// additionally selects the INT8 fast kernel's 8-bit PV form.
-bool envelope_fast_prompt     = false;
-bool envelope_fast_prompt_pv8 = false;
+// additionally selects the 8-bit PV form; --split-workspace-mib bounds prompt key splits.
+bool envelope_fast_prompt                 = false;
+bool envelope_fast_prompt_pv8             = false;
+std::size_t envelope_split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
 
 struct Result {
     Entry entry;
@@ -124,7 +126,7 @@ struct Result {
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--mapping identity|fragmented] "
                  "[--warmup N] [--repeat N] [--graph-calls N] [--profile] [--fast-prompt] "
-                 "[--fast-prompt-pv8] "
+                 "[--fast-prompt-pv8] [--split-workspace-mib N] "
                  "[--csv-out PATH]\n",
                  message);
     std::exit(2);
@@ -264,6 +266,11 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--fast-prompt-pv8") {
             options.fast_prompt     = true;
             options.fast_prompt_pv8 = true;
+        } else if (argument == "--split-workspace-mib") {
+            options.split_workspace_bytes =
+                static_cast<std::size_t>(parse_i32(next("--split-workspace-mib requires a value"),
+                                                   0, 1048576, "--split-workspace-mib"))
+                << 20;
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out requires a path");
         } else if (argument == "--help" || argument == "-h") {
@@ -419,6 +426,7 @@ ops::CausalAttentionExecutionEnvelope execution_envelope(int visible, int maximu
         static_cast<unsigned>(maximum == 0 ? visible : maximum)};
     envelope.fast_prompt_kernel = envelope_fast_prompt;
     envelope.fast_prompt_pv8    = envelope_fast_prompt_pv8;
+    envelope.prompt_split_workspace_bytes = envelope_split_workspace_bytes;
     return envelope;
 }
 
@@ -882,6 +890,7 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         envelope_fast_prompt     = options.fast_prompt;
         envelope_fast_prompt_pv8 = options.fast_prompt_pv8;
+        envelope_split_workspace_bytes = options.split_workspace_bytes;
         DeviceContext device;
         const auto execution = device.execution_view();
         const auto stream    = execution.stream;

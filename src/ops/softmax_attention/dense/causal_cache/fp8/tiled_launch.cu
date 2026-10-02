@@ -12,8 +12,8 @@ void fp8_kv_tiled_attention(const CausalAttentionOperands& p, Fp8KvReadView cach
     const auto partial =
         allocate_causal_partials(workspace, p.query_heads, p.width, partition.capacity, 1);
     const auto invoke = [&]<class G>() {
-        launch_mxfp8_kv_tiled_mma<G, Fp8KvTiledInstance, Fp8KvTiledValues>(p, cache, partition,
-                                                                           partial.view(), stream);
+        launch_mxfp8_kv_tiled_mma<G, Fp8KvTiledInstance, Fp8TiledKeys, Fp8KvTiledValues>(
+            p, cache, partition, partial.view(), false, stream);
         launch_causal_tiled_merge<G, false>(p, cache.valid_columns, partition, partial.view(),
                                             stream);
     };
