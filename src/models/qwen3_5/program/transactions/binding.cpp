@@ -491,7 +491,9 @@ void ProgramImpl::prepare_binding(ContextTransaction& tx) {
             .write        = *tx.reserved_state,
             .fork_pending = true,
         };
-        if (is_masked_draft_backend(speculative_backend)) {
+        // DFlash lane-local state and the exact KV window are copied eagerly; the rest of the
+        // StateImage forks lazily.
+        if (state_images->has_fork_local()) {
             copy_local_for_context(tx, selectors.source, selectors.destination);
         }
     } else if (!tx.source) {

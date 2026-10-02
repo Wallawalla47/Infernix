@@ -19,6 +19,26 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+/**
+ * Exact recent-key window planes of one layer (see kKVWindowSlots); empty for formats without a
+ * window. A window belongs to a sequence's state, so its last extent counts sequence state slots:
+ * a single-sequence view carries its own slot (extent one); a batched view carries every slot and
+ * `slots` (I32 [B]) names each row's slot.
+ *   k_codes/v_codes   I8   [256, kKVWindowSlots, Hkv, slots]  rotated INT8-G64 codes
+ *   k_scales/v_scales FP16 [4, kKVWindowSlots, Hkv, slots]    their group scales
+ *   tags              I32  [2, kKVWindowSlots, Hkv, slots]    K and V position/code hashes
+ */
+struct PagedKVWindowView {
+    Tensor k_codes;
+    Tensor v_codes;
+    Tensor k_scales;
+    Tensor v_scales;
+    Tensor tags;
+    Tensor slots;
+
+    [[nodiscard]] bool present() const noexcept { return tags.data != nullptr; }
+};
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -29,6 +49,7 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVWindowView window;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -41,6 +62,7 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVWindowView window;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */

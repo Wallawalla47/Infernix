@@ -23,12 +23,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
+                                 frame.state_destination_slots, envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens, *frame.feature_sink);
     } else {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
-                                 envelope, frame.target_hidden, frame.target_logits,
+                                 frame.state_destination_slots, envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
     if (tree) {
@@ -43,7 +43,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             execution.work, stream);
         // Move each accepted side path onto the main-chain columns so the rest of the round, the
         // commit, Fold and the next context append see an ordinary chain round.
-        card.compact_tree_kv(frame.cache_positions, frame.kv_table_rows, frame.accepted_path,
+        card.compact_tree_kv(frame.cache_positions, frame.kv_table_rows,
+                             frame.state_destination_slots, frame.accepted_path,
                              frame.accepted_drafts);
         const GdnReplayRecords& records = *frame.replay_records;
         const auto dense_columns        = [](const Tensor& plane) {

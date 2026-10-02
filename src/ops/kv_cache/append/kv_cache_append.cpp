@@ -198,7 +198,9 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     if (static_cast<std::uint32_t>(tokens) > capacity) {
         throw std::invalid_argument("kv_cache_append: T exceeds cache capacity");
     }
-    if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+    if (kv_storage_has_exact_window(cache.storage)) {
+        detail::kv_cache_append_vq_launch(k, v, positions, cache, stream);
+    } else if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         detail::kv_cache_append_k8v4_launch(k, v, positions, cache, stream);
     } else if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::kv_cache_append_nvfp4_launch(k, v, positions, cache, stream);

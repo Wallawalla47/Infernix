@@ -44,14 +44,14 @@ std::size_t context_resource_index(runtime::ContextResourceClass resource) {
 
 runtime::ContextTransferRequirement
 state_transfer_requirement(const StateImageHostLayout& layout,
-                           runtime::ContextTransferDirection direction, bool dflash_local_only) {
+                           runtime::ContextTransferDirection direction, bool fork_local_only) {
     return runtime::ContextTransferRequirement{
         .resource   = runtime::ContextResourceClass::State,
         .direction  = direction,
         .units      = 1,
         .page_count = 0,
-        .work       = dflash_local_only ? dflash_local_transfer_work(layout)
-                                        : state_image_transfer_work(layout),
+        .work       = fork_local_only ? fork_local_transfer_work(layout)
+                                      : state_image_transfer_work(layout),
     };
 }
 

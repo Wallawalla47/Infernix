@@ -52,8 +52,19 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * vector occupies 128 code bytes plus 16 scale bytes. K8V4 uses the existing 256-byte row-scaled
  * FP8 K code plus one FP16 scale, and the 144-byte NVFP4 representation for V.
  *
- * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4 and K8V4 apply it
- * to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
+ * Vq2 stores each rotated row (y = R*x) as 32 eight-value word codes (64 bytes) and one FP16 row
+ * scale S; Q4KeyVq2Value stores K as 128 bytes of 4-bit Lloyd-Max level codes with one FP16 scale
+ * and V as Vq2. Their exact FP32 encoders (nearest codeword of a fixed 2^16-point codebook, or
+ * nearest level, after normalizing the row to unit RMS; S = FP16_RNE(|y|^2 / <y, c>) so the
+ * reconstruction is unbiased along y) are specified in ops/kv_cache/vq2_codec.cuh and
+ * q4_lloyd_codec.cuh. A view of these formats may carry an exact recent-key window
+ * (PagedKVWindowView): the append also writes, for every position below kKVWindowSinkTokens and
+ * every position within the final kKVWindowRingTokens of the call, that position's window slot
+ * (the INT8-G64 codes of y and a tag hashing the position and the stored codes); no other slot
+ * changes.
+ *
+ * INT8 and FP8 apply the fixed normalized D256 Hadamard preparation to K; NVFP4, K8V4 and the
+ * vector-quantized formats apply it to both K and V. Every transform is evaluated in FP32 from represented BF16 source values. The
  * paired Q and output interpretation belongs to the causal softmax_attention contract. Transform
  * results and raw code/scale bytes are not standalone mathematical outputs. Standalone and fused
  * append produce byte-identical cache representations. Every addressed code/value and scale is

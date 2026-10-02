@@ -68,7 +68,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] (default fp8)\n"
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--prefill-8bit-pv | --no-prefill-8bit-pv] (8-bit P*V for INT8; FP16 for NVFP4\n"
            "        and k8v4, which default to 8-bit; see the ninfer-serve help)\n"
@@ -143,8 +143,12 @@ Options parse_options(int argc, char** argv) {
                 out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
             } else if (dtype == "k8v4") {
                 out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+            } else if (dtype == "vq2") {
+                out.kv = ninfer::KvCacheStorage::Vq2;
+            } else if (dtype == "k4v2") {
+                out.kv = ninfer::KvCacheStorage::Q4KeyVq2Value;
             } else {
-                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, or k8v4");
+                usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
@@ -180,6 +184,10 @@ std::string kv_name(ninfer::KvCacheStorage value) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::Vq2:
+        return "vq2";
+    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     throw std::logic_error("unknown KV dtype");
 }

@@ -11,6 +11,29 @@ namespace ninfer {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 
+// Exact recent-key window of the vector-quantized formats (Vq2, Q4KeyVq2Value). Every execution
+// row of a layer owns kKVWindowSlots INT8-G64 copies of rotated K and V rows: slots
+// [0, kKVWindowSinkTokens) hold positions below kKVWindowSinkTokens and the remaining
+// kKVWindowRingTokens slots hold position p >= kKVWindowSinkTokens at
+// kKVWindowSinkTokens + p % kKVWindowRingTokens. Each slot carries a tag that hashes the
+// position and the persistent codes it copies, so a reader uses a slot only while the paged
+// row still holds those codes.
+inline constexpr std::int32_t kKVWindowSinkTokens = 64;
+inline constexpr std::int32_t kKVWindowRingTokens = 1024;
+inline constexpr std::int32_t kKVWindowSlots      = kKVWindowSinkTokens + kKVWindowRingTokens;
+// Keys at most this far before a call's first query are read from the window.
+inline constexpr std::int32_t kKVWindowRecentTokens = 768;
+// Calls up to this width write their window slots before attention; wider calls read their own
+// keys from per-call staging and commit the window afterwards.
+inline constexpr std::int32_t kKVWindowInlineWidth = kKVWindowRingTokens - kKVWindowRecentTokens;
+inline constexpr std::int32_t kKVWindowGroups      = kD256KVCacheHeadDim / 64;
+
+static_assert(kKVWindowInlineWidth >= 64);
+
+[[nodiscard]] constexpr bool kv_storage_has_exact_window(KvCacheStorage storage) noexcept {
+    return storage == KvCacheStorage::Vq2 || storage == KvCacheStorage::Q4KeyVq2Value;
+}
+
 /** Physical data/scale planes for one K or V vector. */
 struct PagedKVVectorLayout {
     DType data_dtype                  = DType::BF16;
@@ -85,6 +108,17 @@ struct PagedKVStorageLayout {
                     head_dim,
                     {DType::FP8_E4M3FN, 256, DType::FP16, 1},
                     {DType::U8, 128, DType::U8, 16}};
+        }
+        break;
+    case KvCacheStorage::Vq2:
+        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::U8, 64, DType::FP16, 1}); }
+        break;
+    case KvCacheStorage::Q4KeyVq2Value:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 128, DType::FP16, 1},
+                    {DType::U8, 64, DType::FP16, 1}};
         }
         break;
     }

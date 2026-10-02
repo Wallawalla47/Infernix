@@ -14,6 +14,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/k8v4/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/vq2/launch.h"
 
 #include <algorithm>
 #include <cmath>
@@ -312,6 +313,10 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         return detail::nvfp4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                                 execution.multiprocessor_count);
 
+    if (kv_storage_has_exact_window(cache_storage))
+        return detail::vq_kv_workspace_bytes(q_heads, geometry.kv_heads, batch_size, min_width,
+                                             max_width, envelope);
+
     return detail::k8v4_kv_workspace_bytes(q_heads, batch_size, min_width, max_width, envelope,
                                            execution.multiprocessor_count);
 }
@@ -387,6 +392,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 
+    if (kv_storage_has_exact_window(cache.storage)) {
+        detail::vq_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows,
+                                       tree_masks, scale, cache, envelope, workspace, out,
+                                       execution.stream);
+        return;
+    }
+
     detail::k8v4_kv_append_attention(q, k, v, positions, valid_columns, kv_table_rows, tree_masks,
                                      scale, cache, envelope, workspace, out, execution);
 }
@@ -424,6 +436,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
         detail::nvfp4_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
                                           execution);
+        return;
+    }
+
+    if (kv_storage_has_exact_window(cache.storage)) {
+        detail::vq_kv_cached_attention(q, positions, scale, cache, envelope, workspace, out,
+                                       execution.stream);
         return;
     }
 

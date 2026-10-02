@@ -29,7 +29,7 @@ void ProgramImpl::copy_local_for_context(ContextTransaction& tx, std::int32_t so
     tx.transfers.push_back(state_transfer_requirement(
         state_images->host_layout(), runtime::ContextTransferDirection::DeviceToDevice, true));
     start_context_transfer_timer(runtime::ContextResourceClass::State);
-    state_images->copy_dflash_local(source, destination, device.transfer_stream);
+    state_images->copy_fork_local(source, destination, device.transfer_stream);
     stop_context_transfer_timer(runtime::ContextResourceClass::State);
 }
 

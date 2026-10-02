@@ -233,6 +233,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             };
         }
     }
+    if (kv_storage_has_exact_window(plan.kv_storage)) {
+        state_image_spec.kv_window = qwen3_5::KVWindowStateSpec{
+            .layers   = config.full_attention_layers + (plan.features.mtp() ? 1U : 0U),
+            .kv_heads = dimension(config.attention->num_key_value_heads),
+        };
+    }
     out.state_images = qwen3_5::plan_state_image_device_pool(builder, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
         out.replay_records = plan_gdn_replay_records(
@@ -1083,15 +1089,17 @@ PromptAttention prompt_attention(const EngineOptions& options) {
             .pv8  = pv8 && pv8_capable,
             .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20};
 }
-// The fast INT8 and NVFP4 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV run one
-// 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use other
-// tiles.
+// The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
+// run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
+// other tiles.
 bool prefill_attention_runs_waves(const EngineOptions& options) {
     switch (options.kv_cache) {
     case KvCacheStorage::Int8Group64: return !options.original_int8_prefill_kernel;
     case KvCacheStorage::Nvfp4Group16: return !options.original_nvfp4_prefill_kernel;
     case KvCacheStorage::Fp8E4M3Row256:
-    case KvCacheStorage::Fp8KeyNvfp4Value: return true;
+    case KvCacheStorage::Fp8KeyNvfp4Value:
+    case KvCacheStorage::Vq2:
+    case KvCacheStorage::Q4KeyVq2Value: return true;
     case KvCacheStorage::BFloat16: return false;
     }
     return false;

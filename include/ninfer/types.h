@@ -35,6 +35,10 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
+    // Rotated 2-bit eight-value vector codes for K and V plus an exact INT8 recent-key window.
+    Vq2,
+    // Rotated 4-bit Lloyd-Max K codes, 2-bit vector V codes and the same exact recent-key window.
+    Q4KeyVq2Value,
 };
 
 // How prompt attention runs P*V where its kernel has an 8-bit form (the fast INT8 and NVFP4

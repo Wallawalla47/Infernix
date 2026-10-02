@@ -30,26 +30,30 @@ for creating NInfer!
    P×V runs on 8-bit Tensor Cores by default (5-7 % less end-to-end long-prompt prefill, KL
    divergence from BF16 KV within 1.1× the FP16 form's), while INT8 KV keeps FP16 P×V unless
    `--prefill-8bit-pv` asks for its 8-bit form, and `--no-prefill-8bit-pv` forces FP16 everywhere
-5. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
+5. adds two compact KV formats, `--kv-dtype vq2` and `k4v2` (a quarter and three eighths of INT8's
+   KV memory, based on HyperQuant and [cometkim](https://github.com/cometkim)'s implementation),
+   which keep the most recent keys exact, always run P×V in FP16, and decode faster than INT8 at
+   long context
+6. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
    which greatly speeds up copy-heavy workloads, with more than one concurrent request
-6. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
+7. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
    the decode-width kernels, for faster speculative decode rounds with the same output
-7. can offload the vision encoder to system RAM (`--vision-offload on`), based on the work of
+8. can offload the vision encoder to system RAM (`--vision-offload on`), based on the work of
    Valeriy Selitskiy ([iamwavecut](https://github.com/iamwavecut))
-8. supports YaRN context extension up to 1M tokens (`--rope-yarn-factor F`, F from 1 to 4)
-9. sizes the CUDA Graph memory allowance from measurement instead of an estimate that could reserve
-   far more VRAM than ever used
-10. lets `--vram-headroom-mib N` shrink the 1 GiB VRAM headroom left after `--kv-capacity auto`
-11. adds a custom thinking budget message (`--default-thinking-budget N` with
+9. supports YaRN context extension up to 1M tokens (`--rope-yarn-factor F`, F from 1 to 4)
+10. sizes the CUDA Graph memory allowance from measurement instead of an estimate that could reserve
+    far more VRAM than ever used
+11. lets `--vram-headroom-mib N` shrink the 1 GiB VRAM headroom left after `--kv-capacity auto`
+12. adds a custom thinking budget message (`--default-thinking-budget N` with
     `--thinking-budget-message "..."`)
-12. accepts more tool-call formats and API options used by agent clients such as Claude Code, Qwen
+13. accepts more tool-call formats and API options used by agent clients such as Claude Code, Qwen
     Code, Codex, Zed and GitHub Copilot, and fixes several tool-call and reasoning-output issues
     (mostly based on the work of others credited below); `--tolerant-tool-calls` recovers some
     broken tool calls
-13. improves the console: optional colours (`--log-colours on`), a statistics panel at the bottom
+14. improves the console: optional colours (`--log-colours on`), a statistics panel at the bottom
     (`--log-stats-panel off` removes it) and a `--help` screen organised by category, and can
     rotate the request log by size (`--request-log-max-mib N`)
-14. contains various other fixes and improvements, including upstream pull requests merged before
+15. contains various other fixes and improvements, including upstream pull requests merged before
     upstream did
 
 I recommend using this with the NVIDIA NVFP4 artifact I’ve uploaded here, which runs a bit faster
@@ -567,6 +571,70 @@ which require `--use-original-prefix-caching`. Details:
   falls from 9.5 % to 8.5 %; perplexity moves within one standard error.
   Commit: [`a79c2cd`][c-nvfp4-targets].
 
+### Smaller KV cache: `--kv-dtype vq2` and `k4v2`
+
+- **Two vector-quantized KV formats.** `vq2` stores K and V in 2 bits per value, and `k4v2` stores K
+  in 4 bits and V in 2. Per token and KV head they take 132 and 196 bytes, against 528 for INT8 and
+  288 for NVFP4. For the 27B models' attention layers, 240K tokens of context need 1.9 GiB of KV as
+  `vq2` and 2.8 GiB as `k4v2`, against 7.6 GiB as INT8 and 4.1 GiB as NVFP4, so the same VRAM holds
+  three or four times the context or requests. How it works:
+  - each 256-value row is rotated with the fork's fixed Hadamard transform;
+  - V, and K for `vq2`, then store every 8 values as one 16-bit code (one of 512 trained magnitude
+    patterns plus 7 sign bits, the 8th sign set by parity);
+  - K for `k4v2` stores 4-bit Lloyd-Max levels instead;
+  - each row keeps an FP16 scale chosen so its reconstruction is unbiased.
+- **Recent keys stay exact.** The attention sinks (the first 64 tokens) and the 768 tokens before
+  each query are read from INT8 copies held in the request's state. Which keys a query reads
+  exactly depends only on positions, so a context reads the same values however it was split into
+  prefill chunks, decode steps or cache reuse points. These copies take about 40 MB per state slot
+  for the 27B models; each running request, each GPU checkpoint slot and each host checkpoint image
+  holds one.
+- **Quality** (perplexity at 64K context, 32K stride, `ninfer-ppl-1m-v1` quick corpus, NVIDIA NVFP4
+  27B artifact):
+
+  | KV | Perplexity | vs BF16 |
+  |---|---:|---:|
+  | BF16 | 4.1661 | |
+  | INT8 | 4.1728 | +0.16 % |
+  | NVFP4 | 4.1764 | +0.25 % |
+  | `k4v2` | 4.1709 | +0.12 % |
+  | `vq2` | 4.1859 | +0.48 % |
+- **Speed** (one request, official NVFP4 27B artifact, RTX 5090, `ninfer_bench` against INT8 measured
+  in the same run):
+
+  | Run | Format | Prefill | Decode |
+  |---|---|---:|---:|
+  | 32K context | `vq2` / `k4v2` | -4.5 % | +1.6 % / +1.4 % |
+  | 128K context | `vq2` / `k4v2` | -7.3 % / -8.7 % | +7.4 % / +6.7 % |
+  | DFlash2 K=7, 32K context | `vq2` / `k4v2` | -4.2 % / -4.4 % | -3.4 % / -3.6 % |
+
+  In the DFlash2 rows, draft acceptance is 0.82 for both formats against INT8's 0.85.
+  Per attention layer, against INT8 measured in the same run (`ninfer_causal_softmax_attention_bench`,
+  40 calls, cold, first row / four rows):
+
+  | Call | 2K keys | 8K keys | 32K keys | 128K keys |
+  |---|---:|---:|---:|---:|
+  | one-token decode | 1.54x / 2.23x | 1.19x / 0.96x | 0.80x / 0.62x | 0.62x / 0.59x |
+  | 4-column verification | 1.61x / 2.21x | 1.23x / 1.07x | 0.89x / 0.75x | 0.76x / 0.73x |
+  | 8-column verification | 1.54x / 2.48x | 1.23x / 1.42x | 1.09x / 1.10x | 1.04x / 1.03x |
+  | 16-column verification | 1.71x / 3.29x | 1.28x / 1.64x | 1.30x / 1.31x | 1.22x / 1.33x |
+
+  Below 32K keys these formats pay for expanding their codes; from 32K, calls of up to four columns
+  overtake INT8 at 0.6-0.9x, because the attention reads a quarter of the KV bytes. Wider
+  verification stays above INT8 at 1.0-1.4x, where its G64 kernel fills the SM better. `k4v2` is
+  within about 0.05x of `vq2` except on 16-column verification, where it is 0.1-0.4x slower
+  (1.4-1.9x at 8K keys and below). Prompt attention is 1.2-1.3x at 32-128K keys
+  and 1.4x at 8K against INT8's fast prompt kernel (896-3584 columns, 20 calls), and on short
+  prompts the encoding of each new row costs more than the attention.
+- They work with the hybrid and original prefix caches (a restored checkpoint reads exactly what
+  the original request read), cache files, MTP, DFlash2 chain and tree verification, n-gram
+  drafting, concurrent requests, CUDA Graphs and vision.
+- Based on the HyperQuant KV cache (arXiv 2606.23406) and the implementation of it by
+  [cometkim (Hyeseong Kim)](https://github.com/cometkim). Measured on this model's K and V rows, a
+  fixed-rate 8-value code beat HyperQuant's E8 lattice with Rice coding at fewer bytes. Keeping
+  recent keys exact mattered more than either, so the fork implements the fixed-rate code with an
+  exact window.
+
 ### Tool calls and reasoning output
 
 - **More tool-call formats**: the XML forms emitted by Claude Code and other agent tools
@@ -770,7 +838,8 @@ A big thank you to all the contributors to upstream NInfer and to the forks this
 [Macasacker](https://github.com/Macasacker),
 [Sha1rholder](https://github.com/Sha1rholder),
 [adubkov](https://github.com/adubkov),
-[Gideon Zenz (gzenz)](https://github.com/gzenz), David Oelfke, Fedor Suchkov,
+[Gideon Zenz (gzenz)](https://github.com/gzenz),
+[cometkim (Hyeseong Kim)](https://github.com/cometkim), David Oelfke, Fedor Suchkov,
 Yunado, and everyone else whose pull
 requests, reviews and commits made this fork possible — and a particular thank you to
 **[Neroued](https://github.com/Neroued)** for creating NInfer, maintaining upstream so

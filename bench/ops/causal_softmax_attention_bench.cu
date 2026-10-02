@@ -40,7 +40,7 @@ constexpr std::size_t kFlushBytes = std::size_t{256} << 20;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, All };
+enum class KvChoice : std::uint8_t { Bf16, Int8, Fp8, Nvfp4, K8V4, Vq2, K4V2, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
@@ -119,7 +119,7 @@ struct Result {
                  "usage: ninfer_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] [--batch B,...] [--tokens W,...] "
+                 "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--envelope-max N] "
@@ -201,10 +201,14 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Nvfp4;
             else if (value == "k8v4")
                 options.kv = KvChoice::K8V4;
+            else if (value == "vq2")
+                options.kv = KvChoice::Vq2;
+            else if (value == "k4v2")
+                options.kv = KvChoice::K4V2;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, or all");
+                usage("--kv-dtype expects bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
@@ -434,6 +438,41 @@ DeviceBuffer varied_values(std::size_t count, unsigned seed, float scale) {
     return bench::make_bf16(count, seed, -scale, scale);
 }
 
+// Exact recent-key window planes of the vector-quantized formats (rows = 0: none).
+class BenchWindow {
+public:
+    BenchWindow(std::int32_t rows, std::int32_t kv_heads)
+        : rows_(rows), kv_heads_(kv_heads), k_(bench::make_zeros(bytes(kHeadDim))),
+          v_(bench::make_zeros(bytes(kHeadDim))), ks_(bench::make_zeros(bytes(8))),
+          vs_(bench::make_zeros(bytes(8))), tags_(bench::make_zeros(bytes(8))) {}
+
+    // The planes of rows [row, row + count).
+    [[nodiscard]] PagedKVWindowView view(std::int32_t row, std::int32_t count) const {
+        if (rows_ == 0) { return {}; }
+        const auto at = [&](const DeviceBuffer& buffer, std::size_t row_bytes) {
+            return static_cast<unsigned char*>(buffer.p) + row_bytes * row;
+        };
+        const std::size_t code_row = static_cast<std::size_t>(kHeadDim) * kKVWindowSlots * kv_heads_;
+        const std::size_t small_row = std::size_t{8} * kKVWindowSlots * kv_heads_;
+        return {
+            .k_codes  = Tensor(at(k_, code_row), DType::I8, {kHeadDim, kKVWindowSlots, kv_heads_, count}),
+            .v_codes  = Tensor(at(v_, code_row), DType::I8, {kHeadDim, kKVWindowSlots, kv_heads_, count}),
+            .k_scales = Tensor(at(ks_, small_row), DType::FP16, {4, kKVWindowSlots, kv_heads_, count}),
+            .v_scales = Tensor(at(vs_, small_row), DType::FP16, {4, kKVWindowSlots, kv_heads_, count}),
+            .tags     = Tensor(at(tags_, small_row), DType::I32, {2, kKVWindowSlots, kv_heads_, count}),
+        };
+    }
+
+private:
+    [[nodiscard]] std::size_t bytes(std::int32_t per_slot) const {
+        return std::max<std::size_t>(1, static_cast<std::size_t>(per_slot) * kKVWindowSlots *
+                                            kv_heads_ * rows_);
+    }
+    std::int32_t rows_;
+    std::int32_t kv_heads_;
+    DeviceBuffer k_, v_, ks_, vs_, tags_;
+};
+
 class Case {
 public:
     Case(Geometry geometry, KvCacheStorage storage, std::int32_t tokens,
@@ -473,6 +512,7 @@ public:
                   ? scale_plane_bytes(geometry, storage_layout_.value, physical_pages_)
                   : std::size_t{1})),
           block_table_(static_cast<std::size_t>(logical_pages_) * batch_ * sizeof(std::int32_t)),
+          window_(kv_storage_has_exact_window(storage) ? batch_ : 0, geometry.kv_heads),
           output_(bench::make_zeros(static_cast<std::size_t>(kHeadDim) * geometry.query_heads *
                                     tokens * batch_ * 2)),
           workspace_bytes_(
@@ -490,6 +530,12 @@ public:
           batch_cache_view_(make_batch_cache_view(cache_k_, cache_v_, cache_k_scale_,
                                                   cache_v_scale_, block_table_, geometry, storage,
                                                   padded_, physical_pages_, batch_)) {
+        cache_view_.window       = window_.view(0, 1);
+        batch_cache_view_.window = window_.view(0, batch_);
+        // Batch row b's window is state slot b (the bench's table rows are the identity).
+        if (batch_cache_view_.window.present()) {
+            batch_cache_view_.window.slots = table_rows_tensor_;
+        }
         std::vector<std::int32_t> host_positions(static_cast<std::size_t>(tokens) * batch_, 0);
         for (std::int32_t row = 0; row < batch_; ++row) {
             const std::int32_t valid = valid_columns[static_cast<std::size_t>(row)];
@@ -537,6 +583,7 @@ public:
             row_cache.block_table =
                 Tensor(static_cast<std::int32_t*>(block_table_.p) + row * logical_pages_,
                        DType::I32, {logical_pages_});
+            row_cache.window = window_.view(row, 1);
             ops::kv_cache_append(k, v, positions, row_cache, nullptr);
             CUDA_CHECK(cudaDeviceSynchronize());
         }
@@ -589,6 +636,7 @@ private:
     DeviceBuffer cache_k_scale_;
     DeviceBuffer cache_v_scale_;
     DeviceBuffer block_table_;
+    BenchWindow window_;
     DeviceBuffer output_;
     std::size_t workspace_bytes_;
     WorkspaceArena workspace_;
@@ -617,6 +665,10 @@ const char* storage_name(KvCacheStorage storage) {
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case KvCacheStorage::Vq2:
+        return "vq2";
+    case KvCacheStorage::Q4KeyVq2Value:
+        return "k4v2";
     }
     return "unknown";
 }
@@ -839,8 +891,11 @@ std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Fp8) { return {KvCacheStorage::Fp8E4M3Row256}; }
     if (choice == KvChoice::Nvfp4) { return {KvCacheStorage::Nvfp4Group16}; }
     if (choice == KvChoice::K8V4) { return {KvCacheStorage::Fp8KeyNvfp4Value}; }
+    if (choice == KvChoice::Vq2) { return {KvCacheStorage::Vq2}; }
+    if (choice == KvChoice::K4V2) { return {KvCacheStorage::Q4KeyVq2Value}; }
     return {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
-            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value};
+            KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value, KvCacheStorage::Vq2,
+            KvCacheStorage::Q4KeyVq2Value};
 }
 
 struct RowProfile {

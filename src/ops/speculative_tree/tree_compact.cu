@@ -6,6 +6,7 @@
 #include "core/pdl.cuh"
 #include "ninfer/types.h"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kv_cache/kv_window.cuh"
 
 #include <cstdint>
 #include <stdexcept>
@@ -52,6 +53,14 @@ struct KvCompactArgs {
     std::int32_t kv_heads;
     std::int32_t plane_count;
     std::int32_t width;
+    // Exact recent-key window of the vector-quantized formats, whose planes 0/1 are the K/V
+    // codes and 2/3 their FP16 row scales: window codes and scales per (layer, role) and tags per
+    // layer, of every execution row.
+    bool window;
+    std::int8_t* window_codes[kMaxCompactLayers][2];
+    __half* window_scales[kMaxCompactLayers][2];
+    std::int32_t* window_tags[kMaxCompactLayers];
+    const std::int32_t* window_slots; // per verification row (null: slot 0)
 };
 
 template <class Word>
@@ -96,6 +105,69 @@ __device__ __forceinline__ void copy_position(const KvCompactArgs& args, int lay
     }
 }
 
+inline constexpr int kMaxCompactWindowHeads = 8;
+
+// Moves the window slot of a compacted position: the source position's slot becomes the
+// destination's, re-tagged for the destination position, when it still matched the source codes;
+// otherwise the destination slot's tags are cleared and its readers fall back to the codes.
+__device__ void move_window_slot(const KvCompactArgs& args, int layer, int row, int source_page,
+                                 int source_position, int destination_position,
+                                 std::int32_t* tags) {
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int heads       = args.kv_heads;
+    const int source      = kv_window_slot(source_position);
+    const int destination = kv_window_slot(destination_position);
+    const auto slot_index = [&](int head, int slot) {
+        return (static_cast<std::int64_t>(row) * heads + head) * kKVWindowSlots + slot;
+    };
+    __syncthreads();
+    if (tid < 2 * heads) {
+        const int head           = tid >> 1;
+        const int role           = tid & 1;
+        const std::int32_t bytes = args.plane_bytes[role];
+        const std::int64_t element =
+            static_cast<std::int64_t>(kPagedKVPageSize) *
+                (head + static_cast<std::int64_t>(heads) * source_page) +
+            (source_position & kPagedKVPageMask);
+        const auto* codes =
+            reinterpret_cast<const std::uint32_t*>(args.planes[layer][role] + bytes * element);
+        const std::uint16_t scale_bits =
+            reinterpret_cast<const std::uint16_t*>(args.planes[layer][2 + role])[element];
+        const auto tag_of = [&](int position) {
+            std::uint32_t hash = kv_window_tag_begin(position);
+            for (int w = 0; w < bytes / 4; ++w) hash = kv_window_tag_step(hash, codes[w]);
+            return kv_window_tag_finish(hash, scale_bits);
+        };
+        const bool valid = static_cast<std::uint32_t>(
+                               args.window_tags[layer][slot_index(head, source) * 2 + role]) ==
+                           tag_of(source_position);
+        tags[tid] = valid ? static_cast<std::int32_t>(tag_of(destination_position)) : 0;
+    }
+    __syncthreads();
+    for (int item = tid; item < 2 * heads * 17; item += kCompactThreads) {
+        const int unit = item / 17;
+        const int part = item - unit * 17;
+        const int head = unit >> 1;
+        const int role = unit & 1;
+        if (tags[unit] == 0) { continue; }
+        if (part < 16) {
+            const std::int8_t* from =
+                args.window_codes[layer][role] + slot_index(head, source) * 256 + part * 16;
+            std::int8_t* to =
+                args.window_codes[layer][role] + slot_index(head, destination) * 256 + part * 16;
+            *reinterpret_cast<uint4*>(to) = *reinterpret_cast<const uint4*>(from);
+        } else {
+            const __half* from = args.window_scales[layer][role] + slot_index(head, source) * 4;
+            __half* to = args.window_scales[layer][role] + slot_index(head, destination) * 4;
+            *reinterpret_cast<uint2*>(to) = *reinterpret_cast<const uint2*>(from);
+        }
+    }
+    __syncthreads();
+    if (tid < 2 * heads) {
+        args.window_tags[layer][slot_index(tid >> 1, destination) * 2 + (tid & 1)] = tags[tid];
+    }
+}
+
 // One block per (layer, row). Sources (columns after the main chain) are never destinations.
 __global__ __launch_bounds__(kCompactThreads) void tree_compact_kv_kernel(
     const __grid_constant__ KvCompactArgs args, const std::int32_t* verify_positions,
@@ -109,15 +181,21 @@ __global__ __launch_bounds__(kCompactThreads) void tree_compact_kv_kernel(
         args.tables + static_cast<std::int64_t>(table_rows[row]) * args.table_stride;
     // Column 0 of a verification row sits at its base position F.
     const int base = verify_positions[row * args.width];
+    __shared__ std::int32_t window_tag[2 * kMaxCompactWindowHeads];
     for (int i = 1; i <= count; ++i) {
         const int column = accepted_path[row * args.width + i];
         if (column == i || column < 0) { continue; }
         const int source_position      = base + column;
         const int destination_position = base + i;
-        copy_position(args, layer, table[source_position >> kPagedKVPageShift],
-                      source_position & kPagedKVPageMask,
+        const int source_page          = table[source_position >> kPagedKVPageShift];
+        copy_position(args, layer, source_page, source_position & kPagedKVPageMask,
                       table[destination_position >> kPagedKVPageShift],
                       destination_position & kPagedKVPageMask);
+        if (args.window) {
+            move_window_slot(args, layer,
+                             args.window_slots == nullptr ? 0 : args.window_slots[row],
+                             source_page, source_position, destination_position, window_tag);
+        }
     }
 }
 
@@ -215,6 +293,19 @@ void speculative_tree_compact_kv(const PagedKVBatchLayerView* layers, std::int32
         add(view.k_scale_pages, key_scale_bytes);
         add(view.v_scale_pages, value_scale_bytes);
         args.plane_count = planes;
+        if (view.window.present()) {
+            args.window                  = true;
+            args.window_codes[layer][0]  = static_cast<std::int8_t*>(view.window.k_codes.data);
+            args.window_codes[layer][1]  = static_cast<std::int8_t*>(view.window.v_codes.data);
+            args.window_scales[layer][0] = static_cast<__half*>(view.window.k_scales.data);
+            args.window_scales[layer][1] = static_cast<__half*>(view.window.v_scales.data);
+            args.window_tags[layer]      = static_cast<std::int32_t*>(view.window.tags.data);
+            args.window_slots = static_cast<const std::int32_t*>(view.window.slots.data);
+        }
+    }
+    if (args.window && (!kv_storage_has_exact_window(first.storage) ||
+                        first.num_kv_heads > kMaxCompactWindowHeads)) {
+        throw std::invalid_argument("speculative_tree_compact_kv: unexpected KV window");
     }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(static_cast<unsigned int>(layer_count), static_cast<unsigned int>(rows)),

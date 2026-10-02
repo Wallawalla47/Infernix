@@ -261,9 +261,17 @@ int main() {
     const ServeOptions k8v4 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "k8v4"});
     failures += check(k8v4.kv_cache == ninfer::KvCacheStorage::Fp8KeyNvfp4Value,
                       "--kv-dtype k8v4 did not select asymmetric K8V4 KV");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "vq2"}).kv_cache ==
+                          ninfer::KvCacheStorage::Vq2,
+                      "--kv-dtype vq2 did not select 2-bit vector KV");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "k4v2"}).kv_cache ==
+                          ninfer::KvCacheStorage::Q4KeyVq2Value,
+                      "--kv-dtype k4v2 did not select 4-bit K / 2-bit V KV");
     const std::string kv_help = serve_usage_text("ninfer-serve");
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
-                          kv_help.find("k8v4") != std::string::npos,
+                          kv_help.find("k8v4") != std::string::npos &&
+                          kv_help.find("vq2") != std::string::npos &&
+                          kv_help.find("k4v2") != std::string::npos,
                       "serve help omits a production KV storage mode");
 
     const ServeOptions model_alias =

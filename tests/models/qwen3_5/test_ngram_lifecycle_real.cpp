@@ -1,3 +1,4 @@
+#include "kv_cache_storage.h"
 #include "ninfer/engine.h"
 #include "speculative_page_boundary.h"
 
@@ -88,17 +89,7 @@ int main(int argc, char** argv) {
             options.speculative.proposal_head = ninfer::ProposalHead::Full;
         }
         const std::string codec = argc > 5 ? argv[5] : "nvfp4";
-        if (codec == "bf16") {
-            options.kv_cache = ninfer::KvCacheStorage::BFloat16;
-        } else if (codec == "int8") {
-            options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
-        } else if (codec == "fp8") {
-            options.kv_cache = ninfer::KvCacheStorage::Fp8E4M3Row256;
-        } else if (codec == "k8v4") {
-            options.kv_cache = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
-        } else if (codec != "nvfp4") {
-            throw std::invalid_argument("unsupported fixture codec");
-        }
+        options.kv_cache        = ninfer::test::parse_kv_cache_storage(codec);
         if (argc > 6) { options.speculative.ngram_min_match = std::stoul(argv[6]); }
         std::cout << "ngram=" << ngram_k << " artifact=" << artifact << " backend=" << backend
                   << " neural=" << options.speculative.draft_tokens

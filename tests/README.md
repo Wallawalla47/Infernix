@@ -73,6 +73,16 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 
 `ninfer_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type.
+
+The vector-quantized `vq2` and `k4v2` caches have their own suites. `ninfer_kv_cache_vq_test`
+compares every stored code, row scale, exact-window slot and tag with independent host encoders
+(`kv_cache_vq_reference.h`), checks untouched bytes, and moves tree-compacted slots between state
+slots. `ninfer_vq_attention_test` checks both geometries and both formats against an FP64 oracle
+of the per-query read rule (sinks and keys at most 768 positions before the query as exact INT8-G64
+rows, every other key from its stored codes): grouped decode and verification widths, batched rows with partial valid columns, tree
+masks, prompt chunks with key splits, cached-only calls, stale window slots, and the window a wide
+call commits from staging. Each batch row's window lives in a different state slot from its KV table
+row.
 The suite covers prefill, decode/spec widths, batched prefixes, cache effects, and Graph replay and
 updates with changing live lengths. Numerical cases include small, unit-RMS and RMS1.8 Q/K inputs.
 The FP64 oracle retains internal Q quantization error; the INT8/FP8 compute budgets account for
@@ -166,11 +176,11 @@ NINFER_TEST_SPECULATIVE=mtp NINFER_TEST_BATCH=2 \
   ./build/tests/ninfer_qwen3_5_prefix_real_test
 ```
 
-KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, and `k8v4`; backend choices are `none`, `mtp`,
-`dflash`, and `dflash2`, requiring an artifact with the selected component. Batch defaults to 2;
-`NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The DFlash2-specific
-integration executable also accepts all five KV names as its fifth positional argument and rejects
-unknown names.
+KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; backend choices are
+`none`, `mtp`, `dflash`, and `dflash2`, requiring an artifact with the selected component. Batch
+defaults to 2; `NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The
+DFlash2-specific integration executable, the n-gram lifecycle test (fifth argument) and the hybrid
+prefix test (`NINFER_HYBRID_KV_DTYPE`) accept the same KV names and reject unknown ones.
 
 Continuation and pressure recovery have dedicated entries:
 
@@ -283,12 +293,12 @@ NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16`, `int8`,
-`fp8`, `nvfp4` or `k8v4`), Vision enabled, and extra Device StateImage slots. Defaults are
+`fp8`, `nvfp4`, `k8v4`, `vq2` or `k4v2`), Vision enabled, and extra Device StateImage slots. Defaults are
 `15 1 1 8 bf16 0 3`. An optional eighth argument, a `--draft-tree-nodes` table such as
 `16,12,12,10` or `auto`, runs the fixture through DFlash2 tree verification (with `auto`, the
 same-seed replay check is skipped because the chosen widths follow measured round time); CTest
-runs a table on INT8, K8V4 and NVFP4 as `ninfer_qwen3_5_dflash2_tree_<kv>_real_test`. Run GPU
-integration tests serially. The
+runs a table on INT8, K8V4, NVFP4, VQ2 and K4V2 as `ninfer_qwen3_5_dflash2_tree_<kv>_real_test`. Run
+GPU integration tests serially. The
 individual Op suites remain the numerical/state-transition oracle; the fixed Engine fixture does
 not define bit parity across arbitrary floating-point routes.
 
@@ -308,4 +318,4 @@ NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
 
 Arguments are the target KV, the tree table (`auto` for automatic widths, `0` runs chain decoding
 against the same oracle), output tokens per prompt and K; defaults are `int8 16 160 7`. CTest
-runs it on INT8, K8V4 and NVFP4.
+runs it on INT8, K8V4, NVFP4, VQ2 and K4V2.

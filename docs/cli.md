@@ -212,15 +212,15 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8 or K8V4 KV unless an original prompt kernel is selected | `1024` |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8, K8V4, VQ2 or K4V2 KV unless an original prompt kernel is selected | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage | `bf16` |
 | `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
-| `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels and K8V4's); INT8 only overrides its default, FP16 P×V, which is up to 5 % slower on long prompts but has about half the KL divergence from a BF16 KV reference | INT8 only |
+| `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels and K8V4's; VQ2 and K4V2 KV always run P×V in FP16, so it does not apply to them); INT8 only overrides its default, FP16 P×V, which is up to 5 % slower on long prompts but has about half the KL divergence from a BF16 KV reference | INT8 only |
 | `--no-prefill-8bit-pv` | force FP16 P×V for NVFP4 and K8V4 KV too, without their default 8-bit E4M3 form (5-7 % more end-to-end long-prompt prefill time; the 8-bit form's KL divergence from BF16 KV stays within 1.1x FP16's) | NVFP4, K8V4 |
 | `--use-original-nvfp4-prefill-kernel` | prefill NVFP4 KV with the tiled prompt-attention kernel; requires `--kv-dtype nvfp4` | fast kernel over more than 768 visible keys |
-| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, for splitting one prompt-attention launch's keys across SMs (INT8, NVFP4, FP8 and K8V4 KV); less frees KV cache but slows 1-2K-token chunks over long context (`64`: 17-25 % slower attention over 32K-128K keys; `128`: 2-5 %; `192` and up: under 1 %); `0` turns splitting off. See [serving](serving.md) | `256` |
+| `--prefill-split-workspace-mib N` | workspace in MiB, `0..16384`, for splitting one prompt-attention launch's keys across SMs (INT8, NVFP4, FP8, K8V4, VQ2 and K4V2 KV); less frees KV cache but slows 1-2K-token chunks over long context (`64`: 17-25 % slower attention over 32K-128K keys; `128`: 2-5 %; `192` and up: under 1 %); `0` turns splitting off. See [serving](serving.md) | `256` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -301,6 +301,11 @@ This is long-context extrapolation, not a guarantee of answer quality; evaluate 
 
 `--kv-dtype` independently selects runtime KV storage. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
+Per token and KV head, K+V take 1024 bytes as `bf16`, 528 as `int8`, 516 as `fp8`, 402 as `k8v4`,
+288 as `nvfp4`, 196 as `k4v2` and 132 as `vq2`. `vq2` stores 2-bit vector-quantized K and V (one
+16-bit code per 8 rotated values) and `k4v2` 4-bit K with the same 2-bit V; both keep the attention
+sinks and the most recent 768 keys exact through a per-sequence INT8 window, about 40 MB per state
+slot for the 27B models, which every running request and every Device checkpoint slot holds.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime

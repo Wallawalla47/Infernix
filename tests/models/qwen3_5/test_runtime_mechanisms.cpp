@@ -148,6 +148,31 @@ void test_decoder_layout() {
                k8v4.mtp_kv &&
                k8v4.mtp_kv->payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * mtp_vectors,
            "K8V4 Text/MTP asymmetric physical payload bytes");
+
+    // Vector-quantized formats: compact code planes with one FP16 row scale. Their exact
+    // recent-key window is sequence state (StateImage), not part of the page pool.
+    for (const auto storage :
+         {ninfer::KvCacheStorage::Vq2, ninfer::KvCacheStorage::Q4KeyVq2Value}) {
+        ninfer::LayoutBuilder vq_builder;
+        const q36::DecoderStateSpec spec = decoder_spec(storage, true);
+        const q36::DecoderStateLayout vq = q36::plan_decoder_state(vq_builder, spec);
+        (void)vq_builder.finish(256);
+        const int key_bytes = storage == ninfer::KvCacheStorage::Vq2 ? 64 : 128;
+        expect(vq.text_kv.pages.planes.size() == 8 &&
+                   vq.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+                   vq.text_kv.pages.planes[0].geometry.leading_extent == key_bytes &&
+                   vq.text_kv.pages.planes[1].geometry.leading_extent == 64 &&
+                   vq.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+                   vq.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
+                   vq.text_kv.pages.planes[3].geometry.leading_extent == 1,
+               "vector-quantized Text KV has code planes and FP16 row-scale planes");
+        expect(vq.text_kv.payload_bytes() ==
+                       static_cast<std::size_t>(key_bytes + 2 + 64 + 2) * text_vectors &&
+                   vq.mtp_kv &&
+                   vq.mtp_kv->payload_bytes() ==
+                       static_cast<std::size_t>(key_bytes + 2 + 64 + 2) * mtp_vectors,
+               "vector-quantized Text/MTP physical payload bytes");
+    }
 }
 
 void test_round_layout() {

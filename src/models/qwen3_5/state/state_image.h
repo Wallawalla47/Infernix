@@ -5,6 +5,7 @@
 #include "core/host_context_arena.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "core/transfer_work.h"
 
@@ -24,10 +25,19 @@ struct DFlashLocalStateSpec {
     std::int32_t head_dim  = 0;
 };
 
+// Exact recent-key window of the vector-quantized KV formats (core/paged_kv_storage.h): for each
+// slot and attention layer (the Main Text layers, then MTP), INT8-G64 copies of rotated K/V rows,
+// their group scales and slot tags (PagedKVWindowView).
+struct KVWindowStateSpec {
+    std::uint32_t layers  = 0;
+    std::int32_t kv_heads = 0;
+};
+
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
+    std::optional<KVWindowStateSpec> kv_window;
 };
 
 struct StateImageHostLayout {
@@ -40,18 +50,32 @@ struct StateImageHostLayout {
     std::optional<LayoutRegion> dflash_local_k;
     std::optional<LayoutRegion> dflash_local_v;
     std::size_t dflash_local_layer_bytes = 0;
-    std::size_t image_bytes              = 0;
+    // One layer's window: K codes, V codes, K scales, V scales, then tags.
+    std::optional<LayoutRegion> kv_window;
+    std::size_t kv_window_layer_bytes = 0;
+    std::size_t image_bytes           = 0;
+};
+
+// Window planes of every (layer, slot): last extent layer * slot_count + slot.
+struct KVWindowDeviceLayout {
+    TensorRegion k_codes;
+    TensorRegion v_codes;
+    TensorRegion k_scales;
+    TensorRegion v_scales;
+    TensorRegion tags;
 };
 
 struct StateImageDeviceLayout {
     LinearAttentionStatePoolLayout linear;
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
+    std::optional<KVWindowDeviceLayout> kv_window;
     StateImageHostLayout host;
 };
 
 [[nodiscard]] TransferWork state_image_transfer_work(const StateImageHostLayout& layout);
-[[nodiscard]] TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout);
+// The sequence-local components a fork copies eagerly: DFlash local state and the KV window.
+[[nodiscard]] TransferWork fork_local_transfer_work(const StateImageHostLayout& layout);
 
 [[nodiscard]] StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                                                   const StateImageSpec& spec);
@@ -132,6 +156,18 @@ struct StateImageDeviceSlotView {
  * Every absolute slot contains common GDN/hidden state and, for a DFlash Program, its local cyclic
  * K/V state. The pool owns neither slot roles nor logical checkpoint identity.
  */
+// One independently transferable part of a StateImage's Host form: one linear-attention layer's
+// conv and recurrent state, or everything else (continuation hidden, DFlash local KV, KV window).
+struct StateImagePart {
+    enum class Kind : std::uint8_t {
+        LinearLayer,
+        Rest,
+    };
+
+    Kind kind           = Kind::Rest;
+    std::uint32_t layer = 0;
+};
+
 class StateImageDevicePool {
 public:
     StateImageDevicePool(DeviceSpan backing, const StateImageDeviceLayout& layout);
@@ -159,6 +195,13 @@ public:
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCache* dflash_local() const noexcept;
 
+    [[nodiscard]] bool has_kv_window() const noexcept { return kv_window_.has_value(); }
+    // The window planes of one attention layer for every slot (extent slot_count), or for one
+    // slot (extent one).
+    [[nodiscard]] PagedKVWindowView kv_window_view(std::uint32_t layer) const;
+    [[nodiscard]] PagedKVWindowView kv_window_slot_view(std::uint32_t layer,
+                                                        std::int32_t slot) const;
+
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
@@ -166,6 +209,13 @@ public:
     void copy_slot(std::int32_t source, std::int32_t destination, cudaStream_t stream = nullptr);
     void copy_dflash_local(std::int32_t source, std::int32_t destination,
                            cudaStream_t stream = nullptr);
+    // Whether a fork must copy sequence-local components before its first step (DFlash local
+    // state, the KV window), and that copy.
+    [[nodiscard]] bool has_fork_local() const noexcept {
+        return dflash_local_.has_value() || kv_window_.has_value();
+    }
+    void copy_fork_local(std::int32_t source, std::int32_t destination,
+                         cudaStream_t stream = nullptr);
     void copy_to_host(std::int32_t source, HostStateImageView destination,
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,
@@ -177,7 +227,16 @@ private:
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
+    std::optional<PagedKVWindowView> kv_window_;
+    std::uint32_t kv_window_layers_ = 0;
     StateImageHostLayout host_layout_;
+
+    void copy_kv_window(std::int32_t source, std::int32_t destination, cudaStream_t stream);
+    // Visits every Device component of `slot` (or of one part) with its Host image offset.
+    template <class Visit>
+    void for_each_host_component(std::int32_t slot, Visit&& visit) const;
+    template <class Visit>
+    void for_each_host_component(std::int32_t slot, StateImagePart part, Visit&& visit) const;
 };
 
 } // namespace ninfer::models::qwen3_5

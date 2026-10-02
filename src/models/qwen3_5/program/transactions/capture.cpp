@@ -267,7 +267,7 @@ bool ProgramImpl::start_capture(SequenceHandle handle) {
         context_source_ready_.wait(device.transfer_stream);
         if (operation.state_transfer) {
             enqueue_state_backup(operation);
-        } else if (is_masked_draft_backend(speculative_backend)) {
+        } else if (state_images->has_fork_local()) {
             copy_local_for_context(operation, state_store->physical_slot(state.state.read),
                                    state_store->physical_slot(*operation.reserved_state));
         }
