@@ -503,6 +503,7 @@ int main() {
                       "thinking-control result accounting missing");
     failures +=
         check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
+                  done.at("result").at("tool_call_parse").at("tolerant_recovered") == false &&
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
                   done.at("result").at("tool_call_parse").at("empty_arguments_omitted") == 0 &&
                   done.at("result").at("tool_call_parse").at("schema_mismatch_arguments") == 0 &&
@@ -666,6 +667,7 @@ int main() {
         .empty_arguments_omitted   = 1,
         .schema_mismatch_arguments = 2,
         .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .tolerant_recovered        = true,
     };
     const Json normalized_tool_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, normalized_tool_outcome));
@@ -680,6 +682,8 @@ int main() {
                     .at("schema_mismatch_arguments") == 2 &&
             normalized_tool_done.at("result").at("tool_call_parse").at("fallback_reason") ==
                 "none" &&
+            normalized_tool_done.at("result").at("tool_call_parse").at("tolerant_recovered") ==
+                true &&
             !render_tool_call_fallback(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
 

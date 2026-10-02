@@ -28,6 +28,8 @@ struct RawParameter {
 struct RawToolCall {
     std::string_view name;
     std::vector<RawParameter> parameters;
+    // Tolerant mode repaired its opener or kept an undeclared name the strict parser rejects.
+    bool repaired = false;
 };
 
 enum class JsonValueKind : std::uint8_t {
@@ -662,8 +664,9 @@ private:
                 return FallbackReason::MalformedStructure;
             }
             if (text_[scan] == '=') { ++scan; }
-            header_begin = scan;
-            fn_close = kw_len == 8 ? "</function>" : "</invoke>";
+            header_begin  = scan;
+            fn_close      = kw_len == 8 ? "</function>" : "</invoke>";
+            call.repaired = true;
         } else {
             return FallbackReason::MalformedStructure;
         }
@@ -688,8 +691,9 @@ private:
                 std::size_t after = scan;
                 while (after < text_.size() && is_format_whitespace(text_[after])) { ++after; }
                 if (after >= text_.size() || text_[after] == '<') {
-                    tag_end     = scan;
-                    ws_boundary = true;
+                    tag_end       = scan;
+                    ws_boundary   = true;
+                    call.repaired = true;
                 }
             }
         }
@@ -704,9 +708,10 @@ private:
         // Strict mode rejects a name outside the declared tool set. Tolerant mode keeps an
         // otherwise well-formed call structured and leaves the identity judgment to the consumer:
         // leaking the raw region to content would turn a valid call into prose.
-        if (!tolerant_ && contract_.enforce_declared_names &&
+        if (contract_.enforce_declared_names &&
             find_tool_contract(contract_, call.name) == nullptr) {
-            return FallbackReason::UndeclaredTool;
+            if (!tolerant_) { return FallbackReason::UndeclaredTool; }
+            call.repaired = true;
         }
         pos = ws_boundary ? tag_end : tag_end + 1;
 
@@ -939,7 +944,12 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
         return fallback(text, out.diagnostics);
     }
     // A recovered truncated tail keeps its reason for transparency without demoting the output.
+    // Only tolerant mode produces one, or repairs a kept call.
     out.diagnostics.fallback_reason = accepted_reason;
+    out.diagnostics.tolerant_recovered =
+        accepted_reason == FallbackReason::TruncatedTail ||
+        std::any_of(raw_calls.begin(), raw_calls.end(),
+                    [](const RawToolCall& call) { return call.repaired; });
 
     out.content = rtrim_format_whitespace(source.substr(0, accepted));
     out.tool_calls.reserve(raw_calls.size());
