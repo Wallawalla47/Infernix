@@ -798,9 +798,19 @@ Thinking is returned with an opaque compatibility signature; SSE emits its `sign
 before closing the block. Request lowering reconstructs the local prompt from the visible
 `thinking` text and treats `signature` as non-semantic transport metadata, so retained history
 remains usable across serve restarts.
-`display:"omitted"` is rejected because NInfer cannot provide Anthropic's
-encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
-closed-turn reasoning history. `output_config.effort` passes its protocol-validated value to the
+
+`thinking.display:"omitted"`, which current Claude Code sends on every request, returns each
+Thinking block with an empty `thinking` string and no `thinking_delta` events. Its `signature`
+(`signature_delta` when streaming) is `ninfer-reasoning.v1:` followed by the Base64 reasoning text,
+so the reasoning stays out of the visible transcript but comes back with the block the client
+echoes. When a replayed Thinking block has empty `thinking` and such a signature, request lowering
+restores the reasoning from it, so the prompt (and its prefix-cache identity) is the one
+`summarized` display would give; non-empty `thinking` text takes precedence, any other signature
+stays non-semantic metadata, and a malformed NInfer signature fails with
+`invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
+trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
+ignores `display`. `preserve_thinking` remains a NInfer extension for closed-turn reasoning
+history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 
 User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
