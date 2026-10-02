@@ -372,6 +372,13 @@ which require `--use-original-prefix-caching`. Details:
 - **Several requests can prefill at the same time**, overlapping one request's prefill with
   others' prefill and decode. By David Oelfke in the [gzenz/ninfer](https://github.com/gzenz/ninfer)
   fork. Commit: [`25e52f9`][c-concurrent-prefill].
+- **`--prefill-round-robin`** (opt-in) serves concurrently prefilling requests in turn and, while
+  another request is active, prefills in steps of at most 1024 tokens (896 with the fast INT8
+  kernel), so a short prompt or a decoding request beside a long prompt waits one short step
+  instead of the whole long prefill. A prompt alone still prefills in whole chunks, and KV capacity
+  is unchanged. Based on the round-robin prefill and narrow prefill width by
+  [giveen](https://github.com/giveen) in [giveen/ninfer-ext](https://github.com/giveen/ninfer-ext).
+  Commit: [`dae362c`][c-prefill-rr].
 - **Fused text q/k RMSNorm + RoPE at every width** (14-22 % faster than three separate calls at
   the 3584-token chunk, one sincos per lane), and only for checkpoints with its built-in RoPE theta
   and epsilon. Commit: [`2c8be5e`][c-rope-fused].
@@ -475,7 +482,9 @@ which require `--use-original-prefix-caching`. Details:
 - **`--tolerant-tool-calls`** keeps a good call followed by junk, a final call cut off by the
   output limit (if a parameter is complete), repairs a missing `>` after the function name, and
   returns calls to undeclared tools. By David Oelfke in the gzenz/ninfer fork, ported onto this
-  fork's parser. Commit: [`9e28ab8`][c-tolerant-tools].
+  fork's parser. The request log's `tool_call_parse.tolerant_recovered` shows when it rescued a
+  call (from giveen's giveen/ninfer-ext). Commits: [`9e28ab8`][c-tolerant-tools],
+  [`d2ab752`][c-tolerant-recovered].
 - **A reasoning effort the chat template rejects renders as its nearest accepted one** (the
   official Qwen3.8 template accepts only low, medium and xhigh), and `--chat-template` gains the
   froggeric v22.5 template. Commits: [`9b7c58b`][c-effort-nearest],
@@ -505,6 +514,10 @@ which require `--use-original-prefix-caching`. Details:
   routes answer under a doubled `/v1` prefix (a base URL ending in `/v1`).
   Commits: [`e56b408`][c-pr223], [`f863ddc`][c-thinking-budget-max],
   [`e49a360`][c-doubled-v1].
+- **Claude Code's `thinking.display: "omitted"`** is accepted instead of rejected: Thinking blocks
+  come back with empty text and the reasoning in their signature, which is restored when the
+  client sends the block back, so retained thinking and prefix-cache reuse are unchanged. Ported
+  from giveen's change in giveen/ninfer-ext. Commit: [`ca1f50e`][c-thinking-omitted].
 
 ### Stability
 
@@ -520,12 +533,13 @@ which require `--use-original-prefix-caching`. Details:
   phase's allocations back; a request an idle engine can never admit gets 503 instead of 500;
   token-count requests are bounded like generation requests; Windows servers detect clients that
   vanish without closing the connection; a vision overlay suffix is encoded at the right
-  position (fork PR #1 by Yunado); and an Anthropic stream whose client leaves while it is still
+  position (fork PR #1 by Yunado); an Anthropic stream whose client leaves while it is still
   queued is logged as a disconnect (499) instead of an internal error (500), by Gideon Zenz in
-  the gzenz/ninfer fork.
+  the gzenz/ninfer fork; and a full main KV pool no longer ends an MTP or DFlash answer early when
+  only its draft KV lease needed room, from giveen's giveen/ninfer-ext.
   Commits: [`f67a284`][c-arena-scope], [`edc9785`][c-idle-503],
   [`7936838`][c-count-bound], [`f6af07f`][c-win-keepalive],
-  [`22e6ef1`][c-pr1], [`bcac0a8`][c-queued-cancel].
+  [`22e6ef1`][c-pr1], [`bcac0a8`][c-queued-cancel], [`6ee864c`][c-lease-thin].
 
 ### Models, conversion and vision
 
@@ -537,8 +551,11 @@ which require `--use-original-prefix-caching`. Details:
   conversion. Commits: [`33afed8`][c-modelopt], [`de4623a`][c-quasar],
   [`5b73bba`][c-tokenizer].
 - **`nvfp4_absmax` and `nvfp4_mse` conversion methods** quantize BF16 sources to NVFP4 for
-  16-bit-activation parents (`nvfp4_mse` picks each 16-value group's best of five scale targets
-  by squared error); the NVIDIA recipe uses them for the DFlash2 drafter MLP.
+  16-bit-activation parents; the NVIDIA recipe uses them for the DFlash2 drafter MLP. `nvfp4_mse`
+  picks each 16-value group's scale from all 126 E4M3 values by squared error (based on
+  giveen's scale sweep in giveen/ninfer-ext): on the drafter's gate projection the relative
+  error is 0.0812, against 0.0847 for the earlier best of five targets and 0.0952 for absmax.
+  Commit: [`2309ead`][c-nvfp4-mse].
 - **A `qwen3_8_27b_q6` recipe** and a `grouped_mse` scale-search method for groupwise
   quantisation; **Q8 MTP** and a **general BF16 GEMM fallback** for shapes without a dedicated
   kernel. Commits: [`a4c112f`][c-pr284], [`afb274c`][c-grouped-mse],
@@ -744,6 +761,11 @@ well, and for the work this branch builds on.
 [c-thinking-message]: https://github.com/Wallawalla47/ninfer-custom/commit/f3aaad7c3a8e0d6a66746aa6558e5cb05ceeba57
 [c-log-rotation]: https://github.com/Wallawalla47/ninfer-custom/commit/80d73bb9ee5d83fa88a4ced068a1ec792bf2bc22
 [c-queued-cancel]: https://github.com/Wallawalla47/ninfer-custom/commit/bcac0a84e115341c78ece01e905c9831c95b712e
+[c-nvfp4-mse]: https://github.com/Wallawalla47/ninfer-custom/commit/2309ead35d7d2e2b532c88b061f5a29ae811ad33
+[c-prefill-rr]: https://github.com/Wallawalla47/ninfer-custom/commit/dae362c9ae56babbbc430fae4bdcfd29d6516d47
+[c-thinking-omitted]: https://github.com/Wallawalla47/ninfer-custom/commit/ca1f50edd8754aa468a5a099e6a8dd5141cca902
+[c-lease-thin]: https://github.com/Wallawalla47/ninfer-custom/commit/6ee864cd60ba17f41f29f1dfafbc4c807f68ff6c
+[c-tolerant-recovered]: https://github.com/Wallawalla47/ninfer-custom/commit/d2ab7524324919dd2319c4b7b6fcf724910a4105
 
 ---
 
