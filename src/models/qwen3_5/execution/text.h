@@ -13,6 +13,7 @@
 #include "ninfer/ops/speculative_tree.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
+#include "models/qwen3_5/state/state_image.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
 
@@ -69,7 +70,7 @@ class VisionPrefillSession;
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
-                qwen3_5::PagedKVCacheView kv, LinearAttentionStatePool& state,
+                qwen3_5::PagedKVCacheView kv, qwen3_5::StateImageDevicePool& state,
                 qwen3_5::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
@@ -114,9 +115,11 @@ public:
     // nullptr restores the chain.
     void set_verification_tree(const Tensor* tree_rows, const Tensor* ancestor_masks);
     // Moves each row's accepted tree path onto the main-chain KV cache positions of every
-    // full-attention layer (ops::speculative_tree_compact_kv).
+    // full-attention layer (ops::speculative_tree_compact_kv). `state_destination_slots` name
+    // each row's StateImage slot, whose exact KV window moves with the path.
     void compact_tree_kv(const Tensor& verify_positions, const Tensor& kv_table_rows,
-                         const Tensor& accepted_path, const Tensor& accepted_drafts);
+                         const Tensor& state_destination_slots, const Tensor& accepted_path,
+                         const Tensor& accepted_drafts);
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -151,16 +154,19 @@ public:
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             const Tensor& linear_state_destination_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens);
     void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                              const Tensor& rope_positions, const Tensor& valid_columns,
                              const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             const Tensor& linear_state_destination_slots,
                              ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                              Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink);
     void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                   const Tensor& cache_positions, const Tensor& rope_positions,
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                  const Tensor& state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
     void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
@@ -176,6 +182,14 @@ private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
+
+    // The exact recent-key window of one attention layer (Main Text layers, then MTP) for the
+    // bound sequences: every slot indexed by the batch's destination state slots, or the single
+    // sequence's destination slot. Empty for storages without a window.
+    [[nodiscard]] PagedKVWindowView kv_window(std::uint32_t window_layer) const;
+    [[nodiscard]] PagedKVBatchLayerView text_kv_layer(std::uint32_t layer) const;
+    [[nodiscard]] PagedKVBatchLayerView mtp_kv_batch_layer() const;
+    [[nodiscard]] PagedKVLayerView mtp_kv_layer() const;
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
@@ -194,6 +208,7 @@ private:
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows,
                                   const Tensor& linear_state_source_slots,
+                                  const Tensor& linear_state_destination_slots,
                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
                                   Tensor& logits, Tensor& target_tokens, Tap& tap);
 
@@ -237,6 +252,7 @@ private:
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
+    qwen3_5::StateImageDevicePool& state_images_;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;

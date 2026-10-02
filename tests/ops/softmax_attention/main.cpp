@@ -28,6 +28,10 @@ int main(int argc, char** argv) {
                 storage     = name == "all" ? std::nullopt
                                             : std::optional(ninfer::test::parse_kv_cache_storage(name));
                 causal_only = true;
+                if (storage == ninfer::KvCacheStorage::Vq2 ||
+                    storage == ninfer::KvCacheStorage::Q4KeyVq2Value)
+                    throw std::invalid_argument(
+                        "vq2 and k4v2 attention is qualified by ninfer_vq_attention_test");
             } else
                 throw std::invalid_argument("invalid attention test option");
         }

@@ -32,7 +32,7 @@ struct ExecutionCore {
     DeviceContext& device;
     const execution::Parameters& parameters;
     WorkspaceArena& work;
-    LinearAttentionStatePool& linear_attention;
+    qwen3_5::StateImageDevicePool& state_images;
     const GdnReplayRecords* replay_records;
     qwen3_5::RoundState& io;
     Tensor& prefill_hidden;

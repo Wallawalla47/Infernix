@@ -216,6 +216,18 @@ int main() {
         memory, environment, std::uint64_t{123456}));
     failures +=
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
+    for (const auto& [storage, name] :
+         {std::pair{ninfer::KvCacheStorage::Vq2, "vq2"},
+          std::pair{ninfer::KvCacheStorage::Q4KeyVq2Value, "k4v2"}}) {
+        options.kv_cache        = storage;
+        engine_options.kv_cache = storage;
+        memory.kv_cache         = storage;
+        const Json vq_server    = Json::parse(format_server_start_json(
+            "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+            load, memory, environment, std::uint64_t{123456}));
+        failures += check(vq_server.at("engine").at("kv_cache") == name,
+                          "vector-quantized KV report name missing");
+    }
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");

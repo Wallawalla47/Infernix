@@ -320,7 +320,7 @@ void ProgramImpl::prepare_graphs() {
         return execution::ExecutionCore{device,
                                         parameters,
                                         work,
-                                        state_images->linear(),
+                                        *state_images,
                                         replay_records ? &*replay_records : nullptr,
                                         io,
                                         prefill_hidden,

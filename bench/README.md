@@ -81,7 +81,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--use-original-int8-prefill-kernel]
+          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
           [--prefill-8bit-pv | --no-prefill-8bit-pv] [--use-original-nvfp4-prefill-kernel]
           [--prefill-split-workspace-mib <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
@@ -580,7 +580,8 @@ counts, or kernel-name filters in these benchmarks.
 
 `ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
-with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, and K8V4 KV storage. Production dispatch
+with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, VQ2 and K4V2 KV storage (the latter two
+with their exact window planes, one state slot per batch row). Production dispatch
 receives the caller-visible execution envelope and owns prefill, decode/spec and work-partition
 choices. `all` emits every storage mode as an independent row.
 
@@ -629,7 +630,8 @@ cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
 
 The report exposes separate QK/PV logical FLOPs, their full-public-Op-equivalent TFLOP/s,
 `key_vector_bytes`/`value_vector_bytes`, and `physical_cache_bytes`. Persistent K+V bytes per D256
-vector are 516 for FP8, 288 for NVFP4, and 402 for K8V4 (258-byte K plus 144-byte V).
+vector are 516 for FP8, 288 for NVFP4, 402 for K8V4 (258-byte K plus 144-byte V), 196 for K4V2
+(130-byte K plus 66-byte V) and 132 for VQ2; window reads of VQ2/K4V2 are not counted.
 `unique_kv_bytes` counts each visible persistent KV vector once; `unique_kv_gbps` divides it by
 complete Op latency. Payload rates exclude repeated reads and do not measure DRAM bandwidth.
 Logical FLOPs do not model private operand conversion, padding, or additional quantization work;

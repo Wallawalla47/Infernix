@@ -24,7 +24,7 @@ std::size_t context_resource_index(runtime::ContextResourceClass resource);
 runtime::ContextTransferRequirement
 state_transfer_requirement(const StateImageHostLayout& layout,
                            runtime::ContextTransferDirection direction,
-                           bool dflash_local_only = false);
+                           bool fork_local_only = false);
 
 runtime::ContextTransferRequirement
 kv_transfer_requirement(runtime::ContextResourceClass resource,

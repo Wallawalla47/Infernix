@@ -76,8 +76,9 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_real.cpp"
   LIBRARIES ninfer_engine)
 
-# DFlash2 tree verification at K=7 over every batch-size route, on the INT8, K8V4 and NVFP4 caches.
-foreach(kv IN ITEMS int8 k8v4 nvfp4)
+# DFlash2 tree verification at K=7 over every batch-size route, on the INT8, K8V4, NVFP4, VQ2 and
+# K4V2 caches.
+foreach(kv IN ITEMS int8 k8v4 nvfp4 vq2 k4v2)
   add_test(NAME ninfer_qwen3_5_dflash2_tree_${kv}_real_test
     COMMAND ninfer_qwen3_5_dflash2_real_test 7 1 1 4 ${kv} 0 3 16,12,12,10)
   list(APPEND ninfer_qwen3_5_tree_real_tests ninfer_qwen3_5_dflash2_tree_${kv}_real_test)
@@ -90,7 +91,7 @@ ninfer_add_test(ninfer_qwen3_5_dflash2_tree_greedy_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_dflash2_tree_greedy_real.cpp"
   LIBRARIES ninfer_engine)
 
-foreach(kv IN ITEMS k8v4 nvfp4)
+foreach(kv IN ITEMS k8v4 nvfp4 vq2 k4v2)
   add_test(NAME ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test
     COMMAND ninfer_qwen3_5_dflash2_tree_greedy_real_test ${kv})
   list(APPEND ninfer_qwen3_5_tree_real_tests ninfer_qwen3_5_dflash2_tree_greedy_${kv}_real_test)

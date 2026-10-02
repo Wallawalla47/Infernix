@@ -38,10 +38,11 @@ struct CausalAttentionExecutionEnvelope {
     // Other routes and cache formats ignore it.
     bool fast_prompt_pv8 = false;
     // Workspace the FP32 split partials of one prompt-route launch of the fast INT8 or NVFP4
-    // prompt kernel, or FP8 or K8V4's tiled kernel, may take. These kernels split a launch's keys
-    // across CTAs when its row blocks alone would leave SMs idle; a launch whose split count would
-    // need more runs fewer splits. The split count changes only rounding. It sizes the workspace,
-    // so workspace planning and execution must use the same value.
+    // prompt kernel, FP8 or K8V4's tiled kernel, or a VQ2 or K4V2 prompt launch may take (the
+    // last two plan their splits with the fast INT8 prompt kernel). These kernels split a launch's
+    // keys across CTAs when its row blocks alone would leave SMs idle; a launch whose split count
+    // would need more runs fewer splits. The split count changes only rounding. It sizes the
+    // workspace, so workspace planning and execution must use the same value.
     std::size_t prompt_split_workspace_bytes = kCausalPromptSplitWorkspaceDefaultBytes;
 };
 
@@ -74,6 +75,17 @@ struct ContextAttentionExecutionEnvelope {
  * It does not quantize or round q, probabilities, partial sums or decoded vectors to copy a
  * kernel's private arithmetic. Newly appended rows cross their specified persistent codec
  * boundary before attention observes them.
+ *
+ * The vector-quantized formats (Vq2, Q4KeyVq2Value) store R*K and R*V and keep an exact
+ * recent-key window. A query at position q reads key j:
+ *   - when j < kKVWindowSinkTokens or j >= q - kKVWindowRecentTokens: its exact INT8-G64 row,
+ *     which for a key appended by this call is the INT8-G64 codes of its rotated input row, and
+ *     for an older key (or a cached-only call's own key) its window slot when the slot tag matches
+ *     position j and the stored codes of j, and its stored codes otherwise;
+ *   - otherwise: its stored codes (codebook or level times the FP16 row scale).
+ * The rule depends on positions only, so a context reads the same keys however it was split into
+ * calls. Without a window every key reads its stored codes. The oracle decodes exactly these
+ * persistent values.
  *
  * Kernels may select native BF16/FP16/INT8/FP8 operands, internal reductions, staging precision
  * and decomposition. These are qualified implementation profiles, not extra public tensor

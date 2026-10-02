@@ -16,8 +16,11 @@ configuration. [DFlash](dflash.md) owns the drafter and the chain round it exten
 ## Scope
 
 - DFlash2 neural rounds only. Ngram copy rounds, MTP and DFlash (v1) keep chain verification.
-- Every KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`): each format's grouped and parallel
-  verification attention applies per-row ancestor masks, and compaction moves every stored plane.
+- Every KV storage (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`): each format's grouped
+  and parallel verification attention applies per-row ancestor masks, and compaction moves every
+  stored plane. For `vq2` and `k4v2` it also moves each accepted column's exact-window slot in the
+  row's StateImage slot, re-tagged for the destination position (cleared when the source slot no
+  longer matches its codes).
 - Single FP8 or NVFP4 GDN input projections (the tree convolution reads ancestors from the
   materialized projection); startup rejects other parents.
 - A tree row holds at most 32 columns (one 32-bit ancestor mask per column) and 8 root-to-leaf

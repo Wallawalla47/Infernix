@@ -200,7 +200,7 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
 
         const StateImageSelectors selectors = state_selectors(sequence);
         execution::PrefillContext context{
-            {device, parameters, work, state_images->linear(),
+            {device, parameters, work, *state_images,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head},
             text_kv_view(sequence),

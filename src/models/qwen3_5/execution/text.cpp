@@ -235,13 +235,14 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
 
 TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weights,
                          WorkspaceArena& work, qwen3_5::PagedKVCacheView kv,
-                         LinearAttentionStatePool& state, qwen3_5::RoundState& io,
+                         qwen3_5::StateImageDevicePool& state, qwen3_5::RoundState& io,
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
                          const qwen3_5::PagedKVCache* batch_mtp_kv)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
-      mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
+      mtp_kv_(mtp_kv), state_images_(state), state_(state.linear()), io_(io),
+      prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
       batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
@@ -286,15 +287,50 @@ void TextContext::set_verification_tree(const Tensor* tree_rows, const Tensor* a
     tree_ancestor_masks_ = ancestor_masks;
 }
 
+PagedKVWindowView TextContext::kv_window(std::uint32_t window_layer) const {
+    if (!state_images_.has_kv_window()) { return {}; }
+    if (active_sequence_batch_ == 0) {
+        return state_images_.kv_window_slot_view(window_layer, linear_state_destination_slot_);
+    }
+    if (active_linear_state_destination_slots_ == nullptr) {
+        throw std::logic_error("batched KV window access has no destination state slots");
+    }
+    PagedKVWindowView window = state_images_.kv_window_view(window_layer);
+    window.slots             = *active_linear_state_destination_slots_;
+    return window;
+}
+
+PagedKVBatchLayerView TextContext::text_kv_layer(std::uint32_t layer) const {
+    PagedKVBatchLayerView view = batch_text_kv_->batch_layer_view(layer);
+    view.window                = kv_window(layer);
+    return view;
+}
+
+PagedKVBatchLayerView TextContext::mtp_kv_batch_layer() const {
+    PagedKVBatchLayerView view = batch_mtp_kv_->batch_layer_view(0);
+    view.window                = kv_window(config_.full_attention_layers);
+    return view;
+}
+
+PagedKVLayerView TextContext::mtp_kv_layer() const {
+    PagedKVLayerView view = mtp_kv_.layer_view(0);
+    view.window           = kv_window(config_.full_attention_layers);
+    return view;
+}
+
 void TextContext::compact_tree_kv(const Tensor& verify_positions, const Tensor& kv_table_rows,
+                                  const Tensor& state_destination_slots,
                                   const Tensor& accepted_path, const Tensor& accepted_drafts) {
     if (batch_text_kv_ == nullptr) {
         throw std::logic_error("tree KV compaction requires the batched Text KV cache");
     }
+    ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                   &state_destination_slots);
+    ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, kv_table_rows.ne[0]);
     std::vector<PagedKVBatchLayerView> layers;
     layers.reserve(batch_text_kv_->layers());
     for (std::uint32_t layer = 0; layer < batch_text_kv_->layers(); ++layer) {
-        layers.push_back(batch_text_kv_->batch_layer_view(layer));
+        layers.push_back(text_kv_layer(layer));
     }
     ops::speculative_tree_compact_kv(layers.data(), static_cast<std::int32_t>(layers.size()),
                                      verify_positions, kv_table_rows, accepted_path,
@@ -411,7 +447,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, ctx_.execution_view());
+            mtp_kv_batch_layer(), envelope, work_, a_batch, ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
@@ -419,7 +455,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, ctx_.execution_view());
+            mtp_kv_batch_layer(), envelope, work_, a, ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -516,7 +552,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
         text_rope(rope_positions, *config_.rope_parameters, *parameters_.text.rope, kn,
                   ctx_.execution_view());
-        ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
+        ops::kv_cache_append(kn, v, positions, mtp_kv_layer(), s);
 
         if (final_chunk) {
             const std::size_t column_bytes =
@@ -571,7 +607,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_.layer_view(0), envelope, work_, a, ctx_.execution_view());
+            mtp_kv_layer(), envelope, work_, a, ctx_.execution_view());
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
@@ -743,6 +779,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
                                            const Tensor& linear_state_source_slots,
+                                           const Tensor& linear_state_destination_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                            Tap& tap) {
@@ -762,6 +799,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "target verify batch KV rows");
     require_tensor_shape(linear_state_source_slots, DType::I32, {batch},
                          "target verify batch Linear Attention slots");
+    require_tensor_shape(linear_state_destination_slots, DType::I32, {batch},
+                         "target verify batch Linear Attention destination slots");
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "target verify batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), width, batch},
@@ -777,6 +816,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
         ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
                                                  &linear_state_source_slots);
+        ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                       &linear_state_destination_slots);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -804,30 +845,33 @@ void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_pos
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
+                                      const Tensor& linear_state_destination_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens) {
     NullTap tap;
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             tap);
+                             linear_state_source_slots, linear_state_destination_slots, envelope,
+                             hidden, logits, target_tokens, tap);
 }
 
 void TextContext::target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
                                       const Tensor& rope_positions, const Tensor& valid_columns,
                                       const Tensor& kv_table_rows,
                                       const Tensor& linear_state_source_slots,
+                                      const Tensor& linear_state_destination_slots,
                                       ops::CausalAttentionExecutionEnvelope envelope,
                                       Tensor& hidden, Tensor& logits, Tensor& target_tokens,
                                       DFlashFeatureSink& sink) {
     target_verify_batch_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                             linear_state_source_slots, envelope, hidden, logits, target_tokens,
-                             sink);
+                             linear_state_source_slots, linear_state_destination_slots, envelope,
+                             hidden, logits, target_tokens, sink);
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
                                            const Tensor& cache_positions,
                                            const Tensor& rope_positions,
                                            const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                           const Tensor& state_destination_slots,
                                            ops::CausalAttentionExecutionEnvelope envelope,
                                            Tensor& mtp_hidden) {
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
@@ -846,10 +890,14 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
                          "MTP decode batch RoPE positions");
     require_tensor_shape(valid_columns, DType::I32, {batch}, "MTP decode batch valid columns");
     require_tensor_shape(kv_table_rows, DType::I32, {batch}, "MTP decode batch KV rows");
+    require_tensor_shape(state_destination_slots, DType::I32, {batch},
+                         "MTP decode batch destination state slots");
     require_tensor_shape(mtp_hidden, DType::BF16, {dimension(config_.hidden_size), width, batch},
                          "MTP decode batch hidden");
 
     ScopedValue<const Tensor*> backend_binding(active_backend_kv_table_rows_, &kv_table_rows);
+    ScopedValue<const Tensor*> destination_binding(active_linear_state_destination_slots_,
+                                                   &state_destination_slots);
     ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
     ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
     ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -946,8 +994,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, ctx_.execution_view());
+            text_kv_layer(static_cast<std::uint32_t>(fidx)), *active_causal_attention_envelope_,
+            work_, a_batch, ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
@@ -955,8 +1003,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            ctx_.execution_view());
+            text_kv_layer(static_cast<std::uint32_t>(fidx)), *active_causal_attention_envelope_,
+            work_, a, ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
 

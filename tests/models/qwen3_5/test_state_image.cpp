@@ -35,7 +35,8 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
+                      bool window = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -59,13 +60,17 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
                                 : q36::DFlashLocalStateSpec{
                                       .layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
+    if (window) { spec.kv_window = q36::KVWindowStateSpec{.layers = 3, .kv_heads = 2}; }
     ninfer::LayoutBuilder builder;
     q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     return {.layout = std::move(layout), .bytes = builder.finish(256)};
 }
 
+// The pool copies on the device's non-blocking stream, which does not wait for legacy-stream
+// work, so a fill completes before the next pool operation is enqueued.
 void set_bytes(const ninfer::Tensor& tensor, unsigned char value) {
     CUDA_CHECK(cudaMemset(tensor.data, value, tensor.bytes()));
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 void expect_bytes(const ninfer::Tensor& tensor, unsigned char expected, std::string_view label) {
@@ -94,6 +99,14 @@ void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char
             set_bytes(view.v.slice(3, slot, 1), static_cast<unsigned char>(base + 0x40 + layer));
         }
     }
+    for (std::uint32_t layer = 0; pool.has_kv_window() && layer < 3; ++layer) {
+        const ninfer::PagedKVWindowView window = pool.kv_window_slot_view(layer, slot);
+        unsigned char value = static_cast<unsigned char>(base + 0x50 + 8 * layer);
+        for (const ninfer::Tensor& plane :
+             {window.k_codes, window.v_codes, window.k_scales, window.v_scales, window.tags}) {
+            set_bytes(plane, value++);
+        }
+    }
 }
 
 void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char base,
@@ -115,6 +128,14 @@ void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned ch
                          label);
         }
     }
+    for (std::uint32_t layer = 0; pool.has_kv_window() && layer < 3; ++layer) {
+        const ninfer::PagedKVWindowView window = pool.kv_window_slot_view(layer, slot);
+        unsigned char value = static_cast<unsigned char>(base + 0x50 + 8 * layer);
+        for (const ninfer::Tensor& plane :
+             {window.k_codes, window.v_codes, window.k_scales, window.v_scales, window.tags}) {
+            expect_bytes(plane, value++, label);
+        }
+    }
 }
 
 void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::string_view label) {
@@ -130,12 +151,17 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
             expect_bytes(view.v.slice(3, slot, 1), 0, label);
         }
     }
+    // A cleared window is one whose tags are zero (slot tags are odd).
+    for (std::uint32_t layer = 0; pool.has_kv_window() && layer < 3; ++layer) {
+        expect_bytes(pool.kv_window_slot_view(layer, slot).tags, 0, label);
+    }
 }
 
-void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false) {
-    PlannedPool planned = plan_pool(dflash, 2, dflash2);
+void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false,
+                         bool window = false) {
+    PlannedPool planned = plan_pool(dflash, 2, dflash2, window);
     if (dflash2) {
-        expect(q36::dflash_local_transfer_work(planned.layout.host).payload_bytes ==
+        expect(q36::fork_local_transfer_work(planned.layout.host).payload_bytes ==
                    40ULL * 1024 * 1024,
                "DFlash2 local snapshot must transfer exactly 40 MiB");
     }
@@ -228,6 +254,60 @@ void test_shared_host_capacity() {
            "shared Host typed owners return all live and reserved extents");
 }
 
+// The exact KV window is a per-slot component: a layer view spans every slot, a slot view one;
+// a fork copies it with DFlash local state but leaves the Linear Attention state alone.
+void test_kv_window(ninfer::DeviceContext& device) {
+    PlannedPool planned = plan_pool(true, 3, false, true);
+    ninfer::DeviceArena arena(planned.bytes);
+    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    expect(pool.has_kv_window() && pool.has_fork_local(), "StateImage KV window is present");
+    const ninfer::PagedKVWindowView all = pool.kv_window_view(2);
+    expect(all.k_codes.ne[0] == 256 && all.k_codes.ne[1] == ninfer::kKVWindowSlots &&
+               all.k_codes.ne[2] == 2 && all.k_codes.ne[3] == 3 &&
+               all.k_scales.ne[0] == ninfer::kKVWindowGroups && all.tags.ne[0] == 2 &&
+               all.tags.ne[3] == 3,
+           "StateImage KV window layer view spans every slot");
+    const ninfer::PagedKVWindowView one = pool.kv_window_slot_view(2, 1);
+    expect(one.k_codes.ne[3] == 1 &&
+               static_cast<const std::byte*>(one.k_codes.data) ==
+                   static_cast<const std::byte*>(all.k_codes.data) + one.k_codes.bytes(),
+           "StateImage KV window slot view selects the slot");
+    bool layer_rejected = false;
+    try {
+        (void)pool.kv_window_view(3);
+    } catch (const std::out_of_range&) { layer_rejected = true; }
+    expect(layer_rejected, "an out-of-range KV window layer was accepted");
+
+    const ninfer::TransferWork fork = q36::fork_local_transfer_work(planned.layout.host);
+    expect(fork.payload_bytes == 2ULL * planned.layout.host.dflash_local_layer_bytes * 2 +
+                                     planned.layout.host.kv_window->bytes &&
+               fork.copy_operations == 2 * 2 + 5 * 3,
+           "fork-local work covers DFlash local state and the KV window");
+
+    fill_slot(pool, 0, 0x13);
+    fill_slot(pool, 1, 0x61);
+    pool.copy_fork_local(0, 1, device.stream);
+    device.synchronize();
+    for (std::uint32_t layer = 0; layer < 3; ++layer) {
+        const ninfer::PagedKVWindowView window = pool.kv_window_slot_view(layer, 1);
+        unsigned char value = static_cast<unsigned char>(0x13 + 0x50 + 8 * layer);
+        for (const ninfer::Tensor& plane :
+             {window.k_codes, window.v_codes, window.k_scales, window.v_scales, window.tags}) {
+            expect_bytes(plane, value++, "fork copy moves the KV window");
+        }
+    }
+    for (std::uint32_t layer = 0; layer < pool.linear().layer_count(); ++layer) {
+        expect_bytes(pool.linear().recurrent_slot(layer, 1),
+                     static_cast<unsigned char>(0x61 + 0x10 + layer),
+                     "fork copy leaves the Linear Attention state");
+    }
+    pool.copy_slot(0, 2, device.stream);
+    pool.zero_slot(0, device.stream);
+    device.synchronize();
+    expect_slot(pool, 2, 0x13, "StateImage D2D copy carries the KV window");
+    expect_zero_slot(pool, 0, "StateImage zero clears the KV window tags");
+}
+
 } // namespace
 
 int main() {
@@ -273,6 +353,8 @@ int main() {
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);
     test_shared_host_capacity();
+    test_host_roundtrip(false, device, false, true);
+    test_kv_window(device);
 
     return failures == 0 ? 0 : 1;
 }

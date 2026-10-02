@@ -75,10 +75,19 @@ Speculative backends 在一个 Engine 内互斥，因此当前最多有两个 gr
 | MTP | MTP persistent K/V 与其 code/scale planes | MTP KV frontier |
 | Draft Full | selected draft 的 full-context K/V | draft context frontier |
 
-Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16 或 K8V4
-KV profile；Draft Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
+Main Text 与 MTP 使用 Engine 选择的 BF16、INT8-G64、FP8-E4M3FN-row256、NVFP4-G16、K8V4、VQ2 或
+K4V2 KV profile；Draft Full 使用自己的 BF16 profile。`BFloat16` 名称下的物理 layout 为 BF16 K、FP16 V，
 写入端将 BF16 V 一次转换为 FP16。K8V4 是封闭的非对称 profile，不是运行时 bit-width 组合：K 固定为
 FP8-E4M3FN-row256，V 固定为 NVFP4-G16。
+
+VQ2 与 K4V2 是 vector-quantized profile：行先经固定的 normalized Hadamard H256 旋转，VQ2 的每 8 维
+存一个 16-bit 码字（512 个训练得到的 INT8 magnitude pattern × 7 个 sign bit 加偶校验第 8 个 sign），
+K4V2 的 K 存 4-bit Lloyd-Max 标量码、V 存同样的 VQ2 码；每行一个无偏 FP16 scale
+\(S=\lVert y\rVert^2/\langle y,c\rangle\)。码字选择的距离按
+[`vq2_codec.cuh`](../../src/ops/kv_cache/vq2_codec.cuh) 规定的固定 FMA 次序计算，相等时取最小 pattern
+index；append 无论走 block kernel 还是宽调用的 warp-per-row kernel，同一行都得到逐位相同的 codes，
+因此 chunk 切分与 prefix-cache 复用不改变已存储的 KV。两者都带一个 exact recent-key window（9.3），
+它属于 sequence state（StateImage），不在 page pool 中。
 
 `PagedKVStorageLayout` 将选定的 closed profile 解析为 K/V data/scale plane schema；target planner 按
 layer 展开该 schema 并确定 plane ordinal。Common pool implementation 仍只接收已展开的
@@ -276,6 +285,8 @@ D256 Main/MTP profile 的单 token/head 物理 payload 为：
 | FP8-E4M3FN-row256 | 256 B + 2 B | 256 B + 2 B | 516 B |
 | NVFP4-G16 | 128 B + 16 B | 128 B + 16 B | 288 B |
 | K8V4 | 256 B + 2 B | 128 B + 16 B | 402 B |
+| K4V2 | 128 B + 2 B | 64 B + 2 B | 196 B |
+| VQ2 | 64 B + 2 B | 64 B + 2 B | 132 B |
 
 K/V 的 code 和 scale planes 具有各自的 dtype、leading extent 和 group size；它们仍共享 page-group
 identity、frontier 和 lifetime。Capacity curve、Device/Host replica、continuation transfer 和 memory
@@ -596,6 +607,48 @@ canonical write 覆盖。
 DFlash/DFlash2 cyclic K/V 使用自己的 `CyclicKVCacheLayerView` 与 modulo/window 语义；它不持有 page ID、
 block table 或 growing reservation。模型配置决定其 layer count、heads 和 window。
 
+### 9.3 VQ2/K4V2 exact recent-key window
+
+VQ2 与 K4V2 的每个 attention layer（Main Text layers 之后是 MTP layer）在每个 StateImage slot 中持有
+一个 exact window：64 个 sink slot 加 1024 个 ring slot（position \(p\) 的 slot 为
+\(p<64\,?\,p:64+(p\bmod 1024)\)），每个 slot、KV head 和 K/V role 一行旋转后的 INT8-G64 值、4 个 FP16
+group scale 和一个 tag。Tag 是 (position, 已存储的 code words, scale bits) 的 FNV-1a hash，强制为奇数；
+零 tag 永不匹配，所以清零 tag 即清空 window。
+
+读取规则（[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h)）只取决于位置：位于
+\(q\) 的 query 对 sink 以及 \(j\ge q-768\) 的 key 读 exact INT8-G64 行（本次调用 append 的 key 读其
+输入行的 INT8-G64，更早的 key 在 tag 与已存储 codes 匹配时读 slot，否则读 codes），对其余 key 读
+codes。因此同一 context 无论如何切分为 prefill chunk、decode step 或 prefix-cache 复用点，读到的 key
+表示都相同。一个 CTA 的 queries 覆盖 \([q_0,q_1]\) 时，\([q_0-768,q_1-768)\) 内的 key 对部分 query
+exact、对其余 query 为 codes。Prompt kernel 对与该 band 相交的 tile 先做 exact pass，再做一次带 mask
+的 codes pass（128 行 CTA 至多 127 个 key）。Prompt kernel 的 key tile 为 32 个 key（双缓冲 INT8
+tile），调用可见 key 达到 1536 时改用 64-key tile（一页一个 INT8 tile，codes 预取隐藏其读取，
+exact 行 tile 同步读取）：实测 32-128K 可见 key 下快 6-9 %，而短 chunk 的 tile 多为 exact 行，
+64-key 反而慢 3-12 %，故设此阈值。Decode/verify kernel 则让一行的前几个 split CTA 只处理 sink 与
+recent tiles（exact 读取的 pairs），其余 split CTA 只处理 codes 读取的 pairs，每对
+(key, query) 只计入一个 CTA，merge 合并全部 split。Grouped kernel 的 key tile 为 32 或 64 个 key：
+64 只用于 16 列的 CTA 且要求一个 block 的 shared memory 装得下（vq2 的 16 列满足；k4v2 每行 K 码
+130 B，16 列需要 103296 B，超过本 target 的 101376 B per-block 上限，因此恒为 32）。实测 64-key tile
+在 vq2 的 16 列、≤8K key 调用上快 7-11 %（W=16 对 INT8 由 1.89x 降到 1.71x，B=1，2K），在 8 列 CTA 上
+则因每个 SM 少一个 block 慢 13-44 %，故不对 8 列使用。Codes CTA 只读比任何 query 的 window 更早的 key，
+因此作为 append 的 programmatic dependent 与其并行执行，window CTA 先等待 append 完成。Tag 自验证，因此
+trim、rollback、rejected drafts 或残留的旧内容只会退回 codes，不会读错行。宽度不超过 256 的调用在
+append 时直接写 slot；更宽的 prompt 调用先把 window 行写入 workspace staging，attention 之后再提交
+sinks 与最后 1024 列。
+
+Window 是 sequence-local state，与 DFlash local K/V 一样由 StateImage 持有并按 destination state slot
+索引：
+
+- batched view 的 `window` 覆盖全部 slot，`window.slots[b]` 为 compact row \(b\) 的 destination slot；
+  single-sequence view 只绑定该 sequence 的一个 slot；
+- `zero_slot` 清零 tag，`copy_slot`、Host snapshot/restore 携带全部 window bytes；
+- StateImage Fork 在首次写入前用 `copy_fork_local` 把 source window 复制到 destination；
+- tree compaction 把 accepted column 的 slot 移到 chain position 并重新计算 tag（源 slot 已失效时清零）。
+
+因此 prefix-cache hit 恢复的 window 与 miss 时同一 frontier 的 window 逐字节相同。每个 slot、每层的
+window 为 \(1088\times H_{kv}\times 536\) B（Qwen3.6/3.8-27B：17 层、\(H_{kv}=4\)，约 39.7 MB），
+既占 Device StateImage slot，也计入 Host checkpoint image 与 fork 的 transfer work。
+
 ---
 
 ## 10. Consumer contract
@@ -611,7 +664,8 @@ PagedKVLayerView
 ├── block_table          I32 [Nlogical]
 ├── head_dim
 ├── num_kv_heads
-└── storage
+├── storage
+└── window               VQ2/K4V2 exact window of this sequence's slot (9.3); empty otherwise
 ```
 
 View 只包含一个 layer 的 plane tensors 与一行 block table。它不包含 allocator handle、request identity、
@@ -627,6 +681,7 @@ PagedKVBatchLayerView
 ├── block_tables         I32 [Nlogical, C]
 ├── head_dim / num_kv_heads
 ├── storage
+├── window               VQ2/K4V2 window planes of every StateImage slot, window.slots I32 [B]
 └── table_rows[B]        separate Op input
 ```
 

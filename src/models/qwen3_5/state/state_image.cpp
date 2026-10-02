@@ -2,6 +2,8 @@
 
 #include "core/device.h"
 
+#include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -55,6 +57,20 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
            left->kv_heads == right->kv_heads && left->head_dim == right->head_dim;
 }
 
+bool same_window_spec(const std::optional<KVWindowStateSpec>& left,
+                      const std::optional<KVWindowStateSpec>& right) noexcept {
+    if (left.has_value() != right.has_value()) { return false; }
+    return !left || (left->layers == right->layers && left->kv_heads == right->kv_heads);
+}
+
+// One slot's window bytes of one layer, in plane order.
+std::array<std::size_t, 5> kv_window_plane_bytes(std::int32_t kv_heads) {
+    const std::size_t rows = static_cast<std::size_t>(kKVWindowSlots) * kv_heads;
+    return {rows * kD256KVCacheHeadDim, rows * kD256KVCacheHeadDim,
+            rows * kKVWindowGroups * sizeof(std::uint16_t),
+            rows * kKVWindowGroups * sizeof(std::uint16_t), rows * 2 * sizeof(std::int32_t)};
+}
+
 bool same_region(const LayoutRegion& left, const LayoutRegion& right) noexcept {
     return left.offset == right.offset && left.bytes == right.bytes &&
            left.alignment == right.alignment;
@@ -70,6 +86,9 @@ bool same_host_layout(const StateImageHostLayout& left,
     return same_linear_spec(left.spec.linear, right.spec.linear) &&
            left.spec.hidden == right.spec.hidden &&
            same_dflash_spec(left.spec.dflash_local, right.spec.dflash_local) &&
+           same_window_spec(left.spec.kv_window, right.spec.kv_window) &&
+           same_optional_region(left.kv_window, right.kv_window) &&
+           left.kv_window_layer_bytes == right.kv_window_layer_bytes &&
            same_region(left.linear_conv, right.linear_conv) &&
            left.linear_conv_layer_bytes == right.linear_conv_layer_bytes &&
            same_region(left.linear_recurrent, right.linear_recurrent) &&
@@ -129,6 +148,19 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
     }
+    if (spec.kv_window) {
+        if (spec.kv_window->layers == 0 || spec.kv_window->kv_heads <= 0) {
+            throw std::invalid_argument("StateImage KV window geometry is invalid");
+        }
+        std::size_t layer_bytes = 0;
+        for (const std::size_t bytes : kv_window_plane_bytes(spec.kv_window->kv_heads)) {
+            layer_bytes = checked_add(layer_bytes, bytes, "StateImage KV window bytes overflow");
+        }
+        host.kv_window_layer_bytes = layer_bytes;
+        host.kv_window             = builder.add(
+            checked_mul(layer_bytes, spec.kv_window->layers, "StateImage KV window bytes overflow"),
+            kStateImageAlignment, "StateImage host KV window");
+    }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
 }
@@ -162,6 +194,24 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count);
     }
+    if (spec.kv_window) {
+        const std::int32_t heads = spec.kv_window->kv_heads;
+        const auto extent        = static_cast<std::int32_t>(
+            checked_mul(spec.kv_window->layers, static_cast<std::size_t>(spec.linear.slot_count),
+                        "StateImage KV window extent overflow"));
+        out.kv_window = KVWindowDeviceLayout{
+            .k_codes  = builder.add_tensor(DType::I8, {kD256KVCacheHeadDim, kKVWindowSlots, heads, extent},
+                                           kStateImageAlignment, "StateImage KV window K codes"),
+            .v_codes  = builder.add_tensor(DType::I8, {kD256KVCacheHeadDim, kKVWindowSlots, heads, extent},
+                                           kStateImageAlignment, "StateImage KV window V codes"),
+            .k_scales = builder.add_tensor(DType::FP16, {kKVWindowGroups, kKVWindowSlots, heads, extent},
+                                           kStateImageAlignment, "StateImage KV window K scales"),
+            .v_scales = builder.add_tensor(DType::FP16, {kKVWindowGroups, kKVWindowSlots, heads, extent},
+                                           kStateImageAlignment, "StateImage KV window V scales"),
+            .tags     = builder.add_tensor(DType::I32, {2, kKVWindowSlots, heads, extent},
+                                           kStateImageAlignment, "StateImage KV window tags"),
+        };
+    }
 
     out.host = plan_host_state_image(spec);
     return out;
@@ -183,9 +233,14 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
             payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
             "StateImage transfer payload overflow");
     }
+    if (layout.kv_window) {
+        payload = checked_add(payload, layout.kv_window->bytes,
+                              "StateImage transfer payload overflow");
+    }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
-        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
+        (layout.spec.kv_window ? 5ULL * layout.spec.kv_window->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -193,19 +248,34 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
-TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
-    if (!layout.spec.dflash_local || !layout.dflash_local_k || !layout.dflash_local_v) {
-        throw std::invalid_argument("StateImage has no DFlash local component");
+TransferWork fork_local_transfer_work(const StateImageHostLayout& layout) {
+    if (!layout.spec.dflash_local && !layout.spec.kv_window) {
+        throw std::invalid_argument("StateImage has no fork-local component");
     }
-    const std::size_t component_bytes =
-        checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
-                    "StateImage DFlash transfer payload overflow");
-    const std::uint64_t operations = 2ULL * layout.spec.dflash_local->layers;
-    if (component_bytes > std::numeric_limits<std::uint64_t>::max() / 2U ||
-        operations > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("StateImage DFlash transfer work exceeds its representation");
+    std::size_t payload      = 0;
+    std::uint64_t operations = 0;
+    if (layout.spec.dflash_local) {
+        if (!layout.dflash_local_k || !layout.dflash_local_v) {
+            throw std::invalid_argument("StateImage DFlash local layout is incomplete");
+        }
+        const std::size_t component_bytes =
+            checked_mul(layout.dflash_local_layer_bytes, layout.spec.dflash_local->layers,
+                        "StateImage fork transfer payload overflow");
+        payload    = checked_mul(component_bytes, 2U, "StateImage fork transfer payload overflow");
+        operations = 2ULL * layout.spec.dflash_local->layers;
     }
-    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(2U * component_bytes),
+    if (layout.spec.kv_window) {
+        if (!layout.kv_window) {
+            throw std::invalid_argument("StateImage KV window layout is incomplete");
+        }
+        payload = checked_add(payload, layout.kv_window->bytes,
+                              "StateImage fork transfer payload overflow");
+        operations += 5ULL * layout.spec.kv_window->layers;
+    }
+    if (operations > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("StateImage fork transfer work exceeds its representation");
+    }
+    return TransferWork{.payload_bytes   = static_cast<std::uint64_t>(payload),
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
@@ -297,6 +367,22 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
     StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
+    if (layout.kv_window) {
+        const std::int32_t extent = layout.kv_window->tags.shape[3];
+        if (extent % linear_.slot_count() != 0) {
+            throw std::invalid_argument("StateImage KV window extent is inconsistent");
+        }
+        kv_window_layers_       = static_cast<std::uint32_t>(extent / linear_.slot_count());
+        device_spec.kv_window   = KVWindowStateSpec{.layers   = kv_window_layers_,
+                                                    .kv_heads = layout.kv_window->tags.shape[2]};
+        kv_window_              = PagedKVWindowView{
+            .k_codes  = layout.kv_window->k_codes.bind(backing),
+            .v_codes  = layout.kv_window->v_codes.bind(backing),
+            .k_scales = layout.kv_window->k_scales.bind(backing),
+            .v_scales = layout.kv_window->v_scales.bind(backing),
+            .tags     = layout.kv_window->tags.bind(backing),
+        };
+    }
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
             .layers   = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
@@ -338,6 +424,34 @@ const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
     return dflash_local_ ? &*dflash_local_ : nullptr;
 }
 
+PagedKVWindowView StateImageDevicePool::kv_window_view(std::uint32_t layer) const {
+    if (!kv_window_ || layer >= kv_window_layers_) {
+        throw std::out_of_range("StateImage KV window layer is out of range");
+    }
+    const auto base  = static_cast<std::int32_t>(layer) * slot_count();
+    const auto count = slot_count();
+    return PagedKVWindowView{
+        .k_codes  = kv_window_->k_codes.slice(3, base, count),
+        .v_codes  = kv_window_->v_codes.slice(3, base, count),
+        .k_scales = kv_window_->k_scales.slice(3, base, count),
+        .v_scales = kv_window_->v_scales.slice(3, base, count),
+        .tags     = kv_window_->tags.slice(3, base, count),
+    };
+}
+
+PagedKVWindowView StateImageDevicePool::kv_window_slot_view(std::uint32_t layer,
+                                                            std::int32_t slot) const {
+    validate_slot(slot, slot_count(), "StateImage KV window slot is out of range");
+    const PagedKVWindowView all = kv_window_view(layer);
+    return PagedKVWindowView{
+        .k_codes  = all.k_codes.slice(3, slot, 1),
+        .v_codes  = all.v_codes.slice(3, slot, 1),
+        .k_scales = all.k_scales.slice(3, slot, 1),
+        .v_scales = all.v_scales.slice(3, slot, 1),
+        .tags     = all.tags.slice(3, slot, 1),
+    };
+}
+
 void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
     linear_.zero_slot(slot, stream);
@@ -352,6 +466,11 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
             CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), stream));
         }
     }
+    // A zero tag never matches (tags are odd), so clearing the tags empties the window.
+    for (std::uint32_t layer = 0; kv_window_ && layer < kv_window_layers_; ++layer) {
+        const Tensor tags = kv_window_slot_view(layer, slot).tags;
+        CUDA_CHECK(cudaMemsetAsync(tags.data, 0, tags.bytes(), stream));
+    }
 }
 
 void StateImageDevicePool::zero_all(cudaStream_t stream) {
@@ -363,6 +482,9 @@ void StateImageDevicePool::zero_all(cudaStream_t stream) {
             CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), stream));
         }
+    }
+    if (kv_window_) {
+        CUDA_CHECK(cudaMemsetAsync(kv_window_->tags.data, 0, kv_window_->tags.bytes(), stream));
     }
 }
 
@@ -379,6 +501,31 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     if (dflash_local_) {
         dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
     }
+    copy_kv_window(source, destination, stream);
+}
+
+void StateImageDevicePool::copy_kv_window(std::int32_t source, std::int32_t destination,
+                                          cudaStream_t stream) {
+    for (std::uint32_t layer = 0; kv_window_ && layer < kv_window_layers_; ++layer) {
+        const PagedKVWindowView from = kv_window_slot_view(layer, source);
+        const PagedKVWindowView to   = kv_window_slot_view(layer, destination);
+        for (const auto& [f, t] : {std::pair{from.k_codes, to.k_codes}, std::pair{from.v_codes, to.v_codes},
+                                   std::pair{from.k_scales, to.k_scales},
+                                   std::pair{from.v_scales, to.v_scales}, std::pair{from.tags, to.tags}}) {
+            CUDA_CHECK(cudaMemcpyAsync(t.data, f.data, t.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+}
+
+void StateImageDevicePool::copy_fork_local(std::int32_t source, std::int32_t destination,
+                                           cudaStream_t stream) {
+    validate_slot(source, slot_count(), "StateImage fork copy source is out of range");
+    validate_slot(destination, slot_count(), "StateImage fork copy destination is out of range");
+    if (source == destination) { return; }
+    if (dflash_local_) {
+        dflash_local_->copy_slot_from(*dflash_local_, source, destination, stream);
+    }
+    copy_kv_window(source, destination, stream);
 }
 
 void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t destination,
@@ -398,41 +545,70 @@ void StateImageDevicePool::validate_host_layout(const StateImageHostLayout* layo
     }
 }
 
+template <class Visit>
+void StateImageDevicePool::for_each_host_component(std::int32_t slot, Visit&& visit) const {
+    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
+        for_each_host_component(
+            slot, StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, visit);
+    }
+    for_each_host_component(slot, StateImagePart{.kind = StateImagePart::Kind::Rest}, visit);
+}
+
+template <class Visit>
+void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImagePart part,
+                                                   Visit&& visit) const {
+    if (part.kind == StateImagePart::Kind::LinearLayer) {
+        if (part.layer >= linear_.layer_count()) {
+            throw std::out_of_range("StateImage linear layer is out of range");
+        }
+        const Tensor conv = linear_.conv_slot(part.layer, slot);
+        visit(conv.data,
+              host_layout_.linear_conv.offset + part.layer * host_layout_.linear_conv_layer_bytes,
+              conv.bytes());
+        const Tensor recurrent = linear_.recurrent_slot(part.layer, slot);
+        visit(recurrent.data,
+              host_layout_.linear_recurrent.offset +
+                  part.layer * host_layout_.linear_recurrent_layer_bytes,
+              recurrent.bytes());
+        return;
+    }
+    const Tensor hidden = continuation_hidden_slot(slot);
+    visit(hidden.data, host_layout_.continuation_hidden.offset, hidden.bytes());
+    if (dflash_local_) {
+        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
+            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
+            const Tensor k                    = view.k.slice(3, slot, 1);
+            const Tensor v                    = view.v.slice(3, slot, 1);
+            visit(k.data,
+                  host_layout_.dflash_local_k->offset +
+                      layer * host_layout_.dflash_local_layer_bytes,
+                  k.bytes());
+            visit(v.data,
+                  host_layout_.dflash_local_v->offset +
+                      layer * host_layout_.dflash_local_layer_bytes,
+                  v.bytes());
+        }
+    }
+    for (std::uint32_t layer = 0; kv_window_ && layer < kv_window_layers_; ++layer) {
+        const PagedKVWindowView window = kv_window_slot_view(layer, slot);
+        std::size_t offset =
+            host_layout_.kv_window->offset + layer * host_layout_.kv_window_layer_bytes;
+        for (const Tensor& plane :
+             {window.k_codes, window.v_codes, window.k_scales, window.v_scales, window.tags}) {
+            visit(plane.data, offset, plane.bytes());
+            offset += plane.bytes();
+        }
+    }
+}
+
 void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView destination,
                                         cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
-    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
-        const Tensor conv = linear_.conv_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
-            byte_offset(destination.data, host_layout_.linear_conv.offset +
-                                              layer * host_layout_.linear_conv_layer_bytes),
-            conv.data, conv.bytes(), cudaMemcpyDeviceToHost, stream));
-        const Tensor recurrent = linear_.recurrent_slot(layer, source);
-        CUDA_CHECK(cudaMemcpyAsync(
-            byte_offset(destination.data, host_layout_.linear_recurrent.offset +
-                                              layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.data, recurrent.bytes(), cudaMemcpyDeviceToHost, stream));
-    }
-    const Tensor hidden = continuation_hidden_slot(source);
-    CUDA_CHECK(
-        cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
-                        hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
-            const Tensor k                    = view.k.slice(3, source, 1);
-            const Tensor v                    = view.v.slice(3, source, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_k->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                k.data, k.bytes(), cudaMemcpyDeviceToHost, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                byte_offset(destination.data, host_layout_.dflash_local_v->offset +
-                                                  layer * host_layout_.dflash_local_layer_bytes),
-                v.data, v.bytes(), cudaMemcpyDeviceToHost, stream));
-        }
-    }
+    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data, offset), device, bytes,
+                                   cudaMemcpyDeviceToHost, stream));
+    });
 }
 
 void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::int32_t destination,
@@ -440,41 +616,10 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
-    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
-        const Tensor conv = linear_.conv_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
-            conv.data,
-            byte_offset(source.data, host_layout_.linear_conv.offset +
-                                         layer * host_layout_.linear_conv_layer_bytes),
-            conv.bytes(), cudaMemcpyHostToDevice, stream));
-        const Tensor recurrent = linear_.recurrent_slot(layer, destination);
-        CUDA_CHECK(cudaMemcpyAsync(
-            recurrent.data,
-            byte_offset(source.data, host_layout_.linear_recurrent.offset +
-                                         layer * host_layout_.linear_recurrent_layer_bytes),
-            recurrent.bytes(), cudaMemcpyHostToDevice, stream));
-    }
-    const Tensor hidden = continuation_hidden_slot(destination);
-    CUDA_CHECK(cudaMemcpyAsync(hidden.data,
-                               byte_offset(source.data, host_layout_.continuation_hidden.offset),
-                               hidden.bytes(), cudaMemcpyHostToDevice, stream));
-    if (dflash_local_) {
-        for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
-            const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
-            const Tensor k                    = view.k.slice(3, destination, 1);
-            const Tensor v                    = view.v.slice(3, destination, 1);
-            CUDA_CHECK(cudaMemcpyAsync(
-                k.data,
-                byte_offset(source.data, host_layout_.dflash_local_k->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                k.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(
-                v.data,
-                byte_offset(source.data, host_layout_.dflash_local_v->offset +
-                                             layer * host_layout_.dflash_local_layer_bytes),
-                v.bytes(), cudaMemcpyHostToDevice, stream));
-        }
-    }
+    for_each_host_component(destination, [&](void* device, std::size_t offset, std::size_t bytes) {
+        CUDA_CHECK(cudaMemcpyAsync(device, byte_offset(source.data, offset), bytes,
+                                   cudaMemcpyHostToDevice, stream));
+    });
 }
 
 } // namespace ninfer::models::qwen3_5

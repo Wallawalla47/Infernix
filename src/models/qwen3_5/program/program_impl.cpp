@@ -419,7 +419,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
         while (cursor < predictor_count) {
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
-                {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
+                {device, parameters, work, *state_images, nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, prompt_attention},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},

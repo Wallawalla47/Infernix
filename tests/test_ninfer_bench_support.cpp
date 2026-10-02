@@ -225,6 +225,18 @@ int test_cli_contract() {
                               "NVFP4 report name");
     failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Fp8KeyNvfp4Value), "k8v4",
                               "K8V4 report name");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype",
+                                       "vq2"})
+                               .kv_cache == ninfer::KvCacheStorage::Vq2,
+                       "VQ2 KV");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype",
+                                       "k4v2"})
+                               .kv_cache == ninfer::KvCacheStorage::Q4KeyVq2Value,
+                       "K4V2 KV");
+    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Vq2), "vq2",
+                              "VQ2 report name");
+    failures += expect_string(qb::kv_cache_name(ninfer::KvCacheStorage::Q4KeyVq2Value), "k4v2",
+                              "K4V2 report name");
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
