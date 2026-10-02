@@ -509,3 +509,21 @@ value (at most 13 halvings), only eight-warp CTAs split, and the four-warp split
 longer compiled. A first version that bounded the loop's condition instead made the four-warp
 unsplit kernel spill 8 bytes and run 3-6 % slower; the clamp inside the rarely taken branch does
 not.
+
+## Decoding each INT8 V tile once per CTA (not adopted)
+
+The profile above suggested decoding each V tile once per eight-warp CTA instead of in every warp.
+Adding a 32 KB FP16 V buffer does not fit: sm_120 allows 99 KB of shared memory per block and the
+kernel uses 98 KB. The measured form decoded in place instead: after every warp's QK of a tile, each
+thread read one key's 64 codes of one group into registers and, after a barrier, wrote them as
+FP16 (the same values as the register decode) over the tile's consumed K and V codes, exactly
+32 KB, in an even/odd-column, key-swizzled layout that every warp then loaded with ldmatrix.trans.
+It passed the attention suite. Per layer against the register decode (append entry, 24/4 geometry,
+cold cache, graph, three alternating passes): 3584 columns -0.2 % over 128K keys, -1.2 % over 32K,
++1.1 % over 8K and +1.3 % over an empty context; 2048 columns +1.5 to +2.4 % everywhere; 4096 columns
+-0.5 % to +1.8 %. The removed decode instructions had been filling issue slots the Tensor Cores
+were not using: with two warps per scheduler the Tensor pipe idles while a warp runs its softmax,
+and the two added barriers per tile and a larger spill (24 instead of 8 bytes of stack) took back
+what the decode saved.
+Overlapping one tile's softmax with another tile's P×V would need a third K/V stage, which the 99
+KB limit also rules out for this CTA shape.
