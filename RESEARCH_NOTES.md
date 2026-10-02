@@ -413,3 +413,47 @@ against 68.0-68.2 us at 33, 40, 47, 48 and 49 tokens (-2.4 to -3.0 %), 66.2 agai
 66.1 against 66.8 at 63 and equal at 64. The 128-row tile takes 68.2 us in most passes at 33-49
 tokens, the 64-row tiles 66.1 in every pass; the eight-warp 64,64,256,4,2,2,2 is routed for 33-64
 tokens.
+
+## Key splits for the fast INT8 prompt kernel: the plan's cost model
+
+The fast NVFP4 prompt kernel's plan (waves x one CTA's sweep / splits, plus 1 % per extra split)
+was first reused for the INT8 kernel. Over long contexts it was right, but the INT8 kernel also
+runs over short ones (NVFP4 only above 2048 keys), and there its splits cost more than they saved:
+each split writes and merges an FP32 row per column and query head, which the plan ignored. Per
+layer call against the unsplit kernel (RTX 5090, append entry, 24/4 geometry, cold cache, graph,
+four passes in opposite order): 900-1280 columns over 1K cached keys were 16-21 % slower, 512-640
+columns over 2K 6-13 % slower.
+
+Every CTA shape and split count was then forced (8 warps with 1-8 splits, 4 warps with 1-7) at
+257-1536 columns over 0-64K cached keys, one pass. Splitting a four-warp CTA was never the fastest
+choice. The best eight-warp split count, and its gain over the best unsplit launch:
+
+| Cached keys | 257-384 columns | 512 | 576-640 | 768-896 | 1024-1280 | 1408-1536 |
+|---|---|---|---|---|---|---|
+| 0-512 | none | none | none | none | none | none |
+| 1K | 2: -3 to -7 % | none | none | none | none | none |
+| 2K | 2: -10 to -12 % | 3: -4 % | none | none | none | none |
+| 4K | 2: -14 to -19 % | 3: -12 % | none | none | 2: -7 to -9 % | none |
+| 8K | 2: -18 to -23 % | 5: -18 % | 4: -6 % | none | 2: -14 to -15 % | none |
+| 32K | 7: -26 to -33 % | 5: -30 % | 4: -15 to -16 % | none | 2: -20 to -21 % | none |
+| 64K | 7: -29 to -35 % | 5: -32 % | 4: -16 to -18 % | none | 2: -20 to -22 % | none |
+
+(448 columns, between the four- and eight-warp shapes, gains 3-8 % with five splits from 16K.)
+A plan in units of one eight-warp CTA's sweep over one visible key (about 59 ns): waves x keys /
+splits, plus half a key's sweep per column and split for 24 query heads, with the four-warp CTA at
+80 % of the eight-warp per-key time and never split, chooses within 0.14 % of the fastest measured
+configuration on average and 3.8 % at worst (448 columns over 8K keys). The NVFP4 kernel keeps its
+own plan.
+
+One forced configuration hung the GPU: four-warp CTAs with eight splits (reached only at 257 and
+320 columns over at least 4K keys). The kernel ran at 100 % for over a minute; killing the process
+caused a TDR with a microcode reset ('UCodeReset TDR occurred', nvlddmkm event 153) and the machine
+had to be restarted. The four-warp kernel with up to seven splits and the eight-warp kernel with
+eight completed. The cause was not found by reading the code: the cache is populated through the
+codec, the workspace arena checks capacity, every barrier is CTA-uniform, and the kernel's only
+data-dependent loop was the FP16 range rescale (`while (ldexpf(vmax, -shift) > 8)`), which never
+ends if a V scale reads as infinity. The loop now halves the scale clamped to the largest finite FP16
+value (at most 13 halvings), only eight-warp CTAs split, and the four-warp split instance is no
+longer compiled. A first version that bounded the loop's condition instead made the four-warp
+unsplit kernel spill 8 bytes and run 3-6 % slower; the clamp inside the rarely taken branch does
+not.

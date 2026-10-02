@@ -935,6 +935,7 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                     values[index(d, head, pos)] = cache_value(cache, false, head, pos, d);
                 }
             }
+        });
     // Amortize thread startup with enough dot-product work per worker. Bound CPU workers and
     // their per-row score buffers; parallel rows retain each FP64 sum's original order.
     constexpr unsigned kMaxOracleWorkers      = 8;
@@ -2923,65 +2924,76 @@ int run_wide_batch_copy_cases(DeviceExecutionView execution, KvCacheStorage stor
 }
 
 // The fast INT8 prompt kernel over prompt-route widths: partial row blocks, both CTA shapes (its
-// launcher picks four or eight warps from the width), V magnitudes on either side of its
-// FP16-partial scale limit, graph replay, and the production 3584-token prefill chunk as a first
-// chunk and after a long history.
+// launcher picks four or eight warps from the width), launches over enough key pages to split them
+// across CTAs (including an envelope far past the populated keys, so late splits own no visible
+// key), V magnitudes on either side of its FP16-partial scale limit, graph replay, masked rows, and
+// the production 3584-token prefill chunk as a first chunk and after a long history.
 int run_int8_fast_prompt_cases(DeviceExecutionView execution, bool pv8) {
-    constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
-    int failures                     = 0;
-    const auto fast                  = [pv8](AttentionCase test_case) {
-        test_case.fast_prompt_kernel = true;
-        test_case.fast_prompt_pv8    = pv8;
-        return test_case;
-    };
-    const auto values = [&](AttentionCase test_case, float amplitude) {
-        test_case.value_amplitude = amplitude;
-        return fast(test_case);
-    };
-    const Geometry& h24 = kGeometries[0];
-    const Geometry& h16 = kGeometries[1];
-    failures += run_a1_case(execution, h24, storage, fast({300, 700, 1000, 901u}),
-                            MappingPattern::Fragmented);
-    failures += run_a3_case(execution, h24, storage, fast({300, 700, 1000, 902u}),
-                            MappingPattern::Identity);
-    failures += run_a1_case(execution, h24, storage, fast({1100, 0, 1100, 903u}),
-                            MappingPattern::Fragmented);
-    failures +=
-        run_a3_case(execution, h24, storage, fast({1057, 131, 1188, 904u}), MappingPattern::Offset);
-    failures += run_a1_case(execution, h16, storage, fast({1500, 500, 2000, 905u}),
-                            MappingPattern::Identity);
-    failures += run_a3_case(execution, h16, storage, fast({257, 2000, 2257, 906u}),
-                            MappingPattern::Fragmented);
-    // |V| up to 2048 puts group scales near 16, whose FP16 partials would overflow without the
-    // power-of-two rescale; |V| up to 900 keeps scales near 7, inside the unscaled path's margin.
-    failures += run_a1_case(execution, h24, storage, values({300, 1000, 1300, 907u}, 2048.0f),
-                            MappingPattern::Identity);
-    failures += run_a3_case(execution, h24, storage, values({1100, 64, 1164, 908u}, 2048.0f),
-                            MappingPattern::Fragmented);
-    failures += run_a3_case(execution, h24, storage, values({640, 400, 1040, 909u}, 900.0f),
-                            MappingPattern::Identity);
-    failures += run_a1_case(execution, h24, storage, fast({600, 300, 900, 910u, false, true}),
-                            MappingPattern::Identity);
-    const std::array<int, 6> chunk_queries{0, 127, 128, 1791, 3456, 3583};
-    const auto chunk = [&](std::int32_t base, std::uint32_t seed) {
-        return fast({3584, base, static_cast<std::uint32_t>(base + 3584), seed});
-    };
-    failures += run_a1_case(execution, h24, storage, chunk(0, 912u), MappingPattern::Fragmented,
-                            chunk_queries);
-    failures += run_a1_case(execution, h24, storage, chunk(8192, 913u), MappingPattern::Fragmented,
-                            chunk_queries);
-    AttentionCase scaled   = chunk(1000, 914u);
-    scaled.value_amplitude = 2048.0f;
-    failures +=
-        run_a1_case(execution, h24, storage, scaled, MappingPattern::Identity, chunk_queries);
-    failures += run_a3_case(execution, h16, storage, chunk(2000, 915u), MappingPattern::Offset,
-                            chunk_queries);
-    // Inactive columns of a masked single-row prompt publish zeros.
-    BatchAttentionCase masked{300, {0}, {250}, {0}, MappingPattern::Identity, 916u};
-    masked.fast_prompt_kernel = true;
-    masked.fast_prompt_pv8    = pv8;
-    failures += run_batch_case(execution, h24, storage, masked);
-    return failures;
+        constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
+        int failures                     = 0;
+        const auto fast                  = [pv8](AttentionCase test_case) {
+            test_case.fast_prompt_kernel = true;
+            test_case.fast_prompt_pv8    = pv8;
+            return test_case;
+        };
+        const auto values = [&](AttentionCase test_case, float amplitude) {
+            test_case.value_amplitude = amplitude;
+            return fast(test_case);
+        };
+        const Geometry& h24 = kGeometries[0];
+        const Geometry& h16 = kGeometries[1];
+        failures += run_a1_case(execution, h24, storage, fast({300, 700, 1000, 901u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, h24, storage, fast({300, 700, 1000, 902u}),
+                                MappingPattern::Identity);
+        failures += run_a1_case(execution, h24, storage, fast({1100, 0, 1100, 903u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, h24, storage, fast({1057, 131, 1188, 904u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(execution, h16, storage, fast({1500, 500, 2000, 905u}),
+                                MappingPattern::Identity);
+        failures += run_a3_case(execution, h16, storage, fast({257, 2000, 2257, 906u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, h24, storage, fast({300, 1900, 8192, 917u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(execution, h16, storage, fast({600, 5000, 9000, 918u}),
+                                MappingPattern::Identity);
+        // |V| up to 2048 puts group scales near 16, whose FP16 partials would overflow without the
+        // power-of-two rescale; |V| up to 900 keeps scales near 7, inside the unscaled path's
+        // margin.
+        failures += run_a1_case(execution, h24, storage, values({300, 1000, 1300, 907u}, 2048.0f),
+                                MappingPattern::Identity);
+        failures += run_a3_case(execution, h24, storage, values({1100, 64, 1164, 908u}, 2048.0f),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, h24, storage, values({640, 400, 1040, 909u}, 900.0f),
+                                MappingPattern::Identity);
+        failures += run_a1_case(execution, h24, storage, fast({600, 300, 900, 910u, false, true}),
+                                MappingPattern::Identity);
+        const std::array<int, 6> chunk_queries{0, 127, 128, 1791, 3456, 3583};
+        const auto chunk = [&](std::int32_t base, std::uint32_t seed) {
+            return fast({3584, base, static_cast<std::uint32_t>(base + 3584), seed});
+        };
+        failures += run_a1_case(execution, h24, storage, chunk(0, 912u), MappingPattern::Fragmented,
+                                chunk_queries);
+        failures += run_a1_case(execution, h24, storage, chunk(8192, 913u),
+                                MappingPattern::Fragmented, chunk_queries);
+        AttentionCase scaled   = chunk(1000, 914u);
+        scaled.value_amplitude = 2048.0f;
+        failures +=
+            run_a1_case(execution, h24, storage, scaled, MappingPattern::Identity, chunk_queries);
+        failures += run_a3_case(execution, h16, storage, chunk(2000, 915u), MappingPattern::Offset,
+                                chunk_queries);
+        // Inactive columns of a masked single-row prompt publish zeros.
+        BatchAttentionCase masked{300, {0}, {250}, {0}, MappingPattern::Identity, 916u};
+        masked.fast_prompt_kernel = true;
+        masked.fast_prompt_pv8    = pv8;
+        failures += run_batch_case(execution, h24, storage, masked);
+        BatchAttentionCase split_masked{300, {3000}, {211}, {0}, MappingPattern::Fragmented, 919u};
+        split_masked.graph_replay       = true;
+        split_masked.fast_prompt_kernel = true;
+        split_masked.fast_prompt_pv8    = pv8;
+        failures += run_batch_case(execution, h24, storage, split_masked);
+        return failures;
 }
 
 // The fast NVFP4 prompt kernel over prompt-route widths above 2048 visible keys: partial and full
