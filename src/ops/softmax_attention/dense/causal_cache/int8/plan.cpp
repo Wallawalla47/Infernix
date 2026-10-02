@@ -1,5 +1,6 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/plan.h"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
+#include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_plan.h"
 #include <algorithm>
 #include <stdexcept>
 
@@ -58,6 +59,11 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
         (void)allocate_causal_partials(layout, heads, width, splits, batch);
         maximum = std::max(maximum, layout.peak_bytes(1));
     }
+    // The fast prompt kernel may split a prompt-route launch's keys across CTAs.
+    if (envelope.fast_prompt_kernel && batch == 1 && max_width > kGroupedPrefillMaxWidth)
+        maximum = std::max(maximum, int8_fast_prompt_workspace_bytes(
+                                        heads, std::max(min_width, kGroupedPrefillMaxWidth + 1),
+                                        max_width, envelope.max_visible_keys));
     return maximum;
 }
 

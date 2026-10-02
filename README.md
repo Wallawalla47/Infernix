@@ -350,6 +350,23 @@ which require `--use-original-prefix-caching`. Details:
   original INT8 kernel (4K windows: 4.8986 against 4.9027, BF16 KV 4.8948).
   `--use-original-int8-prefill-kernel` keeps upstream's kernel.
   Commit: [`4c9a949`][c-fast-int8].
+- **Key splits for short INT8 prompt chunks**: a chunk of up to about 1300 tokens over a long
+  cached prefix leaves SMs idle with one CTA per row block, so the fast INT8 kernel divides its keys
+  among eight-warp CTAs and merges their FP32 partial rows, as the fast NVFP4 kernel does. It splits
+  only when the time saved outweighs writing and merging the partial rows (a cost model fitted to
+  every split count measured at 0-64K keys), so chunks over less than about 1K keys and widths whose
+  row blocks already fill the GPU stay unsplit. Per attention layer against the kernel before
+  splits: 257-384-token chunks take 4-7 % less time over 1K cached keys, 10-14 % over 2K, 15-19 %
+  over 4K and 28-37 % over 32K-128K; 512 tokens 6-34 % less from 2K keys, 576-640 tokens 7-20 % less
+  from 8K and 1024-1280 tokens 8-23 % less from 4K. Slower: 448 tokens over 8K keys (+2.9 %), 576
+  over 4K (+1.9 %) and 1024-1280 over 2K (+1.9 to +2.7 %); other widths, including full 3584-token
+  chunks, are within 1 %. End to end, a 267-token follow-up over a 128K-token cached prefix
+  prefilled 21 % faster, and 550-620-token follow-ups 12 % faster (5 % over 32K; measured with an
+  earlier plan that splits these widths the same way); uncached prompts, full documents and longer
+  follow-ups were unchanged within about 2 %. Perplexity on the full `ninfer-ppl-1m-v1` corpus moved
+  from 4.9077081 to 4.9076804 with 4K windows and from 4.9041197 to 4.9041624 with 64K windows, each
+  within 0.7 standard errors of the per-window differences. The partials take up to 64 MiB of
+  workspace: 576 fewer KV tokens (0.23 %) at startup with `--max-context 140000`.
 - **8-bit P×V in the fast INT8 prompt kernel** (opt-in, `--int8-prefill-8bit-pv`): the kernel
   multiplies P×V on INT8 Tensor Cores (4× the FP16 rate with FP32 accumulation on RTX 5090). Each
   row's probabilities, scaled by the V group scale, are quantized to 8-bit codes per 64-key tile and

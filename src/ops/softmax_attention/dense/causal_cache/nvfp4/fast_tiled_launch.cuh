@@ -24,12 +24,11 @@ void launch_nvfp4_kv_fast_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvRea
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("fast prompt attention requires a complete single query row");
-    const RotatedFastPromptPlan plan =
-        rotated_fast_prompt_plan(G::QHeads, p.width, p.visible_capacity);
+    const FastPromptPlan plan = nvfp4_fast_prompt_plan(G::QHeads, p.width, p.visible_capacity);
     auto scope = workspace.scope();
-    RotatedFastPromptPartials partials{};
+    FastPromptPartials partials{};
     if (plan.splits > 1)
-        partials = allocate_rotated_fast_prompt_partials(workspace, G::QHeads, p.width, plan.splits);
+        partials = allocate_fast_prompt_partials(workspace, G::QHeads, p.width, plan.splits);
     const auto invoke = [&]<class Metadata>(Metadata metadata, const std::int32_t* valid) {
         const auto launch = [&]<int Warps, bool Split>() {
             using Shape = CausalPromptRotatedShape<Warps>;
@@ -57,7 +56,7 @@ void launch_nvfp4_kv_fast_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvRea
         }
         dispatch.template operator()<true>();
         constexpr float Log2E = 1.4426950408889634074f;
-        causal_attention_prompt_rotated_fast_merge_kernel<G>
+        causal_attention_prompt_fast_merge_kernel<G>
             <<<dim3(p.width, G::QHeads), kCausalPromptHeadDim, 0, stream>>>(
                 static_cast<const float*>(partials.rows.data),
                 static_cast<const float2*>(partials.stats.data), valid, p.width, plan.splits,

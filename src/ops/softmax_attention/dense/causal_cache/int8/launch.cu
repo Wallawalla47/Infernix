@@ -118,14 +118,15 @@ void execute_parallel(const CausalAttentionOperands& p, Int8KvReadView cache,
 }
 
 void tiled(const CausalAttentionOperands& p, Int8KvReadView cache,
-           const CausalAttentionExecutionEnvelope& envelope, cudaStream_t stream) {
+           const CausalAttentionExecutionEnvelope& envelope, WorkspaceArena& workspace,
+           cudaStream_t stream) {
     if (envelope.fast_prompt_kernel) {
         if (p.query_heads == 24)
             launch_int8_kv_fast_tiled_mma<CausalD256H24Kv4>(p, cache, envelope.fast_prompt_pv8,
-                                                             stream);
+                                                            workspace, stream);
         else
             launch_int8_kv_fast_tiled_mma<CausalD256H16Kv2>(p, cache, envelope.fast_prompt_pv8,
-                                                             stream);
+                                                            workspace, stream);
         return;
     }
     if (p.query_heads == 24)
@@ -153,7 +154,7 @@ void int8_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         auto view = make_quantized_causal_cache_view<Int8KvCacheView<false>>(cache, &valid, &rows);
         view.tree_masks = tree;
         if (plan.family == Int8KvFamily::Tiled)
-            tiled(p, view, envelope, stream);
+            tiled(p, view, envelope, workspace, stream);
         else
             execute_parallel(p, view, plan, workspace, stream);
     } else {
@@ -174,7 +175,8 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
     const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Int8KvFamily::Tiled)
         tiled(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-              make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), envelope, stream);
+              make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), envelope, workspace,
+              stream);
     else if (plan.family == Int8KvFamily::ParallelGrouped)
         execute_parallel(make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
                          make_quantized_causal_cache_view<Int8KvCacheView<false>>(view), plan,

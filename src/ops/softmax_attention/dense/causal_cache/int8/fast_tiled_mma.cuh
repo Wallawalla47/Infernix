@@ -30,6 +30,12 @@
 //     The k32 MMA consumes each lane's own QK keys in a fixed permuted key order, matched by the
 //     V fragments, so no probability crosses lanes.
 //   * CTAs are issued longest-first so a causal prompt's heaviest row blocks do not form the tail.
+//   * A split launch (gridDim.z > 1, Split; eight-warp CTAs only) gives each CTA a contiguous run
+//   of
+//     key pages for launches whose row blocks alone would leave SMs idle; each CTA publishes its
+//     normalized FP32 rows and their (max, sum) statistics, and
+//     causal_attention_prompt_fast_merge_kernel combines the splits (int8/fast_tiled_plan.h
+//     chooses the CTA shape and split count).
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -121,7 +127,7 @@ __device__ __forceinline__ void causal_prompt_i8_fast_decode_v_pair(unsigned cod
     odd                   = load_vec<unsigned>(&vo);
 }
 
-template <typename Geometry, typename Metadata, int Warps, bool Pv8>
+template <typename Geometry, typename Metadata, int Warps, bool Pv8, bool Split>
 __global__ __launch_bounds__(
     CausalPromptI8FastShape<Warps>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
@@ -132,7 +138,9 @@ __global__ __launch_bounds__(
                                                    Metadata metadata,
                                                    const std::int32_t* __restrict__ positions,
                                                    float scale, __nv_bfloat16* __restrict__ out,
-                                                   std::int32_t width) {
+                                                   std::int32_t width,
+                                                   float* __restrict__ partial_rows,
+                                                   float2* __restrict__ partial_stats) {
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int DB16          = D / 2;
     using Shape                 = CausalPromptI8FastShape<Warps>;
@@ -151,6 +159,7 @@ __global__ __launch_bounds__(
 
     static_assert(GroupKc == 2);
     static_assert(GroupDBlocks == 4);
+    static_assert(!Split || Warps == 8, "only eight-warp CTAs split");
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     std::int8_t* q_i8    = reinterpret_cast<std::int8_t*>(smem_raw);
@@ -181,9 +190,12 @@ __global__ __launch_bounds__(
     };
 
     if (q0 >= tokens) {
-        for (int element = tid; element < Br * (D / 4); element += Threads) {
-            const int row = element / (D / 4);
-            store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+        // The merge publishes a split launch's inactive columns.
+        if constexpr (!Split) {
+            for (int element = tid; element < Br * (D / 4); element += Threads) {
+                const int row = element / (D / 4);
+                store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
         }
         return;
     }
@@ -193,6 +205,11 @@ __global__ __launch_bounds__(
     const int rows                  = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + rows - 1;
     const int key_blocks            = max_query_abs / Bc + 1;
+    // Key pages [kb_begin, kb_end) of this split; an empty run publishes neutral statistics.
+    const int split           = Split ? static_cast<int>(blockIdx.z) : 0;
+    const int pages_per_split = Split ? div_up(key_blocks, static_cast<int>(gridDim.z)) : 0;
+    const int kb_begin        = Split ? min(key_blocks, split * pages_per_split) : 0;
+    const int kb_end          = Split ? min(key_blocks, kb_begin + pages_per_split) : key_blocks;
 
     // Each warp rotates and encodes its own 16 rows, keeping the two rows each lane owns in the
     // MMA C layout as register scales.
@@ -418,7 +435,10 @@ __global__ __launch_bounds__(
             const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
             tile_shift       = 0;
             if (vmax > kCausalPromptI8FastF16PartialScaleLimit) {
-                while (ldexpf(vmax, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
+                // An infinite scale would never halve below the limit; the largest finite FP16
+                // value takes 13 halvings.
+                const float bounded = fminf(vmax, 65504.0f);
+                while (ldexpf(bounded, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
                     ++tile_shift;
                 }
             }
@@ -623,14 +643,27 @@ __global__ __launch_bounds__(
     };
 
     // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
-    issue_tile(0);
+    // The unsplit launch keeps its own loop, so it compiles to the same code as before splits.
+    if constexpr (Split) {
+        if (kb_begin < kb_end) { issue_tile(kb_begin); }
 #pragma unroll 1
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        cp_wait<0>();
-        __syncthreads();
-        if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
-        qk_softmax(kb);
-        pv(kb);
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            cp_wait<0>();
+            __syncthreads();
+            if (kb + 1 < kb_end) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+        }
+    } else {
+        issue_tile(0);
+#pragma unroll 1
+        for (int kb = 0; kb < key_blocks; ++kb) {
+            cp_wait<0>();
+            __syncthreads();
+            if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+        }
     }
 
     running_l0         = warp_sum<4>(running_l0, FullMask);
@@ -639,13 +672,32 @@ __global__ __launch_bounds__(
     const float inv_l1 = running_l1 > 0.0f ? __frcp_rn(running_l1) : 0.0f;
     // Even n8 tiles hold dimensions 16b + 2n and odd tiles 16b + 2n + 1, so lane (g, t) owns the
     // four contiguous dimensions 16b + 4t .. 16b + 4t + 3 of its two rows.
+    if constexpr (Split) {
+        // Each split row is normalized by its own sum; the merge weights the splits.
+        const auto publish = [&](int row, int e, float maximum, float sum, float inv) {
+            if (row >= rows) { return; }
+            const std::int64_t index =
+                causal_prompt_fast_partial_row<Geometry>(split, q0 + row, q_head, width);
+            if (lid == 0) { partial_stats[index] = make_float2(maximum, sum); }
+            float* target = partial_rows + index * D;
 #pragma unroll
-    for (int b = 0; b < DBlocks; ++b) {
-        const int d0 = b * 16 + 4 * lid;
-        store_row(row0, d0, acc[b][0][0] * inv_l0, acc[b][1][0] * inv_l0, acc[b][0][1] * inv_l0,
-                  acc[b][1][1] * inv_l0);
-        store_row(row1, d0, acc[b][0][2] * inv_l1, acc[b][1][2] * inv_l1, acc[b][0][3] * inv_l1,
-                  acc[b][1][3] * inv_l1);
+            for (int b = 0; b < DBlocks; ++b) {
+                store_vec(target + b * 16 + 4 * lid,
+                          make_float4(acc[b][0][e] * inv, acc[b][1][e] * inv,
+                                      acc[b][0][e + 1] * inv, acc[b][1][e + 1] * inv));
+            }
+        };
+        publish(row0, 0, running_m0, running_l0, inv_l0);
+        publish(row1, 2, running_m1, running_l1, inv_l1);
+    } else {
+#pragma unroll
+        for (int b = 0; b < DBlocks; ++b) {
+            const int d0 = b * 16 + 4 * lid;
+            store_row(row0, d0, acc[b][0][0] * inv_l0, acc[b][1][0] * inv_l0, acc[b][0][1] * inv_l0,
+                      acc[b][1][1] * inv_l0);
+            store_row(row1, d0, acc[b][0][2] * inv_l1, acc[b][1][2] * inv_l1, acc[b][0][3] * inv_l1,
+                      acc[b][1][3] * inv_l1);
+        }
     }
 }
 
