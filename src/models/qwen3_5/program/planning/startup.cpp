@@ -1074,21 +1074,39 @@ PromptAttentionKernel prompt_attention_kernel(const EngineOptions& options) {
                ? PromptAttentionKernel::Fast
                : PromptAttentionKernel::Original;
 }
+// The fast INT8 and NVFP4 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV run one
+// 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use other
+// tiles.
+bool prefill_attention_runs_waves(const EngineOptions& options) {
+    switch (options.kv_cache) {
+    case KvCacheStorage::Int8Group64: return !options.original_int8_prefill_kernel;
+    case KvCacheStorage::Nvfp4Group16: return !options.original_nvfp4_prefill_kernel;
+    case KvCacheStorage::Fp8E4M3Row256:
+    case KvCacheStorage::Fp8KeyNvfp4Value: return true;
+    case KvCacheStorage::BFloat16: return false;
+    }
+    return false;
+}
 } // namespace
 
-// Every chunk but a prompt's last one has the effective width, so with the fast prefill kernel it
-// is rounded down to whole prompt-attention waves, keeping each full chunk's attention free of a
-// partial last wave.
-std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
-                                      const EngineOptions& options) {
-    const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
-    if (!uses_fast_int8_prefill(options)) { return requested; }
+// Every chunk but a prompt's last one has the effective width, so with a prompt-attention kernel of
+// whole-SM row blocks it is rounded down to whole prompt-attention waves, keeping each full chunk's
+// attention free of a partial last wave.
+std::uint32_t prefill_step_width(const execution::Parameters& parameters,
+                                 const EngineOptions& options, std::uint32_t requested) {
+    requested = std::min(requested, options.max_context);
+    if (!prefill_attention_runs_waves(options)) { return requested; }
     const auto& attention = *parameters.model.config().text.attention;
     const auto wave = static_cast<std::uint32_t>(ops::causal_softmax_attention_prompt_wave_tokens(
         {static_cast<std::int32_t>(attention.head_dim),
          static_cast<std::int32_t>(attention.num_attention_heads),
          static_cast<std::int32_t>(attention.num_key_value_heads)}));
     return requested < wave ? requested : requested / wave * wave;
+}
+
+std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
+                                      const EngineOptions& options) {
+    return prefill_step_width(parameters, options, options.prefill_chunk);
 }
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>

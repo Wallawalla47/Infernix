@@ -212,7 +212,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-context N` | per-sequence logical context ceiling | `2048` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128; rounded down to whole prompt-attention waves (896 tokens for the 24-head model on RTX 5090) with INT8, NVFP4, FP8 or K8V4 KV unless an original prompt kernel is selected | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
