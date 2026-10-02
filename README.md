@@ -386,12 +386,18 @@ which require `--use-original-prefix-caching`. Details:
   14.4 % at 64K. Perplexity moves by +1.1e-3 nats per token (standard error 2.0e-3).
   `--use-original-nvfp4-prefill-kernel` keeps upstream's kernel.
   Commit: [`8dcd89a`][c-nvfp4-kv].
+- **Wave-aligned prefill chunks for NVFP4, FP8 and K8V4 KV**: their prompt kernels (the fast NVFP4
+  kernel and the MX-FP8 tiled kernel) run one 128-row CTA per SM, like the fast INT8 kernel, so
+  `--prefill-chunk` is now rounded down to whole attention waves for them too (`4096` runs as
+  `3584`), which keeps each full chunk's attention free of a mostly idle last wave. One request,
+  DFlash2: FP8 prefill 1.3 % faster at 32K tokens, 1.2 % at 64K and 0.8 % at 128K (same-session A/B,
+  two passes), K8V4 0.7-1.6 %, NVFP4 1.4-2.2 % at 128K and within noise at 32-64K.
 - **Several requests can prefill at the same time**, overlapping one request's prefill with
   others' prefill and decode. By David Oelfke in the [gzenz/ninfer](https://github.com/gzenz/ninfer)
   fork. Commit: [`25e52f9`][c-concurrent-prefill].
 - **`--prefill-round-robin`** (opt-in) serves concurrently prefilling requests in turn and, while
-  another request is active, prefills in steps of at most 1024 tokens (896 with the fast INT8
-  kernel), so a short prompt or a decoding request beside a long prompt waits one short step
+  another request is active, prefills in steps of at most 1024 tokens (896 where the prefill chunk
+  is rounded to attention waves), so a short prompt or a decoding request beside a long prompt waits one short step
   instead of the whole long prefill. A prompt alone still prefills in whole chunks, and KV capacity
   is unchanged. Based on the round-robin prefill and narrow prefill width by
   [giveen](https://github.com/giveen) in [giveen/ninfer-ext](https://github.com/giveen/ninfer-ext).
