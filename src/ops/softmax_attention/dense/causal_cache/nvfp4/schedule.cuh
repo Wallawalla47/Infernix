@@ -32,6 +32,25 @@ struct Nvfp4KvTiledMmaSchedule {
     static constexpr int kSharedBytes       = (kQueryRows + 2 * Keys) * 256 * 2 + 32;
 };
 
+// The MXFP8 tiled kernel over NVFP4 KV (Nvfp4TiledKeys): eight warps of 16 query rows, one
+// 64-key page per tile, V decoded once per tile into an FP16 arena.
+struct Nvfp4KvArenaTiledSchedule {
+    static constexpr int kQueryRows    = 128;
+    static constexpr int kKeyRows      = 64;
+    static constexpr int kWarps        = kQueryRows / 16;
+    static constexpr int kThreads      = kWarps * 32;
+    static constexpr int kMaxRegisters = 255;
+    static constexpr int kQBytes       = kQueryRows * 256; // two terms, 128 B each
+    static constexpr int kQScaleBytes  = 2 * kQueryRows * 16 + kQueryRows * 4;
+    static constexpr int kKBytes       = kKeyRows * 128;
+    static constexpr int kVBytes       = kKeyRows * 128;
+    static constexpr int kVStageBytes  = kKeyRows * 256 * 2;
+    static constexpr int kScaleBytes   = kKeyRows * (16 + 16);
+    static constexpr int kSharedBytes =
+        kQBytes + kQScaleBytes + kKBytes + kVBytes + kVStageBytes + kScaleBytes;
+    static_assert(kSharedBytes <= 99 * 1024);
+};
+
 struct Nvfp4KvMergeSchedule {
     static constexpr int kDChunk = 256, kThreads = 256;
 };

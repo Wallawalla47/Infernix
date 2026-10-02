@@ -18,12 +18,6 @@ void require_rank_two(const Tensor& tensor, const char* label) {
     }
 }
 
-void require_vector(const Tensor& tensor, std::int32_t columns, const char* label) {
-    if (tensor.ne[0] != columns || tensor.ne[1] != 1 || tensor.ne[2] != 1 || tensor.ne[3] != 1) {
-        throw std::invalid_argument(std::string("target_logprobs: ") + label +
-                                    " must have shape [columns]");
-    }
-}
 
 void require_accessible(const Tensor& tensor, std::size_t alignment, const char* label) {
     if (!tensor.is_contiguous()) {
@@ -62,9 +56,13 @@ void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_
     }
 
     require_rank_two(logits, "logits");
-    const std::int32_t columns = logits.ne[1];
-    require_vector(target_ids, columns, "target_ids");
-    require_vector(output, columns, "output");
+    require_rank_two(target_ids, "target_ids");
+    require_rank_two(output, "output");
+    if (target_ids.ne[1] != logits.ne[1] || output.ne[0] != target_ids.ne[0] ||
+        output.ne[1] != target_ids.ne[1]) {
+        throw std::invalid_argument(
+            "target_logprobs: target_ids and output must have shape [targets, columns]");
+    }
     if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
         throw std::invalid_argument("target_logprobs: valid_rows must be in [1, physical_rows]");
     }

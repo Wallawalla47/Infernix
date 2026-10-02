@@ -4,8 +4,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/template_launch.cuh"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_launch.h"
-#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_tiled_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/nvfp4/fast_prompt_launch.h"
 
 namespace ninfer::ops::detail {
 namespace {
@@ -143,7 +142,7 @@ void nvfp4_kv_append_attention(const Tensor& q, const Tensor& k, const Tensor& v
         view.tree_masks = tree;
         if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
             nvfp4_fast_prompt_applies(envelope.max_visible_keys))
-            nvfp4_kv_fast_tiled_attention(p, view, workspace, stream);
+            nvfp4_kv_fast_prompt_attention(p, view, envelope, workspace, execution);
         else if (plan.family == Nvfp4KvFamily::Tiled)
             nvfp4_kv_tiled_attention(p, view, stream);
         else
@@ -166,9 +165,10 @@ void nvfp4_kv_cached_attention(const Tensor& q, const Tensor& positions, float s
     const auto view = single_row_paged_kv_batch_view(cache);
     if (plan.family == Nvfp4KvFamily::Tiled && envelope.fast_prompt_kernel &&
         nvfp4_fast_prompt_applies(envelope.max_visible_keys))
-        nvfp4_kv_fast_tiled_attention(
+        nvfp4_kv_fast_prompt_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),
-            make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), workspace, stream);
+            make_quantized_causal_cache_view<Nvfp4KvCacheView<false>>(view), envelope, workspace,
+            execution);
     else if (plan.family == Nvfp4KvFamily::Tiled)
         nvfp4_kv_tiled_attention(
             make_causal_operands(q, positions, out, scale, envelope.max_visible_keys),

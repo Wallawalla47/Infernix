@@ -45,7 +45,8 @@ struct ServeOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     bool original_int8_prefill_kernel  = false;
-    bool int8_prefill_8bit_pv          = false;
+    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
+    std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs

@@ -23,17 +23,19 @@ constexpr ReductionCriterion kTargetLogprobsFp32Criterion{
     /*gross_relative_to_max_reference=*/0.0,
 };
 
-std::vector<std::int32_t> make_targets(std::int32_t valid_rows, std::int32_t columns) {
-    std::vector<std::int32_t> targets(static_cast<std::size_t>(columns));
-    for (std::int32_t column = 0; column < columns; ++column) {
-        if (column % 4 == 0) {
-            targets[static_cast<std::size_t>(column)] = 0;
-        } else if (column % 4 == 1) {
-            targets[static_cast<std::size_t>(column)] = valid_rows - 1;
+// Column-major [T,C]: target t of column c at c*T+t.
+std::vector<std::int32_t> make_targets(std::int32_t valid_rows, std::int32_t columns,
+                                       std::int32_t per_column) {
+    std::vector<std::int32_t> targets(static_cast<std::size_t>(columns) * per_column);
+    for (std::size_t index = 0; index < targets.size(); ++index) {
+        if (index % 4 == 0) {
+            targets[index] = 0;
+        } else if (index % 4 == 1) {
+            targets[index] = valid_rows - 1;
         } else {
-            targets[static_cast<std::size_t>(column)] =
-                static_cast<std::int32_t>((static_cast<std::uint64_t>(column + 1) * 7919u) %
-                                          static_cast<std::uint32_t>(valid_rows));
+            targets[index] = static_cast<std::int32_t>((static_cast<std::uint64_t>(index + 1) *
+                                                        7919u) %
+                                                       static_cast<std::uint32_t>(valid_rows));
         }
     }
     return targets;
@@ -106,9 +108,11 @@ std::vector<std::uint16_t> make_extreme_logits(std::int32_t physical_rows, std::
 
 std::vector<double> target_logprobs_oracle(const std::vector<std::uint16_t>& logits,
                                            const std::vector<std::int32_t>& targets,
-                                           std::int32_t physical_rows, std::int32_t valid_rows) {
+                                           std::int32_t physical_rows, std::int32_t valid_rows,
+                                           std::int32_t per_column) {
     std::vector<double> expected(targets.size());
-    for (std::size_t column = 0; column < targets.size(); ++column) {
+    const std::size_t columns = targets.size() / static_cast<std::size_t>(per_column);
+    for (std::size_t column = 0; column < columns; ++column) {
         const std::size_t base = column * static_cast<std::size_t>(physical_rows);
         double maximum         = -std::numeric_limits<double>::infinity();
         for (std::int32_t row = 0; row < valid_rows; ++row) {
@@ -118,8 +122,12 @@ std::vector<double> target_logprobs_oracle(const std::vector<std::uint16_t>& log
         for (std::int32_t row = 0; row < valid_rows; ++row) {
             sum += std::exp(static_cast<double>(bf16_to_f32(logits[base + row])) - maximum);
         }
-        const double target = static_cast<double>(bf16_to_f32(logits[base + targets[column]]));
-        expected[column]    = target - maximum - std::log(sum);
+        for (std::int32_t target = 0; target < per_column; ++target) {
+            const std::size_t index = column * static_cast<std::size_t>(per_column) +
+                                      static_cast<std::size_t>(target);
+            expected[index] = static_cast<double>(bf16_to_f32(logits[base + targets[index]])) -
+                              maximum - std::log(sum);
+        }
     }
     return expected;
 }
@@ -130,9 +138,11 @@ std::vector<double> fp32_as_double(const void* device, std::size_t count) {
 }
 
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
-             std::int32_t columns, const std::vector<std::uint16_t>& logits) {
-    const auto targets  = make_targets(valid_rows, columns);
-    const auto expected = target_logprobs_oracle(logits, targets, physical_rows, valid_rows);
+             std::int32_t columns, const std::vector<std::uint16_t>& logits,
+             std::int32_t per_column = 1) {
+    const auto targets  = make_targets(valid_rows, columns, per_column);
+    const auto expected =
+        target_logprobs_oracle(logits, targets, physical_rows, valid_rows, per_column);
 
     GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_targets(targets.size() * sizeof(std::int32_t));
@@ -142,8 +152,8 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     device_output.fill(0xcd);
 
     Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, columns});
-    Tensor targets_tensor(device_targets.data(), DType::I32, {columns});
-    Tensor output_tensor(device_output.data(), DType::FP32, {columns});
+    Tensor targets_tensor(device_targets.data(), DType::I32, {per_column, columns});
+    Tensor output_tensor(device_output.data(), DType::FP32, {per_column, columns});
     ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor, nullptr);
     cuda_synchronize();
 
@@ -178,8 +188,8 @@ int run_validation_cases() {
     DeviceBuffer targets_data(3 * sizeof(std::int32_t));
     DeviceBuffer output_data(3 * sizeof(float));
     Tensor logits(logits_data.p, DType::BF16, {8, 3});
-    Tensor targets(targets_data.p, DType::I32, {3});
-    Tensor output(output_data.p, DType::FP32, {3});
+    Tensor targets(targets_data.p, DType::I32, {1, 3});
+    Tensor output(output_data.p, DType::FP32, {1, 3});
 
     int failures = 0;
     failures += expect_invalid("target_logprobs rejects valid_rows=0",
@@ -187,11 +197,15 @@ int run_validation_cases() {
     failures += expect_invalid("target_logprobs rejects valid_rows>physical_rows",
                                [&] { ops::target_logprobs(logits, targets, 9, output, nullptr); });
     failures += expect_invalid("target_logprobs rejects target shape mismatch", [&] {
-        Tensor wrong_targets(targets_data.p, DType::I32, {2});
+        Tensor wrong_targets(targets_data.p, DType::I32, {1, 2});
         ops::target_logprobs(logits, wrong_targets, 8, output, nullptr);
     });
+    failures += expect_invalid("target_logprobs rejects output target-count mismatch", [&] {
+        Tensor wrong_output(output_data.p, DType::FP32, {3, 1});
+        ops::target_logprobs(logits, targets, 8, wrong_output, nullptr);
+    });
     failures += expect_invalid("target_logprobs rejects output dtype", [&] {
-        Tensor wrong_output(output_data.p, DType::BF16, {3});
+        Tensor wrong_output(output_data.p, DType::BF16, {1, 3});
         ops::target_logprobs(logits, targets, 8, wrong_output, nullptr);
     });
     failures += expect_invalid("target_logprobs rejects non-contiguous logits", [&] {
@@ -200,11 +214,11 @@ int run_validation_cases() {
         ops::target_logprobs(strided_logits, targets, 8, output, nullptr);
     });
     failures += expect_invalid("target_logprobs rejects null output", [&] {
-        Tensor null_output(nullptr, DType::FP32, {3});
+        Tensor null_output(nullptr, DType::FP32, {1, 3});
         ops::target_logprobs(logits, targets, 8, null_output, nullptr);
     });
     failures += expect_invalid("target_logprobs rejects output alias", [&] {
-        Tensor alias_output(logits_data.p, DType::FP32, {3});
+        Tensor alias_output(logits_data.p, DType::FP32, {1, 3});
         ops::target_logprobs(logits, targets, 8, alias_output, nullptr);
     });
     failures += expect_invalid("target_logprobs rejects non-matrix logits", [&] {
@@ -228,6 +242,10 @@ int main() {
                          make_random_logits(248320, 248077, 3));
     failures += run_case("target_logprobs non-aligned rows C=1025", 523, 509, 1025,
                          make_random_logits(523, 509, 1025));
+    failures += run_case("target_logprobs full vocabulary T=32", 248320, 248077, 5,
+                         make_random_logits(248320, 248077, 5), 32);
+    failures += run_case("target_logprobs T=300 beyond one CTA pass", 523, 509, 7,
+                         make_random_logits(523, 509, 7), 300);
     failures += run_case("target_logprobs uniform logits", 263, 257, 1024,
                          make_uniform_logits(263, 257, 1024, 3.5f));
     failures +=

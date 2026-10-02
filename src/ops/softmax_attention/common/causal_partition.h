@@ -18,6 +18,9 @@ struct CausalKvPartition {
     // balance_limit keys keep the plain count.
     int balance_shift = 0;
     int balance_limit = 0;
+    // The device's SM count, for partitions whose kernels choose their live split count at launch
+    // (mxfp8_tiled_active_splits); zero elsewhere.
+    int multiprocessors = 0;
 
     // The plain count: the live count of any row window up to `visible` is at most this, so
     // capture sizes partials and grids with it.

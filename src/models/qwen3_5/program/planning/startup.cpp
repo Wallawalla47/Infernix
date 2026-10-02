@@ -353,13 +353,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks run the selected prompt kernel, whose fast NVFP4 form may split keys into
-    // workspace (see execution/text.cpp).
-    const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys   = 1,
-        .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel != PromptAttentionKernel::Original,
-        .fast_prompt_pv8    = plan.fast_prefill_kernel == PromptAttentionKernel::FastPv8};
+    // Prefill chunks run the selected prompt kernel, which may split keys into workspace (see
+    // execution/text.cpp).
+    const ops::CausalAttentionExecutionEnvelope prefill_envelope =
+        plan.prompt_attention.envelope(1, plan.capacity);
     const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
@@ -548,6 +545,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
+        // Top tokens and candidates: ids and log-probabilities of each.
+        for (const DType dtype : {DType::I32, DType::FP32, DType::I32, DType::FP32}) {
+            matrix(causal_score, dtype, static_cast<std::int32_t>(kMaximumScoreTopTokens),
+                   static_cast<std::int32_t>(kCausalScoreTile));
+        }
         linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }
@@ -983,7 +985,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->fast_prefill_kernel  = inputs.fast_prefill_kernel;
+    impl->prompt_attention     = inputs.prompt_attention;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
@@ -1062,17 +1064,24 @@ bool uses_fast_int8_prefill(const EngineOptions& options) {
     return options.kv_cache == KvCacheStorage::Int8Group64 && !options.original_int8_prefill_kernel;
 }
 
-// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected;
-// the INT8 fast kernel runs its PV in 8 bits when requested.
-PromptAttentionKernel prompt_attention_kernel(const EngineOptions& options) {
-    if (uses_fast_int8_prefill(options)) {
-        return options.int8_prefill_8bit_pv ? PromptAttentionKernel::FastPv8
-                                            : PromptAttentionKernel::Fast;
-    }
-    return options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
-                   !options.original_nvfp4_prefill_kernel
-               ? PromptAttentionKernel::Fast
-               : PromptAttentionKernel::Original;
+static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
+              ops::kCausalPromptSplitWorkspaceDefaultBytes);
+
+// INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
+// Those kernels and K8V4's prompt kernel run their PV in 8 bits when prefill_8bit_pv asks for it
+// or leaves the choice to the KV format: NVFP4 and K8V4 by default, INT8 only when forced.
+PromptAttention prompt_attention(const EngineOptions& options) {
+    const bool fast = uses_fast_int8_prefill(options) ||
+                      (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+                       !options.original_nvfp4_prefill_kernel);
+    const bool pv8_capable = fast || options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value;
+    const bool pv8_auto = options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
+                          options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value;
+    const bool pv8 = options.prefill_8bit_pv == PrefillPv8::On ||
+                     (options.prefill_8bit_pv == PrefillPv8::Auto && pv8_auto);
+    return {.fast = fast,
+            .pv8  = pv8 && pv8_capable,
+            .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20};
 }
 // The fast INT8 and NVFP4 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV run one
 // 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use other
@@ -1131,7 +1140,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .fast_prefill_kernel  = prompt_attention_kernel(options),
+        .prompt_attention     = prompt_attention(options),
         .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

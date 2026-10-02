@@ -82,7 +82,8 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--use-original-int8-prefill-kernel]
-          [--int8-prefill-8bit-pv]
+          [--prefill-8bit-pv | --no-prefill-8bit-pv] [--use-original-nvfp4-prefill-kernel]
+          [--prefill-split-workspace-mib <n>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -600,6 +601,11 @@ not 32 speculative rounds. Cold measurements require one call per graph.
 `--envelope-max N` uses a fixed `[1,N]` execution envelope while actual contexts vary; N must
 cover every visible row. The default uses the exact visible length. CSV rows record both bounds,
 so broad Graph-envelope measurements can be distinguished from exact-length measurements.
+`--fast-prompt` sets every envelope's fast prompt-kernel hint (INT8 and NVFP4 KV),
+`--fast-prompt-pv8` also selects the 8-bit P×V forms (INT8, NVFP4 and K8V4), and
+`--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
+`--prefill-split-workspace-mib`). `--prefill-8bit-pv` / `--no-prefill-8bit-pv` override the
+per-format P×V default of `ninfer-bench` itself (8-bit for NVFP4 and K8V4, FP16 for INT8).
 
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench

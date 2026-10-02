@@ -13,18 +13,21 @@ namespace ninfer::ops::detail {
 // causal_softmax_attention_prompt_wave_tokens() counts waves of these rows.
 static_assert(CausalPromptI8FastShape<8>::Br == 128);
 
-// One complete query row whose K/V are already in the paged cache, as launch_int8_kv_tiled_mma. pv8
-// selects the 8-bit PV form. int8_fast_prompt_plan() picks the CTA shape and splits the keys of an
-// eight-warp launch whose row blocks alone would leave SMs idle; the split partials come from the
-// workspace.
+// One complete query row whose K/V are already in the paged cache, as launch_int8_kv_tiled_mma.
+// envelope.fast_prompt_pv8 selects the 8-bit PV form. int8_fast_prompt_plan() picks the CTA shape
+// and splits the keys of an eight-warp launch whose row blocks alone would leave SMs idle, within
+// envelope.prompt_split_workspace_bytes; the split partials come from the workspace.
 template <class G>
-void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache, bool pv8,
+void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView cache,
+                                   CausalAttentionExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    const bool pv8 = envelope.fast_prompt_pv8;
     validate_quantized_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument(
             "INT8 fast prompt attention requires a complete single query row");
-    const FastPromptPlan plan = int8_fast_prompt_plan(G::QHeads, p.width, p.visible_capacity);
+    const FastPromptPlan plan = int8_fast_prompt_plan(G::QHeads, p.width, p.visible_capacity,
+                                                      envelope.prompt_split_workspace_bytes);
     auto scope                = workspace.scope();
     FastPromptPartials partials{};
     if (plan.splits > 1)

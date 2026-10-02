@@ -527,3 +527,225 @@ and the two added barriers per tile and a larger spill (24 instead of 8 bytes of
 what the decode saved.
 Overlapping one tile's softmax with another tile's P×V would need a third K/V stage, which the 99
 KB limit also rules out for this CTA shape.
+
+## Decoupled warps in the fast INT8 prompt kernel (not adopted)
+
+The INT8 profile's math-pipe throttle suggested the eight warps run each 64-key tile in phase
+(QK, softmax and PV at the same time), because every tile ends at a CTA barrier. The measured form
+removed that barrier: each of the two stages got an mbarrier completed by the loading warp's
+cp.async copies (`cp.async.mbarrier.arrive.noinc`), warps waited on it by phase parity, counted
+themselves off the stage with a shared atomic, and the warp that released a stage last loaded the
+page two tiles ahead into it, so warps could drift up to a tile apart. It passed the attention
+suite and spilled nothing. Per layer against the barrier form (append entry, 24/4 geometry, cold
+cache, graph, three alternating passes): +3 to +6 % from 8K to 128K keys at every width
+(3584 columns +4.6 % over 128K) and +0.8 to +2.2 % at 2048-4096 columns over an empty context.
+The warp that releases a stage last is the slowest one, and the whole 33 KB page load (68 copies
+per lane) lands on it, which lengthens exactly the critical path the drift was meant to shorten.
+Spreading the load over all warps would need a third stage (a warp could only load into a stage
+every warp has left), which the 99 KB limit rules out (the kernel uses 98 KB), and TMA cannot
+zero-fill the keys past a CTA's last visible key, which keep masked columns finite.
+
+## FP8 P×V in the fast NVFP4 prompt kernel's register decode (not adopted)
+
+The fast NVFP4 prompt kernel decodes V in registers in every warp. An 8-bit form rounded each
+probability (as 256 p against the tile's own row maximum) and each decoded V value to E4M3 and ran
+P×V on block-scaled E4M3 Tensor Cores with FP32 accumulation, twice the rate of the FP16-accumulate
+P×V it replaced (1013 against 508 TFLOPS dense on RTX 5090; FP16 with FP32 accumulation runs at
+254). The k32 MMA consumes the lane's own QK keys in a permuted order (2t, 2t+1, 8+2t, 9+2t per
+half) that two consecutive k16 V fragments already match, so no probability or V value crosses
+lanes. Relative L2 error against the oracle was 0.025-0.036 (the FP16 form: 0.0017), and it was
+slower per layer: 0 to +5 % (3584 columns +1.3 % over 128K keys, 512-1024 columns +3 to +5 % from
+8K). The extra E4M3 conversion of every decoded value, done again in each of the eight warps, cost
+more issue slots than the halved MMA time saved; see the decode-once kernel below for the form
+that does pay.
+
+## The MX-FP8 tiled prompt kernel: FP16 P×V, cost-aware splits and issue order
+
+The FP8 and K8V4 prompt kernel (upstream's `mxfp8_tiled_mma.cuh`: QK on block-scaled FP8 Tensor
+Cores, each V tile decoded once per CTA into a shared FP16 arena) accumulated P×V with FP16 MMAs
+in FP32. On RTX 5090 that form runs at half the FP16 rate (`mma_rates.cu`, dense mma.sync:
+FP16 with FP16 accumulation 508 TFLOPS, with FP32 accumulation 254; E4M3 block-scaled with FP32
+accumulation 1013, plain E4M3 with FP32 accumulation 507). All measurements below are per
+attention layer (append entry, 24/4 geometry, cold cache, graph, three alternating passes).
+
+- FP16 accumulation per 64-key tile, promoted into the FP32 output once per tile under a per-tile
+  power-of-two V shift that keeps the partial inside FP16 (K8V4: largest scale at most 128; FP8:
+  largest row scale below 2): K8V4 -7 to -19 % (3584 columns -15.5 % over 128K keys), FP8 -7 to
+  -18 %, at every width and context measured. The four FP16 partial registers made the kernel
+  spill 24-40 bytes (none before). Taking alpha into the accumulator before P×V and re-deriving
+  the shift after QK (to shorten live ranges) kept the spill and ran 1-5 % slower, so the fused
+  promotion stayed.
+- Longest-first issue order (the first QHeads CTAs take every head's last row block): K8V4 3584
+  columns -19 % over an empty context and -10 % over 8K, 1024 columns -14 % over an empty
+  context, -0.3 to -3 % from 32K; FP8 alike. Slower: K8V4 512 columns over an empty context +3 %
+  and FP8 256 columns +3.5 % (passes from +1.4 %).
+- Split count from a cost model instead of the fewest waves per split: upstream's partition chose
+  the split count that minimizes waves per split and ignored storing and merging every split's
+  FP32 rows, so a chunk over a short context split into up to eight (4096 columns over an empty
+  context: 1731 us against 820 us for 3584 columns). The kernel and the merge now take the
+  cheapest count up to the partition's bound under the fast INT8 kernel's measured model (waves x
+  keys per split, plus half a key's sweep per column and split for 24 heads). Together with the
+  two changes above, against master: K8V4 -5.5 to -58 % (3584 columns -31.5 % over an empty
+  context, -26 % over 8K, -22 % over 32K, -15 % over 128K; 4096 columns over an empty context
+  -58 %), FP8 -5.7 to -59 %, faster at every point measured (256-4096 columns, 0-128K keys).
+- Split workspace: upstream's partition reserves FP32 partials for its full split target, about
+  550 MiB at 3328-column launches with 4096-token prefill chunks (169 MiB at its default 1024),
+  which comes out of the KV cache. FP8 and K8V4 keep that (their workspace is master's); NVFP4 on
+  this kernel keeps its old 64 MiB budget (below). The budget costs every format alike: with 64 MiB
+  the same kernel takes 17-28 % more time at 1024-2048 columns over 32K-128K keys (K8V4 +27.7 % at
+  1024 over 128K, FP8 +25.0 %, NVFP4 +27.5 %), 3-14 % more over 8K, 3-6 % more at 4096 columns over
+  32K-128K, and the same at 256-512 columns and full 3584-column chunks. The split cost model
+  predicted these penalties (+29 % predicted at 1024 over 128K) and put a 192-256 MiB budget within
+  5 % of unbounded everywhere.
+- Split-workspace sweep (`--prefill-split-workspace-mib`, one envelope bound for all four prompt
+  kernels): 3 interleaved passes per budget, H24, widths 256-4096 over 0/8K/32K/128K keys, against
+  16 GiB (unbounded). Mean over 1024/1408/2048 columns at 8K/32K/128K keys: 64 MiB INT8
+  +5/+17/+20 %, FP8 +8/+19/+23 %, K8V4 +10/+20/+25 %, NVFP4 +7/+19/+25 %; 128 MiB 0/+2/+4-5 %;
+  192 MiB and up within 0.7 %. Worst cells: 64 MiB +23-27 % (1024 columns over 128K); 128 MiB
+  +10-13 % (3072 columns over 128K); 192-256 MiB +4.5-5.9 % (4096 columns over 128K); 384 MiB
+  +0.8-2.3 %. No split (0) makes 256-column FP8/K8V4/NVFP4 launches over 128K 3.1-3.3 times slower
+  and INT8 1024-column ones 1.6 times. The partials of one launch at 256 MiB peak at 233-242 MiB
+  (1408-2560 columns); the tiled kernel always writes one split's rows (85 MiB at 3584 columns), so
+  budgets under that are equivalent for full chunks. Startup workspace (4096-token chunks,
+  `--max-context 220000`, DFlash2): 380 MiB at 64 MiB, 515 MiB at 256 MiB, 809 MiB at 16 GiB (FP8
+  and K8V4 before the bound). End to end, fresh 64K and 128K prompts (whose last chunks are 1024
+  and 2048 tokens wide) prefill within 0.3 % at all three budgets for all four formats (2 runs
+  each). Default 256 MiB.
+
+## NVFP4 on the decode-once kernel (replaces the register-decode fast kernel)
+
+The fast NVFP4 prompt kernel decoded V in registers in each of its eight warps and accumulated
+P×V in FP16 per tile; it ran about as fast as the MX-FP8 kernel did with FP32 accumulation (3584
+columns over 128K keys: 38.6 against 38.7 ms). The MX-FP8 kernel gained a key-format policy and
+runs NVFP4 keys: Q enters as the same two NVFP4 terms (q_terms.cuh) and QK runs on block-scaled
+FP4 Tensor Cores straight from the stored codes and scales; V (the same NVFP4-G16 codec as K8V4's)
+is decoded once per CTA into the FP16 arena. 88 KB of shared memory, one CTA per SM, 56-96 bytes
+of stack (the register-decode kernel: 120-216). Its attention-suite error against the oracle is the
+register-decode kernel's (relative L2 0.0017). Against master's fast kernel, with the issue order,
+split cost and split budget: -6 to -26 % wherever it runs (3584 columns -7.8 % over an empty
+context, -14.6 % over 8K, -15.5 % over 32K, -17.5 % over 128K; 1024-2048 columns -6 to -16 % from
+8K keys; 0.32-0.63 times upstream's tiled NVFP4 kernel).
+Before the issue order and split cost it was 13 % slower at 3584 columns over an empty context and
+2.2 times slower at 4096. Its splits keep the old kernel's 64 MiB partial budget (one split's
+FP32 rows are always written for the merge, so wide launches reserve up to about 85 MiB, against
+64 MiB before); without the budget it reached the same 550 MiB as FP8 and K8V4 and took a further
+14-22 % less time at 1024-2048 columns over 32K-128K keys (2048 columns over 128K: 18.3 against
+22.9 ms), the width of a follow-up prompt over a long cached prefix (the default budget is now
+256 MiB, split-workspace sweep above). Launches over at most 768 visible keys keep the tiled
+kernel (the threshold re-tune is below).
+
+## INT8 on the decode-once kernel (not adopted)
+
+The same kernel with an INT8 key policy (one INT8 Q code and FP32 scale per row and 64-dimension
+group, s8 QK per group with both group scales in FP32) and INT8 V decoded once into the arena
+used exactly the 99 KB of shared memory a block may have and 0-8 bytes of stack, and matched the
+fast INT8 kernel's error (relative L2 0.0017). With upstream's split counts it took 9-20 % less
+time than the fast INT8 kernel for 1024-2048 columns from 8K visible keys, but 7 % more for
+1408-2048 columns over an empty context, 9 % more for 3584 columns over an empty context and about
+the same for full chunks over long contexts. Those wins came from splitting into up to eight
+(363 MiB of partials, against the fast kernel's 64 MiB budget): within the same 64 MiB it was
+0.7-2.2 % slower at 1024-2048 columns over 32K-128K keys and still 6-7 % slower over an empty
+context, so INT8 keeps the fast kernel. The fast INT8 kernel takes the same gain from a larger
+split budget: at 256 MiB it takes 14-17 % less time at 1024-2048 columns over 32K-128K keys than
+at 64 MiB (split-workspace sweep above). A first version also merged the splits with the inverse D256 rotation K8V4 and
+NVFP4 need; INT8 rotates only Q and K, and the suite caught it (relative L2 1.41, the
+norm-preserving mismatch).
+
+## 8-bit P×V for NVFP4 and K8V4 (E4M3, opt-in)
+
+In the decode-once kernel the V arena holds E4M3 bytes instead of FP16 (half the shared memory)
+and P×V runs on block-scaled E4M3 Tensor Cores with FP32 accumulation, four times the rate of the
+upstream FP32-accumulate form. Probabilities are formed as 256 p against the tile's own row maximum:
+the softmax reference follows each tile's row maximum (held within 2^40 of the running maximum,
+so the FP32 accumulator and row sum cannot overflow), which keeps values down to 2^-17 of that
+tile's largest instead of flushing a tile's whole diffuse tail below the running maximum's E4M3
+range. V decodes as in the FP16 form, scaled by the power of two that brings the tile's largest
+scale into [32, 64) (shifting small scales up as well), and is rounded once to E4M3; the shift
+returns exactly through the MMA's UE8M0 B scale. Transposed byte-pair loads of the arena split
+into an even- and an odd-dimension n8 tile in the permuted key order (2t, 2t+1, 8+2t, 9+2t per
+half) that the lane's own QK probabilities already hold. Error against the oracle: relative L2
+0.026-0.037 (FP16 form 0.0017-0.0018), within 4.5 % of the largest reference value pointwise; the
+suite checks these cases against a criterion derived from E4M3 rounding of both operands. Per
+layer, against the default FP16 form: K8V4 0 to -20 % (no change at 256 columns over an empty
+context, -6 % at 512-1408 there) and NVFP4 0 to -20 % (no change where the tiled kernel still runs,
+at most 768 visible keys); 3584 columns over 128K keys -18.9 % and -17.3 %. The same E4M3 rounding inside the register-decode NVFP4 kernel
+did not pay (above).
+
+## KL divergence of the 8-bit P×V forms (and the instrument for it)
+
+Perplexity sees one token's probability, so it cannot tell a small systematic shift from corpus
+noise: the bundled `ninfer-ppl-1m-v1` moves by up to 0.36 nats per token on single streams for any
+small numeric change. `ninfer-perplexity --save-top-tokens` and `--kl-reference` measure the
+distribution shift directly: the reference run (BF16 KV) records each scored position's 32 most
+probable tokens and their log-probabilities, and a test run scores exactly those candidates plus its
+own top-1 and reports KL(reference || test) over them and one bucket for all other tokens, by
+context length, with top-1 agreement and the mean target-token NLL change. Merging the tail makes
+the number a lower bound; the 32 reference tokens carry 0.952 of the reference mass at 64K.
+
+Two artifacts were needed. On the production `qwen3_8_27b_nvfp4-nvidia` artifact (W4A4) everything
+sits at a floor: KL(BF16 || INT8 KV) = 0.0835 and KL(INT8 KV || INT8 KV with 8-bit P×V) = 0.0782 per
+stream, i.e. the change under test is indistinguishable from the A4 activation noise. On
+`qwen3_8_27b_q6-dflash2` (BF16 activations) the floor is 20-30 times lower and the change stands
+out. 64K windows, full corpus, 1,044,876 scored tokens, against a BF16 KV reference:
+
+| KV + P×V form | mean KL | median | top-1 | 32-64K bucket |
+|---|---|---|---|---|
+| INT8, FP16 P×V | 0.00514 | 0.00012 | 98.92 % | 0.0071 |
+| INT8, 8-bit P×V | 0.01108 | 0.00025 | 98.56 % | 0.0161 |
+| INT8, original prompt kernel | 0.00505 | 0.00012 | 98.92 % | 0.0068 |
+| NVFP4, FP16 P×V | 0.02055 | 0.00105 | 97.41 % | 0.0272 |
+| NVFP4, 8-bit P×V | 0.02027 | 0.00107 | 97.40 % | 0.0271 |
+| K8V4, FP16 P×V | 0.01337 | 0.00069 | 97.95 % | 0.0179 |
+| K8V4, 8-bit P×V | 0.01408 | 0.00072 | 97.89 % | 0.0188 |
+
+The E4M3 forms (NVFP4, K8V4) are numerically equivalent to FP16 P×V by this measure: within 1.05×
+overall, within 1.13× in every bucket, within 0.06 pp of top-1. INT8's integer form doubles the
+divergence, worse on all sixteen streams, with the growth concentrated in long context (the 32-64K
+bucket ×2.28) — the same tail-flushing effect the 64K perplexity first showed, now measured without
+corpus noise. The fast INT8 kernel's own FP16 P×V matches the original INT8 kernel (0.0051 against
+0.0050), so the entire cost belongs to the 8-bit P. Since the production artifact hides all of this,
+the criterion was fixed before the Q6 runs: a KV format keeps 8-bit P×V on by default only if its
+mean KL stays within 1.10× its FP16 form's, the same holds in the longest buckets, and top-1
+agreement drops by at most 0.1 pp. NVFP4 and K8V4 pass; INT8 fails, so `EngineOptions::
+prefill_8bit_pv` is a three-way `PrefillPv8 {Auto, On, Off}` whose Auto keeps FP16 P×V for INT8 and
+the E4M3 form for NVFP4 and K8V4, with `--prefill-8bit-pv` / `--no-prefill-8bit-pv` forcing either.
+End to end (one request, DFlash2, 4096-token chunks, two runs each) the default forms remove 4.7 %
+(NVFP4) and 5.0 % (K8V4) of prefill time at 64K tokens and 6.8 % and 7.5 % at 128K; INT8's opt-in
+8-bit P×V would remove 4.2 % and 5.1 %.
+
+## NVFP4 fast-prompt threshold re-tuned to 768 visible keys
+
+The 2048-visible-key threshold of 2026-09 was set against the register-decode fast NVFP4 kernel,
+whose launch cost made it lose to the tiled kernel below that. The decode-once kernel changed the
+crossover: its fast launch is a single 128-row CTA per SM whose cost barely depends on the visible
+length, and the tiled kernel scales with it instead. Forcing the fast kernel at every visible count
+(3 passes, `--entry append`, cold cache, CUDA Graph, 256-3584 columns over 0-8192 cached keys, both
+H24 and H16 geometries, new threshold-0 build against the same commit's tiled kernel): equal at
+512-768 visible keys, up to 1.6x faster from 1024, up to 3.4x at 8192, and up to 1.6x slower for
+256-512-column launches over an empty context, where the tiled kernel's narrower launch wins. A
+threshold of 768 keys is within 0.03 % of the per-shape best over the whole sweep in both
+geometries; 2048 costs 2.3-2.7 % of the total and up to 64 % in its worst cell (3584 columns over
+512 keys, 2048 columns over none). 640 keys is marginally better for H24 but 11 % off best for
+H16 at 768 columns, so 768 is the joint choice.
+
+## Register spills in the MX-FP8 tiled prompt kernel: the NVFP4 slab loop
+
+`ptxas -v` on the H24 and H16 instantiations showed the NVFP4 key path spilling 112-176 bytes per
+thread (FP8 and K8V4 24-40, the FP16-P×V forms only; the 8-bit P×V forms of FP8 and K8V4 spill
+nothing) at the 255-register cap. The spills are the fragment addresses and scale words of the
+fully unrolled four-slab QK loop: at 255 registers the allocator gave up on live ranges that span
+all four slabs, which also serialized their loads. Rolling that loop (`#pragma unroll 1`) removes
+almost all of them (112-176 → 8-16 bytes) and is faster: per attention layer, 3 interleaved passes
+over 256-3584 columns at 0-64K keys, H24 FP16 P×V -4.9 % (geomean, -4.3 to -5.7 % per shape), H24
+8-bit P×V -3.7 %, H16 FP16 P×V -3.7 %, H16 8-bit P×V -4.2 %; end to end, NVFP4 prefill is 1.0 %
+faster at 64K and 1.3-1.5 % at 128K (two runs each). Each slab still issues its sixteen MMAs
+between two loads, so the Tensor Cores stay busy.
+
+Two other ideas were built and dropped. Precomputing the PV V-fragment address bases (the swizzle's
+XOR touches only address bits 4-6, so four per-lane bases plus immediates replace four XORs per
+iterations) is neutral for FP8 (x1.0009) and 0.85 % faster for K8V4's FP16 P×V, both within pass
+noise, and does not remove the remaining 24-40 bytes of FP8/K8V4 spill: 2-3 spill operations per
+64-key tile are not worth a second code path. Combined with the rolled slab loop it changed nothing
+further. The 32-register `bf[2][QKNt][2]` double-buffered key fragment was left alone: unrolling the
+pipelined FP8 QK loop by two is what makes the load/mma overlap work, and the measured spills there
+are small.

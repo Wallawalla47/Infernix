@@ -248,7 +248,8 @@ std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     return impl_->active->frontend.tokenize_text(text);
 }
 
-std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target) {
+ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                 ScoreOptions options) {
     nvtx::ScopedRange score_range(nvtx::Name::Score, nvtx::Category::Scoring,
                                   static_cast<std::uint64_t>(tokens.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -261,19 +262,33 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     if (first_target == 0 || first_target >= tokens.size()) {
         throw std::invalid_argument("score_tokens first_target must be in [1,token_count-1]");
     }
-    PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
-    const std::size_t expected = prompt.summary().prompt_tokens - first_target;
-    std::vector<float> result  = std::visit(
-        [&](auto& core) -> std::vector<float> {
+    const std::size_t positions = tokens.size() - first_target;
+    if (options.top_k > kMaximumScoreTopTokens ||
+        options.candidates_per_position > kMaximumScoreTopTokens) {
+        throw std::invalid_argument("score_tokens top_k and candidates_per_position must be in "
+                                    "[0,64]");
+    }
+    if (options.candidates.size() != positions * options.candidates_per_position) {
+        throw std::invalid_argument(
+            "score_tokens needs candidates_per_position candidates for every scored position");
+    }
+    const std::size_t top_values       = positions * options.top_k;
+    const std::size_t candidate_values = options.candidates.size();
+    PreparedPrompt prompt              = prepare_tokens(std::move(tokens), false);
+    ScoreResult result                 = std::visit(
+        [&](auto& core) -> ScoreResult {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
-                return core->score(std::move(prompt.impl_->value), first_target);
+                return core->score(std::move(prompt.impl_->value), first_target,
+                                   std::move(options));
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
             }
         },
         impl_->core);
-    if (result.size() != expected) {
+    if (result.logprobs.size() != positions || result.top_ids.size() != top_values ||
+        result.top_logprobs.size() != top_values ||
+        result.candidate_logprobs.size() != candidate_values) {
         throw std::logic_error("target Program returned an invalid causal score count");
     }
     return result;

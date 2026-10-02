@@ -155,7 +155,8 @@ int main(int argc, char** argv) {
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-        engine_options.int8_prefill_8bit_pv         = options.int8_prefill_8bit_pv;
+        engine_options.prefill_8bit_pv              = options.prefill_8bit_pv;
+        engine_options.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
         engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.context_cache.enabled             = false;
@@ -171,7 +172,8 @@ int main(int argc, char** argv) {
         env.rope_yarn_factor         = options.rope_yarn_factor;
         env.prefill_chunk            = options.prefill_chunk;
         env.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-        env.int8_prefill_8bit_pv         = options.int8_prefill_8bit_pv;
+        env.prefill_8bit_pv              = options.prefill_8bit_pv;
+        env.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;

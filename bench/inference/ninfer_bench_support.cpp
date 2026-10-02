@@ -317,9 +317,16 @@ std::string usage_text(std::string_view program) {
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
-        << "  --int8-prefill-8bit-pv      8-bit P*V in the fast INT8-KV prompt kernel\n"
+        << "  --prefill-8bit-pv           INT8 KV: 8-bit P*V in the fast prompt kernel\n"
+        << "                              (default FP16; 8-bit is faster but about twice the\n"
+        << "                              KL divergence from a BF16 KV reference)\n"
+        << "  --no-prefill-8bit-pv        NVFP4 and K8V4 KV: FP16 P*V in their prompt kernels\n"
+        << "                              (default 8-bit, 5-7 % faster at long context)\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
+        << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
+        << kDefaultPrefillSplitWorkspaceMiB << ";\n"
+        << "                              128-384 recommended, 0 = no splitting)\n"
         << "  --spec <mtp|dflash|dflash2> speculative backend (default: none)\n"
         << "  --draft-tokens <n>         MTP 1..5; DFlash/DFlash2 1..15\n"
         << "  --ngram-draft-tokens <n>   copy proposals 1..63; 0 disables (default: 0)\n"
@@ -386,8 +393,13 @@ BenchOptions parse_args(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--int8-prefill-8bit-pv") {
-            options.int8_prefill_8bit_pv = true;
+        } else if (arg == "--prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::On;
+        } else if (arg == "--no-prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::Off;
+        } else if (arg == "--prefill-split-workspace-mib") {
+            options.prefill_split_workspace_mib =
+                parse_u32(value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--spec") {
@@ -645,7 +657,8 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  corpus:     " << env.corpus_path << " (" << env.corpus_tokens << " tokens)\n"
         << "  config:     max_context=" << env.max_context << " prefill_chunk=" << env.prefill_chunk
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
-        << " int8_prefill_8bit_pv=" << (env.int8_prefill_8bit_pv ? "on" : "off")
+        << " prefill_8bit_pv=" << prefill_pv8_name(env.prefill_8bit_pv)
+        << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
@@ -775,8 +788,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"original_int8_prefill_kernel\": "
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
-        << "    \"int8_prefill_8bit_pv\": " << (env.int8_prefill_8bit_pv ? "true" : "false")
+        << "    \"prefill_8bit_pv\": \"" << prefill_pv8_name(env.prefill_8bit_pv) << "\""
         << ",\n"
+        << "    \"prefill_split_workspace_mib\": " << env.prefill_split_workspace_mib << ",\n"
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"

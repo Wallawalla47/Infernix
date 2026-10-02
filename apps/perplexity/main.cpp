@@ -1,5 +1,6 @@
 #include "ninfer_build_id.h"
 #include "corpus.h"
+#include "distribution.h"
 #include "evaluation.h"
 
 #include "product/rope_yarn_options.h"
@@ -38,6 +39,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using json  = nlohmann::json;
 using ninfer::perplexity::CorpusSelection;
+using ninfer::perplexity::DivergenceAggregate;
 using ninfer::perplexity::ScoreAggregate;
 using ninfer::perplexity::WindowPlan;
 
@@ -47,6 +49,8 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    std::optional<std::filesystem::path> save_top_tokens;
+    std::optional<std::filesystem::path> kl_reference;
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -54,7 +58,7 @@ struct Options {
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
-    bool int8_prefill_8bit_pv           = false;
+    ninfer::PrefillPv8 prefill_8bit_pv          = ninfer::PrefillPv8::Auto;
     bool original_nvfp4_prefill_kernel  = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
@@ -66,9 +70,13 @@ std::string usage_text() {
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
-           "       [--int8-prefill-8bit-pv (int8 fast kernel only; 8-bit P*V)]\n"
+           "       [--prefill-8bit-pv | --no-prefill-8bit-pv] (8-bit P*V for INT8; FP16 for NVFP4\n"
+           "        and k8v4, which default to 8-bit; see the ninfer-serve help)\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--output <directory>]\n"
+           "       [--save-top-tokens <file>] (record each position's 32 most probable tokens)\n"
+           "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
+           "        same corpus, context and stride, by context length)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -117,8 +125,10 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--use-original-int8-prefill-kernel") {
             out.original_int8_prefill_kernel = true;
-        } else if (option == "--int8-prefill-8bit-pv") {
-            out.int8_prefill_8bit_pv = true;
+        } else if (option == "--prefill-8bit-pv") {
+            out.prefill_8bit_pv = ninfer::PrefillPv8::On;
+        } else if (option == "--no-prefill-8bit-pv") {
+            out.prefill_8bit_pv = ninfer::PrefillPv8::Off;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--kv-dtype") {
@@ -138,6 +148,10 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
+        } else if (option == "--save-top-tokens") {
+            out.save_top_tokens = std::filesystem::path(value("--save-top-tokens"));
+        } else if (option == "--kl-reference") {
+            out.kl_reference = std::filesystem::path(value("--kl-reference"));
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -241,7 +255,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
     engine_options.kv_cache         = options.kv;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-    engine_options.int8_prefill_8bit_pv         = options.int8_prefill_8bit_pv;
+    engine_options.prefill_8bit_pv              = options.prefill_8bit_pv;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
@@ -282,6 +296,28 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
+    const ninfer::perplexity::ReferenceHeader reference_header{.corpus_id = corpus.corpus_id,
+                                                                .mode      = corpus.mode,
+                                                                .context   = options.context,
+                                                                .stride    = options.stride};
+    std::optional<ninfer::perplexity::ReferenceWriter> top_tokens;
+    if (options.save_top_tokens) { top_tokens.emplace(*options.save_top_tokens, reference_header); }
+    std::optional<ninfer::perplexity::ReferenceReader> kl_reference;
+    if (options.kl_reference) {
+        kl_reference.emplace(*options.kl_reference);
+        const ninfer::perplexity::ReferenceHeader& saved = kl_reference->header();
+        if (saved.corpus_id != reference_header.corpus_id || saved.mode != reference_header.mode ||
+            saved.context != reference_header.context || saved.stride != reference_header.stride) {
+            throw std::runtime_error("--kl-reference was recorded for corpus " + saved.corpus_id +
+                                     " / " + saved.mode + " with context/stride " +
+                                     std::to_string(saved.context) + "/" +
+                                     std::to_string(saved.stride));
+        }
+    }
+    // The evaluated run's own most probable token, for top-1 agreement.
+    const std::uint32_t own_top_tokens =
+        top_tokens ? ninfer::perplexity::kReferenceTopTokens : (kl_reference ? 1U : 0U);
+    DivergenceAggregate overall_divergence;
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
@@ -307,6 +343,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         }
         const Clock::time_point stream_started = Clock::now();
         ScoreAggregate stream_score;
+        DivergenceAggregate stream_divergence;
         json window_reports = json::array();
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
@@ -314,17 +351,62 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
             const Clock::time_point window_started = Clock::now();
-            std::vector<float> logprobs;
+            const std::uint64_t input_hash = ninfer::perplexity::token_fingerprint(input);
+            ninfer::ScoreOptions score_options{.top_k = own_top_tokens};
+            std::optional<ninfer::perplexity::ReferenceWindow> reference;
+            if (kl_reference) {
+                reference = kl_reference->next();
+                if (reference->stream_index != stream_index ||
+                    reference->target_begin != window.target_begin ||
+                    reference->target_end != window.target_end ||
+                    reference->input_hash != input_hash) {
+                    throw std::runtime_error("--kl-reference window " +
+                                             std::to_string(window_index) + " of " +
+                                             stream.source.id + " scored different tokens");
+                }
+                score_options.candidates_per_position = kl_reference->header().top_k;
+                score_options.candidates              = reference->top_ids;
+            }
+            ninfer::ScoreResult scored;
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                scored = engine.score_tokens(std::move(input), window.first_target,
+                                             std::move(score_options));
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
             }
-            const std::size_t expected = window.target_end - window.target_begin;
+            const std::vector<float>& logprobs = scored.logprobs;
+            const std::size_t expected         = window.target_end - window.target_begin;
             if (logprobs.size() != expected) {
                 throw std::runtime_error("scoring returned an invalid target count for " +
                                          stream.source.id);
+            }
+            if (top_tokens) {
+                top_tokens->write({.stream_index    = static_cast<std::uint32_t>(stream_index),
+                                   .target_begin    = window.target_begin,
+                                   .target_end      = window.target_end,
+                                   .input_hash      = input_hash,
+                                   .target_logprobs = logprobs,
+                                   .top_ids         = scored.top_ids,
+                                   .top_logprobs    = scored.top_logprobs});
+            }
+            if (reference) {
+                const std::size_t k = kl_reference->header().top_k;
+                for (std::size_t position = 0; position < expected; ++position) {
+                    const std::span<const float> reference_top(
+                        reference->top_logprobs.data() + position * k, k);
+                    const std::span<const float> evaluated_top(
+                        scored.candidate_logprobs.data() + position * k, k);
+                    const bool top1_match =
+                        scored.top_ids[position * own_top_tokens] == reference->top_ids[position * k];
+                    // The predicted token at window input index first_target + position follows
+                    // that many tokens of context.
+                    stream_divergence.add(window.first_target + position,
+                                          ninfer::perplexity::position_divergence(
+                                              reference_top, evaluated_top, top1_match,
+                                              reference->target_logprobs[position],
+                                              logprobs[position]));
+                }
             }
             ScoreAggregate window_score;
             window_score.add(logprobs);
@@ -351,7 +433,12 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 line << "scoring | " << ninfer::product::format_pretty_count(overall.scored_tokens)
                      << '/' << ninfer::product::format_pretty_count(total_scored_tokens)
                      << " tokens | " << completed_windows << '/' << total_windows
-                     << " windows | PPL " << std::fixed << std::setprecision(4) << overall.ppl()
+                     << " windows | PPL " << std::fixed << std::setprecision(4) << overall.ppl();
+                if (kl_reference && stream_divergence.positions() > 0) {
+                    line << " | stream KL " << std::scientific << std::setprecision(3)
+                         << stream_divergence.mean_kl() << std::fixed;
+                }
+                line
                      << " | " << ninfer::product::format_pretty_rate(rate, "tok") << " | elapsed "
                      << ninfer::product::format_pretty_duration(elapsed) << " | ETA "
                      << ninfer::product::format_pretty_duration(eta);
@@ -370,6 +457,15 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                      ninfer::product::format_pretty_count(stream_score.scored_tokens),
                      stream_score.ppl(), ninfer::product::format_pretty_duration(stream_seconds));
         json stream_report               = aggregate_json(stream_score);
+        if (kl_reference) {
+            logger->info("[{}/{}] {} | KL {:.4e} | top-1 agreement {:.4f} | by context {}",
+                         stream_index + 1, streams.size(),
+                         ninfer::product::format_pretty_text(stream.source.id),
+                         stream_divergence.mean_kl(), stream_divergence.top1_agreement(),
+                         stream_divergence.bucket_summary());
+            stream_report["kl_divergence"] = stream_divergence.to_json();
+            overall_divergence.add(stream_divergence);
+        }
         stream_report["id"]              = stream.source.id;
         stream_report["domain"]          = stream.source.domain;
         stream_report["path"]            = stream.source.path.string();
@@ -382,6 +478,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     const double scoring_seconds = seconds_since(scoring_started);
     progress->clear();
+    if (top_tokens) { top_tokens->finish(); }
+    if (kl_reference) { kl_reference->finish(); }
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",
                  ninfer::product::format_pretty_count(overall.scored_tokens), completed_windows,
                  overall.ppl(), ninfer::product::format_pretty_duration(scoring_seconds),
@@ -415,7 +513,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"context_tokens", options.context},
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
-          {"int8_prefill_8bit_pv", options.int8_prefill_8bit_pv},
+          {"prefill_8bit_pv", ninfer::prefill_pv8_name(options.prefill_8bit_pv)},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", 1024},
@@ -432,6 +530,19 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         {"domains", std::move(domain_reports)},
         {"overall", aggregate_json(overall)},
     };
+    if (top_tokens) {
+        report["top_tokens"] = {{"path", std::filesystem::absolute(*options.save_top_tokens).string()},
+                                {"per_position", ninfer::perplexity::kReferenceTopTokens}};
+    }
+    if (kl_reference) {
+        json divergence         = overall_divergence.to_json();
+        divergence["reference"] = std::filesystem::absolute(*options.kl_reference).string();
+        divergence["reference_top_tokens"] = kl_reference->header().top_k;
+        divergence["definition"] =
+            "KL(reference || this run) over the reference's top tokens plus one bucket for all "
+            "others (a lower bound); context is the number of tokens before the predicted one";
+        report["kl_divergence"] = std::move(divergence);
+    }
 
     const std::filesystem::path temporary = output_directory / "report.json.tmp";
     const std::filesystem::path final     = output_directory / "report.json";
@@ -458,8 +569,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     std::cout << std::left << std::setw(24) << "overall" << std::right << std::setw(16)
               << overall.scored_tokens << std::setw(16) << std::fixed << std::setprecision(6)
-              << overall.mean_nll() << std::setw(16) << overall.ppl() << "\n\n"
-              << "score rate: " << std::setprecision(1)
+              << overall.mean_nll() << std::setw(16) << overall.ppl() << "\n\n";
+    if (kl_reference) {
+        std::cout << "KL divergence from reference: mean " << std::scientific
+                  << std::setprecision(4) << overall_divergence.mean_kl() << ", top-1 agreement "
+                  << std::fixed << std::setprecision(4) << overall_divergence.top1_agreement()
+                  << "\nby context: " << overall_divergence.bucket_summary() << "\n\n";
+    }
+    std::cout << "score rate: " << std::fixed << std::setprecision(1)
               << static_cast<double>(overall.scored_tokens) / scoring_seconds << " tok/s\n"
               << "report: " << final << '\n';
     return 0;

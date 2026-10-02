@@ -128,12 +128,24 @@ std::string serve_usage_text(const char* argv0) {
            "                             prefill INT8 KV with the original prompt kernel at\n"
            "                             the requested chunk (default: the fast kernel, chunk\n"
            "                             rounded down to whole attention waves)\n"
-           "  --int8-prefill-8bit-pv     INT8 KV: run the fast prompt kernel's P*V on 8-bit\n"
-           "                             integer Tensor Cores (faster long-prompt prefill;\n"
-           "                             probabilities rounded to 8 bits per 64-key tile)\n"
+           "  --prefill-8bit-pv          INT8 KV: run prompt attention's P*V on 8-bit\n"
+           "                             Tensor Cores (up to 5 % faster long-prompt\n"
+           "                             prefill, but about twice the KL divergence from a\n"
+           "                             BF16 KV reference, so FP16 P*V is the default)\n"
+           "  --no-prefill-8bit-pv       NVFP4 and K8V4 KV: run prompt attention's P*V in\n"
+           "                             FP16 instead of 8 bits (5-7 % slower long-prompt\n"
+           "                             prefill; the default 8-bit form stays within 1.1x\n"
+           "                             FP16's KL divergence from a BF16 KV reference)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                             prefill NVFP4 KV with the tiled prompt kernel\n"
            "                             (default: the fast kernel)\n"
+           "  --prefill-split-workspace-mib N\n"
+           "                             memory for splitting prompt attention across SMs\n"
+           "                             (default " +
+           std::to_string(kDefaultPrefillSplitWorkspaceMiB) +
+           "; 128-384 recommended). Less frees KV cache but\n"
+           "                             slows 1-2K-token chunks over long context (64: up\n"
+           "                             to 27% slower attention; 0: no splitting)\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
            "                             (default " +
@@ -357,8 +369,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--int8-prefill-8bit-pv") {
-            options.int8_prefill_8bit_pv = true;
+        } else if (arg == "--prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::On;
+        } else if (arg == "--no-prefill-8bit-pv") {
+            options.prefill_8bit_pv = PrefillPv8::Off;
+        } else if (arg == "--prefill-split-workspace-mib") {
+            options.prefill_split_workspace_mib = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib"));
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
         } else if (arg == "--context-cost-presets") {
@@ -598,6 +615,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    }
+    if (options.prefill_split_workspace_mib > kMaximumPrefillSplitWorkspaceMiB) {
+        throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_offload && !options.enable_vision) {

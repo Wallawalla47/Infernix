@@ -122,11 +122,9 @@ void tiled(const CausalAttentionOperands& p, Int8KvReadView cache,
            cudaStream_t stream) {
     if (envelope.fast_prompt_kernel) {
         if (p.query_heads == 24)
-            launch_int8_kv_fast_tiled_mma<CausalD256H24Kv4>(p, cache, envelope.fast_prompt_pv8,
-                                                            workspace, stream);
+            launch_int8_kv_fast_tiled_mma<CausalD256H24Kv4>(p, cache, envelope, workspace, stream);
         else
-            launch_int8_kv_fast_tiled_mma<CausalD256H16Kv2>(p, cache, envelope.fast_prompt_pv8,
-                                                            workspace, stream);
+            launch_int8_kv_fast_tiled_mma<CausalD256H16Kv2>(p, cache, envelope, workspace, stream);
         return;
     }
     if (p.query_heads == 24)

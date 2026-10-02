@@ -23,11 +23,13 @@ for creating NInfer!
 3. keeps upstream's original prefix caching, with a raft of fixes, behind
    `--use-original-prefix-caching` (I worked on it before switching to a new design; I found the
    original too complex and fragile)
-4. prefills INT8 and NVFP4 KV with faster prompt-attention kernels by default (a third to two
-   thirds less prompt-attention time on long prompts); `--use-original-int8-prefill-kernel` and
-   `--use-original-nvfp4-prefill-kernel` select upstream's kernels, and `--int8-prefill-8bit-pv`
-   opts in to an 8-bit P×V version of the INT8 one (about a tenth less prompt-attention time at
-   long context, at a small numerical cost)
+4. prefills INT8, NVFP4, FP8 and K8V4 KV with faster prompt-attention kernels by default (a third
+   to two thirds less prompt-attention time on long INT8 and NVFP4 prompts than upstream's kernels,
+   a sixth to a half less for FP8 and K8V4); `--use-original-int8-prefill-kernel` and
+   `--use-original-nvfp4-prefill-kernel` select upstream's INT8 and NVFP4 kernels; NVFP4 and K8V4
+   P×V runs on 8-bit Tensor Cores by default (5-7 % less end-to-end long-prompt prefill, KL
+   divergence from BF16 KV within 1.1× the FP16 form's), while INT8 KV keeps FP16 P×V unless
+   `--prefill-8bit-pv` asks for its 8-bit form, and `--no-prefill-8bit-pv` forces FP16 everywhere
 5. adds ngram copy drafting (based on an implementation by [remesis](https://github.com/remesis)),
    which greatly speeds up copy-heavy workloads, with more than one concurrent request
 6. overlaps each decode kernel's launch and weight loading with the kernel before it, and tunes
@@ -352,7 +354,7 @@ which require `--use-original-prefix-caching`. Details:
   Commit: [`4c9a949`][c-fast-int8].
 - **Key splits for short INT8 prompt chunks**: a chunk of up to about 1300 tokens over a long
   cached prefix leaves SMs idle with one CTA per row block, so the fast INT8 kernel divides its keys
-  among eight-warp CTAs and merges their FP32 partial rows, as the fast NVFP4 kernel does. It splits
+  among eight-warp CTAs and merges their FP32 partial rows, as the NVFP4 kernel does. It splits
   only when the time saved outweighs writing and merging the partial rows (a cost model fitted to
   every split count measured at 0-64K keys), so chunks over less than about 1K keys and widths whose
   row blocks already fill the GPU stay unsplit. Per attention layer against the kernel before
@@ -365,29 +367,94 @@ which require `--use-original-prefix-caching`. Details:
   earlier plan that splits these widths the same way); uncached prompts, full documents and longer
   follow-ups were unchanged within about 2 %. Perplexity on the full `ninfer-ppl-1m-v1` corpus moved
   from 4.9077081 to 4.9076804 with 4K windows and from 4.9041197 to 4.9041624 with 64K windows, each
-  within 0.7 standard errors of the per-window differences. The partials take up to 64 MiB of
-  workspace: 576 fewer KV tokens (0.23 %) at startup with `--max-context 140000`.
-- **8-bit P×V in the fast INT8 prompt kernel** (opt-in, `--int8-prefill-8bit-pv`): the kernel
-  multiplies P×V on INT8 Tensor Cores (4× the FP16 rate with FP32 accumulation on RTX 5090). Each
-  row's probabilities, scaled by the V group scale, are quantized to 8-bit codes per 64-key tile and
-  group against the stored INT8 V codes, which stay exact. Per attention layer, 3584-token chunks
-  take 3.5 % less time from an empty context and 8-11 % less from 16K to 128K; end to end, prefill
-  is 1.5 % faster at a 16K-token prompt and 3.9 % at 64K. It is not a free speed-up: probabilities
-  below half a code step of their tile's largest round to zero. Perplexity on the full
-  `ninfer-ppl-1m-v1` corpus moved from 4.90771 to 4.90551 with 4K windows and from 4.90412 to
-  4.85164 (-1.1 %) with 64K windows; the 64K change is larger than any other kernel change here
-  and is a systematic deviation from exact attention, even though it lowers perplexity on this
-  corpus. Off by default.
-- **Fast NVFP4 prompt attention** (default for `--kv-dtype nvfp4` over more than 2048 cached keys):
-  QK runs on block-scaled FP4 Tensor Cores (8× the FP16 rate on RTX 5090) straight from the stored
-  K codes, with Q as two NVFP4 terms (0.9 % RMS error); a single chunk whose rows alone would leave
-  SMs idle splits its keys across CTAs. 0.34-0.67× the time of upstream's NVFP4 prompt kernel per
-  attention layer; end to end, prefill is 3.5 % faster at a 16K-token prompt, 6.4 % at 32K and
-  14.4 % at 64K. Perplexity moves by +1.1e-3 nats per token (standard error 2.0e-3).
-  `--use-original-nvfp4-prefill-kernel` keeps upstream's kernel.
+  within 0.7 standard errors of the per-window differences. The partials took up to 64 MiB of
+  workspace: 576 fewer KV tokens (0.23 %) at startup with `--max-context 140000`; their bound is now
+  `--prefill-split-workspace-mib` (below).
+- **8-bit P×V in prompt attention** (default for NVFP4 and K8V4 KV; `--prefill-8bit-pv` turns it
+  on for INT8 KV, which defaults to FP16 P×V, and `--no-prefill-8bit-pv` forces FP16 everywhere).
+  NVFP4 and K8V4 KV: the MX-FP8 tiled prompt kernel rounds each probability (as 256 p against its
+  tile's own row maximum, which the softmax reference follows) and each decoded V value to E4M3 and
+  multiplies them on block-scaled E4M3 Tensor Cores with FP32 accumulation, four times the rate of
+  upstream's FP16 P×V with FP32 accumulation; a per-tile power of two keeps V in E4M3's range and
+  returns through the MMA's block scale. Its error against exact attention over the stored values is
+  about 15 times the FP16 form's (relative L2 0.026-0.037 against 0.0017), but the divergence it
+  causes does not follow that: on a Q6 artifact with BF16 activations, where the measurement is not
+  buried under A4 activation noise, its KL divergence from a BF16 KV reference over the full corpus
+  at 64K context is 0.0203 against the FP16 form's 0.0205 (NVFP4) and 0.0141 against 0.0134 (K8V4),
+  within 1.1× of FP16 in every context bucket and within 0.06 pp of top-1 agreement. Per attention
+  layer, against the FP16 form, 3584-token chunks take 19 % (K8V4) and 18 % (NVFP4) less time over
+  128K keys and up to 20 % less elsewhere; end to end, one request's prefill (DFlash2, 4096-token
+  chunks) is 4.7-5.1 % (NVFP4) and 5.0-5.4 % (K8V4) faster at 64K tokens and 6.8-7.1 % and 7.5-7.7 %
+  at 128K (two runs differing by 0.4-0.7 pp).
+  Perplexity on the full `ninfer-ppl-1m-v1` corpus: 4.89624 → 4.91573 (K8V4) and 4.91651 → 4.91384
+  (NVFP4) with 4K windows, 4.84164 → 4.97411 and 4.89965 → 4.87335 with 64K windows; the median
+  stream moved by under 0.002 nats per token, but at 64K single streams moved by up to 0.36 (K8V4) —
+  the corpus moves that much for any small numeric change, which is why the KL comparison above is
+  the direct measure.
+  INT8 KV (`--prefill-8bit-pv`, off by default): the fast kernel multiplies P×V on INT8 Tensor Cores
+  (4× the FP16 rate with FP32 accumulation on RTX 5090); each row's probabilities, scaled by the V
+  group scale, are quantized to 8-bit codes per 64-key tile and multiplied against the stored INT8 V
+  codes, which stay exact. Per attention layer, 3584-token chunks take 3.5 % less time from an empty
+  context and 8-11 % less from 16K to 128K; end to end, prefill is 1.9-2.6 % faster at a 16K-token
+  prompt, 2.6-4.2 % at 64K and 4.0-5.1 % at 128K (two runs). Unlike the E4M3 form it is not free: probabilities below
+  half a code step of their tile's largest round to zero, and on the same Q6 artifact the KL
+  divergence from BF16 KV about doubles, 0.0051 → 0.0111 at 64K, with all sixteen streams worse and
+  the growth concentrated in longer context (the 32-64K bucket ×2.28, top-1 98.9 % → 98.6 %). The
+  fast kernel's FP16 P×V matches the original INT8 prompt kernel there (0.0051 against 0.0050), so
+  the whole cost is the 8-bit P, and FP16 P×V stays INT8's default.
+- **Fast NVFP4 prompt attention** (default for `--kv-dtype nvfp4` over more than 768 cached
+  keys, re-tuned from 2048 with the decode-once kernel: forced at every visible count the fast
+  kernel is within 0.03 % of the per-shape best above 768 visible keys in both head geometries
+  (24 query heads x 4 KV heads and 16 x 2), where 2048 costs 2.3-2.7 % overall and up to 64 % in
+  its worst cell):
+  QK runs on block-scaled FP4 Tensor Cores (8× the FP16 rate on RTX 5090) straight from the stored K
+  codes, with Q as two NVFP4 terms (0.9 % RMS error). It now runs on the MX-FP8 tiled kernel (below)
+  with NVFP4 keys: each 64-key V tile is decoded once per CTA into shared memory instead of in every
+  warp's registers. Per attention layer it takes 6-26 % less time than the previous fast NVFP4
+  kernel wherever it runs (3584-token chunks 8 % less over an empty context, 15 % over 8K-32K and
+  17 % over 128K keys), and 0.32-0.63× the time of upstream's NVFP4 prompt kernel; end to end,
+  prefill of one request (DFlash2) is 2.1 % faster at 16K tokens, 3.6 % at 32K, 6.0 % at 64K and
+  9.2 % at 128K than with the previous fast kernel, both with the previous kernel's 64 MiB split
+  budget; the bound is now `--prefill-split-workspace-mib` (below). Perplexity:
+  4.90646 → 4.91651 with 4K windows and 4.90946 → 4.89965 with 64K windows, moves of the size the
+  corpus shows for any small numeric change (below). `--use-original-nvfp4-prefill-kernel` keeps
+  upstream's kernel.
   Commit: [`8dcd89a`][c-nvfp4-kv].
-- **Wave-aligned prefill chunks for NVFP4, FP8 and K8V4 KV**: their prompt kernels (the fast NVFP4
-  kernel and the MX-FP8 tiled kernel) run one 128-row CTA per SM, like the fast INT8 kernel, so
+- **Faster FP8 and K8V4 prompt attention** (default): upstream's MX-FP8 tiled prompt kernel now
+  accumulates P×V on FP16 Tensor Cores per 64-key tile (FP32 accumulation runs at half their rate on
+  RTX 5090) under a per-tile power-of-two V shift, issues the heaviest row blocks first, and chooses
+  each launch's key splits by a cost model that counts writing and merging the split partials, which
+  upstream's wave count ignored. Per attention layer against master, every width and context
+  measured (256-4096 tokens over 0-128K cached keys) is faster: K8V4 5.5-58 % less time (3584-token
+  chunks 31 % less over an empty context, 26 % over 8K, 22 % over 32K, 15 % over 128K;
+  1408-2048-token chunks about half the time over an empty context), FP8 5.7-59 % less. End to end,
+  prefill of one request (DFlash2) is 2-2.4 % faster at 16K tokens, 4 % at 32K, 6 % at 64K and 8.5 %
+  (K8V4) and 9.4 % (FP8) at 128K. Perplexity: K8V4 4.91185 → 4.89624 and FP8 4.89797 → 4.89736 with
+  4K windows, 4.88656 → 4.84164 and 4.84961 → 4.89144 with 64K windows. These come from one or two
+  streams that react strongly to any small numeric change: a control build that differed only by
+  FP32 accumulation scored K8V4 4.92107 (4K), and one stream moved by 0.08-0.11 nats per token
+  between the three. The median stream moved by under 0.001 nats per token, and the kernel's error
+  against exact attention is within 2 % of master's (relative L2 0.0017-0.0018). These measurements
+  kept upstream's unbounded split workspace (about 550 MiB at 3328-token launches); it is now bounded
+  by `--prefill-split-workspace-mib` (next).
+- **One split-workspace bound for prompt attention** (`--prefill-split-workspace-mib`, default
+  256 MiB). The fast INT8 and NVFP4 prompt kernels and the FP8/K8V4 prompt kernel split a launch's
+  keys across SMs when its row blocks alone would leave SMs idle, which needs FP32 partial rows in
+  workspace. INT8 and NVFP4 were capped at 64 MiB and FP8 and K8V4 were unbounded (about 550 MiB with
+  4096-token chunks; upstream's default 1024-token chunks need 169 MiB). One bound now applies to all
+  four, and a launch that would need more runs fewer splits. Per attention layer against unbounded
+  (3 interleaved passes, widths 256-4096 over 0-128K cached keys), 1024-2048-token chunks take
+  17-25 % longer at 64 MiB over 32K-128K keys (27 % at worst), 2-5 % at 128 MiB and under 1 % from
+  192 MiB, the same for all four formats; at the 256 MiB default 3-4K-token chunks over 128K keys
+  still take up to 5 % longer, and 3584-token chunks and short contexts are unaffected. These widths
+  are follow-up turns over a cached prefix and `--prefill-round-robin` steps beside another request;
+  a fresh 64K or 128K prompt prefills in the same time within 0.3 % end to end. The startup
+  workspace with 4096-token chunks and `--max-context 220000` is 515 MiB at 256 MiB against 380 MiB
+  at 64 MiB: about 4K fewer INT8 KV tokens (7.7K NVFP4); FP8 and K8V4 gain about 300 MiB of KV
+  cache against unbounded.
+- **Wave-aligned prefill chunks for NVFP4, FP8 and K8V4 KV**: their prompt kernel (the MX-FP8
+  tiled kernel, which fast NVFP4 prompt attention now also uses) runs one 128-row CTA per SM, like
+  the fast INT8 kernel, so
   `--prefill-chunk` is now rounded down to whole attention waves for them too (`4096` runs as
   `3584`), which keeps each full chunk's attention free of a mostly idle last wave. One request,
   DFlash2: FP8 prefill 1.3 % faster at 32K tokens, 1.2 % at 64K and 0.8 % at 128K (same-session A/B,

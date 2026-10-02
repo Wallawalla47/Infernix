@@ -4,6 +4,7 @@
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_operands.h"
 #include "ops/softmax_attention/common/causal_partition.h"
+#include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include <math_constants.h>
 
 namespace ninfer::ops::detail {
@@ -26,7 +27,8 @@ __launch_bounds__(256) __global__
             causal_store_output(out + causal_q_index<G>(head, d, token), 0.0F);
         return;
     }
-    const int splits        = partition.active(positions[width - 1] + 1);
+    const int splits =
+        mxfp8_tiled_active_splits(partition, positions[width - 1] + 1, width, G::QHeads);
     const auto stat         = causal_stat_index<G>(head, token, lane, width);
     const float m           = lane < splits ? partial.maximum[stat] : -CUDART_INF_F;
     const float l           = lane < splits ? partial.sum[stat] : 0.0F;

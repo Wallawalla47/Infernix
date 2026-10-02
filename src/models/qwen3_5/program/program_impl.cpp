@@ -5,6 +5,7 @@
 #include "core/startup.h"
 #include "core/device.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "ninfer/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -27,7 +28,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
-      fast_prefill_kernel(plan.fast_prefill_kernel), draft_window(plan.draft_window),
+      prompt_attention(plan.prompt_attention), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
       draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
@@ -39,9 +40,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       round_host(plan.causal_scoring ? std::nullopt
                                      : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
-      score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
-                                                    kCausalScoreTile * sizeof(float))
-                                              : std::nullopt),
+      // Target log-probabilities and three [kMaximumScoreTopTokens x kCausalScoreTile] distribution
+      // regions (causal_score).
+      score_logprobs_host(plan.causal_scoring
+                              ? std::make_optional<PinnedHostBuffer>(
+                                    (1 + 3 * std::size_t{kMaximumScoreTopTokens}) *
+                                    kCausalScoreTile * sizeof(float))
+                              : std::nullopt),
       ordinary_host(
           !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
@@ -263,8 +268,8 @@ ProgramImpl::~ProgramImpl() noexcept {
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
 }
 
-std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
-                                             std::uint32_t first_target) {
+ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
+                                      const ScoreOptions& options) {
     if (!causal_scoring || !score_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
@@ -282,6 +287,19 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     }
     if (prompt.has_media()) {
         throw std::invalid_argument("causal scoring accepts text tokens only");
+    }
+    const std::uint32_t top_k         = options.top_k;
+    const std::uint32_t per_position  = options.candidates_per_position;
+    const std::int32_t public_tokens  = dimension(parameters.model.resources().public_token_count);
+    const std::size_t scored_positions = token_count_size - first_target;
+    if (top_k > kMaximumScoreTopTokens || per_position > kMaximumScoreTopTokens ||
+        options.candidates.size() != scored_positions * per_position) {
+        throw std::invalid_argument("causal score distribution outputs have an invalid shape");
+    }
+    for (const TokenId candidate : options.candidates) {
+        if (candidate < 0 || candidate >= public_tokens) {
+            throw std::invalid_argument("causal score candidate is not a public token");
+        }
     }
 
     const auto token_count                     = static_cast<std::uint32_t>(token_count_size);
@@ -306,8 +324,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (!released) { throw std::logic_error("causal score resources could not be released"); }
     };
 
-    std::vector<float> output;
-    output.reserve(token_count_size - first_target);
+    ScoreResult output;
+    output.logprobs.reserve(scored_positions);
+    output.top_ids.reserve(scored_positions * top_k);
+    output.top_logprobs.reserve(scored_positions * top_k);
+    output.candidate_logprobs.reserve(scored_positions * per_position);
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
@@ -331,22 +352,64 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             work.reset();
             mark_workspace_usage(workspace_plan.causal_score);
             const auto columns = static_cast<std::int32_t>(staged_columns);
+            // The staged columns' first scored position.
+            const std::size_t first_position = output.logprobs.size();
             Tensor logits      = work.alloc(
                 DType::BF16, {dimension(parameters.model.config().text.vocab_size), columns});
-            Tensor target_ids = work.alloc(DType::I32, {columns});
-            Tensor logprobs   = work.alloc(DType::FP32, {columns});
-            Tensor hidden     = score_hidden->slice(1, 0, columns);
+            Tensor target_ids = work.alloc(DType::I32, {1, columns});
+            Tensor logprobs   = work.alloc(DType::FP32, {1, columns});
+            const auto distribution = [&](DType dtype, std::uint32_t rows) {
+                return rows == 0 ? Tensor{}
+                                 : work.alloc(dtype, {static_cast<std::int32_t>(rows), columns});
+            };
+            Tensor top_ids            = distribution(DType::I32, top_k);
+            Tensor top_logprobs       = distribution(DType::FP32, top_k);
+            Tensor candidate_ids      = distribution(DType::I32, per_position);
+            Tensor candidate_logprobs = distribution(DType::FP32, per_position);
+            Tensor hidden             = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
-            ops::target_logprobs(logits, target_ids,
-                                              dimension(parameters.model.resources().public_token_count),
-                                              logprobs, device.stream);
-            CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                                                    cudaMemcpyDeviceToHost, device.stream));
+                                       cudaMemcpyHostToDevice, device.stream));
+            ops::target_logprobs(logits, target_ids, public_tokens, logprobs, device.stream);
+            // Pinned staging: target log-probabilities, then each distribution output's
+            // [kMaximumScoreTopTokens x kCausalScoreTile] region.
+            auto* host_logprobs = static_cast<float*>(score_logprobs_host->data());
+            auto* host_top_ids  = reinterpret_cast<TokenId*>(host_logprobs + kCausalScoreTile);
+            auto* host_top_logprobs = reinterpret_cast<float*>(
+                host_top_ids + std::size_t{kMaximumScoreTopTokens} * kCausalScoreTile);
+            auto* host_candidate_logprobs =
+                host_top_logprobs + std::size_t{kMaximumScoreTopTokens} * kCausalScoreTile;
+            CUDA_CHECK(cudaMemcpyAsync(host_logprobs, logprobs.data, logprobs.bytes(),
+                                       cudaMemcpyDeviceToHost, device.stream));
+            if (top_k > 0) {
+                ops::top_logprobs(logits, public_tokens, top_ids, top_logprobs, device.stream);
+                CUDA_CHECK(cudaMemcpyAsync(host_top_ids, top_ids.data, top_ids.bytes(),
+                                           cudaMemcpyDeviceToHost, device.stream));
+                CUDA_CHECK(cudaMemcpyAsync(host_top_logprobs, top_logprobs.data,
+                                           top_logprobs.bytes(), cudaMemcpyDeviceToHost,
+                                           device.stream));
+            }
+            if (per_position > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(candidate_ids.data,
+                                           options.candidates.data() + first_position * per_position,
+                                           candidate_ids.bytes(), cudaMemcpyHostToDevice,
+                                           device.stream));
+                ops::target_logprobs(logits, candidate_ids, public_tokens, candidate_logprobs,
+                                     device.stream);
+                CUDA_CHECK(cudaMemcpyAsync(host_candidate_logprobs, candidate_logprobs.data,
+                                           candidate_logprobs.bytes(), cudaMemcpyDeviceToHost,
+                                           device.stream));
+            }
             device.synchronize();
-            const auto* host = static_cast<const float*>(score_logprobs_host->data());
-            output.insert(output.end(), host, host + staged_columns);
+            output.logprobs.insert(output.logprobs.end(), host_logprobs,
+                                   host_logprobs + staged_columns);
+            output.top_ids.insert(output.top_ids.end(), host_top_ids,
+                                  host_top_ids + std::size_t{staged_columns} * top_k);
+            output.top_logprobs.insert(output.top_logprobs.end(), host_top_logprobs,
+                                       host_top_logprobs + std::size_t{staged_columns} * top_k);
+            output.candidate_logprobs.insert(
+                output.candidate_logprobs.end(), host_candidate_logprobs,
+                host_candidate_logprobs + std::size_t{staged_columns} * per_position);
             staged_targets.clear();
             staged_columns = 0;
             work.reset();
@@ -357,7 +420,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, fast_prefill_kernel},
+                 prefill_chunk, proposal_head, prompt_attention},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -404,7 +467,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             }
         }
         flush();
-        if (output.size() != token_count_size - first_target) {
+        if (output.logprobs.size() != scored_positions) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
         }
         cleanup();

@@ -273,7 +273,8 @@ public:
     ~ProgramImpl() noexcept;
     [[nodiscard]] RequestBasePlan plan_request(PreparedPromptData&&,
                                                const runtime::ResolvedExecutionOptions&);
-    [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&&, std::uint32_t first_target);
+    [[nodiscard]] ScoreResult causal_score(PreparedPromptData&&, std::uint32_t first_target,
+                                           const ScoreOptions& options);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
                    std::span<const CheckpointHandle> = {}) const;
@@ -352,7 +353,7 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
-    const PromptAttentionKernel fast_prefill_kernel;
+    const PromptAttention prompt_attention;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
     // DFlash2 tree verification: the tree widths each batch size may verify and the most

@@ -25,6 +25,9 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+// Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
+inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
+inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -33,6 +36,25 @@ enum class KvCacheStorage : std::uint8_t {
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
 };
+
+// How prompt attention runs P*V where its kernel has an 8-bit form (the fast INT8 and NVFP4
+// prompt kernels and K8V4's). Auto keeps FP16 P*V for INT8 KV, whose 8-bit integer form doubles
+// the KL divergence from a BF16 KV reference that its FP16 form has at 64K context, and uses the
+// 8-bit form for NVFP4 and K8V4 KV, whose E4M3 form stays within 1.1x of FP16's.
+enum class PrefillPv8 : std::uint8_t {
+    Auto,
+    On,
+    Off,
+};
+
+[[nodiscard]] constexpr const char* prefill_pv8_name(PrefillPv8 policy) noexcept {
+    switch (policy) {
+    case PrefillPv8::Auto: return "auto";
+    case PrefillPv8::On: return "on";
+    case PrefillPv8::Off: return "off";
+    }
+    return "auto";
+}
 
 enum class EnginePurpose : std::uint8_t {
     Generation,
@@ -211,12 +233,19 @@ struct EngineOptions {
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
     bool original_int8_prefill_kernel  = false;
-    // Opt-in: the fast INT8 prompt kernel runs its P*V on 8-bit integer Tensor Cores, rounding
-    // each probability (times its key's V group scale) to 8 bits per 64-key tile and multiplying
-    // the stored V codes exactly. Faster long-prompt prefill with a small precision change of the
-    // probabilities. Requires the INT8 KV cache and the fast kernel.
-    bool int8_prefill_8bit_pv          = false;
-    // NVFP4 KV prefills over more than 2048 visible keys with the fast prompt-attention kernel
+    // Prompt attention's P*V form where its kernel has both: the fast INT8 kernel's 8-bit form
+    // rounds each probability (times its key's V group scale) to a u8 code per 64-key tile and
+    // multiplies the stored V codes exactly, and the fast NVFP4 and the K8V4 prompt kernels round
+    // probabilities and decoded V to E4M3; both are faster long-prompt prefill for a precision
+    // change of P (and NVFP4/K8V4 V). BF16 and FP8 KV and the original INT8 and NVFP4 prompt
+    // kernels have only FP16 P*V, which this setting leaves alone.
+    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
+    // Workspace (MiB, [0,16384]) the FP32 partials of one prompt-attention launch may take when
+    // it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4).
+    // Larger budgets speed up prompt chunks of about 1-2K tokens over long cached context and take
+    // device memory from the KV cache; BF16 KV and the original INT8/NVFP4 kernels ignore it.
+    std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
+    // NVFP4 KV prefills over more than 768 visible keys with the fast prompt-attention kernel
     // (block-scaled FP4 QK). True selects the tiled NVFP4 prompt kernel; it requires the NVFP4
     // KV cache.
     bool original_nvfp4_prefill_kernel = false;
@@ -949,6 +978,31 @@ struct VisionWorkspaceMemorySummary {
     std::size_t handoff_capacity_bytes    = 0;
     std::size_t handoff_active_bytes      = 0;
     std::size_t handoff_peak_bytes        = 0;
+};
+
+// Most tokens Engine::score_tokens returns per scored position for each distribution output.
+inline constexpr std::uint32_t kMaximumScoreTopTokens = 64;
+
+// Distribution outputs of Engine::score_tokens beyond every target token's log-probability. All
+// log-probabilities are over the model's public tokens.
+struct ScoreOptions {
+    // The top_k most probable tokens of every scored position, in [0,64].
+    std::uint32_t top_k = 0;
+    // The log-probabilities of candidates_per_position given tokens at every scored position, in
+    // [0,64]: candidates holds them position-major (scored positions x candidates_per_position).
+    std::uint32_t candidates_per_position = 0;
+    std::vector<TokenId> candidates;
+};
+
+struct ScoreResult {
+    // log p(tokens[i] | tokens[0..i)) for every scored position i.
+    std::vector<float> logprobs;
+    // Position-major (scored positions x top_k): most probable first, equal logits by ascending
+    // token id.
+    std::vector<TokenId> top_ids;
+    std::vector<float> top_logprobs;
+    // Position-major (scored positions x candidates_per_position), in the candidates' order.
+    std::vector<float> candidate_logprobs;
 };
 
 struct MemorySummary {

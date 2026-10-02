@@ -14,7 +14,7 @@ void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std:
     target_logprobs_kernel<kTargetLogprobsBlock><<<columns, kTargetLogprobsBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(logits.data),
         static_cast<const std::int32_t*>(target_ids.data), static_cast<float*>(output.data),
-        valid_rows, logits.ne[0]);
+        valid_rows, logits.ne[0], target_ids.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

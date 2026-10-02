@@ -77,9 +77,10 @@ public:
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
 
-    // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
-    [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
-                                                  std::uint32_t first_target);
+    // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()), and the
+    // distribution outputs options requests for those positions.
+    [[nodiscard]] ScoreResult score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
+                                           ScoreOptions options = {});
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
