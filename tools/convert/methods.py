@@ -26,7 +26,7 @@ from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
 from .quantization.groupwise import quantize_matrix, quantize_matrix_mse
-from .quantization.nvfp4 import E2M1_MAX, quantize_nvfp4, weight_divisor
+from .quantization.nvfp4 import E2M1_MAX, quantize_nvfp4, quantize_nvfp4_mse, weight_divisor
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -321,10 +321,12 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce, auxiliaries=auxiliaries)
 
 
-_NVFP4_MSE_TARGETS = (E2M1_MAX, 5.5, 5.0, 4.5, 4.0)
+# The MSE divisor maps the parent's largest magnitude to 4 at the largest scale, so its largest
+# group may still take scales up to 1.5x its max-magnitude scale.
+_NVFP4_MSE_DIVISOR_TARGET = 4.0
 
 
-def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...]) -> PreparedMethod:
+def _nvfp4_quantized(request: PrepareRequest, quantize, divisor_target: float) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError("NVFP4 quantization requires an nvfp4 matrix target")
     _preflight(request)
@@ -350,11 +352,11 @@ def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...]) -> Pre
             if not values.dtype.is_floating_point:
                 raise TypeError("NVFP4 quantization source must be floating point")
             amax = max(amax, float(values.abs().max()))
-        divisor = weight_divisor(amax, targets)
+        divisor = weight_divisor(amax, divisor_target)
         for begin in range(0, n, rows):
             end = min(n, begin + rows)
             values = request.values(begin * k, end * k).reshape(end - begin, k)
-            words = quantize_nvfp4(values.to(request.device), divisor, targets)
+            words = quantize(values.to(request.device), divisor)
             output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
@@ -362,12 +364,12 @@ def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...]) -> Pre
 
 def nvfp4_absmax(request: PrepareRequest) -> PreparedMethod:
     """NVFP4 with every 16-value group's largest magnitude at the largest E2M1 code."""
-    return _nvfp4_quantized(request, (E2M1_MAX,))
+    return _nvfp4_quantized(request, quantize_nvfp4, E2M1_MAX)
 
 
 def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
-    """NVFP4 with each group's scale chosen among five targets by least squared error."""
-    return _nvfp4_quantized(request, _NVFP4_MSE_TARGETS)
+    """NVFP4 with each group's least-squared-error scale among every E4M3FN value."""
+    return _nvfp4_quantized(request, quantize_nvfp4_mse, _NVFP4_MSE_DIVISOR_TARGET)
 
 
 METHODS: dict[str, Method] = {

@@ -190,9 +190,10 @@ The converter currently writes these formats:
 `grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
 rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
 `nvfp4_absmax` maps each 16-value group's largest magnitude to the largest E2M1 code (6) through
-an E4M3FN group scale, with one FP32 divisor for the whole parent; `nvfp4_mse` keeps, per group,
-whichever of the targets 6, 5.5, 5, 4.5 and 4 gives the least squared error. Both round codes to
-nearest with ties to even. They quantize weights only: an `AllowA4` use still needs its activation
+an E4M3FN group scale, with one FP32 divisor for the whole parent; `nvfp4_mse` evaluates every
+positive finite E4M3FN group scale and keeps the one with the least squared reconstruction error
+(ModelOpt's NVFP4 weight-MSE scale sweep), so it is never worse, group by group, than any fixed
+max-magnitude target at the same divisor. Both round codes to nearest with ties to even. They quantize weights only: an `AllowA4` use still needs its activation
 divisor supplied through `recipe.use`, so for an uncalibrated parent use `A16Only`.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
