@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iterator>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string_view>
@@ -28,6 +29,10 @@ std::string random_identifier(const char* prefix) {
                   static_cast<unsigned long long>(distribution(random)));
     return std::string(prefix) + buffer.data();
 }
+
+constexpr std::string_view kThinkingSignatureMarker = "ninfer-reasoning.v1:";
+constexpr std::string_view kBase64Alphabet =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 std::string event(const char* type, Json payload) {
     return std::string("event: ") + type + "\ndata: " + payload.dump() + "\n\n";
@@ -190,15 +195,71 @@ std::string make_anthropic_sse_error(const ApiError& error, const std::string& r
            "\n\n";
 }
 
+std::string encode_thinking_signature(std::string_view reasoning) {
+    std::string out(kThinkingSignatureMarker);
+    out.reserve(out.size() + (reasoning.size() + 2) / 3 * 4);
+    for (std::size_t i = 0; i < reasoning.size(); i += 3) {
+        const std::size_t left = reasoning.size() - i;
+        std::uint32_t group    = static_cast<std::uint32_t>(static_cast<std::uint8_t>(reasoning[i]))
+                                 << 16;
+        if (left > 1) {
+            group |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(reasoning[i + 1])) << 8;
+        }
+        if (left > 2) { group |= static_cast<std::uint8_t>(reasoning[i + 2]); }
+        out += kBase64Alphabet[group >> 18 & 63];
+        out += kBase64Alphabet[group >> 12 & 63];
+        out += left > 1 ? kBase64Alphabet[group >> 6 & 63] : '=';
+        out += left > 2 ? kBase64Alphabet[group & 63] : '=';
+    }
+    return out;
+}
+
+std::optional<std::string> decode_thinking_signature(std::string_view signature) {
+    if (!signature.starts_with(kThinkingSignatureMarker)) { return std::nullopt; }
+    const std::string_view payload = signature.substr(kThinkingSignatureMarker.size());
+    const auto malformed           = [] {
+        return std::invalid_argument("malformed hidden-reasoning signature");
+    };
+    if (payload.size() % 4 != 0) { throw malformed(); }
+    std::string out;
+    out.reserve(payload.size() / 4 * 3);
+    for (std::size_t i = 0; i < payload.size(); i += 4) {
+        std::uint32_t group = 0;
+        int data_chars      = 0;
+        for (std::size_t j = 0; j < 4; ++j) {
+            const char c = payload[i + j];
+            if (c == '=') {
+                // Padding is valid only in the last two positions of the last group.
+                if (i + 4 != payload.size() || j < 2) { throw malformed(); }
+                group <<= 6;
+                continue;
+            }
+            const std::size_t value = kBase64Alphabet.find(c);
+            if (value == std::string_view::npos || data_chars != static_cast<int>(j)) {
+                throw malformed();
+            }
+            group = group << 6 | static_cast<std::uint32_t>(value);
+            ++data_chars;
+        }
+        out += static_cast<char>(group >> 16 & 255);
+        if (data_chars > 2) { out += static_cast<char>(group >> 8 & 255); }
+        if (data_chars > 3) { out += static_cast<char>(group & 255); }
+    }
+    return out;
+}
+
 std::string make_anthropic_messages_response(const AnthropicResponseIdentity& identity,
-                                             const GenerationOutcome& outcome) {
+                                             const GenerationOutcome& outcome, bool hide_thinking) {
     OrderedJson content = OrderedJson::array();
     if (!outcome.reasoning.empty()) {
-        // Claude clients expect a non-empty opaque value. The response identity already has the
-        // required lifetime, so Thinking introduces no independent state or credential.
-        content.push_back(OrderedJson{{"type", "thinking"},
-                                      {"thinking", outcome.reasoning},
-                                      {"signature", identity.message_id}});
+        // Claude clients expect a non-empty opaque value. Summarized display uses the response
+        // identity, so Thinking introduces no independent state. Omitted display makes the
+        // signature the only carrier of the reasoning, restored when the client returns the block.
+        content.push_back(
+            OrderedJson{{"type", "thinking"},
+                        {"thinking", hide_thinking ? std::string() : outcome.reasoning},
+                        {"signature", hide_thinking ? encode_thinking_signature(outcome.reasoning)
+                                                    : identity.message_id}});
     }
     if (!outcome.text.empty()) {
         content.push_back(OrderedJson{{"type", "text"}, {"text", outcome.text}});
@@ -226,8 +287,8 @@ std::string make_anthropic_count_tokens_response(int input_tokens) {
 }
 
 AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity identity,
-                                                 int input_tokens)
-    : identity_(std::move(identity)), input_tokens_(input_tokens) {}
+                                                 int input_tokens, bool hide_thinking)
+    : identity_(std::move(identity)), input_tokens_(input_tokens), hide_thinking_(hide_thinking) {}
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
@@ -268,7 +329,7 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
                         Json{{"type", "thinking"}, {"thinking", ""}, {"signature", ""}}}}));
     }
     reasoning_ += text;
-    if (!text.empty()) {
+    if (!text.empty() && !hide_thinking_) {
         events.push_back(
             event("content_block_delta",
                   Json{{"type", "content_block_delta"},
@@ -281,11 +342,12 @@ std::vector<std::string> AnthropicMessagesStream::reasoning_delta(const std::str
 std::vector<std::string> AnthropicMessagesStream::close_thinking() {
     std::vector<std::string> events;
     if (!thinking_open_) { return events; }
-    events.push_back(event(
-        "content_block_delta",
-        Json{{"type", "content_block_delta"},
-             {"index", thinking_index_},
-             {"delta", Json{{"type", "signature_delta"}, {"signature", identity_.message_id}}}}));
+    const std::string signature =
+        hide_thinking_ ? encode_thinking_signature(reasoning_) : identity_.message_id;
+    events.push_back(event("content_block_delta", Json{{"type", "content_block_delta"},
+                                                       {"index", thinking_index_},
+                                                       {"delta", Json{{"type", "signature_delta"},
+                                                                      {"signature", signature}}}}));
     events.push_back(event("content_block_stop",
                            Json{{"type", "content_block_stop"}, {"index", thinking_index_}}));
     thinking_open_ = false;

@@ -118,8 +118,9 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         lifecycle->done(outcome);
         try {
             set_ngram_generation_header(res, outcome.metrics.ngram_archive);
-            set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
-                                   prepared.lifetime);
+            set_owned_json_content(
+                res, make_anthropic_messages_response(identity, outcome, request.hide_thinking),
+                prepared.lifetime);
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->response_failure(
@@ -138,7 +139,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     try {
         auto stream  = std::make_shared<HttpGenerationStream>(std::move(prepared));
-        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens);
+        auto encoder = std::make_shared<AnthropicMessagesStream>(identity, input_tokens,
+                                                                 request.hide_thinking);
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
