@@ -340,7 +340,9 @@ and K8V4 (FP8 QK, FP16 P x V) nearly double from 8 to 16 columns (209 to 406 us 
 at 131K), so they are compute-bound too. Both INT8 forms were reverted. What would still lower
 the cost of verification columns at long context: cheaper P x V arithmetic (FP16 accumulation per
 key tile, or 8-bit P as in `--int8-prefill-8bit-pv`; both change precision) or a warp-specialized
-kernel nearer the Tensor Core peak.
+kernel nearer the Tensor Core peak. FP16 accumulation was measured later and gained nothing: the
+INT8 kernel is latency-bound at low occupancy rather than Tensor Core-bound (see "FP16 P×V
+accumulation in the INT8 verification kernel" below).
 
 ## FP8 LM head schedules at 42-64 columns
 
@@ -413,6 +415,56 @@ against 68.0-68.2 us at 33, 40, 47, 48 and 49 tokens (-2.4 to -3.0 %), 66.2 agai
 66.1 against 66.8 at 63 and equal at 64. The 128-row tile takes 68.2 us in most passes at 33-49
 tokens, the 64-row tiles 66.1 in every pass; the eight-warp 64,64,256,4,2,2,2 is routed for 33-64
 tokens.
+
+## FP16 P×V accumulation in the INT8 verification kernel (not adopted)
+
+The entry above ends with cheaper P×V as the remaining lever for verification columns at long
+context. The pipelined INT8 kernel (`grouped_pipelined.cuh`: 2-8 columns, and the 8-column tiles
+of wider rows) accumulated each 32-key tile's P×V with FP16 accumulators (`mma.m16n8k16`, twice
+the FP32-accumulate rate on RTX 5090) and added the tile into the FP32 output, as the fast INT8
+prompt kernel does. Per layer call (append entry, 24/4 geometry, cold cache, graph launches, one
+row, two passes in opposite order), us, FP32 → FP16 accumulation:
+
+| Columns | 2K | 16K | 64K | 131K |
+|---|---|---|---|---|
+| 2 | 14.2 → 15.0 | 33.6 → 33.4 | 94.8 → 94.8 | 173.2 → 174.8 |
+| 8 | 24.2 → 25.0 | 45.5 → 45.7 | 109.3 → 109.0 | 189.1 → 189.3 |
+| 12 | 28.5 → 29.3 | 56.2 → 57.2 | 155.2 → 156.3 | 293.7 → 296.5 |
+| 16 | 29.6 → 31.3 | 57.9 → 58.0 | 158.2 → 158.6 | 299.9 → 297.9 |
+| 24 | 31.9 → 33.4 | 72.3 → 72.6 | 222.1 → 222.1 | 416.9 → 412.6 |
+
+Two rows moved by -1.1 % to +5.2 %. Nsight Compute, 16 columns over 131K keys: 350.9 → 346.6 us,
+DRAM throughput 40 %, SM throughput 51 → 46 %, issue slots busy 36 → 46 %, no eligible warp in
+62 → 51 % of cycles, theoretical occupancy 33 % (two CTAs per SM, limited by both registers and
+shared memory). The kernel waits on latency, not on Tensor Core throughput, so halving the P×V
+cost does not shorten it; the extra time of 16 columns over 8 comes from more dependent work per
+KV byte at low occupancy, not from a saturated Tensor Core. Reverted, with no option, since it
+gave no speed for its lower precision. What could still help: more warps in flight per SM, or a
+warp-specialized form in which producer warps load and decode K/V while consumer warps run the
+MMAs.
+
+## Where a full INT8 prompt chunk's attention time goes (no change made)
+
+Nsight Compute on the fast INT8 prompt kernel for one 3584-column chunk over 32K cached keys
+(RTX 5090, `ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4
+--kv-dtype int8 --tokens 3584 --context 32768 --fast-prompt`, eager, cold cache; 10.1 ms at the
+profiler's 2.36 GHz): the Tensor pipe is active in 55.6 % of cycles (FP16 HMMA for P×V 37.1 %,
+INT8 IMMA for QK 18.5 %) and issue slots are busy 50 % of the time. One eight-warp CTA fits an SM
+(255 registers per thread, 100 KB of shared memory), so each scheduler has two warps, 0.66 of
+them eligible on average, and none in 49 % of cycles; the main stall is a fixed-latency
+dependency wait, then math-pipe throttle. K/V come from L2 (98.6 % hit rate, DRAM 1 %); 2.9 M
+local loads are register spills.
+
+Of 8.15 G executed warp instructions the MMAs are 0.56 G (HMMA 0.37 G, IMMA 0.19 G). The V decode
+(`causal_prompt_i8_fast_decode_v_pair`: one LOP3, two PRMT, two HADD2 and two HMUL2 per four codes)
+is 2.9 G, 36 % of all instructions (LOP3 0.42 G, PRMT, HADD2 and HMUL2 0.84 G each), and every one
+of a CTA's eight warps decodes the whole V tile, so seven eighths of it repeats. FMUL 0.97 G, FFMA
+0.85 G and I2FP 0.37 G are the QK group scales, the online softmax and the output rescale.
+Decoding each V tile once per CTA into shared memory (32 KB more, which fits at one CTA per SM, at
+twice the shared-memory bytes per V fragment), or splitting the warps into decode producers and
+MMA consumers, would remove close to a third of the issued instructions; that is the largest lever
+left for long prefill, and the numerics would be unchanged. Folding the V group scale into P
+instead (as the 8-bit P×V form does) would remove most HMUL2s but round differently.
 
 ## Key splits for the fast INT8 prompt kernel: the plan's cost model
 
