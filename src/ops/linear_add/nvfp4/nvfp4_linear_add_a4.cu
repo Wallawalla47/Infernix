@@ -17,6 +17,10 @@ namespace {
 // the K=17408 down projection takes 45.5-47.7 us instead of 57.7-60.0 and K=6144 21.1 us instead
 // of 27.2, bit-identically.
 using M32N64            = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2>;
+// At 8 tokens the K=17408 down projection streams 512 K per stage over 160 CTAs: 36.6 instead of
+// 37.6 us (RTX 5090, cold weights, six interleaved passes), the same K order per output. Other
+// widths, K=6144 and 32-row variants with 256 K per stage measured no faster.
+using M32N32K512        = Nvfp4A4MmaSchedule<32, 32, 512, 2, 2, 3, 2>;
 using M32N128           = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
@@ -39,7 +43,9 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace worksp
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    if (tokens <= 64) {
+    if (Geometry::kInputRows == 17408 && tokens <= 8) {
+        launch_gemm<Geometry, M32N32K512>(weight, residual, workspace, tokens, stream);
+    } else if (tokens <= 64) {
         launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 128) {
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);

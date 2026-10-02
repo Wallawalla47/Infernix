@@ -403,6 +403,16 @@ which require `--use-original-prefix-caching`. Details:
   tokens), and two 16-row tiles sharing each staged activation in the FP8 head and the Q8 DFlash2
   drafter.
   Commits: [`5db3795`][c-nvfp4-linear-add], [`5db53c7`][c-row-tiles].
+- **NVFP4 MLP tiles for verification widths**: the fused gate/up projection runs 64-row tiles at
+  two CTAs per SM up to 64 tokens (with a third pipeline stage up to 32), and the [5120,17408]
+  down projection streams 512 K per stage up to 8 tokens. Gate/up takes 65.3 instead of 66.1 µs
+  at 8 tokens, 64.9 instead of 66.1 at 12 and 66.1 instead of 68.0-68.2 at 33-49 (unchanged at
+  16-32 and 56-64); the down projection 36.6 instead of 37.6 µs at 8 tokens. Every output keeps its
+  K order, so output is unchanged bit for bit. On the decode-saturation suite (DFlash2 K=7, n-gram
+  15/12, INT8 KV, four passes) one request's rounds are 0.56 % shorter with chain verification and
+  0.23 % with 12-column trees, four requests' 0.18 % (chain); four requests verifying 12-column
+  trees (48 columns, on the 33-64-token tiles) changed by -0.15 % and +0.23 % in two passes, which is
+  within noise.
 - **Faster split-KV attention for verification rows** (DFlash2/MTP drafts and n-gram copies):
   short rows split their keys into more, balanced KV splits so they fill the GPU; the split merge
   launches as a programmatic dependent of the attention kernel; and INT8 KV rows of 2-16 columns
