@@ -10,3 +10,6 @@ elseif(MSVC)
   target_compile_options(ninfer_offloaded_moe_cpu PRIVATE /fp:precise)
 endif()
 target_link_libraries(ninfer_ops PUBLIC ninfer_offloaded_moe_cpu)
+
+# GPU narrow route: the same canonical arithmetic, compiled for the device.
+target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/narrow_expert.cu")

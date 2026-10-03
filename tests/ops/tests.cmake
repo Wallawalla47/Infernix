@@ -185,3 +185,8 @@ set_tests_properties(ninfer_gdn_replay_fold_wide_test
 ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
   LIBRARIES ninfer_offloaded_moe_cpu)
+
+# The GPU narrow route against the golden hashes and the CPU engine, bit for bit.
+ninfer_add_op_test(ninfer_offloaded_moe_cuda_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
+  LIBRARIES ninfer_ops)

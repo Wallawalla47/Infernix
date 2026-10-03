@@ -2310,13 +2310,15 @@ parallel and must finish before the policy is frozen in M5.
 ### 19.1 Implementation status and handoff
 
 The first pieces were built on a development VM without a GPU or Hugging Face access: a 4-vCPU
-Xeon at 2.1 GHz with AVX-512 VNNI, and nvcc 13.4 for compiling only. Everything below compiles and
-its tests pass there. Nothing has run on the RTX 5090 or touched the real checkpoint.
+Xeon at 2.1 GHz with AVX-512 VNNI. nvcc 13.4 from PyPI was used to compile only: the project's CMake
+build configures and compiles there with a stub `libcuda.so`. Everything below compiles, and its
+host tests pass there. Nothing has run on the RTX 5090 or touched the real checkpoint.
 
 | Piece | Where | Verified on the VM | Remaining on the target machine |
 |---|---|---|---|
 | Canonical W4A4 arithmetic (§16.2): E4M3/E2M1 encoders, A4 quantizer, `exp_c`, `silu_c`, epilogues | `src/ops/common/canonical_math.h` | Encoders against grid enumeration; BF16 rounding; `exp_c`/SiLU exhaustively over BF16 against FP64; exact int64 against FP64 | GPU build of the same header; exhaustive CPU-GPU equality (M3) |
 | CPU narrow expert engine: scalar, AVX2, AVX-VNNI, AVX-512 VNNI | `src/ops/offloaded_sparse_moe/cpu/`; test `ninfer_offloaded_moe_cpu_test` | Bit equality across ISAs, batch and split invariance, golden output hashes (`kGolden1`, `kGolden4`) with GCC, Clang and -O0 | Throughput on the target (`host_probe`); the multi-column optimization of §10.2; the worker team and handshake (§10.3); AVX-VNNI-INT8 |
+| GPU narrow route, first version: quantize, gate/up + SwiGLU + A4(h), and down kernels using `dp4a` and the canonical header | `src/ops/offloaded_sparse_moe/cuda/narrow_expert.*`; test `ninfer_offloaded_moe_cuda_test` | Compiled for `sm_120a` inside the project's CMake build (nvcc 13.4); the canonical header has no contractible float expressions | Run the test: it must reproduce `kGolden1`/`kGolden4`, equal the CPU engine bit for bit (device and mapped-host records), and match the canonical scalar functions exhaustively over BF16 and around every encoder boundary. Then the optimized K7a/K7b of §8.5 (tickets, PDL, TMA ring, persistent items, IMMA for n ≥ 3), qualified against this version |
 | Formats `nvfp4_mul`, `fp8_e4m3fn_block128_f32`; layouts `nvfp4_expert_rg16_v1`, `block128_scale_v1`; codecs; ModelOpt source readers | `tools/artifact/`, `tools/convert/sources/modelopt.py`; tests in `tests/artifact/`, `tests/convert/` | Word-exact round trips; C++ and Python agree on rg16 row sums | C++ `QType`/`QuantLayout` registration and loader binding (`src/core/weight.h`, `src/artifact/formats.cpp`, `src/core/weight_view.cpp`), deliberately left untouched until it can be built with CUDA; the recipes A and B themselves (M2) |
 | Host expert cache: LFRU, residency words, frame epochs, deferred-load controller | `src/models/qwen4_exp/program/expert_cache/`; test `ninfer_qwen4_exp_expert_cache_test` | Victims identical to `tools/expert_cache_replay` on a 1,200-group fixture; device/agent simulation with no frame reused early | The transfer agent around it: copy stream, `cuStreamWriteValue32`, route log, loans (M5) |
 | M0 source facts | `tools/flash_next/inspect_checkpoint.py` | Synthetic checkpoints | Run on the real checkpoint and record the facts in §6.1 |
@@ -2335,7 +2337,7 @@ its tests pass there. Nothing has run on the RTX 5090 or touched the real checkp
 
 1. `tools/flash_next_probe/run_m0.sh` (M0), then update §4, §6.1 and §8.3 from the results.
 2. C++ format registration, then recipe A conversion (M2).
-3. The GPU narrow expert kernel, which must reproduce `kGolden1` and `kGolden4` bit for bit (M3).
+3. Run `ninfer_offloaded_moe_cuda_test`. It must reproduce `kGolden1` and `kGolden4` bit for bit. Then optimize K7a/K7b against it (M3).
 4. Optimize the CPU kernel's multi-column path and re-measure it.
 
 ---
