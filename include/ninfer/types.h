@@ -42,9 +42,10 @@ enum class KvCacheStorage : std::uint8_t {
 };
 
 // How prompt attention runs P*V where its kernel has an 8-bit form (the fast INT8 and NVFP4
-// prompt kernels and K8V4's). Auto keeps FP16 P*V for INT8 KV, whose 8-bit integer form doubles
-// the KL divergence from a BF16 KV reference that its FP16 form has at 64K context, and uses the
-// 8-bit form for NVFP4 and K8V4 KV, whose E4M3 form stays within 1.1x of FP16's.
+// prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel). Auto keeps FP16 P*V
+// for INT8 and K4V2 KV, whose 8-bit forms cost measurable KL divergence against FP16's at 64K
+// context, and uses the 8-bit form for NVFP4, K8V4 and VQ2 KV, where it is numerically equivalent
+// or nearly so (see the README).
 enum class PrefillPv8 : std::uint8_t {
     Auto,
     On,

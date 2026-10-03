@@ -1074,15 +1074,18 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
               ops::kCausalPromptSplitWorkspaceDefaultBytes);
 
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
-// Those kernels and K8V4's prompt kernel run their PV in 8 bits when prefill_8bit_pv asks for it
-// or leaves the choice to the KV format: NVFP4 and K8V4 by default, INT8 only when forced.
+// Those kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel run their PV in 8 bits
+// when prefill_8bit_pv asks for it or leaves the choice to the KV format.
 PromptAttention prompt_attention(const EngineOptions& options) {
     const bool fast = uses_fast_int8_prefill(options) ||
                       (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
                        !options.original_nvfp4_prefill_kernel);
-    const bool pv8_capable = fast || options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value;
+    const bool pv8_capable = fast || options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
+                             options.kv_cache == KvCacheStorage::Vq2 ||
+                             options.kv_cache == KvCacheStorage::Q4KeyVq2Value;
     const bool pv8_auto = options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
-                          options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value;
+                          options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
+                          options.kv_cache == KvCacheStorage::Vq2;
     const bool pv8 = options.prefill_8bit_pv == PrefillPv8::On ||
                      (options.prefill_8bit_pv == PrefillPv8::Auto && pv8_auto);
     return {.fast = fast,

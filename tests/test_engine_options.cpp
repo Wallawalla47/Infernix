@@ -95,7 +95,8 @@ int main() {
         for (const auto storage :
              {ninfer::KvCacheStorage::BFloat16, ninfer::KvCacheStorage::Int8Group64,
               ninfer::KvCacheStorage::Fp8E4M3Row256, ninfer::KvCacheStorage::Nvfp4Group16,
-              ninfer::KvCacheStorage::Fp8KeyNvfp4Value}) {
+              ninfer::KvCacheStorage::Fp8KeyNvfp4Value, ninfer::KvCacheStorage::Vq2,
+              ninfer::KvCacheStorage::Q4KeyVq2Value}) {
             for (const bool original : {false, true}) {
                 options.kv_cache = storage;
                 options.original_int8_prefill_kernel =

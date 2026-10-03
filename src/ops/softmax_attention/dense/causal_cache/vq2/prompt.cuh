@@ -19,6 +19,10 @@
 //     pass over those keys' codes for the rows that read them from codes.
 //   * V is stored rotated: the normalized rows are inverse-rotated in registers (butterflies over
 //     the lane's dimension bits and its quad) before they are stored or published as split rows.
+//   * The 8-bit PV form (Pv8, CausalAttentionExecutionEnvelope::fast_prompt_pv8) instead runs PV
+//     on u8 x s8 Tensor Cores with exact INT32 accumulation over the tile's INT8 V rows, rounding
+//     each group's probabilities, scaled by that key's group scale, to u8 codes against their row
+//     maximum over the tile; the only precision change is P, as in the fast INT8 prompt kernel.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -142,7 +146,7 @@ __device__ __forceinline__ void vq_prompt_inverse_rotate(float (&values)[16][4],
 }
 
 template <typename Geometry, typename Metadata, KVCacheVqKeyCodec KeyCodec, int Warps, bool Split,
-          int Bc>
+          bool Pv8, int Bc>
 __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
                              1) void vq_prompt_kernel(const __nv_bfloat16* __restrict__ q,
                                                       VqKvCacheView cache, Metadata metadata,
@@ -628,21 +632,24 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
         running_l0 = __fmaf_rn(running_l0, tile_alpha0, bl0);
         running_l1 = __fmaf_rn(running_l1, tile_alpha1, bl1);
 
-        // A 32-key FP16 partial is bounded by 32 * 127 * max_scale; the INT8 kernel's limit keeps
-        // it representable with twice the margin.
-        __half2 vmax2 = __float2half2_rn(0.0f);
+        if constexpr (!Pv8) {
+            // A 32-key FP16 partial is bounded by 32 * 127 * max_scale; the INT8 kernel's limit
+            // keeps it representable with twice the margin. The 8-bit form carries each group's
+            // scale in its own codes instead, so it needs no tile shift.
+            __half2 vmax2 = __float2half2_rn(0.0f);
 #pragma unroll
-        for (int c = 0; c < Bc * Groups / 128; ++c) {
-            const uint2 v4 = load_vec<uint2>(&vs_s[4 * lane + 128 * c]);
-            vmax2          = __hmax2(vmax2, __hmax2(__habs2(load_vec<__half2>(&v4.x)),
-                                                    __habs2(load_vec<__half2>(&v4.y))));
-        }
-        const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
-        tile_shift       = 0;
-        if (vmax > kCausalPromptI8FastF16PartialScaleLimit) {
-            const float bounded = fminf(vmax, 65504.0f);
-            while (ldexpf(bounded, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
-                ++tile_shift;
+            for (int c = 0; c < Bc * Groups / 128; ++c) {
+                const uint2 v4 = load_vec<uint2>(&vs_s[4 * lane + 128 * c]);
+                vmax2 = __hmax2(vmax2, __hmax2(__habs2(load_vec<__half2>(&v4.x)),
+                                               __habs2(load_vec<__half2>(&v4.y))));
+            }
+            const float vmax = warp_max(fmaxf(__low2float(vmax2), __high2float(vmax2)), FullMask);
+            tile_shift       = 0;
+            if (vmax > kCausalPromptI8FastF16PartialScaleLimit) {
+                const float bounded = fminf(vmax, 65504.0f);
+                while (ldexpf(bounded, -tile_shift) > kCausalPromptI8FastF16PartialScaleLimit) {
+                    ++tile_shift;
+                }
             }
         }
         tile_live = true;
@@ -650,6 +657,126 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
 
     const auto pv = [&](int v) {
         if (!tile_live) { return; }
+        if constexpr (Pv8) {
+            // 8-bit PV (CausalAttentionExecutionEnvelope::fast_prompt_pv8). PV runs on u8 x s8
+            // Tensor Cores with exact INT32 accumulation over this tile's INT8 V rows, which are
+            // the format's own reconstruction of V, so no V code is decoded again and the only
+            // precision change is P: each group's probabilities are scaled by that key's group
+            // scale (a VQ row repeats its row scale in every group) and rounded to u8 codes
+            // against their row maximum over the tile, exactly as the fast INT8 prompt kernel's
+            // 8-bit form does. The lane's probabilities pa[j] cover keys 16j + {2t, 2t+1}
+            // (registers 0/1: rows g and g+8) and 16j + {8+2t, 9+2t} (registers 2/3); a k32 step
+            // s takes the keys of steps j = 2s and 2s+1 in exactly that order.
+            const std::int8_t* pv8_v =
+                reinterpret_cast<const std::int8_t*>(stage_base(v & 1)) + Shape::TileBytes;
+            const __half* pv8_scales =
+                reinterpret_cast<const __half*>(pv8_v + Shape::TileBytes) + Bc * Groups;
+            const __half2 code_origin = __float2half2_rn(1024.0f);
+            constexpr int Steps       = Bc / 32;
+            static_assert(PVKs == Steps * 2);
+#pragma unroll
+            for (int grp = 0; grp < Groups; ++grp) {
+                __half2 product[PVKs][4];
+                __half2 max0 = __float2half2_rn(0.0f);
+                __half2 max1 = max0;
+#pragma unroll
+                for (int j = 0; j < PVKs; ++j) {
+                    const int key    = j * 16 + 2 * lid;
+                    const __half2 lo = __halves2half2(pv8_scales[key * Groups + grp],
+                                                      pv8_scales[(key + 1) * Groups + grp]);
+                    const __half2 hi = __halves2half2(pv8_scales[(key + 8) * Groups + grp],
+                                                      pv8_scales[(key + 9) * Groups + grp]);
+                    product[j][0]    = __hmul2(load_vec<__half2>(&pa[j][0]), lo);
+                    product[j][1]    = __hmul2(load_vec<__half2>(&pa[j][1]), lo);
+                    product[j][2]    = __hmul2(load_vec<__half2>(&pa[j][2]), hi);
+                    product[j][3]    = __hmul2(load_vec<__half2>(&pa[j][3]), hi);
+                    max0             = __hmax2(max0, __hmax2(product[j][0], product[j][2]));
+                    max1             = __hmax2(max1, __hmax2(product[j][1], product[j][3]));
+                }
+                const float row_max0 =
+                    warp_max<4>(fmaxf(__low2float(max0), __high2float(max0)), FullMask);
+                const float row_max1 =
+                    warp_max<4>(fmaxf(__low2float(max1), __high2float(max1)), FullMask);
+                // Codes are rint(product * inverse) with the represented FP16 inverse rounded
+                // down, so none exceeds 255; the step that reconstructs them is its exact
+                // reciprocal.
+                const __half inverse0 =
+                    __float2half_rd(row_max0 > 0.0f ? 255.0f / row_max0 : 0.0f);
+                const __half inverse1 =
+                    __float2half_rd(row_max1 > 0.0f ? 255.0f / row_max1 : 0.0f);
+                const float step0 = __hgt(inverse0, __float2half(0.0f))
+                                        ? 1.0f / __half2float(inverse0)
+                                        : 0.0f;
+                const float step1 = __hgt(inverse1, __float2half(0.0f))
+                                        ? 1.0f / __half2float(inverse1)
+                                        : 0.0f;
+                const __half2 inv0 = __half2half2(inverse0);
+                const __half2 inv1 = __half2half2(inverse1);
+                // FP16 1024 + n has the integer n in its low byte for n in [0, 1023].
+                unsigned a[Steps][4];
+#pragma unroll
+                for (int s = 0; s < Steps; ++s) {
+                    unsigned q[2][4];
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int j      = 2 * s + h;
+                        const __half2 c0 = __hfma2(product[j][0], inv0, code_origin);
+                        const __half2 c1 = __hfma2(product[j][1], inv1, code_origin);
+                        const __half2 c2 = __hfma2(product[j][2], inv0, code_origin);
+                        const __half2 c3 = __hfma2(product[j][3], inv1, code_origin);
+                        q[h][0]          = load_vec<unsigned>(&c0);
+                        q[h][1]          = load_vec<unsigned>(&c1);
+                        q[h][2]          = load_vec<unsigned>(&c2);
+                        q[h][3]          = load_vec<unsigned>(&c3);
+                    }
+                    a[s][0] = __byte_perm(q[0][0], q[0][2], 0x6420);
+                    a[s][1] = __byte_perm(q[0][1], q[0][3], 0x6420);
+                    a[s][2] = __byte_perm(q[1][0], q[1][2], 0x6420);
+                    a[s][3] = __byte_perm(q[1][1], q[1][3], 0x6420);
+                }
+#pragma unroll
+                for (int b = 0; b < GroupDBlocks; ++b) {
+                    const int db = grp * GroupDBlocks + b;
+                    int even[4]  = {0, 0, 0, 0};
+                    int odd[4]   = {0, 0, 0, 0};
+#pragma unroll
+                    for (int s = 0; s < Steps; ++s) {
+                        // Matrices: keys 32s + 0..7, 8..15, 16..23 and 24..31 of this
+                        // 16-dimension block. Lane (g, t) receives keys {2t, 2t+1} at dimensions
+                        // {2g, 2g+1}.
+                        const int key = s * 32 + (a_mat << 3) + a_rin;
+                        unsigned r[4];
+                        ldmatrix_x4_t(r[0], r[1], r[2], r[3],
+                                      smem_addr(&pv8_v[key * D + ((db ^ (key & 7)) << 4)]));
+                        causal_prompt_i8_fast_mma_u8s8(
+                            even[0], even[1], even[2], even[3], a[s][0], a[s][1], a[s][2], a[s][3],
+                            __byte_perm(r[0], r[1], 0x6420), __byte_perm(r[2], r[3], 0x6420));
+                        causal_prompt_i8_fast_mma_u8s8(
+                            odd[0], odd[1], odd[2], odd[3], a[s][0], a[s][1], a[s][2], a[s][3],
+                            __byte_perm(r[0], r[1], 0x7531), __byte_perm(r[2], r[3], 0x7531));
+                    }
+                    float (&e)[4] = acc[db][0];
+                    float (&o)[4] = acc[db][1];
+                    e[0]          = __fmaf_rn(e[0], tile_alpha0,
+                                              step0 * causal_prompt_i8_fast_small_int_to_float(even[0]));
+                    e[1]          = __fmaf_rn(e[1], tile_alpha0,
+                                              step0 * causal_prompt_i8_fast_small_int_to_float(even[1]));
+                    e[2]          = __fmaf_rn(e[2], tile_alpha1,
+                                              step1 * causal_prompt_i8_fast_small_int_to_float(even[2]));
+                    e[3]          = __fmaf_rn(e[3], tile_alpha1,
+                                              step1 * causal_prompt_i8_fast_small_int_to_float(even[3]));
+                    o[0]          = __fmaf_rn(o[0], tile_alpha0,
+                                              step0 * causal_prompt_i8_fast_small_int_to_float(odd[0]));
+                    o[1]          = __fmaf_rn(o[1], tile_alpha0,
+                                              step0 * causal_prompt_i8_fast_small_int_to_float(odd[1]));
+                    o[2]          = __fmaf_rn(o[2], tile_alpha1,
+                                              step1 * causal_prompt_i8_fast_small_int_to_float(odd[2]));
+                    o[3]          = __fmaf_rn(o[3], tile_alpha1,
+                                              step1 * causal_prompt_i8_fast_small_int_to_float(odd[3]));
+                }
+            }
+            return;
+        }
         const unsigned char* base = stage_base(v & 1);
         const std::int8_t* v_s =
             reinterpret_cast<const std::int8_t*>(base) + Shape::TileBytes;
