@@ -21,6 +21,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
+| Replay Qwen3.8-Flash-Next routing traces through VRAM expert-cache policies (needs numpy) | `python -m tools.expert_cache_replay.replay TRACE_DIR`; [`expert_cache_replay/`](expert_cache_replay/replay.py) |
 | Regenerate or check the VQ2 KV-cache codebook (needs numpy) | `python -m tools.kv_codebook.make_vq2_codebook [--check]`; [`kv_codebook/`](kv_codebook/make_vq2_codebook.py) |
 
 ## Standalone HBM probe
