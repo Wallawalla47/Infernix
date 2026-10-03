@@ -2,8 +2,12 @@
 
 **Status: design proposal, not implemented.** This is a temporary planning document for the
 Qwen3.8-Flash-Next product change. When the implementation lands, its stable content moves into
-the active authorities named in [§18](#18-documentation-and-authority-changes) and this file is
+the active authorities named in [§20](#20-documentation-and-authority-changes) and this file is
 removed.
+
+**Revision 2026-10-03.** This version was revised after an expert review for implementability and
+peak performance on the target hardware. [Appendix A](#appendix-a-review-findings-and-changes)
+lists every finding and what changed.
 
 This design adds `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, about 180B parameters) to NInfer.
 The target system is:
@@ -43,10 +47,13 @@ decode** on the target machine.
 14. [Calibration and adaptive tuning](#14-calibration-and-adaptive-tuning)
 15. [Memory plans](#15-memory-plans)
 16. [Numerics and qualification](#16-numerics-and-qualification)
-17. [Implementation plan](#17-implementation-plan)
-18. [Documentation and authority changes](#18-documentation-and-authority-changes)
-19. [Risks and open questions](#19-risks-and-open-questions)
-20. [Sources](#20-sources)
+17. [High-reward options](#17-high-reward-options)
+18. [Configuration surface](#18-configuration-surface)
+19. [Implementation plan](#19-implementation-plan)
+20. [Documentation and authority changes](#20-documentation-and-authority-changes)
+21. [Risks and open questions](#21-risks-and-open-questions)
+22. [Sources](#22-sources)
+- [Appendix A. Review findings and changes](#appendix-a-review-findings-and-changes)
 
 ---
 
@@ -86,14 +93,15 @@ All comparisons run on the same machine, with the same prompts and the same outp
 
 The targets assume Text with thinking off, a 4K prompt and 256 output tokens, at C=1 unless stated
 otherwise. They are acceptance gates, not claims. [§4](#4-performance-model) derives where they
-come from.
+come from: the Must column beats the Strata baseline by 1.5-2×, and the Stretch column is the
+model projection at a 0.9 hit rate, which is more conservative than the replay traces.
 
 | Metric | Must | Stretch |
 |---|---:|---:|
-| Decode, no speculation, C=1, 4K context | ≥ 120 tok/s (1.5× Strata Q4) | ≥ 170 |
-| Decode, best speculation, C=1, mixed chat corpus | ≥ 160 tok/s (2× Strata Q4) | ≥ 230 |
+| Decode, no speculation, C=1, 4K context | ≥ 120 tok/s (1.5× Strata Q4) | ≥ 220 |
+| Decode, best speculation, C=1, mixed chat corpus | ≥ 160 tok/s (2× Strata Q4) | ≥ 330 |
 | Decode at a 128K context, relative to 4K | ≥ 85% | ≥ 92% |
-| Aggregate decode, C=8 | ≥ 300 tok/s | ≥ 400 |
+| Aggregate decode, C=8 | ≥ 300 tok/s | ≥ 600 |
 | Prefill, 32K fresh prompt | ≥ 6,000 tok/s | ≥ 9,000 |
 | Quality: mean KL vs the BF16 reference, on a fixed corpus | ≤ KL of UD-Q4_K_XL | — |
 
@@ -110,8 +118,8 @@ missed, the report says so; the target is not changed after the measurement.
 ### 1.4 Non-goals
 
 - Copying Strata or ninfer-ext code. Both were studied for mechanisms and measurements only.
-- Experts below NVFP4 precision by default. [§19](#19-risks-and-open-questions) lists this as a
-  possible explicit opt-in.
+- Experts below NVFP4 precision by default. [§17](#17-high-reward-options) lists this as an
+  explicit opt-in (H10).
 - Multi-GPU, AMD, or GPUs other than `sm_120a`.
 - A generic offloading framework for other models. The mechanisms are written for this
   architecture, with Ops and core primitives kept model-independent where they are naturally so.
@@ -155,9 +163,10 @@ What follows from these facts:
   10,000 slots: **~40%** of the 25,088 experts, MTP included.
 - **The whole expert set fits in 96 GB of RAM, but not much else does.** About 20 GB remains for
   everything else. The 51 GB n-gram table therefore has to stay on NVMe, as required.
-- **Every miss is limited by host DRAM bandwidth.** This holds whether the miss crosses PCIe (a DMA
-  read of DRAM) or is computed by the CPU (a CPU read of DRAM). It is the central constraint of
-  this design ([§4](#4-performance-model)).
+- **Every miss costs host DRAM bandwidth**, whether it crosses PCIe (a DMA read of DRAM) or is
+  computed by the CPU (a CPU read of DRAM). At ~41% capacity a plain-decode token is
+  **latency-bound** on its few misses. The DRAM ceiling binds for wide verify windows at low hit
+  rates and for prefill ([§4.1](#41-bound)).
 
 ---
 
@@ -169,20 +178,20 @@ Strata is GGUF-based with custom CUDA kernels.
 
 | Mechanism | Detail | Consequence for NVFP4 on 32 GB |
 |---|---|---|
-| Expert placement | All experts pinned in RAM. VRAM slots are filled in the order of a shipped routing profile (all 24,576 experts ranked; `data/expert-profile.bin`). **Misses are never admitted on demand.** Every 4 rounds, `adapt()` (`src/program/generate.cpp`) pairs each layer's hottest non-resident experts (decayed count ≥ 2) against that layer's coldest residents and swaps while candidate ≥ victim + 1.5. It applies at most 96 swaps (highest gain first), then multiplies every count by 0.7. The victim is evicted at once and the newcomer admitted when its copy lands. Since issue #463 the next round **waits** for those swaps. The learned ranking can be saved and reloaded (`--expert-profile-save`). | A good **bandwidth** trade: in replay it makes ~7× fewer promotions than LRU (§9.4). Its counts decay by half about every 8 rounds, so it is mostly recency-driven, and it has 0-15% more misses than LRU. At 2.77 MB per expert, 96 blocking swaps cost ~5 ms. |
+| Expert placement | All experts pinned in RAM. VRAM slots are filled in the order of a shipped routing profile (all 24,576 experts ranked; `data/expert-profile.bin`). **Misses are never admitted on demand.** Every 4 rounds, `adapt()` (`src/program/generate.cpp`) pairs each layer's hottest non-resident experts (decayed count ≥ 2) against that layer's coldest residents and swaps while candidate ≥ victim + 1.5. It applies at most 96 swaps (highest gain first), then multiplies every count by 0.7. The victim is evicted at once and the newcomer admitted when its copy lands. Since issue #463 the next round **waits** for those swaps. The learned ranking can be saved and reloaded (`--expert-profile-save`). | A good **bandwidth** trade: in replay it makes ~7× fewer promotions than LRU (§9.3). Its counts decay by half about every 8 rounds, so it is mostly recency-driven, and it has 0-15% more misses than LRU. At 2.77 MB per expert, 96 blocking swaps cost ~5 ms. |
 | Miss service | Distinct misses are split between CPU in-place compute and an in-graph SM copy kernel that reads mapped host memory (`pcie_frac`, 0.55 by default for IQ packs) | CPU plus PCIe co-service is the right primitive, but the copy kernel occupies SMs and serializes after the hit kernels. |
 | Hit/miss resolution | **One GPU→host→GPU handshake per layer, even at a 100% hit rate.** A doorbell kernel writes the activation and ids to mapped memory, the host builds the plan, and a single-thread GPU spin kernel waits. A device-side planner exists but is off by default. | 48 serialized round trips per window, on the critical path. |
 | Kernels | llama.cpp-style dp4a MMVQ, FP32 gate/up intermediates through global memory, BF16 hyper-connections (~1.27 GB read per window). About 2,000 graph nodes per window. | On a 5090 a verify round takes ~14-15 ms against a ~2 ms bandwidth floor: it is overhead-bound even at 98% hits. |
 | Speculation | MTP with up to 3 drafts, Q2_0 MTP experts in VRAM, a reduced draft head (106K ids), and suffix lookup. 1.6-1.8× on a 5070. Drafts run serially after verify, with a stream sync per step. | Gains depend on a high hit rate. Strata measured the missed-expert union at 1.75 / 2.4 / 3.05× one token's for windows of 2 / 3 / 4 tokens. |
 | PLE | 28.8 GB IQ4_NL repack. `O_DIRECT` `pread` on 16 threads, a 1M-row host CLOCK cache, and a **synchronous** gather before each window. | NVMe latency on the critical path whenever the row cache misses. |
-| KV | INT8 KV. Above 64K context only 32,768 cells per attention layer stay in VRAM, as a CLOCK cache of 4-cell blocks over an authoritative host copy (96-99.4% block hits on a 5090). | **This is why Strata keeps a large expert cache at 262K context**: KV costs ~0.4 GiB of VRAM instead of several GB. Adopted for long contexts (§9.5). |
+| KV | INT8 KV. Above 64K context only 32,768 cells per attention layer stay in VRAM, as a CLOCK cache of 4-cell blocks over an authoritative host copy (96-99.4% block hits on a 5090). | **This is why Strata keeps a large expert cache at 262K context**: KV costs ~0.4 GiB of VRAM instead of several GB. Adopted for long contexts (§9.6). |
 | Tuning | Offline `--calibrate`: sweeps `pcie_frac`, `spec_min_p` and pool workers, and keeps a value only if it is > 3% faster (no published gain). Startup probes: PCIe (best of 4 × 256 MiB bursts), CPU ISA and topology, cache auto-sizing, prefill chunk planning. Online: the adaptive tier, `DraftPolicy` EMAs. | §14 replaces this with host calibration, startup validation and online adaptation. |
 
 Strata's printed hit rate is hits / (hits + CPU-served misses). PCIe-served misses (the default
 `pcie_frac` share, 0.55) count in neither term, so the true VRAM hit rate is lower than printed.
 On 12 GB cards, profile-only caching gave ~0.50 and adaptive caching ~0.72. A user-measured printed
 hit rate above 80% at 262K context with Q8 on a 5090 is consistent with KV streaming keeping the
-cache large; replay at comparable capacity gives the Strata policy 0.87-0.92 (§9.4).
+cache large; replay at comparable capacity gives the Strata policy 0.87-0.92 (§9.3).
 
 **Forks.**
 
@@ -228,14 +237,14 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
 
 | Work | Mechanism | Used here |
 |---|---|---|
-| Eliseev & Mazur (2312.17238), FATE (2502.12224) | Next layer's gate applied to the current hidden state to predict the next layer's experts; FATE reports cosine similarity > 0.83 and 97% prefetch accuracy | §8.4. Recall must be measured: the HC streams may weaken it on this model. |
-| SP-MoE (2510.10302) | Prefetch the experts implied by draft tokens before verification | §11.3 |
-| Fiddler (2402.07033), KTransformers (SOSP'25), FreeToken q\* | CPU computes misses in place, or a balanced CPU/PCIe split | §10, §8.3 |
-| HOBBIT (2411.01433) | Low-precision copies for less important missed experts | Opt-in only (§19), because it changes the represented weights |
-| AdapMoE (2408.10284), FATE | Per-layer cache allocation; shallow layers miss more | One global pool. Hard per-layer quotas lost 1-35% in replay (§9.4). |
-| Zhang, "Reproducible evaluation of MoE expert caching" (2608.07911) | Event-atomic replay. LFRU, f / (age + 1), is the best causal policy in 12 of 13 workloads. 84-97% of the Belady gap comes from victim ranking. A learned next-use predictor did **worse** than LFRU. | Base policy of §9.4 |
-| SeqMoE (2609.12978) | A sequence predictor of expert activations several tokens ahead drives a probabilistic Belady (reported 91.7% / 97.0% hits at 25% / 45% residency) | Research option behind M1's predictor evaluation (§9.4) |
-| Local routing consistency (2505.16056) | Models with shared experts show weaker token-to-token expert reuse | Explains the modest LRU hit rates; Belady's gap is the headroom (§9.4) |
+| Eliseev & Mazur (2312.17238), FATE (2502.12224) | Next layer's gate applied to the current hidden state to predict the next layer's experts; FATE reports cosine similarity > 0.83 and 97% prefetch accuracy | §8.7. Recall must be measured: the HC streams may weaken it on this model. |
+| SP-MoE (2510.10302) | Prefetch the experts implied by draft tokens before verification | §11.4 |
+| Fiddler (2402.07033), KTransformers (SOSP'25), FreeToken q\* | CPU computes misses in place, or a balanced CPU/PCIe split | §10, §8.6 |
+| HOBBIT (2411.01433) | Low-precision copies for less important missed experts | Opt-in only (§17, H10), because it changes the represented weights |
+| AdapMoE (2408.10284), FATE | Per-layer cache allocation; shallow layers miss more | One global pool. Hard per-layer quotas lost 1-35% in replay (§9.3). |
+| Zhang, "Reproducible evaluation of MoE expert caching" (2608.07911) | Event-atomic replay. LFRU, f / (age + 1), is the best causal policy in 12 of 13 workloads. 84-97% of the Belady gap comes from victim ranking. A learned next-use predictor did **worse** than LFRU. | Base policy of §9.3 |
+| SeqMoE (2609.12978) | A sequence predictor of expert activations several tokens ahead drives a probabilistic Belady (reported 91.7% / 97.0% hits at 25% / 45% residency) | Research option behind M1's predictor evaluation (§9.3) |
+| Local routing consistency (2505.16056) | Models with shared experts show weaker token-to-token expert reuse | Explains the modest LRU hit rates; Belady's gap is the headroom (§9.3) |
 | DeepSeek Engram (2601.07372), InferenceX PR #3080 | Token-determined table rows can be prefetched; tiered caching driven by Zipfian n-gram reuse | §12 |
 
 ### 3.4 Lessons that shape this design
@@ -250,7 +259,7 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
    NVFP4, hyper-connections FP8, and the per-layer kernel count should fall from ~32-40 to ~10 or
    fewer (all three engines).
 4. **LRU is not the best policy; a recency × frequency hybrid is.** On this model's traces LFRU has
-   15-22% fewer misses than LRU at every capacity tested (§9.4). Pure LFU and per-layer
+   15-22% fewer misses than LRU at every capacity tested (§9.3). Pure LFU and per-layer
    partitioning lose, and Belady still has 2-3× fewer misses. Promotion runs on the copy engine in
    the background, and a slot is reused only after its epoch has retired (Strata's #463 blocking).
 5. **Speculation does not multiply misses per accepted token.** In replay, verify windows of 1, 2
@@ -267,38 +276,45 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
 
 ### 4.1 Bound
 
-For one decode round with T token columns (T=1 for plain decode, K+1 for a speculative verify), the
-round time is approximately:
+For one decode round with T token columns (T = 1 for plain decode, K+1 for a speculative verify),
+the round time is approximately:
 
 ```text
-t_round ≈ t_gpu + Σ_layers t_exposed_miss(l) + t_draft + t_boundary
+t_round ≈ t_gpu(T) + Σ_layers t_exposed(l) + t_draft + t_boundary
 
-t_gpu          = (B_dense + B_hit) / (η · 1.79 TB/s) + 48 · t_fixed
-B_hit          = U_T · h · 48 · 2.765 MB      U_T: distinct experts per layer for T columns
-misses per layer: m = U_T · (1 − h)
-t_exposed_miss(l) = max(0, t_cpu(m_cpu) + t_handshake − t_hit_gemv(l))
-m = m_prefetched + m_cpu,   m_prefetched ≤ window(l) · BW_pcie / 2.765 MB
+t_gpu(T)    = Σ_kernels max(bytes_k / BW_eff, compute_k) + n_boundaries · t_b      (§8.3 budget)
+t_exposed(l) = max(0, t_service(misses of l) − t_overlap(l))      t_service from §8.6
+misses per layer ≈ U_T · (1 − h),   U_T = distinct experts per layer for T columns
 ```
 
-The host-DRAM bound holds whatever the mix of CPU and PCIe service:
+Two ceilings bound the misses:
 
 ```text
-miss bytes per round = Σ_l m_l · 2.765 MB  ≤  BW_dram · t_round        (BW_dram ≈ 70-90 GB/s on dual-channel DDR5)
+host DRAM:  Σ_l (CPU-served + DMA'd + promoted bytes)  ≤  BW_dram · t_round     (BW_dram ≈ 70-90 GB/s)
+PCIe:       Σ_l (DMA'd + promoted bytes)               ≤  BW_pcie · t_round     (≈ 50 GB/s)
 ```
 
-Three levers decide the result. The design attacks all three:
+At this design's capacity (~41% of experts in VRAM), a T = 1 token is **latency-bound on misses**,
+not bandwidth-bound:
+
+- ~10 of 48 layers have a miss;
+- each costs one handshake plus one expert's service time;
+- the DRAM ceilings bind only for wide verify windows at low hit rates, and for prefill.
+
+There are four levers, each attacked by the design:
 
 | Lever | Mechanism |
 |---|---|
-| **h**: hit rate | More VRAM for experts (§6, §9), a frequency-plus-recency policy (§9), and lookahead prefetch counted as an effective hit (§8.4) |
-| **t_exposed_miss**: the miss stall | CPU in place; a single handshake only for missing layers; overlap with the hit GEMVs (§8, §10) |
-| **t_fixed**: per-layer fixed latency | ≤ 10 fused kernels per layer with PDL; no host involvement on hits (§8.6) |
+| **h**: hit rate | Frame pool of ~10,200 experts (§6, §9.1); LFRU (§9.3); prefetch converting misses into staged hits (§8.7); KV loans and the KV host tier keep the pool large (§9.2, §9.6) |
+| **t_exposed**: the miss stall | CPU in place, with no handshake for hit-only layers; x pre-published; warming (H2); arbiter (§8.6); stall-time L2 warming of the next layer (§8.3) |
+| **t_gpu**: dense path and kernel latency | NVFP4/FP8 dense (2.8 GB); 7-9 launches per layer with PDL and pre-dependency weight prefetch; per-kernel budget (§8.3); megakernel option (H1) |
+| **Tokens per round** | MTP with a miss-aware draft length (§11); trees (H9) |
 
 ### 4.2 Projection
 
-**Measured input: misses per token.** The routing traces of this model (FreeToken community repo:
-3 × 383 single-client decode tokens, English technical writing) were replayed through candidate
-policies (§9.4). At this design's ~10,200 frames (41.5% of experts):
+**Measured input: misses per token.** This model's published routing traces (FreeToken community
+repo: 3 × 383 single-client decode tokens, English technical writing) were replayed through
+candidate policies (§9.3). At ~10,200 frames (41.5% of experts):
 
 | | Value | Note |
 |---|---|---|
@@ -309,83 +325,80 @@ policies (§9.4). At this design's ~10,200 frames (41.5% of experts):
 | Reuse distance | median 3 tokens | 36% of accesses repeat on the next token; 92% within 64 tokens |
 | Verify windows (T = 1 / 2 / 4) | **same misses per accepted token** (LRU 14.9 / 14.8 / 14.8) | 27 distinct experts per layer for T = 4, i.e. 2.7× one token |
 
-The trace sample is small and narrow, so longer, more diverse sessions will miss more. Milestone M1
-replays broad traces ([§17](#17-implementation-plan)). The projection is therefore given across a
-range of hit rates.
+The trace sample is small and narrow, so long, diverse sessions will miss more. Milestone M1
+replays broad traces (§19). The projection therefore spans a range of hit rates.
 
-**Assumptions:**
+**Two GPU assumptions:**
 
-- GPU time per token at T = 1: t_gpu ≈ 4.0 ms (dense 2.8 GB plus hits at η ≈ 0.6 of 1.79 TB/s, plus
-  25 µs fixed per layer). For a T = 4 verify: 6.0 ms.
-- A CPU-served expert takes 42 µs (2.765 MB at ~65 GB/s). The handshake adds 6 µs.
-- Hit GEMVs overlap 12 µs per layer at T = 1 and 30 µs at T = 4.
-- Prefetch covers up to 1.5 (T = 1) or 2 (T = 4) experts per layer at recall 0.6.
-- Misses per layer are Poisson.
-- MTP K = 3: 2.6 accepted tokens per round, +15% misses from rejected drafts, 0.8 ms drafting.
+- **Target:** the §8.3 budget, with t_gpu(1) = 3.6 ms and t_gpu(4) = 5.1 ms. The draft takes
+  0.3 ms (3 steps), and 2.8 tokens are accepted per round (§11.1).
+- **Conservative:** t_gpu(1) = 4.0 ms and t_gpu(4) = 6.0 ms, with 0.8 ms drafting and 2.6 accepted
+  per round.
 
-| Hit rate h | Misses per token | Plain decode | MTP K = 3 | Miss DRAM traffic (plain) |
-|---|---:|---:|---:|---:|
-| 0.974 (LFRU on the replay traces) | 12.5 | ~240 tok/s | ~375 tok/s | ~8 GB/s |
-| 0.95 | 24 | ~235 tok/s | ~355 tok/s | ~15 GB/s |
-| 0.90 | 48 | ~215 tok/s | ~295 tok/s | ~28 GB/s |
-| 0.85 | 72 | ~190 tok/s | ~235 tok/s | ~38 GB/s |
-| 0.80 | 96 | ~170 tok/s | ~190 tok/s | ~46 GB/s |
+**Common assumptions:**
+
+- A cold CPU-served expert takes 42 µs; the handshake 6 µs.
+- Hit work overlaps 15 µs per layer at T = 1 and 45 µs at T = 4.
+- Prefetch covers up to 1 (T = 1) or 1.5 (T = 4) experts per layer at recall 0.6.
+- Misses per layer are Poisson; rejected drafts add 15%.
+- Warming (H2), split service (H3) and the megakernel (H1) are **not** included.
+
+| Hit rate h | Misses per token | Plain decode, target (conservative) | MTP K = 3, target (conservative) |
+|---|---:|---:|---:|
+| 0.974 (LFRU on the replay traces) | 12.5 | ~270 (~240) tok/s | ~510 (~375) tok/s |
+| 0.95 | 24 | ~255 (~235) tok/s | ~475 (~355) tok/s |
+| 0.90 | 48 | ~230 (~215) tok/s | ~360 (~295) tok/s |
+| 0.85 | 72 | ~200 (~190) tok/s | ~265 (~235) tok/s |
+| 0.80 | 96 | ~175 (~170) tok/s | ~205 (~190) tok/s |
 
 How to read the table:
 
-- **The GPU term dominates at this capacity.** At h ≥ 0.9 the miss stall is under 15% of the token,
-  and host DRAM bandwidth is far from saturated. The decisive work is the dense path, kernel count
-  and per-layer latency (§8.6). That is a different regime from ninfer-ext and FreeToken, whose
-  serialized PCIe misses dominate. Their caches hold only 16-26% of experts, and with Q8 or BF16
-  dense they have less room.
-- **Speculation pays.** Misses per accepted token do not grow with the window, so speculation keeps
-  its advantage down to h ≈ 0.8. ninfer-ext's MTP loss comes from its serialized PCIe misses, its
-  separate MTP expert bank in the same LRU, and full `lm_head` drafts, not from the window itself.
-- **Every row clears the Must targets of §1.3** if t_gpu ≈ 4 ms holds. That assumption is the
-  largest risk in the projection, and M6 measures it first.
-
-- **Calibration of the GPU term.** SGLang with every expert resident on an sm_120 card with the
-  same 1.79 TB/s spends 11.4 ms per token. That run reads ~10 GB per token (BF16 dense) through
-  generic kernels (~5.5 ms byte floor). This design reads ~4.1 GB per token at h=1 (~2.3 ms floor).
-  The assumed t_gpu ≈ 4 ms requires ~58% of peak bandwidth plus 25 µs per layer. NInfer reaches
-  comparable efficiency today on Qwen3.6-35B-A3B (338 tok/s, 40 MoE layers). M6 verifies this
-  assumption first.
+- **At h ≥ 0.9 the GPU term dominates.** The decisive work is the dense path, the kernel count and
+  per-layer latency (§8.3). That is a different regime from ninfer-ext and FreeToken, whose
+  serialized PCIe misses dominate and whose caches hold only 16-26% of experts.
+- **Speculation pays at every row.** Its advantage shrinks as h falls. A 4-column verify at
+  h ≤ 0.85 puts ~5 misses per layer on the CPU (~230 per round), so the arbiter's DMA overflow, H2
+  and H3 matter there.
+- **References.** SGLang with all experts resident on a 96 GB sm_120 card (BF16 dense, generic
+  kernels) measures 87 tok/s plain and 148 with MTP. Every row above exceeds that, mainly because
+  this design reads 4.5 GB per token instead of ~10 GB.
+- **Sensitivity.** Each +0.5 ms of t_gpu costs ~12% of plain decode at h = 0.95. The §8.3 budget
+  is the largest risk in the projection, and M6 measures it first.
 
 ---
 
 ## 5. Design overview
 
 ```text
- ┌──────────────────────────── RTX 5090, 32 GB ───────────────────────────────┐
- │ Dense Text (NVFP4/FP8, 2.8 GB) · MTP dense · head · QSA KV · GDN/PLE state  │
- │ ┌───────────────────── frame pool (~26 GiB, 2.64 MiB frames) ─────────────┐ │
- │ │ hot experts (~9,400) │ prefetch staging (≤128) │ KV loans │ prefill arena│ │
- │ └─────────────────────────────────────────────────────────────────────────┘ │
- │ residency table [49×512] · device PLE row cache · miss / ngram mailboxes     │
- └─────────▲───────────────────────▲──────────────────────────▲───────────────┘
-   copy engine (DMA)          mapped mailboxes            mapped row buffers
-           │ prefetch / promote    │ act + ids ↓ / y ↑        │ rows ↑
- ┌─────────┴───────────────────────┴──────────────┐  ┌────────┴──────────────┐
- │ 96 GB host: 25,088 NVFP4 experts pinned on 2 MiB│  │ NVMe: n-gram table    │
- │ pages (69.4 GB) · embedding rows · row cache     │  │ 51.2 GB FP8, 4 KiB-   │
- │ CPU expert engine (spin workers, AVX-512/AVX2)   │◄─┤ packed, io_uring      │
- └──────────────────────────────────────────────────┘  └───────────────────────┘
+ ┌──────────────────────────────── RTX 5090, 32 GB ─────────────────────────────────┐
+ │ Dense Text (NVFP4/FP8, 2.8 GB) · MTP dense · heads · QSA KV + index keys · state │
+ │ ┌──────────────── frame pool: ~10,200 × 2,764,800 B frames (~26 GiB) ───────────┐ │
+ │ │ cached experts │ staging (≤128) │ KV loans │ prefill arena │ vision (on demand)│ │
+ │ └────────────────────────────────────────────────────────────────────────────────┘ │
+ │ residency[49×512] · land_seq[frame] · L0 PLE row cache · decode workspace          │
+ └──────▲──────────────────────▲─────────────────────────▲───────────────────▲───────┘
+        │ copy engine (DMA)    │ zero-copy reads/writes  │ zero-copy          │ WriteValue
+        │                      │ (mailboxes, CPU y)      │ (PLE rows)         │ (residency)
+ ┌──────┴──────────────────────┴─────────────────────────┴───────────┐  ┌────┴──────────┐
+ │ 96 GB host                                                         │  │ NVMe          │
+ │  pinned expert banks 25,088 × 2,764,800 B (69.4 GB, huge pages)    │  │ n-gram table  │
+ │  embedding rows · L1 PLE row cache · mailboxes · (KV host tier)    │  │ 52.4 GB FP8,  │
+ │  transfer agent ─ cache policy, all DMA, residency updates         │  │ 4 KiB blocks  │
+ │  CPU expert engine ─ spin workers (narrow canonical route)         │  └────▲──────────┘
+ │  NVMe agent ─ io_uring SQPOLL/IOPOLL, L1 cache  ────────────────────────────┘
+ └────────────────────────────────────────────────────────────────────┘
 ```
 
-Decode round at C=1 with no speculation. Every arrow is device-driven, and the host loop does not
-sit on the critical path:
+A decode round at C = 1 without speculation. The host loop is not on the critical path, and the
+host learns about a layer only when it has a CPU-served miss:
 
 ```text
-sample(t) ─► ngram ids (GPU) ─► device row-cache probe ─► miss ids → NVMe ring ─┐
-          │                                                                       │ (hidden by layer 0)
-          ▼                                                                       ▼
- embed (host row, zero-copy) ─► layer 0 ─► [PLE waits for rows] ─► layer 1 ... layer 47 ─► head ─► sample(t+1)
-
- per layer l:  HC_attn ─► GDN/QSA ─► HC_mlp ─► router+top-k+residency (1 kernel)
-                 │                                   ├─ hits ─► grouped NVFP4 GEMV (GPU)
-                 │                                   ├─ CPU misses ─► mailbox ─► CPU engine ─► mapped y
-                 │                                   └─ next-layer prediction ─► DMA prefetch → staging
-                 └──────────── combine(hits, staged, CPU y, shared) ─► HC inject (fused)
+round r: embed(host row) ─ [PLE kernel waits for rows: L0 hit or NVMe agent] before layer 1 ─┐
+ per layer l:                                                                                 │
+   K1 HC_attn ─ K2/K3 (GDN) or K2q/K2b/K3a/K3b (QSA) ─ K4 out_proj+inject ─ K5 HC_mlp (x→host)
+   K6 router(l, l+1): top-10 ─ residency ─ jobs ─ [miss_req → CPU] ─ [prefetch_req → agent]
+   K7 experts (clusters) ─ combine (waits CPU only if needed; warms L2 with layer l+1 meanwhile)
+ head ─ sample ─ n-gram ids(t+1) ─ L0 probe ─ NVMe requests ─ token egress ─ round_done
 ```
 
 ---
@@ -415,31 +428,25 @@ in [§16.3](#163-recipe-qualification) before they become the official recipe.
 
 ### 6.2 Expert storage layout: one layout for two consumers
 
-The pinned host bank is read by both the GPU (DMA into a VRAM frame, then GEMV/GEMM) and the CPU
-(in-place AVX GEMV). Only one copy can exist in 96 GB, and NInfer forbids runtime repacking. The
-artifact therefore stores every expert as a contiguous, frame-sized record that serves both
-consumers:
+The pinned host bank is read by the GPU (DMA into a frame, then the narrow GEMV or the wide GEMM)
+and by the CPU (in-place narrow GEMV). Only one copy fits in 96 GB, and NInfer forbids runtime
+repacking. The artifact therefore stores each expert as one contiguous record of 2,764,800 B
+(= 675 × 4 KiB) in the layout **`nvfp4_rg16_kmajor`** defined in §16.2:
 
-```text
-expert record (2,764,800 B, 4 KiB aligned, padded to the frame size):
-  gate_up codes  [1280 rows × 2560]  row-interleaved gate/up pairs, 16-row × 512-col tiles
-  gate_up scales                     E4M3, tile-major, adjacent to their code tile
-  down codes     [2560 rows × 640]   same tiling
-  down scales
-  (FP32 matrix divisors and the A4 divisor live in a small separate device/host table)
-```
+- gate/up rows interleaved (gate_i, up_i);
+- 16-row groups;
+- one 144-byte unit (codes + scales) per row group and 16-element block.
 
-- **One DMA per expert:** a single contiguous `cudaMemcpyAsync` from pinned host memory into a
-  frame.
-- **GPU decode:** a warp reads a 16-row tile with 16-byte vector loads, and the scales sit in the
-  same cache lines as their codes.
-- **GPU prefill:** tiles are loaded to shared memory and converted there into the block-scaled MMA
-  operand order. No tensor-core layout leaks into the stored record.
-- **CPU:** a core's row band is one contiguous memory stream, which suits hardware prefetchers and
-  2 MiB pages.
+The FP32 matrix divisors and the per-layer A4 input divisor live in a small separate table.
 
-The tile shape is fixed by a layout benchmark in M3 and recorded in
-[storage layouts](storage-layouts.md) as a new layout id (`expert_record_nvfp4_t16x512_v1`).
+| Consumer | Access |
+|---|---|
+| DMA | One contiguous copy per expert into a frame |
+| GPU narrow route | Units staged into shared memory with 16-byte `cp.async`; lane-per-row canonical arithmetic (§16.2) |
+| GPU wide route (prefill, n > 8) | Units converted into MMA operand order in shared memory. No tensor-core layout leaks into the record. |
+| CPU | One AVX-512 vector per row group; a worker's row band is one contiguous stream on huge pages |
+
+The layout id and its byte-exact definition are recorded in [storage layouts](storage-layouts.md).
 
 ### 6.3 Residency classes in the v3 container
 
@@ -466,156 +473,292 @@ boundaries ([engine architecture](engine-architecture.md)).
 
 | Component | Owner | Location (proposed) |
 |---|---|---|
-| Mathematics, config, binding, PLE n-gram ids, HC, block order, MTP alignment | Model | `src/models/qwen4_exp/` (config, load, execution, frontend reuse of the Qwen3.5 tokenizer/template/vision) |
-| Host-pinned expert bank, embedding bank, n-gram file region | Immutable Model data, through a new artifact residency class | `src/artifact/materializer.*` |
-| 2 MiB pinned host arena; `O_DIRECT` + io_uring reader; mapped mailbox ring; spin-worker pool | Core primitives (raw transfer and host execution, model-independent) | `src/core/host_pinned_arena.*`, `src/core/direct_io_ring.*`, `src/core/mapped_mailbox.*`, `src/core/spin_worker_pool.*` |
-| Expert cache, frame pool, residency table, epochs, promotion policy, prefetch staging, device and host PLE row caches, CPU miss-server thread lifetimes | **Program** (mutable state and placement; allocated at startup) | `src/models/qwen4_exp/program/` |
-| Routed MoE with residency-aware execution (GPU hits, staged hits, CPU misses) | **Op** `offloaded_sparse_moe` | `include/ninfer/ops/offloaded_sparse_moe.h`, `src/ops/offloaded_sparse_moe/{gpu,cpu}/` |
-| Router with residency resolution and next-layer prediction | Part of the same Op family | same |
-| HC mixer (grouped norm, low-rank gates, collapse) and HC inject/combine | Op `hyper_connection` | `include/ninfer/ops/hyper_connection.h` |
-| QSA indexer append, pooled-key maintenance, block select, sparse attention | Ops `qsa_index`, `qsa_select`; extended `softmax_attention` consumer | `include/ninfer/ops/qsa.h` |
-| PLE gather-from-mapped-rows, key/value projection, gate, dilated conv | Op `ple_ngram_injection` (stateful: conv history) | `include/ninfer/ops/ple.h` |
-| N-gram row id computation | Op `ngram_row_ids` (exact integer oracle) | same |
+| Mathematics, config, binding, block order, MTP alignment, frontend reuse (Qwen3.5 tokenizer, template, vision) | Model | `src/models/qwen4_exp/` |
+| Host-pinned expert banks, embedding bank, n-gram file region | Immutable Model data, through a new artifact residency class (§6.3) | `src/artifact/materializer.*` |
+| Pinned huge-page host arena; `O_DIRECT` + io_uring reader; mapped mailbox and ring primitives; spin-worker pool with barriers | Core (model-independent physical and transfer primitives) | `src/core/host_pinned_arena.*`, `direct_io_ring.*`, `mapped_mailbox.*`, `spin_worker_pool.*` |
+| Frame pool, residency table, staging, loans, epochs; transfer agent (policy, DMA, residency writes); NVMe agent; L0/L1 row caches; CPU-engine lifetime | **Program** (mutable state, placement, agents; all allocated at startup) | `src/models/qwen4_exp/program/` |
+| Cache policy algorithms (LFRU, shadow replay) | Program, behind a policy interface conformance-tested against `tools/expert_cache_replay` | `src/models/qwen4_exp/program/expert_cache/` |
+| Router + top-k + residency classification + prediction; narrow-route expert GEMV (GPU and CPU); wide-route grouped GEMM; combine | **Op family** `offloaded_sparse_moe` (closed contract: output = MoE(x) independent of residency; residency, agents and mailboxes are execution resources) | `include/ninfer/ops/offloaded_sparse_moe.h`, `src/ops/offloaded_sparse_moe/{route,gpu,cpu,wide}/` |
+| HC mixer and HC inject | Op `hyper_connection` | `include/ninfer/ops/hyper_connection.h` |
+| QSA prep, index-key pooling, block select, sparse attention | Ops `qsa_prep`, `qsa_select`; extended `softmax_attention` consumer | `include/ninfer/ops/qsa.h` |
+| PLE gather, projections, gate and dilated conv (stateful) | Op `ple_ngram_injection` | `include/ninfer/ops/ple.h` |
+| N-gram row ids | Op `ngram_row_ids` (exact integer oracle) | same |
+| Canonical narrow-route arithmetic (shared CPU/GPU helpers, `exp_c`) | Op common code | `src/ops/common/canonical_math.h` |
 | Draft-length policy with miss cost | Program speculative backend | `src/models/qwen4_exp/program/speculative/` |
+| Calibration | Runtime (profile schema), Core (probes), product (`ninfer-calibrate`) | §14.7 |
 
 Residency is an **execution resource** for `offloaded_sparse_moe`, like a stream or a workspace.
 By the [Op rules](op-development.md#2-op-admission-and-semantic-boundary), it may choose the
-implementation but must not change the result. That gives this design a testable requirement:
-**placement-invariant expert arithmetic** ([§16.2](#162-placement-invariance)).
+implementation but must not change the result. That is the basis for the placement-invariance
+requirement (§16.2).
 
-The Program plans every allocation at startup, including the frame pool, staging, mailboxes, row
-caches, and the pinned host arena. Nothing allocates during decode.
+If option H1 (megakernel) is adopted, Ops expose device-callable **tile functions** next to their
+host entries. Each tile function is qualified through the same contract. The Model owns the
+instruction sequence, exactly as it owns the call order today. No Op becomes model-labelled.
 
 ---
 
 ## 8. Decode pipeline
 
-### 8.1 Streams and agents
+This section specifies a decode round at the level an implementer needs: agents, the host-device
+protocol, every kernel with its budget, and the router, expert and arbitration algorithms.
 
-| Agent | Role |
+### 8.1 Execution agents
+
+| Agent | Thread / stream | Role |
+|---|---|---|
+| **Compute stream** | CUDA stream owned by the Program | Runs the captured decode graph for each exact (batch B, window T). Contains every GPU kernel of a round. |
+| **Transfer agent** | 1 pinned host thread + 1 CUDA copy stream | Owns all host→device expert traffic and the cache policy: prefetch, on-demand miss DMA, promotions, evictions, epoch retirement, residency-table updates (§9.4). **A GPU kernel cannot start a copy-engine DMA**, so every DMA in this design is issued by this thread. |
+| **CPU expert engine** | N_w pinned spin workers | Computes CPU-served misses (§10), and warms predicted misses into its caches (§10.4) |
+| **NVMe agent** | 1 pinned host thread, io_uring | PLE row reads (§12) |
+| **Engine worker** | Existing | Launches graphs and commits rounds. It does no PLE gathers and no expert planning. |
+
+The default core budget is: engine worker 1, transfer agent 1, NVMe agent 1, and CPU workers =
+physical P-cores − 3. All agents spin only while a request is active, and park on a futex when the
+Engine is idle.
+
+### 8.2 Host–device protocol
+
+All GPU↔host signalling uses **mapped pinned memory** (`cudaHostAlloc(..., cudaHostAllocMapped)`).
+Each exchange has the same structure:
+
+- a producer writes the payload;
+- then it writes a 32-bit **sequence word** with release semantics;
+- the consumer spins on the sequence word with acquire loads, then reads the payload.
+
+| Region | Location | Producer → consumer | Content |
+|---|---|---|---|
+| `x_host[L][T][2560]` | host, mapped | GPU (HC_mlp epilogue) → CPU workers | FFN input of each layer, **written every round** before routing is known. That is 5 KiB per layer at T=1 and keeps x off the miss critical path. |
+| `miss_req[L]` | host, mapped | GPU (router kernel) → CPU workers | `{round, n_miss, expert_id[], column_mask[]}` + `seq` |
+| `miss_out[L][slot][T][2560]` FP32 | host, mapped (or device memory via BAR, option H7) | CPU → GPU (combine) | Expert outputs, then `done_seq` |
+| `prefetch_req[L]` | host, mapped | GPU (router kernel) → transfer agent | Up to 16 `{expert_id, predicted weight}` for layer l+1 (and l+2 if enabled) + `seq` |
+| `route_log[round][L][T×10]` u16 | host, mapped ring | GPU (router kernel) → transfer agent | Every routed id. Used for LFRU accounting and shadow replay. |
+| `residency[49×512]` u32 | **device** | transfer agent (via `cuStreamWriteValue32` on the copy stream) → GPU (router kernel) | Expert state and frame (§9.4) |
+| `land_seq[frame]` u32 | device | copy stream (`cuStreamWriteValue32` after the DMA) → GPU | Landing ticket for in-flight DMAs |
+| `round_started`, `round_done` u64 | host, mapped | GPU (first and last kernel of each round) → all agents | Safe frame reuse (§9.5) and the agents' watchdog |
+| `agent_error` u32 | host, mapped | GPU (bounded-spin timeout) → engine worker | Device-side timeout report |
+
+**Ordering rules.**
+
+- **Device → host.** The writer thread stores the payload, executes `fence.sc.sys`
+  (`__threadfence_system()`), then `st.release.sys` of `seq`.
+- **Payload written by an earlier kernel.** Payloads written by an earlier kernel of the round
+  (`x_host` by K5) are fenced with `fence.sc.sys` by each writing thread before that kernel ends.
+  The later publisher's release then covers them.
+- **Host → device.** x86 store order is total. The CPU writes the payload, then `done_seq` with a
+  release store. The GPU reads `done_seq` with `ld.acquire.sys` and only then reads the payload.
+- **Polling discipline.** Exactly **one thread per CTA** (lane 0 of warp 0) polls a host-resident
+  sequence word, with `__nanosleep(32-128)` backoff after the first 2 µs. It then releases the CTA
+  through a shared-memory flag and `__syncthreads()`. No warp-wide polling over PCIe is allowed.
+- **Bounded spins.** Every device spin has an iteration bound worth about 2 s. On expiry the thread
+  writes `agent_error`, skips the computation (outputs are undefined), and the engine worker turns
+  that round into an Engine-wide failure ([engine architecture §7.4](engine-architecture.md)). Host
+  agents have a 2 s watchdog on `round_done` progress.
+
+### 8.3 Per-layer kernel sequence and time budget
+
+Decode at T=1. Bytes are what each kernel must read from HBM with every expert resident. The
+budget is at 1.5 TB/s, which is 90% of this card's measured 1,674.5 GB/s sustained read
+([linear benchmark §9](linear-benchmark.md)), plus ~1 µs per boundary.
+
+**GDN layer (36 of 48):**
+
+| # | Kernel (one launch each) | Reads | Budget |
+|---|---|---|---|
+| K1 | **HC_attn mixer.** Grouped offset RMSNorm of R (stream sums of squares come from the previous K7 epilogue), W_down [324×10240] FP8 by split-K, gates, W_up [10240×320] FP8, collapse to x [2560]. Persistent cooperative kernel with 2 device-wide barriers. | 6.6 MB | 6 µs |
+| K2 | **GDN input projection.** [16,384×2560] NVFP4 rows (q,k,v,z) + [96×2560] BF16 (a,b). Row-local epilogue only: causal conv (state update) + SiLU on q,k,v; β = sigmoid(b), g = −exp(A_log)·softplus(a + dt_bias). Any row tiling, so the grid fills all SMs. In layer 1 only, the PLE kernel (§12.3) runs before K1. | 24.1 MB | 17 µs |
+| K3 | **Gated delta recurrence.** One CTA per (value head, 32-row slice of the 128×128 FP32 state): 192 CTAs. The rows of a head's state update independently given k. The prologue applies per-head L2 norm to q and k (and the 1/√128 q scale); this is recomputed per CTA, at negligible cost. Outputs o (unnormalized). | 6.3 MB | 5 µs |
+| K4 | **out_proj** [2560×6144] NVFP4. Prologue: per-head sigmoid-gated RMSNorm of o with z (each CTA recomputes the 48 head norms; 6,144 values). Epilogue: HC inject `R += inject_attn ⊗ y` + partial stream sums of squares for K5. | 8.8 MB | 7 µs |
+| K5 | **HC_mlp mixer** (as K1). Epilogue writes x to `x_host[l]` (§8.2). | 6.6 MB | 6 µs |
+| K6 | **Router** (§8.4): router l and l+1 [1024×2560] BF16, top-10, residency, job list, mailbox, prefetch requests, route log | 5.2 MB | 5 µs |
+| K7 | **Experts** (§8.5): narrow-route hits + shared expert; fused combine + HC inject `R += inject_mlp ⊗ y_moe` + stream sums of squares for the next K1. Waits on the CPU only if this layer has CPU misses. | 30.4 MB | 21 µs |
+| | **Layer total** | **88 MB** | **≈ 67 µs** |
+
+**QSA layer (12 of 48).** K2/K3 become four kernels:
+
+- K2q: QKVG [13,312×2560], FP8 by recipe default (NVFP4 if the §16.3 ablation allows), plus
+  the index projection [640×2560] BF16, projection only;
+- K2b: QSA prep:
+  - Q/K offset-RMSNorm and partial MRoPE;
+  - K/V append (FP8 row-scaled);
+  - raw index-key append;
+  - pooled index-key completion when a 4-token block closes (§13);
+- K3a: block scores over the pooled index keys + exact top-512 radix select;
+- K3b: sparse attention over ≤ 2,051 selected tokens (GQA 24/2, D=256) + sigmoid output gate.
+
+That is ≈ 98 MB and ≈ 74 µs per layer at short context, or ≈ 82 MB and 66 µs with an NVFP4
+QKVG. A GDN layer has 7 launches and a QSA layer 9: about 366 launches per token, including
+embedding, PLE, head and sampling.
+
+**Per token:**
+
+| Item | Budget |
 |---|---|
-| Compute stream | The captured decode graph per exact batch size and window |
-| Copy stream (DMA) | Prefetch into staging frames; background promotions. Uses the copy engine, not SMs. |
-| CPU expert engine | N−2 pinned spin workers (§10) |
-| NVMe agent | One pinned thread on io_uring with SQPOLL and IOPOLL (§12) |
-| Engine worker | Unchanged. It launches graphs and commits rounds. It does **not** gather PLE rows or plan experts. |
+| 48 layers (36 × 67 µs + 12 × 74 µs) | ≈ 3.30 ms |
+| PLE (18 MB) | 0.02 ms |
+| `lm_head` 0.36 GB NVFP4 + sampling | 0.25 ms |
+| Embedding (host row) | 0.005 ms |
+| **t_gpu (T=1, all hits)** | **≈ 3.6 ms (≈ 280 tok/s ceiling)** |
 
-All communication between the GPU and the host agents uses **mapped mailboxes**: pinned host
-memory mapped into the device address space, holding sequence-numbered slots. The device publishes
-with `st.release.sys` after `__threadfence_system()`. The host polls with acquire loads. The device
-waits on host completions with a bounded `ld.acquire.sys` spin, inside the consuming kernel's
-prologue, so no separate spin kernel is needed. A host-side watchdog turns an agent failure into an
-Engine-wide failure ([engine architecture §7.4](engine-architecture.md)).
+The total is 4.7 GB per token. Its pure-bandwidth floor is 2.8 ms at the sustained read rate.
 
-### 8.2 Router, top-k and residency in one kernel
+**Rules that every decode kernel follows.** This is the "HBM never idle" baseline.
 
-One kernel per layer does all of the following:
+1. **PDL with pre-dependency weight prefetch.**
+   - Kernels launch as programmatic dependents ([op development](op-development.md#programmatic-dependent-launch)).
+   - Before `griddepcontrol.wait`, each CTA issues L2 prefetches (`cp.async.bulk.prefetch.L2`) of
+     the **static weights it will read**. The next kernel's weight stream therefore starts while
+     the previous kernel drains.
+   - The router (K6) prefetches only its own weights. K7's expert weights depend on routing, so they
+     are prefetched by K6's last block as soon as routing is known, before K7 starts.
+2. **Stall-time warming.** A kernel that waits on the host (K7 for CPU misses, the PLE kernel for
+   rows) issues L2 prefetches of the **next layer's K1-K4 weights** while it waits (≈ 46 MB,
+   bounded to half of L2). The stall is converted into progress on the next layer.
+3. **No float atomics.** Split-K and cross-CTA reductions write partials to workspace. The last CTA
+   (atomic counter) reduces them in fixed order. Results are run-to-run deterministic.
+4. **Streaming cache hints.** Weight loads use `L2::evict_first`. Activations, state and the
+   residency table use the default or `evict_last`.
+5. **Grid sizing.** Every kernel's grid is a multiple of 170 SMs × resident CTAs per SM. Device-wide
+   barriers and per-expert counters (§8.5) then never deadlock, because all CTAs are co-resident.
+   Wave quantization is avoided.
 
-1. computes router logits (BF16 `[512,2560]` GEMV);
-2. computes the softmax, top-10 and renormalization (exact lower-id tie rule);
-3. looks up each selected expert in the device residency table `res[layer][expert] → frame | STAGED | ABSENT`;
-4. classifies every selected expert as a **hit**, a **staged hit** (landed by prefetch), or a
-   **CPU miss**;
-5. writes a compact job list for the GEMV kernel;
-6. only if CPU misses exist, publishes one mailbox record: activation (BF16, T×2560), miss ids,
-   route weights, layer and epoch;
-7. computes the next layer's predicted top-k (§8.4) and publishes prefetch requests.
+The budget is a planning tool, not a promise. M6 publishes measured per-kernel times against it,
+and any kernel more than 30% over budget gets an ncu investigation before the next milestone.
 
-When a layer has no CPU miss, the host never hears about it. That removes Strata's 48 per-window
-handshakes in the common case.
+### 8.4 Router kernel (K6)
 
-### 8.3 Expert execution and combine
+**Inputs:**
 
-- **Hits and staged hits.** One grouped NVFP4 kernel runs gate/up, SwiGLU, and down for all
-  resident jobs of the layer. The intermediate stays in shared memory or registers, not in global
-  memory. Decode (T ≤ 8 per expert) uses a W4A16 GEMV path with FP32 accumulation. Wider verify
-  windows and C=8 jobs switch to block-scaled MMA (`mma.sync … kind::mxf4nvf4.block_scale`), with
-  activations kept at A16 or quantized to A4 only where the recipe Use allows `AllowA4`. The
-  shared expert is fused into the same launch as job 0.
-- **CPU misses.** These run concurrently with the GPU kernel ([§10](#10-cpu-expert-engine)). The CPU
-  writes its BF16 or FP32 outputs (T×2560 per expert) straight into mapped memory.
-- **Combine.** The combine is fused into the HC_mlp inject epilogue. It waits on the layer's CPU
-  completion sequence (when misses existed), reads CPU outputs straight from mapped memory with
-  zero-copy coalesced loads (no copy kernel), forms the route-weighted sum in a **fixed expert-rank
-  order**, adds the gated shared expert, and applies `R += inject ⊗ y`.
+- x_l [T, 2560] BF16;
+- router W_l and the next layer's router W_{l+1} (BF16, 512 × 2560 each);
+- the residency table;
+- the cost-model constants (expected CPU service time; expected landing time per `LOADING` frame,
+  published by the transfer agent).
 
-The exposed stall per layer is about max(0, t_cpu + ~6 µs − t_gpu_hits). Hits run at HBM speed:
-about 1.5 µs per resident expert at T=1.
+**Phase 1** (all CTAs, ~128): warp-per-row GEMV of the 1,024 rows. Logits go to workspace.
 
-**Miss arbiter.** When a layer's CPU-bound misses exceed what the CPU can finish within the hit
-kernel's time, the router kernel sends part of them as **on-demand DMA** into staging frames. The
-GPU then computes those experts when they land. The split balances the two finish times using the
-measured CPU and PCIe service rates, bounded by their shared DRAM bandwidth. This is FreeToken's q\*
-and Strata's `pcie_frac` idea, decided per layer from the actual miss count instead of as a global
-fraction. In the common case of 0-2 misses per layer, everything goes to the CPU.
+**Phase 2** (last CTA, selected by an atomic arrival counter):
 
-### 8.4 Lookahead prefetch
+1. **Routing.** For each column t: top-10 of the 512 logits, with the lower id winning exact ties;
+   route weights = softmax over the 10 selected logits (`norm_topk_prob`).
+2. **Union.** The distinct experts over the T columns, with per-expert column masks and n_e.
+3. **Classification** of each distinct expert from its residency entry: GPU job (`READY`), gated GPU
+   job (`LOADING` and landing predicted sooner), CPU miss, or on-demand DMA (§8.6). Experts with
+   n_e > 8 are always GPU jobs. If such an expert is not resident, it becomes an on-demand DMA with
+   a gated job.
+4. **Outputs.**
+   - The job list for K7: frame pointer, mask, weights, gate ticket.
+   - `miss_req[l]`, written with release **only if** there is a CPU miss.
+   - The route log.
+5. **Prediction.** Top-k′ of W_{l+1}·x_l per column, unioned. Non-resident, non-loading experts go
+   to `prefetch_req[l]`.
+6. **Expert weight prefetch.** L2 prefetch of the GPU jobs' frames, so K7 starts on warm lines.
 
-Every layer's MoE phase is preceded by its HC_attn mixer, its mixer (GDN or QSA), and its HC_mlp.
-That is ~60-80 µs of pure GPU time, during which host DRAM and PCIe sit idle in both studied
-engines. This design fills that window:
+Phase 2 is serial but small: about 2 µs at T=1 and about 4 µs at T=8.
 
-- **Prediction.** After layer l's router, the same kernel evaluates layer l+1's router on layer l's
-  FFN-side mixed input `x_l`. With hyper-connections the residual moves slowly, so this
-  approximates layer l+1's input. The cost is one extra 512×2560 BF16 GEMV per layer (2.6 MB, about
-  2 µs).
-- **Request.** The predicted top-k′ experts (k′=10-14, tuned by M2 traces) that are neither resident
-  nor already staged are written to the prefetch ring, ranked by predicted route weight.
-- **Transfer.** The copy stream, driven by a tiny device-side scheduler kernel that reads the ring,
-  issues one contiguous DMA per expert into free staging frames. The transfer stops at a
-  per-layer budget, so it never spills into layer l+1's MoE phase. Within that window roughly one
-  to two experts fit (≈80 µs × 50 GB/s ≈ 4 MB).
-- **Landing.** A landed expert is marked `STAGED` with an epoch. If the actual routing selects it,
-  it is a staged hit on the GPU. Otherwise it is simply overwritten later.
-- **Promotion is free.** A staged expert that turns out hot is promoted by swapping frame roles in
-  the table. No copy is needed.
+### 8.5 Expert kernel (K7)
 
-Depth-2 prediction (layer l+2) is evaluated in M2 and used only if its recall/byte justifies the
-DRAM it consumes. The prefetch budget is shared with the CPU engine's DRAM bandwidth through a
-global token bucket. Prefetch runs only while the CPU engine is idle, which is exactly the
-non-MoE part of each layer. As a result, DRAM is kept busy for nearly the whole token rather than
-only during MoE phases.
+**Narrow route (n_e ≤ 8), cluster-per-expert:**
 
-### 8.5 Batch and verify windows
+1. Each GPU job gets one thread-block cluster of S CTAs (S = 8 or 16, chosen at development time).
+   The shared expert is one more cluster.
+2. **Phase A.** CTA j computes gate/up row groups [80j/S, 80(j+1)/S) with the canonical arithmetic
+   (§16.2), and writes its slice of h (FP32) to its shared memory.
+3. **Cluster barrier.** Each CTA copies the full h (640 × n_e FP32) from its peers through
+   distributed shared memory.
+4. **Phase B.** CTA j computes down row groups [160j/S, 160(j+1)/S). y_e (FP32) goes to workspace.
 
-With T columns (C ≤ 8 lanes and/or a K+1 verify window), the router kernel produces the union of
-experts. Each distinct expert is fetched or computed **once** for all columns routed to it, on both
-the GPU and the CPU. CPU cost scales with distinct misses, not with columns, because the CPU GEMV
-is DRAM-bound up to T≈8.
+**Fallback if the toolchain's cluster limits do not fit:** per-expert ready counters in global
+memory. Down tiles spin on their expert's counter, and co-residency is guaranteed by rule 5 of §8.3.
 
-### 8.6 Kernel count and launch overhead
+**Wide route (n_e > 8):** the same grouped block-scaled tensor-core GEMM as prefill (§13). It uses
+A4 where the Use allows `AllowA4`, and BF16-dequantized A16 otherwise. Wide-route experts never go
+to the CPU, so their arithmetic needs no CPU twin.
 
-The target is **≤ 10 kernels per layer** in the decode graph, compared with ~32-40 in the studied
-engines:
+**Combine.** This is the last-arriving cluster, selected by an atomic counter:
 
-| # | Kernel |
-|---|---|
-| 1 | HC_attn: grouped offset RMSNorm, W_down, sigmoid/silu gates, W_up, collapse (one kernel, FP8 weights) |
-| 2-4 | GDN: fused qkv\|z\|a\|b NVFP4 GEMV with conv + L2-norm + gating epilogue; recurrence + gated sigmoid norm; out_proj with HC inject epilogue. QSA instead uses four kernels: fused QKVG + index projection + norm/RoPE + KV/index append; block score + top-512 select; sparse attention + gate; out_proj + inject. |
-| 5 | HC_mlp (as 1) |
-| 6 | Router + top-k + residency + prediction + mailbox publish (§8.2) |
-| 7 | Grouped hit-expert kernel + shared expert |
-| 8 | Combine + HC inject (waits on CPU completion only when misses exist) |
+1. Wait on `miss_out[l].done_seq` if the layer had CPU misses (rule 2 of §8.3 applies while
+   waiting).
+2. Read the CPU's FP32 outputs zero-copy.
+3. Form y_moe = Σ_rank w_i · y_{e_i} in fixed rank order (FP32), add sigmoid(shared_gate · x) ·
+   y_shared, and round to BF16 at the model's semantic boundary.
+4. Apply `R += inject_mlp ⊗ y_moe`.
+5. Produce the next layer's stream sums of squares.
 
-Every kernel uses programmatic dependent launch ([op development](op-development.md#programmatic-dependent-launch))
-so prologues overlap the previous kernel's tail. A persistent per-layer **megakernel** is a phase-2
-option, adopted only if nsys attribution in M6 shows launch and tail gaps above ~15% of a token.
-It is not built speculatively.
+### 8.6 Miss arbitration
 
-### 8.7 Round boundary without host synchronization
+For each layer, the router's Phase 2 assigns every non-resident narrow-route expert to the
+cheapest predicted service. The inputs are the cost-model coefficients the calibration fitted
+(§14), refreshed online by the transfer agent:
 
-The decode graph ends with these steps:
+| Service | Predicted completion | When chosen |
+|---|---|---|
+| CPU, warmed (H2) | t_handshake + n_cpu · t_warm | Expert is in the CPU's warmed set |
+| CPU, cold | t_handshake + Σ bytes / BW_cpu(n_cpu) | Default |
+| Wait for in-flight DMA | landing time published by the agent | `LOADING` and earlier than the CPU option |
+| On-demand DMA + GPU | t_req + bytes / BW_pcie, contended | Only when the CPU queue for this layer exceeds the DMA completion time (several cold misses in one layer) |
+| Split CPU + DMA (H3) | max of the two halves | Option H3 |
 
-1. sampling (existing sampling Op);
-2. the n-gram row ids of the new token, computed on the device (§12.3);
-3. the device row-cache probe;
-4. the NVMe request publication;
-5. writing the sampled token to a mapped output slot.
+The objective is the earliest time at which **all** of the layer's experts are available,
+because the combine waits for the last one. Ties go to the CPU, which needs no copy.
+Every decision and its outcome (predicted vs actual completion) is logged into per-layer
+histograms. The online model corrects its coefficients from those, and M5 reports the prediction
+error.
 
-The Engine worker reads the token without a full device synchronize, with an event query or
-host-side wait on the mapped slot, commits through the existing transaction path, and enqueues the
-next graph. The next round's embedding and PLE consume device-resident data that the previous graph
-already produced. Host gathers and ingress builds that ninfer-ext performs between rounds disappear.
+### 8.7 Lookahead prefetch
+
+Between the router of layer l and the router of layer l+1 lies one full layer of GPU work
+(≈ 65-70 µs, §8.3). During that window, host DRAM and PCIe would otherwise be idle.
+
+1. **Prediction.** K6 of layer l evaluates layer l+1's router on x_l (§8.4). Its top-k′ per column
+   is unioned, with k′ = 12 by default (M1 fixes it). The non-resident, non-loading experts are
+   published to `prefetch_req[l]` in order of predicted weight.
+2. **Transfer.** The transfer agent (§9.4) issues one contiguous DMA per predicted expert into a
+   staging frame. It stops when the next DMA could not land before layer l+1's K6, using the
+   calibrated DMA completion model. At ~50 GB/s that is about one expert per layer.
+3. **Warm list.** Predicted experts beyond the DMA budget go to the CPU engine's warm list (§10.4,
+   option H2).
+4. **Use.** If layer l+1 routes to a staged expert, it is a GPU job. A still-loading expert is
+   handled by the arbiter (§8.6). An expert staged but not used stays in its staging frame until it
+   is overwritten, or until the policy promotes it by changing the frame's role, with no copy
+   (§9.3).
+
+Prefetch is a **latency** tool. Replay shows that perfectly predicted next-layer experts change the
+miss *count* by < 0.1% (§9.3). Its value is turning critical-path misses into staged hits. Each
+layer's prediction recall and useful-byte ratio (staged bytes used ÷ staged bytes) are published.
+Prefetch is disabled automatically for a layer whose useful-byte ratio stays below 0.3, which saves
+DRAM bandwidth for the CPU engine. Depth-2 prediction is option H4.
+
+### 8.8 Batch and verify windows
+
+With T columns (C ≤ 8 lanes and/or a K+1 verify window), the router computes the union of experts
+with per-expert column masks. Each distinct expert is fetched or computed **once** for all its
+columns:
+
+- experts with n_e ≤ 8 use the narrow route (CPU-servable);
+- experts with n_e > 8 use the wide route (GPU only).
+
+CPU cost scales with distinct misses, not columns, because the CPU narrow kernel is DRAM- or
+L2-bound up to n = 8.
+
+### 8.9 Round boundary
+
+With the current engine, the round boundary is a host synchronization:
+[`ProgramImpl` decode](../../src/models/qwen3_5/program/decode.cpp) builds host ingress, launches the
+graph, calls `device.synchronize()`, then commits. This design keeps that contract in the baseline,
+but moves work off it:
+
+1. The decode graph ends with these steps:
+   - sampling;
+   - the new token's n-gram row ids (§12.3);
+   - the L0 probe;
+   - NVMe request publication;
+   - the token written to the mapped egress slot;
+   - `round_done` (§8.2).
+2. Ingress needs no host gather: embedding and PLE inputs are device- or agent-produced.
+
+The engine's per-round host time is measured in M6. If the GPU idles more than 3% of a token
+between rounds, option H6 (chained rounds) is built.
 
 ---
 
@@ -623,18 +766,22 @@ already produced. Host gathers and ingress builds that ninfer-ext performs betwe
 
 ### 9.1 Frames
 
-After dense weights and fixed state, device memory is one **frame pool** of 2.64 MiB frames (one
-expert record each, 2 MiB-aligned VMM chunks underneath). A frame's role changes at runtime through
-mappings, never through allocation:
+After dense weights and fixed state, device memory is **one allocation** (the frame pool) divided
+into frames of exactly 2,764,800 B = 675 × 4 KiB, one expert record each. Frame i is at
+`base + i × 2,764,800`. Roles change at runtime through the Program's frame table, never through
+allocation:
 
 | Role | Contents |
 |---|---|
 | `expert` | A cached expert. Always **clean**: the host bank holds an identical copy. |
-| `staging` | A prefetch or promotion target (§8.4) |
-| `kv` | Paged KV pages (several pages per frame) |
-| `loan` | A frame inside a KV or prefill reservation that currently holds a clean expert |
+| `staging` | A prefetch or on-demand DMA target (§8.7). It becomes `expert` by a role change. |
+| `kv` | KV pages. The paged KV store is backed by frames, and a KV page size that divides 2,764,800 B is chosen per KV format: 4 KiB multiples whose count divides 675 = 3³ × 5². |
+| `loan` | A frame inside a KV or prefill reservation that currently holds a clean expert (§9.2) |
 | `prefill` | Prefill staging and workspace (§13) |
 | `vision` | Vision tower weights and activations while a vision request runs |
+
+The frame count is a startup decision (§15.1). Frames are 4 KiB-aligned slices of one 2 MiB-page
+allocation, so a frame spans 2-3 GPU pages. The TLB reach of 2 MiB pages covers the whole pool.
 
 ### 9.2 Lending reserved memory, the key to sharing VRAM with KV
 
@@ -649,9 +796,10 @@ an expert **on loan**:
 - **Reclaim is instantaneous and cannot fail.** Clear the residency entry and switch the frame's
   role. There is no write-back and no allocation, so the reservation guarantee is preserved
   exactly.
-- **Reclaim happens at worker boundaries.** When a lane's KV frontier will cross into a loaned frame
-  during the next unit, the Program reclaims it before launch. Graphs address KV and experts
-  through page and frame tables, so the graphs stay valid.
+- **Reclaim is requested ahead of need.** The Program asks the transfer agent to reclaim a loaned
+  frame two rounds (2 × max T tokens) before a lane's KV frontier can reach it. The evicted
+  expert's retire epoch (§9.5) has then passed before the first KV write. Graphs address KV and
+  experts through page and frame tables, so the graphs stay valid.
 - **The same mechanism covers the rest:** prefill arenas (§13), vision weights, and MTP draft
   buffers borrow frames and return them, the borrowed experts being re-admitted lazily by the
   policy instead of re-copied eagerly. Strata re-copies them eagerly after every prompt, which
@@ -660,18 +808,7 @@ an expert **on loan**:
 Result: memory that a 256K-capable configuration reserves for KV (4.1 GB, about 1,550 frames) keeps
 serving experts until the context actually grows into it.
 
-### 9.3 Epochs: never block on the cache
-
-- Each decode round has an epoch number. A kernel reads the residency table at its epoch.
-- An eviction unmaps an entry immediately for future epochs. The frame becomes reusable only after
-  the last epoch that could read it retires (an event-ordered retire queue).
-- A promotion copies into a free or retired frame on the copy stream. The entry is published with a
-  device-side flag write ordered after the copy.
-- **No round ever waits for a promotion.** Until the copy lands, a request for that expert is served
-  as a CPU miss. Strata's #463 wait exists to make outputs deterministic; here determinism comes
-  from placement-invariant arithmetic instead (§16.2).
-
-### 9.4 Replacement and admission policy
+### 9.3 Replacement and admission policy
 
 #### Evidence: is LRU the best policy? No.
 
@@ -723,7 +860,7 @@ the one rigorous published comparison: Zhang (arXiv 2608.07911) found LFRU the b
 Further results:
 
 - **Next-layer prediction does not reduce misses.** Protecting perfectly predicted next-layer
-  experts changes misses by < 0.1%. Its value is hiding latency, which is how §8.4 uses it.
+  experts changes misses by < 0.1%. Its value is hiding latency, which is how §8.7 uses it.
 - **Longer horizons do help when combined with LFRU.** Perfect protection of experts used within
   the next 1 token gives a further −2.5 points; within the next 5 tokens, −8 to −10 points.
 - **Admission filtering alone is worth ≈ 0 at batch 1.** Belady with bypass equals Belady with
@@ -744,15 +881,16 @@ Further results:
 
 1. **Victim ranking: LFRU**, one global pool over the Text and MTP experts.
    - The score is `f / (now − last + 1)`, with time in decode rounds.
-   - `f` is a global per-expert count kept for all 25,088 ids, including evicted ones (100 KB on the
-     device).
+   - `f` is a global per-expert count kept for all 25,088 ids, including evicted ones (100 KB, kept by the
+     transfer agent on the host).
    - For long sessions, `f` is halved every 4,096 rounds to bound staleness. This value is untested
      and is fixed in M1.
    - No per-layer quotas, because hard partitioning lost 3-34%.
    - Experts of the current and predicted groups are protected.
 2. **Admission: promote on miss, within a promotion budget.**
-   - Every CPU-served miss is a promotion candidate. It is copied on the copy engine (§9.3) only if
-     its LFRU score beats the current victim's and the round's DRAM/PCIe token bucket has room.
+   - Every CPU-served miss is a promotion candidate. The transfer agent (§9.4) copies it into a frame
+     only if its LFRU score beats the current victim's and the round's DRAM/PCIe token bucket has
+     room. The device only reads residency entries.
    - At this design's capacity that is ~12.5 promotions per token (~7 GB/s at 200 tok/s), so the
      bucket rarely binds.
    - When it does bind (miss storms after a topic switch, or a long context that has shrunk the
@@ -761,14 +899,13 @@ Further results:
      128 rounds, margin 0.5, ≤ 32 per round) matched the best on-demand policy at 41.5% with half
      the promotions.
 3. **Free promotion of staged experts.** Prefetched or on-demand-DMA'd experts already occupy a
-   frame. Promoting them is a role change with no copy (§8.4).
+   frame. Promoting them is a role change with no copy (§8.7).
 4. **Seed and persistence.**
    - The cache starts from the saved LFRU state of the previous run (counts and ranking).
    - Failing that, it starts from a shipped profile built from broad traces.
    - A static profile alone loses badly when the workload differs: +82% misses on B.
 5. **Policy telemetry and selection on the host, off the critical path.**
-   - At the end of each round the router kernel writes the round's expert ids (48 × 10 × T ×
-     2 bytes) to a mapped ring.
+   - The route log (§8.2) carries every routed id (48 × 10 × T × 2 bytes per round) to the host.
    - A low-priority host thread replays them through shadow copies of LRU, LFRU with 2-3 half-life
      settings, and a windowed Belady over the last ~1K tokens.
    - The results are published as metrics: the live policy's gap to LRU and to Belady.
@@ -788,7 +925,93 @@ Further results:
    - A predictor ships only as **protection** layered over LFRU, never as a replacement ranking.
      That keeps the learning-augmented robustness: with a bad predictor it degrades to LFRU.
 
-### 9.5 Long context: QSA KV host tier
+### 9.4 Residency state machine and the policy engine
+
+**The device only looks up residency; all policy runs on the host, in the transfer agent.** The
+agent receives every routed id through `route_log` (§8.2) one round after the GPU used it. It keeps:
+
+- the LFRU state;
+- the frame table;
+- the shadow replays (§9.3).
+
+It issues every copy. This keeps the decode kernels free of policy bookkeeping. FreeToken's two-hit
+policy, for example, won in replay and lost 4.8% live.
+
+**Residency entry** (`residency[layer × 512 + expert]`, u32, device memory):
+
+| Bits | Field |
+|---|---|
+| 31-30 | state: `ABSENT` = 0, `LOADING` = 1, `READY` = 2 |
+| 29-24 | 6-bit generation, incremented on every state change, so a stale ticket cannot be mistaken |
+| 23-0 | frame index (≤ 16M) |
+
+`READY` covers both cached and staged experts. The difference (whether the frame counts toward the
+policy's resident set or is a staging frame) is policy state, kept only on the host. The device
+treats both as "use this frame".
+
+**Transitions.** All transitions are issued by the transfer agent, in this order on its copy stream:
+
+```text
+ABSENT  → LOADING(f)  : agent picks frame f (free list), WriteValue(entry, LOADING|gen|f),
+                        memcpyAsync(frame f ← host record), WriteValue(land_seq[f], ticket),
+                        WriteValue(entry, READY|gen+1|f)
+READY(f) → ABSENT     : WriteValue(entry, ABSENT|gen+1) + event; frame f is reused only under the
+                        rule of §9.5
+LOADING(f) → (cancel) : not allowed; a started load always completes, then may be evicted
+```
+
+**Device use of an entry** (in the router kernel, once per selected expert per round):
+
+- `READY(f)`: a GPU job on frame f.
+- `LOADING(f)`: the router consults the agent's published expected-landing time. If that is earlier
+  than the CPU's expected finish for this layer's misses (both from the cost model, §8.6), the
+  expert becomes a GPU job **gated on `land_seq[f]`**. Otherwise it is a CPU miss; the load still
+  completes and the expert is used next time.
+- `ABSENT`: CPU miss, unless the miss arbiter (§8.6) requests an on-demand DMA.
+
+**Agent loop** (one pinned thread, never blocking on the GPU):
+
+1. **Prefetch requests** for layer l+1 (`prefetch_req[l]`, seq advanced). Take a free staging
+   frame, or evict the lowest-score staging expert, and issue the ABSENT → LOADING → READY sequence.
+   Stop when the per-layer DMA budget (bytes the copy engine can land before layer l+1's router,
+   from calibration) is used.
+2. **On-demand misses** requested by the arbiter: same sequence, top priority.
+3. **Route log** for completed rounds: update LFRU counts and recency, and run the shadow replays.
+4. **Promotions.** For each CPU-served expert of the last round whose LFRU score beats the current
+   victim's, within the token bucket (§9.3), set the victim ABSENT, then load the newcomer into a
+   free or retired frame.
+5. **Retirement.** Frames whose retire epoch ≤ `round_done` return to the free list.
+6. **Loans.** Process KV-reclaim requests from the Program (§9.2): evict experts from the frames
+   being reclaimed, and hand the frames over once their retire epoch passes.
+
+Commands are batched with `cudaMemcpyBatchAsync` when more than one copy is pending. The agent's CPU
+cost is budgeted: < 15% of one core at 300 tok/s. M5 measures it.
+
+### 9.5 Epochs and safe frame reuse
+
+The copy stream (where residency writes execute) and the compute stream (where rounds read them)
+are not ordered with each other. Frame reuse is therefore keyed to **observed** device progress, not
+to enqueue order:
+
+1. Two counters are maintained. The first kernel of every round writes `round_started = r`, and the
+   last writes `round_done = r`. Both are mapped host memory (§8.2).
+2. To evict, the agent enqueues `WriteValue(entry, ABSENT|gen)` followed by an event. It polls the
+   event without blocking.
+3. When the event has completed, every round that starts from then on reads `ABSENT`. The agent then
+   samples `r_s = round_started`.
+4. Any round that may still use the old frame has an index ≤ r_s + D, where D is the maximum number
+   of rounds in flight: 1 today, 2 with option H6. D covers a round whose `round_started` write was
+   still crossing PCIe when it was sampled. The frame returns to the free list when
+   `round_done ≥ r_s + D`.
+
+When the engine worker has synchronized the compute stream (no round in flight, for example
+between requests or before a prefill), every pending frame is reusable at once. The same rule
+covers KV-loan reclaim (§9.2) and staging-frame reuse.
+
+No kernel ever waits for a promotion. A round that needs an expert still loading serves it from the
+CPU, or waits on the landing ticket only when the arbiter predicts that is faster (§8.6).
+
+### 9.6 Long context: QSA KV host tier
 
 QSA attends to at most 2,051 selected tokens per query. All other KV is only scanned through its
 128-dimensional pooled index key (one per 4 tokens). Strata exploits this: above 64K it keeps
@@ -811,124 +1034,146 @@ This design adopts the same idea in NInfer's paged-KV terms:
   is the difference between ~8,900 and ~10,200 frames: roughly 20 vs 12.5 misses per token with
   LFRU.
 
-
 ---
 
 ## 10. CPU expert engine
 
-### 10.1 Why compute on the CPU at all
+### 10.1 Role
 
-A miss served over PCIe costs 2.765 MB of DRAM read **plus** 2.765 MB of PCIe transfer **plus** an
-SM or copy-engine slot, and the GPU cannot start that expert until the whole record arrives. A miss
-served on the CPU costs 2.765 MB of DRAM read, while the GPU works on the hits in parallel, and only
-T×2560 values cross PCIe. For critical-path misses the CPU is strictly better. PCIe is reserved for
-*predicted* misses (prefetch) and promotions, which are off the critical path.
+At this design's capacity, a layer has 0 CPU-served misses ~80% of the time and 1 miss most of the
+rest (§4.2). The CPU engine is therefore optimized for the **latency of one or two experts**, not
+for throughput:
+
+- 2.765 MB per expert;
+- critical path = handshake + compute + result visibility.
+
+A cold miss is DRAM-bound at ~40-45 µs on dual-channel DDR5. A warmed miss (§10.4) is compute-bound
+at ~12-18 µs (to be measured in M3/M5). PCIe DMA is used for prefetch, promotions and the arbiter's
+overflow case (§8.6).
 
 ### 10.2 Kernels
 
-The primary route is **A16**, and it is placement-invariant (§16.2):
+The **narrow route (A16)** implements the canonical arithmetic of §16.2 on the `nvfp4_rg16_kmajor`
+layout. One vector holds 16 rows (AVX-512) or 8 rows (AVX2). A tile loop runs over k with one
+broadcast and n FMAs per column.
 
-1. Decode each 16-value block: E2M1 nibbles → FP32 through a 16-entry LUT (`vpermps`/`vpshufb`), then
-   multiply by the E4M3 block scale (LUT).
-2. Accumulate FP32 FMAs against the BF16 activation widened to FP32, using a **canonical reduction
-   order**. The GPU kernel uses the same order (§16.2).
+| ISA | Decode | Expected per-core rate (to be measured) |
+|---|---|---|
+| AVX-512F/BW (Zen 4/5, Xeon) | 8 B load → `vpmovzxbd`+shift → `vpermps` 16-entry table | ~40-50 G weights/s/core from L2 |
+| AVX2+FMA (Arrow Lake, Zen 3) | 4 B per half → 3-bit magnitude `vpermps` + sign XOR | ~20-25 G weights/s/core |
 
-| ISA | Implementation |
-|---|---|
-| AVX-512F + BW | 16-wide FMAs, `vpermb` decode |
-| AVX2 + FMA (Arrow Lake, Zen 3) | 8-wide FMAs, `vpshufb` decode |
+The **A8 route** (opt-in only) quantizes the activation to int8 per 16-block, maps E2M1×2 to int8
+and uses `vpdpbusd` (AVX-512 VNNI / AVX-VNNI). It is not placement-invariant (§16.2), so it is
+offered only under an explicit `AllowA8` Use and a user flag.
 
-There is also an optional **A8** route, used only when a recipe Use allows `AllowA8` for routed
-experts. It quantizes the activation to int8 per 16-block, maps E2M1×2 to int8 {0, ±1, ±2, ±3, ±4,
-±6, ±8, ±12}, and computes integer dot products with `vpdpbusd` (AVX-512 VNNI / AVX-VNNI). The
-scales are applied per block. It is about 2× less compute than A16, but it is not placement-invariant
-against the GPU A16 path, so it is opt-in.
-
-Compute is not the limit. A 16-core Zen 5 sustains far more FP32 FMAs than 80 GB/s of NVFP4 needs,
-and the A16 route should be DRAM-bound on AVX-512. M3 verifies that on AVX2 hosts. If the A16 route
-turns out compute-bound there, the cost model in §11.2 learns that from measured service rates.
+Compilation rules: `-ffp-contract=off -fno-fast-math`, and explicit FMA intrinsics only.
 
 ### 10.3 Execution
 
-- **Workers.** One pinned spin worker per physical core minus two: one core for the NVMe agent and
-  one for the Engine worker. SMT siblings stay idle, and hybrid E-cores are measured separately.
-- **Partitioning.** A layer's misses are split across workers in two phases, with an atomic counter
-  barrier between them:
-  1. gate/up row bands of all missed experts → SwiGLU on the owning worker;
-  2. down row bands.
+- **Static row-band ownership.** Worker w owns the same row band of **every** expert: gate/up row
+  groups [80w/N_w, 80(w+1)/N_w) and down row groups [160w/N_w, 160(w+1)/N_w). The data a worker
+  warms (§10.4) is therefore the data it later computes. A layer's misses are processed expert by
+  expert, in rank order:
+  1. phase A (gate/up bands → SwiGLU on the owning worker);
+  2. a spin barrier (one cache line per worker, sense-reversing);
+  3. h exchange through shared memory;
+  4. phase B (down bands).
+- **Handshake.** Workers spin on `miss_req[l].seq` with `_mm_pause` (Intel) / `pause` (AMD). They
+  read x from `x_host[l]`, which is already written by K5 (§8.2). Each writes its output rows to
+  `miss_out[l]`. The last worker to finish (atomic counter) writes `done_seq` with a release store.
+- **Memory.**
+  - Expert banks sit on 1 GiB hugetlbfs pages when available, else on 2 MiB pages (THP with
+    `MADV_POPULATE_WRITE`, then `cudaHostRegister`).
+  - The arena is interleaved across both CCDs' memory paths by construction: one NUMA node on
+    desktop parts.
+  - Software prefetch runs two units ahead.
+- **Topology.**
+  - Workers are pinned one per physical core; SMT siblings stay idle.
+  - On hybrid CPUs, E-cores are used only if calibration (§14) shows they raise the 1-2-expert
+    service rate. A slow core lengthens every barrier.
+  - On dual-CCD Ryzen, workers are split evenly across CCDs, because each CCD has its own memory
+    fabric bandwidth limit.
+- **Idle.** Workers park on a futex when no request is active.
 
-  The partition is static per (miss count, T) and balanced by bytes.
-- **Activation input.** The worker reads the activation from the mailbox record (T×2560 BF16).
-- **Output.** Results go back into the layer's mapped output slab, followed by the completion
-  sequence number.
-- **Memory.** Expert banks sit on 2 MiB pages, prefaulted and locked (the transparent huge page
-  madvise used by ninfer-ext was worth +11-32%). Explicit hugetlbfs is used when configured. Reads
-  use non-temporal software prefetch two bands ahead.
-- **Idle behavior.** Workers spin while a decode is active and park on a futex between requests, so
-  an idle server does not burn CPU.
-- **Calibration.** `ninfer-calibrate` measures the NVFP4 GEMV service rate per kernel variant,
-  worker set and token count. It also measures DRAM bandwidth alone and under concurrent DMA, and
-  PCIe bandwidth. A ≤ 3 s startup probe re-validates these numbers every start (§14). They feed the
-  cost model and the reports.
+### 10.4 Predicted-miss warming (high-reward option H2)
+
+When the router of layer l publishes its prediction for layer l+1 (§8.4), the transfer agent
+splits the predicted non-resident experts in two:
+
+- those its DMA budget can land before layer l+1's router, which are prefetched to VRAM;
+- the rest, which become a **warm list** for the CPU engine.
+
+While the CPU engine is otherwise idle, each worker loads its own row bands of the warm-list experts
+into its private L2:
+
+- 2.765 MB / N_w ≈ 200 KB per worker per expert at N_w = 14;
+- capped at half of the L2 (Zen 4/5 1 MiB, Lion Cove 3 MiB per P-core).
+
+If layer l+1 then misses on a warmed expert, the computation streams from L2 instead of DRAM.
+
+Warming uses DRAM bandwidth only in the GPU-only phase of each layer, when DRAM is otherwise idle.
+Calibration measures warmed versus cold service time, and M5 decides adoption (§17).
 
 ---
 
 ## 11. Speculative decoding
 
-### 11.1 A drafter that never waits on the host
+### 11.1 Expected acceptance
 
-The MTP drafter runs entirely on the GPU, using **residency-bounded routing**:
+On this model, SGLang's all-resident MTP (3 steps, 4 draft tokens, greedy) accepts **2.9-3.3
+tokens per round** on GSM8K, random and ShareGPT prompts. Strata reports 2.4-3.2 tokens per pass.
+The projection (§4.2) uses 2.8.
 
-- The MTP MoE takes the top-10 over the experts that are resident (or staged) and renormalizes over
-  that set.
-- Non-resident MTP experts are simply not used during drafting. Draft quality affects only
-  acceptance; the verify step keeps the output distribution exact.
-- MTP experts carry the acceptance-weighted cache priority from §9.4, so the drafter's routing stays
-  close to the true routing.
+### 11.2 A drafter that never waits on the host
 
-The draft also reuses the existing optimized proposal head (reduced vocabulary) rather than a full
-`lm_head` read per draft step (ninfer-ext's cost).
+The MTP drafter (one QSA block, its MoE, and the optimized proposal head) runs entirely on the GPU
+with **residency-bounded routing**:
 
-PLE rows for draft tokens are requested from NVMe when each draft token is produced. They are
-therefore usually already in the device row cache when the verify forward needs them (§12.3).
+- **Draft routing.** Router logits are computed over all 512 MTP experts. The top-10 are taken
+  among experts whose entry is `READY`. The weights are the softmax over those 10 logits. This is a
+  draft-only approximation: it changes acceptance, never the verified output.
+- **MTP experts.** They share the frame pool and LFRU (§9.3). Their recency updates are weighted
+  by measured acceptance, so the drafter's routing tracks the true routing.
+- **Draft head.** The existing optimized proposal head (reduced vocabulary) is used, not a full
+  `lm_head` read per draft step.
+- **Budget.** ≈ 85 µs per draft step: ~45 MB of dense and proposal-head weights, plus resident
+  experts.
+- **PLE rows** for each draft token are requested from the NVMe agent as soon as the draft token
+  exists, so they normally sit in L0 before the verify forward needs them (§12.3).
 
-### 11.2 Miss-aware draft length
+### 11.3 Draft length
 
-Every round, the policy picks K by maximizing expected tokens per second:
+Every round, the policy picks the draft length K (and, under option H9, a tree shape) that
+maximizes expected tokens per second:
 
 ```text
 E[tokens(K)] / E[t_round(K)],
     t_round(K) = t_gpu(K+1) + t_miss(U_{K+1}, h_now) + t_draft(K)
 ```
 
-- **U_T and h_now** are tracked online from the router kernel's counters: an EWMA of distinct
-  experts per layer as a function of T, and the true VRAM, staged and CPU composition.
+- **t_gpu(T)** and **t_draft** come from the calibration's Stage 2 fit (§14.2).
+- **U_T** (distinct experts per layer for T columns) and **h_now** come from the router kernel's
+  counters, as EWMAs.
 - **E[tokens(K)]** comes from the existing per-position acceptance estimates.
-- **t_cpu** comes from the measured CPU service rate (§10.3).
+- **t_miss** charges each draft position its expected **rejected-path** misses, measured online.
+  The replay shows that accepted tokens add no misses per token (§4.2).
 
-This generalizes NInfer's adaptive MTP and Strata's `DraftPolicy` by **including the miss cost of
-the window**. The replay shows the window does not raise misses per *accepted* token (§4.2): the
-added cost comes from rejected drafts, whose experts are routed and computed but never used. The
-model therefore charges each draft position its expected rejected-path misses. Those are measured
-online as the misses of rejected columns. When the cache is cold or the topic shifts, K falls
-toward 0-1. When the cache is warm, K rises to 3-5.
-
-Experts used only by rejected draft columns are not credited as uses in the LFRU counts, so a
+Experts used only by rejected draft columns are not credited as uses in the LFRU state, so a
 rejected path cannot pollute the cache.
 
-N-gram copy proposals ([ngram](../ngram.md)) and DFlash-style tree verification stay available, and
-the same cost model decides them. A tree's extra columns cost misses too.
+N-gram copy proposals ([ngram](../ngram.md)) and tree verification stay available, and the same
+cost model decides them.
 
-### 11.3 Overlap
+### 11.4 Overlap
 
-- Drafting for round r+1 starts on the compute stream right after verify r's sampling, in the same
-  graph when K is fixed for the topology.
-- The commit fold of the recurrent states follows the existing asynchronous commit path.
-- No stream synchronization happens per draft step. Strata synchronizes once per draft step.
+- Drafting for round r+1 runs on the compute stream right after verify r's sampling, in the same
+  graph when K is fixed for that topology.
+- No stream synchronization happens per draft step; Strata synchronizes once per draft step.
+- The commit fold of the recurrent states uses the existing asynchronous commit path.
 - **Verify-union prefetch** (SP-MoE's idea, adapted). While the drafter runs, layer 0's router is
-  evaluated on the draft tokens' embeddings. Its predicted non-resident experts are DMA'd before the
-  verify forward starts. From layer 1 on, the per-layer lookahead (§8.4) already predicts for all T
-  columns.
+  evaluated on the draft tokens' embeddings. Its predicted non-resident experts go to the
+  prefetch ring before the verify forward starts. From layer 1 on, the per-layer lookahead
+  (§8.7) predicts for all T columns.
 
 ---
 
@@ -938,103 +1183,119 @@ the same cost model decides them. A tree's extra columns cost misses too.
 
 - 16 rows of 160 FP8 values each per token: 2.5 KiB of payload.
 - Rows depend on `t[p-2], t[p-1], t[p]`. EOS restarts the window, as defined in the model reference.
-- The rows are consumed **once**, before block 1's attention mixer. In decode they are not needed
-  until layer 0 has finished, about 80-150 µs after sampling.
+- The rows are consumed **once**, by the PLE kernel that runs before layer 1's K1. In decode, the
+  hiding window is layer 0: ≈ 65-70 µs on the §8.3 budget, longer when layer 0 has a CPU miss. In
+  the replay traces, layer 0 is among the most-missed layers.
 - The table must stay off the page cache. RAM is fully budgeted (§15.2).
 
 ### 12.2 NVMe layout
 
-- Rows are 160 B, 25 rows per 4 KiB block, and never straddle a block. That is a 2.4% padding cost,
-  stored on disk as ~52.4 GB.
+- Rows are 160 B, 25 rows per 4 KiB block, and never straddle a block. That is a 2.4% padding cost:
+  12,800,062 blocks, 52.4 GB on disk.
 - The single BF16 scale is held in the Model.
 - **One row is one 4 KiB `O_DIRECT` read.** Rows of one head are contiguous in the head's prime
   range, so prefill reads that touch nearby rows coalesce into one block.
-- The file can live on a different NVMe drive from the expert banks, which are only read at load.
+- The file is its own volume (`*.ninfer.ngram`). It may live on a different NVMe drive from the
+  expert banks, which are only read at load.
 
 ### 12.3 Three-level row cache with device-driven requests
 
 | Level | Size (default) | Mechanism |
 |---|---|---|
-| L0: device | 64 MiB ≈ 400K rows | Open-addressing hash on the row id with CLOCK replacement. Probed by the decode graph itself. |
-| L1: host | 2 GiB ≈ 13M rows | Pinned. The NVMe agent probes it before issuing I/O. The default size is set by the RAM plan. |
-| L2: NVMe | — | io_uring with registered fixed buffers, `O_DIRECT`, SQPOLL on the agent's core, IOPOLL when the device supports polled queues. Queue depth up to 256. |
+| L0: device | 64 MiB ≈ 400K rows | Open-addressing hash on the row id, 4-way buckets with CLOCK replacement. Probed and filled only by decode/prefill kernels. |
+| L1: host | 2 GiB ≈ 13M rows | Pinned, owned by the NVMe agent, CLOCK replacement. Probed before any I/O. |
+| L2: NVMe | — | io_uring with registered files and fixed buffers, `O_DIRECT`, SQPOLL on the agent's core, and IOPOLL when the driver has polled queues (`nvme.poll_queues > 0`). Queue depth up to 256. |
 
-Decode sequence:
+**Decode sequence for token t+1:**
 
-1. The sampling kernel's epilogue computes the 16 row ids for the new token on the device. The
-   `ngram_row_ids` Op is exact integer arithmetic: XOR of signed 64-bit products and a prime
-   modulus.
-2. The kernel probes L0 and writes hits' row indices.
-3. For L0 misses it publishes `(row id, destination)` records to the NVMe mailbox ring.
-4. The NVMe agent spins on the ring. It serves L1 hits by `memcpy` into the mapped landing buffer.
-   For L1 misses it submits reads that land directly in registered pinned buffers mapped to the
-   device. Completion sets a per-request sequence number.
-5. Layer 0 runs: HC, GDN, MoE, typically 80-150 µs. A polled 4 KiB random read on a modern
-   Gen4/Gen5 NVMe takes about 40-90 µs.
-6. The PLE kernel before block 1 waits, with a bounded acquire spin, for the token's 16 rows. It
-   dequantizes FP8 on the device, applies the PLE mathematics, and inserts the rows into L0. There is
-   no host decode of rows. Both studied engines dequantize on the CPU.
+1. The sampling kernel's epilogue computes the 16 row ids (`ngram_row_ids`: exact integer
+   arithmetic, XOR of signed 64-bit products, prime modulus).
+2. It probes L0. Hits record the L0 slot. For misses, it writes `{row id, landing slot}` records to
+   the NVMe request ring (mapped) and advances the ring's sequence word.
+3. The NVMe agent spins on the ring:
+   - L1 hits are copied into the mapped landing slot;
+   - L1 misses are submitted as reads into registered pinned buffers mapped to the device;
+   - each completion writes the landing slot's sequence word (release).
+4. Layer 0 runs (K1-K7).
+5. The PLE kernel (one launch, before layer 1's K1):
+   - waits, under the §8.2 polling rules, for its missing rows' sequence words;
+   - gathers the 16 rows (L0 or landing slot), dequantizes FP8 with the scalar scale, and computes
+     key/value projections, gate, grouped norms, dilated conv (state update) and the injection
+     into R;
+   - inserts landed rows into L0.
 
-Additional rules:
+**Speculative windows.** Draft tokens' rows are requested when the draft token is produced (§11.2).
+Only the bonus token's rows are requested at the round start.
 
-- **Speculative windows.** Draft tokens' rows are requested at draft time (§11.1). Only the bonus
-  token's rows arrive at round start, and those are hidden by layer 0.
-- **Prefill.** For chunk i+1, the row ids are computed on the GPU, deduplicated, and probed in L0/L1.
-  The misses are sorted by block and read with QD256 while chunk i computes. A 32K prompt needs at
-  most 512K distinct rows. At ~600K-1M IOPS that is ≤ 1 s of I/O, hidden behind ~4-5 s of compute.
-- **Power-state stalls.** The NVMe agent issues a periodic tiny read while a request is active.
-  Strata measured 50-150 ms autonomous power-state exit stalls on some drives.
+**Prefill.** For chunk i+1, the row ids are computed on the GPU, deduplicated, and probed in L0/L1.
+The misses are sorted by block and read at QD 256 while chunk i computes. Rows then reach the device
+in one DMA per chunk. A 32K prompt needs at most 512K distinct rows; at the drive's measured IOPS
+that is ~0.5-1 s, hidden behind ~4-5 s of compute.
 
-Expected exposure: zero for L0/L1 hits, and for most L2 misses at T=1. When the drive is slower than
-layer 0, the residual wait is visible in the per-round telemetry, broken out per layer. It is not
-hidden in an average.
+**Power-state stalls.** The NVMe agent issues a periodic tiny read while a request is active.
+Strata measured 50-150 ms autonomous power-state exit stalls on some drives.
+
+### 12.4 Exposure and its acceptance
+
+- An L0 or L1 hit never waits.
+- An L2 read exposes `max(0, t_nvme − t_layer0)`. With the GPU at the §8.3 budget, a drive whose
+  polled QD1 read latency exceeds ~60 µs exposes part of every L2 miss in plain decode.
+- Speculative rounds hide draft tokens' reads entirely.
+
+M6 publishes per-token PLE wait time and L0/L1/L2 hit rates for each corpus. If the mean PLE wait
+exceeds 1% of the token, calibration (§14) raises the L1 size within the RAM plan. If it is still
+above 1%, the documented drive requirement is tightened (a fast-latency NVMe for the table).
 
 ---
 
 ## 13. Prefill
 
-- **Chunks.** 8K by default. 16K-32K for a solo long prompt, with the arena borrowed from frames
-  (§9.2).
-- **Experts.** Layer-streamed. For each layer:
-  1. the router determines the set of experts used by the chunk;
-  2. resident experts are used in place, with no device-to-device copy (they are addressed through
-     the frame table);
-  3. non-resident experts are DMA'd as **one contiguous copy per expert record** into a
-     double-buffered staging region, with layer l+1's copies overlapping layer l's compute.
+- **Chunks.** A prompt of n tokens is read as ⌈n / max⌉ **equal** chunks. `max` is the largest
+  chunk, searched in 1K steps, whose arena can be lent from frames (§9.2) while keeping a floor of
+  resident experts; it is 16K-32K for a solo long prompt. A short tail (< 1K) that moves only its
+  own routed experts stays separate. architectds/Strata measured +21-59% at 9K-100K from these two
+  rules.
+- **Expert supply.** There are two regimes, with the threshold from calibration (Strata uses 1,024
+  tokens; the fork 3,072 with CPU assist):
+  - **Streamed walk** (chunk ≥ threshold). Almost every expert is used. While layer l computes,
+    the transfer agent DMAs **all non-resident experts of layer l+1** into a double-buffered
+    staging region of frames: one contiguous `cudaMemcpyBatchAsync` per layer, one record per
+    copy. Resident experts are used in place through the frame table, with no device-to-device copy.
+  - **Routed staging** (chunk < threshold). Layer l's router publishes the used set to the agent,
+    which DMAs only those experts. The thinnest non-resident experts are computed by the **CPU
+    engine** at the same time (below).
+- **Expert compute.** Assignments are grouped by expert.
+  - n_e ≤ 8: narrow route, shared with the CPU, placement-invariant.
+  - n_e > 8: wide route, a block-scaled tensor-core grouped GEMM. It uses **A4**
+    (`mma … kind::mxf4nvf4.block_scale`, with the per-layer input divisor) when the artifact's Use
+    allows `AllowA4`. The official recipe enables that for routed experts, from NVIDIA's calibrated
+    `input_scale`, subject to the §16.3 KL check. Otherwise it uses A16 (BF16-dequantized weights),
+    which is ~4-5× slower in compute.
+- **CPU assist for thin experts** (routed staging only). An expert routed to a few tokens costs a
+  full 2.77 MB copy, but only a DRAM-bound CPU GEMV. Non-resident experts are sorted by n_e, and
+  the thinnest (n_e ≤ 8) go to the CPU engine. The cut is chosen so the CPU and copy-engine halves
+  finish together, from per-layer EMAs of measured service rates.
+  - architectds/Strata measured 1.35-1.49× for 200-1,000-token prompts, but on PCIe 3.0 with DDR4.
+    At Gen5 x16 the copy half is ~3× cheaper, so the gain is expected to be smaller. M8 measures
+    it.
+  - ninfer-ext prefills 512 tokens at 431 tok/s, which is where this matters most.
+- **Bound.** At large chunks, PCIe bounds the streamed walk:
 
-  Assignments are grouped by expert and run through a block-scaled NVFP4 tensor-core grouped GEMM:
-  - **A4** activations where the Use allows it, with the per-layer divisor;
-  - otherwise **A16**, by dequantizing the weights to BF16 in shared memory.
-- **CPU help for thin experts.** An expert routed to only a few tokens costs a full 2.77 MB copy
-  over PCIe, but only a DRAM-bound CPU GEMV. Per layer, the non-resident experts are sorted by
-  assigned tokens, and the thinnest are given to the CPU engine while the copy engine streams the
-  rest. The split is balanced online: per-layer EMAs of measured CPU µs per expert and token versus
-  copy-engine µs per expert pick the cut, so both halves finish together.
-  - architectds/Strata measured 1.35-1.49× for 200-1,000-token prompts with this idea, but on
-    PCIe 3.0 and DDR4. At Gen5 x16 the copy half is ~3× cheaper, so the gain is expected to be
-    smaller and to vanish earlier than its 3K-token cutoff. M8 measures it.
-  - The CPU half uses the placement-invariant A16 kernels (§16.2), so it adds no numerical drift.
-    The fork's CPU route differs by 1.3-1.9% relative L2.
-  - ninfer-ext prefills 512 tokens at only 431 tok/s, which is where this matters most.
-- **Chunk planning.** A prompt of n tokens is read as ⌈n / max⌉ **equal** chunks, so a 16.4K prompt
-  is not split into one full chunk plus a tiny tail; each chunk ≥ 1K streams almost every
-  non-resident expert, so cost scales with the chunk count. The exception: a short tail (< 1K) that
-  moves only its own routed experts stays separate. `max` is the largest chunk whose arena can be
-  lent from frames while keeping a floor of resident experts. It is found in 1K steps, not from a
-  fixed ladder; architectds/Strata measured +21-59% at 9K-100K from these two rules.
-- **Bound.**
+  | Chunk | Streamed bytes (60% non-resident) | PCIe time at ~52 GB/s | Rate cap |
+  |---|---:|---:|---:|
+  | 16K | 40.8 GB | 0.78 s | ~21K tok/s |
+  | 8K | 40.8 GB | 0.78 s | ~10.5K tok/s |
 
-  | Chunk | Per-chunk time | Effective rate |
-  |---|---|---|
-  | 16K | ≈ 1.5 s of PCIe (48 × 1.42 GB × 60% non-resident / ~52 GB/s) | ~10K tok/s |
-  | 8K | ~0.8 s | ~10K tok/s |
-
-  At large chunks the GPU's FP4 tensor-core compute and QSA attention become the limit. The Must
-  target of 6,000 tok/s at 32K leaves margin for those.
-- **QSA prefill.** Pooled, normalized, RoPE'd index keys are materialized **once per 4-token block**
-  when the block completes, and stored in an index-key plane beside KV. Select then scans one
-  128-wide key per block. This is the same insight as ninfer-ext's `697ff0c7`, built into the KV
-  layout rather than recomputed per call.
+  GPU compute is ~12 GFLOP per token, ~0.2 s per 16K tokens at the ~900-985 TFLOP/s this card
+  measures for A4 GEMM ([linear benchmark §9](linear-benchmark.md)), plus attention and GDN chunk
+  kernels. A16 expert GEMMs would add ~0.8 s per 16K chunk. With A4, large chunks are bound by PCIe
+  and attention. The Must target of 6,000 tok/s at 32K leaves margin.
+- **QSA prefill.** Pooled, normalized, RoPE'd index keys are materialized **once per 4-token
+  block** when the block completes. They are stored in an FP8 index-key plane beside KV, so select
+  scans one 128-wide key per block. This is the same insight as ninfer-ext's `697ff0c7`, built into
+  the KV layout rather than recomputed per call.
+- **PLE rows** for chunk i+1 are computed on the GPU, deduplicated, probed in L0/L1, sorted by
+  block and read at QD 256 while chunk i computes (§12.3).
 - **MTP KV for the prompt** is built in batch from the chunk residuals.
 
 ---
@@ -1060,7 +1321,7 @@ configurations that give the same numerical results: it changes speed, never out
 |---|---|---|---|
 | **Startup probe** | Every start | ≤ 3 s | Validates the loaded calibration profile against the hardware and seeds the online cost models with today's measurements. Without a profile it gives safe model-based defaults. |
 | **`ninfer-calibrate`** | Once per machine and artifact, and again when hardware, driver or BIOS changes (the startup probe says when) | `--quick` ~2 min; `--full` ~15-25 min | Host capability measurements, CPU kernel variant and worker set, page backing, NVMe I/O mode, and structural choices that need a restart or reallocation. Verified end to end. |
-| **Online adaptation** | Continuously while serving | Off the critical path | Continuous, workload-dependent parameters: miss arbiter split (§8.3), prefetch budget and k′ (§8.4), cache parameters (§9.4 shadow replay), draft length (§11.2), prefill CPU share (§13). These start from the calibrated values instead of generic defaults. |
+| **Online adaptation** | Continuously while serving | Off the critical path | Continuous, workload-dependent parameters: miss arbiter split (§8.6), prefetch budget and k′ (§8.7), cache parameters (§9.3 shadow replay), draft length (§11.3), prefill CPU share (§13). These start from the calibrated values instead of generic defaults. |
 
 **Why both an explicit calibration and online adaptation.**
 
@@ -1101,14 +1362,15 @@ repetitions and reports median and range:
 | Measurement | Method | Used for |
 |---|---|---|
 | H2D DMA bandwidth vs copy size (64 KiB-16 MiB), D2H | Copy engine from the pinned arena, each page backing | Prefetch and promotion budget; detects small-copy penalties |
-| SM zero-copy read bandwidth and latency from mapped host memory | Kernel reading the expert arena | KV-tier block fetch (§9.5) |
+| SM zero-copy read bandwidth and latency from mapped host memory | Kernel reading the expert arena | KV-tier block fetch (§9.6) |
 | DRAM read bandwidth vs threads (per P-core, E-core, CCD) | Streaming reads over the pinned arena | Worker set; per-CCD placement (Zen CCDs have separate bandwidth limits) |
-| **DRAM contention curve:** CPU read bandwidth while H2D DMA runs at 0 / 25 / 50 / 100% | Concurrent runs | Arbiter and token-bucket model (§8.3, §8.4). Host DRAM is the shared bottleneck. |
+| **DRAM contention curve:** CPU read bandwidth while H2D DMA runs at 0 / 25 / 50 / 100% | Concurrent runs | Arbiter and token-bucket model (§8.6, §8.7). Host DRAM is the shared bottleneck. |
 | CPU NVFP4 expert GEMV: each compiled variant (AVX-512 / AVX2; A16, and A8 only if the recipe allows it and the user opted in), T ∈ {1, 2, 4, 8}, worker counts, SMT on/off, prefetch distance | Real expert records | Kernel variant, worker set, service-rate table t_cpu(n_experts, T) |
 | GPU↔CPU mailbox round trip | Mapped-memory publish → host spin → completion → device acquire | Handshake term in the cost model |
 | NVMe random 4 KiB reads at QD 1-256 on the n-gram file, for `O_DIRECT` + io_uring with and without SQPOLL/IOPOLL | Random row ids | I/O mode, queue depth, expected PLE latency; whether layer 0 hides it (§12.3) |
 | Huge pages | DMA and CPU bandwidth over THP 2 MiB, hugetlbfs 2 MiB and 1 GiB | Page backing of the expert arena |
-| GPU sanity | Fixed-shape decode kernels vs the expected time for an RTX 5090 | Detects power-limit throttling, a downtrained link or a busy GPU, and refuses to calibrate on a disturbed machine |
+| Copy-engine submission latency | `cudaMemcpyBatchAsync` call → `land_seq` visible on the device, for 1-16 experts | Prefetch window model (§8.7) |
+| GPU sanity | HBM read probe vs the 1,674.5 GB/s sustained-read reference, memory clock under CUDA load, fixed-shape decode kernels vs the §8.3 budget | Detects power or memory-clock limits, a downtrained link or a busy GPU, and refuses to calibrate on a disturbed machine |
 
 **Stage 2: model-level cost fit** (~1-2 min). The real decode graph runs with **synthetic routing**
 at controlled miss rates (0, 1, 2, 4 misses per layer; T = 1, 4, 8). This fits the online cost
@@ -1148,7 +1410,7 @@ The fitted model replaces the generic assumptions in §4.2 for this host. It als
 **Stage 4: cache parameters from the user's own routing** (seconds, CPU only).
 
 - If routing-trace recording is enabled (expert ids only, opt-in), the recorded traces are replayed
-  through the §9.4 policy family with `tools/expert_cache_replay`.
+  through the §9.3 policy family with `tools/expert_cache_replay`.
 - This fixes the LFRU parameters and promotion budget for the user's real workload, rather than for
   the calibration corpus.
 - The online shadow replay keeps them current afterwards.
@@ -1232,7 +1494,6 @@ A different GPU is outside the product scope (§1.4).
 | `ninfer-calibrate` (CLI, corpus, Stage 3 orchestration through the public Engine, report) | Product (`apps/`) |
 | Trace replay for Stage 4 | `tools/expert_cache_replay` |
 
-
 ---
 
 ## 15. Memory plans
@@ -1256,7 +1517,7 @@ For comparison, ninfer-ext has 6,347 slots (26%) and Strata at NVFP4 sizes would
 slots (35%).
 
 At a 256K context the KV reservation is 4.1 GB. Through loans (§9.2) it costs expert frames **only
-as the context actually fills**. Above the long-context threshold, the QSA KV host tier (§9.5) keeps
+as the context actually fills**. Above the long-context threshold, the QSA KV host tier (§9.6) keeps
 most of it off the device altogether.
 
 ### 15.2 Host RAM: 96 GB (≈ 93 GiB visible)
@@ -1268,7 +1529,7 @@ most of it off the device altogether.
 | L1 PLE row cache | 2.1 (configurable 0.5-4) |
 | Mailboxes, landing buffers, io_uring buffers | 0.2 |
 | Host checkpoint tier (prefix cache), capped | 2.0 (configurable) |
-| QSA KV host tier (§9.5), only above the long-context threshold | 0-4.1 (at 262K, FP8) |
+| QSA KV host tier (§9.6), only above the long-context threshold | 0-4.1 (at 262K, FP8) |
 | Process: tokenizer, server, frontend | ~1.5 |
 | **Total NInfer** | **~76.5**, or ~80.6 at 262K with the KV host tier |
 | OS, desktop, page cache headroom | ~19, or ~15 at 262K |
@@ -1294,44 +1555,119 @@ Every new Op is qualified against a naive FP32/FP64 oracle at the real shapes, u
 
 | Op | Oracle | Boundaries |
 |---|---|---|
-| `offloaded_sparse_moe` | FP64. NVFP4 independently decoded from codes, block scales and divisors; BF16 inputs. | Every residency mix: all-hit, all-CPU, all-staged, mixed. T ∈ {1, 2, 4, 8, 16, 64, 512, 8192}. Exact top-10 lower-id ties. |
-| `hyper_connection` | FP64 | FP8 weights decoded exactly; grouped norm per stream |
-| `qsa_index` / `qsa_select` | FP64 block scores | Near-tie allowance as in the existing selector contracts; dense equivalence while n ≤ 2051 |
+| `offloaded_sparse_moe` (route) | FP64 logits; exact top-10 with lower-id ties | T ∈ {1, 2, 4, 8, 16, 64}; near-tie fixtures |
+| `offloaded_sparse_moe` (narrow, GPU and CPU) | FP64, NVFP4 decoded independently from codes, block scales and divisors; BF16 inputs | Every residency mix: all-frame, all-staging, all-CPU, random mixes; n = 1-8 columns; **plus bit-exact equality across routes** (§16.2) |
+| `offloaded_sparse_moe` (wide) | Same FP64 oracle; A4 route against the represented A4 activations | n = 9-8192 |
+| `hyper_connection` | FP64 | FP8 weights decoded exactly; grouped norm per stream; split-K partial order fixed |
+| `qsa_prep`, `qsa_select` | FP64 block scores | Near-tie allowance as in the existing selector contracts; dense equivalence while n ≤ 2051; pooled key completion at block boundaries |
 | `ple_ngram_injection` | FP64 | FP8 rows decoded with the scalar scale; conv state transition; EOS restarts |
 | `ngram_row_ids` | **Exact integer** | Signed 64-bit products, primes 20,000,003-20,000,171, offsets; EOS and sequence start |
-| CPU NVFP4 kernels | Same FP64 oracle, independently | A16 and A8 routes separately |
 
 The fork's FP64 Python reference may be consulted as a cross-check of the published mathematics.
 NInfer's oracle is written from the upstream definitions, consistent with [§1.4](#14-non-goals).
 
-### 16.2 Placement invariance
+### 16.2 Placement invariance: the canonical expert arithmetic
 
-**Requirement.** For the A16 routes, an expert's output is **bit-identical** whether it ran on:
+**Requirement.** For every routed expert computed on a **narrow route** (the expert has n ≤ 8
+token columns in this forward), its FP32 output vector is **bit-identical** whichever of these
+computed it:
 
 - the GPU from a cache frame;
 - the GPU from a staging frame;
-- the CPU.
+- the CPU from the host record.
 
-**Mechanism.** Both implementations follow one canonical arithmetic:
+Experts with n > 8 columns always use the GPU **wide route** (tensor cores, §8.5). The CPU never
+serves them. The route is decided by n, which does not depend on placement, so outputs remain
+placement-invariant.
 
-- decode each block to FP32;
-- within each 16-block, a fixed 16-term FMA chain;
-- across the 160 (gate/up) or 40 (down) blocks of a row, a fixed pairwise tree;
-- FP32 SwiGLU with the same `expf` polynomial (no fast-math intrinsics in either path);
-- a fixed expert-rank order in the combine.
+**Canonical arithmetic** for one matrix row r: K inputs, K/16 blocks, E2M1 codes c, E4M3 block
+scales s, FP32 matrix divisor d, FP32 input column x (BF16 inputs widened exactly; for the down
+projection, x is the FP32 SwiGLU output h):
 
-**Why it is worth the constraint:**
+```text
+acc = 0.0f
+for b in 0 .. K/16-1:                      # increasing block order
+    p = 0.0f
+    for j in 0 .. 15:                      # increasing element order, sequential chain
+        p = fmaf(e2m1(c[r,16b+j]), x[16b+j], p)
+    acc = fmaf(p, e4m3(s[r,b]), acc)
+y[r] = acc / d                             # IEEE division, round to nearest even
+```
 
-- Cache contents depend on timing, so without invariance two identical requests can produce
-  different tokens. Strata measures 95-97.7% top-1 agreement between cache states.
-- With invariance:
-  - greedy outputs do not depend on cache state, prefetch timing, or the CPU/GPU split;
-  - no round has to wait for a promotion to stay deterministic (§9.3);
-  - every residency route can be tested by exact comparison against the all-GPU route.
+The SwiGLU between the two projections is:
 
-**Cost.** If the canonical order costs more than ~5% of the hit GEMV's bandwidth in M3
-measurements, the design falls back to oracle-tolerance qualification for the GPU route. That
-change, and its effect on determinism, will be stated explicitly.
+```text
+h_i = (g_i / (1 + exp_c(-g_i))) * u_i
+```
+
+- The division and multiplication are IEEE FP32, with the parenthesization exactly as written.
+- `exp_c` is one shared implementation, in `ops/common/canonical_math.h`, with no FMA contraction
+  outside explicit `fmaf`:
+  - Cody-Waite range reduction;
+  - a fixed degree-6 polynomial evaluated by explicit `fmaf`;
+  - exponent reconstruction by integer add.
+- Neither `__expf` nor the libm `expf` is used.
+- The expert output y_e (2560 FP32) is the semantic boundary returned to the combine. The combine
+  always runs on the GPU, in fixed rank order (§8.5).
+
+Both compilers must be prevented from contracting or reassociating:
+
+- **GPU:** `--fmad=false` for the canonical translation unit, or explicit `__fmaf_rn` /
+  `__fmul_rn` / `__fadd_rn` / `__fdiv_rn` intrinsics everywhere in it;
+- **CPU:** `-ffp-contract=off -fno-fast-math`, and explicit `_mm512_fmadd_ps` / `_mm256_fmadd_ps`.
+
+**Layout that makes the canonical order natural on both processors:** `nvfp4_rg16_kmajor`.
+
+- Rows are grouped by 16.
+- For each row group g and block b there is one 144-byte unit:
+  - 128 bytes of codes, k-major. For each of the 16 k positions, 8 bytes hold the 16 rows' nibbles;
+    row i is nibble i, with the low nibble first.
+  - 16 bytes of E4M3 scales, row i at byte i.
+- Units are ordered g-major, then b. For the gate/up matrix, rows alternate gate and up
+  (row 2i = gate_i, row 2i+1 = up_i), so a row group holds 8 complete SwiGLU pairs.
+
+Sizes:
+
+| Matrix | Units per row group | Bytes per row group | Row groups | Bytes |
+|---|---|---|---|---|
+| gate/up | 160 | 23,040 | 80 | 1,843,200 |
+| down | 40 | 5,760 | 160 | 921,600 |
+| **Record total** | | | | **2,764,800 B = 675 × 4 KiB** |
+
+How each processor uses the layout:
+
+- **CPU.** One AVX-512 vector holds the 16 rows of a group. Each k step:
+  1. load 8 bytes and expand nibbles to 16 byte lanes;
+  2. `vpermps` with a 16-entry E2M1 table;
+  3. one `vfmadd` per column with broadcast x[k].
+
+  AVX2 uses two 8-row halves and a 3-bit-magnitude table plus a sign XOR.
+- **GPU narrow route.**
+  - 144-byte units are staged into shared memory with 16-byte `cp.async` (or TMA bulk copies) in a
+    multi-stage pipeline.
+  - Lane i of a half-warp owns row i and runs the canonical chain from shared memory; the other
+    half-warp owns the next row group.
+  - Each lane interleaves the chains of its n columns, plus a second row group when n is small, to
+    hide FMA latency.
+
+**Cost gate (M3).** The narrow-route GPU kernel is measured against a free-order variant of the
+same kernel at T = 1, 2, 4, 8 on the real expert shapes. If the canonical kernel loses more than 5%
+bandwidth at T = 1, or more than 10% at T = 4, the requirement is downgraded:
+
+- GPU and CPU are then qualified separately against the FP64 oracle;
+- greedy outputs may then differ between cache states at near-ties;
+- §9.5 then also needs a determinism mode (`--deterministic`) that blocks on promotions, as Strata
+  does.
+
+The downgrade and its measured cost are recorded here.
+
+**What placement invariance buys:**
+
+- Greedy output does not depend on cache contents, prefetch timing or the CPU/GPU split. Strata
+  measures only 95-97.7% top-1 agreement between cache states.
+- No round ever waits for a promotion.
+- Every residency route is tested by exact comparison: all-GPU vs all-CPU vs random mixes
+  (§16.4).
 
 ### 16.3 Recipe qualification
 
@@ -1352,52 +1688,134 @@ Run the comparison for:
 A class stays NVFP4 only if its KL contribution is below the threshold fixed **before** the
 measurement. Proposed threshold: total KL ≤ that of UD-Q4_K_XL, and each class ≤ 20% of the total.
 
-### 16.4 Engine-level tests
+### 16.4 Engine-level and system tests
 
-- Incremental decode equals one-shot prefill (exact on A16 routes).
-- Speculative output equals plain output (greedy, exact).
-- Cache-cold equals cache-warm equals all-CPU forced mode (exact on A16).
-- PLE served from L0, L1 and NVMe gives exact equality.
-- Fault injection:
+- **Exactness.**
+  - Incremental decode equals one-shot prefill on the narrow routes.
+  - Speculative output equals plain output (greedy).
+- **Placement invariance end to end.** Greedy outputs are byte-identical across:
+  - forced all-CPU experts (`--expert-frames 0`);
+  - a small cache;
+  - the full cache;
+  - prefetch on and off;
+  - H2 warming on and off;
+  - arbiter decisions forced to each service.
+- **PLE.** L0, L1 and NVMe service give exact equality.
+- **Policy conformance.** For recorded route logs, the transfer agent's LFRU victim and promotion
+  decisions equal `tools/expert_cache_replay`'s decisions, step for step. Ties are broken by expert
+  id.
+- **Protocol stress.** Injected random delays (0-500 µs) are applied in:
+  - CPU workers;
+  - the transfer agent;
+  - the NVMe agent;
+  - DMA completion.
+
+  Outputs stay exact, and no frame is reused before its retire epoch. The latter is checked by a
+  debug build that poisons retired frames.
+- **Fault injection.** Each of these reaches the Engine-wide failure path within the 2 s bound:
   - an NVMe read error;
   - CPU worker death;
-  - a watchdog timeout.
-
-  Each must reach the Engine-wide failure path.
+  - an agent stall;
+  - a device spin timeout.
 
 ---
 
-## 17. Implementation plan
+## 17. High-reward options
 
-Each milestone has exit criteria measured on the target machine. Later milestones may change
-because of earlier findings. Such changes and the evidence for them are recorded here, not silently
-absorbed.
+These options are **not** in the baseline. Each has an expected gain, a cost, and a measurable gate
+that decides whether it is built. The baseline (§8-§13) must work without any of them. Gains are
+model estimates at C=1 unless marked otherwise.
 
-| # | Milestone | Exit criteria |
+| ID | Option | Expected gain | Cost / risk | Gate (measured in) |
+|---|---|---|---|---|
+| **H1** | **Persistent decode megakernel.** One persistent kernel per round executes an instruction stream of the round's Op tiles. Ops provide device-callable tile functions in addition to their host entries. An on-GPU scheduler resolves dependencies with counters. Weights for instruction i+1 stream into shared memory while instruction i computes, and host waits (CPU misses, PLE rows) are just dependencies. | Removes most of the ~370 kernel boundaries per token. Hazy Research measured large gains on a 1B model at batch 1 (see §22); here ~0.2-0.4 ms per token (5-12%). | Very high: a new execution framework. Op tiles must remain individually qualifiable. Graph capture is replaced by instruction-list capture. | M6 nsys attribution: kernel boundary and tail gaps > 10% of the token after the baseline's PDL and prefetch measures. |
+| **H2** | **CPU cache warming for predicted misses** (§10.4). Workers pre-load the predicted CPU-served experts' row bands into their own L2 caches during the GPU's dense phase, so the miss computes from cache. | Warmed miss ~12-18 µs instead of ~42 µs. At ~10 missing layers per token, −0.2 to −0.3 ms (6-9%). | Low. Wasted DRAM bandwidth when mispredicted, but DRAM is idle then. | M5: warmed-miss service time and prediction recall. Keep it if the exposed stall falls by > 25%. |
+| **H3** | **Intra-expert CPU + DMA split.** For a layer with a single miss, the CPU computes the gate/up half while the copy engine lands the down half into a staging frame. The GPU computes down from the CPU's h, which crosses PCIe as 2.5 KB. | One cold miss ~32 µs instead of ~42 µs; more at low hit rates | Medium. Two handshakes. The h exchange is FP32, so invariance holds. | M5: only if cold (unwarmed) misses remain > 20% of the exposed stall |
+| **H4** | **Two-layer-ahead prediction** (router of l+2 applied to x_l) | Doubles the prefetch window, so more misses become staged hits | Low. Lower recall, wasted DMA. | M1 recall@k′ and M5 useful-byte ratio > 0.5 |
+| **H5** | **Multi-token protection predictor** (§9.3, policy item 6) | Up to 2.5-10 points of hit rate on top of LFRU, with perfect prediction | Research | M1 on the hidden-state trace set |
+| **H6** | **Chained rounds (asynchronous scheduling).** Enqueue round r+1 before r completes. The device carries the sampled or accepted tokens. The host commits round r while r+1 runs. This needs a device-side accepted-prefix fold and an abort path for rounds launched past a stop. | Hides the host's per-round work (ingress build, commit, output). Expected 2-6% at 3.5 ms tokens. | High. Engine transaction changes; see [engine architecture §6](engine-architecture.md). | M6 nsys: GPU idle between rounds > 3% of the token |
+| **H7** | **BAR-mapped mailboxes** (gdrcopy-style). CPU results and done flags are written directly into device memory, so the GPU polls local memory instead of reading host memory over PCIe. | ~2-4 µs less per missing layer | Medium. Kernel module, Resizable BAR, write-combining stores. | M3 mailbox round trip: keep it if it is > 30% faster |
+| **H8** | **Prompt-seeded cache.** Prefill already routes every prompt token. At the end of prefill, the prompt's per-layer expert counts seed the LFRU state, and the top uncached experts are promoted while the copy engine is otherwise idle, before the first decode token (MoE-Infinity's request-level activation idea). | Fewer cold misses in the first hundreds of decode tokens after a topic switch | Low | M1 replay with prefill routing: hit rate of the first 256 decode tokens with and without seeding |
+| **H9** | **Draft trees** (DFlash2-style lattice over MTP top-2 at the first one or two positions) | +10-25% accepted tokens per round in the literature | More columns, so more misses on rejected branches | M7 cost model: it is chosen per round only when expected tokens/s rise |
+| **H10** | **Reduced-precision miss copies** (HOBBIT-style: a 2-bit host copy of cold experts, served when a miss is on the critical path) | Halves the bytes of cold misses | **Changes model output.** RAM for the extra copies. | Never default. A labeled product option, after the KL check. |
+| **H11** | **Exclusive residency** (an expert lives in VRAM *or* RAM) for 64 GB hosts | Supports smaller machines | Write-back and eviction complexity | Outside the current product scope |
+
+Considered and rejected:
+
+- **Lossless entropy coding of NVFP4 codes in VRAM** to fit more experts. E2M1 codes of
+  MSE-calibrated weights carry roughly 3.5-3.8 bits of entropy, a ≤ 12% capacity gain. Decoding at
+  1.5 TB/s would cost more GPU time than the extra hit rate saves.
+- **GPU-side expert skipping or dynamic top-k.** It changes the model's mathematics.
+- **Mixed SM copy kernels for prefetch.** They steal SMs and HBM bandwidth from the decode kernels.
+  The copy engine is free.
+
+---
+
+## 18. Configuration surface
+
+These are the startup options added for this architecture, with their defaults. The exact names
+are final when `--help` is written. Unspecified values come from the calibration profile (§14),
+then from model-based defaults. Every option that affects output is marked.
+
+| Option | Default | Meaning |
 |---|---|---|
-| **M0** | Source facts. Record NVIDIA NVFP4 `hf_quant_config.json`, tensor dtypes, and the actual machine: CPU ISA, DRAM bandwidth, PCIe, NVMe latency at QD1 and QD16. | Recorded facts; §4 assumptions confirmed or revised |
-| **M1** | Routing traces, cache policy and predictors. A first replay on the public FreeToken traces is done (§9.4). Remaining: broad traces (code, chat, CJK, long-context, tool use; C = 1-8; MTP with rejected drafts) from the public `aswinkumar99/qwen3.8-flash-next-expert-traces` set, Strata's `--dump-routing`, or M4's engine. Confirm LFRU on held-out traces and fix its parameters. Measure next-layer recall and useful-byte ratio. Evaluate multi-token protection predictors. | LFRU (or a better causal policy) confirmed on held-out traces, with its gap to LRU and Belady reported. Prediction recall@k′ measured. §4.2 projection updated with the real h. |
-| **M2** | Converter recipe, expert record layout, NVMe table layout, residency classes, loader with `O_DIRECT` pinned load | Exact import tests; load time; RAM peak ≤ plan |
-| **M3** | Ops with oracles: `offloaded_sparse_moe` (GPU A16/A4 + CPU A16/A8), `hyper_connection`, QSA, PLE, `ngram_row_ids`. Placement-invariance test. CPU kernel bandwidth on target CPUs. | All Op qualifications pass. CPU NVFP4 GEMV ≥ 80% of measured DRAM bandwidth (AVX-512) or measured shortfall recorded (AVX2). |
-| **M4** | Functional model, all-host-experts mode: no cache, every expert CPU-served. Prefill + decode + MTP + Vision through the Engine; CausalScoring perplexity. | Model oracle agreement; recipe KL report (§16.3); first end-to-end numbers |
-| **M5** | Frame pool, residency table, epochs, §9.4 policy, loans, lookahead prefetch | Measured hit composition matches the M1 simulation within 2 points. No round blocks on promotions. |
-| **M6** | Decode graph fusion (≤ 10 kernels per layer, PDL), device-driven PLE, host-sync-free round boundary. nsys attribution of one token. | Plain decode Must target (≥ 120 tok/s). Attribution table published. |
-| **M7** | Speculative decoding with residency-bounded drafter and miss-aware K; n-gram copy | Speculation Must target (≥ 160 tok/s). Spec never below plain on any corpus category by more than noise, shown by repeated runs. |
-| **M8** | Prefill streaming, thin-expert CPU help, QSA pooled-key plane | Prefill Must target; short-prompt prefill reported |
-| **M9** | Calibration (§14): startup probe, `ninfer-calibrate --quick/--full`, profile and drift check, Stage 2 cost-model fit, Stage 3 A/B harness. Validate it on at least two different hosts, for example AVX-512 + Gen5 and AVX2 + Gen4, or 2 vs 4 DIMMs. | On each host, the calibrated configuration beats the uncalibrated defaults or ties within noise on the calibration corpus **and** a held-out corpus. Every chosen and rejected candidate is reported. A recalibration on the same host reproduces the choices. |
-| **M10** | Head-to-head campaign vs Strata UD-Q4_K_XL and ninfer-ext on the target machine; serving C=1..8; 4K/32K/128K; quality report | §1.3 table filled with every result, favorable or not |
+| `--expert-frames auto\|N` | `auto` | Frame pool size; `auto` takes all device memory left after the plan of §15.1 |
+| `--cpu-experts auto\|off\|N` | `auto` | CPU expert engine worker count; `off` forces DMA service for every miss (testing) |
+| `--expert-prefetch auto\|off\|1\|2` | `auto` | Lookahead depth (layers) of §8.7 |
+| `--cpu-warming auto\|off` | `auto` | Option H2 |
+| `--cache-policy lfru\|lru` | `lfru` | §9.3; `lru` is kept for A/B and replay validation |
+| `--cache-state PATH\|off` | state dir | Load and save the LFRU state and ranking |
+| `--record-routing PATH` | off | Opt-in route log, expert ids only, for calibration Stage 4 and M1 |
+| `--ngram-file PATH` | next to the artifact | N-gram table volume, which may sit on another NVMe drive |
+| `--ple-device-cache-mib N` | 64 | L0 row cache (§12.3) |
+| `--ple-host-cache-mib N` | 2048 | L1 row cache |
+| `--kv-host-tier auto\|off\|TOKENS` | `auto` (65,536) | QSA KV host tier threshold (§9.6) |
+| `--hugepages auto\|1g\|2m\|thp` | `auto` | Backing of the pinned expert arena |
+| `--calibration auto\|off\|PATH` | `auto` | §14.3 |
+| `--deterministic` | off | Only if the §16.2 cost gate downgrades invariance: blocks on promotions |
+| `--cpu-a8` | off | **Changes output.** A8 CPU route (§10.2), only with an `AllowA8` Use |
+| `--spec mtp`, `--draft-tokens`, `--fixed-draft`, `--ngram-draft-tokens`, `--draft-tree-nodes` | existing | Existing speculation options; draft length policy of §11.3 |
+
+Command: `ninfer-calibrate ARTIFACT [--quick|--full] [--corpus DIR] [--out PATH]` (§14.2).
 
 ---
 
-## 18. Documentation and authority changes
+## 19. Implementation plan
+
+Each milestone has deliverables and exit criteria measured on the target machine. Later milestones
+may change because of earlier findings. Such changes, and the evidence for them, are recorded here
+rather than silently absorbed.
+
+| # | Milestone | Deliverables | Exit criteria |
+|---|---|---|---|
+| **M0** | Source and machine facts | NVIDIA NVFP4 `hf_quant_config.json` and tensor dtypes; target machine inventory (CPU ISA, DRAM bandwidth, PCIe, NVMe QD1/QD16 latency, memory clock under CUDA load) | Facts recorded; §4 and §8.3 assumptions confirmed or revised |
+| **M1** | Routing traces, policy and predictors | Broad traces (code, chat, CJK, long context, tool use; C = 1-8; MTP with rejected drafts) from the public hidden-state trace set, Strata's `--dump-routing`, or M4's engine. Replay extended with prediction and DMA-budget modelling. | LFRU (or a better causal policy) confirmed on held-out traces, with its gap to LRU and Belady reported; recall@k′ and useful-byte ratio for depth 1 and 2; §4.2 projection updated with the real h |
+| **M2** | Artifact | Recipe; `nvfp4_rg16_kmajor` expert records; n-gram volume with 4 KiB blocks; residency classes; `O_DIRECT` huge-page loader | Exact-import tests; load time; host RAM peak ≤ §15.2 plan |
+| **M3** | Ops with oracles | `offloaded_sparse_moe` (route, narrow GPU, narrow CPU A16/A8, wide, combine), `hyper_connection`, QSA, PLE, `ngram_row_ids`; core mailbox, ring and spin-pool primitives with stress tests | All Op qualifications pass; **placement invariance** bit-exact across GPU frame, GPU staging and CPU for T = 1-8; §16.2 cost gate evaluated; CPU narrow kernel ≥ 80% of measured DRAM bandwidth cold (AVX-512), shortfall recorded for AVX2; mailbox round trip measured |
+| **M4** | Functional model, CPU-only experts | Prefill, decode, MTP and Vision through the Engine with every routed expert CPU-served; CausalScoring | Model oracle agreement; recipe KL report (§16.3); first end-to-end numbers |
+| **M5** | Expert cache | Frame pool, residency table and state machine, transfer agent, LFRU, loans, epochs, prefetch, arbiter, H2 warming experiment | Host policy decisions **identical** to `tools/expert_cache_replay` on recorded routing; live hit composition within 2 points of replay; no round ever blocks on a promotion; agent CPU < 15% of a core; H2 and prefetch adoption decided by measurement |
+| **M6** | Decode performance | §8.3 kernels with PDL, pre-dependency prefetch and stall-time warming; cluster expert kernel; device-driven PLE; nsys/ncu attribution of one token | Per-kernel times vs the §8.3 budget published; plain decode ≥ 120 tok/s (Must); H1, H6 and H7 gates evaluated |
+| **M7** | Speculation | Residency-bounded drafter, miss-aware draft length, n-gram copy; tree option H9 evaluated | Speculative decode ≥ 160 tok/s (Must); speculation never slower than plain beyond noise on any corpus category |
+| **M8** | Prefill and long context | Layer-streamed prefill with host-issued DMA, CPU thin-expert assist, equal chunk planning, QSA pooled-key plane, KV host tier | Prefill Must target; short-prompt (512-2K) prefill reported; 128K decode ≥ 85% of 4K |
+| **M9** | Calibration | §14: startup probe, `ninfer-calibrate --quick/--full`, profile and drift check, Stage 2 fit, Stage 3 A/B | On at least two different hosts, calibrated ≥ uncalibrated (or tie within noise) on the calibration **and** held-out corpora; every candidate reported; recalibration reproduces the choices |
+| **M10** | Head-to-head | Campaign vs Strata UD-Q4_K_XL and ninfer-ext on the target machine; serving C = 1-8; 4K/32K/128K; quality report | §1.3 table filled with every result, favorable or not |
+
+The milestones on the critical path to the decode targets are M2 → M3 → M5 → M6. M1 runs in
+parallel and must finish before the policy is frozen in M5.
+
+---
+
+## 20. Documentation and authority changes
 
 When the implementation lands:
 
 - `AGENTS.md` and `README.md`: add `Qwen4ExpForCausalLM` to the product architectures, and the
   host-RAM and NVMe requirements.
 - `docs/maintainer/qwen4-exp-model.md`: new model reference (mathematics, config, state, MTP, PLE).
-- `docs/maintainer/expert-offload.md`: frame pool, residency, epochs, policy, mailboxes, CPU engine.
-  §8-§12 of this file move there.
+- `docs/maintainer/expert-offload.md`: frame pool, residency state machine, epochs, policy,
+  transfer agent, mailboxes, CPU engine, canonical arithmetic. §8-§12 and §16.2 of this file move
+  there.
+- [Storage layouts](storage-layouts.md): `nvfp4_rg16_kmajor`.
 - [Engine architecture](engine-architecture.md): Program ownership of host agents and frames.
   Residency as an Op execution resource.
 - [Artifact container](artifact-container.md), [storage layouts](storage-layouts.md): residency
@@ -1410,37 +1828,42 @@ When the implementation lands:
 
 ---
 
-## 19. Risks and open questions
+## 21. Risks and open questions
 
 | Risk | Effect | Mitigation / decision point |
 |---|---|---|
-| Routing locality is weaker than expected (h < 0.8 at 40%; the shared expert lowers token-to-token reuse) | Plain decode stays near the projection's 0.7 row; speculation gains shrink | M1 decides early. Fallback levers: HC and lm_head NVFP4 if quality allows (+~400 frames); opt-in reduced-precision copies of the **coldest** experts (HOBBIT-style mixed precision) as an explicit, labeled product option, never default. |
-| Next-layer prediction recall is low for this architecture | Less DRAM time-shifting | Prefetch is budgeted and self-disabling when its measured useful-byte ratio drops below a threshold |
-| AVX2-only hosts are compute-bound in A16 | CPU misses slower | A8 opt-in route. Cost model shifts misses to PCIe. Reported per host class. |
-| DRAM bandwidth of the user's platform (DDR5 speed, 2 vs 4 DIMMs) | Directly scales miss service | M0 measures. 4-DIMM DDR5 often runs at lower speeds, so the 96 GB configuration (2×48 GB) is preferred. |
-| NVIDIA's dense tensors are already NVFP4 or excluded differently than assumed | Recipe table changes | M0 reads `hf_quant_config.json`; recipe follows the source |
-| Mapped-memory spin waits inside graphs, and driver behavior | Hangs or latency spikes | Bounded spins with a watchdog; fall back to `cuStreamWaitValue32` graph memory-op nodes if measured better |
-| NVMe without polled queues, or high latency (QLC, DRAM-less) | PLE wait exposed | L1 cache size; telemetry; documented drive requirement |
-| Calibration overfits the bundled corpus or a noisy measurement | Settings that are slower on real workloads | Held-out corpus check in M9, noise-aware acceptance, defaults kept on ties, online adaptation corrects continuous parameters |
-| Placement-invariant arithmetic costs too much | Lower hit GEMV throughput | §16.2 decision rule, disclosed |
-| 96 GB is tight with a desktop session | OOM or swap | Startup plan check; configurable L1 and checkpoint tier; recommended server-only operation |
+| Routing locality is weaker than in the replay traces (h < 0.85 at 41%; the shared expert lowers token-to-token reuse) | Plain decode toward the lower rows of §4.2; smaller speculation gains | M1 decides early. Levers: H2, H8, H3; HC and `lm_head` NVFP4 if quality allows (+~400 frames). Opt-in H10 only. |
+| The §8.3 GPU budget is missed (small-GEMV efficiency, boundaries) | Every row of §4.2 drops ~12% per +0.5 ms | M6 per-kernel attribution against the budget; ncu on any kernel > 30% over; H1 gate |
+| Thread-block cluster or DSMEM limits on sm_120 differ from the plan | Cluster-per-expert kernel unavailable at S = 16 | Fallback per-expert counters (§8.5); S = 8 |
+| Host-issued DMA submission latency is too high for the one-layer prefetch window | Fewer staged hits | Batch submission; two-layer-ahead (H4); measured by calibration |
+| Spinning kernels hold SMs while the CPU computes | No overlap for other work | Waiting is done by the last cluster only; meanwhile it L2-warms the next layer (§8.3 rule 2) |
+| Next-layer prediction recall is low with hyper-connections | Less prefetch benefit | Prefetch self-disables per layer below useful-byte ratio 0.3 (§8.7) |
+| The canonical arithmetic costs more than its gate allows | Lower narrow-route bandwidth | §16.2 downgrade rule, with `--deterministic`, disclosed |
+| AVX2-only hosts are compute-bound on the narrow route at n > 1 | Slower CPU misses in verify windows | A8 opt-in; arbiter shifts load to DMA; reported per host class |
+| DRAM bandwidth of the platform (DDR5 speed, 2 vs 4 DIMMs) | Scales cold-miss service and the DRAM ceiling | Calibration advice; 2 × 48 GB preferred |
+| GPU memory clock below maximum under CUDA load (P-state) | All bandwidth-bound kernels slower | Calibration GPU sanity check against the 1,674.5 GB/s sustained-read reference; advice |
+| NVIDIA's dense tensors differ from the assumed BF16 | Recipe table changes | M0 reads `hf_quant_config.json`; the recipe follows the source |
+| NVMe without polled queues, or high latency (QLC, DRAM-less) | PLE wait exposed in plain decode (§12.4) | L1 sizing, telemetry, documented drive requirement |
+| Calibration overfits the bundled corpus or a noisy measurement | Settings slower on real workloads | Held-out check in M9; noise-aware acceptance; defaults on ties |
+| 96 GB is tight with a desktop session | OOM or swap | Startup plan check; configurable L1, checkpoint tier and KV host tier; server-only operation recommended |
+| Engine contract changes for chained rounds (H6) | Large change to transactions | Built only if its gate passes; otherwise the synchronous boundary stays |
 
 Open questions answered by measurement, not assumption:
 
-- optimal k′ and depth of prediction;
-- LFRU count-halving period, promotion budget, and the shadow-tuning switch threshold;
-- frame pool versus KV loan reclaim frequency at C=8;
-- whether a persistent megakernel is worth it (M6 attribution).
+- k′ and the depth of prediction;
+- LFRU count-halving period, the promotion budget and the shadow-tuning switch threshold;
+- the frame pool's KV-loan reclaim frequency at C = 8;
+- H1-H9 adoption (§17 gates).
 
 ---
 
-## 20. Sources
+## 22. Sources
 
 - Strata forks: https://github.com/architectds/Strata (`best`, 10 commits ahead of v0.1.38: prefill CPU
   assist, chunk sizing, elastic cache). chimpera/strata-nvfp4 was not read.
 - Routing traces and replay: https://github.com/hz1ulqu01gmnZH4/qwen38-freetoken
   (`experiments/2026-09-22_tg-expert-cache-trace-replay/data/*.npz`). Extended replays for this
-  design, continuous-session and per-request, are described in §9.4. Zhang, "Reproducible evaluation
+  design, continuous-session and per-request, are described in §9.3. Zhang, "Reproducible evaluation
   of MoE expert caching", arXiv 2608.07911 (https://github.com/shijiuzhang/moe-cache-eval). SeqMoE,
   arXiv 2609.12978. Angelopoulos et al., "Cache management for MoE LLMs", arXiv 2509.02408.
 - Strata: https://github.com/Niko1221/Strata. Read from source at `99f3dbd`: `src/core/verify.cpp`,
@@ -1470,3 +1893,68 @@ Open questions answered by measurement, not assumption:
   2510.10302 (SP-MoE), 2504.05897 (HybriMoE), 2505.16056 (routing consistency), 2601.07372 (Engram),
   KTransformers (SOSP'25). Most were read through summaries, not in full; claims taken from them are
   re-measured on this model before they decide anything.
+- This repository: `docs/maintainer/linear-benchmark.md` §9 (RTX 5090 sustained-read probe of
+  1,674.5 GB/s; T=1 GEMV at 90-92% of it; NVFP4 A4 GEMM at 882-985 TFLOP/s),
+  `src/core/pdl.cuh`, `src/models/qwen3_5/program/decode.cpp`.
+
+---
+
+## Appendix A. Review findings and changes
+
+The previous version of this design was reviewed against three questions:
+
+- Can it be implemented on the RTX 5090 and CUDA as they are?
+- Does it leave performance on the table?
+- Is it specific enough to build?
+
+The findings are listed by severity. Each points to the section that now resolves it.
+
+### A.1 Errors (the previous text could not be implemented as written)
+
+| # | Finding | Resolution |
+|---|---|---|
+| E1 | Prefetch was "driven by a device-side scheduler kernel that issues DMA". A CUDA kernel cannot start a copy-engine DMA. | All DMA is issued by a host **transfer agent**. Landing is signalled by stream-ordered `cuStreamWriteValue32` (§8.1, §8.2, §9.4). |
+| E2 | "One grouped kernel runs gate/up, SwiGLU and down with the intermediate in shared memory" cannot saturate HBM at T=1. Ten experts would occupy ten CTAs. | A cluster-per-expert kernel exchanges h through distributed shared memory, or falls back to per-expert ready counters (§8.5). |
+| E3 | The router kernel as specified would run its 2.6 MB GEMV on a handful of SMs | Split GEMV over all SMs, then a last-CTA phase for top-k, classification and publication (§8.4) |
+| E4 | The canonical arithmetic was underspecified: its order could not be both GPU- and CPU-natural; `expf`, FMA contraction and the h dtype were undefined | Exact definition, the `nvfp4_rg16_kmajor` layout that makes it natural on both, compiler rules, the n ≤ 8 route rule and a measured cost gate (§16.2) |
+| E5 | Frames were described as "2 MiB-aligned VMM chunks" while being 2.64 MiB | Frames are 675 × 4 KiB slices of one allocation, and KV page sizes divide a frame (§9.1) |
+| E6 | Device-side "recency updates" contradicted the requirement that policy bookkeeping stay off the critical path | The device only reads residency. LFRU, shadow replay and all decisions run in the transfer agent from the route log (§9.4). |
+| E7 | The residency states had no `LOADING`, no generation and no reuse rule, which allowed use-after-reuse races | State machine with generations, landing tickets and epoch-based retirement (§9.4, §9.5) |
+| E8 | Prefill's wide route defaulted to A16 tensor cores: about 4-5× slower in compute than the A4 the checkpoint was calibrated for | A4 wherever the Use allows `AllowA4`, which the official recipe sets for routed experts after the KL check (§13) |
+| E9 | The recipe kept QSA QKV in FP8 while the budget assumed NVFP4 | Budget uses FP8 by default (§8.3) |
+
+### A.2 Performance gaps (the design left speed on the table)
+
+| # | Finding | Resolution |
+|---|---|---|
+| P1 | HBM sat idle during kernel boundaries and while waiting on the host | Baseline rules: PDL with pre-dependency weight prefetch; stall-time L2 warming of the next layer; evict-first weight streams (§8.3) |
+| P2 | x was shipped to the host only once a miss was known, so its transfer sat on the miss path | x is written to host memory every layer (5 KiB) before routing (§8.2) |
+| P3 | CPU misses always read DRAM cold | Static row-band ownership plus predicted-miss L2 warming (H2, §10.4) |
+| P4 | No per-kernel budget: the 4.0 ms GPU assumption was unsupported | Per-kernel byte and time budget (≈ 3.6 ms at T=1), grounded in this repo's measured 1,674.5 GB/s sustained read (§8.3) |
+| P5 | Recurrence and dense GEMV tiling were constrained by per-head norms in epilogues | Norms move to consumer prologues; recurrence splits state rows across 192 CTAs (§8.3) |
+| P6 | Megakernel, chained rounds and BAR mailboxes were unscoped | Specified as options H1, H6 and H7, with measured gates (§17) |
+| P7 | Prompt routing was not used to warm the cache | Option H8 (§17) |
+| P8 | The miss decision ignored in-flight DMAs and per-layer completion time | Arbiter minimizes each layer's latest completion, including waiting for in-flight loads (§8.6) |
+
+### A.3 Clarity gaps (not specified well enough to build)
+
+| # | Finding | Resolution |
+|---|---|---|
+| C1 | No host-device protocol: memory regions, ordering, polling and failure | §8.2 |
+| C2 | No configuration surface | §18 |
+| C3 | Tests did not cover policy conformance, protocol races or forced placements | §16.4 |
+| C4 | PLE hiding assumed a 80-150 µs layer 0; the faster GPU budget shrinks it to ~65-70 µs | Exposure model and an acceptance rule (§12.4) |
+| C5 | Statements that every miss is DRAM-bound | Corrected: plain decode is latency-bound at this capacity (§2, §4.1) |
+| C6 | Milestones lacked deliverables | §19 |
+
+### A.4 Projections and targets
+
+- Projections were recomputed with the per-kernel budget (§4.2).
+- The Must targets are unchanged.
+- The Stretch targets were raised to the model's projection at a 0.9 hit rate:
+  - plain decode 220 tok/s;
+  - speculative decode 330 tok/s;
+  - C = 8 aggregate 600 tok/s.
+
+  The 0.9 hit rate is below the replay traces' 0.974. The targets were set before any measurement
+  (§1.3).
