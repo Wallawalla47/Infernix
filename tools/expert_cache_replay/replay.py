@@ -496,6 +496,7 @@ class LFRU(Sim):
     def __init__(self, cap):
         super().__init__(cap)
         self.res = set(); self.f = defaultdict(int); self.last = {}; self.t = 0
+        self.trace = None   # set to a list to record (group, victims) for conformance fixtures
 
     def step_group(self, g, score):
         self.t += 1; gs = set(g); miss = []
@@ -507,9 +508,14 @@ class LFRU(Sim):
         if miss and len(self.res) + len(miss) > self.cap:
             t = self.t
             need = len(self.res) + len(miss) - self.cap
+            # IEEE binary64 score, ties to the lower key: the engine's policy reproduces this exactly.
             vict = heapq.nsmallest(need, (x for x in self.res if x not in gs),
-                                   key=lambda x: self.f[x] / (t - self.last[x] + 1))
+                                   key=lambda x: (self.f[x] / (t - self.last[x] + 1), x))
             for v in vict: self.res.discard(v)
+        else:
+            vict = []
+        if self.trace is not None:
+            self.trace.append(([int(k) for k in g], [int(v) for v in vict]))
         for k in miss:
             self.res.add(k); self.promo += score
 
