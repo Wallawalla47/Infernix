@@ -40,7 +40,7 @@ decode** on the target machine.
 11. [Speculative decoding](#11-speculative-decoding)
 12. [PLE n-gram table on NVMe](#12-ple-n-gram-table-on-nvme)
 13. [Prefill](#13-prefill)
-14. [Tuning: fixed, probed, and adapted](#14-tuning-fixed-probed-and-adapted)
+14. [Calibration and adaptive tuning](#14-calibration-and-adaptive-tuning)
 15. [Memory plans](#15-memory-plans)
 16. [Numerics and qualification](#16-numerics-and-qualification)
 17. [Implementation plan](#17-implementation-plan)
@@ -176,7 +176,7 @@ Strata is GGUF-based with custom CUDA kernels.
 | Speculation | MTP with up to 3 drafts, Q2_0 MTP experts in VRAM, a reduced draft head (106K ids), and suffix lookup. 1.6-1.8× on a 5070. Drafts run serially after verify, with a stream sync per step. | Gains depend on a high hit rate. Strata measured the missed-expert union at 1.75 / 2.4 / 3.05× one token's for windows of 2 / 3 / 4 tokens. |
 | PLE | 28.8 GB IQ4_NL repack. `O_DIRECT` `pread` on 16 threads, a 1M-row host CLOCK cache, and a **synchronous** gather before each window. | NVMe latency on the critical path whenever the row cache misses. |
 | KV | INT8 KV. Above 64K context only 32,768 cells per attention layer stay in VRAM, as a CLOCK cache of 4-cell blocks over an authoritative host copy (96-99.4% block hits on a 5090). | **This is why Strata keeps a large expert cache at 262K context**: KV costs ~0.4 GiB of VRAM instead of several GB. Adopted for long contexts (§9.5). |
-| Tuning | Offline `--calibrate`: sweeps `pcie_frac`, `spec_min_p` and pool workers, and keeps a value only if it is > 3% faster (no published gain). Startup probes: PCIe (best of 4 × 256 MiB bursts), CPU ISA and topology, cache auto-sizing, prefill chunk planning. Online: the adaptive tier, `DraftPolicy` EMAs. | See §14 for what this design fixes for the 5090, probes, and adapts online. |
+| Tuning | Offline `--calibrate`: sweeps `pcie_frac`, `spec_min_p` and pool workers, and keeps a value only if it is > 3% faster (no published gain). Startup probes: PCIe (best of 4 × 256 MiB bursts), CPU ISA and topology, cache auto-sizing, prefill chunk planning. Online: the adaptive tier, `DraftPolicy` EMAs. | §14 replaces this with host calibration, startup validation and online adaptation. |
 
 Strata's printed hit rate is hits / (hits + CPU-served misses). PCIe-served misses (the default
 `pcie_frac` share, 0.55) count in neither term, so the true VRAM hit rate is lower than printed.
@@ -866,9 +866,10 @@ turns out compute-bound there, the cost model in §11.2 learns that from measure
   use non-temporal software prefetch two bands ahead.
 - **Idle behavior.** Workers spin while a decode is active and park on a futex between requests, so
   an idle server does not burn CPU.
-- **Calibration at startup.** A 2-second probe measures single-core and all-core NVFP4 GEMV
-  throughput, DRAM bandwidth with and without concurrent DMA, and PCIe H2D bandwidth. These numbers
-  feed the cost model and the reports.
+- **Calibration.** `ninfer-calibrate` measures the NVFP4 GEMV service rate per kernel variant,
+  worker set and token count. It also measures DRAM bandwidth alone and under concurrent DMA, and
+  PCIe bandwidth. A ≤ 3 s startup probe re-validates these numbers every start (§14). They feed the
+  cost model and the reports.
 
 ---
 
@@ -1038,40 +1039,199 @@ hidden in an average.
 
 ---
 
-## 14. Tuning: fixed, probed, and adapted
+## 14. Calibration and adaptive tuning
 
-Strata tunes in three places:
+Every supported machine has the same GPU. The rest of the platform differs, and the CPU/host side
+sets the miss cost, the prefetch window, the PLE latency and the prefill CPU share:
 
-- an offline `--calibrate` sweep of `pcie_frac`, `spec_min_p` and pool workers, which keeps a value
-  only if it is > 3% faster and has no published gain;
-- startup probes;
-- online adaptation (adaptive tier, `DraftPolicy`).
+- PCIe link (Gen5 x16 vs Gen4, chipset vs CPU lanes);
+- DDR5 speed and channel population;
+- CPU ISA, core count and P/E or CCD topology;
+- NVMe latency and polled-queue support;
+- huge-page configuration;
+- memlock limits.
 
-Because this design targets one GPU, every GPU-dependent choice is made once, offline, by the
-developers. Only **host**-dependent and **workload**-dependent quantities are measured on the user's
-machine. Those are measured continuously rather than by an offline sweep, so they track the actual
-workload and stay current. An offline calibration command is added only if M9 shows a host-specific
-gain that the online models miss.
+The engine therefore **calibrates itself to the host**. Calibration only chooses among
+configurations that give the same numerical results: it changes speed, never output (§14.6).
 
-| Quantity | Strata | This design | Class |
+### 14.1 Three layers
+
+| Layer | When | Budget | Decides |
 |---|---|---|---|
-| Kernel variants, tiles, fused-route gating, GEMM schedules | Occupancy and shape rules at startup; hipBLASLt tables on AMD | Fixed per sm_120a shape at development time, with existing NInfer route-development evidence ([op development](op-development.md)) | Fixed for the 5090 |
-| Expert slot count | Auto-sized from free VRAM / largest blob | Planned by the Program from the startup budget (§15.1). Frames are uniform (NVFP4), so no per-layer blob sizing is needed. | Fixed per configuration |
-| Prefill chunk size | Ladder {32K, 16K, 8K, …} under a lend cap; the fork adds a 1K-step search | Largest lendable equal chunk, 1K steps (§13) | Planned at request time |
-| Prefill staging ring sizes | Ring of 96-384 slots by pinned share | Two staging buffers per layer sized by the chunk plan; experts always pinned | Fixed |
-| PCIe H2D bandwidth | Startup probe; scales `pcie_frac` below 20 GB/s | Startup probe (best of 4 × 256 MiB, DMA), plus continuous measurement of every prefetch and promotion copy | Host-dependent |
-| Host DRAM bandwidth, alone and while DMA runs | Not measured | Startup probe (2 s) plus continuous measurement of CPU miss service | Host-dependent |
-| CPU ISA, cores, P/E topology, worker count | ISA detection; workers = physical cores − 1; calibrate tries ⅔ and ½ | ISA dispatch (AVX-512 / AVX2+FMA, VNNI). Workers = physical P-cores − 2. E-cores included only if the startup probe shows they add service rate. | Host-dependent |
-| CPU-vs-PCIe share of critical-path misses | Static `pcie_frac` (0.55 / 0.2), offline sweep | Per-layer arbiter from measured service rates (§8.3) | Online |
-| Prefetch depth and k′ | — (no decode prefetch) | Token bucket plus useful-byte ratio. Prefetch is disabled per layer when its staged-hit yield falls below a threshold (§8.4). | Online |
-| Cache parameters (decay, budget) | Fixed adaptive-tier constants | LFRU with host shadow replay switching parameters (§9.4) | Online |
-| Draft length / `spec_min_p` | `DraftPolicy` EMAs; `spec_min_p` offline | Miss-aware cost model, all online (§11.2) | Online |
-| Prefill CPU share | Fork: per-layer EMA balance | Same idea, measured service rates (§13) | Online |
-| NVMe queue depth, L1 row-cache size | Static (256 in flight, 1M rows) | Startup QD1/QD32 latency probe on the table file; L1 sized by the RAM plan; per-round PLE wait telemetry | Host-dependent |
-| Pinned memory, huge pages, memlock limit | Windows pin cap; 4 KiB fallback | Startup check against the plan; 2 MiB pages required, with a clear failure message instead of silent 4 KiB fallback (ninfer-ext measured +11-32% from 2 MiB pages) | Host-dependent |
+| **Startup probe** | Every start | ≤ 3 s | Validates the loaded calibration profile against the hardware and seeds the online cost models with today's measurements. Without a profile it gives safe model-based defaults. |
+| **`ninfer-calibrate`** | Once per machine and artifact, and again when hardware, driver or BIOS changes (the startup probe says when) | `--quick` ~2 min; `--full` ~15-25 min | Host capability measurements, CPU kernel variant and worker set, page backing, NVMe I/O mode, and structural choices that need a restart or reallocation. Verified end to end. |
+| **Online adaptation** | Continuously while serving | Off the critical path | Continuous, workload-dependent parameters: miss arbiter split (§8.3), prefetch budget and k′ (§8.4), cache parameters (§9.4 shadow replay), draft length (§11.2), prefill CPU share (§13). These start from the calibrated values instead of generic defaults. |
 
-Every probe result and online estimate is reported in the startup log and the metrics endpoint, so a
-performance report always states the conditions it ran under.
+**Why both an explicit calibration and online adaptation.**
+
+- Online adaptation can only explore what it can change safely mid-request: continuous knobs with
+  smooth effects.
+- Worker count and placement, page backing (THP vs hugetlbfs 2 MiB or 1 GiB), the CPU kernel
+  variant, NVMe I/O mode, the RAM split between the PLE L1 cache and the KV host tier, and the
+  long-context KV-tier threshold are **structural**. They need a restart or a reallocation, or they
+  behave discontinuously. Exploring them online would cause latency spikes.
+- A calibrated starting point also means the first requests run at full speed. Online estimators
+  would otherwise have to converge from generic defaults.
+
+### 14.2 What `ninfer-calibrate` measures and decides
+
+**Stage 0: inventory.** Instant, nothing timed. It reads:
+
+- GPU UUID, VBIOS, driver and CUDA versions, and the negotiated PCIe link (generation and width,
+  from NVML);
+- CPU model, ISA flags, P/E or CCD topology (cpuid, sysfs);
+- installed memory, DIMM count and speed (sysfs/SMBIOS when readable);
+- NUMA layout;
+- NVMe model and firmware, and whether polled queues are enabled (`nvme poll_queues`);
+- huge-page pools, THP mode, `RLIMIT_MEMLOCK`;
+- the kernel version.
+
+Stage 0 also emits **actionable system advice** before measuring:
+
+- a link trained below Gen5 x16;
+- DIMMs below rated speed, or a 4-DIMM configuration known to drop speed;
+- no 2 MiB / 1 GiB huge pages configured;
+- a memlock limit below the plan;
+- NVMe without polled queues;
+- background load on the GPU or CPU.
+
+**Stage 1: microbenchmarks** (~60-90 s, GPU and host quiescent). Each runs ≥ 5 interleaved
+repetitions and reports median and range:
+
+| Measurement | Method | Used for |
+|---|---|---|
+| H2D DMA bandwidth vs copy size (64 KiB-16 MiB), D2H | Copy engine from the pinned arena, each page backing | Prefetch and promotion budget; detects small-copy penalties |
+| SM zero-copy read bandwidth and latency from mapped host memory | Kernel reading the expert arena | KV-tier block fetch (§9.5) |
+| DRAM read bandwidth vs threads (per P-core, E-core, CCD) | Streaming reads over the pinned arena | Worker set; per-CCD placement (Zen CCDs have separate bandwidth limits) |
+| **DRAM contention curve:** CPU read bandwidth while H2D DMA runs at 0 / 25 / 50 / 100% | Concurrent runs | Arbiter and token-bucket model (§8.3, §8.4). Host DRAM is the shared bottleneck. |
+| CPU NVFP4 expert GEMV: each compiled variant (AVX-512 / AVX2; A16, and A8 only if the recipe allows it and the user opted in), T ∈ {1, 2, 4, 8}, worker counts, SMT on/off, prefetch distance | Real expert records | Kernel variant, worker set, service-rate table t_cpu(n_experts, T) |
+| GPU↔CPU mailbox round trip | Mapped-memory publish → host spin → completion → device acquire | Handshake term in the cost model |
+| NVMe random 4 KiB reads at QD 1-256 on the n-gram file, for `O_DIRECT` + io_uring with and without SQPOLL/IOPOLL | Random row ids | I/O mode, queue depth, expected PLE latency; whether layer 0 hides it (§12.3) |
+| Huge pages | DMA and CPU bandwidth over THP 2 MiB, hugetlbfs 2 MiB and 1 GiB | Page backing of the expert arena |
+| GPU sanity | Fixed-shape decode kernels vs the expected time for an RTX 5090 | Detects power-limit throttling, a downtrained link or a busy GPU, and refuses to calibrate on a disturbed machine |
+
+**Stage 2: model-level cost fit** (~1-2 min). The real decode graph runs with **synthetic routing**
+at controlled miss rates (0, 1, 2, 4 misses per layer; T = 1, 4, 8). This fits the online cost
+model's coefficients to this machine:
+
+- t_gpu(T);
+- exposed stall per CPU-served miss;
+- the hit-GEMV overlap;
+- the prefetch window per layer;
+- the drafting cost.
+
+The fitted model replaces the generic assumptions in §4.2 for this host. It also produces an honest
+**predicted tok/s versus hit rate** curve for the machine.
+
+**Stage 3: end-to-end A/B of structural choices** (`--full` only, ~10-20 min).
+
+- **Method.**
+  1. The cost model ranks candidates and predicts the best.
+  2. Only the top 2-3 per choice are verified end to end, on a bundled calibration corpus (chat,
+     code, CJK, 32K document), through the public Engine.
+  3. Runs are interleaved A/B/A/B, with ≥ 3 repetitions each.
+  4. Coordinate descent runs over these choices:
+     - worker set (incl. E-cores, SMT);
+     - CPU kernel variant;
+     - page backing;
+     - NVMe mode and queue depth;
+     - prefetch on/off, k′ and depth;
+     - RAM split between the L1 row cache and the KV host tier;
+     - KV-tier threshold;
+     - maximum prefill chunk and the CPU-assist threshold;
+     - maximum draft length and n-gram copy proposals.
+- **Acceptance rule.** A non-default choice is kept only if its median beats the default by more
+  than the larger of 2% and twice the measured run-to-run spread. Otherwise the default stays.
+  Strata uses a fixed 3% margin; this rule also respects noise.
+- **Reporting.** The report lists every candidate measured, including the losers.
+
+**Stage 4: cache parameters from the user's own routing** (seconds, CPU only).
+
+- If routing-trace recording is enabled (expert ids only, opt-in), the recorded traces are replayed
+  through the §9.4 policy family with `tools/expert_cache_replay`.
+- This fixes the LFRU parameters and promotion budget for the user's real workload, rather than for
+  the calibration corpus.
+- The online shadow replay keeps them current afterwards.
+
+### 14.3 Calibration profile
+
+The output is a JSON profile in the engine's state directory, next to the saved cache state. It
+contains:
+
+- **Fingerprint.**
+  - Hardware: GPU UUID, PCIe link, CPU model and microcode, memory size and speed, NVMe model and
+    firmware.
+  - Software: driver, CUDA, kernel.
+  - Artifact id and engine build.
+- **Measurements**, with medians and ranges.
+- **Fitted cost-model coefficients.**
+- **Chosen settings**, each with its evidence (measured gain and margin) or "default kept".
+- **System advice**, and whether it was applied.
+
+At start, the engine behaves as follows:
+
+1. **Fingerprint matches.** It loads the profile, runs the ≤ 3 s probe (PCIe, DRAM, NVMe QD1/QD32,
+   mailbox), and compares.
+   - **Drift ≤ 15%:** use the profile. Online models take today's numbers.
+   - **Drift > 15%:** use today's numbers in the cost models, keep the structural choices, and log
+     a recommendation to recalibrate. Typical causes are a downtrained link, a changed memory
+     profile, or a thermally limited CPU.
+2. **Fingerprint differs** (hardware, driver or artifact changed). It ignores the profile, uses the
+   probe plus model-based defaults, and recommends `ninfer-calibrate`.
+
+Explicit command-line options always override profile values. `--calibration off` ignores the
+profile, which is needed for reproducible benchmarking. `--calibration PATH` selects one.
+
+### 14.4 What stays fixed for the RTX 5090
+
+These choices depend only on the GPU and the model, and are made once at development time with
+NInfer's route-development evidence ([op development](op-development.md)). They are never
+calibrated per machine:
+
+- kernel variants, tiles and fused-route gating;
+- GEMM and attention schedules;
+- graph topology;
+- frame size and the expert record layout;
+- the device memory plan's structure.
+
+A different GPU is outside the product scope (§1.4).
+
+### 14.5 Mapping from Strata's tuning
+
+| Strata | This design |
+|---|---|
+| `--calibrate`: `pcie_frac` {0, 0.2, 0.35, 0.55, 0.75}, `spec_min_p` {0.3, 0.5, 0.7}, workers {default, ⅔, ½}; keep if > 3% | Miss split and draft length become **online** cost-model decisions, seeded by Stage 2. Workers are chosen in Stage 1 by measured service rate and verified in Stage 3. The acceptance rule is noise-aware. |
+| PCIe probe, which only matters below 20 GB/s | Full DMA size curve, plus the DRAM contention curve that the arbiter needs |
+| CPU ISA detection | ISA dispatch plus measured variant choice per ISA |
+| Static PLE I/O settings (256 in flight, 1M-row cache) | Measured NVMe mode and queue depth; L1 size from the RAM plan and Stage 3 |
+| 4 KiB fallback when no huge pages | Huge pages measured. Missing huge pages produce explicit advice, not a silent slowdown. |
+| Prefill chunk ladder, ring sizes | Planned per request from the frame pool (§13). Ring sizes are fixed. |
+| Adaptive tier constants | LFRU with Stage 4 fit and online shadow replay |
+
+### 14.6 Safety rules
+
+- Calibration and online adaptation choose only among configurations that are numerically
+  identical:
+  - placement-invariant A16 routes (§16.2);
+  - different workers, page backing, I/O, prefetch and cache settings.
+
+  The A8 CPU route changes results, so it is offered only when the artifact's Use permits A8 **and**
+  the user explicitly enables it.
+- Calibration runs only on a quiescent machine. It aborts and reports if the GPU is in use or CPU
+  load is above a threshold.
+- Every probe result and online estimate is visible in the startup log and the metrics endpoint.
+  A performance report always states the calibration profile and conditions it ran under.
+
+### 14.7 Ownership
+
+| Component | Owner |
+|---|---|
+| Probe primitives: copy timing, DRAM streams, mailbox round trip, NVMe I/O | Core (model-independent) |
+| Calibration profile schema, fingerprint, drift check | Runtime (common execution contract) |
+| Consuming the profile when planning frames, workers, I/O, prefetch and cost models | The Qwen4Exp Program at startup |
+| `ninfer-calibrate` (CLI, corpus, Stage 3 orchestration through the public Engine, report) | Product (`apps/`) |
+| Trace replay for Stage 4 | `tools/expert_cache_replay` |
+
 
 ---
 
@@ -1224,7 +1384,8 @@ absorbed.
 | **M6** | Decode graph fusion (≤ 10 kernels per layer, PDL), device-driven PLE, host-sync-free round boundary. nsys attribution of one token. | Plain decode Must target (≥ 120 tok/s). Attribution table published. |
 | **M7** | Speculative decoding with residency-bounded drafter and miss-aware K; n-gram copy | Speculation Must target (≥ 160 tok/s). Spec never below plain on any corpus category by more than noise, shown by repeated runs. |
 | **M8** | Prefill streaming, thin-expert CPU help, QSA pooled-key plane | Prefill Must target; short-prompt prefill reported |
-| **M9** | Head-to-head campaign vs Strata UD-Q4_K_XL and ninfer-ext on the target machine; serving C=1..8; 4K/32K/128K; quality report | §1.3 table filled with every result, favorable or not |
+| **M9** | Calibration (§14): startup probe, `ninfer-calibrate --quick/--full`, profile and drift check, Stage 2 cost-model fit, Stage 3 A/B harness. Validate it on at least two different hosts, for example AVX-512 + Gen5 and AVX2 + Gen4, or 2 vs 4 DIMMs. | On each host, the calibrated configuration beats the uncalibrated defaults or ties within noise on the calibration corpus **and** a held-out corpus. Every chosen and rejected candidate is reported. A recalibration on the same host reproduces the choices. |
+| **M10** | Head-to-head campaign vs Strata UD-Q4_K_XL and ninfer-ext on the target machine; serving C=1..8; 4K/32K/128K; quality report | §1.3 table filled with every result, favorable or not |
 
 ---
 
@@ -1242,7 +1403,8 @@ When the implementation lands:
 - [Artifact container](artifact-container.md), [storage layouts](storage-layouts.md): residency
   classes, `expert_record_nvfp4_*`, the n-gram volume.
 - [Weight conversion](../weight-conversion.md), [CLI](../cli.md), [serving](../serving.md): recipe and
-  options (`--expert-cache`, `--cpu-experts`, `--ngram-file`, `--ple-row-cache`).
+  options (`--expert-cache`, `--cpu-experts`, `--ngram-file`, `--ple-row-cache`, `--calibration`), and
+  `ninfer-calibrate`.
 - `docs/performance/qwen3.8-flash-next.md` and a model card.
 - This file is deleted.
 
@@ -1259,6 +1421,7 @@ When the implementation lands:
 | NVIDIA's dense tensors are already NVFP4 or excluded differently than assumed | Recipe table changes | M0 reads `hf_quant_config.json`; recipe follows the source |
 | Mapped-memory spin waits inside graphs, and driver behavior | Hangs or latency spikes | Bounded spins with a watchdog; fall back to `cuStreamWaitValue32` graph memory-op nodes if measured better |
 | NVMe without polled queues, or high latency (QLC, DRAM-less) | PLE wait exposed | L1 cache size; telemetry; documented drive requirement |
+| Calibration overfits the bundled corpus or a noisy measurement | Settings that are slower on real workloads | Held-out corpus check in M9, noise-aware acceptance, defaults kept on ties, online adaptation corrects continuous parameters |
 | Placement-invariant arithmetic costs too much | Lower hit GEMV throughput | §16.2 decision rule, disclosed |
 | 96 GB is tight with a desktop session | OOM or swap | Startup plan check; configurable L1 and checkpoint tier; recommended server-only operation |
 
