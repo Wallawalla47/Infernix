@@ -374,8 +374,9 @@ which require `--use-original-prefix-caching`. Details:
   within 0.7 standard errors of the per-window differences. The partials took up to 64 MiB of
   workspace: 576 fewer KV tokens (0.23 %) at startup with `--max-context 140000`; their bound is now
   `--prefill-split-workspace-mib` (below).
-- **8-bit P×V in prompt attention** (default for NVFP4 and K8V4 KV; `--prefill-8bit-pv` turns it
-  on for INT8 KV, which defaults to FP16 P×V, and `--no-prefill-8bit-pv` forces FP16 everywhere).
+- **8-bit P×V in prompt attention** (default for NVFP4, K8V4 and VQ2 KV; `--prefill-8bit-pv`
+  turns it on for INT8 and K4V2 KV, which default to FP16 P×V, and `--no-prefill-8bit-pv`
+  forces FP16 everywhere).
   NVFP4 and K8V4 KV: the MX-FP8 tiled prompt kernel rounds each probability (as 256 p against its
   tile's own row maximum, which the softmax reference follows) and each decoded V value to E4M3 and
   multiplies them on block-scaled E4M3 Tensor Cores with FP32 accumulation, four times the rate of
@@ -395,6 +396,16 @@ which require `--use-original-prefix-caching`. Details:
   stream moved by under 0.002 nats per token, but at 64K single streams moved by up to 0.36 (K8V4) —
   the corpus moves that much for any small numeric change, which is why the KL comparison above is
   the direct measure.
+  VQ2 and K4V2 KV: the vector-quantized prompt kernel runs the same integer form over the tile's
+  INT8 V rows, scaling each group's probabilities by that key's row scale and rounding them to
+  u8 codes against their row maximum. VQ2 takes it by default: against a BF16 KV reference on a
+  BF16-activation model its KL divergence moves 0.0367 → 0.0378 (1.03x, every bucket within
+  1.05x, top-1 within 0.04 pp) while prefill of one request is 5.0 % faster at 64K tokens and
+  6.8 % at 128K. K4V2 stays opt-in: its divergence moves 0.0212 → 0.0232, 1.09x overall but
+  1.11x in the 32-64K bucket, against the 1.10x bound the other formats were held to, for
+  5.3 % and 7.2 % the same way. Per attention layer the two are 3.3-18 % faster at 3584-key
+  chunks over long context (geomean 0.97 over 256-3584 keys at 0-64K) and up to 5 % slower for
+  512-1024-key calls over an empty context.
   INT8 KV (`--prefill-8bit-pv`, off by default): the fast kernel multiplies P×V on INT8 Tensor Cores
   (4× the FP16 rate with FP32 accumulation on RTX 5090); each row's probabilities, scaled by the V
   group scale, are quantized to 8-bit codes per 64-key tile and multiplied against the stored INT8 V

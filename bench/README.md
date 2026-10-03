@@ -603,10 +603,11 @@ not 32 speculative rounds. Cold measurements require one call per graph.
 cover every visible row. The default uses the exact visible length. CSV rows record both bounds,
 so broad Graph-envelope measurements can be distinguished from exact-length measurements.
 `--fast-prompt` sets every envelope's fast prompt-kernel hint (INT8 and NVFP4 KV),
-`--fast-prompt-pv8` also selects the 8-bit P×V forms (INT8, NVFP4 and K8V4), and
+`--fast-prompt-pv8` also selects the 8-bit P×V forms (INT8, NVFP4, K8V4, VQ2 and K4V2), and
 `--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
 `--prefill-split-workspace-mib`). `--prefill-8bit-pv` / `--no-prefill-8bit-pv` override the
-per-format P×V default of `ninfer-bench` itself (8-bit for NVFP4 and K8V4, FP16 for INT8).
+per-format P×V default of `ninfer-bench` itself (8-bit for NVFP4, K8V4 and VQ2; FP16 for INT8
+and K4V2).
 
 ```bash
 cmake --build build --parallel --target ninfer_causal_softmax_attention_bench

@@ -749,3 +749,37 @@ noise, and does not remove the remaining 24-40 bytes of FP8/K8V4 spill: 2-3 spil
 further. The 32-register `bf[2][QKNt][2]` double-buffered key fragment was left alone: unrolling the
 pipelined FP8 QK loop by two is what makes the load/mma overlap work, and the measured spills there
 are small.
+
+## Vector-quantized KV: the 8-bit PV form, and what its FP16 path's spills are worth
+
+The VQ2 and K4V2 caches (the Vq2 and Q4KeyVq2Value storages) run a prompt kernel derived from the
+fast INT8 one, and their V rows already sit in the INT8-G64 tile layout the INT8 8-bit PV form
+consumes, so that form ports directly: each group's probabilities, scaled by that key's row scale,
+become u8 codes against their row maximum over the tile, and `mma.m16n8k32.s32.u8.s8.s32` multiplies
+them by the tile's INT8 V rows with exact INT32 accumulation — no V code is decoded again. The VQ
+attention test's prompt cases run both PV forms at both tile widths (32 keys under 1536 visible,
+64 above), with and without key splits, through the exact-window band and a stale window, and
+through the cached entry, all against the FP64 oracle. On Q6 (BF16 activations, full corpus, 64K
+windows, against a BF16 KV reference) the form costs VQ2 0.03666 → 0.03778 mean KL (1.03x, every
+bucket within 1.05x, top-1 within 0.04 pp) and K4V2 0.02124 → 0.02319 (1.09x overall, 1.11x in the
+32-64K bucket), both reproducible to four digits across two runs. VQ2 therefore takes the 8-bit
+form by default alongside NVFP4 and K8V4, while K4V2 stays opt-in against the 1.10x longest-bucket
+bound the other formats were held to. Per attention layer the form is 3.3-18 % faster at 3584-key
+chunks over long context (geomean 0.97 over 256-3584 keys at 0-64K keys) and up to 5 % slower for
+512-1024-key calls over an empty context; end to end it removes 5.0 % (VQ2) and 5.3 % (K4V2) of one
+request's prefill time at 64K tokens and 6.8 % and 7.2 % at 128K. A budget sweep on VQ2 confirms the
+256 MiB split-workspace default for these formats as well: 64 MiB is 14-26 % slower for
+1024-2048-token chunks over 32-128K cached keys, 128 MiB 1-6.6 %, 256 MiB within 0.1 % of
+unbounded, and full 3584-token chunks are unaffected.
+
+The FP16 PV path spills 36-96 bytes of stack per thread (the 8-bit form: median 2), so three ways to
+remove that were built and measured. Rolling either the group loop or the pass loop of the PV nest
+removes the spills completely (median 0) and is decisively worse: 1.20-1.76x per shape, geomean
+1.44, on both formats and in all three rolled variants, while the unchanged 8-bit path in the same
+binaries measures identical within 0.7 % — the difference is the change, not the build. Shortening
+the scale fragments' live range instead — filling them per pass, or loading each key step's pair
+where it is used, both with the loops left unrolled — does not reduce the spills at all (median 36 →
+48 bytes). The unrolled nest is what lets ptxas software-pipeline the ldmatrix/decode/mma chain, and
+its spill traffic is far cheaper than losing that schedule, so the loops stay as they are. The whole
+opportunity is bounded anyway: the near-spill-free 8-bit form is only 2.8 % faster per layer than
+the FP16 one, and part of that gap is its different Tensor Core rate rather than the spills.

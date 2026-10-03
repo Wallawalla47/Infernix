@@ -26,7 +26,7 @@ prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 vis
 `ninfer-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
 `--kv-dtype`. Prompt attention's P×V form follows `ninfer-serve`'s per-format default: the fast
-NVFP4 kernel and `k8v4` use their 8-bit forms, INT8 KV its FP16 form. `--prefill-8bit-pv` and
+NVFP4 kernel, `k8v4` and `vq2` use their 8-bit forms; INT8 and `k4v2` keep FP16. `--prefill-8bit-pv` and
 `--no-prefill-8bit-pv` force either form. `report.json` records them as
 `original_int8_prefill_kernel`, `prefill_8bit_pv` and `original_nvfp4_prefill_kernel`.
 

@@ -294,6 +294,7 @@ struct Call {
     int oracle_columns           = 64;    // query columns checked per row (evenly spaced)
     int envelope_keys            = 0;     // visible-key envelope (0: the cache capacity); above
                                           // 32K it selects the 8-column verification CTAs
+    bool prompt_pv8              = false; // the prompt kernel's 8-bit PV form
 };
 
 int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std::string& name,
@@ -338,6 +339,7 @@ int run_call(const Geometry& g, KvCacheStorage storage, const Call& c, const std
     const ops::AttentionHeadGeometry geometry{kDim, g.q_heads, g.kv_heads};
     ops::CausalAttentionExecutionEnvelope envelope{1, static_cast<std::uint32_t>(capacity)};
     envelope.fast_prompt_kernel = true;
+    envelope.fast_prompt_pv8    = c.prompt_pv8;
     const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
         geometry, storage, envelope, batch, width, width, test_execution());
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
@@ -573,6 +575,25 @@ int main(int argc, char** argv) {
                     failures += run_call(g, storage,
                                          Call{.width = w, .prefix = {prefix}, .seed = 71u + w, .oracle_columns = 24},
                                          "prompt W=" + std::to_string(w) + " prefix=" + std::to_string(prefix));
+                // The prompt kernel's 8-bit PV form: its V rows stay the stored INT8 codes and
+                // groups, so the case criterion is the format's own. Both tile widths (a call
+                // under 1536 visible keys takes 32-key tiles, above it 64) and the exact-window
+                // band are covered, with and without key splits and through the cached entry.
+                for (const auto& [w, prefix, stale] :
+                     std::vector<std::array<int, 3>>{{300, 0, 0}, {1100, 900, 0}, {300, 3000, 0},
+                                                     {2048, 40, 0}, {300, 5000, 0}, {300, 1500, 1}}) {
+                    failures += run_call(
+                        g, storage,
+                        Call{.width = w, .prefix = {prefix}, .seed = 91u + w, .oracle_columns = 24,
+                             .prompt_pv8 = true},
+                        "prompt pv8 W=" + std::to_string(w) + " prefix=" + std::to_string(prefix),
+                        stale != 0);
+                }
+                failures += run_call(
+                    g, storage,
+                    Call{.width = 400, .prefix = {1800}, .seed = 92, .cached = true,
+                         .oracle_columns = 16, .prompt_pv8 = true},
+                    "cached prompt pv8 W=400");
             }
         }
     }

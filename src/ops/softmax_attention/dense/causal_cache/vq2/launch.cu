@@ -60,6 +60,9 @@ struct VqKvCausalPlan {
     // planning call was given (CausalAttentionExecutionEnvelope::prompt_split_workspace_bytes),
     // so the plan carries it to the launch.
     std::size_t prompt_split_workspace_bytes = kCausalPromptSplitWorkspaceDefaultBytes;
+    // CausalAttentionExecutionEnvelope::fast_prompt_pv8: the prompt route's PV runs on 8-bit
+    // Tensor Cores over the tile's INT8 V rows. It changes no allocation, so the plan carries it.
+    bool prompt_pv8 = false;
 };
 
 VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
@@ -67,6 +70,7 @@ VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
     VqKvCausalPlan out{
         make_int8_kv_causal_plan(heads, width, batch, envelope, fast_prompt_multiprocessors()), 0};
     out.prompt_split_workspace_bytes = envelope.prompt_split_workspace_bytes;
+    out.prompt_pv8                   = envelope.fast_prompt_pv8;
     if (out.plan.family == Int8KvFamily::Tiled) return out;
     const bool parallel = out.plan.family == Int8KvFamily::ParallelGrouped;
     out.parallel_tile   = envelope.max_visible_keys <= kVqWideTileMaxKeys ? kVqParallelTile : 8;
@@ -182,8 +186,8 @@ void grouped_routes(const CausalAttentionOperands& p, const VqKvCacheView& cache
 
 template <class G, KVCacheVqKeyCodec Codec>
 void prompt(const CausalAttentionOperands& p, const VqKvCacheView& cache,
-            const KVCacheVqStaging* staging, std::size_t split_budget, WorkspaceArena& workspace,
-            cudaStream_t stream) {
+            const KVCacheVqStaging* staging, std::size_t split_budget, bool pv8,
+            WorkspaceArena& workspace, cudaStream_t stream) {
     validate_vq_causal_operands<G>(p, cache);
     if (p.batch != 1)
         throw std::invalid_argument("VQ prompt attention requires a complete single query row");
@@ -197,9 +201,10 @@ void prompt(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         staging ? VqPromptStaging{staging->k_codes, staging->v_codes, staging->k_scales,
                                   staging->v_scales}
                 : VqPromptStaging{nullptr, nullptr, nullptr, nullptr};
-    const auto launch_prompt = [&]<int Warps, bool Split, int Bc, class Metadata>(Metadata metadata) {
+    const auto launch_prompt = [&]<int Warps, bool Split, bool Pv8, int Bc, class Metadata>(
+                                   Metadata metadata) {
         using Shape           = VqPromptShape<Codec, Warps, Bc>;
-        constexpr auto kernel = vq_prompt_kernel<G, Metadata, Codec, Warps, Split, Bc>;
+        constexpr auto kernel = vq_prompt_kernel<G, Metadata, Codec, Warps, Split, Pv8, Bc>;
         static const auto status = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Shape::SmemBytes);
         CUDA_CHECK(status);
@@ -215,10 +220,21 @@ void prompt(const CausalAttentionOperands& p, const VqKvCacheView& cache,
         // whose tiles are mostly exact rows loaded before use.
         const bool wide_tiles = p.visible_capacity >= kVqPromptWideTileKeys;
         const auto launch     = [&]<int Warps, bool Split>() {
+            if (pv8) {
+                if (wide_tiles)
+                    launch_prompt.template operator()<Warps, Split, true, kVqPromptWideBc, Metadata>(
+                        metadata);
+                else
+                    launch_prompt.template operator()<Warps, Split, true, kVqPromptBc, Metadata>(
+                        metadata);
+                return;
+            }
             if (wide_tiles)
-                launch_prompt.template operator()<Warps, Split, kVqPromptWideBc, Metadata>(metadata);
+                launch_prompt.template operator()<Warps, Split, false, kVqPromptWideBc, Metadata>(
+                    metadata);
             else
-                launch_prompt.template operator()<Warps, Split, kVqPromptBc, Metadata>(metadata);
+                launch_prompt.template operator()<Warps, Split, false, kVqPromptBc, Metadata>(
+                    metadata);
         };
         if (plan.splits == 1) {
             if (plan.warps == 4)
@@ -256,10 +272,10 @@ void attention(const CausalAttentionOperands& p, const VqKvCacheView& cache,
     if (plan.family == Int8KvFamily::Tiled) {
         if (p.query_heads == 24)
             prompt<CausalD256H24Kv4, Codec>(p, cache, staging, vq.prompt_split_workspace_bytes,
-                                            workspace, stream);
+                                            vq.prompt_pv8, workspace, stream);
         else
             prompt<CausalD256H16Kv2, Codec>(p, cache, staging, vq.prompt_split_workspace_bytes,
-                                            workspace, stream);
+                                            vq.prompt_pv8, workspace, stream);
         return;
     }
     auto scope         = workspace.scope();
