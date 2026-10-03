@@ -2,7 +2,7 @@
 
 **Status: design proposal, not implemented.** This is a temporary planning document for the
 Qwen3.8-Flash-Next product change. When the implementation lands, its stable content moves into
-the active authorities named in [§17](#17-documentation-and-authority-changes) and this file is
+the active authorities named in [§18](#18-documentation-and-authority-changes) and this file is
 removed.
 
 This design adds `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, about 180B parameters) to NInfer.
@@ -40,12 +40,13 @@ decode** on the target machine.
 11. [Speculative decoding](#11-speculative-decoding)
 12. [PLE n-gram table on NVMe](#12-ple-n-gram-table-on-nvme)
 13. [Prefill](#13-prefill)
-14. [Memory plans](#14-memory-plans)
-15. [Numerics and qualification](#15-numerics-and-qualification)
-16. [Implementation plan](#16-implementation-plan)
-17. [Documentation and authority changes](#17-documentation-and-authority-changes)
-18. [Risks and open questions](#18-risks-and-open-questions)
-19. [Sources](#19-sources)
+14. [Tuning: fixed, probed, and adapted](#14-tuning-fixed-probed-and-adapted)
+15. [Memory plans](#15-memory-plans)
+16. [Numerics and qualification](#16-numerics-and-qualification)
+17. [Implementation plan](#17-implementation-plan)
+18. [Documentation and authority changes](#18-documentation-and-authority-changes)
+19. [Risks and open questions](#19-risks-and-open-questions)
+20. [Sources](#20-sources)
 
 ---
 
@@ -109,7 +110,7 @@ missed, the report says so; the target is not changed after the measurement.
 ### 1.4 Non-goals
 
 - Copying Strata or ninfer-ext code. Both were studied for mechanisms and measurements only.
-- Experts below NVFP4 precision by default. [§18](#18-risks-and-open-questions) lists this as a
+- Experts below NVFP4 precision by default. [§19](#19-risks-and-open-questions) lists this as a
   possible explicit opt-in.
 - Multi-GPU, AMD, or GPUs other than `sm_120a`.
 - A generic offloading framework for other models. The mechanisms are written for this
@@ -168,16 +169,36 @@ Strata is GGUF-based with custom CUDA kernels.
 
 | Mechanism | Detail | Consequence for NVFP4 on 32 GB |
 |---|---|---|
-| Expert placement | All experts pinned in RAM; VRAM slots are filled from a ranked routing profile. Every 4 rounds an adaptive thread swaps experts per layer using decayed LFU (factor 0.7, gain ≥ 1.5×, ≤ 96 swaps). Since issue #463 the next round **waits** for those swaps. | Sound idea. At 2.77 MB per expert, 96 blocking swaps cost ~5 ms. |
+| Expert placement | All experts pinned in RAM. VRAM slots are filled in the order of a shipped routing profile (all 24,576 experts ranked; `data/expert-profile.bin`). **Misses are never admitted on demand.** Every 4 rounds, `adapt()` (`src/program/generate.cpp`) pairs each layer's hottest non-resident experts (decayed count ≥ 2) against that layer's coldest residents and swaps while candidate ≥ victim + 1.5. It applies at most 96 swaps (highest gain first), then multiplies every count by 0.7. The victim is evicted at once and the newcomer admitted when its copy lands. Since issue #463 the next round **waits** for those swaps. The learned ranking can be saved and reloaded (`--expert-profile-save`). | A good **bandwidth** trade: in replay it makes ~7× fewer promotions than LRU (§9.4). Its counts decay by half about every 8 rounds, so it is mostly recency-driven, and it has 0-15% more misses than LRU. At 2.77 MB per expert, 96 blocking swaps cost ~5 ms. |
 | Miss service | Distinct misses are split between CPU in-place compute and an in-graph SM copy kernel that reads mapped host memory (`pcie_frac`, 0.55 by default for IQ packs) | CPU plus PCIe co-service is the right primitive, but the copy kernel occupies SMs and serializes after the hit kernels. |
 | Hit/miss resolution | **One GPU→host→GPU handshake per layer, even at a 100% hit rate.** A doorbell kernel writes the activation and ids to mapped memory, the host builds the plan, and a single-thread GPU spin kernel waits. A device-side planner exists but is off by default. | 48 serialized round trips per window, on the critical path. |
 | Kernels | llama.cpp-style dp4a MMVQ, FP32 gate/up intermediates through global memory, BF16 hyper-connections (~1.27 GB read per window). About 2,000 graph nodes per window. | On a 5090 a verify round takes ~14-15 ms against a ~2 ms bandwidth floor: it is overhead-bound even at 98% hits. |
 | Speculation | MTP with up to 3 drafts, Q2_0 MTP experts in VRAM, a reduced draft head (106K ids), and suffix lookup. 1.6-1.8× on a 5070. Drafts run serially after verify, with a stream sync per step. | Gains depend on a high hit rate. Strata measured the missed-expert union at 1.75 / 2.4 / 3.05× one token's for windows of 2 / 3 / 4 tokens. |
 | PLE | 28.8 GB IQ4_NL repack. `O_DIRECT` `pread` on 16 threads, a 1M-row host CLOCK cache, and a **synchronous** gather before each window. | NVMe latency on the critical path whenever the row cache misses. |
-| KV | INT8 KV, with only the hot part in VRAM above 64K and the rest streamed from RAM | Not needed at our KV sizes ([§14](#14-memory-plans)). |
+| KV | INT8 KV. Above 64K context only 32,768 cells per attention layer stay in VRAM, as a CLOCK cache of 4-cell blocks over an authoritative host copy (96-99.4% block hits on a 5090). | **This is why Strata keeps a large expert cache at 262K context**: KV costs ~0.4 GiB of VRAM instead of several GB. Adopted for long contexts (§9.5). |
+| Tuning | Offline `--calibrate`: sweeps `pcie_frac`, `spec_min_p` and pool workers, and keeps a value only if it is > 3% faster (no published gain). Startup probes: PCIe (best of 4 × 256 MiB bursts), CPU ISA and topology, cache auto-sizing, prefill chunk planning. Online: the adaptive tier, `DraftPolicy` EMAs. | See §14 for what this design fixes for the 5090, probes, and adapts online. |
 
-Strata's true VRAM hit rate is lower than it reports, because PCIe-served misses are excluded from
-the reported ratio. On 12 GB cards, profile-only caching gave ~0.50 and adaptive caching ~0.72.
+Strata's printed hit rate is hits / (hits + CPU-served misses). PCIe-served misses (the default
+`pcie_frac` share, 0.55) count in neither term, so the true VRAM hit rate is lower than printed.
+On 12 GB cards, profile-only caching gave ~0.50 and adaptive caching ~0.72. A user-measured printed
+hit rate above 80% at 262K context with Q8 on a 5090 is consistent with KV streaming keeping the
+cache large; replay at comparable capacity gives the Strata policy 0.87-0.92 (§9.4).
+
+**Forks.**
+
+- **architectds/Strata** (`best`, 10 commits ahead of v0.1.38) adds three things:
+  - **prefill CPU assist** — the CPU computes the thinnest non-resident experts (≤ 8 tokens,
+    fewest first) while the copy engine streams the rest, balanced online by per-layer EMAs of
+    CPU µs per unit vs GPU µs per streamed expert. Claimed 1.35-1.49× for 200-1,000-token prompts
+    and ≈ 1.0× at 4K, measured on PCIe 3.0 with DDR4;
+  - **equal-size prompt chunks** with a short-tail exception, plus a 1024-token-step search for the
+    largest chunk that expert-slot lending allows (+21-59% at 9K-100K with `auto:16384`);
+  - a **VMM-backed elastic expert cache** (`LEND`/`RECLAIM`) for on-demand vision.
+
+  There is nothing new on decode or cache policy. The ideas are folded into §9.2 and §13.
+- **chimpera/strata-nvfp4** (reported, not verified) runs Qwen3.8 NVFP4 experts with ~7,200-7,350
+  slots on a 5090. It tunes the adaptive tier to every 2 rounds, decay 0.92 and 192 swaps, and
+  reports 30-40% fewer misses than upstream.
 
 ### 3.2 ninfer-ext
 
@@ -210,8 +231,10 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
 | Eliseev & Mazur (2312.17238), FATE (2502.12224) | Next layer's gate applied to the current hidden state to predict the next layer's experts; FATE reports cosine similarity > 0.83 and 97% prefetch accuracy | §8.4. Recall must be measured: the HC streams may weaken it on this model. |
 | SP-MoE (2510.10302) | Prefetch the experts implied by draft tokens before verification | §11.3 |
 | Fiddler (2402.07033), KTransformers (SOSP'25), FreeToken q\* | CPU computes misses in place, or a balanced CPU/PCIe split | §10, §8.3 |
-| HOBBIT (2411.01433) | Low-precision copies for less important missed experts | Opt-in only (§18), because it changes the represented weights |
-| AdapMoE (2408.10284) | Per-layer cache allocation by dynamic programming | Covered by the global policy plus per-layer floors (§9.4) |
+| HOBBIT (2411.01433) | Low-precision copies for less important missed experts | Opt-in only (§19), because it changes the represented weights |
+| AdapMoE (2408.10284), FATE | Per-layer cache allocation; shallow layers miss more | One global pool. Hard per-layer quotas lost 1-35% in replay (§9.4). |
+| Zhang, "Reproducible evaluation of MoE expert caching" (2608.07911) | Event-atomic replay. LFRU, f / (age + 1), is the best causal policy in 12 of 13 workloads. 84-97% of the Belady gap comes from victim ranking. A learned next-use predictor did **worse** than LFRU. | Base policy of §9.4 |
+| SeqMoE (2609.12978) | A sequence predictor of expert activations several tokens ahead drives a probabilistic Belady (reported 91.7% / 97.0% hits at 25% / 45% residency) | Research option behind M1's predictor evaluation (§9.4) |
 | Local routing consistency (2505.16056) | Models with shared experts show weaker token-to-token expert reuse | Explains the modest LRU hit rates; Belady's gap is the headroom (§9.4) |
 | DeepSeek Engram (2601.07372), InferenceX PR #3080 | Token-determined table rows can be prefetched; tiered caching driven by Zipfian n-gram reuse | §12 |
 
@@ -226,13 +249,14 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
    tensor in BF16: 8.6 GB per token, and 22.5% of FreeToken's token time. Dense weights should be
    NVFP4, hyper-connections FP8, and the per-layer kernel count should fall from ~32-40 to ~10 or
    fewer (all three engines).
-4. **Cache policy must start from recency, never block, and earn every refinement in trace replay.**
-   On this model LRU is a strong baseline, pure LFU loses, and Belady shows ~50-60% fewer misses
-   are possible (FreeToken traces). Promotion runs on the copy engine in the background, and a slot
-   is reused only after its epoch has retired (Strata's #463 blocking).
-5. **Speculation pays only when its verify cost includes the misses.** The drafter must never wait
-   on the host, and the draft length has to come from a cost model that includes misses
-   (ninfer-ext's MTP regression).
+4. **LRU is not the best policy; a recency × frequency hybrid is.** On this model's traces LFRU has
+   15-22% fewer misses than LRU at every capacity tested (§9.4). Pure LFU and per-layer
+   partitioning lose, and Belady still has 2-3× fewer misses. Promotion runs on the copy engine in
+   the background, and a slot is reused only after its epoch has retired (Strata's #463 blocking).
+5. **Speculation does not multiply misses per accepted token.** In replay, verify windows of 1, 2
+   and 4 tokens have the same misses per accepted token (§4.2). Only rejected drafts add misses. The
+   drafter must never wait on the host, and the draft length comes from a cost model that includes
+   misses (ninfer-ext's MTP regression).
 6. **NVMe reads must not wait for the host.** Row identification and the device row cache belong on
    the GPU, and the NVMe latency should be hidden behind layer 0 (both engines gather
    synchronously).
@@ -272,44 +296,54 @@ Three levers decide the result. The design attacks all three:
 
 ### 4.2 Projection
 
-The assumptions behind this projection are uncertain and are tested in milestone M1/M2
-([§16](#16-implementation-plan)):
+**Measured input: misses per token.** The routing traces of this model (FreeToken community repo:
+3 × 383 single-client decode tokens, English technical writing) were replayed through candidate
+policies (§9.4). At this design's ~10,200 frames (41.5% of experts):
 
-- dense 2.8 GB per token;
-- η = 0.75;
-- t_fixed = 25 µs per layer;
-- CPU service at 65 GB/s while contended;
-- PCIe DMA at 50 GB/s;
-- a prefetch window of about one GPU layer;
-- next-layer recall of 0.7;
-- a handshake of 6 µs;
-- U_4 = 3.05 × 10, Strata's measured union;
-- 2.6 accepted tokens per MTP round, Strata's 5090 measurement.
+| | Value | Note |
+|---|---|---|
+| LRU hit rate | 0.969 (14.9 misses per token) | |
+| LFRU hit rate | 0.974 (12.5 misses per token) | |
+| Layers with at least one miss | ~10 of 48 per token | |
+| Layers with two or more misses | ~5% | |
+| Reuse distance | median 3 tokens | 36% of accesses repeat on the next token; 92% within 64 tokens |
+| Verify windows (T = 1 / 2 / 4) | **same misses per accepted token** (LRU 14.9 / 14.8 / 14.8) | 27 distinct experts per layer for T = 4, i.e. 2.7× one token |
 
-| Hit rate h (VRAM, before prefetch) | Plain decode, projected | MTP K=3, projected | Miss DRAM traffic (plain) |
-|---|---:|---:|---:|
-| 0.70 | ~150 tok/s | ~150 tok/s | ~60 GB/s |
-| 0.80 | ~200 tok/s | ~200 tok/s | ~55 GB/s |
-| 0.90 | ~230 tok/s | ~290 tok/s | ~35 GB/s |
-| 1.00 (all resident, impossible here) | ~250 tok/s | ~380 tok/s | 0 |
+The trace sample is small and narrow, so longer, more diverse sessions will miss more. Milestone M1
+replays broad traces ([§17](#17-implementation-plan)). The projection is therefore given across a
+range of hit rates.
+
+**Assumptions:**
+
+- GPU time per token at T = 1: t_gpu ≈ 4.0 ms (dense 2.8 GB plus hits at η ≈ 0.6 of 1.79 TB/s, plus
+  25 µs fixed per layer). For a T = 4 verify: 6.0 ms.
+- A CPU-served expert takes 42 µs (2.765 MB at ~65 GB/s). The handshake adds 6 µs.
+- Hit GEMVs overlap 12 µs per layer at T = 1 and 30 µs at T = 4.
+- Prefetch covers up to 1.5 (T = 1) or 2 (T = 4) experts per layer at recall 0.6.
+- Misses per layer are Poisson.
+- MTP K = 3: 2.6 accepted tokens per round, +15% misses from rejected drafts, 0.8 ms drafting.
+
+| Hit rate h | Misses per token | Plain decode | MTP K = 3 | Miss DRAM traffic (plain) |
+|---|---:|---:|---:|---:|
+| 0.974 (LFRU on the replay traces) | 12.5 | ~240 tok/s | ~375 tok/s | ~8 GB/s |
+| 0.95 | 24 | ~235 tok/s | ~355 tok/s | ~15 GB/s |
+| 0.90 | 48 | ~215 tok/s | ~295 tok/s | ~28 GB/s |
+| 0.85 | 72 | ~190 tok/s | ~235 tok/s | ~38 GB/s |
+| 0.80 | 96 | ~170 tok/s | ~190 tok/s | ~46 GB/s |
 
 How to read the table:
 
-- **Plain decode** can clear the Must target even at h=0.7, provided the miss stall is hidden as
-  described. ninfer-ext reaches only 98 tok/s at h≈0.8 because each miss is a serialized
-  ~77 µs PCIe stall.
-- **Speculative decoding** only beats plain decode once h ≳ 0.85, because a 4-column verify roughly
-  triples the distinct misses. This is why ninfer-ext's MTP lost to plain decode. Speculation
-  therefore needs the miss-aware draft-length controller in [§11](#11-speculative-decoding), and
-  its gains depend directly on the cache.
-- The hit rate at 40% capacity is the main unknown. Measured points so far:
-  - FreeToken LRU: 0.72-0.76 at 16% capacity;
-  - ninfer-ext's LRU: 0.805 at 26% capacity, MTP K=3;
-  - Strata adaptive caching: 0.72 at about 18% (IQ3_XXS on 12 GB).
+- **The GPU term dominates at this capacity.** At h ≥ 0.9 the miss stall is under 15% of the token,
+  and host DRAM bandwidth is far from saturated. The decisive work is the dense path, kernel count
+  and per-layer latency (§8.6). That is a different regime from ninfer-ext and FreeToken, whose
+  serialized PCIe misses dominate. Their caches hold only 16-26% of experts, and with Q8 or BF16
+  dense they have less room.
+- **Speculation pays.** Misses per accepted token do not grow with the window, so speculation keeps
+  its advantage down to h ≈ 0.8. ninfer-ext's MTP loss comes from its serialized PCIe misses, its
+  separate MTP expert bank in the same LRU, and full `lm_head` drafts, not from the window itself.
+- **Every row clears the Must targets of §1.3** if t_gpu ≈ 4 ms holds. That assumption is the
+  largest risk in the projection, and M6 measures it first.
 
-  From that trend, LRU alone should reach roughly 0.85-0.88 at 40%. The §9 policy and prefetch,
-  credited as effective hits, aim at 0.90+. Milestone M1 tests that expectation with real routing
-  traces before the cache is built.
 - **Calibration of the GPU term.** SGLang with every expert resident on an sm_120 card with the
   same 1.79 TB/s spends 11.4 ms per token. That run reads ~10 GB per token (BF16 dense) through
   generic kernels (~5.5 ms byte floor). This design reads ~4.1 GB per token at h=1 (~2.3 ms floor).
@@ -363,7 +397,7 @@ sample(t) ─► ngram ids (GPU) ─► device row-cache probe ─► miss ids �
 The source is [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4).
 The recipe imports NVIDIA's quantized tensors exactly and chooses the representation of the
 remaining tensors on measured quality per byte. Per-class choices are qualified by the KL ablation
-in [§15.3](#153-recipe-qualification) before they become the official recipe.
+in [§16.3](#163-recipe-qualification) before they become the official recipe.
 
 | Tensor class | Source form | Artifact form | Reason |
 |---|---|---|---|
@@ -447,7 +481,7 @@ boundaries ([engine architecture](engine-architecture.md)).
 Residency is an **execution resource** for `offloaded_sparse_moe`, like a stream or a workspace.
 By the [Op rules](op-development.md#2-op-admission-and-semantic-boundary), it may choose the
 implementation but must not change the result. That gives this design a testable requirement:
-**placement-invariant expert arithmetic** ([§15.2](#152-placement-invariance)).
+**placement-invariant expert arithmetic** ([§16.2](#162-placement-invariance)).
 
 The Program plans every allocation at startup, including the frame pool, staging, mailboxes, row
 caches, and the pinned host arena. Nothing allocates during decode.
@@ -635,71 +669,148 @@ serving experts until the context actually grows into it.
   device-side flag write ordered after the copy.
 - **No round ever waits for a promotion.** Until the copy lands, a request for that expert is served
   as a CPU miss. Strata's #463 wait exists to make outputs deterministic; here determinism comes
-  from placement-invariant arithmetic instead (§15.2).
+  from placement-invariant arithmetic instead (§16.2).
 
 ### 9.4 Replacement and admission policy
 
-**Evidence on this model.** FreeToken's trace replay of Qwen3.8-Flash-Next routing (§3.3) shows:
+#### Evidence: is LRU the best policy? No.
 
-- LRU is a strong baseline;
-- frequency-only policies lose, by as much as 61% more misses;
-- Belady's offline optimum misses **52-62% less than LRU**.
+Two independent replays of this model's routing traces were run for this design. The
+continuous-session replay is [`tools/expert_cache_replay`](../../tools/expert_cache_replay/replay.py). Both used the
+FreeToken community repo's `warmup`, `A` and `B` traces (383 decode tokens each, 48 layers, top-10,
+batch 1). Both used event-atomic semantics: a layer's 10 experts must be resident together, so the
+current group is never evicted.
 
-The headroom is real, but it comes from **short-range reuse plus knowledge of the next uses**, not
-from long-run popularity. The shared expert weakens token-to-token locality (routing-consistency
-study, §3.3). The policy therefore starts from recency and adds only the signals that replay shows
-to help. Every frame holds an expert of the same size, and every miss costs the same DRAM bytes, so
-no size or cost weighting is needed.
+- **Continuous session.** The cache is warmed on `warmup`, then A and B are scored as one session,
+  at five capacities.
+- **Per-request reset at 4,008 slots.** Each request starts from the recorded engine cache state.
+  This reproduces the repo's exact LRU copy plans and Belady counts.
 
-**Base: segmented recency over all 49 layers (one global pool).**
+The table shows misses per token, with the change against LRU in brackets. Promotions are the
+copies into VRAM.
 
-- An expert enters a probationary LRU segment, and is promoted to a protected LRU segment on its
-  second reference within the segment's lifetime.
-- Victims come from the probationary tail first.
-- Ghost entries for recently evicted ids adapt the split between the two segments, as ARC does.
-- The clock is a **round counter**, not a per-layer-call counter. ninfer-ext's per-layer stamping
-  distorts age across layers.
+| Policy (continuous session) | 16.3% (4,008) | 25.8% (6,347) | 32.6% (8,000) | **41.5% (10,200)** | 48.8% (12,000) |
+|---|---:|---:|---:|---:|---:|
+| LRU (global) | 104.6 | 49.9 | 30.2 | **14.9** | 8.5 |
+| **LFRU** (Zhang 2026: f / (age + 1), global f never reset) | **88.4 (−15%)** | **42.0 (−16%)** | **25.0 (−17%)** | **12.5 (−16%)** | **6.6 (−22%)** |
+| ARC | 81.1 (−22%) | 40.6 (−19%) | 27.9 (−8%) | 14.2 (−5%) | 7.2 (−15%) |
+| S3-FIFO | 94.2 (−10%) | 45.7 (−8%) | 26.6 (−12%) | 12.8 (−14%) | 7.2 (−15%) |
+| SLRU (80% protected) | 93.8 (−10%) | 47.0 (−6%) | 27.3 (−10%) | 13.8 (−7%) | 6.1 (−28%) |
+| Decayed LFU, half-life 64 tokens | 103.8 (−1%) | 47.4 (−5%) | 26.4 (−13%) | 13.6 (−9%) | 7.6 (−11%) |
+| LRU-2 | 105.9 (+1%) | 54.0 (+8%) | 32.1 (+6%) | 17.0 (+14%) | 7.0 (−18%) |
+| W-TinyLFU, 1% window (this implementation) | 149.8 (+43%) | 76.4 (+53%) | 41.6 (+38%) | 15.3 (+3%) | 7.6 (−11%) |
+| SIEVE | 172.4 (+65%) | 98.3 (+97%) | 65.4 (+117%) | 13.3 (−11%) | 7.0 (−18%) |
+| LRU, equal per-layer quotas | 107.8 (+3%) | 57.6 (+15%) | 36.8 (+22%) | 20.0 (+34%) | 11.2 (+32%) |
+| **Strata's adaptive exchange** (CPU-served misses, profile seed) | 119.9 (+15%), promotions 16.9 | 62.5 (+25%), 9.3 | 37.0 (+23%), 5.1 | 16.4 (+10%), **2.0** | 8.6 (+1%), 1.0 |
+| Static profile, hindsight frequency of A+B (not deployable) | 118.7 | 54.9 | 29.6 | 11.1 | 4.1 |
+| **Belady MIN** (offline optimum) | 46.0 (−56%) | 20.2 (−60%) | 11.8 (−61%) | 5.6 (−62%) | 3.2 (−62%) |
 
-**Refinements, each kept only if M1 replay shows a gain:**
+The per-request replay at 16.3% gives:
 
-1. **Prediction-informed protection.** Experts named by the next-layer prediction (§8.4) for the
-   current round cannot be evicted during that round. Belady's advantage is knowing the next use;
-   prediction is the online approximation of that knowledge.
-2. **Prefetch as admission.** Staged experts that are actually used are promoted by remapping, with
-   no copy. Staged experts that were never used expire without disturbing the resident set.
-3. **Per-layer floors.** A layer keeps a minimum resident count (AdapMoE-style allocation,
-   recomputed from replayed per-layer hit curves). This stops one layer's burst from starving
-   another layer.
-4. **Long-term prior.** A persisted per-user decayed usage score (half-life ~16K tokens) seeds the
-   cache at startup and breaks ties among probationary victims. It is only a tiebreaker and never
-   overrides recency: replay showed that frequency used as the primary key loses.
-5. **MTP experts.** They sit in the same pool. Their recency updates are weighted by measured draft
-   acceptance.
+| Policy | warmup | A | B |
+|---|---:|---:|---:|
+| LFRU | −9.8% | −9.2% | −20.9% |
+| S3-FIFO | −0.1% | −0.2% | −18.4% |
+| ARC | +5.0% | +5.3% | −3.6% |
+| LRU-2 | +10.9% | +12.1% | −11.3% |
+| Static warmup profile applied to A / B | — | +9.3% | +82% |
+| Belady | −51.7% | −51.6% | −61.5% |
 
-**Mechanics.**
+**LFRU is the only policy better than LRU in every replay, method and capacity.** That agrees with
+the one rigorous published comparison: Zhang (arXiv 2608.07911) found LFRU the best causal policy in
+12 of 13 workloads on Qwen3-30B-A3B.
 
-- The router kernel updates recency state on the device, with no host traffic.
-- Victim selection is amortized. A device-side sweep keeps a small precomputed victim list per
-  round. ninfer-ext instead runs a single-CTA radix select over all slots for every layer that has
-  misses.
-- Promotion of a CPU-served miss is **bandwidth-budgeted**. It draws on the DRAM token bucket shared
-  with prefetch, runs only in GPU-only phases, and is capped per round. Under heavy CPU miss load,
-  promotions defer rather than compete.
-- On shutdown, and periodically while idle, the state is saved and seeds the next start. This
-  generalizes Strata's `--expert-profile-save`.
+Further results:
 
-**Selection by trace-driven simulation before implementation (M1).** The candidates are:
+- **Next-layer prediction does not reduce misses.** Protecting perfectly predicted next-layer
+  experts changes misses by < 0.1%. Its value is hiding latency, which is how §8.4 uses it.
+- **Longer horizons do help when combined with LFRU.** Perfect protection of experts used within
+  the next 1 token gives a further −2.5 points; within the next 5 tokens, −8 to −10 points.
+- **Admission filtering alone is worth ≈ 0 at batch 1.** Belady with bypass equals Belady with
+  forced admission, so the gain lies in choosing victims.
+- **Speculation.** Per-layer unions over 2 / 4 / 5-token windows leave misses per accepted token
+  unchanged for every policy.
 
-- LRU (ninfer-ext, FreeToken);
-- Strata's per-layer decayed-LFU exchange;
-- ARC, SLRU, LRU-2 and W-TinyLFU;
-- the policy above, with each refinement switched on and off;
-- Belady's optimum, as the upper bound.
+**Caveats.**
 
-They run on held-out traces at 30-45% capacity, C ∈ {1, 4, 8}, and window T ∈ {1, 4}. Replay
-reports misses per token **and** DRAM bytes, so prefetch traffic is counted. The shipped policy is
-the best candidate on held-out traces. If nothing beats LRU by more than the replay noise, the
-product ships LRU plus prediction-informed protection and prefetch, and says so.
+- The traces are short, and all three are English technical writing.
+- The per-request and continuous replays disagree on ARC and S3-FIFO. On these traces only LFRU is
+  robust.
+- A replay gain does not guarantee a wall-clock gain. FreeToken's two-hit policy won in replay and
+  lost 4.8% live, for unmeasured reasons. Policy bookkeeping must therefore stay off the critical
+  path. M5 runs a live A/B.
+
+#### Policy
+
+1. **Victim ranking: LFRU**, one global pool over the Text and MTP experts.
+   - The score is `f / (now − last + 1)`, with time in decode rounds.
+   - `f` is a global per-expert count kept for all 25,088 ids, including evicted ones (100 KB on the
+     device).
+   - For long sessions, `f` is halved every 4,096 rounds to bound staleness. This value is untested
+     and is fixed in M1.
+   - No per-layer quotas, because hard partitioning lost 3-34%.
+   - Experts of the current and predicted groups are protected.
+2. **Admission: promote on miss, within a promotion budget.**
+   - Every CPU-served miss is a promotion candidate. It is copied on the copy engine (§9.3) only if
+     its LFRU score beats the current victim's and the round's DRAM/PCIe token bucket has room.
+   - At this design's capacity that is ~12.5 promotions per token (~7 GB/s at 200 tok/s), so the
+     bucket rarely binds.
+   - When it does bind (miss storms after a topic switch, or a long context that has shrunk the
+     pool), promotion degrades into **lazy, batched promotion ranked by the same score**. This is
+     Strata's mechanism, which replay shows makes ~7× fewer copies than LRU. Lazy LFRU (half-life
+     128 rounds, margin 0.5, ≤ 32 per round) matched the best on-demand policy at 41.5% with half
+     the promotions.
+3. **Free promotion of staged experts.** Prefetched or on-demand-DMA'd experts already occupy a
+   frame. Promoting them is a role change with no copy (§8.4).
+4. **Seed and persistence.**
+   - The cache starts from the saved LFRU state of the previous run (counts and ranking).
+   - Failing that, it starts from a shipped profile built from broad traces.
+   - A static profile alone loses badly when the workload differs: +82% misses on B.
+5. **Policy telemetry and selection on the host, off the critical path.**
+   - At the end of each round the router kernel writes the round's expert ids (48 × 10 × T ×
+     2 bytes) to a mapped ring.
+   - A low-priority host thread replays them through shadow copies of LRU, LFRU with 2-3 half-life
+     settings, and a windowed Belady over the last ~1K tokens.
+   - The results are published as metrics: the live policy's gap to LRU and to Belady.
+   - If a shadow variant beats the live parameters by > 5% over a long window, the parameters are
+     switched. This uses the set-dueling idea of CPU caches, applied to parameters, not policy
+     families.
+   - This replaces Strata's offline parameter calibration with continuous measurement on the
+     user's own workload.
+6. **Research option, decided in M1:** protection driven by multi-token prediction.
+   - Perfect 1-5-token lookahead is worth 2.5-10 points on top of LFRU. A real predictor only pays
+     if it is precise.
+   - Zhang's learned next-use regressor made things worse. SeqMoE reports large gains with a
+     sequence model (not replicated).
+   - M1 evaluates candidate predictors on a public trace set that includes router inputs and hidden
+     states (`aswinkumar99/qwen3.8-flash-next-expert-traces`). The candidates are: the main model's
+     routers applied to MTP-draft hidden states, and multi-layer gate lookahead.
+   - A predictor ships only as **protection** layered over LFRU, never as a replacement ranking.
+     That keeps the learning-augmented robustness: with a bad predictor it degrades to LFRU.
+
+### 9.5 Long context: QSA KV host tier
+
+QSA attends to at most 2,051 selected tokens per query. All other KV is only scanned through its
+128-dimensional pooled index key (one per 4 tokens). Strata exploits this: above 64K it keeps
+32,768 cells per layer in VRAM over an authoritative host copy, with 96-99.4% block hits on a
+5090. That is why its expert cache survives a 262K context.
+
+This design adopts the same idea in NInfer's paged-KV terms:
+
+- **Index-key plane: always fully device-resident.** At 262K it is ~0.1 GB in FP8.
+- **K/V pages:**
+  - The authoritative copy lives in a pinned host arena (~4 GB at 262K, FP8). §15.2 has room for it.
+  - The device holds a page cache of hot 4-token blocks: CLOCK replacement, residency resolved in
+    the graph.
+  - Missed blocks are fetched zero-copy inside the attention kernel. A block is 4 tokens ×
+    1,040 B per layer, a few KB, so latency- rather than bandwidth-bound.
+- **Writes** go to both copies at append time.
+- **Enabling.** The tier is used only when the configured context needs more than a threshold
+  (64K by default, fixed in M8 by measurement). Below it, KV is fully device-resident.
+- **Payoff.** At 262K, ~3.5 GB, about 1,300 frames, return to the expert pool. In the replay that
+  is the difference between ~8,900 and ~10,200 frames: roughly 20 vs 12.5 misses per token with
+  LFRU.
+
 
 ---
 
@@ -715,12 +826,12 @@ T×2560 values cross PCIe. For critical-path misses the CPU is strictly better. 
 
 ### 10.2 Kernels
 
-The primary route is **A16**, and it is placement-invariant (§15.2):
+The primary route is **A16**, and it is placement-invariant (§16.2):
 
 1. Decode each 16-value block: E2M1 nibbles → FP32 through a 16-entry LUT (`vpermps`/`vpshufb`), then
    multiply by the E4M3 block scale (LUT).
 2. Accumulate FP32 FMAs against the BF16 activation widened to FP32, using a **canonical reduction
-   order**. The GPU kernel uses the same order (§15.2).
+   order**. The GPU kernel uses the same order (§16.2).
 
 | ISA | Implementation |
 |---|---|
@@ -794,9 +905,15 @@ E[tokens(K)] / E[t_round(K)],
 - **E[tokens(K)]** comes from the existing per-position acceptance estimates.
 - **t_cpu** comes from the measured CPU service rate (§10.3).
 
-This generalizes NInfer's adaptive MTP and Strata's `DraftPolicy` by **including the miss cost that
-grows with the window**. That cost is exactly what made ninfer-ext's MTP lose on chat. When the
-cache is cold or the topic shifts, K falls toward 0-1. When the cache is warm, K rises to 3-5.
+This generalizes NInfer's adaptive MTP and Strata's `DraftPolicy` by **including the miss cost of
+the window**. The replay shows the window does not raise misses per *accepted* token (§4.2): the
+added cost comes from rejected drafts, whose experts are routed and computed but never used. The
+model therefore charges each draft position its expected rejected-path misses. Those are measured
+online as the misses of rejected columns. When the cache is cold or the topic shifts, K falls
+toward 0-1. When the cache is warm, K rises to 3-5.
+
+Experts used only by rejected draft columns are not credited as uses in the LFRU counts, so a
+rejected path cannot pollute the cache.
 
 N-gram copy proposals ([ngram](../ngram.md)) and DFlash-style tree verification stay available, and
 the same cost model decides them. A tree's extra columns cost misses too.
@@ -822,7 +939,7 @@ the same cost model decides them. A tree's extra columns cost misses too.
 - Rows depend on `t[p-2], t[p-1], t[p]`. EOS restarts the window, as defined in the model reference.
 - The rows are consumed **once**, before block 1's attention mixer. In decode they are not needed
   until layer 0 has finished, about 80-150 µs after sampling.
-- The table must stay off the page cache. RAM is fully budgeted (§14.2).
+- The table must stay off the page cache. RAM is fully budgeted (§15.2).
 
 ### 12.2 NVMe layout
 
@@ -887,10 +1004,23 @@ hidden in an average.
   Assignments are grouped by expert and run through a block-scaled NVFP4 tensor-core grouped GEMM:
   - **A4** activations where the Use allows it, with the per-layer divisor;
   - otherwise **A16**, by dequantizing the weights to BF16 in shared memory.
-- **CPU help for thin experts.** An expert routed to only a few tokens in a chunk costs more PCIe
-  bytes than CPU work. For chunks below ~1K tokens, experts with ≤ τ assigned tokens are computed on
-  the CPU in place (τ from the cost model). This lifts short-prompt prefill, which in ninfer-ext is
-  431 tok/s at 512 tokens.
+- **CPU help for thin experts.** An expert routed to only a few tokens costs a full 2.77 MB copy
+  over PCIe, but only a DRAM-bound CPU GEMV. Per layer, the non-resident experts are sorted by
+  assigned tokens, and the thinnest are given to the CPU engine while the copy engine streams the
+  rest. The split is balanced online: per-layer EMAs of measured CPU µs per expert and token versus
+  copy-engine µs per expert pick the cut, so both halves finish together.
+  - architectds/Strata measured 1.35-1.49× for 200-1,000-token prompts with this idea, but on
+    PCIe 3.0 and DDR4. At Gen5 x16 the copy half is ~3× cheaper, so the gain is expected to be
+    smaller and to vanish earlier than its 3K-token cutoff. M8 measures it.
+  - The CPU half uses the placement-invariant A16 kernels (§16.2), so it adds no numerical drift.
+    The fork's CPU route differs by 1.3-1.9% relative L2.
+  - ninfer-ext prefills 512 tokens at only 431 tok/s, which is where this matters most.
+- **Chunk planning.** A prompt of n tokens is read as ⌈n / max⌉ **equal** chunks, so a 16.4K prompt
+  is not split into one full chunk plus a tiny tail; each chunk ≥ 1K streams almost every
+  non-resident expert, so cost scales with the chunk count. The exception: a short tail (< 1K) that
+  moves only its own routed experts stays separate. `max` is the largest chunk whose arena can be
+  lent from frames while keeping a floor of resident experts. It is found in 1K steps, not from a
+  fixed ladder; architectds/Strata measured +21-59% at 9K-100K from these two rules.
 - **Bound.**
 
   | Chunk | Per-chunk time | Effective rate |
@@ -908,9 +1038,46 @@ hidden in an average.
 
 ---
 
-## 14. Memory plans
+## 14. Tuning: fixed, probed, and adapted
 
-### 14.1 VRAM: 32,607 MiB card, C=1, MTP, 32K context, FP8 KV
+Strata tunes in three places:
+
+- an offline `--calibrate` sweep of `pcie_frac`, `spec_min_p` and pool workers, which keeps a value
+  only if it is > 3% faster and has no published gain;
+- startup probes;
+- online adaptation (adaptive tier, `DraftPolicy`).
+
+Because this design targets one GPU, every GPU-dependent choice is made once, offline, by the
+developers. Only **host**-dependent and **workload**-dependent quantities are measured on the user's
+machine. Those are measured continuously rather than by an offline sweep, so they track the actual
+workload and stay current. An offline calibration command is added only if M9 shows a host-specific
+gain that the online models miss.
+
+| Quantity | Strata | This design | Class |
+|---|---|---|---|
+| Kernel variants, tiles, fused-route gating, GEMM schedules | Occupancy and shape rules at startup; hipBLASLt tables on AMD | Fixed per sm_120a shape at development time, with existing NInfer route-development evidence ([op development](op-development.md)) | Fixed for the 5090 |
+| Expert slot count | Auto-sized from free VRAM / largest blob | Planned by the Program from the startup budget (§15.1). Frames are uniform (NVFP4), so no per-layer blob sizing is needed. | Fixed per configuration |
+| Prefill chunk size | Ladder {32K, 16K, 8K, …} under a lend cap; the fork adds a 1K-step search | Largest lendable equal chunk, 1K steps (§13) | Planned at request time |
+| Prefill staging ring sizes | Ring of 96-384 slots by pinned share | Two staging buffers per layer sized by the chunk plan; experts always pinned | Fixed |
+| PCIe H2D bandwidth | Startup probe; scales `pcie_frac` below 20 GB/s | Startup probe (best of 4 × 256 MiB, DMA), plus continuous measurement of every prefetch and promotion copy | Host-dependent |
+| Host DRAM bandwidth, alone and while DMA runs | Not measured | Startup probe (2 s) plus continuous measurement of CPU miss service | Host-dependent |
+| CPU ISA, cores, P/E topology, worker count | ISA detection; workers = physical cores − 1; calibrate tries ⅔ and ½ | ISA dispatch (AVX-512 / AVX2+FMA, VNNI). Workers = physical P-cores − 2. E-cores included only if the startup probe shows they add service rate. | Host-dependent |
+| CPU-vs-PCIe share of critical-path misses | Static `pcie_frac` (0.55 / 0.2), offline sweep | Per-layer arbiter from measured service rates (§8.3) | Online |
+| Prefetch depth and k′ | — (no decode prefetch) | Token bucket plus useful-byte ratio. Prefetch is disabled per layer when its staged-hit yield falls below a threshold (§8.4). | Online |
+| Cache parameters (decay, budget) | Fixed adaptive-tier constants | LFRU with host shadow replay switching parameters (§9.4) | Online |
+| Draft length / `spec_min_p` | `DraftPolicy` EMAs; `spec_min_p` offline | Miss-aware cost model, all online (§11.2) | Online |
+| Prefill CPU share | Fork: per-layer EMA balance | Same idea, measured service rates (§13) | Online |
+| NVMe queue depth, L1 row-cache size | Static (256 in flight, 1M rows) | Startup QD1/QD32 latency probe on the table file; L1 sized by the RAM plan; per-round PLE wait telemetry | Host-dependent |
+| Pinned memory, huge pages, memlock limit | Windows pin cap; 4 KiB fallback | Startup check against the plan; 2 MiB pages required, with a clear failure message instead of silent 4 KiB fallback (ninfer-ext measured +11-32% from 2 MiB pages) | Host-dependent |
+
+Every probe result and online estimate is reported in the startup log and the metrics endpoint, so a
+performance report always states the conditions it ran under.
+
+---
+
+## 15. Memory plans
+
+### 15.1 VRAM: 32,607 MiB card, C=1, MTP, 32K context, FP8 KV
 
 | Item | GiB |
 |---|---:|
@@ -929,9 +1096,10 @@ For comparison, ninfer-ext has 6,347 slots (26%) and Strata at NVFP4 sizes would
 slots (35%).
 
 At a 256K context the KV reservation is 4.1 GB. Through loans (§9.2) it costs expert frames **only
-as the context actually fills**.
+as the context actually fills**. Above the long-context threshold, the QSA KV host tier (§9.5) keeps
+most of it off the device altogether.
 
-### 14.2 Host RAM: 96 GB (≈ 93 GiB visible)
+### 15.2 Host RAM: 96 GB (≈ 93 GiB visible)
 
 | Item | GB |
 |---|---:|
@@ -940,9 +1108,10 @@ as the context actually fills**.
 | L1 PLE row cache | 2.1 (configurable 0.5-4) |
 | Mailboxes, landing buffers, io_uring buffers | 0.2 |
 | Host checkpoint tier (prefix cache), capped | 2.0 (configurable) |
+| QSA KV host tier (§9.5), only above the long-context threshold | 0-4.1 (at 262K, FP8) |
 | Process: tokenizer, server, frontend | ~1.5 |
-| **Total NInfer** | **~76.5** |
-| OS, desktop, page cache headroom | ~19 |
+| **Total NInfer** | **~76.5**, or ~80.6 at 262K with the KV host tier |
+| OS, desktop, page cache headroom | ~19, or ~15 at 262K |
 
 Additional rules:
 
@@ -956,9 +1125,9 @@ Additional rules:
 
 ---
 
-## 15. Numerics and qualification
+## 16. Numerics and qualification
 
-### 15.1 Op oracles
+### 16.1 Op oracles
 
 Every new Op is qualified against a naive FP32/FP64 oracle at the real shapes, under the
 [Op development](op-development.md) rules:
@@ -975,7 +1144,7 @@ Every new Op is qualified against a naive FP32/FP64 oracle at the real shapes, u
 The fork's FP64 Python reference may be consulted as a cross-check of the published mathematics.
 NInfer's oracle is written from the upstream definitions, consistent with [§1.4](#14-non-goals).
 
-### 15.2 Placement invariance
+### 16.2 Placement invariance
 
 **Requirement.** For the A16 routes, an expert's output is **bit-identical** whether it ran on:
 
@@ -1004,7 +1173,7 @@ NInfer's oracle is written from the upstream definitions, consistent with [§1.4
 measurements, the design falls back to oracle-tolerance qualification for the GPU route. That
 change, and its effect on determinism, will be stated explicitly.
 
-### 15.3 Recipe qualification
+### 16.3 Recipe qualification
 
 The reference is the BF16 checkpoint run through the engine's CausalScoring path at
 all-BF16-equivalent precision, or published BF16 logits where available. On a fixed corpus (code,
@@ -1023,7 +1192,7 @@ Run the comparison for:
 A class stays NVFP4 only if its KL contribution is below the threshold fixed **before** the
 measurement. Proposed threshold: total KL ≤ that of UD-Q4_K_XL, and each class ≤ 20% of the total.
 
-### 15.4 Engine-level tests
+### 16.4 Engine-level tests
 
 - Incremental decode equals one-shot prefill (exact on A16 routes).
 - Speculative output equals plain output (greedy, exact).
@@ -1038,7 +1207,7 @@ measurement. Proposed threshold: total KL ≤ that of UD-Q4_K_XL, and each class
 
 ---
 
-## 16. Implementation plan
+## 17. Implementation plan
 
 Each milestone has exit criteria measured on the target machine. Later milestones may change
 because of earlier findings. Such changes and the evidence for them are recorded here, not silently
@@ -1047,10 +1216,10 @@ absorbed.
 | # | Milestone | Exit criteria |
 |---|---|---|
 | **M0** | Source facts. Record NVIDIA NVFP4 `hf_quant_config.json`, tensor dtypes, and the actual machine: CPU ISA, DRAM bandwidth, PCIe, NVMe latency at QD1 and QD16. | Recorded facts; §4 assumptions confirmed or revised |
-| **M1** | Routing traces and cache simulation. Collect traces from the BF16 or NVFP4 model on a corpus: from an existing engine's routing dump, a Transformers run on a larger host, or M4's first functional engine. Build the trace simulator (§9.4 candidates and Belady), plus next-layer prediction recall. | Hit-rate curves at 30-45% capacity. Shipped policy chosen, with its gap to LRU and to Belady reported. Prediction recall@k′ and useful-byte ratio measured. §4 projection updated with the real h. |
+| **M1** | Routing traces, cache policy and predictors. A first replay on the public FreeToken traces is done (§9.4). Remaining: broad traces (code, chat, CJK, long-context, tool use; C = 1-8; MTP with rejected drafts) from the public `aswinkumar99/qwen3.8-flash-next-expert-traces` set, Strata's `--dump-routing`, or M4's engine. Confirm LFRU on held-out traces and fix its parameters. Measure next-layer recall and useful-byte ratio. Evaluate multi-token protection predictors. | LFRU (or a better causal policy) confirmed on held-out traces, with its gap to LRU and Belady reported. Prediction recall@k′ measured. §4.2 projection updated with the real h. |
 | **M2** | Converter recipe, expert record layout, NVMe table layout, residency classes, loader with `O_DIRECT` pinned load | Exact import tests; load time; RAM peak ≤ plan |
 | **M3** | Ops with oracles: `offloaded_sparse_moe` (GPU A16/A4 + CPU A16/A8), `hyper_connection`, QSA, PLE, `ngram_row_ids`. Placement-invariance test. CPU kernel bandwidth on target CPUs. | All Op qualifications pass. CPU NVFP4 GEMV ≥ 80% of measured DRAM bandwidth (AVX-512) or measured shortfall recorded (AVX2). |
-| **M4** | Functional model, all-host-experts mode: no cache, every expert CPU-served. Prefill + decode + MTP + Vision through the Engine; CausalScoring perplexity. | Model oracle agreement; recipe KL report (§15.3); first end-to-end numbers |
+| **M4** | Functional model, all-host-experts mode: no cache, every expert CPU-served. Prefill + decode + MTP + Vision through the Engine; CausalScoring perplexity. | Model oracle agreement; recipe KL report (§16.3); first end-to-end numbers |
 | **M5** | Frame pool, residency table, epochs, §9.4 policy, loans, lookahead prefetch | Measured hit composition matches the M1 simulation within 2 points. No round blocks on promotions. |
 | **M6** | Decode graph fusion (≤ 10 kernels per layer, PDL), device-driven PLE, host-sync-free round boundary. nsys attribution of one token. | Plain decode Must target (≥ 120 tok/s). Attribution table published. |
 | **M7** | Speculative decoding with residency-bounded drafter and miss-aware K; n-gram copy | Speculation Must target (≥ 160 tok/s). Spec never below plain on any corpus category by more than noise, shown by repeated runs. |
@@ -1059,7 +1228,7 @@ absorbed.
 
 ---
 
-## 17. Documentation and authority changes
+## 18. Documentation and authority changes
 
 When the implementation lands:
 
@@ -1079,7 +1248,7 @@ When the implementation lands:
 
 ---
 
-## 18. Risks and open questions
+## 19. Risks and open questions
 
 | Risk | Effect | Mitigation / decision point |
 |---|---|---|
@@ -1090,20 +1259,27 @@ When the implementation lands:
 | NVIDIA's dense tensors are already NVFP4 or excluded differently than assumed | Recipe table changes | M0 reads `hf_quant_config.json`; recipe follows the source |
 | Mapped-memory spin waits inside graphs, and driver behavior | Hangs or latency spikes | Bounded spins with a watchdog; fall back to `cuStreamWaitValue32` graph memory-op nodes if measured better |
 | NVMe without polled queues, or high latency (QLC, DRAM-less) | PLE wait exposed | L1 cache size; telemetry; documented drive requirement |
-| Placement-invariant arithmetic costs too much | Lower hit GEMV throughput | §15.2 decision rule, disclosed |
+| Placement-invariant arithmetic costs too much | Lower hit GEMV throughput | §16.2 decision rule, disclosed |
 | 96 GB is tight with a desktop session | OOM or swap | Startup plan check; configurable L1 and checkpoint tier; recommended server-only operation |
 
 Open questions answered by measurement, not assumption:
 
 - optimal k′ and depth of prediction;
-- segment split, per-layer floors and the weight of the long-term prior;
+- LFRU count-halving period, promotion budget, and the shadow-tuning switch threshold;
 - frame pool versus KV loan reclaim frequency at C=8;
 - whether a persistent megakernel is worth it (M6 attribution).
 
 ---
 
-## 19. Sources
+## 20. Sources
 
+- Strata forks: https://github.com/architectds/Strata (`best`, 10 commits ahead of v0.1.38: prefill CPU
+  assist, chunk sizing, elastic cache). chimpera/strata-nvfp4 was not read.
+- Routing traces and replay: https://github.com/hz1ulqu01gmnZH4/qwen38-freetoken
+  (`experiments/2026-09-22_tg-expert-cache-trace-replay/data/*.npz`). Extended replays for this
+  design, continuous-session and per-request, are described in §9.4. Zhang, "Reproducible evaluation
+  of MoE expert caching", arXiv 2608.07911 (https://github.com/shijiuzhang/moe-cache-eval). SeqMoE,
+  arXiv 2609.12978. Angelopoulos et al., "Cache management for MoE LLMs", arXiv 2509.02408.
 - Strata: https://github.com/Niko1221/Strata. Read from source at `99f3dbd`: `src/core/verify.cpp`,
   `expert_cache.cpp`, `expert_source.cpp`, `kernels/cpu/pool.cpp`, `ngram/ple_reader.*`,
   `docs/DETAILS.md`, `docs/paper/Strata-Paper.pdf`, and
