@@ -16,8 +16,10 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
+    Nvfp4MulFormat,
     NumericFormat,
     QuantFormat,
     get_format,
@@ -77,6 +79,44 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class ExpertBankGeometry:
+    """``nvfp4_expert_rg16_v1``: one record per expert, then the FP32 multiplier plane."""
+
+    experts: int
+    hidden: int
+    intermediate: int
+    gate_up_row_groups: int
+    gate_up_blocks: int
+    down_row_groups: int
+    down_blocks: int
+    gate_up_bytes: int
+    record_bytes: int
+    record_stride: int
+    multiplier_offset: int
+    multiplier_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class Block128Geometry:
+    """``block128_scale_v1``: row-major code matrices, then one FP32 multiplier per tile."""
+
+    batch: int
+    n: int
+    k: int
+    block: int
+    scale_rows: int
+    scale_cols: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+EXPERT_UNIT_BYTES = 144
+EXPERT_RECORD_ALIGNMENT = 4096
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -94,6 +134,17 @@ ROW_SCALE_V1 = Layout(
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
 
+NVFP4_EXPERT_RG16_V1 = Layout(
+    "nvfp4_expert_rg16_v1",
+    EXPERT_RECORD_ALIGNMENT,
+    frozenset(("nvfp4_mul",)),
+)
+BLOCK128_SCALE_V1 = Layout(
+    "block128_scale_v1",
+    256,
+    frozenset(("fp8_e4m3fn_block128_f32",)),
+)
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -102,6 +153,8 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            NVFP4_EXPERT_RG16_V1,
+            BLOCK128_SCALE_V1,
         )
     }
 )
@@ -246,6 +299,79 @@ def row_scale_geometry(
     )
 
 
+def expert_bank_geometry(
+    format: str | Nvfp4MulFormat, shape: Sequence[int]
+) -> ExpertBankGeometry:
+    """Geometry of a routed-expert bank ``[experts, hidden, intermediate]``.
+
+    Each record holds the gate/up matrix (rows interleaved gate_i, up_i) and then the down
+    matrix, as 16-row groups of 144-byte units (design §6.2). Records are padded to 4 KiB so
+    each one is a single aligned DMA and ``O_DIRECT`` range.
+    """
+
+    spec = _format(format)
+    if not isinstance(spec, Nvfp4MulFormat):
+        raise ValueError("nvfp4_expert_rg16_v1 requires nvfp4_mul")
+    experts, hidden, intermediate = _shape(shape, rank=3)
+    if hidden % 16 or intermediate % 16:
+        raise ValueError("nvfp4_expert_rg16_v1 requires hidden and intermediate divisible by 16")
+    gate_up_row_groups = 2 * intermediate // 16
+    gate_up_blocks = hidden // 16
+    down_row_groups = hidden // 16
+    down_blocks = intermediate // 16
+    gate_up_bytes = gate_up_row_groups * gate_up_blocks * EXPERT_UNIT_BYTES
+    record_bytes = gate_up_bytes + down_row_groups * down_blocks * EXPERT_UNIT_BYTES
+    record_stride = align_up(record_bytes, EXPERT_RECORD_ALIGNMENT)
+    multiplier_offset = experts * record_stride
+    multiplier_bytes = experts * 3 * 4
+    return ExpertBankGeometry(
+        experts=experts,
+        hidden=hidden,
+        intermediate=intermediate,
+        gate_up_row_groups=gate_up_row_groups,
+        gate_up_blocks=gate_up_blocks,
+        down_row_groups=down_row_groups,
+        down_blocks=down_blocks,
+        gate_up_bytes=gate_up_bytes,
+        record_bytes=record_bytes,
+        record_stride=record_stride,
+        multiplier_offset=multiplier_offset,
+        multiplier_bytes=multiplier_bytes,
+        payload_bytes=multiplier_offset + multiplier_bytes,
+    )
+
+
+def block128_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> Block128Geometry:
+    """Geometry of ``[..., N, K]`` block-scaled FP8 matrices (leading axes are a batch)."""
+
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("block128_scale_v1 requires a block-scaled FP8 format")
+    dims = _shape(shape)
+    if len(dims) < 2:
+        raise ValueError("block128_scale_v1 requires rank 2 or more")
+    batch, (n, k) = prod(dims[:-2]), dims[-2:]
+    scale_rows = -(-n // spec.block)
+    scale_cols = -(-k // spec.block)
+    code_plane_bytes = batch * n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = batch * scale_rows * scale_cols * 4
+    return Block128Geometry(
+        batch=batch,
+        n=n,
+        k=k,
+        block=spec.block,
+        scale_rows=scale_rows,
+        scale_cols=scale_cols,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -276,4 +402,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is NVFP4_EXPERT_RG16_V1:
+        return expert_bank_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BLOCK128_SCALE_V1:
+        return block128_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
