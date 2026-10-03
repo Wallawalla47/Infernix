@@ -180,3 +180,8 @@ add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_gdn_replay_fold_test --wide-only)
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+
+# Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
+ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
+  LIBRARIES ninfer_offloaded_moe_cpu)
