@@ -43,7 +43,29 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class Nvfp4MulFormat:
+    """E2M1 weights, one E4M3FN scale per K-axis group, one FP32 multiplier per matrix.
+
+    This is ModelOpt's NVFP4 convention (``weight_scale_2`` multiplies). It differs from
+    ``nvfp4``, whose matrix coefficient is a divisor, so neither is a variant of the other.
+    """
+
+    name: str
+    group_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class Fp8BlockFormat:
+    """E4M3FN weights with one FP32 multiplier per ``block`` x ``block`` tile."""
+
+    name: str
+    block: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Nvfp4MulFormat | Fp8BlockFormat
+)
 
 
 BF16 = DirectFormat("bf16", 2)
@@ -56,6 +78,8 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+NVFP4_MUL = Nvfp4MulFormat("nvfp4_mul", 16)
+FP8_E4M3FN_BLOCK128_F32 = Fp8BlockFormat("fp8_e4m3fn_block128_f32", 128)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -64,8 +88,17 @@ QUANT_FORMATS = MappingProxyType(
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+NVFP4_MUL_FORMATS = MappingProxyType({NVFP4_MUL.name: NVFP4_MUL})
+FP8_BLOCK_FORMATS = MappingProxyType({FP8_E4M3FN_BLOCK128_F32.name: FP8_E4M3FN_BLOCK128_F32})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **NVFP4_MUL_FORMATS,
+        **FP8_BLOCK_FORMATS,
+    }
 )
 
 
@@ -128,6 +161,14 @@ def valid_positive_fp32_word(word: int) -> bool:
     return math.isfinite(value) and value > 0.0
 
 
+def valid_nonnegative_fp32_word(word: int) -> bool:
+    """Return whether an IEEE binary32 word is finite with a clear sign bit (zero allowed)."""
+
+    if type(word) is not int or not 0 <= word <= 0xFFFFFFFF or word & 0x80000000:
+        return False
+    return (word & 0x7F800000) != 0x7F800000
+
+
 def get_format(name: str) -> NumericFormat:
     """Return the registered format named *name*."""
 
@@ -147,15 +188,21 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "NVFP4_MUL",
+    "FP8_E4M3FN_BLOCK128_F32",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
+    "NVFP4_MUL_FORMATS",
+    "FP8_BLOCK_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
+    "Nvfp4MulFormat",
+    "Fp8BlockFormat",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",
@@ -163,5 +210,6 @@ __all__ = [
     "valid_fp8_row_scale_word",
     "valid_fp8_weight_word",
     "valid_nvfp4_scale_word",
+    "valid_nonnegative_fp32_word",
     "valid_positive_fp32_word",
 ]
