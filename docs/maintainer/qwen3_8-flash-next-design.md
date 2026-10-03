@@ -1,6 +1,7 @@
 # Qwen3.8-Flash-Next on one RTX 5090: design
 
-**Status: design proposal, not implemented.** This is a temporary planning document for the
+**Status: design proposal, partly implemented.** [§19.1](#191-implementation-status-and-handoff) lists what exists
+and what needs the target machine. This is a temporary planning document for the
 Qwen3.8-Flash-Next product change. When the implementation lands, its stable content moves into
 the active authorities named in [§20](#20-documentation-and-authority-changes) and this file is
 removed.
@@ -51,7 +52,7 @@ UD-Q4_K_XL, a 4-bit model comparable to NVFP4, at **72-80 tok/s decode** on the 
 16. [Numerics and qualification](#16-numerics-and-qualification)
 17. [High-reward options](#17-high-reward-options)
 18. [Configuration surface](#18-configuration-surface)
-19. [Implementation plan](#19-implementation-plan)
+19. [Implementation plan](#19-implementation-plan) ([status and handoff](#191-implementation-status-and-handoff))
 20. [Documentation and authority changes](#20-documentation-and-authority-changes)
 21. [Risks and open questions](#21-risks-and-open-questions)
 22. [Sources](#22-sources)
@@ -287,6 +288,7 @@ ninfer-ext is a fork of NInfer.
 | **SGLang** | `qwen4_exp.py` with NEXTN MTP (3 steps, 4 draft tokens). PLE either pinned in host RAM with a Triton gather from the host pointer, or a mapped file that **does not work on a discrete 5090**: it needs pageable host-table access. Lookup on a side stream. Fused n-gram hash. Expert offload only through the generic KTransformers integration. | All-resident on an RTX PRO 6000: TPOT 11.4 ms (≈ 87 tok/s) plain, 6.0 ms (≈ 165 tok/s) with MTP (accepting 2.9-3.3 of 4). KTransformers + SGLang on 2× 5070 Ti: 36-37 tok/s. |
 | **vLLM** | Native `qwen4_exp`: Triton QSA indexer, CuTe-DSL HC kernels. The QSA `qkv_proj` explicitly bypasses FP4. Its NVFP4 MoE backends reduce each expert's gate/up `input_scale` pair to one value, and some share one activation scale across a layer's experts. The Engram/PLE table is pinned on the CPU and read through UVA, prefetched on a side stream during the previous layer. Disk/mmap PRs are open. Expert offload is only generic (`--cpu-offload-gb`, layer-group prefetch); "CPU offload: TODO" in its tracking issue. | No single-5090 number found. DGX Spark NVFP4: 34-44 tok/s. |
 | **llama.cpp** | `qwen4exp` merged (HC, QSA with pooled keys, one PLE layer). Experts placed by `-ncmoe`, with the CPU computing the experts that are not on the GPU. | ~43-52 tok/s on a 5090 with 128 GB (community reports, not verified) |
+| **TensorSharp** (C#, ggml backends) | `qwen4exp` from GGUF. `--n-cpu-moe` keeps whole layers' experts in RAM and multiplies them on the host at a **graph seam per offloaded layer** (the GPU pauses after the router). A selected-expert VRAM cache exists, without lookahead prefetch. CPU kernels are ggml's K-quant dot products (no W4A4 integer path, no AVX-512-specific kernels). QSA selection applied as an attention mask, so it saves no KV bandwidth. KV is F16 and device-only. Its CPU worker team starts the calling thread immediately and hands out chunks atomically; spin versus sleep and the thread count are calibrated (a cliff above ~56-64 threads). Verify uses **exact verify-row kernels**, so speculative output equals plain output, at a measured 2-11% verify cost. | No 5090 number. UD-Q2_K_XL on 3× A40 (layer split, all resident): 49 tok/s plain; shared MTP head 83 tok/s on code copying but **44-46 vs 52 tok/s on prose**, so its speculation needs a cost governor. On a 48 GB Mac it runs larger than memory by reading experts and n-gram rows from SSD. |
 
 Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
 
@@ -1162,10 +1164,13 @@ Further results:
 
 1. **Victim ranking: LFRU**, one global pool over the 24,576 Text experts. The MTP pool runs the
    same policy separately.
-   - The score is `f / (now − last + 1)`, with time in decode rounds.
+   - The score is `f / (now − last + 1)`. The clock advances once per routed layer call (48 ticks
+     per round, plus the MTP layer's ticks in its own pool), which is what the replay of §9.3
+     measured. Scores compare as IEEE binary64, and ties evict the lower expert id, so host and
+     replay decisions are identical step for step.
    - `f` is a global per-expert count kept for all 24,576 ids, including evicted ones (96 KB, kept by
      the transfer agent on the host).
-   - For long sessions, `f` is halved every 4,096 rounds to bound staleness. This value is untested
+   - For long sessions, `f` is halved every 4,096 rounds (196,608 ticks) to bound staleness. This value is untested
      and is fixed in M1.
    - No per-layer quotas, because hard partitioning lost 3-34%.
    - Experts of the current and predicted groups are protected.
@@ -1263,7 +1268,9 @@ LOADING(f) → (cancel) : not allowed; a started load always completes, then may
 4. **Promotions.** For each CPU-served expert of the last round whose LFRU score beats the current
    victim's, within the token bucket (§9.3), set the victim ABSENT, then load the newcomer into a
    free or retired frame.
-5. **Retirement.** Frames whose retire epoch ≤ `round_done` return to the free list.
+5. **Retirement.** Frames whose retire epoch ≤ `round_done` return to the free list. An admitted
+   expert that found no free frame waits in a FIFO **deferred-load queue**, stays CPU-served, and
+   loads as soon as a frame retires; if the policy evicts it first it simply leaves the queue.
 6. **Loans.** Process KV-reclaim requests from the Program (§9.2): evict experts from the frames
    being reclaimed, and hand the frames over once their retire epoch passes.
 
@@ -1286,6 +1293,14 @@ to enqueue order:
    of rounds in flight: 1 today, 2 with option H6. D covers a round whose `round_started` write was
    still crossing PCIe when it was sampled. The frame returns to the free list when
    `round_done ≥ r_s + D`.
+
+**Slack frames.** Evicted frames are unusable for D + 1 rounds, so the pool keeps slack frames
+outside the policy's capacity: at least the peak admissions per round × (D + 1). With too little
+slack, admitted experts queue and are CPU-served although the policy counts them as hits. In the
+host simulation (`tests/models/qwen4_exp/test_expert_cache.cpp`), 12 slack frames for ~27 peak
+admissions per round left 12% of policy hits CPU-served; 48 slack frames served 98% from the GPU.
+At recipe B's ~15 promotions per token, D = 1 and storm peaks of ~60, that is ~120 frames (1.4% of
+the pool). M5 sets the value from the measured admission distribution.
 
 When the engine worker has synchronized the compute stream (no round in flight, for example
 between requests or before a prefill), every pending frame is reusable at once. The same rule
@@ -1345,7 +1360,8 @@ it cheap in compute on every supported ISA:
 
 - **A cold miss** is DRAM-bound: ~35-40 µs on dual-channel DDR5, plus ~1-2 µs of A4 quantization
   and barrier.
-- **A warmed miss** (§10.4) is compute-bound at an estimated 3-5 µs, to be measured in M3/M5.
+- **A warmed miss** (§10.4) is compute-bound. The original estimate was 3-5 µs. The first measurement
+  (below) puts it nearer 7-16 µs on 14 desktop cores, so M3/M5 must measure it.
 
 PCIe DMA is used for prefetch, promotions and the arbiter's overflow case (§8.6).
 
@@ -1376,6 +1392,29 @@ operations.
 
 The A4 quantizer uses IEEE `vdivps` and the canonical E4M3/E2M1 rounding (§16.2): 160 + 40 block
 scales and 3,200 element divisions per expert and column, ~0.3-0.5 µs.
+
+**First measurement, and a risk to the T = 8 claim.** These figures come from the implemented
+kernels (`src/ops/offloaded_sparse_moe/cpu/`) on the development VM, not the target: a 4-vCPU Xeon
+at 2.1 GHz with AVX-512 VNNI. They were taken with `tools/flash_next_probe/host_probe.cpp`.
+
+| n (columns) | warm, µs per expert per core | warm GB/s per core | cold GB/s per core | cold GB/s, 4 threads |
+|---|---|---|---|---|
+| 1 | 227 | 12.2 | 5.2 | 22.2 |
+| 2 | 397 | 7.0 | 4.0 | 17.6 |
+| 4 | 687 | 4.0 | 2.7 | 11.0 |
+| 8 | 1,385 | 2.0 | 1.7 | 6.8 |
+
+The VM's DRAM read rate was 9.2 GB/s for one thread and 33.8 GB/s for four.
+
+- At n = 1 a core is ~1.3× faster than its DRAM share, so cold misses are DRAM-bound, as assumed.
+- From n = 2 the kernel is **compute-bound**. Cost grows almost linearly with n because each column
+  repeats the product and block-scaling work: ~6× the n = 1 cost at n = 8, against the estimated 3.5×.
+- Scaled to a 5+ GHz desktop core, n = 8 is ~5 GB/s per core, ~70 GB/s on 14 workers. That is only
+  barely at the DRAM rate, with no margin.
+- **Action (M3):** amortize decode across columns (decode a quad once into registers, then loop
+  columns) and keep column-pair products in 16-bit lanes before widening. Re-measure on the target
+  with the probe. If n ≥ 4 stays compute-bound there, give such experts to the GPU route, either as a
+  staging-frame DMA or by waiting on the landing ticket (§8.6). Record the decision here.
 
 Compilation rules: `-ffp-contract=off -fno-fast-math`; explicit FMA intrinsics only, for `exp_c`.
 
@@ -1413,6 +1452,12 @@ Compilation rules: `-ffp-contract=off -fno-fast-math`; explicit FMA intrinsics o
   - On dual-CCD Ryzen, workers are split evenly across CCDs, because each CCD has its own memory
     fabric bandwidth limit.
 - **Idle.** Workers park on a futex when no request is active.
+- **Team mechanics** (TensorSharp's measured lessons, §3.3):
+  - the thread that receives a request starts computing at once instead of waking others first;
+  - work beyond the static ownership (for example a second expert while a worker is still on the
+    first) is handed out by an atomic chunk counter;
+  - spin-then-park thresholds and the worker count come from calibration (§14.2). Adding workers
+    past the DRAM knee lengthens barriers without adding bandwidth.
 
 ### 10.4 Predicted-miss warming (high-reward option H2)
 
@@ -1494,6 +1539,20 @@ rejected path cannot pollute the cache.
 
 N-gram copy proposals ([ngram](../ngram.md)) and tree verification stay available, and the same
 cost model decides them.
+
+K = 0 (plain decode) is always a candidate, so the policy turns speculation off where it does not
+pay. TensorSharp's shared-MTP head is the counterexample this guards against on this model: 1.7×
+on code copying, but 44-46 against 52 tok/s on prose (§3.3).
+
+**Verify-width invariance (option, decided in M7).** Exact canonical expert arithmetic makes each
+expert's output independent of placement, but dense kernels at T = K + 1 may reduce in a different
+order than at T = 1. Speculative greedy output can then differ from plain greedy output at near-ties.
+- TensorSharp's exact verify-row kernels (one fixed per-column reduction order at every width) cost
+  2-11% of verify time.
+- The option applies that rule to every dense GEMV and attention kernel on the verify path. It also
+  requires the GPU wide route (n > 8, §8.5) to use the §16.2 arithmetic.
+- M7 measures the cost and the observed divergence rate without the option. The option is adopted if
+  the cost is below ~3% of a round.
 
 ### 11.4 Overlap
 
@@ -1711,6 +1770,8 @@ repetitions and reports median and range:
 | GPU↔CPU mailbox round trip | Mapped-memory publish → host spin → completion → device acquire | Handshake term in the cost model |
 | NVMe random 4 KiB reads at QD 1-256 on the n-gram file, for `O_DIRECT` + io_uring with and without SQPOLL/IOPOLL | Random row ids | I/O mode, queue depth, expected PLE latency; whether layer 0 hides it (§12.3) |
 | Huge pages | DMA and CPU bandwidth over THP 2 MiB, hugetlbfs 2 MiB and 1 GiB; `cudaHostRegister` time of the 70 GB arena for each backing | Page backing of the expert arena; startup time |
+| Host RAM budget | Free and reclaimable RAM after the pinned expert arena, the page cache the n-gram volume needs and the OS reserve | One joint budget for pinned arena, L1 PLE row cache and KV host tier, so pinning never starves the page cache (TensorSharp sizes these separately and can over-commit) |
+| Worker wake-up | Spin-then-park threshold and futex wake latency per core type | The CPU team's idle policy (§10.3) |
 | Copy-engine submission latency | `cudaMemcpyBatchAsync` call → `land_seq` visible on the device, for 1-16 experts | Prefetch window model (§8.7) |
 | GPU sanity | HBM read probe vs the 1,674.5 GB/s sustained-read reference, memory clock under CUDA load, fixed-shape decode kernels vs the §8.3 budget | Detects power or memory-clock limits, a downtrained link or a busy GPU, and refuses to calibrate on a disturbed machine |
 
@@ -1980,6 +2041,16 @@ else:       d      = fl(e4m3fn(s) · g)
             code_j = e2m1_satfinite_rn( v_j / d )   ties to even on the E2M1 grid, |value| ≤ 6
 ```
 
+**Checked against ModelOpt's source (M0, done).** ModelOpt 0.47's FP4 fake quantizer
+(`fp4_fake_quant_kernel` via `fp8_quantize_scale` and `fp4_round_magnitude`) computes the same s, d
+and E2M1 rounding, ties to even included, except for **one guard**: a dequantized scale d < 1e-5
+is replaced by 1.0, which zeroes any block with amax below ~6·10⁻⁵. This rule does not adopt the
+guard: TensorRT-LLM's deployed quantizer has none, and zeroing such blocks is a calibration-time
+convenience rather than part of the NVFP4 format. `tools/flash_next/a4_reference.py` ports both
+rules (bit-equal to the C++ quantizer on 327,680 blocks). They agree on every synthetic block
+outside the guard, rounding ties included. Two checks remain for the GPU host (M3): the port against
+ModelOpt's own kernel, and the guard's frequency on recorded activations.
+
 **Row product.** For one output row r, one column, K inputs in K/16 blocks:
 
 ```text
@@ -1997,14 +2068,20 @@ y   = bf16_rn( (fl32_rn(S) · 2⁻²⁰) ⊗ α ),   α = fl32(weight_scale_2 ·
 exactly:
 
 ```text
-h_i = bf16_rn( (g_i ⊘ (1 ⊕ exp_c(−g_i))) ⊗ u_i )
+silu_c(g) = g ⊘ (1 ⊕ exp_c(−g))                  if g ≥ 0
+           = (g ⊗ e) ⊘ (1 ⊕ e),  e = exp_c(g)     if g < 0
+h_i = bf16_rn( silu_c(g_i) ⊗ u_i )
 ```
 
 - ⊘, ⊕ and ⊗ are IEEE FP32 operations, with the parenthesization exactly as written.
+- The two branches keep SiLU's sign and magnitude for large negative g. The single formula gives
+  exp_c(−g) = +∞ and returns −0 already at g = −90.5.
 - `exp_c` is one shared implementation in `ops/common/canonical_math.h`:
   - Cody-Waite range reduction;
-  - a fixed degree-6 polynomial evaluated by explicit `fmaf`;
-  - exponent reconstruction by integer add;
+  - a fixed degree-7 Taylor polynomial evaluated by explicit `fmaf` (degree 6 measured 2.65 ulp
+    against FP64 over every BF16 input; degree 7 measures 0.857 ulp);
+  - exponent reconstruction by two exact power-of-two scalings, so subnormal results are formed
+    correctly;
   - defined overflow (+∞) and underflow (+0).
 - Its inputs are BF16, so CPU-GPU equality of SiLU is verified **exhaustively** over all 65,536
   inputs.
@@ -2229,6 +2306,37 @@ findings. Such changes, and the evidence for them, are recorded here rather than
 
 The milestones on the critical path to the decode targets are M2 → M3 → M5 → M6. M1 runs in
 parallel and must finish before the policy is frozen in M5.
+
+### 19.1 Implementation status and handoff
+
+The first pieces were built on a development VM without a GPU or Hugging Face access: a 4-vCPU
+Xeon at 2.1 GHz with AVX-512 VNNI, and nvcc 13.4 for compiling only. Everything below compiles and
+its tests pass there. Nothing has run on the RTX 5090 or touched the real checkpoint.
+
+| Piece | Where | Verified on the VM | Remaining on the target machine |
+|---|---|---|---|
+| Canonical W4A4 arithmetic (§16.2): E4M3/E2M1 encoders, A4 quantizer, `exp_c`, `silu_c`, epilogues | `src/ops/common/canonical_math.h` | Encoders against grid enumeration; BF16 rounding; `exp_c`/SiLU exhaustively over BF16 against FP64; exact int64 against FP64 | GPU build of the same header; exhaustive CPU-GPU equality (M3) |
+| CPU narrow expert engine: scalar, AVX2, AVX-VNNI, AVX-512 VNNI | `src/ops/offloaded_sparse_moe/cpu/`; test `ninfer_offloaded_moe_cpu_test` | Bit equality across ISAs, batch and split invariance, golden output hashes (`kGolden1`, `kGolden4`) with GCC, Clang and -O0 | Throughput on the target (`host_probe`); the multi-column optimization of §10.2; the worker team and handshake (§10.3); AVX-VNNI-INT8 |
+| Formats `nvfp4_mul`, `fp8_e4m3fn_block128_f32`; layouts `nvfp4_expert_rg16_v1`, `block128_scale_v1`; codecs; ModelOpt source readers | `tools/artifact/`, `tools/convert/sources/modelopt.py`; tests in `tests/artifact/`, `tests/convert/` | Word-exact round trips; C++ and Python agree on rg16 row sums | C++ `QType`/`QuantLayout` registration and loader binding (`src/core/weight.h`, `src/artifact/formats.cpp`, `src/core/weight_view.cpp`), deliberately left untouched until it can be built with CUDA; the recipes A and B themselves (M2) |
+| Host expert cache: LFRU, residency words, frame epochs, deferred-load controller | `src/models/qwen4_exp/program/expert_cache/`; test `ninfer_qwen4_exp_expert_cache_test` | Victims identical to `tools/expert_cache_replay` on a 1,200-group fixture; device/agent simulation with no frame reused early | The transfer agent around it: copy stream, `cuStreamWriteValue32`, route log, loans (M5) |
+| M0 source facts | `tools/flash_next/inspect_checkpoint.py` | Synthetic checkpoints | Run on the real checkpoint and record the facts in §6.1 |
+| A4 rule against ModelOpt | `tools/flash_next/a4_reference.py` | ModelOpt's rule ported from its source: one guard differs (§16.2) | Compare with ModelOpt's kernel on the GPU; guard frequency on real activations |
+| M0 machine facts | `tools/flash_next_probe/` (`run_m0.sh`) | Host and NVMe probes run; GPU probe compiled for `sm_120a` | Run everything; revise §4, §8.3, §8.6 and §12 from the results |
+
+**Findings so far that change the plan:**
+
+- **The CPU expert kernel is compute-bound from n = 2** (§10.2). T = 8 is not DRAM-bound as
+  assumed. Multi-column work and the n ≥ 4 route decision are added to M3.
+- **The pool needs slack frames:** at least peak admissions per round × (D + 1) (§9.5).
+- **The SiLU and `exp_c` definitions were corrected** (§16.2) before any GPU code depended on them.
+- **ModelOpt's 1e-5 scale guard** is a known, deliberate difference (§16.2).
+
+**Suggested order on the target machine:**
+
+1. `tools/flash_next_probe/run_m0.sh` (M0), then update §4, §6.1 and §8.3 from the results.
+2. C++ format registration, then recipe A conversion (M2).
+3. The GPU narrow expert kernel, which must reproduce `kGolden1` and `kGolden4` bit for bit (M3).
+4. Optimize the CPU kernel's multi-column path and re-measure it.
 
 ---
 
