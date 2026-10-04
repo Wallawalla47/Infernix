@@ -275,6 +275,26 @@ def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
         )
 
 
+def qwen3_8_flash_next_nvfp4(model, recipe, sources):
+    """Recipe A of Qwen3.8-Flash-Next (design §6.1): every NVIDIA-quantized tensor bit-exact, every
+    BF16 tensor BF16. Routed experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1``
+    with each matrix's own ModelOpt input scale; the n-gram table is written to its own volume."""
+    from .qwen4_exp import import_expert_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    for name, parameter in model.parameters.items():
+        if name.startswith("text/layers/") and name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="AllowA4",
+            )
+            recipe.group(name, shape=parameter.shape)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -284,4 +304,5 @@ RECIPES = {
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
 }
