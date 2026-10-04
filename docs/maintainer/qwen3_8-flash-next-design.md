@@ -2964,6 +2964,13 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   verification's n-gram rows: new trigrams of draft tokens, read from the NVMe volume. Keeping the
   64 Win32 events of a batched read alive instead of creating them per call changed nothing
   (tg512 89.99 / 138.84 against 89.96 / 138.70), so the time is in the submissions and the device.
+- **I/O ring for the n-gram rows (rejected).** A standalone probe timed batches of random
+  4 KiB unbuffered reads from the volume's NVMe drive (200 batches each, median). Overlapped
+  `ReadFile` took 87 / 308 / 381 µs for 16 / 64 / 80 reads; one `SubmitIoRing` took
+  72 / 276 / 344 µs. Both scale at ~4.3-4.8 µs per read, the drive's random-read rate, so the
+  after-draft gap is device-bound. An I/O ring would save ~30 µs per round, which is not worth a
+  second read path. Fewer reads or overlap are what remain: the anchor column's 16 rows are known
+  before drafting, and each draft column's rows as soon as its draft step finishes.
 - **Maximum draft length 5** measured the same as 4 (tg512 138.67 against 138.78; code CLI 82.9
   against 83.7). The policy rarely drafts a fifth token, so 4 is the recommendation.
 - **Deferred cache update (adopted).** A round's `after_round` (routes, LFRU, promotions; ~0.5 ms
@@ -3019,8 +3026,10 @@ server, then each alone.
      of a 4K prompt;
    - frames lent to the prefill arena, so large chunks cost no decode speed;
    - BF16 tensor-core shapes for the QSA group.
-3. The remaining host time per MTP round: ~0.58 ms of cache policy after verification and
-   ~0.56 ms of staging after drafting. Both could overlap GPU work.
+3. The after-draft host gap (~0.3-0.5 ms per round: 16 n-gram rows per verified column, at the
+   drive's ~4.5 µs per random read). Read the anchor column's rows during drafting, and each
+   draft column's rows as soon as its step publishes the token to mapped memory; only the last
+   column would stay exposed. The cache-policy gap already overlaps (deferred `after_round`).
 4. Concurrency with MTP: two lanes on a cold cache ran slower in aggregate than one.
 5. Dense decode GEMV (the Q8 SIMT route at ~65 % of the byte floor), split-K for the HC down
    shapes, and fewer small kernels (~1,800 per round).
