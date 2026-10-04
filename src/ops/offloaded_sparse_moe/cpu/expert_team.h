@@ -37,6 +37,7 @@ public:
         CpuIsa isa          = best_cpu_isa();
         int max_jobs        = 16; // per round
         int spin_iterations = 1 << 16; // pause-loop iterations before parking
+        int prefetch_bytes  = kDefaultPrefetchBytes; // calibrated on the target (§14.2)
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
     };
 
@@ -65,6 +66,7 @@ private:
     CpuIsa isa_;
     int max_jobs_;
     int spin_iterations_;
+    int prefetch_bytes_;
     std::vector<WorkerScratch> scratch_;
     std::vector<canon::A4Block> h_; // [job][col][kHBlocks], shared between the phases
     std::span<const CpuExpertJob> jobs_;

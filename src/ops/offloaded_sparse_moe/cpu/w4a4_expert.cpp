@@ -54,6 +54,17 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
 
 #if defined(NINFER_MOE_X86)
 
+// Software prefetch `distance` bytes ahead along the unit stream (design §10.3). The best distance
+// depends on the host's memory latency and core speed, so calibration chooses it (§14.2).
+inline void prefetch_unit(const std::uint8_t* unit, int distance) {
+    if (distance > 0) {
+        const char* p = reinterpret_cast<const char*>(unit) + distance;
+        _mm_prefetch(p, _MM_HINT_T0);
+        _mm_prefetch(p + 64, _MM_HINT_T0);
+        _mm_prefetch(p + 128, _MM_HINT_T0);
+    }
+}
+
 // u8 table: 2 * e2m1(code) + 12, so a weight is unsigned for vpdpbusd / vpmaddubsw.
 constexpr std::array<std::int8_t, 16> kBiasedCodes = {12, 13, 14, 15, 16, 18, 20, 24,
                                                       12, 11, 10, 9,  8,  6,  4,  0};
@@ -81,7 +92,7 @@ inline __m512i scales16_avx512(const std::uint8_t* s) {
 template <int N>
 NINFER_TARGET("avx512f,avx512bw,avx512vnni")
 void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                     const A4Block* const* acts, std::int64_t* out) {
+                     const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) {
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()));
     const __m512i lut    = _mm512_broadcast_i32x4(lut128);
     const __m512i low4   = _mm512_set1_epi8(0x0F);
@@ -90,6 +101,7 @@ void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int r
         for (int c = 0; c < N; ++c) { even[c] = odd[c] = _mm512_setzero_si512(); }
         for (int b = 0; b < blocks; ++b) {
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes;
+            prefetch_unit(unit, prefetch_bytes);
             __m512i p[N];
             for (int c = 0; c < N; ++c) { p[c] = _mm512_setzero_si512(); }
             for (int q = 0; q < 4; ++q) {
@@ -150,7 +162,7 @@ inline __m256i dot4_avxvnni(__m256i acc, __m256i w, __m256i a) {
 // One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant.
 #define NINFER_AVX2_ROW_SUMS(NAME, DOT) \
 void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
-                   const A4Block* const* acts, std::int64_t* out) { \
+                   const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data())); \
     const __m256i lut    = _mm256_broadcastsi128_si256(lut128); \
     const __m256i low4   = _mm256_set1_epi8(0x0F); \
@@ -161,6 +173,7 @@ void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
         } \
         for (int b = 0; b < blocks; ++b) { \
             const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * kUnitBytes; \
+            prefetch_unit(unit, prefetch_bytes); \
             __m256i p[2][N]; \
             for (int h = 0; h < 2; ++h) { \
                 for (int c = 0; c < N; ++c) { p[h][c] = _mm256_setzero_si256(); } \
@@ -311,24 +324,24 @@ CpuIsa best_cpu_isa() {
 }
 
 void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                   const canon::A4Block* const* acts, int ncols, std::int64_t* out) {
+                   const canon::A4Block* const* acts, int ncols, std::int64_t* out, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
     switch (isa) {
     case CpuIsa::kScalar: row_sums_scalar(matrix, blocks, rg_begin, rg_end, acts, ncols, out); return;
 #if defined(NINFER_MOE_X86)
     case CpuIsa::kAvx512Vnni:
-#    define NINFER_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out)
+#    define NINFER_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
         NINFER_MOE_DISPATCH(NINFER_CALL)
 #    undef NINFER_CALL
         return;
     case CpuIsa::kAvxVnni:
-#    define NINFER_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out)
+#    define NINFER_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
         NINFER_MOE_DISPATCH(NINFER_CALL)
 #    undef NINFER_CALL
         return;
     case CpuIsa::kAvx2:
-#    define NINFER_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out)
+#    define NINFER_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
         NINFER_MOE_DISPATCH(NINFER_CALL)
 #    undef NINFER_CALL
         return;
@@ -345,16 +358,17 @@ void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Bloc
 
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
-                   int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks) {
+                   int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks,
+                   int prefetch_bytes) {
     // No allocation on the miss path: one unit's sums fit on the stack.
     std::int64_t s_gate[32 * kMaxColumns];
     std::int64_t s_up[32 * kMaxColumns];
     for (int u = unit_begin; u < unit_end; ++u) {
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
-        rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_gate, ncols, s_gate);
+        rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_gate, ncols, s_gate, prefetch_bytes);
         const std::int64_t* up_sums = s_gate;
         if (x_up != x_gate) {
-            rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up);
+            rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up, prefetch_bytes);
             up_sums = s_up;
         }
         for (int c = 0; c < ncols; ++c) {
@@ -371,10 +385,10 @@ void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
 
 void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                const canon::A4Block* const* h_blocks, int ncols, int rg_begin, int rg_end,
-               std::uint16_t* const* y) {
+               std::uint16_t* const* y, int prefetch_bytes) {
     std::int64_t s[16 * kMaxColumns]; // one row group at a time: no allocation on the miss path
     for (int rg = rg_begin; rg < rg_end; ++rg) {
-        rg16_row_sums(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h_blocks, ncols, s);
+        rg16_row_sums(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h_blocks, ncols, s, prefetch_bytes);
         for (int r = 0; r < 16; ++r) {
             for (int c = 0; c < ncols; ++c) {
                 y[c][rg * 16 + r] = canon::a4_row_output(s[r * ncols + c], scales.alpha_down);
@@ -384,7 +398,7 @@ void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scale
 }
 
 void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
-                    const std::uint16_t* const* x, std::uint16_t* const* y) {
+                    const std::uint16_t* const* x, std::uint16_t* const* y, int prefetch_bytes) {
     if (ncols < 1 || ncols > kMaxColumns) { throw std::invalid_argument("offloaded_moe: ncols must be in [1, 8]"); }
     std::vector<canon::A4Block> xg(static_cast<std::size_t>(ncols) * kGateUpBlocks);
     std::vector<canon::A4Block> xu;
@@ -405,8 +419,8 @@ void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& 
         h_ptr[c]  = &hb[static_cast<std::size_t>(c) * kHBlocks];
         h_cptr[c] = h_ptr[c];
     }
-    gate_up_units(isa, record, scales, g_ptr, shared ? g_ptr : u_ptr, ncols, 0, kHBlocks, h_ptr);
-    down_rows(isa, record, scales, h_cptr, ncols, 0, kDownRowGroups, y);
+    gate_up_units(isa, record, scales, g_ptr, shared ? g_ptr : u_ptr, ncols, 0, kHBlocks, h_ptr, prefetch_bytes);
+    down_rows(isa, record, scales, h_cptr, ncols, 0, kDownRowGroups, y, prefetch_bytes);
 }
 
 } // namespace ninfer::ops::offloaded_moe
