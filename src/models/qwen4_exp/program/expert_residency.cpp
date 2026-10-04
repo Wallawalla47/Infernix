@@ -64,8 +64,8 @@ const std::int32_t* ExpertResidency::table(std::uint32_t layer) const noexcept {
 }
 
 void ExpertResidency::upload_table(cudaStream_t compute) {
-    CUDA_CHECK(cudaMemcpyAsync(table_device_.p, table_host_.data(), table_device_.bytes, cudaMemcpyHostToDevice,
-                               compute));
+    // SM-read, not a copy engine: the table must not wait behind this round's promotion copies.
+    upload_pinned(table_device_.p, table_host_.data(), table_device_.bytes, compute);
     table_dirty_ = false;
 }
 

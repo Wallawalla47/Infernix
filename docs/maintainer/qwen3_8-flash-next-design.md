@@ -2899,6 +2899,46 @@ still 3 % slower than plain, because a cold verify round costs more than the war
 assumes: the story's W = 4 rounds took ~2.6 plain rounds on the cold cache. A cost that follows
 the hit rate is the next refinement.
 
+**MTP round profile and two fixes.** nsys of warm tg512, MTP max 3, `--lm-head-draft`, per
+generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 % of the time.
+
+| Kernel | ms per token |
+|---|---:|
+| `gate_up` | 2.90 |
+| `stage_kernel` (overlapped by the fork) | 2.71 |
+| Q8 dense | 1.63 |
+| `down` | 1.01 |
+| `cpu_wait` | 0.31 |
+| Drafter's own kernels | ~0.3 |
+
+- **Occupancy (adopted).** A W = 4 verify round has ~30 jobs × 40 gate/up CTAs, about seven
+  waves at one CTA per SM. The one-column CTA's activations and partial sums now share storage,
+  separated by one more barrier. At 49,376 B, two CTAs fit per SM, and calls of up to four columns
+  use the one-column kernels, one pass per column over the staged weights. The layer-route test
+  gained a four-column case and passes. Greedy ids are unchanged. tg512: plain 83.30 → 85.46,
+  MTP max 4 115.06 → **121.20**.
+- **Copy-engine stall (found, fixed below).** On average 4.7 ms per round passed between a
+  verification's last kernel and its commit's first. The host was in `cudaStreamSynchronize`,
+  and the compute stream's next 4-byte host-to-device copy waited on the copy engine behind the
+  ~40 × 2.76 MB promotion copies issued a moment earlier: about 3.4 ms of the 4.7. Small per-round
+  host-to-device copies (round inputs, commit counts, drafter ids, the residency table) share the
+  copy engine, which runs FIFO across streams, with bulk promotions. So every round waited for
+  the previous round's promotions to land. Plain decode pays the same every fourth round, when
+  48 promotions (132 MB, ~4.8 ms) go out.
+
+**Two lanes (sanity check only).** `ninfer-serve --max-concurrency 2 --spec mtp --draft-tokens 3
+--lm-head-draft`, temperature 0, 200 tokens, code and story requests sent together on a cold
+server, then each alone.
+
+- **Robustness:** no crash or hang. MTP acceptance was 94.8 % and 63.0 %.
+- **Output equality:** the code answer is identical concurrent and alone. The story diverges after
+  ~30 tokens. A two-row verification has up to eight columns, so kernels whose rounding depends on
+  the call width can flip a near-tie. This is the verify-width invariance question of §11.3 and
+  was not investigated further.
+- **Throughput:** concurrent decode reached 24.9 + 21.7 tok/s on the cold cache, below one cold
+  request (~55-67 tok/s). Two unrelated sequences double the distinct experts per round. C > 1
+  under MTP is not tuned; C = 1 is the recommended setting for now.
+
 **Next, in order of expected gain:**
 
 1. MTP measurements and tuning (draft length policy, §11.3).
