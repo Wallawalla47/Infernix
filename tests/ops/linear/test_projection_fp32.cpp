@@ -163,20 +163,26 @@ void quantized_case(ninfer::QType qtype, std::int32_t n, std::int32_t k, std::ui
     cudaFree(payload);
 }
 
-void bf16_case(std::int32_t n0, std::int32_t n1, std::int32_t k, std::uint32_t seed) {
+// Segments of `rows` rows each, concatenated in order (one to four weights).
+void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::normal_distribution<float> d(0.0F, 0.05F);
-    std::vector<std::uint16_t> w0(static_cast<std::size_t>(n0) * k), w1(static_cast<std::size_t>(n1) * k);
     std::vector<float> wv;
-    for (auto& v : w0) { v = bf16_bits(d(rng)); }
-    for (auto& v : w1) { v = bf16_bits(d(rng)); }
-    for (auto v : w0) { wv.push_back(bf16_value(v)); }
-    for (auto v : w1) { wv.push_back(bf16_value(v)); }
-    auto* d0 = device(w0);
-    auto* d1 = device(w1);
-    const std::int32_t n = n0 + n1;
-    Tensor t0(d0, DType::BF16, {k, n0}), t1(d1, DType::BF16, {k, n1});
-    const Tensor* weights[] = {&t0, &t1};
+    std::vector<std::uint16_t*> devices;
+    std::vector<Tensor> tensors;
+    std::int32_t n = 0;
+    std::string label;
+    for (const std::int32_t segment : rows) {
+        std::vector<std::uint16_t> part(static_cast<std::size_t>(segment) * k);
+        for (auto& v : part) { v = bf16_bits(d(rng)); }
+        for (auto v : part) { wv.push_back(bf16_value(v)); }
+        devices.push_back(device(part));
+        tensors.push_back(Tensor(devices.back(), DType::BF16, {k, segment}));
+        n += segment;
+        label += (label.empty() ? "" : "+") + std::to_string(segment);
+    }
+    std::vector<const Tensor*> weights;
+    for (const auto& t : tensors) { weights.push_back(&t); }
     const WeightAt w = [&](std::int32_t r, std::int32_t i) {
         return static_cast<double>(wv[static_cast<std::size_t>(r) * k + i]);
     };
@@ -184,9 +190,9 @@ void bf16_case(std::int32_t n0, std::int32_t n1, std::int32_t k, std::uint32_t s
     std::vector<float> wide_values;
     random_activations(k, 17, seed + 7, wide_bits, wide_values);
     std::vector<float> single;
-    // Decode widths take the one-row-per-warp mapping, wider calls the four-row one; a column's
-    // bits must not depend on either.
-    for (const std::int32_t t : {1, 3, 8, 9, 17}) {
+    // Decode widths (every T up to 8) take the one-row-per-warp mapping, wider calls the four-row
+    // one; a column's bits must not depend on either.
+    for (const std::int32_t t : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17}) {
         auto* dx    = device(std::vector<std::uint16_t>(wide_bits.begin(), wide_bits.begin() + static_cast<std::ptrdiff_t>(k) * t));
         float* dout = nullptr;
         cudaMalloc(&dout, sizeof(float) * n * t);
@@ -196,8 +202,7 @@ void bf16_case(std::int32_t n0, std::int32_t n1, std::int32_t k, std::uint32_t s
         std::vector<float> host(static_cast<std::size_t>(n) * t);
         cudaMemcpy(host.data(), dout, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
         const std::vector<float> values(wide_values.begin(), wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
-        verify("bf16 N=" + std::to_string(n0) + "+" + std::to_string(n1) + " K=" + std::to_string(k) + " T=" +
-                   std::to_string(t),
+        verify("bf16 N=" + label + " K=" + std::to_string(k) + " T=" + std::to_string(t),
                host, w, values, n, k, t, {});
         if (t == 1) {
             single = host;
@@ -208,8 +213,7 @@ void bf16_case(std::int32_t n0, std::int32_t n1, std::int32_t k, std::uint32_t s
         cudaFree(dx);
         cudaFree(dout);
     }
-    cudaFree(d0);
-    cudaFree(d1);
+    for (auto* p : devices) { cudaFree(p); }
 }
 
 } // namespace
@@ -220,8 +224,10 @@ int main() {
         return 77;
     }
     try {
-        bf16_case(512, 1, 2560, 11);  // router rows and the shared-expert gate, as Qwen4Exp concatenates them
-        bf16_case(1000, 37, 2560, 13);
+        bf16_case({512, 1}, 2560, 11); // router rows and the shared-expert gate, as Qwen4Exp concatenates them
+        bf16_case({1000, 37}, 2560, 13);
+        bf16_case({129}, 2560, 14);           // one segment
+        bf16_case({7, 300, 1, 64}, 1024, 15); // four segments, one of a single row
         quantized_case(ninfer::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(ninfer::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
         quantized_case(ninfer::QType::Q4_G64_FP16, 1000, 2560, 23, false);

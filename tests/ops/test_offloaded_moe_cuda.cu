@@ -7,7 +7,9 @@
 //     records in device memory (cache frame) and in mapped host memory (zero-copy), bit for bit;
 //   - the canonical scalar functions (E4M3/E2M1 encoders, exp_c, silu_c) on the GPU against the
 //     same header on the CPU: exhaustively over BF16 for exp/SiLU, and over every FP32 word near
-//     each encoder rounding boundary plus a strided sweep of all FP32 words.
+//     each encoder rounding boundary plus a strided sweep of all FP32 words;
+//   - the E2M1 decoders (scalar on host and device, four codes at once on the device) against the
+//     E2M1 table, exhaustively.
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -224,6 +226,52 @@ void test_scalar_functions() {
     check(bad == 0, "GPU canonical scalar functions equal the CPU's");
 }
 
+// ------------------------------------------------------------------------------- E2M1 decoding
+
+// Thread i decodes the four codes of i (nibbles 0-3) with e2m1_x2_quad from byte lanes, and code
+// i & 15 with the device e2m1_x2.
+__global__ void e2m1_decode_kernel(std::uint32_t* quads, std::int32_t* scalars) {
+    const std::uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 65536U) { return; }
+    const std::uint32_t lanes = (i & 15U) | ((i >> 4) & 15U) << 8 | ((i >> 8) & 15U) << 16 | ((i >> 12) & 15U) << 24;
+    quads[i] = canon::e2m1_x2_quad(lanes);
+    if (i < 16U) { scalars[i] = canon::e2m1_x2(i); }
+}
+
+// Exhaustive against the E2M1 table itself: twice {0, 0.5, 1, 1.5, 2, 3, 4, 6}, negated by bit 3.
+void test_e2m1_decode() {
+    constexpr std::int32_t kDoubled[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+    const auto doubled = [&](std::uint32_t code) {
+        return (code & 8U) != 0 ? -kDoubled[code & 7U] : kDoubled[code & 7U];
+    };
+    std::uint32_t* d_quads = nullptr;
+    std::int32_t* d_scalars = nullptr;
+    cuda_check(cudaMalloc(&d_quads, 65536 * sizeof(std::uint32_t)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_scalars, 16 * sizeof(std::int32_t)), "cudaMalloc");
+    e2m1_decode_kernel<<<256, 256>>>(d_quads, d_scalars);
+    cuda_check(cudaDeviceSynchronize(), "e2m1 decode kernel");
+    std::vector<std::uint32_t> quads(65536);
+    std::vector<std::int32_t> scalars(16);
+    cuda_check(cudaMemcpy(quads.data(), d_quads, quads.size() * sizeof(std::uint32_t), cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(scalars.data(), d_scalars, scalars.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+               "copy");
+    cudaFree(d_quads);
+    cudaFree(d_scalars);
+    long bad = 0;
+    for (std::uint32_t c = 0; c < 16; ++c) {
+        bad += scalars[c] != doubled(c);
+        bad += canon::e2m1_x2(c) != doubled(c); // the host form
+    }
+    for (std::uint32_t i = 0; i < 65536; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const auto byte = static_cast<std::int8_t>((quads[i] >> (8 * j)) & 0xFFU);
+            bad += byte != doubled((i >> (4 * j)) & 15U);
+        }
+    }
+    std::printf("E2M1 decode: 16 codes, 65536 code quads, %ld mismatches\n", bad);
+    check(bad == 0, "E2M1 decoders equal the E2M1 table");
+}
+
 } // namespace
 
 int main() {
@@ -233,6 +281,7 @@ int main() {
     }
     try {
         test_scalar_functions();
+        test_e2m1_decode();
         test_golden();
         test_cpu_equality();
     } catch (const std::exception& e) {

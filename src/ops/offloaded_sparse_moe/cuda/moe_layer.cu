@@ -76,12 +76,7 @@ __device__ __forceinline__ ActBlock to_act(const canon::A4Block& a) {
 __device__ __forceinline__ int row_quad(const std::uint8_t* unit, int r, int q) {
     const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * (r & 7));
     const int shift          = r < 8 ? 0 : 4;
-    int packed               = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        packed |= (canon::e2m1_x2((word >> (8 * j + shift)) & 15U) & 0xFF) << (8 * j);
-    }
-    return packed;
+    return static_cast<int>(canon::e2m1_x2_quad((word >> shift) & 0x0F0F0F0FU));
 }
 
 // A CTA's weight slice is contiguous in the record. Every thread issues 16-byte asynchronous copies
@@ -261,41 +256,110 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
 
 // ------------------------------------------------------------------------------------- dispatch
 
-__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
-                             std::int32_t* __restrict__ counts) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < entries) { atomicAdd(&counts[ids[i]], 1); }
-}
+// Calls of at most this many entries are dispatched by one CTA; the dispatch serves at most this
+// many experts (one scan thread each).
+constexpr int kDispatchThreads = 1024;
 
-// One CTA: exclusive scan of the counts, the job list, and the scatter cursors.
-__global__ void scan_kernel(const std::int32_t* __restrict__ counts, int experts,
-                            std::int32_t* __restrict__ offsets, std::int32_t* __restrict__ cursor,
-                            std::int32_t* __restrict__ jobs, std::int32_t* __restrict__ job_count) {
-    __shared__ std::int32_t scan[1024];
-    __shared__ std::int32_t used[1024];
-    const int e = threadIdx.x;
-    const int c = e < experts ? counts[e] : 0;
-    scan[e]     = c;
-    used[e]     = c > 0 ? 1 : 0;
+// The dispatch scan, shared by both routes. Thread e of a 1024-thread CTA holds count c of expert e
+// (0 for e >= experts). It writes offsets (exclusive scan, offsets[experts] = total), the scatter
+// cursors (in global or shared memory), the job list in ascending expert id and the job count.
+// Inclusive scans of the counts and of the used flags run within each warp by shuffles, then
+// across the warp totals (in the caller's shared `warp_totals`); the results are integers, so any
+// scan order gives the same values.
+__device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* __restrict__ offsets,
+                                              std::int32_t* cursor, std::int32_t* __restrict__ jobs,
+                                              std::int32_t* __restrict__ job_count,
+                                              std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
+    const int e = threadIdx.x, lane = e % 32, warp = e / 32;
+    int sum = c, used = c > 0 ? 1 : 0;
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        const int s = __shfl_up_sync(0xFFFFFFFFU, sum, offset);
+        const int u = __shfl_up_sync(0xFFFFFFFFU, used, offset);
+        if (lane >= offset) {
+            sum += s;
+            used += u;
+        }
+    }
+    if (lane == 31) {
+        warp_totals[0][warp] = sum;
+        warp_totals[1][warp] = used;
+    }
     __syncthreads();
-    for (int step = 1; step < 1024; step <<= 1) {
-        const int a = e >= step ? scan[e - step] : 0;
-        const int b = e >= step ? used[e - step] : 0;
-        __syncthreads();
-        scan[e] += a;
-        used[e] += b;
-        __syncthreads();
+    if (warp == 0) {
+        int s = warp_totals[0][lane], u = warp_totals[1][lane];
+#pragma unroll
+        for (int offset = 1; offset < 32; offset <<= 1) {
+            const int ps = __shfl_up_sync(0xFFFFFFFFU, s, offset);
+            const int pu = __shfl_up_sync(0xFFFFFFFFU, u, offset);
+            if (lane >= offset) {
+                s += ps;
+                u += pu;
+            }
+        }
+        warp_totals[0][lane] = s;
+        warp_totals[1][lane] = u;
+    }
+    __syncthreads();
+    if (warp > 0) {
+        sum += warp_totals[0][warp - 1];
+        used += warp_totals[1][warp - 1];
     }
     if (e < experts) {
-        const int start = scan[e] - c;
-        offsets[e]      = start;
-        cursor[e]       = start;
-        if (c > 0) { jobs[used[e] - 1] = e; }
+        offsets[e] = sum - c;
+        cursor[e]  = sum - c;
+        if (c > 0) { jobs[used - 1] = e; }
     }
     if (e == experts - 1) {
-        offsets[experts] = scan[e];
-        *job_count       = used[e];
+        offsets[experts] = sum;
+        *job_count       = used;
     }
+}
+
+// The whole dispatch of a call of at most kDispatchThreads entries in one CTA: the count with
+// shared atomics (so no array needs clearing between calls and no memset node precedes it), the
+// scan, the scatter, and the optional route-log copy of the ids. Same results as the three-kernel
+// route below.
+__global__ void __launch_bounds__(kDispatchThreads)
+    dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    const int i = threadIdx.x;
+    count[i]    = 0;
+    __syncthreads();
+    const int id = i < entries ? ids[i] : 0;
+    if (i < entries) {
+        atomicAdd(&count[id], 1);
+        if (route_log != nullptr) { route_log[i] = id; }
+    }
+    __syncthreads();
+    const int c = count[i];
+    if (i < experts) { dispatch.counts[i] = c; }
+    dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
+    __syncthreads();
+    if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+}
+
+__global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
+                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ route_log) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < entries) {
+        const int id = ids[i];
+        atomicAdd(&counts[id], 1);
+        if (route_log != nullptr) { route_log[i] = id; }
+    }
+}
+
+// One CTA: the dispatch scan of the counts into offsets, job list and scatter cursors.
+__global__ void __launch_bounds__(kDispatchThreads)
+    scan_kernel(const std::int32_t* __restrict__ counts, int experts, std::int32_t* __restrict__ offsets,
+                std::int32_t* __restrict__ cursor, std::int32_t* __restrict__ jobs,
+                std::int32_t* __restrict__ job_count) {
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    const int e = threadIdx.x;
+    dispatch_scan(e < experts ? counts[e] : 0, experts, offsets, cursor, jobs, job_count, warp_totals);
 }
 
 __global__ void scatter_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -703,16 +767,23 @@ MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t en
 }
 
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
-                  cudaStream_t stream) {
-    require(experts > 0 && experts <= 1024, "dispatch supports up to 1024 experts");
+                  std::int32_t* route_log, cudaStream_t stream) {
+    require(experts > 0 && experts <= kDispatchThreads, "dispatch supports up to 1024 experts");
     const int entries = static_cast<int>(routing.ids.numel());
+    const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
+    if (entries <= kDispatchThreads) {
+        // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
+        dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log);
+        check_launch("dispatch");
+        return;
+    }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
             "dispatch could not clear its counts");
-    const auto* ids = static_cast<const std::int32_t*>(routing.ids.data);
-    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts);
+    count_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(ids, entries, dispatch.counts,
+                                                                                route_log);
     check_launch("count");
-    scan_kernel<<<1, 1024, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
-                                        dispatch.jobs, dispatch.job_count);
+    scan_kernel<<<1, kDispatchThreads, 0, stream>>>(dispatch.counts, experts, dispatch.offsets, dispatch.cursor,
+                                                    dispatch.jobs, dispatch.job_count);
     check_launch("scan");
     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         ids, entries, dispatch.cursor, dispatch.entries);

@@ -361,9 +361,55 @@ __device__ __forceinline__ int attended_count(int count, int ratio, int p) {
     return count < 0 ? p + 1 : count * ratio + (p + 1) % ratio;
 }
 
+// Score sums of one token for every query head of a group: part[h] is this lane's partial dot
+// product for head h. A reduce-scatter in warp_sum's xor order (16, 8, then 4, 2, 1 over the
+// remaining quarter): at each step a lane adds its partner's value of a head to its own, exactly
+// as warp_sum's `v += shfl_xor(v, o)`, so head h's sum has warp_sum's bits; it ends in the lanes
+// whose bits 4 and 3 select its quarter. Those lanes with bits 0-2 clear write probs[h][j].
+template <int Group>
+__device__ __forceinline__ void scatter_head_sums(const float (&part)[Group], int group, int lane, float scale,
+                                                  float (*probs)[kTokenTile], int j) {
+    static_assert(Group % 4 == 0, "the reduce-scatter halves the heads twice");
+    constexpr int kHalf = Group / 2, kQuarter = Group / 4;
+    const bool upper16 = (lane & 16) != 0, upper8 = (lane & 8) != 0;
+    float half[kHalf];
+#pragma unroll
+    for (int i = 0; i < kHalf; ++i) {
+        const float mine = upper16 ? part[i + kHalf] : part[i];
+        const float send = upper16 ? part[i] : part[i + kHalf];
+        half[i]          = mine + __shfl_xor_sync(0xFFFFFFFFU, send, 16);
+    }
+    float quarter[kQuarter];
+#pragma unroll
+    for (int i = 0; i < kQuarter; ++i) {
+        const float mine = upper8 ? half[i + kQuarter] : half[i];
+        const float send = upper8 ? half[i] : half[i + kQuarter];
+        quarter[i]       = mine + __shfl_xor_sync(0xFFFFFFFFU, send, 8);
+    }
+#pragma unroll
+    for (int o = 4; o > 0; o >>= 1) {
+#pragma unroll
+        for (int i = 0; i < kQuarter; ++i) { quarter[i] += __shfl_xor_sync(0xFFFFFFFFU, quarter[i], o); }
+    }
+    if ((lane & 7) == 0) {
+        const int first = (upper16 ? kHalf : 0) + (upper8 ? kQuarter : 0);
+#pragma unroll
+        for (int i = 0; i < kQuarter; ++i) {
+            if (first + i < group) { probs[first + i][j] = quarter[i] * scale; }
+        }
+    }
+}
+
+// Value cells whose loads one thread issues together before folding them in order.
+constexpr int kValueBatch = 8;
+
 // One CTA per (split, KV head, column): the column's query heads of this KV head over one slice of
 // its attended tokens. Partials (max, sum, unnormalized output) go to workspace when split > 1.
-template <KvCacheStorage Storage>
+// `Group` bounds the query heads per KV head (group = heads / kv_heads <= Group), so every head
+// loop has a compile-time trip count and the accumulators stay in registers. Each head's
+// arithmetic (the score's fma order and butterfly, the serial online softmax, the in-order value
+// fold) does not depend on Group.
+template <KvCacheStorage Storage, int Group>
 __global__ void __launch_bounds__(256)
     attention_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv,
                      const std::int32_t* __restrict__ tables, int table_stride,
@@ -382,9 +428,9 @@ __global__ void __launch_bounds__(256)
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
     const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
 
-    __shared__ float qs[kMaxGroup][kHeadDim];
-    __shared__ float probs[kMaxGroup][kTokenTile];
-    __shared__ float m_run[kMaxGroup], l_run[kMaxGroup], rescale[kMaxGroup];
+    __shared__ float qs[Group][kHeadDim];
+    __shared__ float probs[Group][kTokenTile];
+    __shared__ float m_run[Group], l_run[Group], rescale[Group];
     __shared__ int tokens[kTokenTile];
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     for (int i = threadIdx.x; i < group * kHeadDim; i += blockDim.x) {
@@ -416,28 +462,43 @@ __global__ void __launch_bounds__(256)
         m_run[threadIdx.x] = -INFINITY;
         l_run[threadIdx.x] = 0.0F;
     }
-    float acc[kMaxGroup];
+    float acc[Group];
 #pragma unroll
-    for (int h = 0; h < kMaxGroup; ++h) { acc[h] = 0.0F; }
+    for (int h = 0; h < Group; ++h) { acc[h] = 0.0F; }
     const int d_own = threadIdx.x; // this thread's output dimension
     __syncthreads();
     for (int tile = begin; tile < end; tile += kTokenTile) {
         const int n = min(kTokenTile, end - tile);
         if (threadIdx.x < n) { tokens[threadIdx.x] = attended_token(tile + threadIdx.x, count, list, ratio, p); }
         __syncthreads();
-        // Scores: one warp per token, all query heads of the group.
+        // Scores: one warp per token, all query heads of the group; the next token's key loads are
+        // issued before this token's sums.
+        float k[8];
+        if (warp < n) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { k[r] = Reader::key(kv, table, kv_head, tokens[warp], lane + 32 * r, kv_heads); }
+        }
         for (int j = warp; j < n; j += 8) {
-            const int token = tokens[j];
-            float k[8];
+            float next[8];
+            if (j + 8 < n) {
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { k[r] = Reader::key(kv, table, kv_head, token, lane + 32 * r, kv_heads); }
-            for (int h = 0; h < group; ++h) {
-                float dot = 0.0F;
-#pragma unroll
-                for (int r = 0; r < 8; ++r) { dot += qs[h][lane + 32 * r] * k[r]; }
-                dot = warp_sum(dot);
-                if (lane == 0) { probs[h][j] = dot * scale; }
+                for (int r = 0; r < 8; ++r) {
+                    next[r] = Reader::key(kv, table, kv_head, tokens[j + 8], lane + 32 * r, kv_heads);
+                }
             }
+            float part[Group];
+#pragma unroll
+            for (int h = 0; h < Group; ++h) {
+                float dot = 0.0F;
+                if (h < group) {
+#pragma unroll
+                    for (int r = 0; r < 8; ++r) { dot += qs[h][lane + 32 * r] * k[r]; }
+                }
+                part[h] = dot;
+            }
+            scatter_head_sums<Group>(part, group, lane, scale, probs, j);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) { k[r] = next[r]; }
         }
         __syncthreads();
         // Online softmax per head.
@@ -457,14 +518,32 @@ __global__ void __launch_bounds__(256)
             rescale[h] = r;
         }
         __syncthreads();
-        for (int h = 0; h < group; ++h) { acc[h] *= rescale[h]; }
-        for (int j = 0; j < n; ++j) {
-            const float v = Reader::value(kv, table, kv_head, tokens[j], d_own, kv_heads);
-            for (int h = 0; h < group; ++h) { acc[h] += probs[h][j] * v; }
+#pragma unroll
+        for (int h = 0; h < Group; ++h) {
+            if (h < group) { acc[h] *= rescale[h]; }
+        }
+        // Values: a batch of cells' loads in flight together, then folded in token order.
+        for (int j0 = 0; j0 < n; j0 += kValueBatch) {
+            float v[kValueBatch];
+#pragma unroll
+            for (int u = 0; u < kValueBatch; ++u) {
+                if (j0 + u < n) { v[u] = Reader::value(kv, table, kv_head, tokens[j0 + u], d_own, kv_heads); }
+            }
+#pragma unroll
+            for (int u = 0; u < kValueBatch; ++u) {
+                if (j0 + u < n) {
+#pragma unroll
+                    for (int h = 0; h < Group; ++h) {
+                        if (h < group) { acc[h] += probs[h][j0 + u] * v[u]; }
+                    }
+                }
+            }
         }
         __syncthreads();
     }
-    for (int h = 0; h < group; ++h) {
+#pragma unroll
+    for (int h = 0; h < Group; ++h) {
+        if (h >= group) { continue; }
         const int head = kv_head * group + h;
         if (splits == 1) {
             const float l = l_run[h];
@@ -650,18 +729,30 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     }
     const int splits = attention_splits(columns, geometry.kv_heads);
     const dim3 grid(splits, geometry.kv_heads, columns);
+    const auto launch = [&](auto kernel) {
+        kernel<<<grid, 256, 0, stream>>>(static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv,
+                                         tables, stride, rows, pos, batch.width, geometry.ratio, ws.selected, ws.counts,
+                                         top_blocks, splits, scale, ws.partial, static_cast<bf16*>(out.data));
+    };
+    // Query heads per KV head, rounded up to a multiple of four (Qwen4Exp: 24 / 2 = 12).
+    const auto launch_storage = [&]<KvCacheStorage Storage>() {
+        const int group = geometry.heads / geometry.kv_heads;
+        if (group <= 4) {
+            launch(attention_kernel<Storage, 4>);
+        } else if (group <= 8) {
+            launch(attention_kernel<Storage, 8>);
+        } else if (group <= 12) {
+            launch(attention_kernel<Storage, 12>);
+        } else {
+            launch(attention_kernel<Storage, kMaxGroup>);
+        }
+    };
     switch (layer.kv.storage) {
     case KvCacheStorage::BFloat16:
-        attention_kernel<KvCacheStorage::BFloat16><<<grid, 256, 0, stream>>>(
-            static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv, tables, stride, rows, pos,
-            batch.width, geometry.ratio, ws.selected, ws.counts, top_blocks, splits, scale, ws.partial,
-            static_cast<bf16*>(out.data));
+        launch_storage.template operator()<KvCacheStorage::BFloat16>();
         break;
     case KvCacheStorage::Int8Group64:
-        attention_kernel<KvCacheStorage::Int8Group64><<<grid, 256, 0, stream>>>(
-            static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv, tables, stride, rows, pos,
-            batch.width, geometry.ratio, ws.selected, ws.counts, top_blocks, splits, scale, ws.partial,
-            static_cast<bf16*>(out.data));
+        launch_storage.template operator()<KvCacheStorage::Int8Group64>();
         break;
     default:
         throw std::invalid_argument("qsa: this KV storage is not implemented yet");

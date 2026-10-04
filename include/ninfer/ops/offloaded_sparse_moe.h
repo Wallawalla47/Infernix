@@ -55,8 +55,12 @@ struct MoeDispatch {
 
 [[nodiscard]] std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries);
 [[nodiscard]] MoeDispatch carve_moe_dispatch(void* base, std::int32_t experts, std::int32_t entries);
+/// Fills `dispatch` from routing.ids: counts, offsets (exclusive scan, offsets[E] = k*T), jobs in
+/// ascending expert id, job_count, and entries grouped by expert (their order within an expert is
+/// unspecified). When `route_log` is not null it also receives a copy of the k*T ids. The arrays need
+/// no clearing between calls, so a captured call replays correctly.
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
-                  cudaStream_t stream);
+                  std::int32_t* route_log, cudaStream_t stream);
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host

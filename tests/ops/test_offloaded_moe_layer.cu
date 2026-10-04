@@ -6,7 +6,7 @@
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair, bit for bit. Expert
 // arithmetic is exact and placement-invariant, so neither the record's location nor the staging
-// pass a job falls in may change an output bit.
+// pass a job falls in may change an output bit. moe_dispatch has its own exact oracle (test_dispatch).
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -97,7 +98,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     void* d_dispatch = nullptr;
     cuda_check(cudaMalloc(&d_dispatch, ninfer::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
     auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr);
+    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
 
     const auto x  = fixtures::random_activations(rng, columns);
     auto* d_x     = device_copy(x);
@@ -187,6 +188,91 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cudaFreeHost(host);
 }
 
+// moe_dispatch against an exact oracle: counts, offsets, jobs and job_count exact, each expert's
+// entries as a set, and the route-log copy. The dispatch arrays start as garbage, and a captured
+// call is replayed on new ids, so neither route may depend on memory cleared outside the call.
+// Entries <= 1024 take the one-CTA kernel, more the count/scan/scatter kernels.
+void test_dispatch(int experts, int entries, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> pick(0, experts - 1);
+    const auto random_ids = [&] {
+        std::vector<std::int32_t> ids(entries);
+        // A few hot experts and many cold ones, as routing produces; some experts stay unused.
+        for (auto& id : ids) { id = (rng() % 4 == 0) ? pick(rng) % 8 : pick(rng); }
+        return ids;
+    };
+    std::int32_t* d_ids = nullptr;
+    std::int32_t* d_log = nullptr;
+    void* d_dispatch    = nullptr;
+    const std::size_t bytes = ninfer::ops::moe_dispatch_bytes(experts, entries);
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * entries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_log, sizeof(std::int32_t) * entries), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_dispatch, bytes), "cudaMalloc");
+    cuda_check(cudaMemset(d_dispatch, 0x5A, bytes), "cudaMemset");
+    cuda_check(cudaMemset(d_log, 0xFF, sizeof(std::int32_t) * entries), "cudaMemset");
+    auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, entries);
+    ninfer::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {entries, 1}), Tensor{}, Tensor{}};
+
+    const auto verify = [&](const std::vector<std::int32_t>& ids, const char* phase) {
+        std::vector<std::int32_t> counts(experts), offsets(experts + 1), jobs(experts), got_entries(entries), log(entries);
+        std::int32_t job_count = -1;
+        cuda_check(cudaMemcpy(counts.data(), dispatch.counts, sizeof(std::int32_t) * experts, cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(offsets.data(), dispatch.offsets, sizeof(std::int32_t) * (experts + 1), cudaMemcpyDeviceToHost),
+                   "copy");
+        cuda_check(cudaMemcpy(jobs.data(), dispatch.jobs, sizeof(std::int32_t) * experts, cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(&job_count, dispatch.job_count, sizeof(std::int32_t), cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(got_entries.data(), dispatch.entries, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost),
+                   "copy");
+        cuda_check(cudaMemcpy(log.data(), d_log, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost), "copy");
+        std::vector<std::vector<std::int32_t>> by_expert(experts);
+        for (int i = 0; i < entries; ++i) { by_expert[ids[i]].push_back(i); }
+        bool ok = log == ids;
+        int used = 0, start = 0;
+        for (int e = 0; e < experts; ++e) {
+            const int c = static_cast<int>(by_expert[e].size());
+            ok = ok && counts[e] == c && offsets[e] == start;
+            if (c > 0) { ok = ok && jobs[used++] == e; }
+            if (ok && c > 0) {
+                std::vector<std::int32_t> mine(got_entries.begin() + start, got_entries.begin() + start + c);
+                std::sort(mine.begin(), mine.end());
+                ok = mine == by_expert[e];
+            }
+            start += c;
+        }
+        ok = ok && offsets[experts] == entries && job_count == used;
+        std::printf("dispatch E=%d entries=%d (%s): %s\n", experts, entries, phase, ok ? "exact" : "MISMATCH");
+        check(ok, "moe_dispatch equals the exact oracle");
+    };
+
+    const auto first = random_ids();
+    cuda_check(cudaMemcpy(d_ids, first.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
+    ninfer::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "dispatch");
+    verify(first, "eager");
+
+    cudaStream_t stream = nullptr;
+    cudaGraph_t graph   = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    ninfer::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    for (int replay = 0; replay < 2; ++replay) {
+        const auto ids = random_ids();
+        cuda_check(cudaMemcpy(d_ids, ids.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
+        cuda_check(cudaGraphLaunch(exec, stream), "launch");
+        cuda_check(cudaStreamSynchronize(stream), "replay");
+        verify(ids, replay == 0 ? "graph replay 1" : "graph replay 2");
+    }
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    cudaFree(d_dispatch);
+    cudaFree(d_log);
+    cudaFree(d_ids);
+}
+
 } // namespace
 
 int main() {
@@ -195,6 +281,9 @@ int main() {
         return 77;
     }
     try {
+        for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
+        test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
+        test_dispatch(3, 1000, 37);    // few experts, long runs per expert
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // verify width: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert

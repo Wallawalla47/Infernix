@@ -4461,6 +4461,24 @@ further −0.06 to −0.08 ms); `split_rows` after GDN/QSA projections
 (2.5 + 1.7 + 1.2 µs per GDN layer, QSA 2.0); `recurrent_record_kernel` (5.4 µs × 35.5);
 `cpu_plan_kernel`; `route_kernel` (already a warp per column: a 10-step top-k latency, withdrawn).
 
+**Phase 0 as implemented (step K0, branch `claude/fn-kernels`; built, not yet measured).** Rule
+(user, 2026-10-04): reuse NInfer's existing kernels, templates and instances before adding a
+kernel. Every item is a change to, or a new instance of, the kernel that serves the call today, so
+Phase 0 adds no parallel kernel except the one-CTA dispatch, which shares the scan of the existing
+route.
+
+| Item | Implementation | Existing kernels considered |
+|---|---|---|
+| E2M1 decode | `canon::e2m1_x2` selects the magnitude by one `__byte_perm` over the bytes {0, 1, 2, 3 \| 4, 6, 8, 12} on the device and a 64-bit-constant shift on the host; new `canon::e2m1_x2_quad` decodes the four codes of a `row_quad` word with two byte permutes (magnitude and negated magnitude) and a sign mask. Exact integer transform, so `gate_up`/`down` (1 and 8 columns), `quantize_a4_block`, the CPU engine and `narrow_expert` keep their bits | — (a defect fix in the shared function) |
+| MoE dispatch | `moe_dispatch(..., route_log, stream)`: calls of at most 1,024 entries run `dispatch_small_kernel` (one 1,024-thread CTA: shared-memory count, the scan, the scatter, the route-log copy); larger calls keep memset + count + scan + scatter, with the route log written by `count_kernel`. Both routes share one scan (`dispatch_scan`: warp-shuffle inclusive scans of counts and used flags, then of the warp totals), which also replaces the 20-barrier Hillis-Steele scan of `scan_kernel`. The model passes the route-log slot instead of enqueuing a D2D copy, so decode graphs lose the memset and copy nodes | `sparse_moe_prefill_select_count_kernel` / `sparse_moe_prefill_scan_kernel` (Qwen3.5): fixed 256 experts and top-8, fused with the router's top-k, and a tile-job layout (`route_job_columns`, tile bases) that `MoeDispatch`'s per-expert jobs and entry list do not have |
+| Router [513, 2560] | `projection_kernel` (both mappings) loads its first row's chunks into registers before staging x, stages x as one unrolled `cp.async` batch, and reads segment fields at compile-time indices only; arithmetic unchanged | — (the existing kernel, reordered) |
+| MTP `hidden_norm`, d = 10240 | `rmsnorm_generic_kernel<Epilogue, Preload>`: a preloading instance (Preload = 64, 256 threads) for 8192 < d ≤ 16384, ungated epilogues; same per-thread order and shared tree as the generic instance | `rmsnorm_cta_bf16x2_kernel<…, 512, 10, true, 10240>` fits the shape and alignment but sums bf16x2 pairs and reduces by `block_reduce_sum`, another order: it would change the drafter's bits (MTP acceptance), which Phase 0 must not. It remains the natural rounding-change option if one is ever wanted |
+| GDN control [96, 2560] | `bf16_skinny_gemv_kernel<Tokens, Warps, RowsPerWarp, Preload>`: the existing kernel gains warp/row/preload parameters; the small-N instance (2 warps × 1 row, Preload = 16 chunks per lane, N ≤ 256 and K ≤ 4,096) runs 48 CTAs for the control and issues every chunk load before the FMAs; the default instance (8 × 2, loop) is unchanged | The registered BF16 schedules (`Bf16A16SlicedKMma`, `Bf16A16Gemv`, `Bf16A16Simt`, as for [256, 5120]) accumulate in another k order or by MMA, so registering [96, 2560] would change the GDN gating bits; `gdn_gating_proj` (fused) is a rounding change and stays listed |
+| QSA decode attention | `attention_kernel<Storage, Group>` with Group ∈ {4, 8, 12, 16} (Qwen4Exp: 12); the head sums reduce-scatter in `warp_sum`'s xor order; the next token's key loads issue before the current token's sums; value loads issue in batches of 8 cells (the plan said 4; a scheduling choice) and fold in token order | — (the existing kernel, templated) |
+
+A temporary toggle patch (`fn/rigs/kernels/k0-base-toggle-temporary.patch`, never committed)
+restores each pre-K0 route under `NINFER_K0_BASE` for M0's same-binary A/B.
+
 #### Phase 1a: kernel K1, `q8_a16_stream_kernel`
 
 **Keep the T ≤ 8 arithmetic, change the memory schedule.** K1 keeps both SIMT routes' per-(row,

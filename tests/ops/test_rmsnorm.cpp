@@ -176,6 +176,16 @@ int main() {
             failures += run_case("rmsnorm QK scale/unaligned", {256, 4, 17}, offset, 2002U, scale,
                                  true, true);
         }
+    // Rows wider than every fast route take the preloaded route (8192 < d <= 16384): the Qwen4Exp
+    // MTP hidden_norm (d = 10240, offset) at its decode widths, then that route's edges and the
+    // generic kernel just past it.
+    for (int t = 1; t <= 5; ++t) {
+        const auto label = "rmsnorm hidden_norm d10240 T=" + std::to_string(t);
+        failures += run_case(label.c_str(), {10240, 1, t}, true, 2100U + t, 4.f, false, t == 1 || t == 4);
+    }
+    failures += run_case("rmsnorm plain d8200 unaligned", {8200, 3}, false, 2110U, 4.f, true);
+    failures += run_case("rmsnorm offset d16384", {16384, 2}, true, 2111U);
+    failures += run_case("rmsnorm plain d16392 generic", {16392, 2}, false, 2112U);
     std::cout << (failures ? "FAIL" : "OK") << " rmsnorm\n";
     return failures ? 1 : 0;
 }
