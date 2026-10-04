@@ -106,6 +106,7 @@ public:
         }
         nvml_ = std::make_unique<Nvml>(props_);
 #ifdef _WIN32
+        budget_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
         open_adapter();
 #endif
     }
@@ -113,6 +114,15 @@ public:
     ~DeviceSource() override {
 #ifdef _WIN32
         release_adapter();
+        if (budget_event_ != nullptr) { ::CloseHandle(budget_event_); }
+#endif
+    }
+
+    void* change_event() override {
+#ifdef _WIN32
+        return budget_event_;
+#else
+        return nullptr;
 #endif
     }
 
@@ -168,6 +178,10 @@ private:
         }
         factory_ = factory;
         adapter_ = adapter;
+        if (budget_event_ != nullptr &&
+            FAILED(adapter_->RegisterVideoMemoryBudgetChangeNotificationEvent(budget_event_, &budget_cookie_))) {
+            budget_cookie_ = 0;
+        }
         outputs_ = 0;
         for (UINT i = 0;; ++i) {
             IDXGIOutput* output = nullptr;
@@ -180,6 +194,10 @@ private:
     }
 
     void release_adapter() noexcept {
+        if (adapter_ != nullptr && budget_cookie_ != 0) {
+            adapter_->UnregisterVideoMemoryBudgetChangeNotification(budget_cookie_);
+            budget_cookie_ = 0;
+        }
         if (adapter_ != nullptr) { adapter_->Release(); }
         if (factory_ != nullptr) { factory_->Release(); }
         adapter_ = nullptr;
@@ -190,6 +208,8 @@ private:
     IDXGIFactory4* factory_ = nullptr;
     IDXGIAdapter3* adapter_ = nullptr;
     int outputs_            = -1;
+    HANDLE budget_event_    = nullptr;
+    DWORD budget_cookie_    = 0;
 #endif
     int device_ = 0;
     cudaDeviceProp props_{};

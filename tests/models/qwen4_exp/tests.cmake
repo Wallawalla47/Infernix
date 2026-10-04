@@ -22,6 +22,12 @@ ninfer_add_test(ninfer_qwen4_exp_route_trace_real_test
   LIBRARIES ninfer_engine ninfer_model_runtime ninfer::json)
 set_tests_properties(ninfer_qwen4_exp_route_trace_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Engine-level VRAM pressure (memory RT13): the expert cache shrinks and grows under a fake source.
+ninfer_add_test(ninfer_qwen4_exp_vram_pressure_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vram_pressure_real.cpp"
+  LIBRARIES ninfer_engine ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # The startup RAM ledger (host only).
 ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"

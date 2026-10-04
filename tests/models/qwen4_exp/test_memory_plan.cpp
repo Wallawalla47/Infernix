@@ -3,7 +3,9 @@
 // margin, the commit limit bounds the experts like physical memory, and the reserve is applied
 // once. RT7, the VRAM sizing: the display headroom by display state, the OS budget without
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
-// clamp, and the spill test with noisy free-memory readings.
+// clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
+// pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
+// cap, display hot-plug, and the reserve spent by NInfer's own later allocations.
 
 #include "models/qwen4_exp/memory_plan.h"
 
@@ -258,6 +260,97 @@ void test_spill() {
     require(faked.device_free == 5 * kGiB && faked.display == DisplayState::Headless, "the seam's source answers");
 }
 
+// ---------------------------------------------------------------- RT9
+
+constexpr std::uint64_t kChunk = 64 * kMiB;
+
+// A card where this process has `pool` bytes of frames and `other` bytes of everything else, the OS
+// budget is 31,419 MiB and free memory is budget - usage (as RM0a measured on the RTX 5090).
+VramSnapshot wddm(std::uint64_t pool, std::uint64_t other, DisplayState display = DisplayState::Headless,
+                  std::uint64_t budget = 31'419 * kMiB) {
+    VramSnapshot s;
+    s.device_total = 32'579 * kMiB;
+    s.has_budget   = true;
+    s.local_budget = budget;
+    s.local_usage  = pool + other;
+    s.device_free  = budget > s.local_usage ? budget - s.local_usage : 0;
+    s.display      = display;
+    s.outputs      = display == DisplayState::Attached ? 1 : 0;
+    return s;
+}
+
+std::uint32_t frames_in(std::uint64_t bytes) { return static_cast<std::uint32_t>(bytes / kRecord); }
+
+void test_control_law() {
+    VramDemand d;
+    d.graphs      = 20;
+    d.frame_bytes = kRecord;
+    d.max_frames  = 48 * 512 - 1;
+    const std::uint64_t other = 6 * kGiB; // dense weights, KV, workspace, staging, context
+    // Sizing left headroom (256) + reserve (256) free, on the chunk grid.
+    const std::uint64_t pool = (31'419 * kMiB - other - 512 * kMiB) / kChunk * kChunk;
+    VramControl control(d, kChunk, pool + other, pool);
+    const std::uint32_t frames = frames_in(pool);
+    double t = 0.0;
+
+    auto steady = control.decide(wddm(pool, other), pool, frames, t, true);
+    require(!steady.shrink && !steady.grow && steady.frames == frames, "the sized pool is stable when idle");
+
+    // Another program takes 2 GiB: this process's budget falls by it, free memory to 0.
+    const std::uint64_t squeezed_budget = 31'419 * kMiB - 2 * kGiB;
+    auto shrink = control.decide(wddm(pool, other, DisplayState::Headless, squeezed_budget), pool, frames, t += 1, false);
+    require(shrink.shrink && shrink.pressure && shrink.frames < frames, "low free memory shrinks at once");
+    const std::uint64_t new_pool = (static_cast<std::uint64_t>(shrink.frames) * kRecord + kChunk - 1) / kChunk * kChunk;
+    // After the shrink the same pressure no longer holds and the pool is stable.
+    const VramSnapshot after = wddm(new_pool, other, DisplayState::Headless, squeezed_budget);
+    auto settled             = control.decide(after, new_pool, shrink.frames, t += 1, false);
+    require(!settled.shrink && !settled.pressure && settled.frames == shrink.frames,
+            "one chunk below the target: the next reading does not shrink again");
+    require(after.device_free >= control.headroom(DisplayState::Headless), "the shrink restores the headroom");
+
+    // The other program exits: room for the startup pool again. No growth before the delay.
+    VramSnapshot freed = wddm(new_pool, other);
+    for (double step = 0; step < 29.5; step += 1.0) {
+        const auto wait = control.decide(freed, new_pool, shrink.frames, t + step, false);
+        require(!wait.grow && wait.frames == shrink.frames, "no growth before 30 s");
+    }
+    const auto grow = control.decide(freed, new_pool, shrink.frames, t + 30.0, false);
+    require(grow.grow && grow.frames == frames_in(new_pool + 4 * kChunk),
+            "during rounds the pool grows by at most four chunks per boundary");
+    const auto idle_grow = control.decide(freed, new_pool, shrink.frames, t + 30.5, true);
+    require(idle_grow.grow && idle_grow.frames >= frames - frames_in(kChunk) && idle_grow.frames <= frames,
+            "an idle engine grows to the target at once");
+
+    // Hysteresis: one chunk of room never grows the pool.
+    VramControl tight(d, kChunk, pool + other, pool);
+    const VramSnapshot one_chunk = wddm(pool - kChunk, other);
+    for (double step = 0; step < 120; step += 10) {
+        require(!tight.decide(one_chunk, pool - kChunk, frames_in(pool - kChunk), step, true).grow,
+                "a target one chunk above the pool does not grow it");
+    }
+
+    // A display appears and the desktop takes 400 MiB: the headroom rises from 256 to 512 MiB
+    // (elastic) and the remaining ~170 MiB free is below half of it.
+    VramControl plugged(d, kChunk, pool + other, pool);
+    const VramSnapshot display = wddm(pool, other, DisplayState::Attached, 31'419 * kMiB - 400 * kMiB);
+    require(plugged.headroom(DisplayState::Attached) == 512 * kMiB, "elastic headroom with a display");
+    require(plugged.decide(display, pool, frames, 0.0, false).shrink, "a display appearing shrinks the pool");
+
+    // NInfer's own later allocations (graph executables, 64 MiB) spend the reserve, not the frames:
+    // the target falls by what remains of the reserve's use, and growth never eats into it.
+    VramControl reserve(d, kChunk, pool + other, pool);
+    const VramSnapshot graphs = wddm(pool, other + 64 * kMiB);
+    require(reserve.reserve_left(graphs, pool) == 256 * kMiB - 64 * kMiB, "graph memory spends the reserve");
+    require(reserve.target(graphs, pool) <= frames, "an idle start never grows into the internal reserve");
+    require(!reserve.decide(graphs, pool, frames, 100.0, true).shrink, "spending the reserve is not pressure");
+
+    // The OS budget falls below this process's usage: shrink even with free memory reported.
+    VramSnapshot trimmed = wddm(pool, other);
+    trimmed.local_budget = pool + other - kGiB;
+    trimmed.device_free  = kGiB;
+    require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
+}
+
 } // namespace
 
 int main() {
@@ -272,6 +365,7 @@ int main() {
         test_internal_reserve();
         test_sizing();
         test_spill();
+        test_control_law();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

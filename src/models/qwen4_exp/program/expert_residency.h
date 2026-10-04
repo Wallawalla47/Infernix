@@ -12,9 +12,16 @@
 // table update, so no kernel can read a frame while it is overwritten. A promoted expert becomes
 // visible in its table only after its copy has completed. Expert outputs are placement-invariant
 // (design §16.2), so the round a promotion lands in does not change any result.
+//
+// Size. The frames live in a VMM arena whose base never moves (design §19.3.7): resize() backs more
+// frames chunk by chunk, or releases the top chunks after evicting the lowest-score experts and
+// moving the survivors below the new top, so kernels and captured graphs keep their addresses.
+// Without VMM the frames are one allocation of the first size.
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/vmm_arena.h"
+#include "core/vram_budget.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 
@@ -36,10 +43,10 @@ public:
         std::uint64_t promotions = 0; // expert copies issued
     };
 
-    // banks[l]: layer l's pinned host records (record_stride bytes apart). frames: device frames
-    // to allocate (0 disables the cache). max_columns: the most columns one round routes.
+    // banks[l]: layer l's pinned host records (record_stride bytes apart). max_columns: the most
+    // columns one round routes. The cache starts with no frames: resize() backs them.
     ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
-                    std::uint32_t frames, std::int32_t max_columns);
+                    std::int32_t max_columns, int device);
     ~ExpertResidency();
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
@@ -48,6 +55,26 @@ public:
     [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
     // Frames the cache uses at most: every routed expert but one.
     [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config) noexcept;
+    // Bytes the frames are mapped in (whole chunks); a grow or shrink moves in these steps.
+    static constexpr std::size_t kChunkBytes = 64ULL << 20;
+
+    struct Resize {
+        std::uint32_t frames  = 0;     // frames backed afterwards
+        std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
+        bool refused          = false; // the device had no memory for the next chunk
+    };
+    // Backs `frames` frames (clamped to frame_limit()). Call only between rounds, with nothing in
+    // flight on the compute stream: promotion copies are waited for, then a shrink evicts the
+    // lowest-score experts, moves the survivors above the new top below it on `compute` and
+    // releases the top chunks; a grow maps chunks one at a time, stops at the first the driver
+    // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
+    // Without VMM only the first call allocates.
+    Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
+    // Whether the pool can resize after its first size (VMM).
+    [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
+    [[nodiscard]] std::uint32_t frame_limit() const noexcept { return limit_; }
+    // Bytes the frames occupy now (whole chunks with VMM).
+    [[nodiscard]] std::uint64_t pool_bytes() const noexcept;
 
     [[nodiscard]] const std::uint8_t* frame_base() const noexcept;
     [[nodiscard]] std::uint64_t frame_stride() const noexcept { return stride_; }
@@ -76,15 +103,21 @@ public:
 
 private:
     void upload_table(cudaStream_t compute);
+    // Publishes the promotions whose copies have completed.
+    void publish_landed();
+    // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
+    void issue_loads(cudaStream_t compute);
 
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
     std::uint64_t stride_ = 0;
     std::uint32_t frames_ = 0;
+    std::uint32_t limit_  = 0;
     std::uint32_t experts_ = 0, layers_ = 0, top_k_ = 0;
     std::size_t route_stride_ = 0;
 
-    DeviceBuffer frame_memory_;
+    std::unique_ptr<VmmArena> arena_;
+    DeviceBuffer frame_memory_; // without VMM
     DeviceBuffer table_device_;
     PinnedHostBuffer table_host_{1};
     DeviceBuffer route_device_;

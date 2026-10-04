@@ -1,14 +1,18 @@
 // Host expert cache of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md §9):
-// LFRU decisions equal tools/expert_cache_replay step for step, residency words round-trip, and
-// frames are never reused while a round that may read them is in flight.
+// LFRU decisions equal tools/expert_cache_replay step for step, residency words round-trip,
+// frames are never reused while a round that may read them is in flight, and a resized pool (design
+// §19.3.7, RT8) evicts the lowest-score experts wherever they sit, moves the survivors below the new
+// top and never names a frame above it.
 
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -112,6 +116,107 @@ void test_frame_epochs() {
     check(pool.is_free(*b), "quiescence frees every pending frame");
 }
 
+void test_pool_resize() {
+    FramePool pool(4, 1, 8);
+    check(pool.backed() == 4 && pool.max_frames() == 8, "4 of 8 frames backed");
+    std::vector<std::uint32_t> held;
+    while (auto f = pool.acquire()) { held.push_back(*f); }
+    check(held.size() == 4, "only backed frames are handed out");
+    pool.resize(6);
+    auto e = pool.acquire(), f = pool.acquire();
+    check(e && f && *e >= 4 && *f >= 4 && !pool.acquire(), "growing frees exactly the new frames");
+    pool.release_now(*e);
+    pool.release_now(*f);
+    pool.release_now(held[0]);
+    const auto low = pool.acquire_below(4);
+    check(low && *low < 4, "a relocation target lies below the limit");
+    pool.release_now(*low);
+    pool.resize(4);
+    check(pool.backed() == 4 && pool.free_count() == 1, "shrinking drops the top frames from the free list");
+    bool threw = false;
+    try {
+        pool.resize(2); // frames 2 and 3 hold experts
+    } catch (const std::logic_error&) { threw = true; }
+    check(threw, "a shrink over held frames is refused");
+}
+
+// Fills a 12-frame pool, gives the experts distinct scores, shrinks to 5 and grows back to 9:
+// victims are the 7 lowest-score experts wherever their frames are; every survivor ends below 5
+// (relocated by kRelocate commands from its old frame); growing loads queued experts only into the
+// new frames.
+void test_controller_resize() {
+    constexpr std::uint32_t kKeys = 64;
+    CacheController cache(kKeys, 12, 0, 1, 16);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> frame_of(kKeys, ~0U);
+    const auto apply = [&] {
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kCopy) { frame_of[c.key] = c.frame; }
+            if (c.kind == CacheController::Command::Kind::kRelocate) {
+                check(frame_of[c.key] == c.source, "a relocation starts from the expert's frame");
+                frame_of[c.key] = c.frame;
+            }
+            if (c.kind == CacheController::Command::Kind::kWriteEntry &&
+                ResidencyEntry::decode(c.word).state == ResidencyState::kAbsent) {
+                frame_of[c.key] = ~0U;
+            }
+        }
+        cmds.clear();
+    };
+    std::uint64_t round = 0;
+    // Key k (0..11) is routed k + 1 times: key 11 scores highest.
+    for (std::uint32_t k = 0; k < 12; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+            apply();
+        }
+    }
+    check(cache.policy().resident_count() == 12 && cache.queued_loads() == 0, "12 experts resident");
+    cache.resize(5, cmds);
+    const std::vector<CacheController::Command> shrink = cmds;
+    apply();
+    check(cache.frames() == 5 && cache.policy().resident_count() == 5, "the pool and the policy shrink to 5");
+    for (std::uint32_t k = 0; k < 12; ++k) {
+        const bool kept = k >= 7;
+        check(cache.policy().resident(k) == kept, "the 7 lowest-score experts are evicted");
+        check(kept ? (frame_of[k] < 5 && cache.entry(k).state == ResidencyState::kReady &&
+                      cache.entry(k).frame == frame_of[k])
+                   : (frame_of[k] == ~0U && cache.entry(k).state == ResidencyState::kAbsent),
+              "survivors sit below the new top, victims are absent");
+    }
+    const bool relocations_last = std::is_partitioned(shrink.begin(), shrink.end(), [](const auto& c) {
+        return c.kind == CacheController::Command::Kind::kWriteEntry;
+    });
+    check(relocations_last, "evictions precede relocations");
+    // Growing makes room: the next routes' experts load into the new frames.
+    cache.resize(9, cmds);
+    apply();
+    check(cache.frames() == 9, "the pool grows to 9");
+    for (std::uint32_t k = 20; k < 24; ++k) {
+        const std::uint32_t group[] = {k};
+        cache.on_route(group, ++round, cmds);
+        cache.on_quiescent(cmds);
+        apply();
+    }
+    std::set<std::uint32_t> frames;
+    for (std::uint32_t k = 0; k < kKeys; ++k) {
+        if (frame_of[k] != ~0U) {
+            check(frame_of[k] < 9, "no expert above the grown top");
+            check(frames.insert(frame_of[k]).second, "one expert per frame");
+        }
+    }
+    check(cache.policy().resident_count() == 9, "the grown pool fills");
+    // Shrinking to zero evicts everything and leaves a working, empty cache.
+    cache.resize(0, cmds);
+    apply();
+    check(cache.frames() == 0 && cache.policy().resident_count() == 0, "a pool can shrink to no frames");
+    const std::uint32_t group[] = {30};
+    cache.on_route(group, ++round, cmds);
+    check(cmds.empty() && cache.queued_loads() == 0, "an empty pool admits nothing");
+}
+
 // An agent-and-device simulation. Each round reads the frames named by READY entries; the agent
 // applies the route log while that round runs and its commands become visible to later rounds.
 // Invariants: a READY entry's frame holds its expert, and a frame is overwritten only after every
@@ -176,6 +281,8 @@ int main() {
     test_budgeted_admission();
     test_frame_epochs();
     test_agent_simulation();
+    test_pool_resize();
+    test_controller_resize();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

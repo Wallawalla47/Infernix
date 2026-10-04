@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <random>
 #include <span>
@@ -98,11 +99,33 @@ public:
             if (worker_.joinable()) { worker_.join(); }
             throw;
         }
+        if constexpr (kProgramMaintains) {
+            instance_.program->set_maintenance_waker([this] { request_maintenance(); });
+        }
     }
 
     ~EngineCore() noexcept {
+        // The Program's monitor thread must not wake an engine that is going away.
+        if constexpr (kProgramMaintains) {
+            try { instance_.program->set_maintenance_waker({}); } catch (...) {}
+        }
         stop();
         if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
+    // asks for maintain() through a waker; the idle worker runs it under the execution lock.
+    static constexpr bool kProgramMaintains = requires(Program& program) {
+        program.maintain();
+        program.set_maintenance_waker(std::function<void()>{});
+    };
+
+    void request_maintenance() noexcept {
+        {
+            std::lock_guard lock(queue_mutex_);
+            maintenance_requested_ = true;
+        }
+        queue_cv_.notify_all();
     }
 
     // Refuses new submissions. At its next unit boundary the worker ends every queued and active
@@ -2130,7 +2153,26 @@ private:
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
-                    queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                    queue_cv_.wait(lock, [&] {
+                        return stopping_ || !pending_.empty() || maintenance_requested_;
+                    });
+                    if (!stopping_ && pending_.empty() && maintenance_requested_) {
+                        maintenance_requested_ = false;
+                        lock.unlock();
+                        if constexpr (kProgramMaintains) {
+                            std::scoped_lock execution_lock(execution_mutex_);
+                            try {
+                                instance_.program->maintain();
+                            } catch (const std::exception& error) {
+                                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                                   "VRAM resize outside rounds failed: %s", error.what());
+                            }
+                        }
+                        continue;
+                    }
+                }
+                if (maintenance_requested_) {
+                    maintenance_requested_ = false; // rounds resize at their own boundaries
                 }
                 if (stopping_) {
                     lock.unlock();
@@ -2343,6 +2385,7 @@ private:
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
     bool stopping_ = false;
+    bool maintenance_requested_ = false; // guarded by queue_mutex_
     bool failed_   = false;
     std::thread worker_;
 };

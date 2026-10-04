@@ -33,6 +33,9 @@ class VramBudgetSource {
 public:
     virtual ~VramBudgetSource()             = default;
     [[nodiscard]] virtual VramSnapshot query() = 0;
+    // A Windows event handle (HANDLE) signalled when the OS changes this process's video-memory
+    // budget, or nullptr; it stays valid for the source's lifetime.
+    [[nodiscard]] virtual void* change_event() { return nullptr; }
 };
 
 // The source for `device`: DXGI and NVML where present (both loaded or created lazily; their

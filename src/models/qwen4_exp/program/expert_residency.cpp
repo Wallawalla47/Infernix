@@ -31,19 +31,23 @@ std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
 }
 
 ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
-                                 std::uint64_t record_stride, std::uint32_t frames, std::int32_t max_columns)
-    : c_(config), banks_(std::move(banks)), stride_(record_stride), frames_(frames) {
+                                 std::uint64_t record_stride, std::int32_t max_columns, int device)
+    : c_(config), banks_(std::move(banks)), stride_(record_stride) {
     experts_ = config.moe.experts;
     layers_  = config.num_hidden_layers;
     top_k_   = config.moe.top_k;
     if (banks_.size() != layers_) { throw std::invalid_argument("expert residency: one bank per layer"); }
+    if (stride_ == 0) { throw std::invalid_argument("expert residency: empty records"); }
     const std::size_t keys = static_cast<std::size_t>(layers_) * experts_;
-    if (frames_ > 0) {
-        frames_       = std::min(frames_, max_frames(config));
-        frame_memory_ = DeviceBuffer(static_cast<std::size_t>(frames_) * stride_);
-        controller_   = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), frames_,
-                                                         slack_frames(frames_), 1);
+    limit_                 = max_frames(config);
+    if (VmmArena::supported(device)) {
+        // Address space for the whole card: growth never needs a new range.
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        arena_ = std::make_unique<VmmArena>(device, total_bytes, kChunkBytes);
+        limit_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(limit_, arena_->reserved_bytes() / stride_));
     }
+    controller_ = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), 0, slack_frames(0), 1, limit_);
     table_device_ = DeviceBuffer(keys * sizeof(std::int32_t));
     table_host_   = PinnedHostBuffer(keys * sizeof(std::int32_t));
     std::fill_n(static_cast<std::int32_t*>(table_host_.data()), keys, -1);
@@ -67,7 +71,95 @@ ExpertResidency::~ExpertResidency() {
 }
 
 const std::uint8_t* ExpertResidency::frame_base() const noexcept {
-    return static_cast<const std::uint8_t*>(frame_memory_.p);
+    return static_cast<const std::uint8_t*>(arena_ ? arena_->base() : frame_memory_.p);
+}
+
+std::uint64_t ExpertResidency::pool_bytes() const noexcept {
+    return arena_ ? arena_->mapped_bytes() : frame_memory_.bytes;
+}
+
+ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
+    Resize out;
+    frames = std::min(frames, limit_);
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    publish_landed();
+    commands_.clear();
+    SpillGuard guard(vram);
+    if (!arena_) {
+        // One allocation of the first size; frames the driver placed in system memory are given back
+        // once and the cache starts smaller.
+        if (frames_ == 0 && frames > 0) {
+            for (int attempt = 0;; ++attempt) {
+                guard.begin();
+                frame_memory_ = DeviceBuffer(static_cast<std::size_t>(frames) * stride_);
+                frame_memory_.fill(0);
+                const std::uint64_t spilled = guard.end(frame_memory_.bytes);
+                if (spilled == 0) { break; }
+                out.spilled = spilled;
+                frame_memory_ = DeviceBuffer{};
+                const std::uint64_t drop = (spilled + kChunkBytes + stride_ - 1) / stride_;
+                frames = attempt == 0 && frames > drop ? frames - static_cast<std::uint32_t>(drop) : 0U;
+                if (frames == 0) { break; }
+            }
+            controller_->resize(frames, commands_);
+            frames_ = frames;
+        }
+        if (table_dirty_) { upload_table(compute); }
+        out.frames = frames_;
+        return out;
+    }
+    auto* base  = static_cast<std::uint8_t*>(arena_->base());
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    if (frames < frames_) {
+        controller_->resize(frames, commands_);
+        for (const auto& command : commands_) {
+            if (command.kind == CacheController::Command::Kind::kRelocate) {
+                CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::size_t>(command.frame) * stride_,
+                                           base + static_cast<std::size_t>(command.source) * stride_, stride_,
+                                           cudaMemcpyDeviceToDevice, compute));
+                table[command.key] = static_cast<std::int32_t>(command.frame);
+                table_dirty_       = true;
+            } else if (command.kind == CacheController::Command::Kind::kWriteEntry &&
+                       ResidencyEntry::decode(command.word).state != ResidencyState::kReady && table[command.key] >= 0) {
+                table[command.key] = -1;
+                table_dirty_       = true;
+            }
+        }
+        if (table_dirty_) { upload_table(compute); }
+        // The moves and the table must be complete before the top chunks lose their memory.
+        CUDA_CHECK(cudaStreamSynchronize(compute));
+        const std::size_t keep = static_cast<std::size_t>(frames) * stride_;
+        while (arena_->mapped_bytes() >= keep + arena_->chunk_bytes()) { arena_->unmap_chunk(); }
+        frames_ = frames;
+    } else if (frames > frames_) {
+        const std::size_t need = static_cast<std::size_t>(frames) * stride_;
+        while (arena_->mapped_bytes() < need) {
+            guard.begin();
+            if (!arena_->map_chunk()) {
+                out.refused = true;
+                break;
+            }
+            // Touch the chunk so its memory is resident before free memory is read again.
+            CUDA_CHECK(cudaMemsetAsync(base + arena_->mapped_bytes() - arena_->chunk_bytes(), 0, arena_->chunk_bytes(),
+                                       compute));
+            CUDA_CHECK(cudaStreamSynchronize(compute));
+            if (const std::uint64_t spilled = guard.end(arena_->chunk_bytes()); spilled != 0) {
+                arena_->unmap_chunk();
+                out.spilled = spilled;
+                break;
+            }
+        }
+        const auto backed = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, arena_->mapped_bytes() / stride_));
+        if (backed > frames_) {
+            controller_->resize(backed, commands_);
+            frames_ = backed;
+            if (table_dirty_) { upload_table(compute); }
+            issue_loads(compute);
+        }
+    }
+    if (table_dirty_) { upload_table(compute); }
+    out.frames = frames_;
+    return out;
 }
 
 const std::int32_t* ExpertResidency::table(std::uint32_t layer) const noexcept {
@@ -81,7 +173,11 @@ void ExpertResidency::upload_table(cudaStream_t compute) {
 }
 
 void ExpertResidency::before_round(cudaStream_t compute) {
-    if (!controller_) { return; }
+    publish_landed();
+    if (table_dirty_) { upload_table(compute); }
+}
+
+void ExpertResidency::publish_landed() {
     auto* table = static_cast<std::int32_t*>(table_host_.data());
     for (auto it = in_flight_.begin(); it != in_flight_.end();) {
         const cudaError_t status = cudaEventQuery(it->done);
@@ -101,7 +197,6 @@ void ExpertResidency::before_round(cudaStream_t compute) {
         spare_events_.push_back(it->done);
         it = in_flight_.erase(it);
     }
-    if (table_dirty_) { upload_table(compute); }
 }
 
 void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t columns) {
@@ -137,12 +232,11 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         }
         if (controller_) { controller_->on_route(group_, round_, commands_, per_layer_budget); }
     }
-    if (!controller_) { return; }
+    if (frames_ == 0) { return; }
     controller_->on_quiescent(commands_);
 
     // Evictions take effect on the compute stream before the next round; promotions copy on the
     // copy stream once that table is in place.
-    Batch batch;
     for (const auto& command : commands_) {
         if (command.kind == CacheController::Command::Kind::kWriteEntry) {
             const ResidencyEntry entry = ResidencyEntry::decode(command.word);
@@ -150,15 +244,21 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
                 table[command.key] = -1;
                 table_dirty_       = true;
             }
-        } else {
-            batch.loads.emplace_back(command.key, command.frame);
         }
     }
     if (table_dirty_) { upload_table(compute); }
+    issue_loads(compute);
+}
+
+void ExpertResidency::issue_loads(cudaStream_t compute) {
+    Batch batch;
+    for (const auto& command : commands_) {
+        if (command.kind == CacheController::Command::Kind::kCopy) { batch.loads.emplace_back(command.key, command.frame); }
+    }
     if (batch.loads.empty()) { return; }
     CUDA_CHECK(cudaEventRecord(table_ready_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, table_ready_, 0));
-    auto* base = static_cast<std::uint8_t*>(frame_memory_.p);
+    auto* base = const_cast<std::uint8_t*>(frame_base());
     for (const auto& [key, frame] : batch.loads) {
         const std::uint32_t layer  = key / experts_;
         const std::uint32_t expert = key % experts_;

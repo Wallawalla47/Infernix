@@ -6277,17 +6277,69 @@ change at merge time.
   (moved from the parsers into its Engine validation). The fixed 384 MiB
   `expert_cache_reserve_bytes` is gone.
 
+#### R0 measurements (RTX 5090, headless, Windows WDDM, 2026-10-04)
+
+- **RM0a.** DXGI LOCAL `CurrentUsage` counts CUDA allocations (1,024 of 1,024 MiB), and
+  `cudaMemGetInfo` free equals the OS budget minus that usage (budget 31,419 of 32,579 MiB with no
+  display): free memory and the budget bound coincide on this card. VMM: create 77 / map 1 /
+  access 4 / unmap 60 / release 162 us (p50, idle); from another thread during launches unmap
+  0.9 ms and release 0.27 ms p50 (p99 7.6 / 9.8 ms) and the launch loop slows 9 %, so resizes
+  unmap on the engine thread at a boundary; unmap does not wait for running kernels; released
+  memory returns at once. VMM reads equal `cudaMalloc` reads (streaming -0.01 %, gather +0.03 %).
+  Queries cost under 1 us idle and 3-7 us during launches; the DXGI budget-change event fires.
+- **RM0d.** CUDA graph executables: 13 at C = 1 (MTP 3 + n-gram 7) take 26 MiB (2.0 MiB each,
+  largest 6); 43 at C = 8 (MTP 7 + n-gram 15) take 110 MiB (2.6 MiB each, largest 8). The 4 MiB
+  allowance per graph covers them.
+- **RM0e.** Whole-record reads from the artifact: QD 1 0.553 ms p50 (4.68 GB/s), QD 8 6.71 GB/s;
+  quarter reads are slower (QD 1 0.89 ms per record), a concurrent H2D stream does not slow
+  them, and one 256 KiB prefetch sub-read in flight adds ~7 % to a demand read's p50.
+- **RM0g.** Pinning runs at 9.6-10 GiB/s, the same for 1.32 GiB chunks and one 13.2 GiB block.
+- **Bit-neutrality.** The route trace leaves greedy ids unchanged (12 prompts, plain and MTP).
+
+#### R2 and R3 implementation decisions
+
+- **Pool** (`core/vmm_arena`, helpers shared with `EvictableWeightPool` in `core/cuda_vmm.h`): one
+  address range the size of the card, 64 MiB chunks mapped and released at the top.
+  `ExpertResidency` starts with no frames; `resize()` grows chunk by chunk (each chunk touched,
+  then checked by the spill guard: a spilled or refused chunk ends the growth) and shrinks by
+  `CacheController::resize` (lowest-score experts evicted wherever they are, survivors above the
+  new top moved below it by device copies on the compute stream, one table upload), then waits
+  for the compute stream and unmaps. Without VMM the frames are one allocation of the first size.
+- **One phase, not two.** In full RAM mode every expert keeps its host copy, so a shrink never
+  demotes: phase B of §3.4 (waiting for demotion copies) has nothing to wait for, and the shrink
+  completes at the boundary that decides it (about 1-3 ms). The two-phase form returns with the
+  SSD tier's demotions (R10).
+- **Monitor** (`program/vram_monitor`): one thread, woken by the DXGI budget-change event or every
+  second, keeps the latest snapshot and passes it to the Program. The law (`VramControl`, pure,
+  RT9) shrinks at once when free memory is below half the headroom or usage exceeds the OS budget,
+  to one chunk below the sizing function's target; grows once the target has stayed two chunks
+  above the pool for 30 s, by at most four chunks per round boundary while requests run and to the
+  target when idle. The reserve is the sizing reserve less this process's usage growth other than
+  the pool's (DXGI usage counts CUDA, RM0a). The D3DKMT `Demoted` trigger is not used: on this
+  driver free memory is the budget less usage, so budget pressure already shows as low free
+  memory.
+- **Boundaries.** The Program applies the decision after every `after_round` (prefill chunks,
+  forced tokens, decode and verification settle): no round's kernels are in flight there, and the
+  commit-phase work still running (GDN fold, tails, the drafter's catch-up) reads no frame. An idle
+  engine is woken by the monitor (`Program::set_maintenance_waker`) and runs `maintain()` from its
+  worker under the execution lock (`EngineCore`, only for Programs that provide it).
+- **Headroom.** With the elastic pool the automatic headroom is 512 MiB with a display and 256 MiB
+  without; without VMM it stays 1 GiB with a display and the monitor only warns, once per
+  pressure episode, with the headroom that would have avoided it.
+
 #### Status
 
-R0 implemented on `claude/fn-memory` (base `1dae6914c`): built, not yet run; the orchestrator runs
-the probes, the captures and the replay. Results are recorded below as they are measured.
+R0 implemented on `claude/fn-memory` (base `1dae6914c`) and run: the probes, both traces and both
+graph captures pass (above). The replay (RM0f) runs after the timing work, which it would disturb.
 
 R4 implemented on `claude/fn-memory` (`a3713f5f6`): `--ram-headroom-mib` in `ninfer`,
 `ninfer-serve` and `ninfer_bench`; RT1 in `ninfer_qwen4_exp_memory_plan_test` passes.
 
-R1 implemented on `claude/fn-memory`: startup VRAM sizing, pre-check, spill guard, ledger and
-`--vram-headroom-mib N|auto`; RT7 in the same test. Runtime resizing (R2) and the monitor (R3) are
-not implemented: until they are, a program that takes VRAM after startup is not absorbed.
+R1 implemented on `claude/fn-memory` (`d79ad7172`): startup VRAM sizing, pre-check, spill guard,
+ledger and `--vram-headroom-mib N|auto`; RT7 and the engine smoke pass.
+
+R2 and R3 implemented on `claude/fn-memory`: the VMM frame pool with resize, the monitor, the law
+and the idle hook; RT8 (host), RT9 and RT13 (engine, fake source) are the tests.
 
 ---
 
