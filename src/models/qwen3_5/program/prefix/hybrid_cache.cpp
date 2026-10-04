@@ -203,7 +203,7 @@ InsertResult HybridPrefixCache::insert_block(NodeRef parent, std::uint64_t looku
     }
     InsertResult result;
     try {
-        result = index_->insert_block(parent, lookup_hash, tokens, extra, id);
+        result = index_->insert_block(parent, lookup_hash, tokens, extra, id, true);
     } catch (...) {
         if (adopts) { release(pages); }
         free_block_id(id);

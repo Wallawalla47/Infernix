@@ -130,6 +130,14 @@ struct PublishResult {
     bool created = false;
 };
 
+// Free-list slabs a caller holds for a snapshot image it is copying to the Host before the
+// snapshot exists: owned by no node or snapshot until publish_host_snapshot or release_host_image.
+// The slabs are the image's, then one tail slab when `tail`.
+struct HostImageReservation {
+    std::vector<std::uint32_t> slabs;
+    bool tail = false;
+};
+
 struct NodeView {
     std::uint32_t depth = 0;
     NodeRef parent;
@@ -237,12 +245,13 @@ public:
                                                     std::span<const TokenId> block_tokens,
                                                     std::uint64_t extra) const;
     // Inserts a committed full block owning `device_id`, device Resident, pinned once for the
-    // inserting sequence. When an identical child already exists `inserted` is false; a host-only
-    // existing child adopts `device_id` as its Device copy (device_attached), otherwise the caller
-    // keeps its page private.
+    // inserting sequence. When an identical child already exists `inserted` is false and the child
+    // is pinned; with `attach` a host-only existing child adopts `device_id` as its Device copy
+    // (device_attached), otherwise the caller keeps its page private.
     [[nodiscard]] InsertResult insert_block(NodeRef parent, std::uint64_t lookup_hash,
                                             std::span<const TokenId> block_tokens,
-                                            std::uint64_t extra, std::uint32_t device_id);
+                                            std::uint64_t extra, std::uint32_t device_id,
+                                            bool attach);
 
     // ---- device residency of blocks (§6.4, §9.1)
     // ------------------------------------------------- Host-only pinned node receives a device
@@ -281,7 +290,7 @@ public:
     // tap/endpoint destination (staging): a free one, else a superseded owner's, else the least
     // valuable Device-only owner's when the new snapshot's `claim` priority is at least its GDSF
     // priority (that snapshot is lost), else the least recently hit Host-backed owner's (which
-    // keeps its Host copy).
+    // keeps its Host copy). Absent with no Device slots configured.
     [[nodiscard]] std::optional<std::uint32_t>
     acquire_device_slot(double claim = std::numeric_limits<double>::infinity());
     // GDSF priority of a new snapshot at `frontier` whose nearest retained snapshot on its path
@@ -297,6 +306,23 @@ public:
                                                  std::span<const TokenId> tail,
                                                  std::optional<std::uint32_t> tail_device_id,
                                                  std::uint32_t device_slot, SnapshotKind kind);
+    // Host-born snapshots: the image (and tail) is copied straight to Host slabs, with no Device
+    // slot. Reserves the image's slabs, plus one tail slab when `tail` (which needs host_blocks),
+    // evicting like begin_snapshot_host_fill but no retained snapshot valued above `claim` (the
+    // new snapshot's estimate_priority). Absent when they cannot be freed.
+    [[nodiscard]] std::optional<HostImageReservation> reserve_host_image(bool tail, double claim);
+    // Returns a reservation's slabs to the free list; the reservation is left empty.
+    void release_host_image(HostImageReservation&& reservation) noexcept;
+    // Publishes a snapshot whose image and tail already landed in `image`'s slabs: Host Resident,
+    // no Device slot. A tail requires a reservation made with `tail`; its Device copy
+    // (`tail_device_id`) is optional. Frontier rules as publish_snapshot. A duplicate (same anchor
+    // and tail), or no snapshot entry to be had, releases the slabs and the tail device id; a
+    // duplicate returns the existing snapshot with created=false. `image` is consumed either way.
+    [[nodiscard]] PublishResult publish_host_snapshot(NodeRef anchor, std::uint32_t frontier,
+                                                      std::span<const TokenId> tail,
+                                                      std::optional<std::uint32_t> tail_device_id,
+                                                      HostImageReservation&& image,
+                                                      SnapshotKind kind);
 
     // ---- persistence ---------------------------------------------------------------------------
     // What a saved Host tier keeps: every Host-resident snapshot whose anchor path is Host-resident
@@ -426,6 +452,15 @@ private:
                                       double claim = std::numeric_limits<double>::infinity());
     void free_slab(std::uint32_t slab);
 
+    // The publication shared by publish_snapshot and publish_host_snapshot: exactly one of
+    // `device_slot` (a staging slot) and `host_slabs` (reserved slabs, already unmarked) holds the
+    // image. A duplicate or a full snapshot table releases the image and the tail device id.
+    [[nodiscard]] PublishResult publish_image(NodeRef anchor, std::uint32_t frontier,
+                                              std::span<const TokenId> tail,
+                                              std::optional<std::uint32_t> tail_device_id,
+                                              std::uint32_t device_slot,
+                                              std::vector<std::uint32_t>&& host_slabs,
+                                              SnapshotKind kind);
     void remove_snapshot(std::uint32_t snapshot);
     // Snapshot ancestry: `above` lies on `below`'s path at a smaller frontier.
     [[nodiscard]] bool on_path(const Snapshot& above, const Snapshot& below) const noexcept;
@@ -477,6 +512,8 @@ private:
     std::uint32_t dead_tail_ = kNoId;
 
     std::vector<std::uint32_t> free_slabs_;
+    // Slabs held by an outstanding HostImageReservation (owned by no node or snapshot).
+    std::vector<bool> slab_reserved_;
     std::vector<SlotState> slot_state_;
     std::vector<std::uint32_t> slot_owner_;
 

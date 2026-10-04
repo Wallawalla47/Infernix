@@ -3,6 +3,7 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -78,7 +79,8 @@ std::vector<NodeRef> insert_sequence(PrefixCacheIndex& index, RecordingBackend& 
     for (std::size_t b = 0; b < hashes.size(); ++b) {
         const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
         const std::uint32_t id    = backend.allocate();
-        const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id);
+        const InsertResult result =
+            index.insert_block(parent, hashes[b], block, 0, id, true);
         require(result.inserted == result.device_attached || !result.inserted,
                 "a new node must own its device id");
         if (!result.device_attached) { backend.release_device_block(id); }
@@ -210,8 +212,8 @@ void test_collisions_and_tails() {
     const auto a = make_tokens(64, 3);
     const auto b = make_tokens(64, 4);
     // Force the same lookup hash for two different blocks: exact comparison must separate them.
-    const InsertResult first  = index.insert_block({}, 42, a, 0, backend.allocate());
-    const InsertResult second = index.insert_block({}, 42, b, 0, backend.allocate());
+    const InsertResult first  = index.insert_block({}, 42, a, 0, backend.allocate(), true);
+    const InsertResult second = index.insert_block({}, 42, b, 0, backend.allocate(), true);
     require(first.inserted && second.inserted && !(first.node == second.node),
             "colliding blocks must be distinct nodes");
     require(index.find_child({}, 42, a, 0) == first.node &&
@@ -813,6 +815,241 @@ void test_image_only_host_tier() {
     require(index.stats().host_free_slabs == 8, "the removed snapshot's image slab was leaked");
 }
 
+// Host-born snapshots (images copied straight to Host slabs) on an index without Device snapshot
+// slots: reservations, publication with and without a tail, duplicates, Device-tail eviction.
+void test_host_born_snapshots() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 0), backend);
+    require(!index.acquire_device_slot().has_value(), "no Device slot exists to acquire");
+    require(index.stats().free_device_slots == 0, "zero Device slots are configured");
+    const auto tokens = make_tokens(64 * 2, 50);
+    const auto path   = insert_sequence(index, backend, tokens);
+
+    auto image = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(image.has_value() && image->slabs.size() == 4 && !image->tail,
+            "an image reservation takes the image's slabs");
+    require(index.stats().host_free_slabs == 60, "reserved slabs are not free");
+    index.check_invariants();
+    const PublishResult tap =
+        index.publish_host_snapshot(path[1], 128, {}, std::nullopt, std::move(*image), SnapshotKind::Tap);
+    require(tap.created && image->slabs.empty(), "a Host-born tap is published from its reservation");
+    const SnapshotView tap_view = index.snapshot(tap.snapshot);
+    require(tap_view.device_slot == kNoId && tap_view.host == CopyState::Resident &&
+                tap_view.host_slabs.size() == 4 && tap_view.tail_len == 0,
+            "a Host-born snapshot is Host-resident with no Device slot");
+    index.check_invariants();
+
+    // A duplicate returns the existing snapshot and its slabs to the free list.
+    auto again = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(again.has_value() && index.stats().host_free_slabs == 56, "second reservation");
+    const PublishResult duplicate =
+        index.publish_host_snapshot(path[1], 128, {}, std::nullopt, std::move(*again), SnapshotKind::Tap);
+    require(!duplicate.created && duplicate.snapshot == tap.snapshot,
+            "a duplicate returns the existing snapshot");
+    require(index.stats().host_free_slabs == 60, "a duplicate frees its reserved slabs");
+    index.check_invariants();
+
+    // A reservation that does not match the publication stays reserved and can be released.
+    const auto tail_tokens = make_tokens(10, 51);
+    auto plain             = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(plain.has_value(), "plain reservation");
+    require_throws(
+        [&] {
+            (void)index.publish_host_snapshot(path[1], 138, tail_tokens, std::nullopt, std::move(*plain),
+                                              SnapshotKind::Endpoint);
+        },
+        "a tail needs a reservation with a tail slab");
+    require(plain->slabs.size() == 4 && index.stats().host_free_slabs == 56,
+            "a refused publication leaves the reservation intact");
+    index.check_invariants();
+    index.release_host_image(std::move(*plain));
+    require(plain->slabs.empty() && index.stats().host_free_slabs == 60, "release frees the slabs");
+    index.release_host_image(std::move(*plain)); // already released: nothing to free
+    index.check_invariants();
+
+    // An endpoint with a tail and a Device tail copy: the tail slab is part of the reservation.
+    auto with_tail = index.reserve_host_image(true, std::numeric_limits<double>::infinity());
+    require(with_tail.has_value() && with_tail->slabs.size() == 5 && with_tail->tail,
+            "a tail reservation adds the tail slab");
+    const std::uint32_t tail_id = backend.allocate();
+    const PublishResult endpoint = index.publish_host_snapshot(path[1], 138, tail_tokens, tail_id,
+                                                               std::move(*with_tail), SnapshotKind::Endpoint);
+    require(endpoint.created, "Host-born endpoint not created");
+    const SnapshotView endpoint_view = index.snapshot(endpoint.snapshot);
+    require(endpoint_view.host_slabs.size() == 5 && endpoint_view.tail_len == 10 &&
+                endpoint_view.tail_device == tail_id && endpoint_view.tail_device_copy == CopyState::Resident,
+            "the endpoint keeps its tail on both tiers");
+    index.check_invariants();
+    index.release_path(path);
+
+    // Its Device tail is Host-backed: evicting it keeps the snapshot, and a match plans the
+    // tail's restore from its slab.
+    require(index.evict_backed_device_blocks(1) == 1 && backend.live.count(tail_id) == 0,
+            "the backed Device tail is evictable");
+    require(index.valid(endpoint.snapshot) &&
+                index.snapshot(endpoint.snapshot).tail_device_copy == CopyState::Absent,
+            "the endpoint survives on its Host tail");
+    index.check_invariants();
+    auto prompt = tokens;
+    prompt.insert(prompt.end(), tail_tokens.begin(), tail_tokens.end());
+    prompt.push_back(7);
+    const auto hashes = block_lookup_hashes(prompt, {});
+    const MatchResult match = index.match(prompt, hashes, {}, static_cast<std::uint32_t>(prompt.size()));
+    require(match.candidates.size() == 2 && match.candidates[0].snapshot == endpoint.snapshot &&
+                match.candidates[0].tail && !match.candidates[0].tail_on_device &&
+                !match.candidates[0].image_on_device,
+            "the endpoint is matched with its image and tail on the Host");
+
+    // A Host-born tail without a Device copy is valid from the start.
+    const auto other_tail = make_tokens(20, 52);
+    auto host_tail        = index.reserve_host_image(true, std::numeric_limits<double>::infinity());
+    require(host_tail.has_value(), "tail reservation");
+    const PublishResult host_only = index.publish_host_snapshot(path[1], 148, other_tail, std::nullopt,
+                                                                std::move(*host_tail), SnapshotKind::Endpoint);
+    require(host_only.created && index.snapshot(host_only.snapshot).tail_device_copy == CopyState::Absent,
+            "a Host-only tail is published");
+    index.check_invariants();
+
+    // Without Host blocks a snapshot's tail cannot live on the Host.
+    PrefixIndexConfig image_only = small_config(8, 0);
+    image_only.image_slabs       = 1;
+    image_only.host_blocks       = false;
+    RecordingBackend image_backend;
+    PrefixCacheIndex image_index(image_only, image_backend);
+    require_throws([&] { (void)image_index.reserve_host_image(true, 0.0); },
+                   "a Host-born tail requires Host blocks");
+    // And without a Host tier nothing can be reserved.
+    PrefixCacheIndex device_only(small_config(0, 1), image_backend);
+    require(!device_only.reserve_host_image(false, std::numeric_limits<double>::infinity()).has_value(),
+            "no Host tier: no reservation");
+}
+
+// Reservations evict like begin_snapshot_host_fill, never past their claim, and outstanding
+// reservations are never evicted.
+void test_host_image_claims() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(12, 0), backend);
+    const auto a      = make_tokens(64, 60);
+    const auto path_a = insert_sequence(index, backend, a);
+    auto first        = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(first.has_value(), "first reservation");
+    const PublishResult snap_a =
+        index.publish_host_snapshot(path_a[0], 64, {}, std::nullopt, std::move(*first), SnapshotKind::Tap);
+    require(snap_a.created, "snapshot a");
+    index.release_path(path_a);
+
+    auto held   = index.reserve_host_image(false, 0.0);
+    auto second = index.reserve_host_image(false, 0.0);
+    require(held.has_value() && second.has_value() && index.stats().host_free_slabs == 0,
+            "free slabs need no eviction");
+    index.check_invariants();
+    // Every slab is now owned or reserved: a claim below a's value evicts nothing.
+    const double value_a = index.estimate_priority(0, 64, false);
+    require(!index.reserve_host_image(false, value_a * 0.5).has_value() && index.valid(snap_a.snapshot),
+            "a reservation must not evict a snapshot worth more than its claim");
+    index.check_invariants();
+    // A worthy claim evicts a; the outstanding reservations keep their slabs.
+    auto third = index.reserve_host_image(false, std::numeric_limits<double>::infinity());
+    require(third.has_value() && !index.valid(snap_a.snapshot) &&
+                index.stats().host_snapshot_evictions == 1,
+            "the GDSF minimum yields its slabs to a worthy reservation");
+    index.check_invariants();
+    require(!index.reserve_host_image(false, std::numeric_limits<double>::infinity()).has_value(),
+            "reserved slabs are never evicted");
+    std::vector<std::uint32_t> all;
+    for (const auto* r : {&*held, &*second, &*third}) { all.insert(all.end(), r->slabs.begin(), r->slabs.end()); }
+    std::sort(all.begin(), all.end());
+    require(std::adjacent_find(all.begin(), all.end()) == all.end() && all.size() == 12,
+            "reservations hold distinct slabs");
+    index.release_host_image(std::move(*held));
+    index.release_host_image(std::move(*second));
+    index.release_host_image(std::move(*third));
+    require(index.stats().host_free_slabs == 12, "all slabs return");
+    index.check_invariants();
+}
+
+// insert_block without attach pins an identical Host-only child but leaves its Device copy absent:
+// the inserting sequence keeps its page private.
+void test_insert_without_attach() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 2, 61);
+    const auto path   = insert_sequence(index, backend, tokens);
+    for (const NodeRef node : path) { backup_node(index, node); }
+    index.release_path(path);
+    require(index.evict_device_blocks(2) == 2, "backed blocks are released");
+    const auto hashes = block_lookup_hashes(tokens, {});
+    NodeRef parent;
+    std::vector<NodeRef> pinned;
+    for (std::size_t b = 0; b < hashes.size(); ++b) {
+        const std::span<const TokenId> block(tokens.data() + b * kBlockTokens, kBlockTokens);
+        const std::uint32_t id    = backend.allocate();
+        const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id, false);
+        require(!result.inserted && !result.device_attached && result.node == path[b],
+                "an existing Host-only child is found without adopting the page");
+        const NodeView view = index.node(result.node);
+        require(view.pins == 1 && view.device == CopyState::Absent && view.device_id == kNoId,
+                "the child is pinned and stays Host-only");
+        backend.release_device_block(id); // the caller's private page
+        pinned.push_back(result.node);
+        parent = result.node;
+    }
+    index.check_invariants();
+    index.release_path(pinned);
+    index.check_invariants();
+}
+
+// The saturating call cost: rho = 0 is the per-chunk formula exactly; rho > 0 saturates towards
+// chunk_seconds and one call is never dearer than two splitting it.
+void test_cost_model() {
+    CacheCostModel cost;
+    cost.chunk_seconds          = 1.28;
+    cost.chunk_tokens           = 512;
+    cost.token_seconds          = 1.17e-3;
+    cost.attention_pair_seconds = 3.0e-9;
+    for (const std::uint32_t base : {0U, 100U, 4096U}) {
+        for (const std::uint32_t tokens : {0U, 1U, 7U, 511U, 512U, 513U, 1024U, 5000U}) {
+            const double s      = tokens;
+            const double pairs  = base * s + s * (s + 1.0) / 2.0;
+            const double chunks = static_cast<double>((tokens + 511U) / 512U);
+            const double before =
+                tokens == 0 ? 0.0 : chunks * cost.chunk_seconds + s * cost.token_seconds + pairs * cost.attention_pair_seconds;
+            require(cost.prefill_seconds(base, tokens) == before, "rho = 0 must keep the per-chunk cost");
+        }
+    }
+    require(cost.call_seconds(0) == 0.0 && cost.call_seconds(1) == cost.chunk_seconds,
+            "rho = 0 charges every call chunk_seconds");
+
+    cost.call_route_fraction = 10.0 / 512.0;
+    double previous          = 0.0;
+    for (std::uint32_t t = 1; t <= 8192; t = t < 16 ? t + 1 : t * 2) {
+        const double got    = cost.call_seconds(t);
+        const double oracle = cost.chunk_seconds * (1.0 - std::pow(1.0 - cost.call_route_fraction, t));
+        require(std::abs(got - oracle) <= 1e-12 * cost.chunk_seconds, "call_seconds equals its closed form");
+        require((got > previous || got == cost.chunk_seconds) && got <= cost.chunk_seconds,
+                "call cost grows until it saturates at chunk_seconds");
+        previous = got;
+    }
+    require(cost.chunk_seconds - cost.call_seconds(4096) <= 1e-12 * cost.chunk_seconds,
+            "a call far wider than 1 / rho costs chunk_seconds");
+    for (const std::uint32_t a : {1U, 8U, 100U}) {
+        for (const std::uint32_t b : {1U, 64U, 400U}) {
+            require(cost.call_seconds(a + b) <= cost.call_seconds(a) + cost.call_seconds(b),
+                    "one call is never dearer than two splitting it");
+        }
+    }
+    const double s    = 1300.0;
+    const double want = 2.0 * cost.call_seconds(512) + cost.call_seconds(276) + s * cost.token_seconds +
+                        (s * (s + 1.0) / 2.0) * cost.attention_pair_seconds;
+    require(std::abs(cost.prefill_seconds(0, 1300) - want) <= 1e-12 * want,
+            "prefill charges full calls plus the remainder call");
+    require(cost.prefill_seconds(0, 1024) == 2.0 * cost.call_seconds(512) + 1024.0 * cost.token_seconds +
+                                                 (1024.0 * 1025.0 / 2.0) * cost.attention_pair_seconds,
+            "no remainder call when the tokens fill whole calls");
+    cost.call_route_fraction = 1.5;
+    require(cost.call_seconds(1) == cost.chunk_seconds, "rho >= 1 charges a full call for any width");
+}
+
 void test_random_stress() {
     std::mt19937 rng(1234);
     for (int round = 0; round < 20; ++round) {
@@ -862,7 +1099,8 @@ void test_random_stress() {
                     const std::span<const TokenId> block(prompt.data() + b * kBlockTokens,
                                                          kBlockTokens);
                     const std::uint32_t id    = backend.allocate();
-                    const InsertResult result = index.insert_block(parent, hashes[b], block, 0, id);
+                    const InsertResult result =
+                        index.insert_block(parent, hashes[b], block, 0, id, true);
                     if (!result.device_attached) { backend.release_device_block(id); }
                     path.push_back(result.node);
                     parent = result.node;
@@ -1116,6 +1354,10 @@ int main() {
         test_persistence_roundtrip();
         test_restore_plan();
         test_image_only_host_tier();
+        test_host_born_snapshots();
+        test_host_image_claims();
+        test_insert_without_attach();
+        test_cost_model();
         test_random_stress();
         test_tap_planner();
     } catch (const std::exception& error) {
