@@ -2,6 +2,7 @@
 
 #include "artifact/framing.h"
 #include "artifact/reader.h"
+#include "core/host_memory.h"
 #include "core/startup.h"
 
 #include <cuda_runtime.h>
@@ -13,6 +14,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <span>
 #include <string>
 #include <tuple>
 
@@ -21,6 +24,69 @@ namespace {
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaximumSlotCount = 4;
+// Physical memory left for the OS and everything else once the pinned block is locked.
+constexpr std::uint64_t kPinnedHostReserveBytes = 8ULL << 30;
+
+constexpr std::size_t kBounceBytes = 8ULL * 1024 * 1024;
+
+struct DirectBounce {
+    alignas(kPayloadAlignment) std::array<std::byte, kBounceBytes> bytes;
+};
+
+// Copies file bytes [file_offset, file_offset + out.size()) of one artifact file into `out`
+// through unbuffered reads of whole pages into the bounce buffer.
+void read_bounced(const Reader& reader, std::size_t file, std::uint64_t file_offset,
+                  std::span<std::byte> out, DirectBounce& bounce) {
+    const auto end = file_offset + out.size();
+    auto page      = file_offset / kPayloadAlignment * kPayloadAlignment;
+    while (page < end) {
+        const auto request = static_cast<std::size_t>(std::min<std::uint64_t>(
+            kBounceBytes, align_up(end - page, kPayloadAlignment, "bounce bytes")));
+        const auto received = reader.read_direct(file, page, {bounce.bytes.data(), request});
+        const auto from     = std::max(page, file_offset);
+        const auto to       = std::min(page + request, end);
+        if (page + received < to) {
+            throw ArtifactError("direct read ended before the pinned payload");
+        }
+        std::memcpy(out.data() + (from - file_offset), bounce.bytes.data() + (from - page),
+                    static_cast<std::size_t>(to - from));
+        page += request;
+    }
+}
+
+// Reads a logical payload range into pinned memory with unbuffered I/O only, so tens of GiB of
+// expert banks never pass through (and inflate) the OS file cache. Whole pages whose
+// destination shares the file's page phase (the binder places pinned objects so) are read
+// straight into the destination; partial pages and any out-of-phase segment go through the
+// bounce buffer.
+void read_pinned(const Reader& reader, std::uint64_t offset, std::span<std::byte> destination,
+                 DirectBounce& bounce) {
+    for (const auto& segment : reader.segments(offset, destination.size())) {
+        auto out = destination.subspan(static_cast<std::size_t>(segment.destination_offset),
+                                       static_cast<std::size_t>(segment.bytes));
+        auto file_offset = segment.file_offset;
+        if ((reinterpret_cast<std::uintptr_t>(out.data()) - file_offset) % kPayloadAlignment) {
+            read_bounced(reader, segment.file_index, file_offset, out, bounce);
+            continue;
+        }
+        const auto head = std::min<std::size_t>(
+            out.size(), (kPayloadAlignment - file_offset % kPayloadAlignment) % kPayloadAlignment);
+        if (head) {
+            read_bounced(reader, segment.file_index, file_offset, out.first(head), bounce);
+            out = out.subspan(head);
+            file_offset += head;
+        }
+        const auto whole = out.size() / kPayloadAlignment * kPayloadAlignment;
+        if (whole) {
+            if (reader.read_direct(segment.file_index, file_offset, out.first(whole)) != whole) {
+                throw ArtifactError("direct read ended before the pinned payload");
+            }
+            out = out.subspan(whole);
+            file_offset += whole;
+        }
+        if (!out.empty()) { read_bounced(reader, segment.file_index, file_offset, out, bounce); }
+    }
+}
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -186,9 +252,24 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         device_base = static_cast<std::byte*>(out.arena_->base());
     }
     if (plan.pinned_capacity_bytes) {
+        // Pinned pages cannot be paged out: refuse a lock that would push the rest of the system
+        // into the page file.
+        const auto available = available_host_memory_bytes();
+        if (plan.pinned_capacity_bytes > available ||
+            available - plan.pinned_capacity_bytes < kPinnedHostReserveBytes) {
+            constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+            throw ArtifactError(
+                "pinned weights need " +
+                std::to_string(static_cast<double>(plan.pinned_capacity_bytes) / gib) +
+                " GiB plus a " + std::to_string(kPinnedHostReserveBytes >> 30) +
+                " GiB reserve, but only " + std::to_string(static_cast<double>(available) / gib) +
+                " GiB of physical Host memory is available");
+        }
         out.pinned_ =
             std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
     }
+    const auto bounce =
+        plan.pinned_objects.empty() ? nullptr : std::make_unique<DirectBounce>();
     for (auto& placement : plan.host_objects) {
         reader.validate_object(placement.object);
         auto& storage = out.objects_.at(placement.object.index);
@@ -221,14 +302,14 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (placement.bytes != object_bytes(object)) {
             throw ArtifactError("pinned placement size differs from object");
         }
-        auto data = reader.read_object(placement.object);
+        // Read straight into the pinned block: large pinned objects (expert banks) must never be
+        // staged through a second Host copy or the file cache.
+        const std::span<std::byte> data(
+            static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
+            static_cast<std::size_t>(placement.bytes));
+        read_pinned(reader, object_offset(object), data, *bounce);
         out.stats_.read_bytes =
             checked_add(out.stats_.read_bytes, data.size(), "pinned read bytes");
-        if (data.size() != placement.bytes) {
-            throw ArtifactError("pinned read size differs from placement");
-        }
-        std::memcpy(static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
-                    data.data(), data.size());
         const auto geometry = reader.geometry(placement.object);
         const auto divisor = read_divisor(reader, placement.object, geometry, data, out.stats_);
         storage.pinned = WeightParent{
