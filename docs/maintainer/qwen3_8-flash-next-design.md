@@ -5855,6 +5855,374 @@ Unchanged by Strata:
 - §19.2's "Next" list and "not in a track yet" line.
 - The user guide's C > 1 and context advice.
 
+### 19.3.7 Memory: VRAM sizing with overflow protection, and an SSD expert tier (2026-10-04)
+
+The user's two memory requirements of 2026-10-04, designed read-only against `1dae6914c` and
+revised after two adversarial reviews (rev 2). The full plan, its code check and the review
+dispositions are `local/workdirs/fn/plans/memory-tiers.md` (§ numbers below without a prefix are
+that plan's); the investigation notes are `mem-vram-notes.md`, `mem-host-notes.md` and
+`mem-ssd-notes.md` there. Step, test, measurement and acceptance names are local to this track:
+R0-R14, RT1-RT15, RM0-RM10, A1-A5. Labels as in §19.3 (measured, model, estimated), plus
+**[K]** for external knowledge a named probe settles. Branch `claude/fn-memory`; status and
+measured results are under "Status" at the end of this section.
+
+**Requirements.**
+
+- **U1.** "Make sure the VRAM sizing logic assesses the used VRAM at startup in case a user has a
+  monitor plugged in so some VRAM is reserved for display functionality etc. to make sure that the
+  engine doesn't overflow available VRAM when running."
+- **U2.** "Add another tier to the expert cache to page the least frequently used experts to SSD if
+  there isn't enough system RAM free. Assess available RAM on startup leaving an amount (e.g.
+  2 GiB) extra free for the system when working out how much free RAM there is for holding
+  experts."
+- **U3** (later the same day). "One option to consider in your design of the 3 tier expert system
+  is whether the experts that sit on the SSD should just be read from the source artifact when
+  needed rather than creating a new separate cache that could result in some significant extra
+  SSD writes that might want to be avoided to reduce wear on the SSD. But the most important aspect
+  is speed." **Binding rule:** the SSD tier is the source artifact, read in place. No step adds an
+  SSD cache, spill file, swap file or any write path for expert data; evicting an expert from RAM
+  is a discard. The only writes this track makes are the small expert-state file (kilobytes to a
+  few MB per shutdown) and logs. Within that rule the fastest design wins: R14's mirror is an
+  opt-in, one-time copy the user makes to a second drive, never created automatically, and avoiding
+  Windows page-file writes (on `G:` here) is one reason for the RAM reserve and the hard minimum
+  working set (RM7 measures paging).
+- Standing rules: no precision change; greedy output independent of placement; every trade-off
+  documented. Feature 2 changes nothing in full mode (same kernels, load path, pinned bytes and
+  speed). Feature 1 deliberately gives up some frames for display headroom on every machine; that
+  cost is the trade-off U1 asks for and has its own acceptance arm (A3a).
+
+#### Answer
+
+- **Feature 1, VRAM.** Before any weight is read, the device is queried: device-wide free and total
+  VRAM, on Windows the OS budget and this process's usage (DXGI, adapter matched by LUID), and
+  whether a display is attached (DXGI outputs, NVML as a second signal; unknown counts as attached
+  on Windows). One sizing function, used at startup and at runtime, gives the expert frames; the
+  fixed allocations are checked before the 64 GiB load, every device allocation is checked for a
+  silent spill into system memory, and one VRAM ledger line is logged. At runtime the frame pool
+  sits on CUDA virtual memory (64 MiB chunks under one fixed virtual address, so kernels and
+  graphs are unchanged); a monitor thread shrinks it at the next round boundary (or at once when
+  idle) when device-wide free VRAM falls below half the display headroom, and regrows it after 30 s
+  of slack. No frame floor: NInfer never keeps VRAM the display needs.
+- **Feature 2, SSD tier.** A startup RAM ledger computes the RAM for routed experts as available
+  RAM − a reserve (`--ram-headroom-mib`, default 2 GiB, replacing the loader's fixed 8 GiB for every
+  pinned allocation) − every other planned host allocation. **Full mode** (all 24,576 experts fit
+  with ≥ 1 GiB margin) is today's path. **Tier mode** has three levels, VRAM frames ← pinned host
+  slots ← the artifact on SSD read in place with unbuffered I/O (U3: no SSD cache and no writes;
+  eviction from RAM is a discard). Residency is exclusive under pressure, the RAM tier is ranked by decayed LFU (the
+  user's "least frequently used"; the half-life, or LRU/CLOCK on a ≥ 5 % win, is chosen by replay),
+  and RAM and VRAM are pre-filled from the saved expert state shared with concurrency S4b.
+  SSD-only experts in decode and verification calls become CPU jobs, so their reads overlap all of
+  the layer's GPU work; prefill and overflow use a device fetch channel. A failed read fails only
+  the affected requests.
+- **Expected decode speed** (estimated, several-fold uncertain; RM3 replaces it):
+
+  | Machine | Plain decode, central (range) | MTP, central (range) |
+  |---|---|---|
+  | 96 GB (this machine) | full mode, today's speed | today's |
+  | 64 GB | ~0 SSD reads per token once warm: ≈ full mode | ≈ full mode |
+  | 48 GB | −5 % (−2 to −20 %) | −9 % (−3 to −30 %) |
+  | 32 GB | −22 % (−12 to −40 %) | −34 % (−20 to −53 %) |
+
+  A 4 GiB prefix Host tier costs a further 3-8 points at 32-48 GB. pp4096 at chunk 1024 (today
+  9.92 s): ≈ 10-12 s at 48 GB and ≈ 11-22 s at 32 GB (estimated).
+- **Cost of Feature 1 on every machine** (estimated from the measured −1.8 % tg512 per 436 frames,
+  §19.2): −49 frames headless and −146 with a display when the elastic pool works (−0.2 / −0.6 %
+  tg512 at C = 1); −340 frames (−1.3 %) with a display in warning-only mode.
+- **Effort.** R0-R11 and R13 ≈ 23 engineer-days plus ~8 h of GPU time; R12 (+2 d) and R14 (+1.5 d)
+  only on their measured triggers.
+
+#### Feature 1: startup sizing, flags and the elastic frame pool
+
+- **Core primitive** `src/core/vram_budget.{h,cpp}`: a `VramSnapshot` (device free and total,
+  DXGI LOCAL budget and usage, display state, output count, D3DKMT `Demoted`) from a
+  `VramBudgetSource` per device context. Windows: `IDXGIFactory4::EnumAdapterByLuid`,
+  `QueryVideoMemoryInfo`, `EnumOutputs`, the budget-change event and an `IsCurrent()` refresh for
+  hot-plug; NVML through `LoadLibrary`/`dlopen` only, so a missing DLL never stops startup. A
+  process-wide test seam supplies fake budgets (RT7, RT9, RT13).
+- **One sizing function** (§3.2): `frame_bytes(F, P, B) = min(F + P − H_d, B + P − 64 MiB) − R`, with
+  F device-wide free VRAM, P bytes the pool maps now, B the OS budget slack (`+∞` without a budget
+  source), H_d the display headroom and R the internal reserve still unspent. The display headroom
+  applies to device free only, so a budget below free is not stacked on it. R_total =
+  max(256 MiB, 128 MiB + g × min(graph bound, 32)) for the elastic pool (no cap in warning-only
+  mode), g = 4 MiB per graph executable until RM0d calibrates it; R_used tracks NInfer's growth after
+  sizing, so a runtime grow never spends the reserve.
+- **Fail fast.** `construct_qwen4_exp` evaluates the function with the dense arena and
+  `ProgramImpl::device_plan(options).fixed_bytes` (the single place that computes the constructor's
+  sizes) before `plan_load` reads 64 GiB; a negative result fails with the ledger and the largest
+  contributors, fewer than 2,048 frames warns. Today's silent `frames = 0` goes away.
+- **Spill guard.** Every startup device allocation step (dense arena, each `device_plan`
+  allocation, each frame chunk) must lower device free by at least its size − 32 MiB (and raise
+  LOCAL usage, if RM0a shows it counts CUDA). A spill fails startup with the ledger and the
+  optional "Prefer No Sysmem Fallback" advice; during a grow it unmaps the chunk and stops growing.
+  Every startup pinned host allocation (embedding, tier slots, n-gram cache, prefix Host tier,
+  vision tower) happens before the final frame sizing (WDDM late pinning, Strata #620).
+- **Flags.** `--vram-headroom-mib N|auto` (existing name; `auto` is new and the default) for
+  Qwen4Exp: 512 MiB with a display and the elastic pool, 1,024 MiB with a display in warning-only
+  mode, 256 MiB headless. Qwen3.5 keeps its meaning (`auto` = 1 GiB); the field moves from
+  `KvCapacityPolicy` to `EngineOptions::vram_headroom` and "requires `--kv-capacity auto`" moves
+  into Qwen3.5's validation. Qwen4Exp's `--kv-capacity auto` is defined as `max_context × C`.
+- **VMM frame pool** `src/core/vmm_arena.{h,cu}` (§3.4): one virtual range of the card's size,
+  64 MiB chunks mapped and unmapped at the top, helpers shared with `evictable_weight_pool.cu`.
+  A shrink by k frames runs in two phases: at boundary b the policy evicts the k lowest-score
+  residents anywhere (dropped with a host copy, demoted otherwise); at the first boundary where
+  every demotion D2H has completed, surviving top-region experts are relocated device to device
+  (~3 µs each), one table upload publishes them, and only after host-observed completion are the
+  top chunks unmapped and released. Grow maps ≤ 4 chunks per boundary during rounds, all when idle,
+  each with the spill guard. The capacity API (`LfruPolicy::set_capacity`, `FramePool` unbacked
+  frames, `CacheController::resize`/`relocate`) is shared with vision V4, built by whichever lands
+  first. Without VMM the pool stays one `cudaMalloc` and the monitor only warns.
+- **Monitor** `program/vram_monitor.{h,cpp}` (§3.5): wakes on the DXGI budget event or 1 s; shrinks
+  if F < H_d/2, B < 0 or `Demoted` rose; regrows when the target exceeds the pool by ≥ 2 chunks for
+  30 s. Targets are applied at the expert-quiescent round boundary, or through a new idle
+  `maintain()` hook in the engine worker's idle wait. Display hot-plug changes H_d. Below 25 % of
+  the startup frames it warns once per episode. Linux applies the law only with a display; TCC and
+  headless Linux need none.
+- **WDDM behaviour** (§3.6): under the default sysmem-fallback policy an over-committed allocation
+  silently lands in shared system memory; the pre-check and the spill guard turn that into a
+  startup error, and a runtime grow stops at the spill. Pressure from other processes is met by
+  shrinking before VidMm contention (device free is the primary signal; budget and `Demoted` are
+  secondary). NInfer never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
+  optional.
+
+#### Feature 2: the SSD expert tier
+
+- **Regimes** (§4.1), with H host slots, H_res = H − 176 (128 ring, 16 prefetch, 32 demotion
+  slots) and V_min the smallest runtime frame count: **full** (expert RAM ≥ 64,801 MiB + 1 GiB),
+  **tier without steady-state SSD** (V_min + H_res ≥ 24,576), **tier with SSD**, and **refuse**
+  below H_min = 1,024 slots (2.64 GiB).
+- **RAM ledger** `models/qwen4_exp/memory_plan.{h,cpp}` (§4.2): a pure, unit-tested function over a
+  Core host-memory snapshot (Windows `ullAvailPhys`, commit, `PrivateUsage`; Linux `MemAvailable`
+  under the cgroup limit). Planned: embedding 1.18 GiB, vision tower and media reserve, the prefix
+  Host tier, n-gram row cache 0.16 GiB, Program buffers, load staging 0.26 GiB, 1.0 GiB of process
+  growth until RM7 measures it, and 0.25 % lock overhead. `--expert-ram-mib N` caps the result (to
+  keep RAM for other programs or simulate a smaller machine). The commit limit is honoured, pinning
+  re-checks available RAM before each 1.32 GiB chunk, a failed full-mode pin falls back to tier mode
+  before any read, and a hard minimum working set keeps NInfer's own pageable pages resident.
+  Explicit and default sizes of the prefix tier and vision are honoured first (Q6).
+- **Residency** (§4.3): exclusive with shadows (a VRAM resident keeps its RAM copy only as a shadow;
+  shadows are the first RAM victims). Slots carry pins (`H2D`, `Queue`, `D2H`, `Use`, `Prefetch`)
+  and load serials, so a slot is never rewritten while read and never publishes stale bytes; the
+  12 transitions T1-T12 are each an RT2 case. A VRAM victim without a host copy is demoted from a
+  published frame (frame held, D2H on its own stream) when it outranks the RAM victim; when the
+  boundary's demotion allowance (32 per decode boundary, unlimited at prefill chunk boundaries and
+  shrinks) is spent, VRAM admissions wait instead of dropping it.
+- **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
+  direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
+  segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on
+  Windows, an `O_DIRECT` `pread` pool on POSIX) with demand-before-prefetch priority, sub-reads,
+  transient-error backoff, `cancel_all` and a fault seam. Measured so far on `E:` (990 PRO, Python
+  probe): 0.566 ms p50 at QD 1, 5.8 GB/s (~2,100 experts/s) from QD 4.
+- **Op contract** (§4.5): `MoeExpertSource` gains a per-layer `host_table` of record pointers; null
+  (full mode) keeps today's `host_records + e × stride` code, a null entry means SSD-only. The CPU
+  request carries record pointers when tiered.
+- **Demand path** (§4.6). The plan kernel classifies resident / RAM miss / SSD-only jobs. In decode
+  and verification, SSD-only experts are chosen first as CPU jobs: the CPU service asks a
+  `RecordProvider` for the read, computes from the landed slot, and answers with a status word on
+  failure. Prefill, overflow and CPU-off calls publish their SSD-only experts to a mapped
+  `MoeFetchChannel`; a host agent reads them into a 128-slot landing ring in job order, one device
+  poller mirrors `landed` into L2, the stage kernel copies each record as it lands, and SSD-only jobs
+  run last. Waits are bounded by a host heartbeat (1 s without progress), never a trap; the existing
+  2 s `cpu_wait` trap becomes the same wait, and both channel sequences become wrap-safe. Exposed
+  cost per SSD read ≈ 0.6-0.7 ms (estimated).
+- **RAM policy** (§4.7): decayed LFU, score `Σ w · 2^−(t − t_use)/h`, kept as the time-invariant key
+  `v = log2 s + t/h` (O(1) per use) with lazy min-heaps for victims. Clock: +1 per decode token
+  (verification: + accepted tokens, live columns only); a prefill chunk of T tokens advances
+  min(T, 16) with weight Δ/T per use. Default h = 64 until RM0f; LRU or CLOCK replaces it only with
+  ≥ 5 % fewer SSD reads (Q13). Demand landings are admitted if they outrank the RAM victim, prefetches
+  at 1.25 × its score.
+- **Warm start and prefetch** (§4.9): S4b's expert state file gains a RAM-tier section; startup
+  pre-fills VRAM then RAM in file order with coalesced reads; a shipped profile only behind the
+  replay gate. Background prefetch: one 256 KiB sub-read in flight during rounds, QD 4 when idle,
+  prompt-informed after prefill.
+- **Prefill** (§4.10): route-aware fetch with SSD-last jobs, and a prompt landing reserve (up to
+  min(1,024, H_res/8) slots taken per chunk) so later chunks and the first decode tokens find the
+  prompt's cold experts in RAM. In tier mode with SSD reads the log recommends
+  `--prefill-chunk 4096`.
+- **Failures** (§4.12): the Program checks the tier's error word after each synchronize and throws
+  `runtime::RecoverableExecutionError`, which the engine worker handles like an OOM recovery (fails
+  the active requests, keeps serving); a read is retried once, a key that fails twice is unreadable
+  for 60 s. Every copy stays clean with respect to the artifact (design §9.1's "the host bank holds
+  an identical copy" becomes this invariant).
+- **Diagnostics**: `report_cache` and the request log gain SSD reads, stall ms, host hits,
+  demotions and prefetches; startup prints the RAM and VRAM ledgers; an internal route trace
+  (`ProgramOptions::route_trace`, R0) records every round's routes for the replay tool.
+
+#### Flags
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--vram-headroom-mib N\|auto` | auto | Device VRAM left free for the display and other programs (Qwen4Exp); Qwen3.5 unchanged |
+| `--ram-headroom-mib N` | 2048 | Physical RAM left available after every pinned allocation, all models; replaces the fixed 8 GiB |
+| `--expert-ram-mib N\|auto` | auto | RAM for routed experts; N caps it (N ≥ 65,825 gives full mode if the ledger allows; more than the ledger allows is an error) |
+| `--expert-state FILE\|off` | S4b's path next to the artifact | Saved expert state (VRAM residents; in tier mode also the RAM ranking) |
+| `--expert-mirror DIR` | none | R14 only: a second copy of the parts for split reads, made once by the user (U3: NInfer never writes it) |
+
+All are parsed by `ninfer`, `ninfer-serve` and `ninfer_bench` and carried in `EngineOptions`.
+Internal `ProgramOptions` for tests and A/B only: `vram_monitor`, `tier_exclusive`,
+`tier_cpu_ssd_jobs`, `tier_prefetch`, `tier_reserve`, `tier_lookahead`, `route_trace` and the fault,
+budget and sequence seams.
+
+#### Steps
+
+| Step | Content | Tests | Effort |
+|---|---|---|---|
+| **R0** | Probes RM0a-RM0e and RM0g (`tools/flash_next_probe/vram_probe.cpp`, `expert_read_probe.cpp`); the internal route-trace hook and a long engine-captured trace; the two-level replay `tools/expert_cache_replay/host_tier.py` | Probe logs; ids identical with the hook on | 1 d + ~2 h GPU |
+| R1 | `vram_budget`, `device_plan`, the sizing function, pre-check, spill guard, ledger, `--vram-headroom-mib N\|auto` | RT7; smoke at auto/0/2048 | 1.5 d |
+| R2 | `vmm_arena`, capacity API, two-phase resize | RT8 | 2 d |
+| R3 | Runtime monitor, `maintain()` hook, warning-only fallback | RT9, RT13 | 1.5 d |
+| R4 | Host-memory snapshot, `memory_plan`, shared reserve with per-chunk re-checks, flags | RT1, RT14 (part) | 1.25 d |
+| R5 | Op contract (`host_table`, CPU record pointers), heartbeat wait, wrap-safe sequence | RT5, RT6 (CPU); RM1 | 1.25 d |
+| R6 | Streamed residency, `StreamSource`, `ExpertStore` | RT3, RT4 | 1.5 d |
+| R7 | `DirectReadQueue` | RT3b | 1 d |
+| R8 | CUDA-free RAM-tier controller and its Python reference | RT2 | 2.5 d |
+| R9 | Fetch channel, SSD-first CPU jobs, SSD-last permutation (with concurrency S5 item 1 if not landed) | RT6 | 2.5 d |
+| R10 | Program integration: slot pool, agent, boundary protocol, demotions, state file, recoverable failures | RT10-RT12, RT15 | 4 d |
+| R11 | Prefill landing reserve, prefetch modes, diagnostics | RT10 ext.; RM3/RM4 | 2 d |
+| R12 | Router lookahead, only if RM3 stalls ≥ 3 % at 29,000 MiB and cold-tail recall ≥ 0.5 | RM9 | 2 d |
+| R13 | Docs (§9.1-9.2, §15, §19.2, user guide, `cli.md`, `serving.md`) and the campaign | RM1-RM8 | 1 d + ~5-6 h GPU |
+| R14 | Mirror split reads, only if RM3 stalls ≥ 10 % and a second drive exists | RM10 | 1.5 d |
+
+Tests (§6): RT1 ledger; RT2 every slot transition, lazy heaps against a naive recompute and the
+Python reference over 2,000 rounds; RT3/RT3b/RT4 streamed records equal the pinned bank bytes and
+the read queue's ordering, retries and cancellation; RT5/RT6 bit-exact routes with a null table, a
+permuted table, the fetch channel with a delayed out-of-order responder, heartbeat and wrap seams;
+RT7-RT9 sizing, resize and monitor law with fake sources; RT10 greedy ids identical in full mode
+and at 43,000 / 29,000 / 13,000 MiB caps across every tier option; RT11 fault injection (the next
+request completes with correct ids, no trap); RT12 slot integrity audits (with the host bit-flip
+triage rule); RT13 VRAM pressure; RT14 startup; RT15 lifecycle.
+
+#### Measurements and acceptance (fixed before measuring)
+
+Workloads: tg512 only for the full-RAM no-regression check and Feature 1; tier speed on a
+**non-repeating session** (NRS: 12 distinct code, story, chat and multilingual prompts, ~5K
+generated tokens, disjoint from the trace and profile prompts), first and second halves reported,
+C = 1, 2, 4, equal warm-up in both arms. ABBA on one binary with temporary toggles; median, range
+and worst case.
+
+- RM0a-RM0g probes (R0): DXGI/NVML/VMM facts, sysmem fallback (RM0b, only with the user's consent),
+  VMM speed parity (RM0c, tg512 with R2's toggle), graph bytes (RM0d), expert reads (RM0e), the
+  two-level replay (RM0f) and pin time (RM0g). RM1 full-RAM regression; RM2 Feature 1 cost and a
+  2 GiB ballast; RM3 tier decode at the caps; RM4 tier prefill; RM5 topic switch; RM6 fault timing;
+  RM7 startup and paging; RM8 state, profile and trace; RM9/RM10 only with R12/R14.
+- **A1** RT10-RT13 pass with identical ids, no CUDA trap in any fault case, the engine serves the
+  next request after a read failure.
+- **A2** full RAM with Feature 2 code at equal frames (`--vram-headroom-mib 128`): median of ≥ 3
+  ABBA pairs ≥ −0.5 % against `dev`, worst pair ≥ −1.0 %, load time ≤ +5 %, pinned bytes unchanged,
+  identical ids.
+- **A3** Feature 1: A3a the default configuration's frame cost and tg512 change within the
+  predicted −0.2 to −1.3 % (worse than −1.5 % is a defect to explain); A3b a 2 GiB ballast absorbed
+  within two boundaries plus the unmap, no `Demoted` rise after the shrink, regrow follows; A3c an
+  idle start never grows into the internal reserve. If VMM fails RM0a or RM0c, warning mode is
+  documented.
+- **A4** tier, on NRS second halves: A4a at 43,000 MiB < 0.1 SSD reads per token and ≥ 97 % of full
+  mode at equal frames; A4b ≤ 0.8 ms per SSD read at C = 1 (at 29,000 and 13,000 MiB); A4c plain
+  ≥ 80 % of full mode at 29,000 MiB (central prediction 91 %, pessimistic 74 %); A4d pp4096 at
+  29,000 MiB ≤ 1.6× full mode at chunk 1024 and ≤ 1.4× at 4096; 13,000 MiB reported only.
+- **A5** tier-mode startup time per cap; more than 1.5× today's 25 s is a defect to explain.
+
+#### Decisions and rejected alternatives
+
+| Decision | Rejected (reason) |
+|---|---|
+| Device-wide free VRAM as the primary runtime signal; DXGI budget and `Demoted` secondary | Budget slack alone (reacts only once VidMm trims); NON_LOCAL (fires on our own pins); PDH (~10 ms per collect) |
+| One sizing function with the internal reserve tracked as spent | A separate grow rule that could spend the reserve |
+| VMM pool at a fixed address, shrink evicts the least valuable experts and relocates survivors | Evicting the top region as it stands; a segmented `cudaMalloc` pool (segment table in kernels and graphs); shrinking KV or `work_` |
+| No frame floor (0 frames still works through staging slots and the CPU) | A floor that keeps VRAM the display needs (U1) |
+| Fail fast before reading weights | Today's silent `frames = 0` after 25 s of loading |
+| Explicit tier with unbuffered reads of the artifact in place on `E:` | An OS mapped-file tier (Strata's `--mmap-experts`: 7.54 vs 12.18 tok/s with identical flags); a copy on `G:` (63 GiB, contention with the n-gram volume and page file); any SSD expert cache, spill or swap file (U3: SSD writes and wear for no gain, since the artifact already holds the exact bytes) |
+| Exclusive residency with shadows, pins and admission throttling | Inclusive or independent tier (2-2.5× more SSD reads in the 512-token replay); a fixed demotion cap that drops victims |
+| SSD-only experts as CPU jobs in decode; fetch channel for prefill and overflow | Fetch channel for every call (exposed wait on the serial route); CPU jobs only (caps, no prefill) |
+| Decayed LFU with O(1) updates and lazy heaps, h by replay | LFRU for RAM (time-varying order); long-half-life LFU (+30 % reads in the 512-token replay); per-layer quotas |
+| Full mode keeps today's pinned Model banks and kernel code (null host table) | An identity table in full mode |
+| No precision change for SSD experts; deny-write handles | Lower-bit SSD copies; per-read hashing (~0.25 ms CPU) |
+| RAM tier sized at startup only | Runtime RAM grow and shrink (Q10) |
+| Recoverable round failure | Engine-wide failure on any read error |
+
+#### Risks and open questions
+
+Main risks: VMM release on WDDM unproven or VMM frames slower (warning-only fallback); DXGI usage
+excluding CUDA allocations (spill guard by device free); long device spins during NVMe stalls under
+WDDM (heartbeat waits and a host I/O bound below the TDR bound unless preemption is verified,
+shared with n-gram S2); the hit model resting on one short trace (long-trace replay, NRS, labelled
+uncertainty); the 2 GiB reserve paging NInfer or the desktop (hard minimum working set, RM7);
+`E:`'s ~2,100 reads/s at C > 1 or in prefill; slot protocol bugs (pins, serials, audits); code
+conflicts with concurrency S3-S5/S4b, vision V3/V4, prefix P6 and n-gram S2 (merge order below);
+host RAM bit flips on this machine (triage rule).
+
+Defaults decided before measuring (the user may override): Q1 display headroom 512 / 1,024 / 256
+MiB (on this machine the 5090 drives no display, the monitor is on the Intel UHD 770, so `auto` is
+the headless value); Q2 obey the OS budget with a 64 MiB margin; Q3 runtime shrink and regrow on if
+RM0a and RM0c pass; Q4 "Prefer No Sysmem Fallback" as optional advice only; Q5 the 2 GiB reserve
+for every model's pinned check; Q6 prefix tier and vision before experts; Q7 a shipped profile only
+behind the RM0f gate; Q8 unchanged prefill chunk with a 4096 hint; Q9 heartbeat device wait, I/O
+bound per n-gram S2's gate decision, never a trap; Q10 no runtime RAM-tier resizing; Q11 Linux/WSL
+supported with a native filesystem; Q12 R12 and R14 only on their triggers; **Q13** decayed LFU
+stays unless RM0f shows LRU or CLOCK with ≥ 5 % fewer SSD reads, then that becomes the default with
+LFU selectable, reported as a deviation from the literal request.
+
+#### Integration
+
+Merge order (extends §19.3.0): R0's trace hook and R4 early (before prefix P6 and vision V5 size
+their host memory, which then use the ledger); R1 after concurrency S1/S2; R2 after vision V3
+(whichever of R2 and V4 lands second reuses the capacity API); R3; R5 and R9 after concurrency
+S3-S5, which own `cpu_plan`, `cpu_wait` and `stage_kernel`; R6-R8 any time; R10-R11 after R5-R9 and
+S4b (extending its state file and fill rule); R12 and R14 last. Shared rules: the I/O timeout
+follows n-gram S2's gate decision; demotions obey the copy-engine FIFO rule through the decode
+allowance; kernels Phase 2's L2 warming in `cpu_wait` is unaffected. In-branch this track edits only
+this section and its user-guide subsection; §9, §15, §19.3.0, `cli.md`, `serving.md` and README
+change at merge time.
+
+#### R0 implementation decisions
+
+- **Route trace** (`program/route_trace.{h,cpp}`, internal `ProgramOptions::route_trace`, set only
+  through the process-wide `testing::set_route_trace` seam that `construct_qwen4_exp` reads). The
+  format is documented in `route_trace.h`: a 64-byte header (layers, experts, top-k, frames, max
+  columns, lanes, max width, MTP and n-gram draft tokens, prefill chunk), then one record per
+  round (kind, rows, width, tokens advanced, the promotion budget the cache applied, row 0's first
+  position for prefill chunks, lanes, live mask, every layer's routes) written right before
+  `after_round` applies the same host route log, so the trace is exactly what the VRAM policy saw.
+  It also records each CUDA graph executable the Program instantiates (family, batch, width,
+  device free before its capture and after its instantiation and first launch), which is RM0d's
+  measurement; the family and shape follow from the graph's slot, so no call site changes. Both
+  are bit-neutral: host reads after the round's synchronize, and `cudaMemGetInfo` outside capture.
+- **Capture** (`ninfer_qwen4_exp_route_trace_real_test`): the public Engine over a prompt list,
+  trace off then on with identical ids required; `--mtp`, `--ngram`, `--concurrency` (prompts
+  submitted together in FIFO order) and `--single-pass` (graph measurements); the trace is
+  re-read and checked per lane against each request's prompt and generated tokens.
+- **Probes** `tools/flash_next_probe/vram_probe.cpp` (RM0a, the RM0c read proxy) and
+  `expert_read_probe.cpp` (RM0e, RM0g) are CMake executables built beside the tests
+  (`probes.cmake`). The read probe locates the `nvfp4_expert_rg16_v1` records through the artifact
+  directory, opens the parts unbuffered with the tier's deny-write sharing, completes reads on one
+  I/O completion port (an `O_DIRECT` thread per I/O on POSIX) into `cudaHostAlloc(Portable |
+  Mapped)` slots, and splits quarters on page boundaries (169, 169, 169, 168 pages).
+- **Replay model** (`tools/expert_cache_replay/host_tier.py`), where the plan left a choice:
+  - The VRAM part is the engine's `LfruPolicy` decision for decision (binary64 scores, ties to the
+    lower key), with the tier rules: admission only with a host copy, the budgeted loop for every
+    call, the fill rate keyed on free frames. A promotion is visible from the next round, or one
+    later when its victim's demotion holds the frame.
+  - The demotion list carries a swap: a victim demoted to admit an expert from RAM may use one of
+    the 32 list slots, because the promoted expert's own RAM slot becomes a shadow (exclusive) or
+    is freed (strict) when its copy is published and refills the list at the next round start.
+    So an exclusive swap never sends a victim to SSD for lack of a slot; the 1.25 × rule decides
+    only when no free, shadow or list slot is left. Prefill boundaries can exceed the 32 list
+    slots (16 promotions × 48 layers), after which a demotion evicts the lowest RAM resident or the
+    victim is dropped by the 1.25 × rule; R10 sizes the list for prefill or keeps that behaviour.
+  - Only the last 128 landings of a round (the ring) can be admitted at its boundary; landings
+    beyond the ring in a prefill chunk are lost unless they are among the first K reserve
+    landings. A prefill chunk's reserve takes free slots before evicting residents.
+  - Victims are shadows first, without a score comparison (dropping a shadow loses nothing now);
+    a demand landing is admitted when a slot is free, a shadow can go or it outranks the lowest
+    resident. For LRU and CLOCK, admission, demotion and prefetch comparisons use recency.
+  - Priors seed VRAM with the ranking's top V keys at zero LFRU counts and RAM with the next
+    H_res (inclusive: the top H_res) at ranks below any real use.
+  - Q13 is applied per cell and over all V and RAM sizes of one prior and mode: another policy is
+    adopted only with strictly fewer and at most 95 % of the best half-life's SSD reads.
+
+#### Status
+
+R0 implemented on `claude/fn-memory` (base `1dae6914c`): built, not yet run; the orchestrator runs
+the probes, the captures and the replay. Results are recorded below as they are measured.
+
 ---
 
 ## 20. Documentation and authority changes

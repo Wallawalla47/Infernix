@@ -6,6 +6,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/route_trace.h"
 #include "models/registry.h"
 
 #include <chrono>
@@ -90,6 +91,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;
+    program_options.route_trace = models::qwen4_exp::testing::route_trace();
     instance->program =
         std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
     const MemorySummary memory = instance->program->memory_summary();

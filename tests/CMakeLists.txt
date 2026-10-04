@@ -9,6 +9,8 @@ include(cmake/BenchSupportTests.cmake)
 include(models/qwen3_5/tests.cmake)
 include(models/qwen4_exp/tests.cmake)
 include(ops/tests.cmake)
+# Machine probes of the Qwen3.8-Flash-Next memory track, built beside the tests.
+include(${PROJECT_SOURCE_DIR}/tools/flash_next_probe/probes.cmake)
 
 # All test executables share one per-config runtime directory; stage the shared
 # FFMPEG/curl DLL closure there once so fully-linked tests resolve their imports

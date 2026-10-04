@@ -271,6 +271,10 @@ struct ProgramOptions {
     std::uint32_t cpu_expert_jobs    = 8;
     std::int32_t cpu_pcie_divisor    = 3;
     DiagnosticObserver diagnostics;
+    // Internal (measurement tools and tests): when set, every round's routed experts and every CUDA
+    // graph executable's device memory are appended to this file for the expert-cache replay and
+    // the graph-memory measurement (program/route_trace.h). Changes no result.
+    std::filesystem::path route_trace;
 };
 
 class Program {

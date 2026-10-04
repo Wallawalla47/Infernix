@@ -49,6 +49,10 @@ public:
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;
     [[nodiscard]] std::int32_t* route_log() noexcept { return static_cast<std::int32_t*>(route_device_.p); }
     [[nodiscard]] std::size_t route_stride() const noexcept { return route_stride_; }
+    // The last downloaded route log (valid once its round has completed), as after_round reads it.
+    [[nodiscard]] const std::int32_t* route_host() const noexcept {
+        return static_cast<const std::int32_t*>(route_host_.data());
+    }
     [[nodiscard]] std::uint32_t frames() const noexcept { return frames_; }
 
     // Before a round: publishes the loads that completed since the last round.

@@ -18,6 +18,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/route_trace.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
@@ -357,6 +358,20 @@ public:
         experts.route_log    = residency_->route_log();
         experts.route_stride = residency_->route_stride();
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = residency_->table(l); }
+        if (!options_.route_trace.empty()) {
+            trace_ = std::make_unique<RouteTrace>(
+                options_.route_trace,
+                RouteTraceSetup{.layers             = c_.num_hidden_layers,
+                                .experts            = c_.moe.experts,
+                                .top_k              = c_.moe.top_k,
+                                .frames             = residency_->frames(),
+                                .max_columns        = static_cast<std::uint32_t>(columns_),
+                                .lanes              = options_.max_concurrency,
+                                .max_width          = static_cast<std::uint32_t>(max_width_),
+                                .mtp_draft_tokens   = static_cast<std::uint32_t>(mtp_k_),
+                                .ngram_draft_tokens = options_.ngram_draft_tokens,
+                                .prefill_chunk      = static_cast<std::uint32_t>(chunk_)});
+        }
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context));
         device_.synchronize();
@@ -502,6 +517,8 @@ public:
         lane.state_tokens += static_cast<std::uint32_t>(width);
         if (!last) {
             device_.synchronize();
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
+                        kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
         }
 
@@ -515,6 +532,8 @@ public:
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
             sample(lanes, positions);
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
+                        kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
             const SequenceHandle rows[] = {sequence};
             out.timing.submit_host_ns = elapsed_ns(start);
@@ -634,6 +653,8 @@ public:
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
+            trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
+                        kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
             lane.state_tokens += stride;
         }
@@ -828,12 +849,36 @@ private:
     void settle_round() {
         if (!deferred_.pending) { return; }
         deferred_.pending = false;
-        residency_->after_round(device_.stream, deferred_.columns, decode_budget(deferred_.tokens),
+        const std::size_t budget = decode_budget(deferred_.tokens);
+        if (trace_) {
+            const std::int32_t width = deferred_.live ? round_width_ : 1;
+            trace_round(deferred_.live ? RouteTraceKind::Verify : RouteTraceKind::Decode, deferred_.columns / width,
+                        width, deferred_.tokens, budget, RouteTrace::kUnknownPosition,
+                        deferred_.live ? std::span<const std::uint8_t>(live_.data(),
+                                                                       static_cast<std::size_t>(deferred_.columns))
+                                       : std::span<const std::uint8_t>{});
+        }
+        residency_->after_round(device_.stream, deferred_.columns, budget,
                                 deferred_.live ? std::span<const std::uint8_t>(live_.data(),
                                                                                static_cast<std::size_t>(deferred_.columns))
                                                : std::span<const std::uint8_t>{});
     }
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
+
+    // Appends the round whose routes after_round is about to apply to the internal route trace
+    // (ProgramOptions::route_trace); rows' lanes are host_lanes_ as staged for the round.
+    void trace_round(RouteTraceKind kind, std::int32_t rows, std::int32_t width, std::uint32_t tokens,
+                     std::size_t budget, std::uint32_t position, std::span<const std::uint8_t> live = {}) {
+        if (!trace_) { return; }
+        trace_->append({.kind     = kind,
+                        .rows     = static_cast<std::uint32_t>(rows),
+                        .width    = static_cast<std::uint32_t>(width),
+                        .tokens   = tokens,
+                        .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
+                        .position = position},
+                       std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)), live,
+                       residency_->route_host(), residency_->route_stride());
+    }
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
     // or on stderr without an observer.
@@ -1110,10 +1155,38 @@ private:
             body();
             graph.warmed = true;
         } else {
+            const std::size_t free_before = trace_ ? trace_free() : 0;
             graph.definition.capture(s, body);
             graph.executable.instantiate(graph.definition);
             graph.executable.launch(s);
+            if (trace_) { trace_graph(graph, free_before); }
         }
+    }
+
+    // Device free bytes, and the route trace's record of a graph executable just instantiated
+    // (its family and shape follow from the slot it occupies).
+    static std::size_t trace_free() {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        return free_bytes;
+    }
+    void trace_graph(const DecodeGraph& graph, std::size_t free_before) {
+        RouteTraceGraph family = RouteTraceGraph::Decode;
+        std::ptrdiff_t at      = route_trace_index(graphs_, &graph);
+        std::ptrdiff_t stride  = 1;
+        if (at < 0 && (at = route_trace_index(verify_graphs_, &graph)) >= 0) {
+            family = RouteTraceGraph::Verify;
+            stride = max_width_;
+        } else if (at < 0 && (at = route_trace_index(mtp_draft_graphs_, &graph)) >= 0) {
+            family = RouteTraceGraph::MtpDraft;
+            stride = mtp_k_;
+        } else if (at < 0 && (at = route_trace_index(mtp_catch_graphs_, &graph)) >= 0) {
+            family = RouteTraceGraph::MtpCatchUp;
+            stride = max_width_;
+        }
+        if (at < 0) { return; }
+        trace_->graph(family, static_cast<std::uint32_t>(at / stride + 1), static_cast<std::uint32_t>(at % stride + 1),
+                      free_before, trace_free());
     }
 
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
@@ -1683,6 +1756,7 @@ private:
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
     std::unique_ptr<ExpertResidency> residency_;
+    std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
     // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.
     struct OverlapResources {
