@@ -57,8 +57,10 @@ inline std::vector<std::uint16_t> random_activations(std::mt19937& rng, int ncol
     std::normal_distribution<float> n(0.0F, 1.0F);
     std::vector<std::uint16_t> x(static_cast<std::size_t>(ncols) * moe::kHidden);
     for (auto& v : x) { v = to_bf16(n(rng) * 0.05F); }
-    // An outlier per column, as real activations have.
-    for (int c = 0; c < ncols; ++c) { x[static_cast<std::size_t>(c) * moe::kHidden + 17 * (c + 1)] = to_bf16(9.0F); }
+    // An outlier per column, as real activations have, at a position inside that column.
+    for (int c = 0; c < ncols; ++c) {
+        x[static_cast<std::size_t>(c) * moe::kHidden + static_cast<std::size_t>(17 * (c + 1) % moe::kHidden)] = to_bf16(9.0F);
+    }
     return x;
 }
 
