@@ -59,10 +59,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
     acceptance makes worthwhile, down to none on text it predicts poorly.
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
-  - Greedy output is the same as without it, with one request at a time. With
-    `--max-concurrency 2` a greedy answer differed from the same request run alone (an open
-    defect, design §19.2), and two lanes were slower than one. Use `--max-concurrency 1` with
-    `--spec mtp` or `--ngram-draft-tokens`.
+  - Greedy output is the same as without it when one request runs at a time. With several
+    lanes, speculative verification can round differently and flip a near-tie (design §19.2),
+    and two lanes measured slower than one, so `--max-concurrency 1` is recommended with
+    speculation.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. See [ngram copy proposals](ngram.md).
