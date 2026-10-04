@@ -516,11 +516,12 @@ and the tensor dtypes before the recipe is frozen.
 | Tensor class | Source form | Recipe A | Recipe B | Reason |
 |---|---|---|---|---|
 | Routed experts (48 × 512) | ModelOpt NVFP4: E2M1 codes, E4M3 per 16, FP32 `weight_scale_2` and FP32 `input_scale` per matrix | **Exact import** as `nvfp4_mul` (below), layout `nvfp4_expert_rg16_v1` (§6.2). Every expert's `input_scale` is kept per matrix as an FP32 model-role tensor. | Same | NVIDIA's weights and NVIDIA's activation calibration, with nothing re-derived |
-| MTP routed experts (512) | FP8 E4M3, 128×128 blocks with FP32 multipliers, byte-identical to `Qwen/Qwen3.8-Flash-Next-FP8` | **Exact import** as `fp8_e4m3fn_block128_f32` (below). Activations follow the scheme the checkpoint declares: per-token 1×128 FP8 groups (W8A8) if dynamic, BF16 if weight-only. | Same | Byte-for-byte equal to the source. MTP affects only acceptance, never output. |
+| MTP routed experts (512) | BF16, fused `gate_up_proj` [512, 1280, 2560] and `down_proj` (NVIDIA keeps `mtp.*` unquantized) | BF16, as per-expert row ranges of two parents | **`q4_g64_fp16`, MSE-chosen group scales** (`grouped_mse`), 1.34 GB, all device-resident (§11.2) | MTP affects only acceptance, never output. The FP8 checkpoint the earlier text assumed is not used; Strata stores these experts at 2.25 bits. |
 | N-gram table (128 shards) | FP8 E4M3 plus one BF16 scalar scale | **Exact import** into the NVMe volume of §12.2. One scalar scale, no per-row plane. | Same | One I/O per row instead of two |
 | GDN q/k/v/z projection and `out_proj`; QSA QKVG and `o_proj`; shared experts; HC mixers (down and up); PLE key/value projections; `lm_head` | BF16 | BF16 | **8-bit, W8A16.** `fp8_e4m3fn_row_bf16` (producer `fp8_row_maxabs`) per class; `q8_g32_fp16` (`grouped_absmax`) for a class where FP8 fails §16.3 and Q8 passes; BF16 for a class where neither passes. | 4.2 GB fewer dense bytes per token and ~1,520 more frames (§4.2). These classes are 97% of the dense bytes. |
 | Router, shared-expert gate, GDN `a`/`b`, QSA indexer projection | BF16 | BF16 | BF16 | Small (3% of dense bytes), and routing- or selection-sensitive |
-| MTP dense (its QSA block, HC, shared expert, router, projections) | BF16 | BF16 | BF16; 8-bit only under option H13 | Affects only acceptance; 0.17 GB |
+| MTP dense (its QSA block, HC, shared expert, projections) | BF16 | BF16 | `q8_g32_fp16` (option H13 adopted); router and shared-expert gate stay BF16 | Affects only acceptance; halves the drafter's dense bytes per step |
+| Proposal head (`--proposal`, for `--lm-head-draft`) | `lm_head` rows of the 131,072 most frequent tokens | — | `q4_g64_fp16`, 178 MB | Draft head of the MTP drafter only |
 | Token embedding | BF16 | BF16, **host-resident** (§6.3) | Same | Saves 1.27 GB of VRAM, about 480 frames |
 | Norms, `A_log`, `dt_bias`, conv weights | BF16 / FP32 | Direct | Direct | — |
 | Vision | BF16 | BF16 | BF16 | Not on the decode path. It is selected at startup, and its device weights are borrowed from the frame pool (§9.2). |
@@ -1301,6 +1302,11 @@ host simulation (`tests/models/qwen4_exp/test_expert_cache.cpp`), 12 slack frame
 admissions per round left 12% of policy hits CPU-served; 48 slack frames served 98% from the GPU.
 At recipe B's ~15 promotions per token, D = 1 and storm peaks of ~60, that is ~120 frames (1.4% of
 the pool). M5 sets the value from the measured admission distribution.
+
+As built, the Program is synchronous: `after_round` runs on a quiescent compute stream, and its
+`on_quiescent` frees every retired frame and drains the queue before the next round. Slack
+frames would never hold an expert, so it uses none (D = 0). The code had reserved
+min(F/8, 512) = 512 frames. An asynchronous transfer agent that overlaps rounds needs slack again.
 
 When the engine worker has synchronized the compute stream (no round in flight, for example
 between requests or before a prefill), every pending frame is reusable at once. The same rule
@@ -2608,10 +2614,17 @@ recipe converts:
 - PLE projections.
 
 As §6.1 requires, the router, shared-expert gate, GDN a/b and every MTP tensor stay BF16. Two
-classes the §6.1 table lists for 8 bits also stay BF16 in this first cut:
+further classes from the §6.1 table:
 
-- **`lm_head`.** It runs through the FP32 `projection_fp32`, which has no 8-bit form yet.
-- **QSA QKVG group.** It is stored together with the indexer projection, which must stay BF16.
+- **`lm_head` (8-bit since the second cut).** `projection_fp32` gained a `q8_g32_fp16` form: the
+  same warp-per-row kernel and fixed per-K order, with weights decoded exactly. Logits stay FP32,
+  so verify acceptance and scoring keep their semantics. Against the BF16-head recipe B the 8-bit
+  head costs ΔNLL +0.0004 ± 0.0002 nats over 2,557 positions (KL 0.0001, top-1 agreement
+  98.8-99.6 %). Against recipe A the total is +0.0080 ± 0.0097. It frees ~600 MB and 216 frames
+  (9,007).
+- **QSA QKVG group (stays BF16).** It is stored together with the indexer projection, which must
+  stay BF16. Splitting the group changes the artifact layout of both recipes, for ~0.3 GB per
+  token, so it waits.
 
 The Q8 linear route now admits unregistered shapes through its runtime-shape templates: predicated
 SIMT for T ≤ 8 and MMA tiles beyond. That also puts prefill dense GEMMs on tensor cores. The
@@ -2683,17 +2696,190 @@ Each gate/up CTA quantizes its expert's activation columns to A4 itself. Hoistin
 save ~20 % of `gate_up` by instruction count; the int64 per-column accumulation dominates. The
 real lever is the A4 tensor-core wide route of §13 for experts with more than 8 columns.
 
+**Prefill chunk versus decode** (recipe B, max-ctx 8192). Larger chunks take workspace from the
+expert frames:
+
+| Chunk | pp4096 | tg512 | Frames |
+|---:|---:|---:|---:|
+| 1024 | 413 tok/s | 61.46 (max-ctx 4096) | 8,791 |
+| 2048 | 571 | 60.37 | 8,614 |
+| 4096 | 659 | 58.63 | 8,300 |
+
+For long agentic prompts, 2048-4096 is the better setting. A 10K-token prompt saves ~9 s, against
+~0.4 s lost over 500 generated tokens. The shared product default stays 1024; lending frames to
+the prefill arena (§9.2) would remove the trade-off.
+
+**T = 1 expert kernels (adopted).** The gate/up and down kernels are templated on their pass
+width. A one-token call has one column per job, and the one-column instantiation quantizes,
+accumulates and reduces one column instead of eight. Per decode round: `gate_up` 3.25 → 2.06 ms,
+`down` 1.08 → 0.84 ms. The arithmetic is unchanged, and the layer-route test is bit-exact at
+T = 1. (Correction: an earlier version attributed the gain to occupancy. On sm_120, with 100 KB
+of shared memory per SM and ~1 KB reserved per CTA, `gate_up` fits one CTA per SM at every width
+(~51 KB at one column, ~88 KB at eight). Only `down` gains occupancy, at three CTAs per SM.)
+
+**Runtime-K Q8 GEMV for T = 1 (reverted, inconclusive).** It replaced the predicated SIMT route
+for single-token calls and measured slower (3.72 vs 3.36 ms per round). That profile overlapped
+another session's GPU work, though, so the result needs a clean re-measure.
+
+**Skinny Q8 GEMV for T ≤ 8 (rejected).** A second try streamed each row once per warp in
+16-code chunks for every T ≤ 8 call. Clean nsys profile (tg512, dense8h): 3.39 ms per round of
+Q8 dense kernels against 3.36 ms for the SIMT route, so it was removed.
+
+**VRAM reserve (adopted: 384 MiB).** The expert cache took all free VRAM less 1.5 GiB, which
+left ~1.5 GiB unused (the user saw it). Same build, dense8h, tg512:
+
+| Reserve | Frames | VRAM free after load | tg512 |
+|---:|---:|---:|---:|
+| 1,536 MiB | 9,007 | 1,525 MiB | 62.25 tok/s |
+| 384 MiB | 9,443 | 367-377 MiB (98.8 % used) | 63.39 (+1.8 %) |
+
+384 MiB held through decode, a 4,096-token prefill chunk at max-ctx 8192 and n-gram verification
+graphs (W = 8) with no allocation failure, so it is the default.
+
+**CPU expert workers with dynamic scheduling (kept at 6).** The user noted that Strata keeps the
+CPU busier. The team used a static split (worker w owned units 40w/N..), so E-cores held the
+P-cores back and more workers ran slower. It now hands out quantize items, gate/up units and
+down row groups through atomic counters (output bits unchanged; the team test passes). In
+`cpu_bench`, 12-24 workers then beat 6 (cold records 41 vs 52 µs per expert, warm 26 vs 40).
+End to end it does not pay: tg512 with 6 / 12 / 16 / 24 workers measured 62.25 / 62.01 / 61.51 /
+58.89 ± 1.61 tok/s. With two thirds of the misses on the CPU and the rest staged over PCIe from
+the same DDR5, the two paths share DRAM bandwidth, and extra spinning threads only add
+contention. Six workers stay the default; their low total CPU load is the measured optimum, not
+idle capacity.
+
+**Measurement caveat.** `ninfer_bench` decodes greedily from a fixed corpus prompt, so any change
+in rounding (a dense kernel's reduction order, an 8-bit head) changes the generated text. That
+changes routing and the hit rate with it. The same `dense8` artifact and frame count measured
+90.2 % hits in one build and 85.7 % in another. Kernel changes are therefore judged by per-round
+kernel time in nsys. tg throughput across numerically different builds is reported with its hit
+rate, and differences of a few percent are not attributed.
+
+#### MTP drafter (2026-10-04, third session)
+
+`--spec mtp --draft-tokens K` (K ≤ 5 at the product surface), optionally with `--lm-head-draft`.
+As built, which differs from §11.2 where noted:
+
+- **Mathematics** (Strata's vLLM transcription, `mtp.hpp`): cell c pairs the main model's final
+  multi-stream residual R_c (before the final mixer) with the token t_{c+1}, at rope position c:
+  `R = fc_hidden(per stream of RMSNorm_{S·H}(R_c)) + fc_embedding(RMSNorm_H(embed(t_{c+1})))`,
+  every RMSNorm with the unit offset, then one QSA block (its own K/V and index keys) with the
+  hyper-connection mixers, a 512-expert top-10 MoE with the shared expert, its own final mixer
+  and the text model's head. The output predicts t_{c+2}; a chained step feeds the block's output
+  residual and its draft token to the next cell.
+- **Experts all resident instead of a pool.** The 512 routed experts are `q4_g64_fp16` (1.34 GB)
+  and always in VRAM, so routing is exact and no residency-bounded approximation exists. A new
+  Op, `resident_moe_experts`, streams each selected expert's rows (Q4 or Q8 row-split codecs,
+  FP32 accumulation, FP32 SwiGLU); FP64-oracle test `ninfer_resident_moe_test`.
+- **Real QSA attention**, not Strata's dense window: the drafter's KV layer is a 13th layer of
+  every page group, read through the same block tables; its tails are a 13th slab.
+- **Cells.** Prefill chunks write the drafter's K/V for every cell whose next token is known, from
+  the chunk's live residuals (in sub-chunks of 512 columns), and keep the last residual as the
+  lane's pending cell. Forced tokens do the same. A verification round exports its W final
+  residuals; after its commit, a K/V-only call over the W cells records the index keys and
+  `qsa_commit_tails` keeps the committed ones, and the last committed residual becomes pending.
+  Each decode round then runs K chained full steps from the pending cell; chained cells past it
+  leave the tails alone and are rewritten by the next catch-up before any query reads them.
+- **Draft head.** The text head (8-bit `lm_head`, 248,320 rows) or, with `--lm-head-draft`, the
+  converter's `--proposal` head: `lm_head` rows of the 131,072 most frequent tokens in
+  `q4_g64_fp16` (178 MB) and their token ids (`projection_fp32` gained the Q4 form, `argmax` an
+  id-map overload).
+- **Graphs.** The K-step chain is one CUDA graph per batch size and the catch-up one per
+  (batch, width), as for verification.
+- **N-gram proposals** stay available beside MTP: a longer copy proposal replaces a round's MTP
+  drafts.
+
+**First results** (dense8m, INT8 KV, C = 1, greedy, cold-cache CLI, K = 3, text head). Greedy
+token ids equal plain decode on both prompts (300 and 200 tokens); `resident_moe_experts` and
+the Q4/Q8 `projection_fp32` forms pass their FP64-oracle tests.
+
+| Prompt | Acceptance | Tokens per round | Accepted by position (of rounds) | MTP tok/s (hit rate) | Plain tok/s (hit rate) |
+|---|---:|---:|---|---:|---:|
+| Code rewrite | 98.7 % | 3.96 | 74, 74, 74 of 75 | 33.5 (37.3 %) | 46.3 (69.3 %) |
+| Story (prose) | 39.9 % | 2.19 | 59, 32, 17 of ~91 | 32.5 (55.9 %) | 49.5 (73.8 %) |
+
+On a cold cache MTP was slower than plain for three reasons:
+
+- **Promotions per round, not per token.** A round promoted one expert per layer, so a
+  four-token round warmed the cache a quarter as fast (4,367 against 9,869 promotions over the
+  code prompt). Promotions now follow the tokens a round advances.
+- **Verify rounds miss more.** A W = 4 round routes several times the distinct experts of a
+  decode round.
+- **Fewer frames.** The drafter's experts, head workspace and KV layer took ~930 frames (8,517
+  against 9,443).
+
+The draft-head workspace was also sized for 512 columns (763 MB with the text head); it is now
+sized per sequence, since full steps run one column each.
+
+#### Decode-round bundle (2026-10-04, third session)
+
+A read-only review of the open items, with an adversarial check of each estimate, ranked these
+bit-exact fixes first. All of them landed together:
+
+- **Router projection.** The BF16 `projection_fp32` form ran 17 CTAs for a 513-row router,
+  each warp making ~40 dependent DRAM round trips (~22 µs × 48 per round). Decode-width calls now
+  give each warp one row (129 CTAs) and issue a row's chunk loads before its FMAs, in the same
+  order. Dynamic shared memory follows the live columns in every form (the 8-bit head had 40 KB
+  per CTA at T = 1).
+- **Per-round copies.** Decode and verification rounds copy only the used prefix of the io
+  buffer, not every n-gram row sized by the prefill chunk (2.6 MB at chunk 1024, ~10 MB at 4096).
+  The route log comes back as a 2D copy of the used rows.
+- **Slack frames 0** (§9.5), giving the policy +512 frames.
+- **CPU wait copy.** Batched 16-byte loads replace ten dependent 2-byte PCIe reads per
+  CPU-served column.
+- **Fork of stage and compute** in one-pass decode and verification calls (graph-captured). The
+  misses stage and compute on a side stream while the resident experts compute and the shared
+  expert runs; the join is in `moe_experts_cpu_wait`.
+- **Register-only `route_kernel`**, register-preloaded `hyper_connection_norm`, and the CPU
+  team's A4 quantize split into block slices.
+- **MTP fixes:** promotions follow tokens per round, and the draft-head workspace is sized per
+  sequence.
+
+Results (dense8m, INT8 KV, C = 1). The greedy token ids equal the previous build on the code and
+story prompts and on the bench corpus, so the comparisons below see the same text:
+
+| Workload | Before | After |
+|---|---:|---:|
+| tg512 plain (hit rate) | 70.29 tok/s (91.9 %) | **83.30** (93.0 %, +18.5 %) |
+| Cold-cache CLI, code prompt | 46.3 | 56.7 (+22 %) |
+| Cold-cache CLI, story prompt | 49.5 | 57.0 (+15 %) |
+
+The changes were measured together, not one at a time, so the split between them is not
+measured. (The 70.29 baseline is higher than the 62-63 tok/s dense8h figures above because the
+reverted skinny GEMV changed the greedy text, and with it the hit rate; see the measurement
+caveat.)
+
+**MTP sweep** (same build, tg512 on the bench corpus, warm cache, `ninfer_bench -n 512 -r 2`).
+Greedy output equals plain decode:
+
+| Mode | tok/s | Draft acceptance | Hits | Frames |
+|---|---:|---:|---:|---:|
+| Plain | 83.30 | — | 93.0 % | 9,443 |
+| K = 2, `--lm-head-draft` | 111.47 | 73.0 % | 89.9 % | 8,733 |
+| **K = 3, `--lm-head-draft`** | **113.96** (+37 %) | 63.7 % | 89.8 % | 8,733 |
+| K = 4, `--lm-head-draft` | 106.50 | 56.3 % | 89.3 % | 8,730 |
+| K = 3, 8-bit text head | 110.38 | 63.7 % | 89.8 % | 8,797 |
+
+K = 3 with the proposal head is the best setting: 114 tok/s against Strata's 72-80 tok/s with
+its MTP. On this corpus the proposal head drafts the same tokens as the full head, and it is 3 %
+faster.
+
+Cold-cache CLI with K = 3 and `--lm-head-draft`:
+
+- **Code:** 67.4 tok/s (93.9 % acceptance, 3.82 tokens per round) against 56.7 plain.
+- **Story:** 47.9 tok/s (39.1 % acceptance, 2.16 tokens per round) against 57.0 plain, so prose
+  is 16 % slower. A fixed K costs speed on low-acceptance text; the draft-length policy of §11.3
+  (K = 0 included) is the remedy.
+
 **Next, in order of expected gain:**
 
-1. MTP drafter (needs BF16 → FP8 MTP experts and an MTP expert pool).
+1. MTP measurements and tuning (draft length policy, §11.3).
 2. Prefill:
-   - a profile;
-   - larger default chunks with frames lent to the arena;
-   - an A4 tensor-core wide route for experts with many columns (§13);
-   - BF16 tensor-core shapes for recipe A.
-3. `lm_head` in 8 bits (an 8-bit `projection_fp32`), and the QSA QKVG group split from the
-   indexer.
-4. Expert kernels for T = 1: 3.5 ms per round, ~30 % of VRAM bandwidth.
+   - an A4 tensor-core wide route for experts with many columns (§13): `gate_up` + `down` are 45 %
+     of a 4K prompt;
+   - frames lent to the prefill arena, so large chunks cost no decode speed;
+   - BF16 tensor-core shapes for the QSA group.
+3. Dense decode GEMV: the Q8 SIMT route reaches ~65 % of the byte floor.
+4. The QSA QKVG group split from the indexer (~0.3 GB per token).
 5. Overlap of the PCIe stage with hit compute, and fewer small kernels (~1,800 per round).
 
 **For the user:** an x16 link would roughly double miss bandwidth.

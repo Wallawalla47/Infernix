@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h>
 
@@ -25,5 +26,14 @@ namespace ninfer::ops {
  */
 void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Tensor& out,
                      cudaStream_t stream);
+
+/**
+ * The same FP32 projection with one row-split `q8_g32_fp16` weight [N, K] (an 8-bit `lm_head`) or
+ * `q4_g64_fp16` weight (a proposal head): out[n, t] = sum_k w_hat[n, k] * FP32(x[k, t]), with
+ * w_hat[n, k] = fl32(code[n, k] * scale[n, k / G]) for the group size G (32 or 64), which is
+ * exact. The summation order again depends only on K. K is a multiple of 8 and at most 3072; the
+ * weight's padded K is a multiple of G.
+ */
+void projection_fp32(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

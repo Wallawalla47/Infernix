@@ -250,14 +250,19 @@ struct ProgramOptions {
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
     std::filesystem::path ngram_volume;
-    // Device memory left free after the expert frames take the rest (0 disables the cache).
-    std::size_t expert_cache_reserve_bytes = std::size_t{1536} << 20;
+    // Device memory left free after the expert frames take the rest. 384 MiB (98.8 % of the 5090
+    // in use) measured safe through decode, 4K-token prefill chunks and verification graphs
+    // (design section 19.2).
+    std::size_t expert_cache_reserve_bytes = std::size_t{384} << 20;
     bool expert_cache                      = true;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // MTP drafts per round when the drafter is loaded (design section 11, at most 7). A longer
+    // n-gram proposal, when enabled, replaces a round's MTP drafts.
+    std::uint32_t mtp_draft_tokens = 0;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor).
     // Defaults measured fastest on the i9-13900K (design section 19.2).

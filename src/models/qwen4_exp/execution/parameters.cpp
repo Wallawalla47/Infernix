@@ -31,10 +31,20 @@ public:
     // One projection over consecutive parameters that share an input; the converter packs each
     // such group into one parent, and the rows keep this order.
     LinearParameters linear(std::initializer_list<WeightId> ids) const {
+        return linear(std::span<const WeightId>(ids.begin(), ids.size()));
+    }
+
+    LinearParameters linear(std::span<const WeightId> ids) const {
         std::vector<ops::WeightInput> rows;
         for (const auto id : ids) { rows.push_back(input(id)); }
-        return with_context(model_.weight(*ids.begin()).name,
+        return with_context(model_.weight(ids.front()).name,
                             [&] { return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows)); });
+    }
+
+    AttentionParameters attention(const AttentionWeights& a) const {
+        return AttentionParameters{linear({a.query, a.gate, a.key, a.value, a.index_query, a.index_key}),
+                                   tensor(a.query_norm), tensor(a.key_norm), tensor(a.index_query_norm),
+                                   tensor(a.index_key_norm), linear({a.output})};
     }
 
     Tensor tensor(WeightId id) const {
@@ -75,7 +85,12 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return native_weight(embedding.view); });
-    output_head     = prepare.tensor(w.output_head);
+    const auto& head = source.weight(w.output_head);
+    if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
+        output_head_q8 = prepare.linear({w.output_head});
+    } else {
+        output_head = prepare.tensor(w.output_head);
+    }
     final_mixer     = prepare.hc(w.final_mixer);
 
     const auto banks = source.expert_banks();
@@ -92,11 +107,7 @@ Parameters::Parameters(const Model& source) : model(source) {
         out.attn_hc = prepare.hc(layer.attn_hc);
         out.mlp_hc  = prepare.hc(layer.mlp_hc);
         if (const auto* a = std::get_if<AttentionWeights>(&layer.mixer)) {
-            out.mixer = AttentionParameters{
-                prepare.linear({a->query, a->gate, a->key, a->value, a->index_query, a->index_key}),
-                prepare.tensor(a->query_norm), prepare.tensor(a->key_norm),
-                prepare.tensor(a->index_query_norm), prepare.tensor(a->index_key_norm),
-                prepare.linear({a->output})};
+            out.mixer = prepare.attention(*a);
         } else {
             const auto& g = std::get<GdnWeights>(layer.mixer);
             out.mixer     = GdnParameters{prepare.linear({g.query, g.key, g.value, g.z}),
@@ -124,6 +135,29 @@ Parameters::Parameters(const Model& source) : model(source) {
                                           prepare.tensor(p.ngram_scale)};
         }
         layers.push_back(std::move(out));
+    }
+    if (w.mtp) {
+        const auto& m = *w.mtp;
+        MtpParameters out;
+        out.embedding_norm       = prepare.tensor(m.embedding_norm);
+        out.hidden_norm          = prepare.tensor(m.hidden_norm);
+        out.embedding_projection = prepare.linear({m.embedding_projection});
+        out.hidden_projection    = prepare.linear({m.hidden_projection});
+        out.attn_hc              = prepare.hc(m.attn_hc);
+        out.mlp_hc               = prepare.hc(m.mlp_hc);
+        out.final_mixer          = prepare.hc(m.final_mixer);
+        out.attention            = prepare.attention(m.attention);
+        out.router               = prepare.tensor(m.router);
+        out.shared_score         = prepare.tensor(m.shared_score);
+        out.shared_gate_up       = prepare.linear({m.shared_gate, m.shared_up});
+        out.shared_down          = prepare.linear({m.shared_down});
+        out.experts_gate_up      = prepare.linear(m.expert_gate_up).weight;
+        out.experts_down         = prepare.linear(m.expert_down).weight;
+        mtp = std::move(out);
+    }
+    if (w.proposal) {
+        draft_head.rows      = prepare.linear({w.proposal->head});
+        draft_head.token_ids = prepare.tensor(w.proposal->token_ids);
     }
 }
 

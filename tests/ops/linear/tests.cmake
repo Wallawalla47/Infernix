@@ -45,3 +45,12 @@ ninfer_add_op_test(ninfer_linear_fp8_a8_test
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
   LIBRARIES ninfer_ops)
+
+# FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
+ninfer_add_op_test(ninfer_projection_fp32_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_projection_fp32.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
+ninfer_add_op_test(ninfer_resident_moe_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_resident_moe.cpp"
+  LIBRARIES ninfer_linear_test_support)

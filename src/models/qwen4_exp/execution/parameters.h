@@ -57,6 +57,24 @@ struct PleParameters {
     Tensor ngram_scale;                     // BF16 [1]
 };
 
+// The MTP drafter (design §11.2).
+struct MtpParameters {
+    Tensor embedding_norm, hidden_norm; // BF16 [H], [S*H]
+    LinearParameters embedding_projection, hidden_projection;
+    HyperConnectionParameters attn_hc, mlp_hc, final_mixer;
+    AttentionParameters attention;
+    Tensor router, shared_score; // BF16, as MoeParameters
+    LinearParameters shared_gate_up, shared_down;
+    Weight experts_gate_up; // [E * 2I, H]: expert e's gate rows, then its up rows
+    Weight experts_down;    // [E * H, I]
+};
+
+// The draft head: the text head, or the proposal head's rows and their token ids.
+struct DraftHeadParameters {
+    std::optional<LinearParameters> rows; // the proposal head (q4/q8 [rows, H]); empty = text head
+    Tensor token_ids;                     // I32 [rows]
+};
+
 struct BlockParameters {
     HyperConnectionParameters attn_hc, mlp_hc;
     std::variant<AttentionParameters, GdnParameters> mixer;
@@ -74,8 +92,12 @@ public:
     const Model& model;
     Weight token_embedding; // BF16 rows in pinned host memory, read zero-copy
     Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
+    // Recipe B's 8-bit head (q8_g32_fp16 [V, H], FP32 logits); output_head is then empty.
+    std::optional<LinearParameters> output_head_q8;
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
+    std::optional<MtpParameters> mtp;
+    DraftHeadParameters draft_head;
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E].

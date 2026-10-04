@@ -65,11 +65,32 @@ struct BlockWeights {
     std::optional<PleWeights> ple;
 };
 
+// The MTP drafter (design §11.2): its input fusion, one QSA block whose routed experts are
+// device-resident row ranges of two parents, and its own final mixer; it shares the embedding
+// and the head (or the proposal head) with the text model.
+struct MtpWeights {
+    WeightId embedding_norm, hidden_norm;               // BF16 [H], [S*H]
+    WeightId embedding_projection, hidden_projection;   // [H, H]
+    HyperConnectionWeights attn_hc, mlp_hc, final_mixer;
+    AttentionWeights attention;
+    WeightId router, shared_score, shared_gate, shared_up, shared_down;
+    std::vector<WeightId> expert_gate_up; // per expert: gate, then up ([I, H] each)
+    std::vector<WeightId> expert_down;    // per expert: [H, I]
+};
+
+// The optimized proposal head (--lm-head-draft): lm_head rows of a frequency shortlist.
+struct ProposalWeights {
+    WeightId head;      // [rows, H]
+    WeightId token_ids; // I32 [rows]: each row's token id
+};
+
 struct TextWeights {
     WeightId token_embedding; // BF16, pinned host memory
     WeightId output_head;
     HyperConnectionWeights final_mixer;
     std::vector<BlockWeights> layers;
+    std::optional<MtpWeights> mtp;
+    std::optional<ProposalWeights> proposal;
 };
 
 } // namespace ninfer::models::qwen4_exp

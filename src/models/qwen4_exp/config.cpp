@@ -232,14 +232,26 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             throw ArtifactError("unknown loading purpose");
         }
         if (options.vision) { throw ArtifactError("Vision is not implemented for Qwen4Exp"); }
-        if (options.speculative != SpeculativeBackend::None) {
-            throw ArtifactError("speculative decoding is not implemented for Qwen4Exp");
+        if (options.speculative != SpeculativeBackend::None && !options.mtp()) {
+            throw ArtifactError("Qwen4Exp speculative decoding uses its MTP drafter (--spec mtp)");
         }
         if (options.rope_yarn_factor != 1.0F) {
             throw ArtifactError("Qwen4Exp does not support RoPE scaling");
         }
         Config out;
         out.text = text(directory.component("text").config);
+        if (options.purpose == EnginePurpose::Generation && options.mtp()) {
+            if (!directory.components.contains("mtp")) { throw ArtifactError("the artifact has no MTP component"); }
+            out.mtp = true;
+            if (options.proposal_head == ProposalHead::Optimized) {
+                const auto& proposal = directory.component("text").proposal;
+                if (!proposal || !proposal->indexed || proposal->rows == 0 ||
+                    proposal->rows > out.text.vocab_size) {
+                    throw ArtifactError("--lm-head-draft needs an artifact converted with --proposal");
+                }
+                out.proposal_rows = static_cast<std::uint32_t>(proposal->rows);
+            }
+        }
         return out;
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen4Exp config: ") + error.what());
