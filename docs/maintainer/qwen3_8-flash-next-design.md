@@ -2398,6 +2398,52 @@ host tests pass there. Nothing has run on the RTX 5090 or touched the real check
 3. Run `ninfer_offloaded_moe_cuda_test`. It must reproduce `kGolden1` and `kGolden4` bit for bit. Then optimize K7a/K7b against it (M3).
 4. Optimize the CPU kernel's multi-column path and re-measure it.
 
+### 19.2 Status on the RTX 5090 (2026-10-04)
+
+Work on the target machine (Windows, CUDA 13.4, RTX 5090, 96 GB DDR5), branch
+`claude/wonderful-ritchie-65xtnh`. Qwen4Exp is its own architecture (`src/models/qwen4_exp`), as
+the user asked, not part of the Qwen3.5 family.
+
+| Milestone | State |
+|---|---|
+| M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
+| M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
+| M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. Not yet: CausalScoring, vision, prefix cache, MTP. |
+| M5 expert cache | First version: free VRAM (less 1.5 GiB) as frames (7,804 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream, at most one promotion per layer call in decode and 16 in prefill. No prefetch, loans, CPU expert engine or saved profile yet. |
+| M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
+
+**Measured** (`ninfer_bench`, INT8 KV, C = 1, greedy, warm cache, recipe A): prefill 167-180 tok/s
+at 512 tokens; decode 42.8 tok/s for 128 tokens and 32.5 tok/s for 512 tokens. Progression of
+plain decode in this session: 2.9 tok/s (zero-copy experts, generic dense GEMM) → 4.8 (skinny
+GEMV) → 15.1 (expert cache) → 23.1 (staged expert slices) → 26.4 (graphs, cold cache) → 32-43
+(warm). A warm profile with few promotions runs at 14.9 ms per round (≈67 tok/s): dense GEMV
+5.5 ms, experts 4.2 ms, LM head and router 1.8 ms, small kernels 2.2 ms, gaps 1.2 ms. The
+remaining gap to it is PCIe traffic: about 16 % of routed experts miss (≈77 per token) and the
+LFRU promotes heavily, so misses and promotions together move 0.2-0.4 GB per token.
+
+**Decisions and their reasons:**
+
+- **Promotion budget.** Decode tok/s at 512 tokens fell as the per-layer promotion budget rose
+  (budget 1: 32.5; 2: 31.2; 4: 30.3), while the hit rate barely moved (83.5-84.5 %). A promotion
+  costs the same PCIe bytes as serving that expert once zero-copy, so it pays only if the expert is
+  reused while resident. Decode uses 1 per layer call, prefill 16.
+- **Admission doorkeeper (rejected).** Admitting only experts used at least N times did not reduce
+  churn: N = 2 and 3 gave the same 17,397 promotions per 512-token request and 32.2-32.3 tok/s as
+  N = 1, N = 5 cut promotions by 3 % with no speed change, and budget 2 with N = 3 was slower
+  (30.9). Use counts grow too fast for a count threshold; the churn comes from LFRU's
+  recency-dominated score (f / (age + 1) with 48 ticks per token). A frequency-margin rule against
+  the victim, as Strata's `adapt()` uses, is the next candidate.
+- **Sampling logits.** Generation samples BF16-rounded logits through the existing sampler, whose
+  top-k path keys on BF16; FP32 and BF16 logits measured equal in perplexity (§16.5). An FP32 sampler
+  is a backlog item for exact greedy ties.
+- **KV append.** Decode appends all sequences' K/V through device-chosen table rows
+  (`kv_cache_append_batch`) so a round has no host-dependent value and can be a CUDA graph.
+
+**Next, in order of expected gain:** speculative decoding (MTP drafter, verify rounds with GDN
+replay and PLE/QSA state rollback; amortizes the 5.5 ms of dense reads over ~2.8 tokens), fewer
+misses (admission doorkeeper, saved profile, lookahead prefetch, CPU-served misses), recipe B's
+8-bit dense weights (a measured quality gate, §16.3), and tuned dense kernels.
+
 ---
 
 ## 20. Documentation and authority changes

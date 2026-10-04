@@ -148,8 +148,9 @@ int main(int argc, char** argv) {
             tests, options.max_context, options.speculative, options.use_cuda_graph);
 
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path = options.artifact_path;
-        engine_options.device        = options.device;
+        engine_options.artifact_path     = options.artifact_path;
+        engine_options.ngram_volume_path = options.ngram_volume_path;
+        engine_options.device            = options.device;
         engine_options.max_context   = max_context;
         engine_options.rope_yarn_factor = options.rope_yarn_factor;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);

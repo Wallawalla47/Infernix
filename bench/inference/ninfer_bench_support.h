@@ -53,6 +53,7 @@ enum class OutputFormat { Table, Json, Csv };
 
 struct BenchOptions {
     std::string artifact_path;
+    std::string ngram_volume_path;
     std::string corpus_path{kDefaultCorpusPath};
     std::vector<int> n_prompt;
     std::vector<int> n_gen;
