@@ -200,8 +200,20 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         if (demand.pinned) {
             const ObjectHandle handle{i};
             const auto& geometry = reader_.geometry(handle);
-            const auto offset =
-                align_up(plan.pinned_capacity_bytes, 256, "pinned offset");
+            // Give the placement its payload's page phase so the materializer can read whole
+            // pages straight into it with unbuffered I/O.
+            const auto alignment = std::max<std::uint64_t>(demand.alignment, 256);
+            const auto phase =
+                object_offset(reader_.directory().object(handle)) % kPayloadAlignment;
+            auto offset = align_up(plan.pinned_capacity_bytes, alignment, "pinned offset");
+            if (alignment <= kPayloadAlignment && phase % alignment == 0) {
+                offset = checked_add(
+                    align_up(plan.pinned_capacity_bytes, kPayloadAlignment, "pinned page"), phase,
+                    "pinned offset");
+                if (offset - plan.pinned_capacity_bytes >= kPayloadAlignment) {
+                    offset -= kPayloadAlignment;
+                }
+            }
             plan.pinned_objects.push_back({handle, offset, geometry.bytes});
             plan.pinned_capacity_bytes = checked_add(offset, geometry.bytes, "pinned capacity");
         }

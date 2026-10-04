@@ -10,6 +10,7 @@ add_library(ninfer_core STATIC
   evictable_weight_pool.cu
   device.cu
   dtype.cpp
+  host_memory.cpp
   host_worker_pool.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
