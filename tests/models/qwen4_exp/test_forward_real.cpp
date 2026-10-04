@@ -5,14 +5,17 @@
 //   ninfer_qwen4_exp_forward_real_test TOKENS [--kv bf16|int8] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
 //   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
+//       [TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]]...
 //   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv bf16|int8]
 //
 // With --cpu-columns the test checks that calls of at most 8 columns, which the Program serves
 // with the CPU expert service, give the GPU route's logits bit for bit (check_cpu_columns).
-// TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace.
-// With --dump-logits the test scores the text teacher-forced instead: it prefills it in chunks of N
-// (default 256) with FP32 logits at every position, writes them in Strata's --dump-logits layout
-// (int32 vocabulary, int32 rows, then one FP32 row per position) and prints the perplexity. The test prefills all but the last token as one chunk,
+// TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
+// options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
+// instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
+// them in Strata's --dump-logits layout (int32 vocabulary, int32 rows, then one FP32 row per
+// position) and prints the perplexity. Several such texts are scored in order with one model load.
+// Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
 // every token at the last position. It writes the prefill logits of the last position (FP32) for
@@ -431,28 +434,58 @@ int main(int argc, char** argv) {
         std::printf("SKIP: set NINFER_QWEN4_ARTIFACT and pass a token list\n");
         return 77;
     }
-    std::string logits_path, residuals_path, routes_path, blocks_path, dump_path;
-    std::int32_t chunk = 256;
-    KvCacheStorage kv  = KvCacheStorage::BFloat16;
-    bool cpu_columns   = false;
-    for (int i = 2; i < argc; ++i) { cpu_columns |= std::string(argv[i]) == "--cpu-columns"; }
-    for (int i = 2; i + 1 < argc; ++i) {
-        if (std::string(argv[i]) == "--logits") { logits_path = argv[i + 1]; }
-        if (std::string(argv[i]) == "--residuals") { residuals_path = argv[i + 1]; }
-        if (std::string(argv[i]) == "--routes") { routes_path = argv[i + 1]; }
-        if (std::string(argv[i]) == "--blocks") { blocks_path = argv[i + 1]; }
-        if (std::string(argv[i]) == "--dump-logits") { dump_path = argv[i + 1]; }
-        if (std::string(argv[i]) == "--chunk") { chunk = std::stoi(argv[i + 1]); }
-        if (std::string(argv[i]) == "--kv") {
-            const std::string value = argv[i + 1];
-            if (value != "bf16" && value != "int8") { throw std::invalid_argument("--kv takes bf16 or int8"); }
-            kv = value == "int8" ? KvCacheStorage::Int8Group64 : KvCacheStorage::BFloat16;
-        }
-    }
+    // Each token list takes the options that follow it.
+    struct Job {
+        std::vector<std::int32_t> tokens;
+        std::string logits_path, residuals_path, routes_path, blocks_path, dump_path;
+        std::int32_t chunk = 256;
+        KvCacheStorage kv  = KvCacheStorage::BFloat16;
+        bool cpu_columns   = false;
+    };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
-        const auto tokens = parse_tokens(argv[1]);
-        if (tokens.size() < 2) { throw std::invalid_argument("pass at least two tokens"); }
+        std::vector<Job> jobs;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            if (arg.rfind("--", 0) != 0) {
+                jobs.push_back(Job{parse_tokens(arg)});
+                if (jobs.back().tokens.size() < 2) { throw std::invalid_argument("pass at least two tokens"); }
+                continue;
+            }
+            if (arg == "--cpu-columns") {
+                if (jobs.empty()) { throw std::invalid_argument("--cpu-columns needs a token list before it"); }
+                jobs.back().cpu_columns = true;
+                continue;
+            }
+            if (jobs.empty() || i + 1 >= argc) { throw std::invalid_argument(arg + " needs a token list before it and a value"); }
+            const std::string value = argv[++i];
+            Job& job = jobs.back();
+            if (arg == "--logits") {
+                job.logits_path = value;
+            } else if (arg == "--residuals") {
+                job.residuals_path = value;
+            } else if (arg == "--routes") {
+                job.routes_path = value;
+            } else if (arg == "--blocks") {
+                job.blocks_path = value;
+            } else if (arg == "--dump-logits") {
+                job.dump_path = value;
+            } else if (arg == "--chunk") {
+                job.chunk = std::stoi(value);
+                if (job.chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
+            } else if (arg == "--kv") {
+                if (value != "bf16" && value != "int8") { throw std::invalid_argument("--kv takes bf16 or int8"); }
+                job.kv = value == "int8" ? KvCacheStorage::Int8Group64 : KvCacheStorage::BFloat16;
+            } else {
+                throw std::invalid_argument("unknown option " + arg);
+            }
+        }
+        const bool scoring = !jobs.front().dump_path.empty();
+        for (const Job& job : jobs) {
+            if (job.dump_path.empty() != !scoring || (jobs.size() > 1 && job.dump_path.empty())) {
+                throw std::invalid_argument("several token lists are scored only, each with its own --dump-logits");
+            }
+        }
         print_memory("start");
         DeviceContext device(0);
         print_memory("device context");
@@ -474,47 +507,61 @@ int main(int argc, char** argv) {
         const q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
                                                           : q4::default_ngram_volume(artifact_env),
                                      c.ple.table);
-        const auto n = static_cast<std::int32_t>(tokens.size());
-        const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
         const std::size_t vocab = c.vocab_size;
-        if (!dump_path.empty()) {
-            // Teacher-forced scoring: chunked prefill of the whole text in slot 0.
-            if (chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
-            chunk = std::min(chunk, n);
-            Harness harness(parameters, device, context, chunk, 1, kv);
-            DeviceBuffer logits(vocab * chunk * sizeof(float));
-            std::ofstream out(dump_path, std::ios::binary);
-            const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n};
-            out.write(reinterpret_cast<const char*>(header), sizeof(header));
-            double nll = 0.0;
-            std::int32_t scored = 0, same_top1 = 0;
-            t0 = std::chrono::steady_clock::now();
-            for (std::int32_t first = 0; first < n; first += chunk) {
-                const std::int32_t width = std::min(chunk, n - first);
-                auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
-                Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
-                harness.forward->run(call.batch, chunk_logits);
-                device.synchronize();
-                const auto rows = to_float(logits, vocab * width);
-                out.write(reinterpret_cast<const char*>(rows.data()),
-                          static_cast<std::streamsize>(rows.size() * sizeof(float)));
-                for (std::int32_t i = 0; i < width && first + i + 1 < n; ++i) {
-                    const float* row = rows.data() + static_cast<std::size_t>(i) * vocab;
-                    const float peak = *std::max_element(row, row + vocab);
-                    double sum = 0.0;
-                    for (std::size_t v = 0; v < vocab; ++v) { sum += std::exp(double(row[v]) - peak); }
-                    const std::int32_t next = tokens[first + i + 1];
-                    nll -= double(row[next]) - peak - std::log(sum);
-                    same_top1 += std::max_element(row, row + vocab) - row == next;
-                    ++scored;
+        if (scoring) {
+            // Teacher-forced scoring: chunked prefill of each whole text in slot 0 of its own harness.
+            for (const Job& job : jobs) {
+                const auto& tokens          = job.tokens;
+                const auto n                = static_cast<std::int32_t>(tokens.size());
+                const std::int32_t context  = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+                const std::int32_t chunk    = std::min(job.chunk, n);
+                Harness harness(parameters, device, context, chunk, 1, job.kv);
+                DeviceBuffer logits(vocab * chunk * sizeof(float));
+                std::ofstream out(job.dump_path, std::ios::binary);
+                const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n};
+                out.write(reinterpret_cast<const char*>(header), sizeof(header));
+                double nll = 0.0;
+                std::int32_t scored = 0, same_top1 = 0;
+                t0 = std::chrono::steady_clock::now();
+                for (std::int32_t first = 0; first < n; first += chunk) {
+                    const std::int32_t width = std::min(chunk, n - first);
+                    auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
+                    Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
+                    harness.forward->run(call.batch, chunk_logits);
+                    device.synchronize();
+                    const auto rows = to_float(logits, vocab * width);
+                    out.write(reinterpret_cast<const char*>(rows.data()),
+                              static_cast<std::streamsize>(rows.size() * sizeof(float)));
+                    for (std::int32_t i = 0; i < width && first + i + 1 < n; ++i) {
+                        const float* row = rows.data() + static_cast<std::size_t>(i) * vocab;
+                        const float peak = *std::max_element(row, row + vocab);
+                        double sum = 0.0;
+                        for (std::size_t v = 0; v < vocab; ++v) { sum += std::exp(double(row[v]) - peak); }
+                        const std::int32_t next = tokens[first + i + 1];
+                        nll -= double(row[next]) - peak - std::log(sum);
+                        same_top1 += std::max_element(row, row + vocab) - row == next;
+                        ++scored;
+                    }
                 }
+                if (!out) { throw std::runtime_error("cannot write " + job.dump_path); }
+                std::printf("%s: scored %d positions in %.1f s: mean NLL %.5f nats, perplexity %.4f, top-1 = next %.1f%%\n",
+                            job.dump_path.c_str(), scored, seconds_since(t0), nll / scored, std::exp(nll / scored),
+                            100.0 * same_top1 / scored);
             }
-            std::printf("scored %d positions in %.1f s: mean NLL %.5f nats, perplexity %.4f, top-1 = next %.1f%%\n",
-                        scored, seconds_since(t0), nll / scored, std::exp(nll / scored), 100.0 * same_top1 / scored);
             return 0;
         }
-        if (cpu_columns) { return check_cpu_columns(parameters, device, volume, tokens, context, kv) ? 0 : 1; }
-        Harness harness(parameters, device, context, n, 3, kv);
+        const Job& job = jobs.front();
+        const auto& tokens = job.tokens;
+        const auto n = static_cast<std::int32_t>(tokens.size());
+        const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
+        const std::string& logits_path    = job.logits_path;
+        const std::string& residuals_path = job.residuals_path;
+        const std::string& routes_path    = job.routes_path;
+        const std::string& blocks_path    = job.blocks_path;
+        if (job.cpu_columns) {
+            return check_cpu_columns(parameters, device, volume, tokens, context, job.kv) ? 0 : 1;
+        }
+        Harness harness(parameters, device, context, n, 3, job.kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");
 
