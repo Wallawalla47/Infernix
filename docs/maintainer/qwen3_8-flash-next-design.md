@@ -3018,6 +3018,14 @@ selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
   pp4096 664.7 against 665.5 tok/s.
 - **Frames:** 8,194 with the drafter against 8,912 at this context.
 
+**Serving at the recommended settings (final build, ecaf50e16).** `ninfer-serve --max-concurrency 1
+--spec mtp --draft-tokens 4 --lm-head-draft`, temperature 0, 200 tokens. The code and story requests
+were sent together, so they queued, and then again each alone:
+
+- **Output:** byte-identical queued and alone, for both prompts.
+- **Decode:** first requests on a fresh server 70.6 tok/s (code) and 61.8 (story). Repeated on the
+  warm cache: **147.2** and **97.5**. MTP acceptance 92.6 % and 61.6 %.
+
 **Two lanes (sanity check only).** `ninfer-serve --max-concurrency 2 --spec mtp --draft-tokens 3
 --lm-head-draft`, temperature 0, 200 tokens, code and story requests sent together on a cold
 server, then each alone.
