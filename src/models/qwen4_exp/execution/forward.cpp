@@ -370,14 +370,16 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .record_stride = p.bank->planes.record_stride,
                                 .scales        = p.device_scales,
                                 .staging_base  = experts_.staging_base,
-                                .staging_slots = experts_.staging_slots};
+                                .staging_slots = experts_.staging_slots,
+                                .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
     }
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T));
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s);
+    // The shared expert runs while the host computes the CPU-served misses.
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
 
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor gate_up = work_.alloc(DType::BF16, {2 * I, T});
@@ -392,6 +394,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::silu_mul(gate, up, product, s);
     Tensor shared = work_.alloc(DType::BF16, {H, T});
     project(product, p.shared_down, shared, work_, s);
+    ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
     Tensor y = work_.alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;

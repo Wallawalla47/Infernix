@@ -24,6 +24,15 @@ public:
     [[nodiscard]] std::uint64_t current_bytes() const noexcept;
     std::size_t read_direct(std::uint64_t offset, std::span<std::byte> destination) const;
 
+    // Unbuffered reads issued together and awaited together (overlapped on Windows, so their
+    // device latency overlaps). Offsets, sizes and destinations follow read_direct's alignment
+    // rules; every read must complete in full or the call throws.
+    struct DirectRead {
+        std::uint64_t offset = 0;
+        std::span<std::byte> destination;
+    };
+    void read_direct_batch(std::span<const DirectRead> reads) const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

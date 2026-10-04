@@ -21,7 +21,8 @@ T read_le(const std::byte* p) {
 } // namespace
 
 NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table)
-    : file_(path), table_(table), block_(2 * 4096) {
+    : file_(path), table_(table), block_(2 * 4096), tags_(std::size_t{1} << kCacheBits, 0xFFFFFFFFU),
+      cache_((std::size_t{1} << kCacheBits) * table.row_bytes) {
     const auto base = reinterpret_cast<std::uintptr_t>(block_.data());
     aligned_        = block_.data() + ((4096 - base % 4096) % 4096);
     if (file_.current_bytes() != table.file_bytes) {
@@ -47,15 +48,45 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     if (out.size() != rows.size() * table_.row_bytes) {
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
+    const std::size_t row_bytes = table_.row_bytes;
+    const auto slot_of = [](std::uint32_t row) {
+        return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
+    };
+    missing_.clear();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
-        const std::uint64_t block = rows[i] / table_.rows_per_block;
-        const std::uint64_t slot  = rows[i] % table_.rows_per_block;
-        std::span<std::byte> bounce(aligned_, table_.block_bytes);
-        if (file_.read_direct(table_.header_bytes + block * table_.block_bytes, bounce) != table_.block_bytes) {
-            throw std::runtime_error("n-gram volume: short block read");
+        const std::size_t slot = slot_of(rows[i]);
+        if (tags_[slot] == rows[i]) {
+            std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
+            ++hits_;
+        } else {
+            missing_.push_back(i);
+            ++misses_;
         }
-        std::memcpy(out.data() + i * table_.row_bytes, aligned_ + slot * table_.row_bytes, table_.row_bytes);
+    }
+    if (missing_.empty()) { return; }
+    // One block read per missing row, all in flight together.
+    const std::size_t blocks = missing_.size();
+    if (block_.size() < (blocks + 1) * table_.block_bytes) {
+        block_.assign((blocks + 1) * table_.block_bytes, std::byte{0});
+        const auto base = reinterpret_cast<std::uintptr_t>(block_.data());
+        aligned_        = block_.data() + ((4096 - base % 4096) % 4096);
+    }
+    reads_.clear();
+    for (std::size_t m = 0; m < blocks; ++m) {
+        const std::uint64_t block = rows[missing_[m]] / table_.rows_per_block;
+        reads_.push_back({table_.header_bytes + block * table_.block_bytes,
+                          std::span<std::byte>(aligned_ + m * table_.block_bytes, table_.block_bytes)});
+    }
+    file_.read_direct_batch(reads_);
+    for (std::size_t m = 0; m < blocks; ++m) {
+        const std::size_t i    = missing_[m];
+        const std::uint64_t at = rows[i] % table_.rows_per_block;
+        const std::byte* row   = aligned_ + m * table_.block_bytes + at * row_bytes;
+        std::memcpy(out.data() + i * row_bytes, row, row_bytes);
+        const std::size_t slot = slot_of(rows[i]);
+        tags_[slot]            = rows[i];
+        std::memcpy(cache_.data() + slot * row_bytes, row, row_bytes);
     }
 }
 

@@ -75,6 +75,14 @@ std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
     return static_cast<std::uint64_t>(status.st_size);
 }
 
+void ReadOnlyFile::read_direct_batch(std::span<const DirectRead> reads) const {
+    for (const DirectRead& read : reads) {
+        if (read_direct(read.offset, read.destination) != read.destination.size()) {
+            throw std::runtime_error("direct batch read: a read did not complete in full");
+        }
+    }
+}
+
 std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
                                       std::span<std::byte> destination) const {
     if (offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||

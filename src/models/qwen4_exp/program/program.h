@@ -258,6 +258,12 @@ struct ProgramOptions {
     // ngram_min_match tokens (4..64) earlier in the request.
     std::uint32_t ngram_draft_tokens = 0;
     std::uint32_t ngram_min_match    = 12;
+    // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
+    // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor).
+    // Defaults measured fastest on the i9-13900K (design section 19.2).
+    std::uint32_t cpu_expert_workers = 6;
+    std::uint32_t cpu_expert_jobs    = 6;
+    std::int32_t cpu_pcie_divisor    = 3;
     DiagnosticObserver diagnostics;
 };
 

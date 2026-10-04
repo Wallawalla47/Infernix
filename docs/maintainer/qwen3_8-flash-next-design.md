@@ -2409,7 +2409,7 @@ the user asked, not part of the Qwen3.5 family.
 | M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
 | M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. Not yet: CausalScoring, vision, prefix cache, MTP. |
-| M5 expert cache | Free VRAM (less 1.5 GiB and 64 staging slots) as frames (7,739 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream: one per layer call per round until the frames fill, then every fourth decode round; 16 per layer call in prefill. Misses are staged through device slots (below). No prefetch, loans, CPU expert engine or saved profile yet. |
+| M5 expert cache | Free VRAM (less 1.5 GiB and 64 staging slots) as frames (7,739 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream: one per layer call per round until the frames fill, then every fourth decode round; 16 per layer call in prefill. Misses are shared between the CPU expert engine (six workers) and a PCIe stage through device slots (below). No prefetch, loans, warm list or saved profile yet. |
 | M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
 | M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); n-gram copy proposals only. Greedy output equals plain decode. MTP not started. |
 
@@ -2541,15 +2541,66 @@ AVX-VNNI, DDR5-5800):
 - More workers are slower (E-cores, barriers): 12-24 workers give 59-83 µs per expert.
 
 CPU and PCIe draw DRAM bandwidth in parallel, so splitting a layer's misses between them should
-roughly halve the miss stall. That is §10's CPU-served miss path, next.
+roughly halve the miss stall.
+
+**CPU-served misses (adopted, §10.3).** For each decode or verify layer call:
+
+1. One GPU kernel picks up to `cpu_expert_jobs` non-resident experts. It takes all but
+   misses / `cpu_pcie_divisor` of them, the fewest-column ones first, each with at most 8 columns.
+2. It writes x and a request into mapped host memory (`offloaded_moe::MissRequest`), fences at
+   system scope, and publishes a device-counted sequence number. Graph replays stay valid.
+3. A host service thread (`CpuMissService`, worker 0 of the existing `CpuExpertTeam`) computes
+   those experts from the pinned bank into mapped memory. Meanwhile the GPU stages the remaining
+   misses and computes everything else.
+4. A one-CTA kernel waits for the answer, which traps after 2 s instead of hanging, and places the
+   outputs before the combine.
+
+The outputs are bit-identical: the layer-route test checks CPU channels of 2 and 8 jobs against
+the CPU engine, and greedy token ids are unchanged. Prefill chunks (more than 64 columns) stay on
+the GPU. Same build, tg512:
+
+| CPU workers / job cap / PCIe divisor | tok/s |
+|---|---:|
+| none (staged misses only) | 36.25 |
+| 8 / 4 / 3 | 43.84 |
+| 4 / 4 / 3 | 47.55 |
+| 5 / 4 / 3 | 48.98 |
+| 6 / 4 / 3 | 49.27-49.35 |
+| 7 / 4 / 3 | 47.88 |
+| 6 / 4 / 2 | 47.22 |
+| 6 / 4 / 0 (CPU takes every miss up to the cap) | 48.16 |
+| 6 / 8 / 0 | 47.66 |
+| **6 / 6 / 3 (default)** | **49.80** |
+
+Six workers beat eight, and keeping a third of the misses on PCIe beats giving them all to the
+CPU. Both suggest the host's DRAM is shared by the two paths.
+
+Further measurements:
+
+- **Cold-cache CLI.** Greedy ids are unchanged. With the defaults: code prompt 42.5 tok/s (30.5
+  staged only), prose 43.4 (27.0), code with n-gram drafts 44.1 (33.2).
+- **Pinning (rejected).** Pinning the six workers to P-cores (even logical CPUs) was slower:
+  46.65 vs 50.35 tok/s.
+- **Row cache and wait overlap (+1.4 %).** An nsys profile of tg512 showed ~2 ms per round of
+  host time between rounds, with a long tail, largely the 16 synchronous unbuffered n-gram row
+  reads per token. Two changes ship together:
+  - the volume now keeps a direct-mapped 2^20-row host cache and reads one call's missing blocks
+    together (`ReadOnlyFile::read_direct_batch`, overlapped I/O);
+  - the CPU wait now runs after the shared expert (`moe_experts(..., wait_for_cpu = false)` +
+    `moe_experts_cpu_wait`).
+
+  tg512 went from 49.71 and 49.63 (two runs of the previous build) to 50.35.
+- **Profile at the defaults** (tg512, nsys, per round): dense GEMV 5.5 ms, stage 3.2, CPU wait
+  2.9, expert kernels 3.5, LM head and router 1.8, small kernels ~2.1, intra-graph gaps 0.8.
 
 **Next, in order of expected gain:**
 
-1. CPU-served misses beside the PCIe stage (§10), with the GPU computing hits meanwhile.
-2. MTP drafter (needs BF16 → FP8 MTP experts and an MTP expert pool).
-3. Recipe B's 8-bit dense weights: ~1,450 more frames and half the dense bytes, behind the §16.3
-   quality gate.
-4. Overlap of the stage with hit compute.
+1. MTP drafter (needs BF16 → FP8 MTP experts and an MTP expert pool).
+2. Recipe B's 8-bit dense weights: ~1,450 more frames and half the dense bytes, behind the §16.3
+   quality gate. It needs generic FP8 W8A16 kernels for this model's shapes (the registered FP8
+   shapes are the 27B's) and an FP8 `projection_fp32` for `lm_head`.
+3. Overlap of the PCIe stage with hit compute.
+4. Fewer small kernels per layer (~1,500 per round).
 5. Tuned dense kernels.
 
 **For the user:** an x16 link would roughly double miss bandwidth.

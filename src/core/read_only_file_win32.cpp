@@ -122,6 +122,63 @@ std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
     return static_cast<std::uint64_t>(size.QuadPart);
 }
 
+void ReadOnlyFile::read_direct_batch(std::span<const DirectRead> reads) const {
+    constexpr std::size_t kInFlight = 64;
+    OVERLAPPED operations[kInFlight];
+    HANDLE events[kInFlight];
+    for (std::size_t i = 0; i < kInFlight; ++i) { events[i] = nullptr; }
+    struct Events {
+        HANDLE* handles;
+        ~Events() {
+            for (std::size_t i = 0; i < kInFlight; ++i) {
+                if (handles[i] != nullptr) { ::CloseHandle(handles[i]); }
+            }
+        }
+    } guard{events};
+    for (std::size_t begin = 0; begin < reads.size(); begin += kInFlight) {
+        const std::size_t count = std::min(kInFlight, reads.size() - begin);
+        for (std::size_t i = 0; i < count; ++i) {
+            const DirectRead& read = reads[begin + i];
+            if (read.destination.size() > std::numeric_limits<DWORD>::max()) {
+                throw std::overflow_error("direct batch read exceeds platform I/O limits");
+            }
+            if (events[i] == nullptr) {
+                events[i] = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (events[i] == nullptr) {
+                    throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "CreateEventW");
+                }
+            }
+            ::ResetEvent(events[i]);
+            operations[i]            = OVERLAPPED{};
+            operations[i].Offset     = static_cast<DWORD>(read.offset & 0xffffffffULL);
+            operations[i].OffsetHigh = static_cast<DWORD>(read.offset >> 32U);
+            operations[i].hEvent     = events[i];
+            DWORD bytes = 0;
+            if (!::ReadFile(impl_->direct_file, read.destination.data(), static_cast<DWORD>(read.destination.size()),
+                            &bytes, &operations[i])) {
+                const auto error = ::GetLastError();
+                if (error != ERROR_IO_PENDING) {
+                    // Drain the reads already issued before reporting.
+                    for (std::size_t j = 0; j < i; ++j) {
+                        DWORD ignored = 0;
+                        (void)::GetOverlappedResult(impl_->direct_file, &operations[j], &ignored, TRUE);
+                    }
+                    throw std::system_error(static_cast<int>(error), std::system_category(), "direct batch read");
+                }
+            }
+        }
+        bool short_read = false;
+        for (std::size_t i = 0; i < count; ++i) {
+            DWORD bytes = 0;
+            if (!::GetOverlappedResult(impl_->direct_file, &operations[i], &bytes, TRUE) ||
+                bytes != reads[begin + i].destination.size()) {
+                short_read = true;
+            }
+        }
+        if (short_read) { throw std::runtime_error("direct batch read: a read did not complete in full"); }
+    }
+}
+
 std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
                                       std::span<std::byte> destination) const {
     constexpr auto max_file_offset =

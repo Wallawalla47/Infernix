@@ -1,13 +1,15 @@
 // The layer route of offloaded_sparse_moe (moe_route, moe_dispatch, moe_experts) against the CPU
 // engine, with expert records split between device frames and the pinned host bank and misses
-// read zero-copy or staged through 1, 3 or 64 device slots (one or several staging passes)
-// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §16.2).
+// read zero-copy, staged through 1, 3 or 64 device slots (one or several staging passes), or
+// served by the host expert engine through the CPU miss channel
+// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2).
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair, bit for bit. Expert
 // arithmetic is exact and placement-invariant, so neither the record's location nor the staging
 // pass a job falls in may change an output bit.
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 #include "ops/op_tester.h"
 
@@ -120,7 +122,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
-    for (const int slots : {0, 1, 3, 64}) {
+    std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
+    moe::CpuMissService service_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}});
+    moe::CpuMissService service_eight(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}});
+    struct Config {
+        int slots;
+        const moe::CpuMissService* service;
+    };
+    for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
+                                Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight}}) {
+        const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
         ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
@@ -129,7 +140,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                             .record_stride = stride,
                                             .scales        = d_scales,
                                             .staging_base  = slots > 0 ? d_staging : nullptr,
-                                            .staging_slots = slots};
+                                            .staging_slots = slots,
+                                            .cpu = config.service != nullptr ? config.service->channel(0)
+                                                                             : ninfer::ops::MoeCpuChannel{}};
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
@@ -138,8 +151,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
         long mismatches = 0;
         for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != expected[i]; }
-        std::printf("E=%d T=%d k=%d staging slots %2d: %ld mismatching outputs of %zu\n", experts, columns, top_k,
-                    slots, mismatches, got.size());
+        std::printf("E=%d T=%d k=%d staging slots %2d, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
+                    experts, columns, top_k, slots, config.service != nullptr ? config.service->channel(0).max_jobs : 0,
+                    config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
+                    mismatches, got.size());
         check(mismatches == 0, "layer route equals the CPU engine for every placement and staging pass");
     }
     cudaFree(d_out);

@@ -1,5 +1,15 @@
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 
+#if defined(_WIN32)
+#    ifndef WIN32_LEAN_AND_MEAN
+#        define WIN32_LEAN_AND_MEAN
+#    endif
+#    ifndef NOMINMAX
+#        define NOMINMAX
+#    endif
+#    include <windows.h>
+#endif
+
 #include <stdexcept>
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -25,6 +35,8 @@ void pin_current_thread(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#elif defined(_WIN32)
+    if (cpu >= 0 && cpu < 64) { (void)SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR{1} << cpu); }
 #else
     (void)cpu;
 #endif
