@@ -154,6 +154,11 @@ def main(argv=None):
         type=Path,
         help="Qwen4Exp n-gram volume (default: OUT + '.ngram'); it may live on another drive",
     )
+    parser.add_argument(
+        "--ngram-reuse",
+        type=Path,
+        help="Qwen4Exp: bind the artifact to this existing volume of the same checkpoint instead of writing one",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -171,10 +176,19 @@ def main(argv=None):
                 base, components=components, resource_overrides=overrides
             )
             # The volume id ties the separately placed n-gram volume to this artifact.
-            ngram_out = args.ngram_out or Path(str(args.out) + ".ngram")
-            if ngram_out.exists():
-                raise FileExistsError(f"n-gram volume already exists: {ngram_out}")
-            model.config["ngram_table"]["volume_id"] = os.urandom(16).hex()
+            if args.ngram_reuse is not None:
+                if args.ngram_out is not None:
+                    raise ValueError("--ngram-reuse and --ngram-out are exclusive")
+                volume_id = qwen4_exp.read_ngram_volume_id(
+                    base, qwen4_exp.ngram_volume_shards(base, model.config), args.ngram_reuse
+                )
+                model.config["ngram_table"]["volume_id"] = volume_id.hex()
+                ngram_out = None
+            else:
+                ngram_out = args.ngram_out or Path(str(args.out) + ".ngram")
+                if ngram_out.exists():
+                    raise FileExistsError(f"n-gram volume already exists: {ngram_out}")
+                model.config["ngram_table"]["volume_id"] = os.urandom(16).hex()
         else:
             if args.ngram_out is not None:
                 raise ValueError("--ngram-out applies only to Qwen4Exp sources")
@@ -227,7 +241,7 @@ def main(argv=None):
             f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, {report['seconds']:.1f}s",
             flush=True,
         )
-        if qwen4:
+        if qwen4 and ngram_out is not None:
             table = model.config["ngram_table"]
 
             def ngram_progress(index, total):

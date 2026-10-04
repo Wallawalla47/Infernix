@@ -1,4 +1,5 @@
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
 #include <array>
@@ -30,14 +31,26 @@ constexpr std::array kShapes{
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N17408K5120>(select_q8_n17408_k5120),
     shape<Q8N34816K5120>(select_q8_n34816_k5120),   shape<Q8N248320K5120>(select_q8_n248320_k5120),
 };
+
+// Shapes without a tuned entry (Qwen3.8-Flash-Next's dense classes) use the runtime-shape
+// templates: predicated SIMT for decode and verification widths, MMA tiles beyond, each covering
+// any row count and any K padded to 128.
+Q8Launch select_q8_generic(std::int32_t t) {
+    if (t <= 4) return launch_q8_a16_simt_r8_t4;
+    if (t <= 8) return launch_q8_a16_simt_r8_t8;
+    if (t <= 64) return launch_q8_a16_mma_r32_t64;
+    if (t <= 96) return launch_q8_a16_mma_r32_t96;
+    return launch_q8_a16_mma_r32_t128;
+}
 } // namespace
 
 Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("q8 linear: T must be positive");
+    if (n <= 0 || k <= 0) throw std::invalid_argument("q8 linear: unsupported shape");
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    throw std::invalid_argument("q8 linear: unsupported shape");
+    return select_q8_generic(t);
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {

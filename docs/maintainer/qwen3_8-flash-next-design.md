@@ -2406,6 +2406,7 @@ the user asked, not part of the Qwen3.5 family.
 
 | Milestone | State |
 |---|---|
+| M2 recipe B | Done (`qwen3_8_flash_next_nvfp4_dense8`): recipe A with the dense projection classes in `q8_g32_fp16`, passing the quality gate (ΔNLL +0.008 ± 0.010 nats) at +22 % decode (below). |
 | M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
 | M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. Not yet: CausalScoring, vision, prefix cache, MTP. |
@@ -2593,15 +2594,80 @@ Further measurements:
 - **Profile at the defaults** (tg512, nsys, per round): dense GEMV 5.5 ms, stage 3.2, CPU wait
   2.9, expert kernels 3.5, LM head and router 1.8, small kernels ~2.1, intra-graph gaps 0.8.
 
+#### Recipe B (`qwen3_8_flash_next_nvfp4_dense8`, 2026-10-04)
+
+**Format choice: `q8_g32_fp16` for every class, not FP8 rows.** An int8 code with an FP16 scale
+per 32 weights has far finer resolution than an E4M3 code with one scale per row (3 mantissa bits).
+It costs 1.06 instead of 1.0 bytes per weight, and the user asked for the highest quality. The
+recipe converts:
+
+- the hyper-connection mixers (`down` with its `inject` group, and `up`; K 320 padded to 384);
+- GDN q/k/v/z and `out_proj`;
+- QSA `o_proj`;
+- shared experts;
+- PLE projections.
+
+As §6.1 requires, the router, shared-expert gate, GDN a/b and every MTP tensor stay BF16. Two
+classes the §6.1 table lists for 8 bits also stay BF16 in this first cut:
+
+- **`lm_head`.** It runs through the FP32 `projection_fp32`, which has no 8-bit form yet.
+- **QSA QKVG group.** It is stored together with the indexer projection, which must stay BF16.
+
+The Q8 linear route now admits unregistered shapes through its runtime-shape templates: predicated
+SIMT for T ≤ 8 and MMA tiles beyond. That also puts prefill dense GEMMs on tensor cores. The
+converter's `--ngram-reuse` binds the new artifact to recipe A's n-gram volume (same checkpoint
+words), so no second 52 GB volume is written.
+
+**Quality gate (passed).** Teacher-forced, INT8 KV, the three frozen texts (2,557 positions),
+against recipe A:
+
+| Text | ppl A | ppl B | ΔNLL (B − A) | Top-1 agreement | KL(A‖B) mean |
+|---|---:|---:|---:|---:|---:|
+| code | 1.9052 | 1.9119 | +0.0035 ± 0.0129 | 95.3 % | 0.029 |
+| doc | 9.5874 | 9.5871 | −0.0000 ± 0.0140 | 86.0 % | 0.070 |
+| chat | 3.3611 | 3.4198 | +0.0173 ± 0.0186 | 92.1 % | 0.090 |
+| **all** | **4.5639** | **4.5988** | **+0.0076 ± 0.0097** | | 0.070 |
+
+The difference is within one standard error. KL ~0.07 is the size of the gap between two valid
+FP64 references of this W4A4 model (§16.5). Recipe B stays ahead of Strata (UD-Q4_K_XL, INT8
+KV, 4.864) by ~0.056 nats.
+
+**Speed** (same build, INT8 KV, C = 1):
+
+| | Recipe A | Recipe B |
+|---|---:|---:|
+| Expert frames | 7,739 | 8,791 |
+| Hit rate, 512-token generation | 79.7 % | 90.2 % |
+| tg512 | 50.35 tok/s | **61.46** (+22 %) |
+| tg128 | 58.2 | 62.6 |
+| pp512 (chunk 4096) | 168 | 219 |
+| pp4096 (chunk 4096) | 428 | 573 (+34 %) |
+| Cold-cache CLI, code / prose | 42.9 / 43.8 | 45.0 / 45.8 |
+
+Recipe B is the recommended artifact. It converts in ~6 minutes beside an existing recipe A
+volume:
+
+```text
+python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4> --recipe qwen3_8_flash_next_nvfp4_dense8 \
+  --components text,vision,mtp --device cpu --out <dir>/qwen3_8_flash_next_nvfp4_dense8.ninfer \
+  --ngram-reuse <recipe A volume>.ngram
+```
+
+**Prefill** is still slow: 4K tokens take ~7 s. Chunk 4096 beats 1024 by 1.8× on recipe A
+(pp4096 427.5 vs 240.8 tok/s), because each chunk moves every non-resident expert once.
+
 **Next, in order of expected gain:**
 
 1. MTP drafter (needs BF16 → FP8 MTP experts and an MTP expert pool).
-2. Recipe B's 8-bit dense weights: ~1,450 more frames and half the dense bytes, behind the §16.3
-   quality gate. It needs generic FP8 W8A16 kernels for this model's shapes (the registered FP8
-   shapes are the 27B's) and an FP8 `projection_fp32` for `lm_head`.
-3. Overlap of the PCIe stage with hit compute.
-4. Fewer small kernels per layer (~1,500 per round).
-5. Tuned dense kernels.
+2. Prefill:
+   - a profile;
+   - larger default chunks with frames lent to the arena;
+   - an A4 tensor-core wide route for experts with many columns (§13);
+   - BF16 tensor-core shapes for recipe A.
+3. `lm_head` in 8 bits (an 8-bit `projection_fp32`), and the QSA QKVG group split from the
+   indexer.
+4. Expert kernels for T = 1: 3.5 ms per round, ~30 % of VRAM bandwidth.
+5. Overlap of the PCIe stage with hit compute, and fewer small kernels (~1,800 per round).
 
 **For the user:** an x16 link would roughly double miss bandwidth.
 
