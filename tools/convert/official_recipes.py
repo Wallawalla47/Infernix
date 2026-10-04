@@ -295,6 +295,31 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
             recipe.group(name, shape=parameter.shape)
 
 
+def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
+    """Recipe B of Qwen3.8-Flash-Next (design §6.1): recipe A, plus the dense projection classes
+    that dominate per-token weight reads in ``q8_g32_fp16`` (W8A16): the GDN q/k/v/z and output
+    projections, the QSA output projection, the shared experts, the hyper-connection mixers and the
+    PLE projections. ``q8_g32_fp16`` is used for every class rather than FP8 rows: a 32-element
+    group scale and an 8-bit integer give far finer resolution at 1.06 bytes per weight. The
+    router, shared-expert gate, GDN a/b, the QSA query/gate/key/value/indexer group, ``lm_head``,
+    the embedding and every MTP tensor stay as recipe A has them."""
+
+    qwen3_8_flash_next_nvfp4(model, recipe, sources)
+    dense8 = (
+        "/attn_hc/down", "/attn_hc/inject", "/attn_hc/up",
+        "/mlp_hc/down", "/mlp_hc/inject", "/mlp_hc/up",
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/output",
+        "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name in model.parameters:
+        if name.startswith("text/layers/") and name.endswith(dense8):
+            _assign(recipe, name, Q8)
+    for name in ("text/final_mixer/down", "text/final_mixer/up"):
+        _assign(recipe, name, Q8)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -305,4 +330,5 @@ RECIPES = {
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
 }

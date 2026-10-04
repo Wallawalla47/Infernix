@@ -20,7 +20,13 @@ constexpr std::array kGeometries{
     Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},  Geometry{5120, 10240, 211U},
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
     Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
-    Geometry{17408, 5120, 243U}, Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U}};
+    Geometry{17408, 5120, 243U}, Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U},
+    // Qwen3.8-Flash-Next recipe B classes on the runtime-shape route: hyper-connection down
+    // (+inject) and up (K 320, padded to 384), GDN projection and output, QSA output, shared
+    // expert gate/up and down, PLE projection.
+    Geometry{324, 10240, 301U},  Geometry{320, 10240, 307U},  Geometry{10240, 320, 311U},
+    Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{2560, 4096, 331U},
+    Geometry{1280, 2560, 337U},  Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}};
 
 int q8_a16_conformance() {
     int failures = 0;

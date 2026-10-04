@@ -509,6 +509,37 @@ def ngram_geometry(rows: int, row_bytes: int) -> dict:
     }
 
 
+def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
+    """The volume id of an existing n-gram volume written from this checkpoint's table.
+
+    Another recipe of the same checkpoint (recipe B) shares recipe A's volume: the rows are the
+    checkpoint's words in both. The header geometry and the file size must match this table.
+    """
+
+    row_bytes = store.describe(shards[0][0]).shape[1]
+    rows = sum(count for _, count in shards)
+    geometry = ngram_geometry(rows, row_bytes)
+    path = Path(path)
+    with path.open("rb") as stream:
+        header = stream.read(NGRAM_HEADER.size)
+    magic, version, header_bytes, stored_rows, stored_row_bytes, per_block, block_bytes, blocks, volume_id = (
+        NGRAM_HEADER.unpack(header)
+    )
+    if (
+        magic != NGRAM_MAGIC
+        or version != NGRAM_VERSION
+        or header_bytes != NGRAM_BLOCK_BYTES
+        or stored_rows != rows
+        or stored_row_bytes != row_bytes
+        or per_block != geometry["rows_per_block"]
+        or block_bytes != NGRAM_BLOCK_BYTES
+        or blocks != geometry["blocks"]
+        or path.stat().st_size != geometry["file_bytes"]
+    ):
+        raise ValueError(f"{path}: not an n-gram volume of this checkpoint's table")
+    return volume_id
+
+
 def write_ngram_volume(store: SafetensorsSource, shards, path: Path, volume_id: bytes, *, progress=None) -> dict:
     """Write the FP8 n-gram rows, 25 per 4 KiB block and never straddling one (design §12.2).
 
