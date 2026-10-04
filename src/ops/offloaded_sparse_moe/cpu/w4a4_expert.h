@@ -28,6 +28,11 @@ inline constexpr std::size_t kDownBytes =
 inline constexpr std::size_t kRecordBytes = kGateUpBytes + kDownBytes;      // 2,764,800
 inline constexpr int kMaxColumns          = 8;                              // narrow route: n <= 8
 
+// Software prefetch distance in bytes along a matrix's unit stream (0 disables it). The best value
+// depends on the host's memory latency and core speed; ninfer-calibrate measures it on the target
+// (design §14.2). This default is only a starting point, not a tuned value.
+inline constexpr int kDefaultPrefetchBytes = 2048;
+
 static_assert(kRecordBytes == 675 * 4096);
 
 // Per-expert scalars from the checkpoint (design §6.1). alpha = fl32(weight_scale_2 * input_scale)
@@ -52,7 +57,8 @@ CpuIsa best_cpu_isa();
 // `blocks` quantized activation blocks of column col. `out` has (rg_end - rg_begin) * 16 rows of
 // `ncols` values.
 void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
-                   const canon::A4Block* const* acts, int ncols, std::int64_t* out);
+                   const canon::A4Block* const* acts, int ncols, std::int64_t* out,
+                   int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Quantizes a BF16 vector of `n` (a multiple of 16) elements to A4 blocks.
 void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Block* out);
@@ -62,15 +68,17 @@ void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Bloc
 // input scales (the same pointers when the scales are equal). Writes h_blocks[col][unit].
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
-                   int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks);
+                   int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks,
+                   int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Phase B for down row groups [rg_begin, rg_end): writes y[col][row] in BF16 for those rows.
 void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                const canon::A4Block* const* h_blocks, int ncols, int rg_begin, int rg_end,
-               std::uint16_t* const* y);
+               std::uint16_t* const* y, int prefetch_bytes = kDefaultPrefetchBytes);
 
 // Whole expert on one thread: y[col][0..2560) from x[col][0..2560), both BF16.
 void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales, int ncols,
-                    const std::uint16_t* const* x, std::uint16_t* const* y);
+                    const std::uint16_t* const* x, std::uint16_t* const* y,
+                    int prefetch_bytes = kDefaultPrefetchBytes);
 
 } // namespace ninfer::ops::offloaded_moe

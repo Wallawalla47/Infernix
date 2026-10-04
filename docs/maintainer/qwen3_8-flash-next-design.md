@@ -1393,7 +1393,9 @@ operations.
 The A4 quantizer uses IEEE `vdivps` and the canonical E4M3/E2M1 rounding (§16.2): 160 + 40 block
 scales and 3,200 element divisions per expert and column, ~0.3-0.5 µs.
 
-**First measurement, and a risk to the T = 8 claim.** These figures come from the implemented
+**First measurement, and a risk to the T = 8 claim.** These figures show which mechanisms matter;
+they set no value. Worker count, prefetch distance, ISA variant and every rate used by the cost
+model come from `host_probe` and calibration on the target (§14.2). They come from the implemented
 kernels (`src/ops/offloaded_sparse_moe/cpu/`) on the development VM, not the target: a 4-vCPU Xeon
 at 2.1 GHz with AVX-512 VNNI. They were taken with `tools/flash_next_probe/host_probe.cpp`.
 
@@ -1411,6 +1413,10 @@ The VM's DRAM read rate was 9.2 GB/s for one thread and 33.8 GB/s for four.
   repeats the product and block-scaling work: ~6× the n = 1 cost at n = 8, against the estimated 3.5×.
 - Scaled to a 5+ GHz desktop core, n = 8 is ~5 GB/s per core, ~70 GB/s on 14 workers. That is only
   barely at the DRAM rate, with no margin.
+- **Software prefetch matters.** Without it, one VM core read cold records at about half its DRAM
+  rate. Prefetching 2-4 KiB ahead roughly doubled cold n = 1 throughput there; n = 8 did not change.
+  The distance is therefore a runtime parameter (`prefetch_bytes`; the 2,048 default is a placeholder).
+  `host_probe` sweeps it per worker count, and calibration fixes it for the host.
 - **Action (M3):** amortize decode across columns (decode a quad once into registers, then loop
   columns) and keep column-pair products in 16-bit lanes before widening. Re-measure on the target
   with the probe. If n ≥ 4 stays compute-bound there, give such experts to the GPU route, either as a
@@ -2330,13 +2336,17 @@ host tests pass there. Nothing has run on the RTX 5090 or touched the real check
 
 - **The CPU expert kernel is compute-bound from n = 2** (§10.2). T = 8 is not DRAM-bound as
   assumed. Multi-column work and the n ≥ 4 route decision are added to M3.
+- **CPU software prefetch roughly doubled cold single-core throughput on the VM** (§10.2). Its
+  distance is now a runtime parameter, swept by `host_probe` and chosen on the target.
 - **The pool needs slack frames:** at least peak admissions per round × (D + 1) (§9.5).
 - **The SiLU and `exp_c` definitions were corrected** (§16.2) before any GPU code depended on them.
 - **ModelOpt's 1e-5 scale guard** is a known, deliberate difference (§16.2).
 
 **Suggested order on the target machine:**
 
-1. `tools/flash_next_probe/run_m0.sh` (M0), then update §4, §6.1 and §8.3 from the results.
+1. `tools/flash_next_probe/run_m0.sh` (M0), then update §4, §6.1 and §8.3 from the results. Every
+   VM number in this document is replaced by the target's: DRAM bandwidth and contention, CPU
+   kernel and team rates, prefetch distance, NVMe latency, PCIe and copy-engine behavior.
 2. C++ format registration, then recipe A conversion (M2).
 3. Run `ninfer_offloaded_moe_cuda_test`. It must reproduce `kGolden1` and `kGolden4` bit for bit. Then optimize K7a/K7b against it (M3).
 4. Optimize the CPU kernel's multi-column path and re-measure it.

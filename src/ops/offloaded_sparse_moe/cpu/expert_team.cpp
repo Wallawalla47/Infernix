@@ -42,7 +42,7 @@ std::size_t h_index(int job, int col) {
 
 CpuExpertTeam::CpuExpertTeam(Options options)
     : workers_(options.workers), isa_(options.isa), max_jobs_(options.max_jobs),
-      spin_iterations_(options.spin_iterations) {
+      spin_iterations_(options.spin_iterations), prefetch_bytes_(options.prefetch_bytes) {
     if (workers_ < 1 || workers_ > kHBlocks) { throw std::invalid_argument("CpuExpertTeam: workers must be in [1, 40]"); }
     if (max_jobs_ < 1) { throw std::invalid_argument("CpuExpertTeam: max_jobs must be positive"); }
     if (!cpu_isa_supported(isa_)) { throw std::invalid_argument("CpuExpertTeam: unsupported CPU ISA"); }
@@ -101,7 +101,8 @@ void CpuExpertTeam::work(int w) {
             hb[c] = &h_[h_index(j, c)];
         }
         if (unit_begin < unit_end) {
-            gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, unit_begin, unit_end, hb);
+            gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, unit_begin, unit_end, hb,
+                          prefetch_bytes_);
         }
     }
     barrier();
@@ -111,7 +112,7 @@ void CpuExpertTeam::work(int w) {
         const canon::A4Block* hb[kMaxColumns];
         std::uint16_t* const* y = job.y;
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(j, c)]; }
-        if (rg_begin < rg_end) { down_rows(isa_, job.record, job.scales, hb, job.ncols, rg_begin, rg_end, y); }
+        if (rg_begin < rg_end) { down_rows(isa_, job.record, job.scales, hb, job.ncols, rg_begin, rg_end, y, prefetch_bytes_); }
     }
 }
 

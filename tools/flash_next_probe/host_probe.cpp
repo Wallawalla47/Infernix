@@ -7,6 +7,10 @@
 //     tools/flash_next_probe/host_probe.cpp src/ops/offloaded_sparse_moe/cpu/w4a4_expert.cpp
 //     src/ops/offloaded_sparse_moe/cpu/expert_team.cpp -o build/flash_next_host_probe   (one command)
 //   ./build/flash_next_host_probe [--arena-gib 8] [--experts 256] [--seconds 0.5] [--threads 1,2,4,8]
+//                                 [--prefetch 0,1024,2048,4096,8192]
+//
+// Every tunable here (worker count, software prefetch distance, ISA variant) is chosen from this
+// probe's output on the target machine; numbers from other hosts only show which knobs matter.
 //
 // Reported numbers:
 //   Team: latency of one layer's CPU-served misses (k experts, one column each, cold records)
@@ -47,6 +51,7 @@ struct Options {
     double seconds   = 0.5;
     int repetitions  = 5;
     std::vector<int> threads;
+    std::vector<int> prefetch{0, 1024, 2048, 4096, 8192}; // software prefetch distances to sweep
 };
 
 std::vector<int> parse_list(const char* s) {
@@ -173,12 +178,13 @@ void expert_probe(const Options& o, const std::vector<int>& thread_counts) {
     for (auto& v : y) { v.resize(moe::kHidden); }
 
     std::printf("\nCPU W4A4 expert kernel, %d records (%.0f MB) (median of %d)\n", o.experts, bytes / 1e6, o.repetitions);
-    std::printf("%-12s %5s %3s %8s %12s %12s %12s\n", "isa", "mode", "n", "threads", "GB/s", "us/expert", "experts/s");
+    std::printf("%-12s %5s %3s %8s %6s %12s %12s %12s\n", "isa", "mode", "n", "threads", "pf", "GB/s", "us/expert", "experts/s");
     for (moe::CpuIsa isa : {moe::CpuIsa::kAvx512Vnni, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx2, moe::CpuIsa::kScalar}) {
         if (!moe::cpu_isa_supported(isa)) { continue; }
         for (const bool cold : {true, false}) {
             for (int n : {1, 2, 4, 8}) {
                 for (int threads : thread_counts) {
+                  for (int pf : cold ? o.prefetch : std::vector<int>{moe::kDefaultPrefetchBytes}) {
                     if (isa == moe::CpuIsa::kScalar && threads > 1) { continue; }
                     std::vector<double> rates, latencies;
                     for (int r = 0; r < o.repetitions; ++r) {
@@ -195,7 +201,7 @@ void expert_probe(const Options& o, const std::vector<int>& thread_counts) {
                             while (!stop.load(std::memory_order_relaxed)) {
                                 const std::uint64_t e = cold ? next.fetch_add(1, std::memory_order_relaxed) % o.experts
                                                              : static_cast<std::uint64_t>(t % o.experts);
-                                moe::expert_forward(isa, records + e * moe::kRecordBytes, scales, n, xs, ys);
+                                moe::expert_forward(isa, records + e * moe::kRecordBytes, scales, n, xs, ys, pf);
                                 ++k;
                             }
                             calls[static_cast<std::size_t>(t) * 8] = k;
@@ -206,8 +212,9 @@ void expert_probe(const Options& o, const std::vector<int>& thread_counts) {
                         latencies.push_back(wall * threads / static_cast<double>(std::max<std::uint64_t>(total, 1)) * 1e6);
                     }
                     const double rate = median(rates);
-                    std::printf("%-12s %5s %3d %8d %12.2f %12.1f %12.0f\n", moe::cpu_isa_name(isa), cold ? "cold" : "warm",
-                                n, threads, rate, median(latencies), rate * 1e9 / moe::kRecordBytes);
+                    std::printf("%-12s %5s %3d %8d %6d %12.2f %12.1f %12.0f\n", moe::cpu_isa_name(isa), cold ? "cold" : "warm",
+                                n, threads, pf, rate, median(latencies), rate * 1e9 / moe::kRecordBytes);
+                  }
                 }
             }
         }
@@ -223,10 +230,11 @@ void team_probe(const Options& o, const std::vector<int>& thread_counts) {
     const moe::ExpertScales scales{0.0117F, 0.0117F, 0.0031F, 0.0117F * 0.002F, 0.0117F * 0.002F, 0.0031F * 0.002F};
     std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * 16, 0x3C00), y(x.size());
     std::printf("\nCPU expert team: latency of k cold misses at n = 1 (median of %d x 64 rounds)\n", o.repetitions);
-    std::printf("%8s %4s %12s %12s %12s\n", "workers", "k", "median us", "p90 us", "GB/s");
+    std::printf("%8s %6s %4s %12s %12s %12s\n", "workers", "pf", "k", "median us", "p90 us", "GB/s");
     for (int workers : thread_counts) {
+      for (int pf : o.prefetch) {
         moe::CpuExpertTeam team({.workers = workers, .isa = moe::best_cpu_isa(), .max_jobs = 16,
-                                 .spin_iterations = 1 << 20, .cpus = {}});
+                                 .spin_iterations = 1 << 20, .prefetch_bytes = pf, .cpus = {}});
         for (int k : {1, 2, 4, 10}) {
             std::vector<double> lat;
             std::size_t next = 0;
@@ -246,8 +254,9 @@ void team_probe(const Options& o, const std::vector<int>& thread_counts) {
             }
             std::sort(lat.begin(), lat.end());
             const double med = lat[lat.size() / 2], p90 = lat[lat.size() * 9 / 10];
-            std::printf("%8d %4d %12.1f %12.1f %12.2f\n", workers, k, med, p90, k * moe::kRecordBytes / med / 1e3);
+            std::printf("%8d %6d %4d %12.1f %12.1f %12.2f\n", workers, pf, k, med, p90, k * moe::kRecordBytes / med / 1e3);
         }
+      }
     }
     munmap(records, bytes);
 }
@@ -274,11 +283,13 @@ int main(int argc, char** argv) {
             o.repetitions = std::atoi(value());
         } else if (a == "--threads") {
             o.threads = parse_list(value());
+        } else if (a == "--prefetch") {
+            o.prefetch = parse_list(value());
         } else if (a == "--skip-dram") {
             o.arena_gib = 0;
         } else {
             std::fprintf(stderr, "usage: %s [--arena-gib G] [--skip-dram] [--experts N] [--seconds S] "
-                                 "[--repetitions R] [--threads 1,2,4,...]\n", argv[0]);
+                                 "[--repetitions R] [--threads 1,2,4,...] [--prefetch 0,1024,...]\n", argv[0]);
             return 2;
         }
     }
