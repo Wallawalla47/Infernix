@@ -245,6 +245,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     inspect.complete();
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));
+    plan.set_host_reserve(options.ram_headroom_bytes);
     binding.complete();
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);

@@ -34,6 +34,11 @@ public:
     };
     [[nodiscard]] const Counters& counters() const noexcept { return counters_; }
 
+    // Bytes of the host row cache a volume of this geometry allocates.
+    [[nodiscard]] static std::uint64_t cache_bytes(const NgramTableConfig& table) noexcept {
+        return (std::uint64_t{1} << kCacheBits) * table.row_bytes;
+    }
+
 private:
     static constexpr unsigned kCacheBits = 20; // 2^20 rows, ~170 MB with 160-byte rows
 

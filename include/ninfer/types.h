@@ -25,6 +25,9 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+// Physical Host memory left free for the OS and other programs once every pinned allocation is
+// locked, when --ram-headroom-mib is not given.
+inline constexpr std::uint64_t kDefaultRamHeadroomBytes = 2ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
@@ -342,6 +345,9 @@ struct EngineOptions {
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
+    // Physical Host memory every pinned allocation (weights, caches, buffers) must leave free for
+    // the OS and other programs; startup refuses a lock that would take it.
+    std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;

@@ -2,20 +2,39 @@
 
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "core/host_memory.h"
 #include "core/startup.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/registry.h"
 
 #include <chrono>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 namespace ninfer::runtime {
 namespace {
+
+// Planning allowance for the Program's pinned and mapped buffers (I/O staging, sampling, the CPU
+// expert service's mapped records); the measured total is well below it.
+constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
+// The materializer's upload slots and direct-read bounce buffer during the load.
+constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
+
+void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
+    if (options.diagnostic_observer.callback) {
+        try {
+            options.diagnostic_observer.callback(Diagnostic{.level = level, .message = text});
+        } catch (...) {}
+    } else {
+        std::fprintf(stderr, "[engine] %s\n", text.c_str());
+    }
+}
 
 void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation) {
@@ -66,7 +85,32 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan  = models::qwen4_exp::plan_load(reader, models::load_options(options));
+    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options));
+    // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
+    // allocation leave, before anything is pinned or read.
+    models::qwen4_exp::HostMemoryDemand demand;
+    demand.reserve      = options.ram_headroom_bytes;
+    demand.expert_banks = plan.pinned_expert_bytes();
+    demand.other_pinned = plan.pinned_other_bytes();
+    demand.later_pinned = kProgramPinnedAllowance;
+    demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
+    demand.load_staging = kLoadStagingBytes;
+    const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
+    report(options, DiagnosticLevel::Info, ledger.describe());
+    if (ledger.placement != models::qwen4_exp::ExpertPlacement::Full) {
+        throw std::runtime_error(
+            "Qwen3.8-Flash-Next keeps every expert in Host RAM and this machine has too little free now (" +
+            ledger.describe() + "). Free Host memory, or lower --ram-headroom-mib (now " +
+            std::to_string(options.ram_headroom_bytes >> 20) + " MiB)");
+    }
+    // A small reserve trims other programs' working sets; keep NInfer's own pageable memory
+    // resident so its heap and driver pages never hard-fault from the page file.
+    if (!reserve_process_working_set(demand.process_growth)) {
+        report(options, DiagnosticLevel::Warning,
+               "could not reserve a minimum working set; under memory pressure the engine's pageable memory may "
+               "be paged out");
+    }
+    plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
     auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
 

@@ -270,6 +270,23 @@ const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }
 
+std::uint64_t LoadPlan::pinned_other_bytes() const {
+    // The token embedding is the only pinned weight besides the expert banks (bind_text).
+    const auto& c = impl_->config.text;
+    return std::uint64_t(c.vocab_size) * c.hidden_size * 2U;
+}
+
+std::uint64_t LoadPlan::pinned_expert_bytes() const {
+    const std::uint64_t pinned = impl_->materialization.pinned_capacity_bytes;
+    const std::uint64_t other  = pinned_other_bytes();
+    return pinned > other ? pinned - other : 0;
+}
+
+void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes, std::uint64_t later_pinned_bytes) {
+    impl_->materialization.host_reserve_bytes = reserve_bytes;
+    impl_->materialization.later_pinned_bytes = later_pinned_bytes;
+}
+
 bool is_qwen4_exp(const artifact::Reader& reader) {
     const auto& config = reader.directory().component("text").config;
     if (!config.contains("architectures") || !config.contains("model_type")) { return false; }

@@ -12,6 +12,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -24,8 +25,6 @@ namespace {
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaximumSlotCount = 4;
-// Physical memory left for the OS and everything else once the pinned block is locked.
-constexpr std::uint64_t kPinnedHostReserveBytes = 8ULL << 30;
 
 constexpr std::size_t kBounceBytes = 8ULL * 1024 * 1024;
 
@@ -253,17 +252,20 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     }
     if (plan.pinned_capacity_bytes) {
         // Pinned pages cannot be paged out: refuse a lock that would push the rest of the system
-        // into the page file.
+        // into the page file. Checked against memory available now, not the caller's earlier
+        // snapshot, so other programs' growth since then is seen.
         const auto available = available_host_memory_bytes();
-        if (plan.pinned_capacity_bytes > available ||
-            available - plan.pinned_capacity_bytes < kPinnedHostReserveBytes) {
+        const auto need      = plan.pinned_capacity_bytes + plan.later_pinned_bytes + plan.host_reserve_bytes;
+        if (need > available) {
             constexpr double gib = 1024.0 * 1024.0 * 1024.0;
-            throw ArtifactError(
-                "pinned weights need " +
-                std::to_string(static_cast<double>(plan.pinned_capacity_bytes) / gib) +
-                " GiB plus a " + std::to_string(kPinnedHostReserveBytes >> 30) +
-                " GiB reserve, but only " + std::to_string(static_cast<double>(available) / gib) +
-                " GiB of physical Host memory is available");
+            char message[320];
+            std::snprintf(message, sizeof(message),
+                          "pinned weights need %.2f GiB, later pins %.2f GiB and a %.2f GiB reserve "
+                          "(--ram-headroom-mib), but only %.2f GiB of physical Host memory is available",
+                          static_cast<double>(plan.pinned_capacity_bytes) / gib,
+                          static_cast<double>(plan.later_pinned_bytes) / gib,
+                          static_cast<double>(plan.host_reserve_bytes) / gib, static_cast<double>(available) / gib);
+            throw ArtifactError(message);
         }
         out.pinned_ =
             std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));

@@ -279,6 +279,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.context_cost.preset_path = options_.context_cost_presets;
     engine_options.media_cache_bytes        = options_.media_cache_bytes;
     engine_options.media_live_bytes         = options_.media_live_bytes;
+    engine_options.ram_headroom_bytes       = options_.ram_headroom_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_options.diagnostic_observer      = std::move(diagnostic_observer);

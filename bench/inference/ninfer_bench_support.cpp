@@ -304,6 +304,8 @@ std::string usage_text(std::string_view program) {
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume (default: <weights>.ngram)\n"
+        << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
+        << (ninfer::kDefaultRamHeadroomBytes >> 20) << ")\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -375,6 +377,18 @@ BenchOptions parse_args(int argc, char** argv) {
             options.corpus_path = value("--corpus");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value("--ngram-volume");
+        } else if (arg == "--ram-headroom-mib") {
+            const std::string text = value("--ram-headroom-mib");
+            std::size_t used       = 0;
+            unsigned long long mib = 0;
+            try {
+                mib = std::stoull(text, &used);
+            } catch (const std::exception&) { used = 0; }
+            if (used != text.size() || text.empty() || text.front() == '-' ||
+                mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                throw std::invalid_argument("--ram-headroom-mib must be a MiB count");
+            }
+            options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
         } else if (arg == "-p" || arg == "--n-prompt") {
             auto parsed = parse_int_list(value("--n-prompt"), "n-prompt");
             options.n_prompt.insert(options.n_prompt.end(), parsed.begin(), parsed.end());
