@@ -133,7 +133,8 @@ struct TextConfig {
 
 struct Config {
     TextConfig text;
-    bool mtp = false;
+    bool mtp = false;                // the MTP drafter is bound (--spec mtp)
+    std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);

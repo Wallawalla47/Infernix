@@ -10,6 +10,9 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/projection_fp32.h"
+#include "ninfer/ops/argmax.h"
+#include "ninfer/ops/cast.h"
+#include "ninfer/ops/resident_moe.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/rows.h"
@@ -26,6 +29,9 @@ namespace ninfer::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
+
+// Columns of one MTP call inside a prefill chunk (bounds the drafter's share of the workspace).
+constexpr std::int32_t kMtpChunkColumns = 512;
 
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
@@ -112,9 +118,26 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
             Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
             Tensor xa     = mix(block.attn_hc, residual, &inject);
             const std::uint32_t compact = config_.compact_layer_indices[layer];
-            Tensor y = config_.layer_types[layer] == MixerKind::Gdn
-                           ? gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch)
-                           : attention(std::get<AttentionParameters>(block.mixer), xa, compact, batch);
+            Tensor y;
+            if (config_.layer_types[layer] == MixerKind::Gdn) {
+                y = gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
+            } else {
+                // A verification call records the raw index keys for the tail commit.
+                const AttentionCall call{
+                    .layer        = kv_.layers.at(compact),
+                    .tails        = state_.qsa_tails.at(compact),
+                    .key_records  = batch.verify != nullptr
+                                        ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
+                                              .view({dim(config_.qsa.index_head_dim), T})
+                                        : Tensor{},
+                    .update_tails = batch.verify == nullptr,
+                    .positions    = batch.positions,
+                    .slots        = batch.slots,
+                    .table_rows   = batch.table_rows,
+                    .batch        = batch.batch,
+                    .width        = batch.width};
+                y = attention(std::get<AttentionParameters>(block.mixer), xa, call);
+            }
             ops::hyper_connection_inject(y, inject, residual, s);
             Tensor xm = mix(block.mlp_hc, residual, &inject);
             Tensor ym = moe(block.moe, xm, layer,
@@ -142,11 +165,59 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
             }
         }
     }
+    if (batch.residual_out.data != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
+    if (batch.mtp_chunk != nullptr) {
+        // The chunk's MTP cells from its live residuals, then its last residual becomes pending.
+        const MtpChunk& chunk = *batch.mtp_chunk;
+        const std::int32_t cells = (chunk.prepend ? 1 : 0) + chunk.columns;
+        const std::size_t column = static_cast<std::size_t>(W) * 2;
+        if (chunk.columns < 0 || chunk.columns > T || batch.batch != 1 ||
+            (cells > 0 && (chunk.ids.numel() != cells || chunk.positions.numel() != cells))) {
+            throw std::invalid_argument("Qwen4Exp forward: MTP chunk does not match the call");
+        }
+        // Cell v is `saved` (v = 0 when prepending) or chunk column v - prepend; sub-chunks bound
+        // the drafter's workspace.
+        const std::int32_t first_column = chunk.prepend ? -1 : 0;
+        for (std::int32_t begin = 0; begin < cells; begin += kMtpChunkColumns) {
+            const std::int32_t n = std::min(kMtpChunkColumns, cells - begin);
+            auto scope  = work_.scope();
+            Tensor rows = work_.alloc(DType::BF16, {W, n});
+            auto* out   = static_cast<std::byte*>(rows.data);
+            std::int32_t from = first_column + begin;
+            if (from < 0) {
+                CUDA_CHECK(cudaMemcpyAsync(out, chunk.saved.data, column, cudaMemcpyDeviceToDevice, s));
+                out += column;
+                from = 0;
+            }
+            const std::int32_t rest = first_column + begin + n - from;
+            if (rest > 0) {
+                CUDA_CHECK(cudaMemcpyAsync(out, static_cast<const std::byte*>(residual.data) + column * from,
+                                           column * rest, cudaMemcpyDeviceToDevice, s));
+            }
+            MtpCall call{.residuals  = rows,
+                         .ids        = chunk.ids.slice(0, begin, n),
+                         .positions  = chunk.positions.slice(0, begin, n),
+                         .slots      = batch.slots,
+                         .table_rows = batch.table_rows,
+                         .batch      = 1,
+                         .width      = n,
+                         .kv_only    = true};
+            mtp_block(call, rows);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1),
+                                   column, cudaMemcpyDeviceToDevice, s));
+    }
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
-    const Tensor* head[] = {&parameters_.output_head};
-    ops::projection_fp32(last, head, logits, s);
+    if (parameters_.output_head_q8) {
+        ops::projection_fp32(last, parameters_.output_head_q8->weight, logits, s);
+    } else {
+        const Tensor* head[] = {&parameters_.output_head};
+        ops::projection_fp32(last, head, logits, s);
+    }
 }
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
@@ -273,8 +344,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     return y;
 }
 
-Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
-                          const ForwardBatch& batch) {
+Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call) {
     const cudaStream_t s = device_.stream;
     const auto& a        = config_.attention;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
@@ -287,9 +357,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     Tensor k = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor v = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor iq = work_.alloc(DType::BF16, {ID, IH, T});
-    // A verification call records the raw index keys for the tail commit.
-    Tensor ik = batch.verify != nullptr ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(index), 1).view({ID, T})
-                                        : work_.alloc(DType::BF16, {ID, T});
+    Tensor ik = call.key_records.data != nullptr ? call.key_records.view({ID, T}) : work_.alloc(DType::BF16, {ID, T});
     {
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
@@ -303,10 +371,10 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
         ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
         ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
     }
-    ops::rope(batch.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
+    ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
 
     // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
-    const auto& layer = kv_.layers.at(index);
+    const auto& layer = call.layer;
     {
         const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
                                          .v_pages       = layer.kv.v_pages,
@@ -318,14 +386,15 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
                                          .storage       = layer.kv.storage,
                                          .window        = layer.kv.window};
         const std::int32_t KVH = dim(a.kv_heads);
-        ops::kv_cache_append_batch(kn.view({D, KVH, batch.width, batch.batch}), v.view({D, KVH, batch.width, batch.batch}),
-                                   batch.positions.view({batch.width, batch.batch}), batch.table_rows, view, s);
+        ops::kv_cache_append_batch(kn.view({D, KVH, call.width, call.batch}), v.view({D, KVH, call.width, call.batch}),
+                                   call.positions.view({call.width, call.batch}), call.table_rows, view, s);
     }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
-    const ops::QsaBatch qsa_batch{kv_.block_tables, batch.table_rows, batch.positions, batch.slots, batch.batch,
-                                  batch.width, /*update_tails=*/batch.verify == nullptr};
-    ops::qsa_index_query(iq, p.index_query_norm, batch.positions, geometry, s);
-    ops::qsa_pool_keys(ik, p.index_key_norm, state_.qsa_tails.at(index), layer, qsa_batch, geometry, s);
+    const ops::QsaBatch qsa_batch{kv_.block_tables, call.table_rows, call.positions, call.slots, call.batch,
+                                  call.width, call.update_tails};
+    ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
+    if (call.kv_only) { return Tensor{}; }
+    ops::qsa_index_query(iq, p.index_query_norm, call.positions, geometry, s);
 
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_);
@@ -378,6 +447,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     if (eager_chunk_ && experts_.overlap_stream != nullptr) {
         source.overlap_stream = experts_.overlap_stream;
         for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
+    } else if (experts_.overlap_stream != nullptr) {
+        // Decode and verification calls (one pass, possibly graph-captured): resident experts
+        // compute while the misses stage on the same side stream.
+        source.fork_stream    = experts_.overlap_stream;
+        source.fork_events[0] = experts_.overlap_events[0];
+        source.fork_events[1] = experts_.overlap_events[1];
     }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
@@ -405,6 +480,134 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor y = work_.alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
+}
+
+
+void Forward::run_mtp(const MtpCall& call) {
+    if (!parameters_.mtp || !kv_.mtp || state_.mtp_tails.data == nullptr) {
+        throw std::logic_error("Qwen4Exp forward: the MTP drafter is not loaded");
+    }
+    if (call.batch <= 0 || call.width <= 0 || call.ids.numel() != call.batch * call.width ||
+        call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1)) {
+        throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");
+    }
+    eager_chunk_ = false;
+    work_.reset();
+    const std::int32_t W = dim(config_.residual_width()), T = call.batch * call.width;
+    Tensor rows = work_.alloc(DType::BF16, {W, T});
+    CUDA_CHECK(cudaMemcpyAsync(rows.data, call.residuals.data, rows.bytes(), cudaMemcpyDeviceToDevice, device_.stream));
+    mtp_block(call, rows);
+}
+
+void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
+    const cudaStream_t s = device_.stream;
+    const auto& p        = *parameters_.mtp;
+    const std::int32_t H = dim(config_.hidden_size), W = dim(config_.residual_width()), S = dim(config_.hc.streams);
+    const std::int32_t T = call.batch * call.width;
+    try {
+        auto scope = work_.scope();
+        // Input fusion: R = fc_hidden(per stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
+        Tensor x0 = work_.alloc(DType::BF16, {H, T});
+        ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        Tensor e = work_.alloc(DType::BF16, {H, T});
+        ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
+        Tensor ep = work_.alloc(DType::BF16, {H, T});
+        project(e, p.embedding_projection, ep, work_, s);
+        Tensor hn = work_.alloc(DType::BF16, {W, T});
+        ops::rmsnorm(rows, p.hidden_norm, config_.rms_norm_eps, true, hn, s);
+        Tensor residual = work_.alloc(DType::BF16, {W, T});
+        {
+            Tensor per_stream = residual.view({H, S * T});
+            project(hn.view({H, S * T}), p.hidden_projection, per_stream, work_, s);
+        }
+        ops::hyper_connection_inject(ep, state_.mtp_ones.slice(1, 0, T), residual, s);
+
+        Tensor inject = work_.alloc(DType::FP32, {S, T});
+        Tensor xa     = mix(p.attn_hc, residual, &inject);
+        const AttentionCall attention_call{.layer        = *kv_.mtp,
+                                           .tails        = state_.mtp_tails,
+                                           .key_records  = call.key_records,
+                                           .update_tails = call.kv_only && call.key_records.data == nullptr,
+                                           .kv_only      = call.kv_only,
+                                           .positions    = call.positions,
+                                           .slots        = call.slots,
+                                           .table_rows   = call.table_rows,
+                                           .batch        = call.batch,
+                                           .width        = call.width};
+        Tensor y = attention(p.attention, xa, attention_call);
+        if (call.kv_only) { return; }
+        ops::hyper_connection_inject(y, inject, residual, s);
+
+        // MoE over the device-resident experts, with the shared expert.
+        Tensor xm = mix(p.mlp_hc, residual, &inject);
+        const auto& m        = config_.moe;
+        const std::int32_t E = dim(m.experts), K = dim(m.top_k), I = dim(m.intermediate);
+        Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
+        const Tensor* router_rows[] = {&p.router, &p.shared_score};
+        ops::projection_fp32(xm, router_rows, logits, s);
+        ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
+                                work_.alloc(DType::FP32, {T})};
+        ops::moe_route(logits, K, routing, s);
+        Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
+        const DeviceSpan expert_ws = work_.alloc_bytes(ops::resident_moe_workspace_bytes(K * T, I));
+        ops::resident_moe_experts(xm, routing.ids, p.experts_gate_up, p.experts_down, E, I, expert_ws.data,
+                                  expert_ws.bytes, outputs, s);
+        const std::int32_t SI = dim(m.shared_intermediate);
+        Tensor gate_up = work_.alloc(DType::BF16, {2 * SI, T});
+        project(xm, p.shared_gate_up, gate_up, work_, s);
+        Tensor gate = work_.alloc(DType::BF16, {SI, T});
+        Tensor up   = work_.alloc(DType::BF16, {SI, T});
+        {
+            Tensor* parts[] = {&gate, &up};
+            ops::split_rows(gate_up, parts, s);
+        }
+        Tensor product = work_.alloc(DType::BF16, {SI, T});
+        ops::silu_mul(gate, up, product, s);
+        Tensor shared = work_.alloc(DType::BF16, {H, T});
+        project(product, p.shared_down, shared, work_, s);
+        Tensor ym = work_.alloc(DType::BF16, {H, T});
+        ops::moe_combine(outputs, routing, shared, ym, s);
+        ops::hyper_connection_inject(ym, inject, residual, s);
+        CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
+
+        // The draft token: argmax of the draft head (the proposal head's rows mapped to token ids,
+        // or the text head over the public tokens).
+        Tensor final_x = mix(p.final_mixer, residual, nullptr);
+        const auto& head = parameters_.draft_head;
+        const std::int32_t rows_out = head.rows ? head.rows->weight.n : dim(config_.vocab_size);
+        Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
+        if (head.rows) {
+            ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
+        } else if (parameters_.output_head_q8) {
+            ops::projection_fp32(final_x, parameters_.output_head_q8->weight, head_logits, s);
+        } else {
+            const Tensor* text_head[] = {&parameters_.output_head};
+            ops::projection_fp32(final_x, text_head, head_logits, s);
+        }
+        Tensor narrow = work_.alloc(DType::BF16, {rows_out, T});
+        ops::cast_fp32_to_bf16(head_logits, narrow, s);
+        Tensor drafts = call.drafts;
+        if (head.rows) {
+            ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
+        } else {
+            ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
+        }
+    } catch (const std::exception& error) {
+        throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
+    }
+}
+
+std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t kv_columns, std::int32_t draft_columns,
+                                         std::int32_t vocabulary_rows, std::int32_t max_context) {
+    const std::size_t t = static_cast<std::size_t>(std::max(std::min(kv_columns, kMtpChunkColumns), draft_columns));
+    const std::size_t d = static_cast<std::size_t>(draft_columns);
+    // One block at t columns (as the text forward sizes it), the input fusion's and the copied
+    // residuals; the draft head's logits and the resident experts only at full steps, which run
+    // one column per sequence.
+    return workspace_bytes(c, static_cast<std::int32_t>(t), max_context) +
+           std::size_t(c.residual_width()) * t * 2 * 4 + std::size_t(c.hidden_size) * t * 2 * 4 +
+           std::size_t(vocabulary_rows) * d * 6 +
+           ops::resident_moe_workspace_bytes(dim(c.moe.top_k * d), dim(c.moe.intermediate));
 }
 
 } // namespace ninfer::models::qwen4_exp::execution

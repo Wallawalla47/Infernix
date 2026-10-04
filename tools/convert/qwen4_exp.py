@@ -344,10 +344,20 @@ class _Qwen4ExpBuilder(_Builder):
         self.group(p + "shared/gate", p + "shared/up")
         if mtp:
             # NVIDIA keeps the MTP experts BF16 and fused: gate rows [0, I) then up rows [I, 2I).
-            self.add(p + "experts/gate_up", store, sp + "experts.gate_up_proj", (e, 2 * ir, h),
-                     inputs=(ffn_input,))
-            self.add(p + "experts/down", store, sp + "experts.down_proj", (e, h, ir),
-                     inputs=(p + "experts/product",))
+            # Each expert's matrices become row ranges of two parents (gate and up interleaved per
+            # expert, then every down), so the drafter's resident-expert kernel selects them by id.
+            gate_up, downs = [], []
+            for expert in range(e):
+                ep = p + f"experts/{expert}/"
+                for role, half in (("gate", 0), ("up", 1)):
+                    self.add(ep + role, store, sp + "experts.gate_up_proj", (ir, h), source_shape=(e, 2 * ir, h),
+                             offset=(expert * 2 + half) * ir * h, inputs=(ffn_input,))
+                    gate_up.append(ep + role)
+                self.add(ep + "down", store, sp + "experts.down_proj", (h, ir), source_shape=(e, h, ir),
+                         offset=expert * h * ir, inputs=(ep + "product",))
+                downs.append(ep + "down")
+            self.group(*gate_up)
+            self.group(*downs)
             return
         bank = ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")
         self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), "nvfp4_mul", residency="text"))

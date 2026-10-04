@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -26,11 +27,14 @@ struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
     Tensor ple_conv;                         // BF16 [S*H, span, slots]
     std::vector<Tensor> qsa_tails;           // per attention block: BF16 [Di, R - 1, slots]
+    Tensor mtp_tails;                        // the MTP block's tails (empty without MTP)
+    Tensor mtp_ones;                         // FP32 [S, columns] of 1: broadcasts the embedding
 };
 
 // Program-owned paged KV of the attention blocks.
 struct ForwardKV {
     std::vector<ops::QsaKVLayer> layers; // per attention block
+    std::optional<ops::QsaKVLayer> mtp;  // the MTP block's layer, through the same tables
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
@@ -65,6 +69,18 @@ struct ForwardVerify {
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
 };
 
+// The MTP cells of a prefill or forced-token chunk (one sequence), written from the chunk's own
+// residuals while they are live: cell c pairs the residual at position c with the token at c + 1.
+// The columns are `saved` (the residual of the position before the chunk) when `prepend`, then
+// the chunk's first `columns` residuals; the chunk's last residual then replaces `saved`.
+struct MtpChunk {
+    Tensor saved;     // BF16 [S*H]: the sequence's pending residual
+    bool prepend = false;
+    std::int32_t columns = 0;
+    Tensor ids;       // I32 [prepend + columns]: the token after each cell
+    Tensor positions; // I32 [prepend + columns]: the cells
+};
+
 struct ForwardBatch {
     Tensor ids;        // I32 [T]
     Tensor positions;  // I32 [T]
@@ -78,6 +94,28 @@ struct ForwardBatch {
     std::int32_t batch = 0;
     std::int32_t width = 0;
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
+    Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
+    const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
+};
+
+// One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
+// (the main model's, or the drafter's own output for a chained step) with the token at c + 1, at
+// rope position c; the block's output predicts the token at c + 2.
+struct MtpCall {
+    Tensor residuals;  // BF16 [S*H, T]
+    Tensor ids;        // I32 [T]
+    Tensor positions;  // I32 [T]: the cells
+    Tensor slots;      // I32 [batch]
+    Tensor table_rows; // I32 [batch]
+    std::int32_t batch = 0, width = 0;
+    // K/V and index keys only (prompt, forced and verified cells). The index-key tails advance,
+    // unless key_records ([Di, W, B]) receives the keys for a later qsa_commit_tails.
+    bool kv_only = true;
+    Tensor key_records;
+    // A full step (one column per sequence, tails unchanged): the block's output residual and the
+    // draft head's argmax token of each column.
+    Tensor residual_out; // BF16 [S*H, T]
+    Tensor drafts;       // I32 [T]
 };
 
 // Optional observation of every block, for reference comparison.
@@ -103,16 +141,38 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
+    // Runs the MTP drafter (requires MTP parameters and state).
+    void run_mtp(const MtpCall& call);
+
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::int32_t max_context);
+    // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
+    // run them inside run()) and full steps over `draft_columns` sequences.
+    [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
+                                                         std::int32_t draft_columns, std::int32_t vocabulary_rows,
+                                                         std::int32_t max_context);
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);
     Tensor mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject);
     Tensor gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch);
-    Tensor attention(const AttentionParameters& p, const Tensor& x, std::uint32_t index,
-                     const ForwardBatch& batch);
+    // One QSA block's attention through `layer` and `tails`. Index keys go to `key_records` when
+    // set (verification and MTP catch-up: tails unchanged) or advance the tails when update_tails;
+    // kv_only stops after the K/V and index-key writes and returns an empty tensor.
+    struct AttentionCall {
+        const ops::QsaKVLayer& layer;
+        Tensor& tails;
+        Tensor key_records;
+        bool update_tails = true;
+        bool kv_only      = false;
+        const Tensor& positions;
+        const Tensor& slots;
+        const Tensor& table_rows;
+        std::int32_t batch = 0, width = 0;
+    };
+    Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap);
+    void mtp_block(const MtpCall& call, Tensor& residual);
 
     const Parameters& parameters_;
     const TextConfig& config_;

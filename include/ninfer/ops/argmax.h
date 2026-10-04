@@ -20,4 +20,11 @@ namespace ninfer::ops {
  */
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream);
 
+/**
+ * The same argmax over a shortlist head's rows, mapped to token ids: out[t] = row_ids[r_t] for the
+ * row r_t the overload above selects. `row_ids` is contiguous I32 [physical_rows].
+ */
+void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32_t valid_rows,
+            cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -143,6 +144,10 @@ public:
         std::uint64_t cpu_served_at_admission = 0;
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
+        // MTP drafter: the residual of the last processed position (its pending cell) is in the
+        // lane's saved column; mtp_written says whether that cell's K/V is already written.
+        bool mtp_written = false;
+        bool mtp_live    = false; // false after a plain round left its cells behind
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -165,7 +170,12 @@ public:
             (options_.ngram_draft_tokens > 0 && (options_.ngram_min_match < 4 || options_.ngram_min_match > 64))) {
             throw std::invalid_argument("Qwen4Exp: n-gram drafts must be 0..15 with a minimum match of 4..64");
         }
-        max_width_         = 1 + static_cast<std::int32_t>(options_.ngram_draft_tokens);
+        mtp_ = parameters_.mtp.has_value();
+        if (mtp_ && (options_.mtp_draft_tokens == 0 || options_.mtp_draft_tokens > 7)) {
+            throw std::invalid_argument("Qwen4Exp: MTP needs 1..7 draft tokens");
+        }
+        mtp_k_     = mtp_ ? static_cast<std::int32_t>(options_.mtp_draft_tokens) : 0;
+        max_width_ = 1 + std::max(static_cast<std::int32_t>(options_.ngram_draft_tokens), mtp_k_);
         columns_           = std::max(chunk_, lanes * max_width_);
         pages_per_row_     = (dim(options_.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const auto kv_tokens = options_.kv_capacity_tokens != 0 ? options_.kv_capacity_tokens
@@ -194,14 +204,16 @@ public:
         ple_backing_.fill(0);
         di_ = dim(c_.qsa.index_head_dim);
         r_  = dim(c_.qsa.compress_ratio);
-        tails_backing_ = DeviceBuffer(static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * lanes * 2);
+        // One more tail slab and KV layer for the MTP block (after the text layers).
+        const std::uint32_t kv_layers = c_.attention_layers + (mtp_ ? 1U : 0U);
+        tails_backing_ = DeviceBuffer(static_cast<std::size_t>(kv_layers) * di_ * (r_ - 1) * lanes * 2);
         tails_backing_.fill(0);
 
         // Paged KV: one page group holds 64 positions of every attention layer.
         const auto layout = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
         KVPageGeometry geometry;
         const auto kv_heads = dim(c_.attention.kv_heads);
-        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+        for (std::uint32_t l = 0; l < kv_layers; ++l) {
             geometry.planes.push_back({layout.key.data_dtype, layout.key.data_leading_extent, kv_heads});
             if (layout.key.has_scale()) {
                 geometry.planes.push_back({layout.key.scale_dtype, layout.key.scale_leading_extent, kv_heads});
@@ -231,7 +243,9 @@ public:
         io_layout_.rows      = align(io_layout_.slots + 4ULL * lanes);
         io_layout_.columns   = align(io_layout_.rows + 4ULL * lanes);
         io_layout_.ngram     = align(io_layout_.columns + 4ULL * columns_);
-        io_layout_.bytes     = align(io_layout_.ngram + row_bytes * heads * columns_);
+        io_layout_.mtp_ids   = align(io_layout_.ngram + row_bytes * heads * columns_);
+        io_layout_.mtp_cells = align(io_layout_.mtp_ids + 4ULL * (columns_ + 1));
+        io_layout_.bytes     = align(io_layout_.mtp_cells + 4ULL * (columns_ + 1));
         io_device_ = DeviceBuffer(io_layout_.bytes);
         io_host_   = PinnedHostBuffer(io_layout_.bytes);
 
@@ -256,7 +270,7 @@ public:
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
         std::size_t plane = 0;
-        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+        for (std::uint32_t l = 0; l < kv_layers; ++l) {
             ops::QsaKVLayer layer;
             layer.kv.storage      = options_.kv_cache;
             layer.kv.head_dim     = dim(c_.attention.head_dim);
@@ -266,7 +280,18 @@ public:
             layer.kv.v_pages = pool_->plane(plane++);
             if (layout.value.has_scale()) { layer.kv.v_scale_pages = pool_->plane(plane++); }
             layer.pooled_pages = pool_->plane(plane++);
-            kv.layers.push_back(layer);
+            if (l < c_.attention_layers) {
+                kv.layers.push_back(layer);
+            } else {
+                kv.mtp = layer;
+            }
+        }
+        if (mtp_) {
+            state.mtp_tails = Tensor(static_cast<std::byte*>(tails_backing_.p) +
+                                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * lanes * 2,
+                                     DType::BF16, {di_, r_ - 1, lanes});
+            allocate_mtp(lanes);
+            state.mtp_ones = Tensor(mtp_ones_.p, DType::FP32, {dim(c_.hc.streams), mtp_columns_});
         }
         execution::ForwardExperts experts;
         experts.frames.assign(c_.num_hidden_layers, nullptr);
@@ -276,6 +301,12 @@ public:
             work_capacity_ += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                 token_domain_, 1, max_width_ - 1, 1, lanes);
             allocate_verification(lanes);
+        }
+        if (mtp_) {
+            const auto& head = parameters_.draft_head;
+            work_capacity_ += execution::Forward::mtp_workspace_bytes(
+                c_, std::max(lanes * max_width_, std::min(chunk_, 512)), lanes,
+                head.rows ? head.rows->weight.n : vocab_, dim(options_.max_context));
         }
         work_    = std::make_unique<WorkspaceArena>(work_capacity_);
 
@@ -410,10 +441,16 @@ public:
         lane.prompt_tokens  = static_cast<std::uint32_t>(lane.history.size());
         lane.state_tokens   = 0;
         lane.speculative    = {};
+        lane.mtp_written = false;
+        lane.mtp_live    = mtp_;
         if (max_width_ > 1) {
-            lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
-            for (const auto token : lane.history) { lane.proposer->append(token); }
+            if (options_.ngram_draft_tokens > 0) {
+                lane.proposer =
+                    std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+                for (const auto token : lane.history) { lane.proposer->append(token); }
+            }
             lane.speculative.enabled      = true;
+            lane.speculative.backend      = mtp_ ? SpeculativeBackend::Mtp : SpeculativeBackend::None;
             lane.speculative.draft_window = static_cast<std::uint32_t>(max_width_ - 1);
             lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
         }
@@ -460,7 +497,8 @@ public:
             std::min<std::int32_t>(chunk_, static_cast<std::int32_t>(lane.prompt_tokens) - begin);
         const bool last = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
         stage_sequence(index, begin, width, lane.history);
-        run(1, width, 1);
+        const auto chunk = stage_mtp_chunk(lane, index, begin, width);
+        run(1, width, 1, chunk ? &*chunk : nullptr);
         lane.state_tokens += static_cast<std::uint32_t>(width);
         if (!last) {
             device_.synchronize();
@@ -507,30 +545,48 @@ public:
             }
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
-        // Copy proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one
-        // token fewer than it may still emit, so every verified position lies in its reservation.
+        // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
+        // fewer than it may still emit, so every verified position lies in its reservation. MTP
+        // drafts come first; a longer n-gram copy proposal replaces them.
+        if (mtp_) {
+            mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), budgets);
+        }
         std::int32_t width = 1;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
             Lane& lane = lanes_[lanes[b]];
             drafts_[b].clear();
+            from_ngram_[b] = false;
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
             const auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
-            drafts_[b] = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
-            width      = std::max(width, 1 + static_cast<std::int32_t>(drafts_[b].size()));
+            if (mtp_ && lane.mtp_live) {
+                const auto n = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(mtp_k_));
+                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + n);
+            }
+            if (lane.proposer) {
+                auto copy = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
+                if (copy.size() > drafts_[b].size()) {
+                    drafts_[b]     = std::move(copy);
+                    from_ngram_[b] = true;
+                }
+            }
+            width = std::max(width, 1 + static_cast<std::int32_t>(drafts_[b].size()));
         }
         if (width > 1) {
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
                           std::span<const std::int32_t>(positions.data(), batch), width, start);
         }
-        for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
+        for (std::int32_t b = 0; b < batch; ++b) {
+            ++lanes_[lanes[b]].speculative.fallback_steps;
+            lanes_[lanes[b]].mtp_live = false; // a plain round leaves the drafter's cells behind
+        }
         round_width_ = 1;
         stage_decode(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
         run_decode(batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
-        residency_->after_round(device_.stream, batch, decode_budget());
+        residency_->after_round(device_.stream, batch, decode_budget(1));
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -563,7 +619,8 @@ public:
             }
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
-            run(1, static_cast<std::int32_t>(stride), 1);
+            const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
+            run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
             lane.state_tokens += stride;
@@ -596,6 +653,9 @@ public:
             }
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
             lane.history.push_back(pending_tokens_[row]);
+            // After a plain decode round the drafter's pending cell is two positions back; it
+            // resumes only from a chunk (the prefill's last) whose pending cell is this one.
+            if (lane.phase != Phase::Prefill && mtp_) { lane.mtp_live = false; }
             if (lane.proposer) { lane.proposer->append(pending_tokens_[row]); }
             if (lane.phase == Phase::Prefill) { lane.phase = Phase::Decode; }
             if (d.terminal) {
@@ -700,12 +760,17 @@ private:
     // Misses staged per pass of a layer's experts: every decode and verify call's misses in one
     // pass; a prefill chunk's in several.
     static constexpr std::int32_t kStagingSlots = 64;
-    std::size_t decode_budget() {
-        ++budget_round_;
-        if (residency_->stats().promotions < residency_->frames()) { return kDecodePromotionsPerLayer; }
-        return budget_round_ % kDecodePromotionInterval == 0 ? kDecodePromotionsPerLayer : 0;
+    // Promotions follow the tokens a round advances (the longest row's), not rounds: a verification
+    // round that advances four tokens promotes what four decode rounds would, so a speculative
+    // round's cache warms per token as plain decode does.
+    std::size_t decode_budget(std::uint32_t tokens) {
+        if (residency_->stats().promotions < residency_->frames()) { return kDecodePromotionsPerLayer * tokens; }
+        budget_tokens_ += tokens;
+        const std::uint64_t due = budget_tokens_ / kDecodePromotionInterval;
+        budget_tokens_ %= kDecodePromotionInterval;
+        return static_cast<std::size_t>(due) * kDecodePromotionsPerLayer;
     }
-    std::uint64_t budget_round_ = 0;
+    std::uint64_t budget_tokens_ = 0;
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
@@ -718,14 +783,17 @@ private:
             const auto hits     = s.hits - at_admission.hits;
             const auto promoted = s.promotions - at_admission.promotions;
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
-            char text[320];
+            std::size_t free_vram = 0, total_vram = 0;
+            if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
+            char text[384];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
-                          "%llu misses CPU-served; since start %.1f%%",
+                          "%llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
                           static_cast<unsigned long long>(cpu),
-                          s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0);
+                          s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
+                          free_vram >> 20);
             if (options_.diagnostics.callback) {
                 options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
             } else {
@@ -735,10 +803,18 @@ private:
     }
 
     struct IoLayout {
-        std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, bytes = 0;
+        std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, mtp_ids = 0, mtp_cells = 0,
+                    bytes = 0;
     };
 
     static std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
+
+    // The io bytes a decode or verification round of `columns` columns reads: everything before
+    // the n-gram rows (ids, positions, slots, table rows, logit columns) and its columns' rows.
+    // Prefill and forced-token calls copy the whole layout (their MTP cells follow the rows).
+    std::size_t io_prefix(std::int32_t columns) const {
+        return io_layout_.ngram + static_cast<std::size_t>(columns) * hash_.heads() * c_.ple.table.row_bytes;
+    }
 
     SequenceHandle handle(std::uint32_t lane) const noexcept {
         return ContractAccess::make_sequence(this, lane, lanes_[lane].epoch);
@@ -787,7 +863,7 @@ private:
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(ple_backing_.p) + slot * ple_bytes, 0, ple_bytes, s));
         const auto lanes            = static_cast<std::size_t>(options_.max_concurrency);
         const std::size_t tail_bytes = static_cast<std::size_t>(di_) * (r_ - 1) * 2;
-        for (std::uint32_t l = 0; l < c_.attention_layers; ++l) {
+        for (std::uint32_t l = 0; l < c_.attention_layers + (mtp_ ? 1U : 0U); ++l) {
             CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(tails_backing_.p) + (l * lanes + slot) * tail_bytes, 0,
                                        tail_bytes, s));
         }
@@ -849,11 +925,12 @@ private:
 
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
     // `logit_columns` columns land in logits32_.
-    void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns) {
+    void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
+             const execution::MtpChunk* chunk = nullptr) {
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
-        forward_call(batch, width, logit_columns);
+        forward_call(batch, width, logit_columns, nullptr, chunk);
         residency_->enqueue_route_download(s, batch * width);
     }
 
@@ -863,10 +940,22 @@ private:
     // captured and later rounds replay it.
     void run_decode(std::int32_t batch) {
         const cudaStream_t s = device_.stream;
-        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_prefix(batch), cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
-        DecodeGraph& graph = graphs_[static_cast<std::size_t>(batch - 1)];
-        const auto body    = [&] { forward_call(batch, 1, batch); };
+        replay(graphs_[static_cast<std::size_t>(batch - 1)], [&] { forward_call(batch, 1, batch); });
+        residency_->enqueue_route_download(s, batch);
+    }
+
+    struct DecodeGraph {
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+        bool warmed = false;
+    };
+
+    // Runs a fixed-address round: the first time eagerly (the Ops' one-time setup), the second
+    // captured, then by replay.
+    void replay(DecodeGraph& graph, const std::function<void()>& body) {
+        const cudaStream_t s = device_.stream;
         if (graph.executable.ready()) {
             graph.executable.launch(s);
         } else if (!graph.warmed) {
@@ -877,11 +966,10 @@ private:
             graph.executable.instantiate(graph.definition);
             graph.executable.launch(s);
         }
-        residency_->enqueue_route_download(s, batch);
     }
 
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
-                      const execution::ForwardVerify* verify = nullptr) {
+                      const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr) {
         const std::int32_t cols = batch * width;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch fb;
@@ -897,6 +985,9 @@ private:
         fb.batch           = batch;
         fb.width           = width;
         fb.verify          = verify;
+        fb.mtp_chunk       = chunk;
+        // Decode and verification rounds export their final residuals for the MTP catch-up.
+        if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
     }
@@ -1004,25 +1095,14 @@ private:
             spec_host(spec_layout_.lengths)[b] = positions[b];
             spec_host(spec_layout_.anchors)[b] = anchor;
         }
-        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_prefix(batch * W), cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed,
                                    cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
-        DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
-        const auto body    = [&] {
+        replay(verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
             forward_call(batch, W, batch * W, &view);
-        };
-        if (graph.executable.ready()) {
-            graph.executable.launch(s);
-        } else if (!graph.warmed) {
-            body();
-            graph.warmed = true;
-        } else {
-            graph.definition.capture(s, body);
-            graph.executable.instantiate(graph.definition);
-            graph.executable.launch(s);
-        }
+        });
         residency_->enqueue_route_download(s, batch * W);
 
         // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
@@ -1070,14 +1150,20 @@ private:
                 continue;
             }
             ++stats.rounds;
-            ++stats.ngram_rounds;
             stats.drafted_tokens += n;
-            stats.ngram_drafted_tokens += n;
             stats.accepted_tokens += static_cast<std::uint64_t>(A);
-            stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
+            if (from_ngram_[b]) {
+                ++stats.ngram_rounds;
+                stats.ngram_drafted_tokens += n;
+                stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
+            }
             for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
         }
-        residency_->after_round(s, batch * W, decode_budget(),
+        std::uint32_t advanced = 1;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            advanced = std::max<std::uint32_t>(advanced, static_cast<std::uint32_t>(pending_counts_[b]));
+        }
+        residency_->after_round(s, batch * W, decode_budget(advanced),
                                 std::span<const std::uint8_t>(live_.data(), static_cast<std::size_t>(batch * W)));
         round_width_ = W;
         runtime::ExecutionTiming timing;
@@ -1122,7 +1208,7 @@ private:
             for (std::int32_t j = 0; j < k; ++j) {
                 const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
                 lane.history.push_back(token);
-                lane.proposer->append(token);
+                if (lane.proposer) { lane.proposer->append(token); }
             }
             fold_rows[row].commit_columns = k;
             commit[row]                   = k;
@@ -1147,6 +1233,7 @@ private:
         Tensor ple_states(ple_backing_.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
         ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
                              slots, s);
+        if (mtp_) { mtp_catch_up(rows, W, commit); }
         for (std::int32_t row = 0; row < batch; ++row) {
             if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
         }
@@ -1154,6 +1241,192 @@ private:
         pending_transaction_ = 0;
         round_width_         = 1;
         return out;
+    }
+
+    // ---------------------------------------------------------------- MTP drafter (design 11.2)
+    void allocate_mtp(std::int32_t lanes) {
+        const std::size_t column = 2ULL * width_;
+        mtp_columns_   = std::max(lanes * max_width_, std::min(chunk_, 512));
+        mtp_residuals_ = DeviceBuffer(column * lanes * max_width_);
+        mtp_saved_     = DeviceBuffer(column * lanes);
+        mtp_chain_     = DeviceBuffer(column * lanes);
+        mtp_records_   = DeviceBuffer(2ULL * di_ * max_width_ * lanes);
+        mtp_saved_.fill(0);
+        std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * mtp_columns_, 1.0F);
+        mtp_ones_ = DeviceBuffer(ones.size() * sizeof(float));
+        mtp_ones_.copy_from_host(ones.data(), ones.size() * sizeof(float));
+        // I32: chain ids [B], cells [K, B], drafts [K, B], catch-up ids [W, B], gather columns [B],
+        // catch-up cells [W, B].
+        mtp_io_.ids      = 0;
+        mtp_io_.cells    = mtp_io_.ids + lanes;
+        mtp_io_.drafts   = mtp_io_.cells + lanes * mtp_k_;
+        mtp_io_.up_ids   = mtp_io_.drafts + lanes * mtp_k_;
+        mtp_io_.gather   = mtp_io_.up_ids + lanes * max_width_;
+        mtp_io_.up_cells = mtp_io_.gather + lanes;
+        mtp_io_.words    = mtp_io_.up_cells + lanes * max_width_;
+        mtp_device_      = DeviceBuffer(4ULL * mtp_io_.words);
+        mtp_host_        = PinnedHostBuffer(4ULL * mtp_io_.words);
+        for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
+        mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+    }
+
+    std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
+    std::int32_t* mtp_device(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_device_.p) + offset; }
+    Tensor saved_column(std::uint32_t lane) const {
+        return Tensor(static_cast<std::byte*>(mtp_saved_.p) + 2ULL * width_ * lane, DType::BF16, {width_});
+    }
+
+    // The MTP cells of a chunk (prefill or forced tokens) of one lane. The pending cell (the
+    // position before the chunk) is prepended unless written; the chunk's last cell is included
+    // only when the token after it is known (forced tokens). Stages ids and cells into the io.
+    std::optional<execution::MtpChunk> stage_mtp_chunk(Lane& lane, std::uint32_t index, std::int32_t begin,
+                                                       std::int32_t width) {
+        if (!mtp_) { return std::nullopt; }
+        const bool prepend = begin > 0 && !lane.mtp_written;
+        const bool known   = static_cast<std::int32_t>(lane.history.size()) > begin + width;
+        const std::int32_t columns = known ? width : width - 1;
+        const std::int32_t first   = prepend ? begin - 1 : begin;
+        const std::int32_t cells   = (prepend ? 1 : 0) + columns;
+        auto* ids   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.mtp_ids);
+        auto* cells_host = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.mtp_cells);
+        for (std::int32_t i = 0; i < cells; ++i) {
+            cells_host[i] = first + i;
+            ids[i]        = lane.history[static_cast<std::size_t>(first + i + 1)];
+        }
+        lane.mtp_written = known;
+        lane.mtp_live    = true;
+        auto* base = static_cast<std::byte*>(io_device_.p);
+        execution::MtpChunk chunk;
+        chunk.saved     = saved_column(index);
+        chunk.prepend   = prepend;
+        chunk.columns   = columns;
+        // A one-token prompt has no cell yet (its only position is the pending cell).
+        if (cells > 0) {
+            chunk.ids       = Tensor(base + io_layout_.mtp_ids, DType::I32, {cells});
+            chunk.positions = Tensor(base + io_layout_.mtp_cells, DType::I32, {cells});
+        }
+        return chunk;
+    }
+
+    // MTP drafts for every live lane of a decode round: the pending cell's K/V when unwritten,
+    // then mtp_k_ chained full steps from the saved residual and the anchor token.
+    void mtp_draft(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget>) {
+        const cudaStream_t s = device_.stream;
+        const auto batch     = static_cast<std::int32_t>(lanes.size());
+        const std::size_t column = 2ULL * width_;
+        bool any = false, unwritten = false;
+        auto* slots = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
+        auto* rows  = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const Lane& lane = lanes_[lanes[b]];
+            any |= lane.mtp_live;
+            unwritten |= lane.mtp_live && !lane.mtp_written;
+            const std::int32_t cell  = static_cast<std::int32_t>(lane.state_tokens) - 1;
+            const std::int32_t limit = static_cast<std::int32_t>(lane.pages.size()) * kPagedKVPageSize - 1;
+            mtp_host(mtp_io_.ids)[b] = lane.history.back();
+            for (std::int32_t j = 0; j < mtp_k_; ++j) {
+                mtp_host(mtp_io_.cells)[j * batch + b] = std::min(cell + j, limit);
+            }
+            slots[b] = static_cast<std::int32_t>(lanes[b]);
+            rows[b]  = static_cast<std::int32_t>(lanes[b]);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b, saved_column(lanes[b]).data,
+                                       column, cudaMemcpyDeviceToDevice, s));
+        }
+        if (!any) { return; }
+        auto* io = static_cast<std::byte*>(io_device_.p);
+        CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.slots, slots, 4ULL * batch, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.rows, rows, 4ULL * batch, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(mtp_device_.p, mtp_host_.data(), 4ULL * mtp_io_.drafts, cudaMemcpyHostToDevice, s));
+        const Tensor slot_tensor(io + io_layout_.slots, DType::I32, {batch});
+        const Tensor row_tensor(io + io_layout_.rows, DType::I32, {batch});
+        Tensor chain(mtp_chain_.p, DType::BF16, {width_, batch});
+        Tensor anchors(mtp_device(mtp_io_.ids), DType::I32, {batch});
+        if (unwritten) {
+            // The pending cells' K/V (rewriting a written cell is idempotent).
+            forward_->run_mtp({.residuals  = chain,
+                               .ids        = anchors,
+                               .positions  = Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}),
+                               .slots      = slot_tensor,
+                               .table_rows = row_tensor,
+                               .batch      = batch,
+                               .width      = 1,
+                               .kv_only    = true});
+        }
+        replay(mtp_draft_graphs_[static_cast<std::size_t>(batch - 1)], [&] {
+        for (std::int32_t j = 0; j < mtp_k_; ++j) {
+            Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
+            forward_->run_mtp({.residuals    = chain,
+                               .ids          = j == 0 ? anchors
+                                                      : Tensor(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j - 1) * batch),
+                                                               DType::I32, {batch}),
+                               .positions    = Tensor(mtp_device(mtp_io_.cells + static_cast<std::size_t>(j) * batch),
+                                                      DType::I32, {batch}),
+                               .slots        = slot_tensor,
+                               .table_rows   = row_tensor,
+                               .batch        = batch,
+                               .width        = 1,
+                               .kv_only      = false,
+                               .residual_out = chain,
+                               .drafts       = drafts});
+        }
+        });
+        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * mtp_k_ * batch,
+                                   cudaMemcpyDeviceToHost, s));
+        device_.synchronize();
+        for (std::int32_t b = 0; b < batch; ++b) {
+            Lane& lane = lanes_[lanes[b]];
+            if (unwritten && lane.mtp_live) { lane.mtp_written = true; }
+            for (std::int32_t j = 0; j < mtp_k_; ++j) {
+                mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
+            }
+        }
+    }
+
+    // After a verification round's commit: the drafter's cells of the verified window from its
+    // residuals and committed tokens (index-key tails advance by the committed count), and each
+    // row's last committed residual becomes its pending cell, already written.
+    void mtp_catch_up(std::span<const SequenceHandle> rows, std::int32_t W, const std::int32_t* commit) {
+        const cudaStream_t s = device_.stream;
+        const auto batch     = static_cast<std::int32_t>(rows.size());
+        const std::size_t column = 2ULL * width_;
+        auto* io = static_cast<std::byte*>(io_device_.p);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const std::int32_t k = commit[b];
+            for (std::int32_t j = 0; j < W; ++j) {
+                mtp_host(mtp_io_.up_ids)[b * W + j] =
+                    j < k ? pending_tokens_[static_cast<std::size_t>(b * W + j)] : pending_tokens_[static_cast<std::size_t>(b * W)];
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W,
+                                   cudaMemcpyHostToDevice, s));
+        const Tensor positions(io + io_layout_.positions, DType::I32, {W * batch});
+        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+        replay(mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
+        forward_->run_mtp({.residuals   = Tensor(mtp_residuals_.p, DType::BF16, {width_, W * batch}),
+                           .ids         = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
+                           .positions   = positions,
+                           .slots       = slots,
+                           .table_rows  = Tensor(io + io_layout_.rows, DType::I32, {batch}),
+                           .batch       = batch,
+                           .width       = W,
+                           .kv_only     = true,
+                           .key_records = Tensor(mtp_records_.p, DType::BF16, {di_, W, batch})});
+        Tensor tails(static_cast<std::byte*>(tails_backing_.p) +
+                         static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * options_.max_concurrency * 2,
+                     DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), 1});
+        ops::qsa_commit_tails(Tensor(mtp_records_.p, DType::BF16, {di_, W, batch, 1}), positions.view({W, batch}),
+                              Tensor(spec_device(spec_layout_.commit), DType::I32, {batch}), tails, slots,
+                              execution::qsa_geometry(c_), s);
+        });
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const std::int32_t k = commit[b];
+            const auto lane      = ContractAccess::lane(rows[static_cast<std::size_t>(b)]);
+            if (k < 1) { continue; }
+            CUDA_CHECK(cudaMemcpyAsync(saved_column(lane).data,
+                                       static_cast<const std::byte*>(mtp_residuals_.p) + column * (b * W + k - 1),
+                                       column, cudaMemcpyDeviceToDevice, s));
+            lanes_[lane].mtp_written = true;
+        }
     }
 
     // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
@@ -1221,18 +1494,28 @@ private:
     };
     OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
-    struct DecodeGraph {
-        DecodeGraphDefinition definition;
-        DecodeGraphExecutable executable;
-        bool warmed = false;
-    };
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
+    std::array<DecodeGraph, kMaximumConcurrency> mtp_draft_graphs_;
+    std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
 
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};
     std::vector<TokenId> pending_tokens_ = std::vector<TokenId>(kMaximumConcurrency, 0);
     std::array<std::int32_t, kMaximumConcurrency> pending_counts_{};
+
+    // MTP drafter.
+    struct MtpIo {
+        std::size_t ids = 0, cells = 0, drafts = 0, up_ids = 0, gather = 0, up_cells = 0, words = 0;
+    };
+    bool mtp_            = false;
+    std::int32_t mtp_k_  = 0;
+    std::int32_t mtp_columns_ = 0;
+    DeviceBuffer mtp_residuals_, mtp_saved_, mtp_chain_, mtp_records_, mtp_ones_, mtp_device_;
+    PinnedHostBuffer mtp_host_{1};
+    MtpIo mtp_io_;
+    std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
+    std::array<bool, kMaximumConcurrency> from_ngram_{};
 
     // Speculative verification (max_width_ > 1).
     std::int32_t max_width_   = 1;

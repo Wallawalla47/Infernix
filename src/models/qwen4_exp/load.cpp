@@ -178,6 +178,34 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
     return out;
 }
 
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c) {
+    const std::uint64_t h = c.hidden_size, width = c.residual_width(), e = c.moe.experts,
+                        ir = c.moe.intermediate, s = c.moe.shared_intermediate;
+    MtpWeights out;
+    out.embedding_norm       = b.direct("mtp/embedding_norm", {h});
+    out.hidden_norm          = b.direct("mtp/hidden_norm", {width});
+    out.embedding_projection = b.parameter("mtp/embedding_projection", {h, h}, "mtp/embedding_input");
+    out.hidden_projection    = b.parameter("mtp/hidden_projection", {h, h}, "mtp/hidden_input");
+    out.final_mixer          = bind_hc(b, c, "mtp/final_mixer/", false);
+    const std::string prefix = "mtp/layers/0/";
+    out.attn_hc   = bind_hc(b, c, prefix + "attn_hc/", true);
+    out.attention = bind_attention(b, c, prefix);
+    out.mlp_hc    = bind_hc(b, c, prefix + "mlp_hc/", true);
+    const std::string p = prefix + "moe/", input = prefix + "ffn_input";
+    out.router       = b.parameter(p + "router", {e, h}, input);
+    out.shared_score = b.parameter(p + "shared_score", {1, h}, input);
+    out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input);
+    out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
+    out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
+    for (std::uint64_t i = 0; i < e; ++i) {
+        const std::string ep = p + "experts/" + std::to_string(i) + "/";
+        out.expert_gate_up.push_back(b.parameter(ep + "gate", {ir, h}, input));
+        out.expert_gate_up.push_back(b.parameter(ep + "up", {ir, h}, input));
+        out.expert_down.push_back(b.parameter(ep + "down", {h, ir}, ep + "product"));
+    }
+    return out;
+}
+
 FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
     const auto resource = [&](std::string_view role) {
         const auto bytes = binder.host_object(binder.resource("text", role));
@@ -267,6 +295,27 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->resources = bind_resources(binder, out->config.text);
     Bindings bindings(binder);
     out->weights = bind_text(bindings, out->config.text);
+    if (out->config.mtp) {
+        out->weights.mtp = bind_mtp(bindings, out->config.text);
+        if (out->config.proposal_rows != 0) {
+            const std::uint64_t rows = out->config.proposal_rows;
+            ProposalWeights proposal;
+            proposal.head      = bindings.parameter("proposal/head", {rows, out->config.text.hidden_size},
+                                                    "mtp/final_hidden");
+            proposal.token_ids = bindings.direct("proposal/token_ids", {rows}, QType::INT32);
+            const auto ids = binder.values(bindings.weights.at(proposal.token_ids.index).reference.binding,
+                                           QType::INT32)
+                                 .integers();
+            std::vector<bool> seen(out->config.text.vocab_size, false);
+            for (const auto id : ids) {
+                if (id < 0 || std::uint32_t(id) >= out->config.text.vocab_size || seen[std::size_t(id)]) {
+                    throw ArtifactError("proposal token ids must be unique vocabulary ids");
+                }
+                seen[std::size_t(id)] = true;
+            }
+            out->weights.proposal = proposal;
+        }
+    }
     for (const auto& layer : out->weights.layers) {
         out->input_scales.push_back(
             binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding,

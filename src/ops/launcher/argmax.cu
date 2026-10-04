@@ -60,6 +60,23 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
 
 namespace {
 
+__global__ void argmax_map_kernel(const std::int32_t* row_ids, std::int32_t* out, std::int32_t count) {
+    const std::int32_t t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < count) { out[t] = row_ids[out[t]]; }
+}
+
+} // namespace
+
+void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream) {
+    const std::int32_t count = out.ne[0];
+    if (count == 0) { return; }
+    argmax_map_kernel<<<static_cast<unsigned int>((count + 127) / 128), 128, 0, stream>>>(
+        static_cast<const std::int32_t*>(row_ids.data), static_cast<std::int32_t*>(out.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+namespace {
+
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                 int block, cudaStream_t stream) {
     const std::int32_t physical_rows = logits.ne[0];

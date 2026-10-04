@@ -68,4 +68,14 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     detail::argmax_launch(logits, out, valid_rows, stream);
 }
 
+void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32_t valid_rows,
+            cudaStream_t stream) {
+    if (row_ids.dtype != DType::I32 || !row_ids.is_contiguous() || row_ids.data == nullptr ||
+        row_ids.numel() != logits.ne[0]) {
+        throw std::invalid_argument("argmax: row_ids must be contiguous I32 [physical_rows]");
+    }
+    argmax(logits, out, valid_rows, stream);
+    detail::argmax_map_launch(row_ids, out, stream);
+}
+
 } // namespace ninfer::ops

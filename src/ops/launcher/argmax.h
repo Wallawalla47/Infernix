@@ -10,4 +10,7 @@ namespace ninfer::ops::detail {
 
 void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream);
 
+// out[t] = row_ids[out[t]] in place.
+void argmax_map_launch(const Tensor& row_ids, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

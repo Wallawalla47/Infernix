@@ -298,11 +298,16 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
 def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
     """Recipe B of Qwen3.8-Flash-Next (design §6.1): recipe A, plus the dense projection classes
     that dominate per-token weight reads in ``q8_g32_fp16`` (W8A16): the GDN q/k/v/z and output
-    projections, the QSA output projection, the shared experts, the hyper-connection mixers and the
-    PLE projections. ``q8_g32_fp16`` is used for every class rather than FP8 rows: a 32-element
-    group scale and an 8-bit integer give far finer resolution at 1.06 bytes per weight. The
-    router, shared-expert gate, GDN a/b, the QSA query/gate/key/value/indexer group, ``lm_head``,
-    the embedding and every MTP tensor stay as recipe A has them."""
+    projections, the QSA output projection, the shared experts, the hyper-connection mixers, the
+    PLE projections and ``lm_head``. ``q8_g32_fp16`` is used for every class rather than FP8 rows: a
+    32-element group scale and an 8-bit integer give far finer resolution at 1.06 bytes per weight.
+    The router, shared-expert gate, GDN a/b, the QSA query/gate/key/value/indexer group and the
+    embedding stay as recipe A has them.
+
+    The MTP drafter only proposes tokens that the main model verifies, so its precision changes
+    acceptance, never output (design §11.2). Its projections are ``q8_g32_fp16`` except the
+    router and shared-expert gate, and its 512 routed experts ``q4_g64_fp16`` with MSE-chosen
+    group scales (1.34 GB, all VRAM-resident; Strata keeps them at 2.25 bits)."""
 
     qwen3_8_flash_next_nvfp4(model, recipe, sources)
     dense8 = (
@@ -316,8 +321,17 @@ def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
     for name in model.parameters:
         if name.startswith("text/layers/") and name.endswith(dense8):
             _assign(recipe, name, Q8)
-    for name in ("text/final_mixer/down", "text/final_mixer/up"):
+    for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
         _assign(recipe, name, Q8)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("mtp/") or not parameter.projection:
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")):
+            continue
+        if "/moe/experts/" in name:
+            _assign(recipe, name, Q4, method=grouped_mse)
+        else:
+            _assign(recipe, name, Q8)
 
 
 RECIPES = {

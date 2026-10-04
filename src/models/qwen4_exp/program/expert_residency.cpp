@@ -11,10 +11,11 @@ using expert_cache::CacheController;
 using expert_cache::ResidencyEntry;
 using expert_cache::ResidencyState;
 
-// Frames kept free for one round's promotions while its victims' frames retire.
-std::uint32_t slack_frames(std::uint32_t frames) {
-    return frames == 0 ? 0 : std::min<std::uint32_t>(std::max<std::uint32_t>(frames / 8, 1), 512);
-}
+// Frames kept free for one round's promotions while its victims' frames retire. None: the
+// Program calls after_round only on a quiescent compute stream, and its on_quiescent frees every
+// retired frame and drains the queue before the next round, so slack frames would never hold an
+// expert (they cost 512 frames at 9,443). An asynchronous agent that overlaps rounds needs them.
+std::uint32_t slack_frames(std::uint32_t) { return 0; }
 
 } // namespace
 
@@ -95,8 +96,10 @@ void ExpertResidency::before_round(cudaStream_t compute) {
 void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t columns) {
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
     if (used > route_stride_) { throw std::logic_error("expert residency: round exceeds the route log"); }
-    CUDA_CHECK(cudaMemcpyAsync(route_host_.data(), route_device_.p, route_stride_ * layers_ * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToHost, compute));
+    // Only the round's columns of each layer's log.
+    const std::size_t pitch = route_stride_ * sizeof(std::int32_t);
+    CUDA_CHECK(cudaMemcpy2DAsync(route_host_.data(), pitch, route_device_.p, pitch, used * sizeof(std::int32_t),
+                                 layers_, cudaMemcpyDeviceToHost, compute));
 }
 
 void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
