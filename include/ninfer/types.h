@@ -296,6 +296,8 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
+    std::filesystem::path ngram_volume_path;
     // Message the model receives when it hits its thinking budget, before the canonical
     // </think> close the frontend appends when the message lacks it. Empty preserves the
     // model's built-in end-of-thinking control suffix.

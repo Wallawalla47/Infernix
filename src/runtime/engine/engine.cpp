@@ -10,6 +10,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/qwen4_exp_instance.h"
 
 #include <algorithm>
 #include <atomic>
@@ -204,13 +205,30 @@ public:
         runtime::EngineCore<runtime::ModelInstance,
                             runtime::HybridResourceManager<runtime::ModelInstance::ModelContract>>;
     using ScoringCore = runtime::CausalScoreCore<runtime::ModelInstance>;
+    // Qwen3.8-Flash-Next: the common core over the hybrid manager surface, without a prefix cache.
+    using Qwen4ExpCore = runtime::EngineCore<
+        runtime::Qwen4ExpInstance, runtime::HybridResourceManager<runtime::Qwen4ExpInstance::ModelContract>>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>>;
+                              std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
+                              std::unique_ptr<Qwen4ExpCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
+            auto constructed  = runtime::construct_qwen4_exp(options, device);
+            options           = std::move(constructed.options);
+            qwen4             = std::move(constructed.instance);
+            load              = std::move(constructed.load);
+            model_metadata    = std::move(constructed.model_metadata);
+            load.cuda_sync_mode = device.sync_mode();
+            sampling_defaults = qwen4->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+            core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, runtime::ContextMachineCostModel{});
+            finalize_phase.complete();
+            return;
+        }
         const bool tree_auto_requested = options.speculative.draft_tree_auto;
         auto constructed               = runtime::construct_model(options, device);
         active                         = std::move(constructed.instance);
@@ -299,9 +317,16 @@ public:
         } catch (...) {}
     }
 
+    [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
+        return qwen4 != nullptr ? qwen4->frontend : active->frontend;
+    }
+
+    [[nodiscard]] std::uint32_t capacity() const { return qwen4 != nullptr ? qwen4->capacity : active->capacity; }
+
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;
+    std::unique_ptr<runtime::Qwen4ExpInstance> qwen4;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -323,11 +348,11 @@ Engine& Engine::operator=(Engine&&) noexcept = default;
 PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& control) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    auto prepared      = impl_->active->frontend.prepare(std::move(input), control);
+    auto prepared      = impl_->frontend().prepare(std::move(input), control);
     PromptSummary info = prepared.summary();
     const SamplingMode sampling_mode =
         info.starts_in_reasoning ? SamplingMode::Thinking : SamplingMode::NonThinking;
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted a prompt beyond Engine capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -340,14 +365,13 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    if (token_ids.size() > impl_->active->capacity) {
+    if (token_ids.size() > impl_->capacity()) {
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                           context_capacity_error(token_ids.size(), impl_->active->capacity));
+                           context_capacity_error(token_ids.size(), impl_->capacity()));
     }
-    auto prepared =
-        impl_->active->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity);
     PromptSummary info = prepared.summary();
-    if (info.prompt_tokens > impl_->active->capacity) {
+    if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
     }
     const PromptPreparationStats preparation = prepared.preparation_stats();
@@ -357,7 +381,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.tokenize_text(text);
+    return impl_->frontend().tokenize_text(text);
 }
 
 ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t first_target,
@@ -408,7 +432,7 @@ ScoreResult Engine::score_tokens(std::vector<TokenId> tokens, std::uint32_t firs
 
 std::uint32_t Engine::count_tokens(PromptInput input, const PreparationControl& control) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.count_tokens(std::move(input), control);
+    return impl_->frontend().count_tokens(std::move(input), control);
 }
 
 ModelSamplingDefaults Engine::sampling_defaults() const {
@@ -539,7 +563,7 @@ MemorySummary Engine::memory_summary() const {
 
 MediaCacheSummary Engine::media_cache_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.media_cache_summary();
+    return impl_->frontend().media_cache_summary();
 }
 
 RuntimeStats Engine::runtime_stats() const {
