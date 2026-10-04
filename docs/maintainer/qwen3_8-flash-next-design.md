@@ -2925,6 +2925,35 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   copy engine, which runs FIFO across streams, with bulk promotions. So every round waited for
   the previous round's promotions to land. Plain decode pays the same every fourth round, when
   48 promotions (132 MB, ~4.8 ms) go out.
+- **Pinned uploads (adopted).** A Core primitive, `upload_pinned`, copies pinned (UVA-mapped)
+  host memory to the device with a small kernel in stream order. Every per-round staging copy
+  uses it; prefill chunks keep the bulk copy. GPU idle time fell from 22.5 % to 10.9 % of MTP
+  decode. Greedy ids are unchanged.
+
+  | Workload (same flags) | Before | After |
+  |---|---:|---:|
+  | tg512 plain | 85.46 | **88.81** |
+  | tg512 MTP max 4, `--lm-head-draft` | 121.20 | **131.78** |
+  | Cold CLI code, plain / MTP | 57.2 / 67.6 | **64.8 / 75.3** |
+  | Cold CLI story, plain / MTP | 57.5 / 56.8 | **63.9 / 62.3** |
+
+  The remaining host gaps are ~0.58 ms per round after a verification (the cache policy) and
+  ~0.56 ms after drafting (verification staging, n-gram rows).
+- **CPU jobs per layer call (adopted: 8).** After these fixes `cpu_wait` costs 0.35 ms per token,
+  so the CPU had slack. tg512 with MTP max 4, CPU jobs / PCIe divisor:
+
+  | Jobs / divisor | tok/s |
+  |---|---:|
+  | 6 / 3 (previous default) | 131.96 ± 0.75 |
+  | **8 / 3** | **133.55 ± 0.49** |
+  | 6 / 5 | 131.87 ± 0.57 |
+  | 8 / 5 | 133.06 ± 0.54 |
+  | 8 / 0 | 130.54 ± 0.43 |
+
+  Plain decode is neutral at 8 / 3 (89.04 against 88.98). The split is not the bottleneck any
+  more, because the fork overlaps the PCIe stage with the hit compute. With 8 / 3 as the default
+  (greedy ids unchanged): tg512 plain 88.70, MTP max 4 133.54. Cold CLI code plain 64.7 / MTP
+  81.9, story plain 63.9 / MTP 65.4, so MTP is no longer slower on cold prose.
 
 **Two lanes (sanity check only).** `ninfer-serve --max-concurrency 2 --spec mtp --draft-tokens 3
 --lm-head-draft`, temperature 0, 200 tokens, code and story requests sent together on a cold

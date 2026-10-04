@@ -63,7 +63,8 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. See [ngram copy proposals](ngram.md).
-- The engine starts six CPU worker threads for missed experts. They spin while decoding. More
+- The engine starts six CPU worker threads for missed experts (up to eight per layer call). They
+  spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
 - The expert cache fills all VRAM but 384 MiB (98.8 % used on the 5090).
 
@@ -74,16 +75,16 @@ warms up over the first few hundred tokens of a session.
 
 | Workload | tok/s |
 |---|---:|
-| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~115 |
-| `ninfer_bench` tg512, plain decode (warm cache) | ~83 |
-| Single CLI request, cold cache, plain | ~57 |
-| Single CLI request, cold cache, MTP: code rewrite / prose story | ~67 / ~55 |
+| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~132 |
+| `ninfer_bench` tg512, plain decode (warm cache) | ~89 |
+| Single CLI request, cold cache, plain | ~64 |
+| Single CLI request, cold cache, MTP: code rewrite / prose story | ~82 / ~65 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |
 | Prompt, 4,096 tokens, default chunk 1024 | ~410 |
 
 MTP accepts most drafts on code and other predictable text, and fewer on free prose. The draft
-length follows the measured acceptance, so prose mostly drafts one token. On a cold cache prose
-is still ~3 % slower than plain decode (design §19.2).
+length follows the measured acceptance, so prose mostly drafts one token and stays at least as
+fast as plain decode (design §19.2).
 
 **Quality.** Teacher-forced perplexity over three frozen texts (2,557 positions, INT8 KV): recipe
 A 4.564, recipe B 4.600. For comparison, Strata with UD-Q4_K_XL and INT8 KV gives 4.864.
