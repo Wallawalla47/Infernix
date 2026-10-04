@@ -82,6 +82,19 @@ __device__ __forceinline__ int row_quad(const std::uint8_t* unit, int r, int q) 
     return packed;
 }
 
+// A CTA's weight slice is contiguous in the record. Every thread issues 16-byte asynchronous copies
+// of it into shared memory, so the whole slice is in flight at once instead of one 144-byte unit
+// per warp iteration; this matters most for records read zero-copy over PCIe.
+__device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_t* dst, int bytes) {
+    for (int i = static_cast<int>(threadIdx.x) * 16; i < bytes; i += static_cast<int>(blockDim.x) * 16) {
+        const auto s = static_cast<unsigned>(__cvta_generic_to_shared(dst + i));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(src + i) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+
 __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& source, int expert) {
     const int frame = source.frames[expert];
     return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride
@@ -238,7 +251,12 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const
     }
 }
 
+constexpr int kGateUpSliceBytes = kGateUpGroups * moe::kGateUpBlocks * static_cast<int>(moe::kUnitBytes); // 46,080
+constexpr int kDownSliceBytes   = kDownGroups * moe::kDownBlocks * static_cast<int>(moe::kUnitBytes);     // 23,040
+static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
+
 struct GateUpShared {
+    alignas(16) std::uint8_t stage[kGateUpSliceBytes];
     ActBlock acts[kPassColumns * moe::kGateUpBlocks];          // 25,600 B
     std::int64_t partial[kWarps][16 * kGateUpGroups][kPassColumns]; // 16,384 B
     std::uint16_t y[kPassColumns][16 * kGateUpGroups];
@@ -259,6 +277,8 @@ __global__ void __launch_bounds__(kThreads)
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const bool split_input = scales.input_up != scales.input_gate;
+    stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
+                sm.stage, kGateUpSliceBytes);
 
     for (int pass = 0; pass < count; pass += kPassColumns) {
         const int n = min(kPassColumns, count - pass);
@@ -268,9 +288,10 @@ __global__ void __launch_bounds__(kThreads)
             quantize_columns(x, hidden, dispatch.entries, first + pass, n, top_k,
                              parity == 0 ? scales.input_gate : scales.input_up, sm.acts,
                              moe::kGateUpBlocks);
+            stage_wait();
             __syncthreads();
             std::int64_t s[kGateUpGroups][kPassColumns];
-            unit_sums<kGateUpGroups>(record, moe::kGateUpBlocks, kGateUpGroups * slice, sm.acts, n, s);
+            unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
             if (lane < 16) {
 #pragma unroll
                 for (int g = 0; g < kGateUpGroups; ++g) {
@@ -303,6 +324,7 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 struct DownShared {
+    alignas(16) std::uint8_t stage[kDownSliceBytes];
     ActBlock acts[kPassColumns * kHBlocks];                       // 6,400 B
     std::int64_t partial[kWarps][16 * kDownGroups][kPassColumns]; // 32,768 B
 };
@@ -321,15 +343,18 @@ __global__ void __launch_bounds__(kThreads)
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
+                kDownSliceBytes);
     for (int pass = 0; pass < count; pass += kPassColumns) {
         const int n = min(kPassColumns, count - pass);
         __syncthreads();
         for (int i = threadIdx.x; i < n * kHBlocks; i += blockDim.x) {
             sm.acts[i] = to_act(h_blocks[static_cast<std::size_t>(first + pass) * kHBlocks + i]);
         }
+        stage_wait();
         __syncthreads();
         std::int64_t s[kDownGroups][kPassColumns];
-        unit_sums<kDownGroups>(down, moe::kDownBlocks, kDownGroups * tile, sm.acts, n, s);
+        unit_sums<kDownGroups>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
         if (lane < 16) {
 #pragma unroll
             for (int g = 0; g < kDownGroups; ++g) {
