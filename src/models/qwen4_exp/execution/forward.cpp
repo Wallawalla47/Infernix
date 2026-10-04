@@ -96,6 +96,8 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     }
     const cudaStream_t s = device_.stream;
     const std::int32_t H = dim(config_.hidden_size), W = dim(config_.residual_width());
+    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
+    eager_chunk_ = batch.verify == nullptr && batch.width > 1;
     work_.reset();
     Tensor x0 = work_.alloc(DType::BF16, {H, T});
     ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
@@ -372,6 +374,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
                                 .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};
+    // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
+    if (eager_chunk_ && experts_.overlap_stream != nullptr) {
+        source.overlap_stream = experts_.overlap_stream;
+        for (int i = 0; i < 5; ++i) { source.overlap_events[i] = experts_.overlap_events[static_cast<std::size_t>(i)]; }
+    }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
     }

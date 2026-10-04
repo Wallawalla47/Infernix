@@ -291,6 +291,10 @@ public:
         staging_ = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * record_stride);
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
+        for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
+        experts.overlap_stream = overlap_.stream;
+        experts.overlap_events = overlap_.events;
         // CPU-served misses for decode and verify calls (prefill chunks stay on the GPU).
         const std::uint32_t cpu_workers = options_.cpu_expert_workers;
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
@@ -1204,6 +1208,18 @@ private:
     std::unique_ptr<WorkspaceArena> work_;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
+    // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.
+    struct OverlapResources {
+        ~OverlapResources() {
+            for (auto event : events) {
+                if (event != nullptr) { cudaEventDestroy(event); }
+            }
+            if (stream != nullptr) { cudaStreamDestroy(stream); }
+        }
+        cudaStream_t stream = nullptr;
+        std::array<cudaEvent_t, 5> events{};
+    };
+    OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
     struct DecodeGraph {
         DecodeGraphDefinition definition;
