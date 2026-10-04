@@ -18,30 +18,33 @@ except (AttributeError, ValueError):
     _PAGE_BYTES = 4096
 
 
+# Windows descriptors default to text mode, which translates bytes; every descriptor these tools
+# open for payload I/O must be binary.
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+
 def _install_pread_pwrite() -> None:
     if hasattr(os, "pread") and hasattr(os, "pwrite"):
         return
 
-    # On Windows a bare os.lseek/os.read on a descriptor from os.open does not
-    # honour the seek position (it returns a short read), so transfer through a
-    # buffered file object on a duplicate descriptor instead. The duplicate is
-    # owned and closed by the context manager; the original descriptor is left
-    # untouched.
+    # Windows has no positional I/O in the os module. The tools use each descriptor from one
+    # thread at a time, so a seek followed by unbuffered reads or writes is equivalent; the
+    # descriptor must be binary (O_BINARY or tempfile.mkstemp).
     def pread(fd: int, length: int, offset: int) -> bytes:
-        dup = os.dup(fd)
-        with os.fdopen(dup, "rb", buffering=IO_CHUNK_BYTES) as handle:
-            handle.seek(offset)
-            return handle.read(length)
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks = []
+        remaining = length
+        while remaining:
+            data = os.read(fd, min(remaining, 1 << 30))
+            if not data:
+                break
+            chunks.append(data)
+            remaining -= len(data)
+        return chunks[0] if len(chunks) == 1 else b"".join(chunks)
 
     def pwrite(fd: int, data, offset: int) -> int:
-        dup = os.dup(fd)
-        with os.fdopen(dup, "wb", buffering=IO_CHUNK_BYTES) as handle:
-            handle.seek(offset)
-            view = memoryview(data)
-            written = 0
-            while written < len(view):
-                written += handle.write(view[written:])
-            return written
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.write(fd, data)
 
     if not hasattr(os, "pread"):
         os.pread = pread
