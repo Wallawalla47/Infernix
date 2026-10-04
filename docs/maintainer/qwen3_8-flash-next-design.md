@@ -3767,9 +3767,10 @@ measurements):
 - **MR1.** `stage_mtp_chunk` prepends iff `mtp_cells < begin` and sets `mtp_cells = begin +
   columns` (`state_tokens` for non-last prompt calls and forced tokens, `state_tokens − 1` for the
   last prompt call); the drafter's pending-cell write and the catch-up set `state_tokens`. The
-  settled invariant is checked after every commit (plain and verified), throwing `logic_error` like
-  the Program's other invariant checks: it costs O(rows), and the code base has no debug-only check
-  convention. `finish` is `noexcept`, so there it is a Warning diagnostic.
+  settled invariant is checked after every commit (plain and verified) and at `finish`, at O(rows).
+  A violation cannot change output (verification rejects bad drafts), so it does not fail the
+  request: drafting is switched off for the rest of that request (`mtp_live = false`) and a Warning
+  diagnostic reports the defect.
 - **MR2** runs in `commit`'s cancelled branch for plain rounds only, on the compute stream: the
   round's `residual_out` column of that row (`mtp_residuals_`) becomes the saved column and
   `mtp_cells = state_tokens − 1`. The released lane does not use it today; it makes P3's abort
