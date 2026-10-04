@@ -48,7 +48,7 @@ void require_same_shape(const Tensor& a, const Tensor& b, const char* b_label) {
 namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                  const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
+                  const Tensor* z, bool sigmoid_gate, Tensor& out, std::int32_t multiprocessor_count,
                   cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
         (z != nullptr && z->dtype != DType::BF16)) {
@@ -84,22 +84,28 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
-    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, out, multiprocessor_count, stream);
+    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, sigmoid_gate, out, multiprocessor_count, stream);
 }
 
 } // namespace
 
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream) {
-    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, 0, stream);
+    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, false, out, 0, stream);
 }
 
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    DeviceExecutionView execution) {
+    gated_rmsnorm(x, weight, z, RmsGate::Silu, eps, out, execution);
+}
+
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGate gate, float eps,
+                   Tensor& out, DeviceExecutionView execution) {
     if (execution.multiprocessor_count <= 0) {
         throw std::invalid_argument("gated_rmsnorm: positive multiprocessor count required");
     }
-    rmsnorm_impl(x, weight, eps, false, &z, out, execution.multiprocessor_count, execution.stream);
+    rmsnorm_impl(x, weight, eps, false, &z, gate == RmsGate::Sigmoid, out, execution.multiprocessor_count,
+                 execution.stream);
 }
 
 } // namespace ninfer::ops

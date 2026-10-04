@@ -3,6 +3,8 @@
 #include "core/device.h"
 #include "core/tensor.h"
 
+#include <cstdint>
+
 namespace ninfer::ops {
 
 /**
@@ -22,5 +24,15 @@ namespace ninfer::ops {
  */
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    DeviceExecutionView execution);
+
+enum class RmsGate : std::uint8_t { Silu, Sigmoid };
+
+/**
+ * The same normalization with a selectable gate: ideal[d,r] = x[d,r] * inv_r * weight[d] *
+ * G(z[d,r]), where G is SiLU or the logistic sigmoid. Every other requirement and the numerical
+ * criterion are those of the SiLU form above.
+ */
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGate gate, float eps,
+                   Tensor& out, DeviceExecutionView execution);
 
 } // namespace ninfer::ops

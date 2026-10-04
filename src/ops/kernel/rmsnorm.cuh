@@ -15,14 +15,20 @@ namespace ninfer::ops {
 enum class RmsEpilogue {
     Offset,
     Plain,
-    Gated,
+    Gated,        // x * inv * weight * SiLU(z)
+    SigmoidGated, // x * inv * weight * sigmoid(z)
 };
+
+[[nodiscard]] __host__ __device__ constexpr bool rms_gated(RmsEpilogue epilogue) {
+    return epilogue == RmsEpilogue::Gated || epilogue == RmsEpilogue::SigmoidGated;
+}
 
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
     if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::SigmoidGated) { value *= 1.0f / (1.0f + expf(-z)); }
     return value;
 }
 
@@ -58,7 +64,7 @@ __launch_bounds__(Block) __global__
             values[k] = x[row_base + pair];
             if constexpr (Prefetch) {
                 weights[k] = weight[pair];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { gates[k] = z[row_base + pair]; }
             }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
@@ -78,14 +84,14 @@ __launch_bounds__(Block) __global__
             __nv_bfloat162 z_pair{};
             if constexpr (Prefetch) {
                 w_pair = weights[k];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = gates[k]; }
+                if constexpr (rms_gated(Epilogue)) { z_pair = gates[k]; }
             } else {
                 w_pair = weight[pair];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { z_pair = z[row_base + pair]; }
             }
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
+            if constexpr (rms_gated(Epilogue)) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -125,7 +131,7 @@ __launch_bounds__(Block) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (rms_gated(Epilogue)) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -169,7 +175,7 @@ __launch_bounds__(Block) __global__
             values[k]      = x[row_base + pair];
             if constexpr (Prefetch) {
                 weights[k] = weight[pair];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { gates[k] = z[row_base + pair]; }
             }
             const float2 xf = __bfloat1622float2(values[k]);
             sum += xf.x * xf.x + xf.y * xf.y;
@@ -192,14 +198,14 @@ __launch_bounds__(Block) __global__
             __nv_bfloat162 z_pair{};
             if constexpr (Prefetch) {
                 w_pair = weights[k];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = gates[k]; }
+                if constexpr (rms_gated(Epilogue)) { z_pair = gates[k]; }
             } else {
                 w_pair = weight[pair];
-                if constexpr (Epilogue == RmsEpilogue::Gated) { z_pair = z[row_base + pair]; }
+                if constexpr (rms_gated(Epilogue)) { z_pair = z[row_base + pair]; }
             }
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
-            if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
+            if constexpr (rms_gated(Epilogue)) { zf = __bfloat1622float2(z_pair); }
             out[row_base + pair] =
                 __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
@@ -240,7 +246,7 @@ __launch_bounds__(512) __global__
     const float2 w1 = __bfloat1622float2(weight[pair1]);
     float2 z0{0.0f, 0.0f};
     float2 z1{0.0f, 0.0f};
-    if constexpr (Epilogue == RmsEpilogue::Gated) {
+    if constexpr (rms_gated(Epilogue)) {
         z0 = __bfloat1622float2(z[row_base + pair0]);
         z1 = __bfloat1622float2(z[row_base + pair1]);
     }
@@ -283,7 +289,7 @@ __launch_bounds__(256) __global__
         const float xv           = __bfloat162float(x[index]);
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
-        if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
+        if constexpr (rms_gated(Epilogue)) { zv = __bfloat162float(z[index]); }
         out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
     }
 }
