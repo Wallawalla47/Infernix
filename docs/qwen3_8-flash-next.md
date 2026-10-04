@@ -75,10 +75,10 @@ warms up over the first few hundred tokens of a session.
 
 | Workload | tok/s |
 |---|---:|
-| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~132 |
-| `ninfer_bench` tg512, plain decode (warm cache) | ~89 |
-| Single CLI request, cold cache, plain | ~64 |
-| Single CLI request, cold cache, MTP: code rewrite / prose story | ~82 / ~65 |
+| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~139 |
+| `ninfer_bench` tg512, plain decode (warm cache) | ~90 |
+| Single CLI request, cold cache, plain | ~65 |
+| Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~66 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |
 | Prompt, 4,096 tokens, default chunk 1024 | ~410 |
 
