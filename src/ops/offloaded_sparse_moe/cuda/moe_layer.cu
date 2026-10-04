@@ -127,6 +127,7 @@ __device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, cons
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
+constexpr int kNarrowPassColumns = 4; // calls of at most this many columns use the one-column kernels
 constexpr int kStageChunk = 16384;
 constexpr int kMaxPassJobs = 512;
 
@@ -359,14 +360,21 @@ static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
 template <int Columns>
 struct GateUpShared {
     alignas(16) std::uint8_t stage[kGateUpSliceBytes];
-    ActBlock acts[Columns * moe::kGateUpBlocks];
-    std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
+    // The activations are read only by unit_sums and the partial sums are written only after the
+    // barrier that follows it, so they share storage. That keeps the one-column CTA (49,376 B)
+    // under half of an SM's 100 KB, so two of them fit per SM.
+    union {
+        ActBlock acts[Columns * moe::kGateUpBlocks];
+        std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
+    };
     std::uint16_t y[Columns][16 * kGateUpGroups];
     std::uint16_t h[Columns][16];
 };
 
+static_assert(sizeof(GateUpShared<1>) + 1024 <= 102400 / 2, "two one-column gate/up CTAs must fit an SM");
+
 template <int Columns>
-__global__ void __launch_bounds__(kThreads)
+__global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
                    MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
                    const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
@@ -398,6 +406,7 @@ __global__ void __launch_bounds__(kThreads)
             __syncthreads();
             std::int64_t s[kGateUpGroups][Columns];
             unit_sums<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
+            __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
             if (lane < 16) {
 #pragma unroll
                 for (int g = 0; g < kGateUpGroups; ++g) {
@@ -497,6 +506,10 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                              static_cast<int>(sizeof(GateUpShared<Columns>)));
         cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              static_cast<int>(sizeof(DownShared<Columns>)));
+        cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
         return true;
     }();
     (void)configured;
@@ -809,7 +822,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        if (x.ne[1] == 1) {
+        if (x.ne[1] <= kNarrowPassColumns) {
             launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
                                   outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
             launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
@@ -831,9 +844,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
                                                                                        flags, job_records);
         check_launch("stage");
-        // A one-token call has one column per job: the one-column kernels' smaller shared memory
-        // fits twice the CTAs per SM, so a decode layer's jobs run in one wave.
-        if (x.ne[1] == 1) {
+        // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
+        // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
+        // staged weights.
+        if (x.ne[1] <= kNarrowPassColumns) {
             launch_expert_pass<1>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base,
                                   jobs, h_blocks, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         } else {
