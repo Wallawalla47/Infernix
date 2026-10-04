@@ -1565,6 +1565,12 @@ order than at T = 1. Speculative greedy output can then differ from plain greedy
   requires the GPU wide route (n > 8, §8.5) to use the §16.2 arithmetic.
 - M7 measures the cost and the observed divergence rate without the option. The option is adopted if
   the cost is below ~3% of a round.
+- **Decided (2026-10-04): not adopted; one row needs nothing.** The dense Q8 routes are
+  column-invariant up to 8 columns (SIMT), and one row verifies at most 5 (MTP) or 8 (n-gram)
+  columns. Greedy MTP output equalled plain decode in every C = 1 run. Only multi-row blocks of
+  more than 8 columns reach the MMA tiles (§19.2). Splitting those into ≤ 8-column SIMT launches
+  would cost about one extra pass over the dense weights per round (estimated, not measured).
+  That is above the 3 % bar for a property that does not change quality.
 
 ### 11.4 Overlap
 
@@ -2980,15 +2986,26 @@ selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
 server, then each alone.
 
 - **Robustness:** no crash or hang. MTP acceptance was 94.8 % and 63.0 %.
-- **Output equality (open: batch variance of multi-row verification).** The code answer is
-  identical concurrent and alone; the story diverges after ~30 tokens at a near-tie. The same
-  check without speculation is identical for both prompts, so plain batching is invariant.
-  With n-gram copy proposals and no MTP (`--ngram-draft-tokens 7`), the story also diverges, and
-  it had no drafts of its own: it only rode in the code row's verification rounds. So the cause
-  predates MTP and is not corruption (the text agrees up to a near-tie). Some verification-path
-  kernel rounds differently with two rows × W columns than with one row. This is the
-  verify-width invariance question of §11.3, extended to rows. Greedy output with speculation
-  equals plain decode at C = 1 in every run; at C > 1 it may differ at near-ties.
+- **Output equality (explained: verification block width).** The code answer is identical
+  concurrent and alone; the story diverges after ~30 tokens at a near-tie. Plain C = 2 decode is
+  identical for both prompts. With n-gram copy proposals and no MTP (`--ngram-draft-tokens 7`),
+  the story also diverges, and it had no drafts of its own: it only rode in the code row's
+  verification rounds. So the cause predates MTP and is not corruption.
+  - **Cause, probed at the op.** On the Flash-Next dense Q8 shapes, an output column is
+    bit-identical to the same column computed alone for blocks of 1-8 columns, which use the SIMT
+    routes. From 9 columns the MMA tiles take over, and 40-45 % of BF16 outputs differ by
+    rounding. That holds on all eight classes probed ([16384,2560] … [10240,320]; T = 9, 10, 16,
+    40).
+  - **Why C = 1 matches.** One row verifies at most 8 columns: MTP with up to 4 drafts uses at
+    most 5, n-gram 8. Two rows verify 2 × W columns, so they cross into MMA.
+  - **Contract.** Upstream promises no bit-identity across verification widths
+    ([n-gram guide](../ngram.md)), so this is the documented behaviour, not a defect. The probe
+    does not exclude other width-dependent routes (QSA verification attention, GDN record) from
+    also contributing.
+  - **Possible change.** Verification blocks of 9-16 columns could run as two SIMT launches of
+    ≤ 8 columns to keep concurrency-invariant greedy output. Each launch reads the dense Q8
+    weights again. Not done: it buys determinism, not quality, and two lanes are slower than one
+    anyway.
 - **Throughput:** concurrent decode reached 24.9 + 21.7 tok/s on the cold cache, below one cold
   request (~55-67 tok/s). Two unrelated sequences double the distinct experts per round. C > 1
   under MTP is not tuned; C = 1 is the recommended setting for now.
@@ -3004,8 +3021,7 @@ server, then each alone.
    - BF16 tensor-core shapes for the QSA group.
 3. The remaining host time per MTP round: ~0.58 ms of cache policy after verification and
    ~0.56 ms of staging after drafting. Both could overlap GPU work.
-4. Concurrency with MTP: two lanes on a cold cache ran slower in aggregate than one. Also the
-   verify-width invariance of §11.3.
+4. Concurrency with MTP: two lanes on a cold cache ran slower in aggregate than one.
 5. Dense decode GEMV (the Q8 SIMT route at ~65 % of the byte floor), split-K for the HC down
    shapes, and fewer small kernels (~1,800 per round).
 6. The QSA QKVG group split from the indexer (~1 % of decode; needs a reconversion).
