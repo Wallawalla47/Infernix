@@ -198,6 +198,7 @@ int main() {
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // verify width: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert
+        test_layer(9, 4, 3, 17);   // MTP verification width: one-column kernels, several passes per job
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;
