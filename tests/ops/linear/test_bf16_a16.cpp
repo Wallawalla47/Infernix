@@ -293,6 +293,18 @@ int run_general_bf16_linear() {
             failures += run_bf16_linear_case(weight, tokens);
         }
     }
+    // Qwen3.8-Flash-Next's BF16 projections (hyper-connection down/up, GDN, QSA, shared expert,
+    // PLE). Decode-sized calls (T <= 8) take the small-T path; T = 9 and 64 the tile GEMM.
+    const std::vector<std::pair<int, int>> qwen4_exp_shapes = {
+        {324, 10240}, {320, 10240}, {10240, 320}, {16384, 2560}, {96, 2560},
+        {2560, 6144}, {13952, 2560}, {1280, 2560}, {2560, 640}, {12800, 2560},
+    };
+    for (const auto& [n, k] : qwen4_exp_shapes) {
+        DeviceWeight weight(make_patterned(n, k, 423U));
+        for (int tokens : {1, 2, 3, 5, 8, 9, 64}) { failures += run_bf16_linear_case(weight, tokens); }
+        failures += run_bf16_linear_case(weight, 1, true);
+        failures += run_bf16_linear_case(weight, 8, true);
+    }
     return failures;
 }
 
