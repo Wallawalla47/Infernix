@@ -2870,6 +2870,35 @@ Cold-cache CLI with K = 3 and `--lm-head-draft`:
   is 16 % slower. A fixed K costs speed on low-acceptance text; the draft-length policy of §11.3
   (K = 0 included) is the remedy.
 
+**Draft-length policy (adopted, §11.3 simplified).** `--draft-tokens` is now the maximum K.
+
+- **Choice of K.** Each round, each row drafts the K in [0, max] that maximizes
+  E[tokens(K)] / (1 + c·K). E[tokens(K)] = 1 + Σ_j Π_{i≤j} a_i, from the row's EWMA of the
+  conditional acceptance a_i at each draft position (prior 0.75, weight 0.1). c = 0.38 is the
+  measured cost of a draft column in plain rounds: warm tg512 W = 3, 4, 5 rounds took 1.84, 2.13
+  and 2.54 plain rounds.
+- **Probing.** Every 8th round a row drafts one token more than its choice, so the estimate for
+  the next position stays current. K = 0 then probes one draft.
+- **K = 0 rounds** are plain decode rounds. The drafter writes the round's cell afterwards (a
+  W = 1 catch-up), so it stays current and drafting resumes at no cost.
+- **Rejected first version.** Measuring round time per width (EWMA) made the policy settle on
+  short drafts: the W = 4 time measured on the cold cache never refreshed once K dropped. tg512
+  fell to 101.7 tok/s against 114 at fixed K = 3.
+
+Same build, dense8m, INT8 KV, C = 1, `--lm-head-draft`; greedy ids equal plain decode in every
+run:
+
+| Workload | Fixed K = 3 | Policy, max 3 | Policy, max 4 | Plain |
+|---|---:|---:|---:|---:|
+| tg512, warm | 113.96 | 114.18 | **115.06** | 83.30 |
+| Code CLI, cold | 67.4 | — | 67.4 (4.54 tokens per round) | 56.7 |
+| Story CLI, cold | 47.9 | — | 55.1 (settles on K = 1) | 57.0 |
+
+The policy gets the best warm throughput and removes most of the prose loss. Cold-cache prose is
+still 3 % slower than plain, because a cold verify round costs more than the warm slope c
+assumes: the story's W = 4 rounds took ~2.6 plain rounds on the cold cache. A cost that follows
+the hit rate is the next refinement.
+
 **Next, in order of expected gain:**
 
 1. MTP measurements and tuning (draft length policy, §11.3).

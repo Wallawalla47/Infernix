@@ -54,9 +54,12 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
   their KV cache takes VRAM from the expert cache, and they have not been benchmarked yet.
 - `--prefill-chunk 2048` or `4096` speeds up long prompts by 1.4-1.6×. Each costs ~2-5 % of
   decode speed, because the larger prefill workspace takes expert frames.
-- `--spec mtp --draft-tokens 3 --lm-head-draft` drafts with the model's MTP layer. Its 512
-  experts (1.34 GB) and the proposal head (178 MB) stay in VRAM, so the expert cache gets about
-  550 fewer frames. Greedy output is the same as without it.
+- `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
+  - `--draft-tokens` sets the maximum. Each round drafts the number of tokens the recent
+    acceptance makes worthwhile, down to none on text it predicts poorly.
+  - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
+    VRAM, so the expert cache gets about 710 fewer frames.
+  - Greedy output is the same as without it.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. See [ngram copy proposals](ngram.md).
@@ -71,15 +74,16 @@ warms up over the first few hundred tokens of a session.
 
 | Workload | tok/s |
 |---|---:|
-| `ninfer_bench` tg512, `--spec mtp --draft-tokens 3 --lm-head-draft` (warm cache) | ~114 |
+| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~115 |
 | `ninfer_bench` tg512, plain decode (warm cache) | ~83 |
 | Single CLI request, cold cache, plain | ~57 |
-| Single CLI request, cold cache, MTP: code rewrite / prose story | ~67 / ~48 |
+| Single CLI request, cold cache, MTP: code rewrite / prose story | ~67 / ~55 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |
 | Prompt, 4,096 tokens, default chunk 1024 | ~410 |
 
-MTP accepts most drafts on code and other predictable text, and fewer on free prose, where a
-fixed draft length is slower than plain decode (design §19.2).
+MTP accepts most drafts on code and other predictable text, and fewer on free prose. The draft
+length follows the measured acceptance, so prose mostly drafts one token. On a cold cache prose
+is still ~3 % slower than plain decode (design §19.2).
 
 **Quality.** Teacher-forced perplexity over three frozen texts (2,557 positions, INT8 KV): recipe
 A 4.564, recipe B 4.600. For comparison, Strata with UD-Q4_K_XL and INT8 KV gives 4.864.

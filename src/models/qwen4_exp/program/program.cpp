@@ -147,7 +147,10 @@ public:
         // MTP drafter: the residual of the last processed position (its pending cell) is in the
         // lane's saved column; mtp_written says whether that cell's K/V is already written.
         bool mtp_written = false;
-        bool mtp_live    = false; // false after a plain round left its cells behind
+        bool mtp_live    = false;
+        // Draft-length policy (design 11.3): conditional acceptance of each draft position.
+        std::array<double, 8> mtp_accept{};
+        std::uint64_t mtp_policy_rounds = 0;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -443,6 +446,8 @@ public:
         lane.speculative    = {};
         lane.mtp_written = false;
         lane.mtp_live    = mtp_;
+        lane.mtp_accept.fill(kAcceptancePrior);
+        lane.mtp_policy_rounds = 0;
         if (max_width_ > 1) {
             if (options_.ngram_draft_tokens > 0) {
                 lane.proposer =
@@ -521,6 +526,7 @@ public:
             lane.prefill_ns += out.timing.submit_host_ns;
             out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, rows,
                                                              {pending_tokens_.data(), 1}, out.timing));
+            plain_round_ = false;
             pending_transaction_ = next_transaction_;
         } else {
             out.timing.submit_host_ns = elapsed_ns(start);
@@ -546,10 +552,18 @@ public:
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
         // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
-        // fewer than it may still emit, so every verified position lies in its reservation. MTP
-        // drafts come first; a longer n-gram copy proposal replaces them.
+        // fewer than it may still emit, so every verified position lies in its reservation. Each
+        // row's MTP draft length maximizes its expected tokens per round time; a longer n-gram copy
+        // proposal replaces the drafts.
+        std::array<std::int32_t, kMaximumConcurrency> wanted{};
         if (mtp_) {
-            mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), budgets);
+            std::int32_t steps = 0;
+            for (std::int32_t b = 0; b < batch; ++b) {
+                Lane& lane = lanes_[lanes[b]];
+                wanted[b]  = lane.mtp_live ? choose_draft_length(lane) : 0;
+                steps      = std::max(steps, wanted[b]);
+            }
+            mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps);
         }
         std::int32_t width = 1;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
@@ -560,8 +574,8 @@ public:
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
             const auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
-            if (mtp_ && lane.mtp_live) {
-                const auto n = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(mtp_k_));
+            if (mtp_ && lane.mtp_live && wanted[b] > 0) {
+                const auto n = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b]));
                 drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + n);
             }
             if (lane.proposer) {
@@ -577,11 +591,9 @@ public:
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
                           std::span<const std::int32_t>(positions.data(), batch), width, start);
         }
-        for (std::int32_t b = 0; b < batch; ++b) {
-            ++lanes_[lanes[b]].speculative.fallback_steps;
-            lanes_[lanes[b]].mtp_live = false; // a plain round leaves the drafter's cells behind
-        }
+        for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
         round_width_ = 1;
+        plain_round_ = true;
         stage_decode(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
         run_decode(batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
@@ -640,22 +652,28 @@ public:
         if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
         CommitResult out;
         out.row_count = rows.size();
+        // After a plain decode round the drafter writes the round's cell (its pending cell moves
+        // one position); after the prefill's first token the pending cell stays the prompt's last.
+        const bool catch_up = mtp_ && plain_round_;
+        std::int32_t* commit = catch_up ? spec_host(spec_layout_.commit) : nullptr;
+        bool any_cell        = false;
         for (std::size_t row = 0; row < rows.size(); ++row) {
             const auto index = lane_of(rows[row]);
             Lane& lane       = lanes_[index];
             const auto& d    = decisions[row];
+            if (commit != nullptr) { commit[row] = 0; }
             if (d.cancelled) {
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
-                release(index);
                 continue;
             }
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
             lane.history.push_back(pending_tokens_[row]);
-            // After a plain decode round the drafter's pending cell is two positions back; it
-            // resumes only from a chunk (the prefill's last) whose pending cell is this one.
-            if (lane.phase != Phase::Prefill && mtp_) { lane.mtp_live = false; }
+            if (commit != nullptr && lane.mtp_live) {
+                commit[row] = 1;
+                any_cell    = true;
+            }
             if (lane.proposer) { lane.proposer->append(pending_tokens_[row]); }
             if (lane.phase == Phase::Prefill) { lane.phase = Phase::Decode; }
             if (d.terminal) {
@@ -665,6 +683,15 @@ public:
                 out.rows[row].disposition = runtime::CommitDisposition::Active;
             }
         }
+        if (any_cell) {
+            CUDA_CHECK(cudaMemcpyAsync(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(),
+                                       cudaMemcpyHostToDevice, device_.stream));
+            mtp_catch_up(rows, 1, commit);
+        }
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            if (decisions[row].cancelled) { release(ContractAccess::lane(rows[row])); }
+        }
+        plain_round_ = false;
         ContractAccess::consume(pending);
         pending_transaction_ = 0;
         return out;
@@ -1152,6 +1179,13 @@ private:
             ++stats.rounds;
             stats.drafted_tokens += n;
             stats.accepted_tokens += static_cast<std::uint64_t>(A);
+            if (!from_ngram_[b]) {
+                // Positions 1..A were accepted; position A + 1 (when drafted) was the first rejected.
+                for (std::uint64_t j = 0; j < n && j <= static_cast<std::uint64_t>(A); ++j) {
+                    double& a = lane.mtp_accept[static_cast<std::size_t>(j)];
+                    a = (1.0 - kAcceptanceWeight) * a + kAcceptanceWeight * (j < static_cast<std::uint64_t>(A) ? 1.0 : 0.0);
+                }
+            }
             if (from_ngram_[b]) {
                 ++stats.ngram_rounds;
                 stats.ngram_drafted_tokens += n;
@@ -1268,6 +1302,7 @@ private:
         mtp_host_        = PinnedHostBuffer(4ULL * mtp_io_.words);
         for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+        mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
     }
 
     std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
@@ -1310,7 +1345,30 @@ private:
 
     // MTP drafts for every live lane of a decode round: the pending cell's K/V when unwritten,
     // then mtp_k_ chained full steps from the saved residual and the anchor token.
-    void mtp_draft(std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget>) {
+    // Draft-length policy (design 11.3): the K in [0, mtp_k_] that maximizes expected tokens per
+    // round time. Expected tokens are 1 + the sum of the products of the lane's conditional
+    // position acceptances (learned online); a round of K drafts costs 1 + kWidthCost * K plain
+    // rounds, the slope measured on the 5090 (design 19.2), so the plain round time cancels. Every
+    // kProbeInterval rounds a row drafts one token more than its choice, so the estimate of the
+    // next position stays current (K = 0 then probes one draft).
+    std::int32_t choose_draft_length(Lane& lane) const {
+        std::int32_t best = 0;
+        double best_score = 1.0;
+        double reach = 1.0, tokens = 1.0;
+        for (std::int32_t k = 1; k <= mtp_k_; ++k) {
+            reach *= lane.mtp_accept[static_cast<std::size_t>(k - 1)];
+            tokens += reach;
+            const double score = tokens / (1.0 + kWidthCost * k);
+            if (score > best_score) {
+                best_score = score;
+                best       = k;
+            }
+        }
+        if (++lane.mtp_policy_rounds % kProbeInterval == 0) { best = std::min(best + 1, mtp_k_); }
+        return best;
+    }
+
+    void mtp_draft(std::span<const std::uint32_t> lanes, std::int32_t steps) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::size_t column = 2ULL * width_;
@@ -1332,7 +1390,7 @@ private:
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b, saved_column(lanes[b]).data,
                                        column, cudaMemcpyDeviceToDevice, s));
         }
-        if (!any) { return; }
+        if (!any || (steps == 0 && !unwritten)) { return; }
         auto* io = static_cast<std::byte*>(io_device_.p);
         CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.slots, slots, 4ULL * batch, cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.rows, rows, 4ULL * batch, cudaMemcpyHostToDevice, s));
@@ -1352,8 +1410,14 @@ private:
                                .width      = 1,
                                .kv_only    = true});
         }
-        replay(mtp_draft_graphs_[static_cast<std::size_t>(batch - 1)], [&] {
-        for (std::int32_t j = 0; j < mtp_k_; ++j) {
+        if (steps == 0) {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                if (lanes_[lanes[b]].mtp_live) { lanes_[lanes[b]].mtp_written = true; }
+            }
+            return;
+        }
+        replay(mtp_draft_graphs_[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
+        for (std::int32_t j = 0; j < steps; ++j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
             forward_->run_mtp({.residuals    = chain,
                                .ids          = j == 0 ? anchors
@@ -1370,13 +1434,13 @@ private:
                                .drafts       = drafts});
         }
         });
-        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * mtp_k_ * batch,
+        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
         device_.synchronize();
         for (std::int32_t b = 0; b < batch; ++b) {
             Lane& lane = lanes_[lanes[b]];
             if (unwritten && lane.mtp_live) { lane.mtp_written = true; }
-            for (std::int32_t j = 0; j < mtp_k_; ++j) {
+            for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
             }
         }
@@ -1495,7 +1559,7 @@ private:
     OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
-    std::array<DecodeGraph, kMaximumConcurrency> mtp_draft_graphs_;
+    std::vector<DecodeGraph> mtp_draft_graphs_; // (batch - 1) * mtp_k_ + steps - 1
     std::vector<DecodeGraph> mtp_catch_graphs_; // (batch - 1) * max_width_ + width - 1
     std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
 
@@ -1516,6 +1580,14 @@ private:
     MtpIo mtp_io_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
     std::array<bool, kMaximumConcurrency> from_ngram_{};
+    // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
+    // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
+    // rounds, design 19.2).
+    static constexpr double kAcceptancePrior      = 0.75;
+    static constexpr double kAcceptanceWeight     = 0.1;
+    static constexpr double kWidthCost            = 0.38;
+    static constexpr std::uint64_t kProbeInterval = 8;
+    bool plain_round_ = false;
 
     // Speculative verification (max_width_ > 1).
     std::int32_t max_width_   = 1;
