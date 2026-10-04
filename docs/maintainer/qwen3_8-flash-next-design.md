@@ -2315,6 +2315,9 @@ parallel and must finish before the policy is frozen in M5.
 
 ### 19.1 Implementation status and handoff
 
+A briefing for the next session, with a file map and commands, is in the
+[handoff note](qwen3_8-flash-next-handoff.md).
+
 The first pieces were built on a development VM without a GPU or Hugging Face access: a 4-vCPU
 Xeon at 2.1 GHz with AVX-512 VNNI. nvcc 13.4 from PyPI was used to compile only: the project's CMake
 build configures and compiles there with a stub `libcuda.so`. Everything below compiles, and its
