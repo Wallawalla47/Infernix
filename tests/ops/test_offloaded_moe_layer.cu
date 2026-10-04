@@ -226,21 +226,34 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
         cuda_check(cudaMemcpy(log.data(), d_log, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost), "copy");
         std::vector<std::vector<std::int32_t>> by_expert(experts);
         for (int i = 0; i < entries; ++i) { by_expert[ids[i]].push_back(i); }
-        bool ok = log == ids;
-        int used = 0, start = 0;
-        for (int e = 0; e < experts; ++e) {
+        // The first mismatching field, so a failure names what went wrong.
+        const char* first_bad = log == ids ? nullptr : "route log";
+        int used = 0, start = 0, bad_expert = -1;
+        for (int e = 0; e < experts && first_bad == nullptr; ++e) {
             const int c = static_cast<int>(by_expert[e].size());
-            ok = ok && counts[e] == c && offsets[e] == start;
-            if (c > 0) { ok = ok && jobs[used++] == e; }
-            if (ok && c > 0) {
+            if (counts[e] != c) {
+                first_bad = "counts";
+            } else if (offsets[e] != start) {
+                first_bad = "offsets";
+            } else if (c > 0 && jobs[used++] != e) {
+                first_bad = "jobs";
+            } else if (c > 0) {
                 std::vector<std::int32_t> mine(got_entries.begin() + start, got_entries.begin() + start + c);
                 std::sort(mine.begin(), mine.end());
-                ok = mine == by_expert[e];
+                if (mine != by_expert[e]) { first_bad = "entries"; }
             }
+            if (first_bad != nullptr) { bad_expert = e; }
             start += c;
         }
-        ok = ok && offsets[experts] == entries && job_count == used;
-        std::printf("dispatch E=%d entries=%d (%s): %s\n", experts, entries, phase, ok ? "exact" : "MISMATCH");
+        if (first_bad == nullptr && offsets[experts] != entries) { first_bad = "total offset"; }
+        if (first_bad == nullptr && job_count != used) { first_bad = "job count"; }
+        const bool ok = first_bad == nullptr;
+        if (ok) {
+            std::printf("dispatch E=%d entries=%d (%s): exact\n", experts, entries, phase);
+        } else {
+            std::printf("dispatch E=%d entries=%d (%s): MISMATCH in %s (expert %d)\n", experts, entries, phase,
+                        first_bad, bad_expert);
+        }
         check(ok, "moe_dispatch equals the exact oracle");
     };
 
@@ -260,7 +273,10 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     for (int replay = 0; replay < 2; ++replay) {
         const auto ids = random_ids();
-        cuda_check(cudaMemcpy(d_ids, ids.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
+        // On the replay stream: a pageable cudaMemcpy may return before its DMA lands, and the
+        // non-blocking stream does not wait for the legacy stream.
+        cuda_check(cudaMemcpyAsync(d_ids, ids.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice, stream),
+                   "copy");
         cuda_check(cudaGraphLaunch(exec, stream), "launch");
         cuda_check(cudaStreamSynchronize(stream), "replay");
         verify(ids, replay == 0 ? "graph replay 1" : "graph replay 2");
