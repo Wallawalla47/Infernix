@@ -91,6 +91,38 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         return out;
     }
+    if (layout == QuantLayout::ExpertRg16) {
+        if (format != QType::NVFP4_MUL || shape.size() != 3 || shape[1] % 16 || shape[2] % 16) {
+            throw std::invalid_argument(
+                "nvfp4_expert_rg16_v1 requires nvfp4_mul [experts, hidden, intermediate] with "
+                "hidden and intermediate divisible by 16");
+        }
+        constexpr std::uint64_t kUnit = 144;
+        const auto experts = shape[0], hidden = shape[1], inter = shape[2];
+        const auto gate_up = mul(mul(2 * inter / 16, hidden / 16), kUnit);
+        out.group_size     = 16;
+        out.alignment      = 4096;
+        out.record_bytes   = add(gate_up, mul(mul(hidden / 16, inter / 16), kUnit));
+        out.record_stride  = aligned(out.record_bytes, 4096);
+        out.code_bytes     = mul(experts, out.record_stride);
+        out.scale_offset   = out.code_bytes;
+        out.scale_bytes    = mul(experts, 12);
+        out.bytes          = add(out.scale_offset, out.scale_bytes);
+        return out;
+    }
+    if (layout == QuantLayout::Block128Scale) {
+        if (format != QType::FP8_E4M3FN_BLOCK128_F32 || shape.size() < 2) {
+            throw std::invalid_argument("block128_scale_v1 requires fp8_e4m3fn_block128_f32 [..., N, K]");
+        }
+        const auto n = shape[shape.size() - 2], k = shape.back();
+        const auto batch  = out.elements / mul(n, k);
+        out.group_size    = 128;
+        out.code_bytes    = out.elements;
+        out.scale_offset  = aligned(out.code_bytes, 256);
+        out.scale_bytes   = mul(mul(batch, (n + 127) / 128), mul((k + 127) / 128, 4));
+        out.bytes         = add(out.scale_offset, out.scale_bytes);
+        return out;
+    }
     if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
     const auto n       = shape[0];
     const auto k       = shape[1];
@@ -202,6 +234,9 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
+    if (g.layout == QuantLayout::ExpertRg16 || g.layout == QuantLayout::Block128Scale) {
+        throw std::invalid_argument("expert banks and block-scaled FP8 have no row planes");
+    }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
         throw std::invalid_argument("row view requires resident complete logical rows");
@@ -244,6 +279,9 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     const auto& g     = region.parent->geometry;
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
+    }
+    if (g.layout == QuantLayout::ExpertRg16 || g.layout == QuantLayout::Block128Scale) {
+        throw std::invalid_argument("expert banks and block-scaled FP8 bind through their planes");
     }
     Weight out;
     out.payload          = region.parent->data;
@@ -290,6 +328,39 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
     }
+    return out;
+}
+
+ExpertBankPlanes expert_bank_planes(const WeightParent& parent) {
+    const auto& g = parent.geometry;
+    if (g.layout != QuantLayout::ExpertRg16 || !parent.data) {
+        throw std::invalid_argument("expert bank planes require a resident nvfp4_expert_rg16_v1 parent");
+    }
+    ExpertBankPlanes out;
+    out.records       = parent.data;
+    out.multipliers   = reinterpret_cast<const float*>(parent.data + g.scale_offset);
+    out.record_bytes  = g.record_bytes;
+    out.record_stride = g.record_stride;
+    out.experts       = static_cast<std::uint32_t>(dimension(g.shape[0]));
+    out.hidden        = static_cast<std::uint32_t>(dimension(g.shape[1]));
+    out.intermediate  = static_cast<std::uint32_t>(dimension(g.shape[2]));
+    out.gate_up_bytes = 2ULL * out.intermediate / 16 * (out.hidden / 16) * 144;
+    return out;
+}
+
+Block128Planes block128_planes(const WeightParent& parent) {
+    const auto& g = parent.geometry;
+    if (g.layout != QuantLayout::Block128Scale || !parent.data) {
+        throw std::invalid_argument("block128 planes require a resident block128_scale_v1 parent");
+    }
+    Block128Planes out;
+    out.codes      = parent.data;
+    out.scales     = reinterpret_cast<const float*>(parent.data + g.scale_offset);
+    out.n          = g.shape[g.shape.size() - 2];
+    out.k          = g.shape.back();
+    out.batch      = g.elements / (out.n * out.k);
+    out.scale_rows = (out.n + 127) / 128;
+    out.scale_cols = (out.k + 127) / 128;
     return out;
 }
 

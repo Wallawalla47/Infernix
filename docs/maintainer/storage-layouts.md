@@ -15,10 +15,12 @@ The storage registry contains exactly these identities:
 | `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
+| `block128_scale_v1` | tensor layout | `fp8_e4m3fn_block128_f32` | rank `>= 2` `[..., N, K]` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
-covered separately in Section 8.
+covered separately in Section 10.
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -321,7 +323,68 @@ encoded by concatenating the selected code rows, recomputing the scale-plane ali
 row count, and appending the selected scale words in the same row order. It does not decode or
 requantize either plane.
 
-## 6. `raw_bytes_v1`
+## 6. `nvfp4_expert_rg16_v1`
+
+`nvfp4_expert_rg16_v1` stores one MoE layer's routed experts, `[E,H,I]`: E experts with hidden size
+H and intermediate size I. Each expert has a gate and an up matrix `[I,H]` and a down matrix `[H,I]`
+of `nvfp4_mul` words, plus one FP32 multiplier per matrix. The layout makes every expert one
+contiguous, aligned record that CPU and GPU expert kernels read in place and that one DMA or one
+`O_DIRECT` read moves (Qwen3.8-Flash-Next design §6.2).
+
+```text
+gate_up_row_groups = 2 * I / 16          gate_up_blocks = H / 16
+down_row_groups    = H / 16              down_blocks    = I / 16
+gate_up_bytes      = gate_up_row_groups * gate_up_blocks * 144
+record_bytes       = gate_up_bytes + down_row_groups * down_blocks * 144
+record_stride      = align_up(record_bytes, 4096)
+multiplier_offset  = E * record_stride
+payload_bytes      = multiplier_offset + E * 3 * 4
+```
+
+Record e begins at `e * record_stride`. Zero bytes pad each record to its stride.
+
+**Gate/up matrix.** Its rows interleave the two projections: row `2i` is gate row `i` and row
+`2i + 1` is up row `i`, for `i < I`. Rows form 16-row groups. Row group `rg` stores
+`gate_up_blocks` units in increasing block order, so unit `(rg, b)` begins at record offset
+`(rg * gate_up_blocks + b) * 144`. The down matrix follows at `gate_up_bytes`, with
+`down_row_groups` row groups of `down_blocks` units in the same arrangement.
+
+**Unit.** One 144-byte unit holds the 16 rows `16rg .. 16rg+15` of one 16-element K block
+`16b .. 16b+15`:
+
+- bytes `0..127` are four quads of 32 bytes. Byte `32q + 4j + t` (`q < 4`, `j < 8`, `t < 4`) holds
+  the E2M1 code of row `16rg + j` at `k = 16b + 4q + t` in its low nibble, and the code of row
+  `16rg + 8 + j` at the same k in its high nibble;
+- bytes `128..143` hold the E4M3FN scale words of rows `16rg .. 16rg+15` for block b, in row order.
+
+**Multiplier plane.** `E * 3` little-endian FP32 words follow the records: expert e's gate, up and
+down multipliers at `multiplier_offset + 12e`, `+ 4` and `+ 8`. They are ModelOpt's
+`weight_scale_2` words, copied unchanged.
+
+The layout has no row views: a binding addresses the complete bank, and consumers obtain the record
+and multiplier planes from `expert_bank_planes`. Activation input scales are separate model-role
+tensors.
+
+## 7. `block128_scale_v1`
+
+`block128_scale_v1` stores `fp8_e4m3fn_block128_f32` tensors `[..., N, K]`. Leading axes form a
+batch of `B` matrices, for example the experts of one layer. Let:
+
+```text
+B                  = product of the leading dimensions (1 for rank 2)
+scale_rows         = ceil_div(N, 128)       scale_cols = ceil_div(K, 128)
+code_plane_bytes   = B * N * K
+scale_plane_offset = align_up(code_plane_bytes, 256)
+scale_plane_bytes  = B * scale_rows * scale_cols * 4
+payload_bytes      = scale_plane_offset + scale_plane_bytes
+```
+
+The code plane is the C-order sequence of E4M3FN bytes. The scale plane holds little-endian FP32
+multipliers in C order `[B, scale_rows, scale_cols]`; tile `(r, c)` covers rows `128r ..` and
+columns `128c ..`, truncated at the matrix edge. Zero bytes fill the gap before the scale plane.
+Consumers obtain both planes from `block128_planes`; the layout has no per-row planes.
+
+## 8. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -336,7 +399,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 7. Decode boundary
+## 9. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -347,13 +410,17 @@ Layout decoding yields only persistent logical words:
   matrix-level FP32 weight divisor;
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
+- `nvfp4_expert_rg16_v1` yields, per expert, the gate, up and down E2M1 code words and E4M3FN
+  scale words in natural `[rows, K]` order (undoing the unit packing and row interleave), and the
+  three FP32 multipliers;
+- `block128_scale_v1` yields the E4M3FN code words and the FP32 tile multipliers;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
 not select a quantization encoder, output dtype, accumulation dtype, kernel, runtime device layout,
 or model consumer.
 
-## 8. Logical views and native operands
+## 10. Logical views and native operands
 
 Bindings address C-order logical element ranges of a parent object. The parent retains its full
 geometry and backing allocation, so a view can locate code and scale planes using the original
