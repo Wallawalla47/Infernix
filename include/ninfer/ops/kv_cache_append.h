@@ -76,6 +76,18 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
 
 /**
+ * Append whole columns of B sequences to full-head (D=256) paged storage.
+ *
+ * k/v are contiguous BF16 [256,Hkv,T,B] with Hkv 2 or 4, positions is contiguous device I32 [T,B]
+ * and table_rows contiguous device I32 [B]. Column (t,b) is stored at logical position
+ * positions[t,b] through table row table_rows[b] with kv_cache_append's storage conversions
+ * (BF16, INT8-G64, FP8 row and NVFP4-family storages; not the vector-quantized ones). Every row is
+ * chosen on the device, so a captured call serves any assignment of sequences to rows.
+ */
+void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           const Tensor& table_rows, PagedKVBatchLayerView cache, cudaStream_t stream);
+
+/**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.
  *
  * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and

@@ -212,8 +212,9 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor v = work_.alloc(DType::BF16, {VW, T});
     Tensor o = work_.alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    if (batch.batch == 1) {
-        // One sequence: chunked recurrence over its positions.
+    if (batch.width > 1) {
+        // One sequence of several positions (a prefill chunk): chunked recurrence.
+        if (batch.batch != 1) { throw std::invalid_argument("Qwen4Exp GDN: multi-position calls hold one sequence"); }
         if (batch.host_slots.empty()) { throw std::invalid_argument("Qwen4Exp GDN: missing host slot"); }
         const std::int32_t slot = batch.host_slots[0];
         Tensor conv_state = state_.gdn->conv_slot(index, slot);
@@ -222,7 +223,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         ops::gated_delta_net(q.view({DK, NK, T}), k.view({DK, NK, T}), v.view({DV, NV, T}), gate, beta, scale,
                              /*normalize_qk=*/true, work_, state, state, o, device_.execution_view());
     } else {
-        if (batch.width != 1) { throw std::invalid_argument("Qwen4Exp GDN: batched calls advance one position"); }
+        // One position per sequence (decode): the recurrent update with device-chosen slots.
         auto layer = state_.gdn->layer_view(index);
         Tensor conv_out = work_.alloc(DType::BF16, {C, 1, T});
         ops::causal_conv1d_silu_snapshot(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{}, batch.slots,
@@ -276,15 +277,21 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     }
     ops::rope(batch.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
 
-    // Append K/V to each sequence's pages, then the pooled index keys.
+    // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
     const auto& layer = kv_.layers.at(index);
-    for (std::int32_t i = 0; i < batch.batch; ++i) {
-        PagedKVLayerView view = layer.kv;
-        view.block_table      = kv_.block_tables.slice(1, batch.host_table_rows[i], 1).view({kv_.block_tables.ne[0]});
-        Tensor ks = kn.slice(2, i * batch.width, batch.width);
-        Tensor vs = v.slice(2, i * batch.width, batch.width);
-        Tensor ps = batch.positions.slice(0, i * batch.width, batch.width);
-        ops::kv_cache_append(ks, vs, ps, view, s);
+    {
+        const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
+                                         .v_pages       = layer.kv.v_pages,
+                                         .k_scale_pages = layer.kv.k_scale_pages,
+                                         .v_scale_pages = layer.kv.v_scale_pages,
+                                         .block_tables  = kv_.block_tables,
+                                         .head_dim      = layer.kv.head_dim,
+                                         .num_kv_heads  = layer.kv.num_kv_heads,
+                                         .storage       = layer.kv.storage,
+                                         .window        = layer.kv.window};
+        const std::int32_t KVH = dim(a.kv_heads);
+        ops::kv_cache_append_batch(kn.view({D, KVH, batch.width, batch.batch}), v.view({D, KVH, batch.width, batch.batch}),
+                                   batch.positions.view({batch.width, batch.batch}), batch.table_rows, view, s);
     }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
     const ops::QsaBatch qsa_batch{kv_.block_tables, batch.table_rows, batch.positions, batch.slots, batch.batch,

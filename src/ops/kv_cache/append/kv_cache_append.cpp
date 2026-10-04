@@ -209,6 +209,42 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
     }
 }
 
+void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& positions,
+                           const Tensor& table_rows, PagedKVBatchLayerView cache, cudaStream_t stream) {
+    if (k.dtype != DType::BF16 || v.dtype != DType::BF16 || positions.dtype != DType::I32 ||
+        table_rows.dtype != DType::I32) {
+        throw std::invalid_argument("kv_cache_append_batch: k/v must be BF16, positions and rows I32");
+    }
+    const std::int32_t kv_heads = k.ne[1], tokens = k.ne[2], batch = k.ne[3];
+    if ((kv_heads != 4 && kv_heads != 2) || tokens <= 0 || batch <= 0) {
+        throw std::invalid_argument("kv_cache_append_batch: unsupported geometry");
+    }
+    require_shape(k, kFullHeadDim, kv_heads, tokens, batch, kAppendOp, "k");
+    require_shape(v, kFullHeadDim, kv_heads, tokens, batch, kAppendOp, "v");
+    require_shape(positions, tokens, batch, 1, 1, kAppendOp, "positions");
+    require_shape(table_rows, batch, 1, 1, 1, kAppendOp, "table rows");
+    require_contiguous_nonnull(k, kAppendOp, "k");
+    require_contiguous_nonnull(v, kAppendOp, "v");
+    require_contiguous_nonnull(positions, kAppendOp, "positions");
+    require_contiguous_nonnull(table_rows, kAppendOp, "table rows");
+    if (kv_storage_has_exact_window(cache.storage) || cache.head_dim != kFullHeadDim ||
+        cache.num_kv_heads != kv_heads || cache.block_tables.dtype != DType::I32 ||
+        cache.block_tables.data == nullptr) {
+        throw std::invalid_argument("kv_cache_append_batch: invalid cache geometry or storage");
+    }
+    // INT8-G64 and FP8-row storage have a multi-row kernel; the other storages' batched launch
+    // addresses one table row, so each row gets its own launch (its row still chosen on the device).
+    if (batch == 1 || cache.storage == KvCacheStorage::Int8Group64 ||
+        cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        detail::kv_cache_append_batch_launch(k, v, positions, Tensor{}, table_rows, cache, stream);
+        return;
+    }
+    for (std::int32_t b = 0; b < batch; ++b) {
+        detail::kv_cache_append_batch_launch(k.slice(3, b, 1), v.slice(3, b, 1), positions.slice(1, b, 1), Tensor{},
+                                             table_rows.slice(0, b, 1), cache, stream);
+    }
+}
+
 void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& positions,
                             const Tensor& counts, const Tensor& table_rows,
                             KVCacheAppendPrefixExecutionEnvelope envelope,
