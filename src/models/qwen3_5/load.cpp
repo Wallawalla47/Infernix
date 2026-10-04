@@ -50,6 +50,10 @@ const ModelWeights& LoadPlan::weights() const { return impl_->weights; }
 
 const FrontendResources& LoadPlan::resources() const { return impl_->resources; }
 
+void LoadPlan::set_host_reserve(std::uint64_t reserve_bytes) {
+    impl_->materialization.host_reserve_bytes = reserve_bytes;
+}
+
 const artifact::MaterializationPlan& LoadPlan::materialization() const {
     return impl_->materialization;
 }

@@ -93,7 +93,7 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--ngram-volume FILE]\n"
+           "       [--chat-template FILE] [--ngram-volume FILE] [--ram-headroom-mib N]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
            "       [--vision] [--vision-offload on|off] [--vision-max-merged N]\n"
@@ -111,6 +111,10 @@ std::string usage_text(const char* argv0) {
            "  --prefill-chunk N        prefill chunk size in tokens, multiple of 128\n"
            "  --max-new N              cap on generated tokens\n"
            "  --device N               CUDA device ordinal (default 0)\n"
+           "  --ram-headroom-mib N     physical Host RAM in MiB that pinned weights and\n"
+           "                           caches leave free for the system (default " +
+           std::to_string(kDefaultRamHeadroomBytes >> 20) +
+           ")\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
@@ -242,6 +246,12 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+        } else if (arg == "--ram-headroom-mib") {
+            const std::uint64_t mib = parse_u64(value(arg), "ram-headroom-mib");
+            if (mib > (std::numeric_limits<std::uint64_t>::max() >> 20)) {
+                throw std::invalid_argument("--ram-headroom-mib is out of range");
+            }
+            options.ram_headroom_bytes = mib << 20;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

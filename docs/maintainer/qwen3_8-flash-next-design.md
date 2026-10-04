@@ -2154,11 +2154,12 @@ Additional rules:
   `cudaHostRegister` time for each page backing (§14.2).
 - **Startup check.** Startup verifies `RLIMIT_MEMLOCK` and `MemAvailable` against this plan,
   including the host tier the chosen context and KV profile need, and fails with a precise message.
-  It does not swap. As built, the loader refuses a pinned block that would leave < 8 GiB available
-  (`kPinnedHostReserveBytes`); 64.47 GiB is pinned (§19.2). The prefix tier is resolved after model
-  and Vision load: the request, or `min(4 GiB, available − 8 GiB − vision media reserve)`. An
-  explicit size that would leave less than 8 GiB plus the vision media reserve available fails at
-  startup with the materializer's message; under 126 slabs (≈ 118 MB) the tier is off with a
+  It does not swap. As built, the RAM ledger (§19.3.7, R4) plans every allocation against one
+  reserve (`--ram-headroom-mib`, default 2 GiB), and the loader re-checks it against memory
+  available when it pins; 64.47 GiB is pinned (§19.2). The prefix tier is resolved after model
+  and Vision load: the request, or `min(4 GiB, available − reserve − vision media reserve)`. An
+  explicit size that would leave less than the reserve plus the vision media reserve available
+  fails at startup with the ledger's message; under 126 slabs (≈ 118 MB) the tier is off with a
   warning. **Decided (default, 2026-10-04):** 4 GiB; alternative 8-12 GiB for ~100K-token agentic
   sessions when ≥ 16 GiB stays free.
 - **Machines with less than ~88 GB of RAM** are outside the supported range. Exclusive VRAM/host
@@ -3644,11 +3645,12 @@ documented as a reproducibility trade-off, not a quality one.
   checkpoint tier). Of 95.8 GiB the model pins 64.5 GiB, leaving ≈ 31 GiB; Vision adds 856 MiB of
   tower weights and ≥ 0.4 GB of pageable media buffers (§19.3.2). Resolved in the Program
   constructor after materialization:
-  `host_bytes = explicit, or min(4 GiB, available − 8 GiB − media reserve)`, where the media
+  `host_bytes = explicit, or min(4 GiB, available − reserve − media reserve)` (the RAM ledger's
+  reserve, §19.3.7), where the media
   reserve is the pageable live-media budget (`--media-live-mib`, ≥ 402 MB for the prompt cap) with
   Vision and 0 without; Vision pins only its 856 MiB of tower weights, which are already counted
-  (§19.3.2). An explicit value breaking that guard fails at startup with the materializer's
-  message (`kPinnedHostReserveBytes`); the default clamps to whole slabs and below 126 slabs
+  (§19.3.2). An explicit value breaking that guard fails at startup with the ledger's
+  message; the default clamps to whole slabs and below 126 slabs
   (≈ 118 MB) disables the tier with a warning; with the default 0 Device snapshot slots the prefix
   cache is then off (no snapshot store), and the warning says so and names
   `--device-snapshot-slots` as the alternative. The startup ledger logs model and Vision pins, the
@@ -6218,10 +6220,38 @@ change at merge time.
   - Q13 is applied per cell and over all V and RAM sizes of one prior and mode: another policy is
     adopted only with strictly fewer and at most 95 % of the best half-life's SSD reads.
 
+#### R4 implementation decisions
+
+- **Snapshot** (`core/host_memory`): `host_memory_snapshot()` reads total and available physical
+  memory, available commit (Windows `ullAvailPageFile`; Linux MemAvailable plus free swap) and the
+  process's private bytes; on Linux available memory is lowered to the cgroup v2 limit and
+  `RLIMIT_MEMLOCK` is read. `reserve_process_working_set` sets the hard minimum working set.
+- **Ledger** (`models/qwen4_exp/memory_plan`, pure, RT1): planned = the other pins (the token
+  embedding) and later pins (a 256 MiB allowance for the Program's pinned and mapped buffers),
+  each with 0.25 % lock overhead, plus the n-gram row cache, load staging (264 MiB) and 1 GiB of
+  growth. Full mode needs the banks with their lock overhead plus a 1 GiB margin, in both physical
+  memory and commit after the reserve. Today's model needs about 69.3 GiB available at the
+  default reserve (the old fixed rule needed 72.5 GiB).
+- **One reserve.** `kPinnedHostReserveBytes` is gone: `MaterializationPlan::host_reserve_bytes`
+  (from `EngineOptions::ram_headroom_bytes`, default `kDefaultRamHeadroomBytes` = 2 GiB) and
+  `later_pinned_bytes` are re-checked against memory available at the moment of the pin, so other
+  programs' growth since the snapshot is seen. Qwen3.5 passes the same reserve for its pinned
+  vision tower (its check falls from 8 GiB to the shared default). The materializer still pins
+  one block; chunked pinning and per-chunk re-checks arrive with the tier's slot pool (R10), which
+  is the first allocation large enough to need them.
+- **Tier mode refuses** until R10 with the ledger line and the reserve in use. `--expert-ram-mib`
+  and `--expert-state` are not parsed yet: until the tier exists the first could only force a
+  refusal and the second would do nothing, so both land with R10 (a deviation from the R4 row).
+- **Working set.** Startup sets a hard minimum working set of the growth term (1 GiB); a refusal
+  is logged as a warning, never fatal.
+
 #### Status
 
 R0 implemented on `claude/fn-memory` (base `1dae6914c`): built, not yet run; the orchestrator runs
 the probes, the captures and the replay. Results are recorded below as they are measured.
+
+R4 implemented on `claude/fn-memory`: `--ram-headroom-mib` in `ninfer`, `ninfer-serve` and
+`ninfer_bench`; RT1 in `ninfer_qwen4_exp_memory_plan_test`.
 
 ---
 

@@ -21,3 +21,8 @@ ninfer_add_test(ninfer_qwen4_exp_route_trace_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_route_trace_real.cpp"
   LIBRARIES ninfer_engine ninfer_model_runtime ninfer::json)
 set_tests_properties(ninfer_qwen4_exp_route_trace_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The startup RAM ledger (host only).
+ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
+  LIBRARIES ninfer_model_loading)

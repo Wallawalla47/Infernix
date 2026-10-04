@@ -15,8 +15,10 @@ drafter (`--spec mtp`) and n-gram copy proposals. Not yet supported: vision, Cau
 - **GPU.** An RTX 5090 (sm_120a). A **PCIe x16** link matters: expert misses cross PCIe, and an
   x8 link halves their bandwidth. Check with
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
-- **RAM.** About 96 GB. A run pins ~64.5 GiB, and the loader refuses to start if less than 8 GiB of
-  RAM would remain free.
+- **RAM.** About 96 GB. A run pins ~64.5 GiB. At startup a RAM ledger plans every allocation and
+  keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults about 69.3 GiB
+  must be available. When the experts do not fit, startup stops with the ledger line, which names
+  every term.
 - **Disk.** ~80 GB for the artifact, plus a 52 GB n-gram volume, ideally on its own NVMe drive.
 
 ## Convert

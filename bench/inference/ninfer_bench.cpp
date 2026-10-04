@@ -150,6 +150,7 @@ int main(int argc, char** argv) {
         ninfer::EngineOptions engine_options;
         engine_options.artifact_path     = options.artifact_path;
         engine_options.ngram_volume_path = options.ngram_volume_path;
+        engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
         engine_options.device            = options.device;
         engine_options.max_context   = max_context;
         engine_options.rope_yarn_factor = options.rope_yarn_factor;
