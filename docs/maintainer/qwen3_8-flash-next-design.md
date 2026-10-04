@@ -5768,7 +5768,14 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
    - Strata on sm_90+ scores on many CTAs and selects with an 8-CTA cluster; `cce52db` adds a
      per-warp-histogram top-k (9-12× at 262K-524K cells).
    - Steps:
-     - Q0: nsys at 8K / 32K / 128K (~1 h).
+     - Q0: nsys at 8K / 32K / 128K (~1 h). Method: one `ninfer_bench -r 1 --warmup 0 -pg P,128`
+       process per context and mode (plain; `--spec mtp --draft-tokens 4 --lm-head-draft`), dense8m,
+       INT8 KV, the serving chunk 4096 and one `--max-ctx 132096` for every context (equal frames).
+       Prompts are the first P ids of an untiled corpus of the repository's docs
+       (`tools/bench/make_bench_corpus.py --source-text`). `nsys --cuda-graph-trace=node`; the
+       measured prompt's selects are the eager 32-column launches; decode selects are grouped per
+       graph launch (12 = a main or verify forward of width gridX, fewer = an MTP draft chain).
+       The prompt's last chunk is the "prefill chunk at P".
      - Q1: prefill groups of ≥ 170 columns (0.5 day, exact; ~5× on prefill selection).
      - Q2: multi-CTA scoring with today's per-block arithmetic, plus a cluster or two-pass top-k
        (2-3 days). Ids stay bit-exact.
