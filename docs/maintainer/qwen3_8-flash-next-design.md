@@ -2954,6 +2954,12 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   more, because the fork overlaps the PCIe stage with the hit compute. With 8 / 3 as the default
   (greedy ids unchanged): tg512 plain 88.70, MTP max 4 133.54. Cold CLI code plain 64.7 / MTP
   81.9, story plain 63.9 / MTP 65.4, so MTP is no longer slower on cold prose.
+- **Reused n-gram read events (rejected).** The after-draft host gap (~0.5 ms per round) is the
+  verification's n-gram rows: new trigrams of draft tokens, read from the NVMe volume. Keeping the
+  64 Win32 events of a batched read alive instead of creating them per call changed nothing
+  (tg512 89.99 / 138.84 against 89.96 / 138.70), so the time is in the submissions and the device.
+- **Maximum draft length 5** measured the same as 4 (tg512 138.67 against 138.78; code CLI 82.9
+  against 83.7). The policy rarely drafts a fifth token, so 4 is the recommendation.
 - **Deferred cache update (adopted).** A round's `after_round` (routes, LFRU, promotions; ~0.5 ms
   of host time) now runs in its commit, after the commit has enqueued its GPU work (the GDN fold,
   tail commits, the drafter's catch-up), so the policy overlaps that work. A discarded round skips
@@ -2974,10 +2980,13 @@ selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
 server, then each alone.
 
 - **Robustness:** no crash or hang. MTP acceptance was 94.8 % and 63.0 %.
-- **Output equality:** the code answer is identical concurrent and alone. The story diverges after
-  ~30 tokens. A two-row verification has up to eight columns, so kernels whose rounding depends on
-  the call width can flip a near-tie. This is the verify-width invariance question of §11.3 and
-  was not investigated further.
+- **Output equality (open defect).** The code answer is identical concurrent and alone. The story
+  diverges after ~30 tokens. The same check without MTP gives identical answers for both prompts
+  at C = 2, so plain batching is invariant. One-row MTP output has equalled plain decode in every
+  run. The difference therefore lies in multi-row verification or its commit: rows with different
+  draft lengths padded to one width, or the GDN fold with different commit counts per row.
+  n-gram verification at C > 1 shares that path. Not investigated yet; use `--max-concurrency 1`
+  with speculation until it is.
 - **Throughput:** concurrent decode reached 24.9 + 21.7 tok/s on the cold cache, below one cold
   request (~55-67 tok/s). Two unrelated sequences double the distinct experts per round. C > 1
   under MTP is not tuned; C = 1 is the recommended setting for now.
