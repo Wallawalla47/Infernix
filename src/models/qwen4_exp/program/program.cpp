@@ -684,8 +684,7 @@ public:
             }
         }
         if (any_cell) {
-            CUDA_CHECK(cudaMemcpyAsync(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(),
-                                       cudaMemcpyHostToDevice, device_.stream));
+            upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), device_.stream);
             mtp_catch_up(rows, 1, commit);
         }
         for (std::size_t row = 0; row < rows.size(); ++row) {
@@ -967,7 +966,7 @@ private:
     // captured and later rounds replay it.
     void run_decode(std::int32_t batch) {
         const cudaStream_t s = device_.stream;
-        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_prefix(batch), cudaMemcpyHostToDevice, s));
+        upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch), s);
         residency_->before_round(s);
         replay(graphs_[static_cast<std::size_t>(batch - 1)], [&] { forward_call(batch, 1, batch); });
         residency_->enqueue_route_download(s, batch);
@@ -1122,9 +1121,8 @@ private:
             spec_host(spec_layout_.lengths)[b] = positions[b];
             spec_host(spec_layout_.anchors)[b] = anchor;
         }
-        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_prefix(batch * W), cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed,
-                                   cudaMemcpyHostToDevice, s));
+        upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch * W), s);
+        upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         residency_->before_round(s);
         replay(verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
@@ -1140,7 +1138,7 @@ private:
         ops::argmax(narrow, target, token_domain_, s);
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         for (std::int32_t b = 0; b < batch; ++b) { configs[b] = lanes_[lanes[b]].sampling; }
-        CUDA_CHECK(cudaMemcpyAsync(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, cudaMemcpyHostToDevice, s));
+        upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
         Tensor extents(spec_device(spec_layout_.extents), DType::I32, {batch});
         Tensor lengths(spec_device(spec_layout_.lengths), DType::I32, {batch});
@@ -1254,7 +1252,7 @@ private:
                 out.rows[row].disposition = runtime::CommitDisposition::Active;
             }
         }
-        CUDA_CHECK(cudaMemcpyAsync(spec_device(spec_layout_.commit), commit, 4ULL * batch, cudaMemcpyHostToDevice, s));
+        upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * batch, s);
         fold(W).execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
         auto* io = static_cast<std::byte*>(io_device_.p);
         const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
@@ -1392,9 +1390,9 @@ private:
         }
         if (!any || (steps == 0 && !unwritten)) { return; }
         auto* io = static_cast<std::byte*>(io_device_.p);
-        CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.slots, slots, 4ULL * batch, cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(io + io_layout_.rows, rows, 4ULL * batch, cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(mtp_device_.p, mtp_host_.data(), 4ULL * mtp_io_.drafts, cudaMemcpyHostToDevice, s));
+        upload_pinned(io + io_layout_.slots, slots, 4ULL * batch, s);
+        upload_pinned(io + io_layout_.rows, rows, 4ULL * batch, s);
+        upload_pinned(mtp_device_.p, mtp_host_.data(), 4ULL * mtp_io_.drafts, s);
         const Tensor slot_tensor(io + io_layout_.slots, DType::I32, {batch});
         const Tensor row_tensor(io + io_layout_.rows, DType::I32, {batch});
         Tensor chain(mtp_chain_.p, DType::BF16, {width_, batch});
@@ -1461,8 +1459,7 @@ private:
                     j < k ? pending_tokens_[static_cast<std::size_t>(b * W + j)] : pending_tokens_[static_cast<std::size_t>(b * W)];
             }
         }
-        CUDA_CHECK(cudaMemcpyAsync(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W,
-                                   cudaMemcpyHostToDevice, s));
+        upload_pinned(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W, s);
         const Tensor positions(io + io_layout_.positions, DType::I32, {W * batch});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
         replay(mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
@@ -1508,8 +1505,8 @@ private:
             configs[b]          = lanes_[lanes[b]].sampling;
             sample_positions[b] = positions[b];
         }
-        CUDA_CHECK(cudaMemcpyAsync(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, cudaMemcpyHostToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(sample_pos_.p, sample_positions, 4ULL * batch, cudaMemcpyHostToDevice, s));
+        upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
+        upload_pinned(sample_pos_.p, sample_positions, 4ULL * batch, s);
         Tensor out(sampled_.p, DType::I32, {batch});
         Tensor logical(sample_pos_.p, DType::I32, {batch});
         {
