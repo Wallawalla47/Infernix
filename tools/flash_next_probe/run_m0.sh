@@ -15,7 +15,7 @@ mkdir -p "$out" build
 
 g++ -O3 -std=c++20 -pthread -ffp-contract=off -fno-fast-math -Isrc \
   tools/flash_next_probe/host_probe.cpp src/ops/offloaded_sparse_moe/cpu/w4a4_expert.cpp \
-  -o build/flash_next_host_probe
+  src/ops/offloaded_sparse_moe/cpu/expert_team.cpp -o build/flash_next_host_probe
 g++ -O2 -std=c++20 -pthread tools/flash_next_probe/nvme_probe.cpp -o build/flash_next_nvme_probe
 nvcc -O3 -std=c++17 -arch=sm_120a tools/flash_next_probe/gpu_probe.cu -o build/flash_next_gpu_probe
 

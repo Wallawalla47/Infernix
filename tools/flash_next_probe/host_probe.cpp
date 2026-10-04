@@ -5,10 +5,12 @@
 // Build (from the repository root):
 //   g++ -O3 -std=c++20 -pthread -ffp-contract=off -fno-fast-math -Isrc
 //     tools/flash_next_probe/host_probe.cpp src/ops/offloaded_sparse_moe/cpu/w4a4_expert.cpp
-//     -o build/flash_next_host_probe          (one command)
+//     src/ops/offloaded_sparse_moe/cpu/expert_team.cpp -o build/flash_next_host_probe   (one command)
 //   ./build/flash_next_host_probe [--arena-gib 8] [--experts 256] [--seconds 0.5] [--threads 1,2,4,8]
 //
 // Reported numbers:
+//   Team: latency of one layer's CPU-served misses (k experts, one column each, cold records)
+//   through CpuExpertTeam with N workers, the caller included; the decode critical path (§10.1).
 //   DRAM: GB/s of distinct bytes read, all threads together, over an arena far larger than the LLC.
 //   Expert: record bytes consumed per second (2,764,800 per expert call) and microseconds per expert
 //   call. "cold" walks a record set larger than the LLC so every byte comes from DRAM; "warm" repeats
@@ -16,6 +18,7 @@
 //   the DRAM rate; on the development VM it did not (n = 1 ~5.6 GB/s cold, n = 8 ~3.1 GB/s warm), so
 //   this table decides the CPU worker count and whether n > 4 experts stay on the CPU route.
 
+#include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <algorithm>
@@ -212,6 +215,42 @@ void expert_probe(const Options& o, const std::vector<int>& thread_counts) {
     munmap(records, bytes);
 }
 
+
+void team_probe(const Options& o, const std::vector<int>& thread_counts) {
+    const std::size_t bytes = static_cast<std::size_t>(o.experts) * moe::kRecordBytes;
+    auto* records           = static_cast<std::uint8_t*>(huge_alloc(bytes));
+    fill_records(records, o.experts);
+    const moe::ExpertScales scales{0.0117F, 0.0117F, 0.0031F, 0.0117F * 0.002F, 0.0117F * 0.002F, 0.0031F * 0.002F};
+    std::vector<std::uint16_t> x(static_cast<std::size_t>(moe::kHidden) * 16, 0x3C00), y(x.size());
+    std::printf("\nCPU expert team: latency of k cold misses at n = 1 (median of %d x 64 rounds)\n", o.repetitions);
+    std::printf("%8s %4s %12s %12s %12s\n", "workers", "k", "median us", "p90 us", "GB/s");
+    for (int workers : thread_counts) {
+        moe::CpuExpertTeam team({.workers = workers, .isa = moe::best_cpu_isa(), .max_jobs = 16,
+                                 .spin_iterations = 1 << 20, .cpus = {}});
+        for (int k : {1, 2, 4, 10}) {
+            std::vector<double> lat;
+            std::size_t next = 0;
+            for (int r = 0; r < o.repetitions * 64; ++r) {
+                std::vector<moe::CpuExpertJob> jobs(static_cast<std::size_t>(k));
+                for (int j = 0; j < k; ++j) {
+                    auto& job  = jobs[static_cast<std::size_t>(j)];
+                    job.record = records + (next++ % static_cast<std::size_t>(o.experts)) * moe::kRecordBytes;
+                    job.scales = scales;
+                    job.ncols  = 1;
+                    job.x[0]   = &x[static_cast<std::size_t>(j) * moe::kHidden];
+                    job.y[0]   = &y[static_cast<std::size_t>(j) * moe::kHidden];
+                }
+                const auto t0 = Clock::now();
+                team.run(jobs);
+                lat.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+            }
+            std::sort(lat.begin(), lat.end());
+            const double med = lat[lat.size() / 2], p90 = lat[lat.size() * 9 / 10];
+            std::printf("%8d %4d %12.1f %12.1f %12.2f\n", workers, k, med, p90, k * moe::kRecordBytes / med / 1e3);
+        }
+    }
+    munmap(records, bytes);
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -252,5 +291,6 @@ int main(int argc, char** argv) {
                 moe::cpu_isa_name(moe::best_cpu_isa()), moe::kRecordBytes);
     if (o.arena_gib > 0) { dram_probe(o, o.threads); }
     expert_probe(o, o.threads);
+    team_probe(o, o.threads);
     return 0;
 }

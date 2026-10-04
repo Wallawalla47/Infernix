@@ -346,17 +346,16 @@ void quantize_a4(const std::uint16_t* v, int n, float input_scale, canon::A4Bloc
 void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                    const canon::A4Block* const* x_gate, const canon::A4Block* const* x_up,
                    int ncols, int unit_begin, int unit_end, canon::A4Block* const* h_blocks) {
-    const int rows = 32;
-    std::vector<std::int64_t> s_gate(static_cast<std::size_t>(rows) * ncols);
-    std::vector<std::int64_t> s_up;
+    // No allocation on the miss path: one unit's sums fit on the stack.
+    std::int64_t s_gate[32 * kMaxColumns];
+    std::int64_t s_up[32 * kMaxColumns];
     for (int u = unit_begin; u < unit_end; ++u) {
         // Unit u is row groups 2u, 2u+1: rows 32u..32u+31, gate_i at even rows, up_i at odd rows.
-        rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_gate, ncols, s_gate.data());
-        const std::int64_t* up_sums = s_gate.data();
+        rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_gate, ncols, s_gate);
+        const std::int64_t* up_sums = s_gate;
         if (x_up != x_gate) {
-            s_up.resize(s_gate.size());
-            rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up.data());
-            up_sums = s_up.data();
+            rg16_row_sums(isa, record, kGateUpBlocks, 2 * u, 2 * u + 2, x_up, ncols, s_up);
+            up_sums = s_up;
         }
         for (int c = 0; c < ncols; ++c) {
             std::uint16_t h[16];
@@ -373,11 +372,13 @@ void gate_up_units(CpuIsa isa, const std::uint8_t* record, const ExpertScales& s
 void down_rows(CpuIsa isa, const std::uint8_t* record, const ExpertScales& scales,
                const canon::A4Block* const* h_blocks, int ncols, int rg_begin, int rg_end,
                std::uint16_t* const* y) {
-    std::vector<std::int64_t> s(static_cast<std::size_t>(rg_end - rg_begin) * 16 * ncols);
-    rg16_row_sums(isa, record + kGateUpBytes, kDownBlocks, rg_begin, rg_end, h_blocks, ncols, s.data());
-    for (int r = 0; r < (rg_end - rg_begin) * 16; ++r) {
-        for (int c = 0; c < ncols; ++c) {
-            y[c][rg_begin * 16 + r] = canon::a4_row_output(s[static_cast<std::size_t>(r) * ncols + c], scales.alpha_down);
+    std::int64_t s[16 * kMaxColumns]; // one row group at a time: no allocation on the miss path
+    for (int rg = rg_begin; rg < rg_end; ++rg) {
+        rg16_row_sums(isa, record + kGateUpBytes, kDownBlocks, rg, rg + 1, h_blocks, ncols, s);
+        for (int r = 0; r < 16; ++r) {
+            for (int c = 0; c < ncols; ++c) {
+                y[c][rg * 16 + r] = canon::a4_row_output(s[r * ncols + c], scales.alpha_down);
+            }
         }
     }
 }
