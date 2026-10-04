@@ -303,6 +303,7 @@ std::string usage_text(std::string_view program) {
         << "Options:\n"
         << "  --weights <path>            required .ninfer artifact\n"
         << "  --corpus <path>             token-id corpus (default: " << kDefaultCorpusPath << ")\n"
+        << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume (default: <weights>.ngram)\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -372,6 +373,8 @@ BenchOptions parse_args(int argc, char** argv) {
             saw_artifact          = true;
         } else if (arg == "--corpus") {
             options.corpus_path = value("--corpus");
+        } else if (arg == "--ngram-volume") {
+            options.ngram_volume_path = value("--ngram-volume");
         } else if (arg == "-p" || arg == "--n-prompt") {
             auto parsed = parse_int_list(value("--n-prompt"), "n-prompt");
             options.n_prompt.insert(options.n_prompt.end(), parsed.begin(), parsed.end());

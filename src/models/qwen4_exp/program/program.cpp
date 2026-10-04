@@ -126,6 +126,7 @@ public:
         std::uint64_t prefill_ns      = 0;
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
+        ExpertResidency::Stats cache_at_admission;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -359,6 +360,7 @@ public:
         lane.prefill_ns      = 0;
         lane.decode_ns       = 0;
         lane.decode_share_ns = 0;
+        lane.cache_at_admission = residency_->stats();
         transaction_lane_ = q.lane;
         published_        = false;
         ++revision_;
@@ -540,7 +542,7 @@ public:
             const auto index = lane_of(sequence);
             if (lanes_[index].phase != Phase::Finishable) { return out; }
             out.timings = timings(lanes_[index]);
-            report_cache();
+            report_cache(lanes_[index].cache_at_admission);
             release(index);
             out.status      = runtime::ConsumeStatus::Consumed;
             out.disposition = runtime::FinishDisposition::Released;
@@ -594,20 +596,31 @@ public:
     std::uint64_t revision() const noexcept { return revision_; }
 
 private:
-    static constexpr std::size_t kDecodePromotionsPerLayer  = 2;
+    // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
+    // promotion moves as many PCIe bytes as serving the expert once zero-copy.
+    static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
 
-    void report_cache() noexcept {
-        if (!options_.diagnostics.callback) { return; }
+    // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
+    // or on stderr without an observer.
+    void report_cache(const ExpertResidency::Stats& at_admission) noexcept {
         try {
-            const auto& s     = residency_->stats();
-            const double rate = s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0;
+            const auto& s       = residency_->stats();
+            const auto routed   = s.routed - at_admission.routed;
+            const auto hits     = s.hits - at_admission.hits;
+            const auto promoted = s.promotions - at_admission.promotions;
             char text[256];
             std::snprintf(text, sizeof(text),
-                          "expert cache: %u frames, %.1f%% of %llu routed experts hit since start, %llu promotions",
-                          residency_->frames(), rate, static_cast<unsigned long long>(s.routed),
-                          static_cast<unsigned long long>(s.promotions));
-            options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
+                          "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions; "
+                          "since start %.1f%%",
+                          residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
+                          static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
+                          s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0);
+            if (options_.diagnostics.callback) {
+                options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
+            } else {
+                std::fprintf(stderr, "[engine] %s\n", text);
+            }
         } catch (...) {}
     }
 
