@@ -102,9 +102,9 @@ and whether the GPU drives a display (DXGI outputs, then NVML). The expert cache
 `min(free - fixed - headroom, budget - fixed - 64 MiB) - reserve`
 
 where `fixed` is the dense weights plus the KV cache, workspaces and staging, `reserve` is
-max(256 MiB, 128 MiB + 4 MiB per CUDA graph the engine may capture), and `headroom` is
-`--vram-headroom-mib`: by default 1024 MiB when the GPU drives a display (or cannot tell) and 256 MiB
-when it does not. One line reports the result, for example:
+max(256 MiB, 128 MiB + 4 MiB per CUDA graph the engine may capture, counting at most 32), and
+`headroom` is `--vram-headroom-mib`: by default 512 MiB when the GPU drives a display (or cannot
+tell) and 256 MiB when it does not. One line reports the result, for example:
 
 ```text
 VRAM ledger: 32607 MiB card, no display, 547 in use before loading; dense weights 4198 MiB, KV 1024,
@@ -121,8 +121,13 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   NInfer executables makes such an allocation fail instead (optional).
-- The cache does not resize at runtime yet: a program that takes VRAM later can push the engine's
-  memory into system memory. With a display attached, keep the default headroom or raise it.
+- **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
+  desktop) takes memory and free VRAM falls below half the headroom, the cache gives back the
+  least valuable experts at the next round boundary, or at once when idle, and logs it; it grows
+  back 30 s after the memory is released. Decode is slower while the cache is smaller, and a
+  warning is logged if it falls below a quarter of its startup size.
+- On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
+  display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.
 
 ## Performance

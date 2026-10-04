@@ -27,7 +27,6 @@ ResidencyEntry ResidencyEntry::next(ResidencyState new_state, std::uint32_t new_
 LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period)
     : capacity_(capacity), halving_period_(halving_period), count_(num_keys, 0), last_(num_keys, 0),
       slot_(num_keys, kNone), mark_(num_keys, 0) {
-    if (capacity == 0) { throw std::invalid_argument("LFRU capacity must be positive"); }
     residents_.reserve(capacity);
 }
 
@@ -133,12 +132,54 @@ void LfruPolicy::seed(std::span<const std::uint32_t> resident_keys, std::span<co
     }
 }
 
+void LfruPolicy::set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims) {
+    if (residents_.size() > capacity) {
+        const std::size_t first = victims.size();
+        select_victims(residents_.size() - capacity, {}, victims);
+        for (std::size_t i = first; i < victims.size(); ++i) { erase(victims[i]); }
+    }
+    capacity_ = capacity;
+}
+
 // ---------------------------------------------------------------------------- frames
 
-FramePool::FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight)
-    : rounds_in_flight_(rounds_in_flight), state_(frames, kFree) {
-    free_.reserve(frames);
-    for (std::uint32_t f = frames; f-- > 0;) { free_.push_back(f); } // acquire hands out frame 0 first
+FramePool::FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight, std::uint32_t max_frames)
+    : rounds_in_flight_(rounds_in_flight), backed_(frames), state_(std::max(frames, max_frames), kUnbacked) {
+    free_.reserve(state_.size());
+    for (std::uint32_t f = frames; f-- > 0;) { // acquire hands out frame 0 first
+        state_[f] = kFree;
+        free_.push_back(f);
+    }
+}
+
+std::optional<std::uint32_t> FramePool::acquire_below(std::uint32_t limit) {
+    for (std::size_t i = free_.size(); i-- > 0;) {
+        const std::uint32_t f = free_[i];
+        if (f >= limit) { continue; }
+        free_[i] = free_.back();
+        free_.pop_back();
+        state_[f] = kHeld;
+        return f;
+    }
+    return std::nullopt;
+}
+
+void FramePool::resize(std::uint32_t frames) {
+    if (frames > state_.size()) { throw std::invalid_argument("frame pool resized beyond its maximum"); }
+    if (frames < backed_) {
+        for (std::uint32_t f = frames; f < backed_; ++f) {
+            if (state_[f] != kFree) { throw std::logic_error("frame pool shrunk over a frame in use"); }
+            state_[f] = kUnbacked;
+        }
+        free_.erase(std::remove_if(free_.begin(), free_.end(), [frames](std::uint32_t f) { return f >= frames; }),
+                    free_.end());
+    } else {
+        for (std::uint32_t f = backed_; f < frames; ++f) {
+            state_[f] = kFree;
+            free_.push_back(f);
+        }
+    }
+    backed_ = frames;
 }
 
 std::optional<std::uint32_t> FramePool::acquire() {
@@ -184,11 +225,9 @@ void FramePool::on_quiescent() {
 // ---------------------------------------------------------------------------- controller
 
 CacheController::CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
-                                 std::uint32_t rounds_in_flight)
-    : policy_(num_keys, frames - slack_frames), frames_(frames, rounds_in_flight), table_(num_keys),
-      is_queued_(num_keys, 0) {
-    if (slack_frames >= frames) { throw std::invalid_argument("slack must leave frames for experts"); }
-}
+                                 std::uint32_t rounds_in_flight, std::uint32_t max_frames)
+    : policy_(num_keys, frames > slack_frames ? frames - slack_frames : 0), slack_(slack_frames),
+      frames_(frames, rounds_in_flight, max_frames), table_(num_keys), is_queued_(num_keys, 0) {}
 
 void CacheController::load(std::uint32_t key, std::uint32_t frame, std::vector<Command>& out) {
     // ABSENT -> LOADING(f), copy, READY(f): all on the copy stream, in this order.
@@ -242,6 +281,39 @@ void CacheController::on_round_done(std::uint64_t round_done, std::vector<Comman
 void CacheController::on_quiescent(std::vector<Command>& out) {
     frames_.on_quiescent();
     drain_queue(out);
+}
+
+void CacheController::resize(std::uint32_t frames, std::vector<Command>& out) {
+    frames_.on_quiescent();
+    const std::uint32_t capacity = frames > slack_ ? frames - slack_ : 0;
+    if (frames >= frames_.backed()) {
+        frames_.resize(frames);
+        std::vector<std::uint32_t> none;
+        policy_.set_capacity(capacity, none);
+        drain_queue(out);
+        return;
+    }
+    std::vector<std::uint32_t> victims;
+    policy_.set_capacity(capacity, victims);
+    for (std::uint32_t v : victims) {
+        if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
+        const std::uint32_t frame = table_[v].frame;
+        table_[v]                 = table_[v].next(ResidencyState::kAbsent, 0);
+        out.push_back({Command::Kind::kWriteEntry, v, frame, table_[v].encode()});
+        frames_.release_now(frame);
+    }
+    // Survivors above the new top move into free frames below it: at most `capacity` experts are
+    // resident, so frames below the top suffice.
+    for (std::uint32_t key : policy_.residents()) {
+        if (table_[key].state == ResidencyState::kAbsent || table_[key].frame < frames) { continue; }
+        const auto target = frames_.acquire_below(frames);
+        if (!target) { throw std::logic_error("frame pool shrink found no relocation target"); }
+        const std::uint32_t from = table_[key].frame;
+        table_[key]              = table_[key].next(ResidencyState::kReady, *target);
+        out.push_back({Command::Kind::kRelocate, key, *target, table_[key].encode(), from});
+        frames_.release_now(from);
+    }
+    frames_.resize(frames);
 }
 
 } // namespace ninfer::models::qwen4_exp::expert_cache

@@ -72,6 +72,10 @@ public:
     // Seeds residency and counts, for example from a saved state or a shipped profile.
     void seed(std::span<const std::uint32_t> resident_keys, std::span<const std::uint32_t> counts);
 
+    // Changes the capacity (the frame pool grew or shrank). Shrinking evicts the lowest-score
+    // residents, wherever their frames are, into `victims`; uses keep their counts.
+    void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims);
+
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
     void insert(std::uint32_t key);
@@ -95,24 +99,33 @@ private:
 // Frames of the device pool. A frame whose expert was evicted is reusable only once every round
 // that might still read it has finished (design §9.5): the agent samples r_s = round_started
 // after the ABSENT write is visible, and the frame returns when round_done >= r_s + D, D being the
-// number of rounds that can be in flight.
+// number of rounds that can be in flight. Frames [0, backed()) have memory; the pool can grow up
+// to `max_frames` and shrink from the top (design §19.3.7).
 class FramePool {
 public:
-    FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight);
+    FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0);
 
     [[nodiscard]] std::optional<std::uint32_t> acquire();
     void release_now(std::uint32_t frame);                         // never held an expert
     void retire(std::uint32_t frame, std::uint64_t round_started_sample);
     void on_round_done(std::uint64_t round_done);
     void on_quiescent();                                            // no round in flight
+    // A free frame below `limit` (a relocation target when the pool shrinks to `limit`).
+    [[nodiscard]] std::optional<std::uint32_t> acquire_below(std::uint32_t limit);
+    // Backs frames [0, frames). Growing frees the new frames; shrinking needs every frame at or
+    // above `frames` free (the controller relocates their experts first).
+    void resize(std::uint32_t frames);
 
     [[nodiscard]] std::size_t free_count() const { return free_.size(); }
     [[nodiscard]] std::size_t pending_count() const { return pending_.size(); }
     [[nodiscard]] bool is_free(std::uint32_t frame) const { return state_[frame] == kFree; }
+    [[nodiscard]] std::uint32_t backed() const { return backed_; }
+    [[nodiscard]] std::uint32_t max_frames() const { return static_cast<std::uint32_t>(state_.size()); }
 
 private:
-    enum : std::uint8_t { kFree, kHeld, kPending };
+    enum : std::uint8_t { kFree, kHeld, kPending, kUnbacked };
     std::uint32_t rounds_in_flight_;
+    std::uint32_t backed_ = 0;
     std::vector<std::uint32_t> free_;
     std::deque<std::pair<std::uint64_t, std::uint32_t>> pending_; // (reusable at round_done >=, frame)
     std::vector<std::uint8_t> state_;
@@ -130,22 +143,31 @@ public:
         enum class Kind : std::uint8_t {
             kWriteEntry, // cuStreamWriteValue32(residency[key], word)
             kCopy,       // DMA host record of `key` into `frame`
+            kRelocate,   // device copy of `key`'s record from frame `source` into `frame`
         };
         Kind kind;
         std::uint32_t key;
         std::uint32_t frame;
         std::uint32_t word;
+        std::uint32_t source = 0;
     };
 
+    // `frames` backed now, up to `max_frames` (0: no growth).
     CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
-                    std::uint32_t rounds_in_flight);
+                    std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0);
 
     // The route log of one layer call. `round_started` is the agent's latest sample.
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1));
     void on_round_done(std::uint64_t round_done, std::vector<Command>& out);
     void on_quiescent(std::vector<Command>& out);
+    // Resizes the pool to `frames` while no round is in flight and every issued load has landed.
+    // Shrinking evicts the lowest-score residents (ABSENT writes) and relocates the experts still
+    // above the new top into free frames below it (relocations precede no other command); growing
+    // admits queued experts into the new frames.
+    void resize(std::uint32_t frames, std::vector<Command>& out);
 
+    [[nodiscard]] std::uint32_t frames() const { return frames_.backed(); }
     [[nodiscard]] const ResidencyEntry& entry(std::uint32_t key) const { return table_[key]; }
     [[nodiscard]] const LfruPolicy& policy() const { return policy_; }
     [[nodiscard]] std::size_t queued_loads() const { return queued_.size(); }
@@ -155,6 +177,7 @@ private:
     void drain_queue(std::vector<Command>& out);
 
     LfruPolicy policy_;
+    std::uint32_t slack_;
     FramePool frames_;
     std::vector<ResidencyEntry> table_;
     std::deque<std::uint32_t> queued_;

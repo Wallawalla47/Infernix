@@ -8,6 +8,7 @@ add_library(ninfer_core STATIC
   ${NINFER_READ_ONLY_FILE_SOURCE}
   arena.cu
   evictable_weight_pool.cu
+  vmm_arena.cu
   device.cu
   dtype.cpp
   host_memory.cpp

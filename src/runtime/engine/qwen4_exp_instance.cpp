@@ -10,6 +10,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/route_trace.h"
+#include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/registry.h"
 
 #include <chrono>
@@ -146,6 +147,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;
     program_options.route_trace   = models::qwen4_exp::testing::route_trace();
+    program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the

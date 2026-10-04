@@ -23,6 +23,10 @@ const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->d
 
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
 
+void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
+
+void Program::maintain() { impl_->apply_vram_target(true); }
+
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(prompt, options);
 }

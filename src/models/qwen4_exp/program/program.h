@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -292,6 +293,11 @@ struct ProgramOptions {
     std::uint32_t cpu_expert_jobs    = 8;
     std::int32_t cpu_pcie_divisor    = 3;
     DiagnosticObserver diagnostics;
+    // Internal (A/B measurement and tests): the runtime VRAM monitor that shrinks and grows the
+    // expert cache as other programs take and release device memory (design §19.3.7), and how long
+    // free memory must stay above the cache's target before it grows.
+    bool vram_monitor              = true;
+    double vram_grow_delay_seconds = 30.0;
     // Internal (measurement tools and tests): when set, every round's routed experts and every CUDA
     // graph executable's device memory are appended to this file for the expert-cache replay and
     // the graph-memory measurement (program/route_trace.h). Changes no result.
@@ -310,6 +316,12 @@ public:
     [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
     // How the expert frames were sized at construction.
     [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
+
+    // Expert-cache resizing outside rounds (design §19.3.7). The VRAM monitor calls the waker from
+    // its own thread when the cache should resize; the engine then calls maintain() from its
+    // worker, between rounds and under its execution lock. An empty waker detaches the engine.
+    void set_maintenance_waker(std::function<void()> waker);
+    void maintain();
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

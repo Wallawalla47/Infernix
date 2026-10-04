@@ -1,5 +1,6 @@
 #include "core/evictable_weight_pool.h"
 
+#include "core/cuda_vmm.h"
 #include "core/device.h"
 
 #include <cuda.h>
@@ -16,20 +17,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-void cu_check(CUresult result, const char* expr) {
-    if (result == CUDA_SUCCESS) { return; }
-    const char* name = nullptr;
-    (void)cuGetErrorName(result, &name);
-    throw std::runtime_error(std::string(expr) + " failed: " +
-                             (name != nullptr ? name : "unknown CUresult"));
-}
-
-#define NINFER_CU_CHECK(expr) ::ninfer::cu_check((expr), #expr)
-
-void ensure_driver_initialized() {
-    static std::once_flag once;
-    std::call_once(once, [] { NINFER_CU_CHECK(cuInit(0)); });
-}
+#define NINFER_CU_CHECK(expr) ::ninfer::vmm::check((expr), #expr)
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -61,26 +49,10 @@ struct EvictableWeightPool::Impl {
         set_access(home + offsets[piece], sizes[piece]);
     }
 
-    void set_access(CUdeviceptr va, std::size_t bytes) {
-        CUmemAccessDesc access{};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id   = config.device;
-        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        NINFER_CU_CHECK(cuMemSetAccess(va, bytes, &access, 1));
-    }
+    void set_access(CUdeviceptr va, std::size_t bytes) { vmm::set_access(va, bytes, config.device); }
 };
 
-bool EvictableWeightPool::supported(int device) {
-    ensure_driver_initialized();
-    CUdevice handle = 0;
-    if (cuDeviceGet(&handle, device) != CUDA_SUCCESS) { return false; }
-    int value = 0;
-    if (cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
-                             handle) != CUDA_SUCCESS) {
-        return false;
-    }
-    return value != 0;
-}
+bool EvictableWeightPool::supported(int device) { return vmm::supported(device); }
 
 EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make_unique<Impl>()) {
     if (config.arena_bytes == 0) {
@@ -89,16 +61,11 @@ EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make
     if (config.evictable_tail_bytes == 0 || config.evictable_tail_bytes > config.arena_bytes) {
         throw std::invalid_argument("evictable pool tail must be a nonempty arena suffix");
     }
-    ensure_driver_initialized();
     Impl& impl  = *impl_;
     impl.config = config;
 
-    CUmemAllocationProp prop{};
-    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id   = config.device;
-    NINFER_CU_CHECK(cuMemGetAllocationGranularity(&impl.granularity, &prop,
-                                                  CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    const CUmemAllocationProp prop = vmm::device_prop(config.device);
+    impl.granularity               = vmm::granularity(config.device);
     if (kChunkBytes % impl.granularity != 0) {
         throw std::runtime_error("evictable pool chunk is not a multiple of the VMM granularity");
     }
