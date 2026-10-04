@@ -1437,10 +1437,14 @@ private:
         return !mtp_ || !lane.mtp_live || lane.mtp_cells == lane.state_tokens ||
                lane.mtp_cells + 1U == lane.state_tokens;
     }
-    void require_mtp_settled(const Lane& lane) const {
-        if (!mtp_settled(lane)) {
-            throw std::logic_error("Qwen4Exp: the MTP drafter's cells are out of step with the model state");
-        }
+    // A drafter whose cells fall out of step with the model state would only propose worse drafts,
+    // which verification rejects: output is unaffected. The request keeps decoding without drafts
+    // and the defect is reported, rather than failing the request.
+    void require_mtp_settled(Lane& lane) const noexcept {
+        if (mtp_settled(lane)) { return; }
+        lane.mtp_live = false;
+        diagnostic("Qwen4Exp: the MTP drafter's cells are out of step with the model state; drafting is "
+                 "off for the rest of this request", DiagnosticLevel::Warning);
     }
 
     // The MTP cells of a chunk (prefill or forced tokens) of one lane. The pending cell (the
