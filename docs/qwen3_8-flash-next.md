@@ -19,6 +19,9 @@ drafter (`--spec mtp`) and n-gram copy proposals. Not yet supported: vision, Cau
   keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults about 69.3 GiB
   must be available. When the experts do not fit, startup stops with the ledger line, which names
   every term.
+- **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
+  workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
+  programs (see [VRAM](#vram)).
 - **Disk.** ~80 GB for the artifact, plus a 52 GB n-gram volume, ideally on its own NVMe drive.
 
 ## Convert
@@ -85,11 +88,42 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - The engine starts six CPU worker threads for missed experts (up to eight per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
-- The expert cache fills all VRAM but 384 MiB (98.8 % used on the 5090).
+- The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the
   request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
   of reads`). The row cache outlives requests, so repeated text hits it, while new text reads most
   of its rows from the volume.
+
+## VRAM
+
+At startup the engine reads the GPU's free memory, the Windows video-memory budget of the process
+and whether the GPU drives a display (DXGI outputs, then NVML). The expert cache takes
+
+`min(free - fixed - headroom, budget - fixed - 64 MiB) - reserve`
+
+where `fixed` is the dense weights plus the KV cache, workspaces and staging, `reserve` is
+max(256 MiB, 128 MiB + 4 MiB per CUDA graph the engine may capture), and `headroom` is
+`--vram-headroom-mib`: by default 1024 MiB when the GPU drives a display (or cannot tell) and 256 MiB
+when it does not. One line reports the result, for example:
+
+```text
+VRAM ledger: 32607 MiB card, no display, 547 in use before loading; dense weights 4198 MiB, KV 1024,
+workspace 1236, expert staging 169, state and io 310, expert tables 7; reserve 256 (20 graphs);
+headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
+```
+
+- **Before reading the weights**, the engine checks that the fixed allocations fit; if they do not,
+  it stops with the largest terms and what to lower (`--max-context`, `--max-concurrency`,
+  `--prefill-chunk`, `--kv-dtype int8`). Below 2,048 expert frames it warns that decode will be slow.
+- **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
+  system memory without an error, which slows everything down. The engine checks that every startup
+  allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
+  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
+  NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
+  NInfer executables makes such an allocation fail instead (optional).
+- The cache does not resize at runtime yet: a program that takes VRAM later can push the engine's
+  memory into system memory. With a display attached, keep the default headroom or raise it.
+- `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.
 
 ## Performance
 

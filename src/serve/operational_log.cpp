@@ -554,7 +554,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                    "CUDA graphs {} allowed, {} used",
                    product::format_pretty_bytes(memory.available_after_weights_bytes),
                    product::format_pretty_bytes(memory.available_after_startup_bytes),
-                   product::format_pretty_bytes(memory.kv_capacity_headroom_bytes),
+                   product::format_pretty_bytes(memory.vram_headroom_bytes),
                    product::format_pretty_bytes(memory.planned_slack_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_allowance_bytes),
                    product::format_pretty_bytes(memory.cuda_graph_measured_bytes));

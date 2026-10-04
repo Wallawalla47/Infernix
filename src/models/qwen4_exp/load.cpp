@@ -276,6 +276,12 @@ std::uint64_t LoadPlan::pinned_other_bytes() const {
     return std::uint64_t(c.vocab_size) * c.hidden_size * 2U;
 }
 
+std::uint64_t LoadPlan::device_bytes() const { return impl_->materialization.device_capacity_bytes; }
+
+std::uint32_t LoadPlan::public_token_count() const {
+    return static_cast<std::uint32_t>(impl_->resources.public_token_count);
+}
+
 std::uint64_t LoadPlan::pinned_expert_bytes() const {
     const std::uint64_t pinned = impl_->materialization.pinned_capacity_bytes;
     const std::uint64_t other  = pinned_other_bytes();

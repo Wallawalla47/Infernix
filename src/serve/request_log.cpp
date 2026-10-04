@@ -593,7 +593,7 @@ std::string format_server_start_json(
              {"runtime_reservation_bytes", memory.runtime_reservation_bytes},
              {"available_after_weights_bytes", memory.available_after_weights_bytes},
              {"available_after_startup_bytes", memory.available_after_startup_bytes},
-             {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
+             {"vram_headroom_bytes", memory.vram_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},

@@ -230,7 +230,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
-    print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
+    print_metric("VRAM headroom", format_bytes(memory.vram_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
@@ -324,6 +324,7 @@ int main(int argc, char** argv) {
         engine_options.max_context              = cli.max_context;
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.kv_capacity              = cli.kv_capacity;
+        engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;

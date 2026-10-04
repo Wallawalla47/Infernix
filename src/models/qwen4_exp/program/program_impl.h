@@ -11,11 +11,14 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
+#include "core/vram_budget.h"
+#include "core/weight_view.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
+#include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/route_trace.h"
@@ -100,6 +103,48 @@ struct ContractAccess {
 
 using Clock = std::chrono::steady_clock;
 
+inline std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
+
+// Per-call inputs staged through pinned memory, one device copy.
+struct IoLayout {
+    std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, mtp_ids = 0, mtp_cells = 0,
+                bytes = 0;
+};
+
+// Device I32 arrays of a verification round, each with room for every lane and width.
+struct SpecLayout {
+    std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
+                accepted = 0, commit = 0, words = 0;
+};
+
+// I32 MTP drafter io: chain ids [B], cells [K, B], drafts [K, B], catch-up ids [W, B], gather
+// columns [B], catch-up cells [W, B].
+struct MtpIo {
+    std::size_t ids = 0, cells = 0, drafts = 0, up_ids = 0, gather = 0, up_cells = 0, words = 0;
+};
+
+// Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
+// (ProgramImpl::plan_device) computes it from the options and the configuration alone: before the
+// weights are read, for the startup check, and in the constructor, which allocates exactly it.
+struct DeviceLayout {
+    std::int32_t lanes = 0, token_domain = 0, head_rows = 0, chunk = 0, mtp_k = 0, max_width = 1, columns = 0,
+                 pages_per_row = 0, mtp_columns = 0;
+    bool mtp = false;
+    std::uint32_t kv_pages = 0, kv_layers = 0;
+    std::uint64_t record_stride = 0;
+    LinearAttentionStatePoolLayout gdn;
+    DeviceKVPagePoolLayout pool;
+    KVExecutionTableLayout tables;
+    GdnReplayRecordLayout records;
+    IoLayout io;
+    SpecLayout spec;
+    MtpIo mtp_io;
+    std::size_t gdn_bytes = 0, ple = 0, tails = 0, kv = 0, records_bytes = 0, ple_records = 0, qsa_records = 0;
+    std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
+    std::size_t mtp_column_bytes = 0, mtp_ones = 0;
+    ProgramDevicePlan bytes;
+};
+
 inline std::uint64_t elapsed_ns(Clock::time_point start) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
@@ -155,111 +200,257 @@ public:
         std::uint64_t mtp_policy_rounds = 0;
     };
 
-    ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
-        : parameters_(parameters), device_(device), c_(parameters.model.config().text), options_(std::move(options)),
-          volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0) {
-        if (options_.max_concurrency == 0 || options_.max_concurrency > kMaximumConcurrency) {
+    // Everything the Program allocates on the device besides the expert frames; validates the
+    // options.
+    static DeviceLayout plan_device(const ProgramOptions& o, const Config& config, std::int32_t public_tokens) {
+        const TextConfig& c = config.text;
+        if (o.max_concurrency == 0 || o.max_concurrency > kMaximumConcurrency) {
             throw std::invalid_argument("Qwen4Exp: max_concurrency must be in [1,8]");
         }
-        if (options_.kv_cache != KvCacheStorage::BFloat16 && options_.kv_cache != KvCacheStorage::Int8Group64) {
+        if (o.kv_cache != KvCacheStorage::BFloat16 && o.kv_cache != KvCacheStorage::Int8Group64) {
             throw std::invalid_argument("Qwen4Exp supports --kv-dtype bf16 or int8");
         }
-        if (options_.max_context == 0 || options_.prefill_chunk == 0) {
+        if (o.max_context == 0 || o.prefill_chunk == 0) {
             throw std::invalid_argument("Qwen4Exp: max_context and prefill_chunk must be nonzero");
         }
-        const auto lanes   = static_cast<std::int32_t>(options_.max_concurrency);
-        vocab_             = dim(c_.vocab_size);
-        token_domain_      = dim(parameters.model.resources().public_token_count);
-        chunk_             = static_cast<std::int32_t>(std::min(options_.prefill_chunk, options_.max_context));
-        if (options_.ngram_draft_tokens > 15 ||
-            (options_.ngram_draft_tokens > 0 && (options_.ngram_min_match < 4 || options_.ngram_min_match > 64))) {
+        if (o.ngram_draft_tokens > 15 ||
+            (o.ngram_draft_tokens > 0 && (o.ngram_min_match < 4 || o.ngram_min_match > 64))) {
             throw std::invalid_argument("Qwen4Exp: n-gram drafts must be 0..15 with a minimum match of 4..64");
         }
-        mtp_ = parameters_.mtp.has_value();
-        if (mtp_ && (options_.mtp_draft_tokens == 0 || options_.mtp_draft_tokens > 7)) {
+        if (config.mtp && (o.mtp_draft_tokens == 0 || o.mtp_draft_tokens > 7)) {
             throw std::invalid_argument("Qwen4Exp: MTP needs 1..7 draft tokens");
         }
-        mtp_k_     = mtp_ ? static_cast<std::int32_t>(options_.mtp_draft_tokens) : 0;
-        max_width_ = 1 + std::max(static_cast<std::int32_t>(options_.ngram_draft_tokens), mtp_k_);
-        columns_           = std::max(chunk_, lanes * max_width_);
-        pages_per_row_     = (dim(options_.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
-        const auto kv_tokens = options_.kv_capacity_tokens != 0 ? options_.kv_capacity_tokens
-                                                                 : options_.max_context * options_.max_concurrency;
-        kv_pages_ = (kv_tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        DeviceLayout d;
+        d.lanes         = static_cast<std::int32_t>(o.max_concurrency);
+        d.token_domain  = public_tokens;
+        d.mtp           = config.mtp;
+        d.head_rows     = config.proposal_rows != 0 ? dim(config.proposal_rows) : dim(c.vocab_size);
+        d.chunk         = static_cast<std::int32_t>(std::min(o.prefill_chunk, o.max_context));
+        d.mtp_k         = d.mtp ? static_cast<std::int32_t>(o.mtp_draft_tokens) : 0;
+        d.max_width     = 1 + std::max(static_cast<std::int32_t>(o.ngram_draft_tokens), d.mtp_k);
+        d.columns       = std::max(d.chunk, d.lanes * d.max_width);
+        d.pages_per_row = (dim(o.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        const auto kv_tokens = o.kv_capacity_tokens != 0 ? o.kv_capacity_tokens : o.max_context * o.max_concurrency;
+        d.kv_pages      = (kv_tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        const std::int32_t lanes = d.lanes, W = d.max_width;
+        const std::size_t width = c.residual_width(), di = c.qsa.index_head_dim, r = c.qsa.compress_ratio;
 
-        // Recurrent state: one slot per lane.
+        // Recurrent state: one slot per lane; the PLE history; one QSA tail slab per attention
+        // layer, and one more for the MTP block.
         LayoutBuilder state_builder;
-        const LinearAttentionStatePoolSpec gdn_spec{
-            .layers         = c_.gdn_layers,
-            .conv_channels  = dim(c_.gdn.conv_channels()),
-            .conv_width     = dim(c_.gdn.conv_kernel - 1),
-            .value_heads    = dim(c_.gdn.value_heads),
-            .value_head_dim = dim(c_.gdn.value_head_dim),
-            .key_head_dim   = dim(c_.gdn.key_head_dim),
-            .slot_count     = lanes,
-        };
-        const auto gdn_layout = plan_linear_attention_state_pool(state_builder, gdn_spec);
-        state_backing_        = DeviceBuffer(state_builder.finish(256));
-        state_backing_.fill(0);
-        gdn_ = std::make_unique<LinearAttentionStatePool>(DeviceSpan{state_backing_.p, state_backing_.bytes}, gdn_layout);
-
-        width_   = dim(c_.residual_width());
-        span_    = dim(c_.ple.conv_span());
-        ple_backing_ = DeviceBuffer(static_cast<std::size_t>(width_) * span_ * lanes * 2);
-        ple_backing_.fill(0);
-        di_ = dim(c_.qsa.index_head_dim);
-        r_  = dim(c_.qsa.compress_ratio);
-        // One more tail slab and KV layer for the MTP block (after the text layers).
-        const std::uint32_t kv_layers = c_.attention_layers + (mtp_ ? 1U : 0U);
-        tails_backing_ = DeviceBuffer(static_cast<std::size_t>(kv_layers) * di_ * (r_ - 1) * lanes * 2);
-        tails_backing_.fill(0);
+        d.gdn       = plan_linear_attention_state_pool(state_builder, {
+                                                                    .layers         = c.gdn_layers,
+                                                                    .conv_channels  = dim(c.gdn.conv_channels()),
+                                                                    .conv_width     = dim(c.gdn.conv_kernel - 1),
+                                                                    .value_heads    = dim(c.gdn.value_heads),
+                                                                    .value_head_dim = dim(c.gdn.value_head_dim),
+                                                                    .key_head_dim   = dim(c.gdn.key_head_dim),
+                                                                    .slot_count     = lanes,
+                                                                });
+        d.gdn_bytes = state_builder.finish(256);
+        d.ple       = width * c.ple.conv_span() * lanes * 2;
+        d.kv_layers = c.attention_layers + (d.mtp ? 1U : 0U);
+        d.tails     = d.kv_layers * di * (r - 1) * lanes * 2;
 
         // Paged KV: one page group holds 64 positions of every attention layer.
-        const auto layout = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
+        const auto storage = paged_kv_storage_layout(o.kv_cache, dim(c.attention.head_dim));
         KVPageGeometry geometry;
-        const auto kv_heads = dim(c_.attention.kv_heads);
-        for (std::uint32_t l = 0; l < kv_layers; ++l) {
-            geometry.planes.push_back({layout.key.data_dtype, layout.key.data_leading_extent, kv_heads});
-            if (layout.key.has_scale()) {
-                geometry.planes.push_back({layout.key.scale_dtype, layout.key.scale_leading_extent, kv_heads});
+        const auto kv_heads = dim(c.attention.kv_heads);
+        for (std::uint32_t l = 0; l < d.kv_layers; ++l) {
+            geometry.planes.push_back({storage.key.data_dtype, storage.key.data_leading_extent, kv_heads});
+            if (storage.key.has_scale()) {
+                geometry.planes.push_back({storage.key.scale_dtype, storage.key.scale_leading_extent, kv_heads});
             }
-            geometry.planes.push_back({layout.value.data_dtype, layout.value.data_leading_extent, kv_heads});
-            if (layout.value.has_scale()) {
-                geometry.planes.push_back({layout.value.scale_dtype, layout.value.scale_leading_extent, kv_heads});
+            geometry.planes.push_back({storage.value.data_dtype, storage.value.data_leading_extent, kv_heads});
+            if (storage.value.has_scale()) {
+                geometry.planes.push_back({storage.value.scale_dtype, storage.value.scale_leading_extent, kv_heads});
             }
-            geometry.planes.push_back({DType::BF16, di_ / r_, 1});
+            geometry.planes.push_back({DType::BF16, dim(di / r), 1});
         }
         LayoutBuilder kv_builder;
-        const auto pool_layout =
-            plan_device_kv_page_pool(kv_builder, {.page_group_count = kv_pages_, .geometry = geometry});
-        const auto table_layout = plan_kv_execution_tables(
-            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(pages_per_row_), .table_rows = lanes});
-        kv_backing_ = DeviceBuffer(kv_builder.finish(256));
+        d.pool   = plan_device_kv_page_pool(kv_builder, {.page_group_count = d.kv_pages, .geometry = geometry});
+        d.tables = plan_kv_execution_tables(
+            kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
+        d.kv = kv_builder.finish(256);
+
+        // Per-call inputs, logits and sampling counts.
+        const std::size_t heads     = NgramHash(c.ple.ngram, 0).heads();
+        const std::size_t row_bytes = c.ple.table.row_bytes;
+        const std::size_t columns   = static_cast<std::size_t>(d.columns);
+        d.io.ids       = 0;
+        d.io.positions = align(d.io.ids + 4ULL * columns);
+        d.io.slots     = align(d.io.positions + 4ULL * columns);
+        d.io.rows      = align(d.io.slots + 4ULL * lanes);
+        d.io.columns   = align(d.io.rows + 4ULL * lanes);
+        d.io.ngram     = align(d.io.columns + 4ULL * columns);
+        d.io.mtp_ids   = align(d.io.ngram + row_bytes * heads * columns);
+        d.io.mtp_cells = align(d.io.mtp_ids + 4ULL * (columns + 1));
+        d.io.bytes     = align(d.io.mtp_cells + 4ULL * (columns + 1));
+        d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
+        d.logits16     = 2ULL * c.vocab_size * lanes * W;
+        d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
+
+        // One workspace arena: the forward pass, sampling, draft acceptance and the drafter.
+        d.work = workspace_bytes(c, o, d, lanes);
+
+        // Verification (W > 1): GDN replay records, PLE and QSA records, the round's I32 arrays.
+        if (W > 1) {
+            LayoutBuilder records_builder;
+            d.records       = plan_gdn_replay_records(records_builder, {.layers          = dim(c.gdn_layers),
+                                                                        .record_capacity = lanes,
+                                                                        .width           = W,
+                                                                        .conv_channels   = dim(c.gdn.conv_channels()),
+                                                                        .qk_heads        = dim(c.gdn.key_heads),
+                                                                        .value_heads     = dim(c.gdn.value_heads),
+                                                                        .key_dim         = dim(c.gdn.key_head_dim),
+                                                                        .value_dim       = dim(c.gdn.value_head_dim)});
+            d.records_bytes = records_builder.finish(256);
+            d.ple_records   = 2ULL * width * W * lanes;
+            d.qsa_records   = 2ULL * di * W * lanes * c.attention_layers;
+            const std::size_t cells = static_cast<std::size_t>(lanes) * W;
+            std::size_t at          = 0;
+            const auto take         = [&](std::size_t words) {
+                const std::size_t begin = at;
+                at += (words + 63) / 64 * 64;
+                return begin;
+            };
+            d.spec.target   = take(cells);
+            d.spec.drafts   = take(cells);
+            d.spec.extents  = take(lanes);
+            d.spec.lengths  = take(lanes);
+            d.spec.anchors  = take(lanes);
+            d.spec.licensed = take(cells);
+            d.spec.counts   = take(lanes);
+            d.spec.accepted = take(lanes);
+            d.spec.commit   = take(lanes);
+            d.spec.words    = at;
+        }
+
+        // The MTP drafter (design 11.2): residual columns, the saved and chain columns, its QSA
+        // records, the HC ones and its io.
+        if (d.mtp) {
+            d.mtp_columns      = std::max(lanes * W, std::min(d.chunk, 512));
+            d.mtp_column_bytes = 2ULL * width;
+            d.mtp_ones         = sizeof(float) * c.hc.streams * static_cast<std::size_t>(d.mtp_columns);
+            const auto k       = static_cast<std::size_t>(d.mtp_k);
+            d.mtp_io.ids       = 0;
+            d.mtp_io.cells     = d.mtp_io.ids + lanes;
+            d.mtp_io.drafts    = d.mtp_io.cells + lanes * k;
+            d.mtp_io.up_ids    = d.mtp_io.drafts + lanes * k;
+            d.mtp_io.gather    = d.mtp_io.up_ids + static_cast<std::size_t>(lanes) * W;
+            d.mtp_io.up_cells  = d.mtp_io.gather + lanes;
+            d.mtp_io.words     = d.mtp_io.up_cells + static_cast<std::size_t>(lanes) * W;
+        }
+
+        // Staging slots for each layer call's misses (design 8.6), one expert record each.
+        const std::uint64_t shape[] = {c.moe.experts, c.hidden_size, c.moe.intermediate};
+        d.record_stride = weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, shape).record_stride;
+        d.staging       = static_cast<std::size_t>(kStagingSlots) * d.record_stride;
+
+        auto& b     = d.bytes;
+        b.kv_pages  = d.kv_pages;
+        b.kv        = d.kv;
+        b.workspace = d.work;
+        b.staging   = d.staging;
+        b.state     = d.gdn_bytes + d.ple + d.tails + d.records_bytes + d.ple_records + d.qsa_records +
+                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
+        b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
+               sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
+               4ULL * d.mtp_io.words;
+        b.residency            = ExpertResidency::table_bytes(c, d.columns);
+        b.expert_record_stride = d.record_stride;
+        b.max_frames           = ExpertResidency::max_frames(c);
+        b.graph_bound          = graph_bound(o.max_concurrency, static_cast<std::uint32_t>(W),
+                                             static_cast<std::uint32_t>(d.mtp_k));
+        return d;
+    }
+
+    // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
+    // widest call (a prefill chunk or every lane's widest round), sampling, acceptance and the
+    // drafter. The plan sizes the arena with the Program's lane count; the per-lane report compares
+    // lane counts.
+    static std::size_t workspace_bytes(const TextConfig& c, const ProgramOptions& o, const DeviceLayout& d,
+                                       std::int32_t lanes) {
+        const std::int32_t W = d.max_width;
+        std::size_t bytes =
+            execution::Forward::workspace_bytes(c, std::max(d.chunk, lanes * W), dim(o.max_context)) +
+            ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
+        if (W > 1) {
+            bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
+        }
+        if (d.mtp) {
+            bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
+                                                             d.head_rows, dim(o.max_context));
+        }
+        return bytes;
+    }
+
+    static void allocate(DeviceBuffer& buffer, std::size_t bytes, std::uint64_t& tally) {
+        buffer = DeviceBuffer(bytes);
+        tally += bytes;
+    }
+
+    // The startup failure for device allocations the driver placed in system memory.
+    static std::string spill_message(std::uint64_t bytes) {
+        return std::to_string(bytes >> 20) +
+               " MiB of NInfer's VRAM allocations were placed in shared system memory by the driver's sysmem "
+               "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
+               "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
+               "this fail at allocation instead.";
+    }
+
+    ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
+        : parameters_(parameters), device_(device), c_(parameters.model.config().text), options_(std::move(options)),
+          volume_(options_.ngram_volume, c_.ple.table), hash_(c_.ple.ngram, 0),
+          plan_(plan_device(options_, parameters.model.config(), dim(parameters.model.resources().public_token_count))) {
+        const auto& head = parameters_.draft_head;
+        mtp_             = parameters_.mtp.has_value();
+        if (mtp_ != plan_.mtp || (mtp_ && (head.rows ? dim(head.rows->weight.n) : dim(c_.vocab_size)) != plan_.head_rows)) {
+            throw std::logic_error("Qwen4Exp: the bound drafter differs from its configuration");
+        }
+        const std::int32_t lanes = plan_.lanes;
+        vocab_         = dim(c_.vocab_size);
+        token_domain_  = plan_.token_domain;
+        chunk_         = plan_.chunk;
+        mtp_k_         = plan_.mtp_k;
+        max_width_     = plan_.max_width;
+        columns_       = plan_.columns;
+        pages_per_row_ = plan_.pages_per_row;
+        kv_pages_      = plan_.kv_pages;
+        width_         = dim(c_.residual_width());
+        span_          = dim(c_.ple.conv_span());
+        di_            = dim(c_.qsa.index_head_dim);
+        r_             = dim(c_.qsa.compress_ratio);
+
+        // Every fixed allocation below is checked against the plan and against device free memory
+        // (an allocation the driver placed in system memory fails startup, design §19.3.7).
+        vram_ = open_vram_budget_source(device_.device);
+        SpillGuard guard(*vram_);
+        guard.begin();
+        std::uint64_t allocated = 0;
+
+        allocate(state_backing_, plan_.gdn_bytes, allocated);
+        state_backing_.fill(0);
+        gdn_ = std::make_unique<LinearAttentionStatePool>(DeviceSpan{state_backing_.p, state_backing_.bytes}, plan_.gdn);
+        allocate(ple_backing_, plan_.ple, allocated);
+        ple_backing_.fill(0);
+        allocate(tails_backing_, plan_.tails, allocated);
+        tails_backing_.fill(0);
+
+        allocate(kv_backing_, plan_.kv, allocated);
         kv_backing_.fill(0);
-        pool_   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, pool_layout);
-        tables_ = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, table_layout, *pool_);
+        pool_   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, plan_.pool);
+        tables_ = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, plan_.tables, *pool_);
 
-        // Per-call inputs, staged through pinned memory.
-        const std::size_t heads     = hash_.heads();
-        const std::size_t row_bytes = c_.ple.table.row_bytes;
-        io_layout_.ids       = 0;
-        io_layout_.positions = align(io_layout_.ids + 4ULL * columns_);
-        io_layout_.slots     = align(io_layout_.positions + 4ULL * columns_);
-        io_layout_.rows      = align(io_layout_.slots + 4ULL * lanes);
-        io_layout_.columns   = align(io_layout_.rows + 4ULL * lanes);
-        io_layout_.ngram     = align(io_layout_.columns + 4ULL * columns_);
-        io_layout_.mtp_ids   = align(io_layout_.ngram + row_bytes * heads * columns_);
-        io_layout_.mtp_cells = align(io_layout_.mtp_ids + 4ULL * (columns_ + 1));
-        io_layout_.bytes     = align(io_layout_.mtp_cells + 4ULL * (columns_ + 1));
-        io_device_ = DeviceBuffer(io_layout_.bytes);
-        io_host_   = PinnedHostBuffer(io_layout_.bytes);
-
-        logits32_     = DeviceBuffer(sizeof(float) * vocab_ * lanes * max_width_);
-        logits16_     = DeviceBuffer(2ULL * vocab_ * lanes * max_width_);
-        sampled_      = DeviceBuffer(4ULL * lanes);
-        sample_pos_   = DeviceBuffer(4ULL * lanes);
-        configs_      = DeviceBuffer(sizeof(ops::SamplingConfig) * lanes);
-        token_counts_ = DeviceBuffer(4ULL * token_domain_ * lanes);
+        io_layout_ = plan_.io;
+        allocate(io_device_, io_layout_.bytes, allocated);
+        io_host_ = PinnedHostBuffer(io_layout_.bytes);
+        allocate(logits32_, plan_.logits32, allocated);
+        allocate(logits16_, plan_.logits16, allocated);
+        allocate(sampled_, 4ULL * lanes, allocated);
+        allocate(sample_pos_, 4ULL * lanes, allocated);
+        allocate(configs_, sizeof(ops::SamplingConfig) * lanes, allocated);
+        allocate(token_counts_, plan_.token_counts, allocated);
         token_counts_.fill(0);
         host_sampled_ = PinnedHostBuffer(4ULL * lanes);
         host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
@@ -272,10 +463,12 @@ public:
                                                  static_cast<std::size_t>(l) * di_ * (r_ - 1) * lanes * 2,
                                              DType::BF16, {di_, r_ - 1, lanes}));
         }
+        const auto layout   = paged_kv_storage_layout(options_.kv_cache, dim(c_.attention.head_dim));
+        const auto kv_heads = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
         std::size_t plane = 0;
-        for (std::uint32_t l = 0; l < kv_layers; ++l) {
+        for (std::uint32_t l = 0; l < plan_.kv_layers; ++l) {
             ops::QsaKVLayer layer;
             layer.kv.storage      = options_.kv_cache;
             layer.kv.head_dim     = dim(c_.attention.head_dim);
@@ -295,27 +488,36 @@ public:
             state.mtp_tails = Tensor(static_cast<std::byte*>(tails_backing_.p) +
                                          static_cast<std::size_t>(c_.attention_layers) * di_ * (r_ - 1) * lanes * 2,
                                      DType::BF16, {di_, r_ - 1, lanes});
-            allocate_mtp(lanes);
+            allocate_mtp(lanes, allocated);
             state.mtp_ones = Tensor(mtp_ones_.p, DType::FP32, {dim(c_.hc.streams), mtp_columns_});
         }
         execution::ForwardExperts experts;
         experts.frames.assign(c_.num_hidden_layers, nullptr);
-        work_capacity_ = workspace_capacity(lanes);
-        if (max_width_ > 1) { allocate_verification(lanes); }
-        work_    = std::make_unique<WorkspaceArena>(work_capacity_);
+        if (max_width_ > 1) { allocate_verification(lanes, allocated); }
+        work_capacity_ = plan_.work;
+        work_          = std::make_unique<WorkspaceArena>(work_capacity_);
+        allocated += work_capacity_;
 
-        // The VRAM expert cache takes the device memory left over, less a reserve.
         std::vector<const std::uint8_t*> banks;
         std::uint64_t record_stride = 0;
         for (const auto& layer : parameters_.layers) {
             banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
             record_stride = layer.moe.bank->planes.record_stride;
         }
+        if (record_stride != plan_.record_stride) {
+            throw std::logic_error("Qwen4Exp: the expert banks' record stride differs from their format's");
+        }
         // Staging slots for each layer call's misses (copied with a compact read window, design
         // 8.6), allocated before the frames take the remaining memory.
-        staging_ = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * record_stride);
+        allocate(staging_, plan_.staging, allocated);
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        if (allocated != plan_.bytes.fixed_bytes() - plan_.bytes.residency) {
+            throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
+        }
+        if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
+            throw std::runtime_error(spill_message(spilled));
+        }
         CUDA_CHECK(cudaStreamCreateWithFlags(&overlap_.stream, cudaStreamNonBlocking));
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
@@ -345,14 +547,38 @@ public:
                 experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
             }
         }
+
+        // The VRAM expert cache takes what the fixed allocations, the reserve for graph
+        // executables and the display headroom leave (design §19.3.7).
         std::uint32_t frames = 0;
         if (options_.expert_cache) {
-            std::size_t free_bytes = 0, total_bytes = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-            const std::size_t reserve = options_.expert_cache_reserve_bytes;
-            frames = free_bytes > reserve ? static_cast<std::uint32_t>((free_bytes - reserve) / record_stride) : 0U;
+            VramDemand demand;
+            demand.headroom    = options_.vram_headroom;
+            demand.graphs      = plan_.bytes.graph_bound;
+            demand.fixed       = plan_.bytes.residency;
+            demand.frame_bytes = record_stride;
+            demand.max_frames  = plan_.bytes.max_frames;
+            sizing_            = size_expert_frames(vram_->query(), demand);
+            frames             = sizing_.frames;
         }
-        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, frames, columns_);
+        // The frames are the one elastic allocation: frames the driver placed in system memory
+        // (another program took memory since the reading) are given back once and the cache
+        // starts smaller.
+        for (int attempt = 0;; ++attempt) {
+            guard.begin();
+            residency_ = std::make_unique<ExpertResidency>(c_, banks, record_stride, frames, columns_);
+            const std::uint64_t spilled =
+                guard.end(static_cast<std::uint64_t>(residency_->frames()) * record_stride + plan_.bytes.residency);
+            if (spilled == 0) { break; }
+            if (attempt > 0 || residency_->frames() == 0) { throw std::runtime_error(spill_message(spilled)); }
+            const std::uint64_t drop = (spilled + kVramBudgetMarginBytes + record_stride - 1) / record_stride;
+            frames = residency_->frames() > drop ? residency_->frames() - static_cast<std::uint32_t>(drop) : 0U;
+            residency_.reset();
+            diagnostic(std::to_string(spilled >> 20) +
+                                                 " MiB of the expert frames were placed in system memory; retrying "
+                                                 "with " + std::to_string(frames) + " frames", DiagnosticLevel::Warning);
+        }
+        sizing_.frames       = residency_->frames();
         experts.frame_base   = residency_->frame_base();
         experts.frame_stride = residency_->frame_stride();
         experts.route_log    = residency_->route_log();
@@ -377,6 +603,9 @@ public:
         device_.synchronize();
         report_lane_cost(lanes, record_stride);
     }
+
+    const DeviceLayout& device_layout() const noexcept { return plan_; }
+    const VramSizing& vram_sizing() const noexcept { return sizing_; }
 
     // ---------------------------------------------------------------- admission
     RequestBasePlan plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
@@ -907,22 +1136,7 @@ private:
 
     // The workspace arena of a Program with `lanes` lanes: the forward at its widest call (a prefill
     // chunk or every lane's widest round), sampling, acceptance and the drafter.
-    std::size_t workspace_capacity(std::int32_t lanes) const {
-        std::size_t bytes =
-            execution::Forward::workspace_bytes(c_, std::max(chunk_, lanes * max_width_), dim(options_.max_context)) +
-            ops::sampling_workspace_capacity_bytes(token_domain_, 1, lanes);
-        if (max_width_ > 1) {
-            bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain_, 1, max_width_ - 1, 1,
-                                                                                    lanes);
-        }
-        if (mtp_) {
-            const auto& head = parameters_.draft_head;
-            bytes += execution::Forward::mtp_workspace_bytes(c_, std::max(lanes * max_width_, std::min(chunk_, 512)),
-                                                             lanes, head.rows ? head.rows->weight.n : vocab_,
-                                                             dim(options_.max_context));
-        }
-        return bytes;
-    }
+    std::size_t workspace_capacity(std::int32_t lanes) const { return workspace_bytes(c_, options_, plan_, lanes); }
 
     // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
     // (design 19.3.5): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
@@ -978,22 +1192,16 @@ private:
     }
 
     // A diagnostic (Info unless stated) for the Engine's observer, or stderr without one.
-    void diagnostic(const char* text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
+    void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
         try {
             if (options_.diagnostics.callback) {
                 options_.diagnostics.callback(Diagnostic{.level = level, .message = text});
             } else {
-                std::fprintf(stderr, "[engine] %s\n", text);
+                std::fprintf(stderr, "[engine] %s\n", text.c_str());
             }
         } catch (...) {}
     }
 
-    struct IoLayout {
-        std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, mtp_ids = 0, mtp_cells = 0,
-                    bytes = 0;
-    };
-
-    static std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
     // The io bytes a decode or verification round of `columns` columns reads: everything before
     // the n-gram rows (ids, positions, slots, table rows, logit columns) and its columns' rows.
@@ -1214,48 +1422,17 @@ private:
     }
 
     // ---------------------------------------------------------------- speculative verification
-    // Device I32 arrays of a verification round, each with room for every lane and width.
-    struct SpecLayout {
-        std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
-                    accepted = 0, commit = 0, words = 0;
-    };
-
-    void allocate_verification(std::int32_t lanes) {
-        const GdnReplayRecordSpec spec{.layers          = dim(c_.gdn_layers),
-                                       .record_capacity = lanes,
-                                       .width           = max_width_,
-                                       .conv_channels   = dim(c_.gdn.conv_channels()),
-                                       .qk_heads        = dim(c_.gdn.key_heads),
-                                       .value_heads     = dim(c_.gdn.value_heads),
-                                       .key_dim         = dim(c_.gdn.key_head_dim),
-                                       .value_dim       = dim(c_.gdn.value_head_dim)};
-        LayoutBuilder builder;
-        const auto layout = plan_gdn_replay_records(builder, spec);
-        records_backing_  = DeviceBuffer(builder.finish(256));
-        records_          = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, layout);
-        ple_records_      = DeviceBuffer(2ULL * width_ * max_width_ * lanes);
-        qsa_records_      = DeviceBuffer(2ULL * di_ * max_width_ * lanes * c_.attention_layers);
+    void allocate_verification(std::int32_t lanes, std::uint64_t& allocated) {
+        allocate(records_backing_, plan_.records_bytes, allocated);
+        records_ = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, plan_.records);
+        allocate(ple_records_, plan_.ple_records, allocated);
+        allocate(qsa_records_, plan_.qsa_records, allocated);
         folds_.resize(static_cast<std::size_t>(max_width_) + 1);
         verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
-        std::size_t at          = 0;
-        const auto take = [&](std::size_t words) {
-            const std::size_t begin = at;
-            at += (words + 63) / 64 * 64;
-            return begin;
-        };
-        spec_layout_.target   = take(cells);
-        spec_layout_.drafts   = take(cells);
-        spec_layout_.extents  = take(lanes);
-        spec_layout_.lengths  = take(lanes);
-        spec_layout_.anchors  = take(lanes);
-        spec_layout_.licensed = take(cells);
-        spec_layout_.counts   = take(lanes);
-        spec_layout_.accepted = take(lanes);
-        spec_layout_.commit   = take(lanes);
-        spec_layout_.words    = at;
-        spec_device_          = DeviceBuffer(4ULL * at);
-        spec_host_            = PinnedHostBuffer(4ULL * at);
+        spec_layout_ = plan_.spec;
+        allocate(spec_device_, 4ULL * spec_layout_.words, allocated);
+        spec_host_ = PinnedHostBuffer(4ULL * spec_layout_.words);
         pending_tokens_.assign(cells, 0);
         live_.assign(cells, 0);
         proposer_tokens_ = std::bit_ceil(std::max<std::size_t>(64, options_.max_context + 64ULL));
@@ -1472,28 +1649,20 @@ private:
     }
 
     // ---------------------------------------------------------------- MTP drafter (design 11.2)
-    void allocate_mtp(std::int32_t lanes) {
-        const std::size_t column = 2ULL * width_;
-        mtp_columns_   = std::max(lanes * max_width_, std::min(chunk_, 512));
-        mtp_residuals_ = DeviceBuffer(column * lanes * max_width_);
-        mtp_saved_     = DeviceBuffer(column * lanes);
-        mtp_chain_     = DeviceBuffer(column * lanes);
-        mtp_records_   = DeviceBuffer(2ULL * di_ * max_width_ * lanes);
+    void allocate_mtp(std::int32_t lanes, std::uint64_t& allocated) {
+        const std::size_t column = plan_.mtp_column_bytes;
+        mtp_columns_ = plan_.mtp_columns;
+        allocate(mtp_residuals_, column * lanes * max_width_, allocated);
+        allocate(mtp_saved_, column * lanes, allocated);
+        allocate(mtp_chain_, column * lanes, allocated);
+        allocate(mtp_records_, 2ULL * di_ * max_width_ * lanes, allocated);
         mtp_saved_.fill(0);
         std::vector<float> ones(static_cast<std::size_t>(c_.hc.streams) * mtp_columns_, 1.0F);
-        mtp_ones_ = DeviceBuffer(ones.size() * sizeof(float));
+        allocate(mtp_ones_, plan_.mtp_ones, allocated);
         mtp_ones_.copy_from_host(ones.data(), ones.size() * sizeof(float));
-        // I32: chain ids [B], cells [K, B], drafts [K, B], catch-up ids [W, B], gather columns [B],
-        // catch-up cells [W, B].
-        mtp_io_.ids      = 0;
-        mtp_io_.cells    = mtp_io_.ids + lanes;
-        mtp_io_.drafts   = mtp_io_.cells + lanes * mtp_k_;
-        mtp_io_.up_ids   = mtp_io_.drafts + lanes * mtp_k_;
-        mtp_io_.gather   = mtp_io_.up_ids + lanes * max_width_;
-        mtp_io_.up_cells = mtp_io_.gather + lanes;
-        mtp_io_.words    = mtp_io_.up_cells + lanes * max_width_;
-        mtp_device_      = DeviceBuffer(4ULL * mtp_io_.words);
-        mtp_host_        = PinnedHostBuffer(4ULL * mtp_io_.words);
+        mtp_io_ = plan_.mtp_io;
+        allocate(mtp_device_, 4ULL * mtp_io_.words, allocated);
+        mtp_host_ = PinnedHostBuffer(4ULL * mtp_io_.words);
         for (auto& d : mtp_drafts_) { d.assign(static_cast<std::size_t>(mtp_k_), 0); }
         mtp_catch_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
         mtp_draft_graphs_.resize(static_cast<std::size_t>(lanes) * mtp_k_);
@@ -1741,6 +1910,9 @@ private:
     ProgramOptions options_;
     NgramVolume volume_;
     NgramHash hash_;
+    DeviceLayout plan_;
+    std::unique_ptr<VramBudgetSource> vram_;
+    VramSizing sizing_;
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
@@ -1782,9 +1954,6 @@ private:
     std::array<std::int32_t, kMaximumConcurrency> pending_counts_{};
 
     // MTP drafter.
-    struct MtpIo {
-        std::size_t ids = 0, cells = 0, drafts = 0, up_ids = 0, gather = 0, up_cells = 0, words = 0;
-    };
     bool mtp_            = false;
     std::int32_t mtp_k_  = 0;
     std::int32_t mtp_columns_ = 0;

@@ -6245,13 +6245,49 @@ change at merge time.
 - **Working set.** Startup sets a hard minimum working set of the growth term (1 GiB); a refusal
   is logged as a warning, never fatal.
 
+#### R1 implementation decisions
+
+- **Source** (`core/vram_budget`): `VramSnapshot` (device free/total, DXGI LOCAL budget and usage,
+  display state, outputs) from `cudaMemGetInfo`, DXGI (`EnumAdapterByLuid` on the CUDA LUID,
+  `QueryVideoMemoryInfo`, `EnumOutputs`, recreated when `IsCurrent()` is false) and NVML
+  `DisplayActive` loaded at runtime. `change_event()` and the D3DKMT `Demoted` statistic of §3.1
+  belong to the monitor and arrive with R3. `spill_shortfall` / `SpillGuard` are the spill test
+  (32 MiB tolerance, a second reading before a spill is reported).
+- **Sizing** (`memory_plan`, pure, RT7): §3.2's function with P = 0 (no VMM pool yet); not elastic,
+  so the automatic headroom is the warning-only value (1 GiB with a display or unknown, 256 MiB
+  headless) and the graph reserve counts every graph (`graph_bound`). g stays 4 MiB until RM0d.
+  The 64 MiB chunk grid of §3.2 arrives with the VMM pool (R2); a single `cudaMalloc` needs none.
+- **Device plan** (`Program::plan_device`): one static function computes every fixed allocation of
+  the Program, with the layouts in it (state pool, KV pool and tables, io, verification records and
+  round arrays, MTP buffers, workspace, staging, residency tables), from the options and the
+  configuration alone (the expert record stride from the format's geometry). The constructor
+  allocates exactly from it and throws `logic_error` if the bytes it allocated differ, so the
+  startup estimate cannot drift. Option validation moved into it, so a bad option fails before the
+  weights are read.
+- **Startup order.** `construct_qwen4_exp`: RAM ledger, then the VRAM pre-check (dense bytes from
+  the load plan plus the device plan) before `materialize_model`; a negative frame budget fails
+  with the contributors, fewer than 2,048 frames warn. A spill guard wraps the dense upload (fatal),
+  the Program's fixed allocations (fatal) and the frames (given back once with the shortfall plus
+  64 MiB, then fatal). One `VRAM ledger` line follows the Program; `MemorySummary` now carries the
+  after-weights and after-startup free memory, the headroom (`vram_headroom_bytes`, renamed from
+  `kv_capacity_headroom_bytes`) and the slack for Qwen4Exp.
+- **Flag.** `--vram-headroom-mib N|auto` sets `EngineOptions::vram_headroom_bytes` (empty = auto)
+  in `ninfer`, `ninfer-serve` and `ninfer_bench`; `KvCapacityPolicy` no longer carries a headroom.
+  Qwen3.5 reads the same option for `--kv-capacity auto` and refuses it with an explicit capacity
+  (moved from the parsers into its Engine validation). The fixed 384 MiB
+  `expert_cache_reserve_bytes` is gone.
+
 #### Status
 
 R0 implemented on `claude/fn-memory` (base `1dae6914c`): built, not yet run; the orchestrator runs
 the probes, the captures and the replay. Results are recorded below as they are measured.
 
-R4 implemented on `claude/fn-memory`: `--ram-headroom-mib` in `ninfer`, `ninfer-serve` and
-`ninfer_bench`; RT1 in `ninfer_qwen4_exp_memory_plan_test`.
+R4 implemented on `claude/fn-memory` (`a3713f5f6`): `--ram-headroom-mib` in `ninfer`,
+`ninfer-serve` and `ninfer_bench`; RT1 in `ninfer_qwen4_exp_memory_plan_test` passes.
+
+R1 implemented on `claude/fn-memory`: startup VRAM sizing, pre-check, spill guard, ledger and
+`--vram-headroom-mib N|auto`; RT7 in the same test. Runtime resizing (R2) and the monitor (R3) are
+not implemented: until they are, a program that takes VRAM after startup is not absorbed.
 
 ---
 

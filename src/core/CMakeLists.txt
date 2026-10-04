@@ -12,6 +12,7 @@ add_library(ninfer_core STATIC
   dtype.cpp
   host_memory.cpp
   host_worker_pool.cpp
+  vram_budget.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
   host_context_arena.cpp
@@ -26,3 +27,7 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ninfer_cuda_runtime CUDA::nvtx3 CUDA::cuda_driver Threads::Threads)
+if(WIN32)
+  # DXGI: the OS video-memory budget and display outputs of the CUDA adapter (vram_budget.cpp).
+  target_link_libraries(ninfer_core PRIVATE dxgi)
+endif()

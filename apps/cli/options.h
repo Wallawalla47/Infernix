@@ -25,6 +25,7 @@ struct Options {
     float rope_yarn_factor       = 1.0F;
     std::uint32_t max_context    = 2048;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
 

@@ -55,6 +55,7 @@ struct BenchOptions {
     std::string artifact_path;
     std::string ngram_volume_path;
     std::uint64_t ram_headroom_bytes = ninfer::kDefaultRamHeadroomBytes;
+    std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     std::string corpus_path{kDefaultCorpusPath};
     std::vector<int> n_prompt;
     std::vector<int> n_gen;

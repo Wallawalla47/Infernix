@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/vram_budget.h"
 #include "models/load_options.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -25,6 +26,22 @@ namespace {
 constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
 // The materializer's upload slots and direct-read bounce buffer during the load.
 constexpr std::uint64_t kLoadStagingBytes = 4ULL * (64ULL << 20) + (8ULL << 20);
+// Below this many expert frames most routed experts miss the VRAM cache and decode slows down
+// markedly (design §19.2).
+constexpr std::uint32_t kFewFrames = 2048;
+
+unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20); }
+
+// The fixed device allocations, largest first in the order a user can act on them.
+std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::ProgramDevicePlan& plan) {
+    char text[256];
+    std::snprintf(text, sizeof(text),
+                  "dense weights %llu MiB, KV %llu, workspace %llu, expert staging %llu, state and io %llu, expert "
+                  "tables %llu",
+                  mib(dense), mib(plan.kv), mib(plan.workspace), mib(plan.staging), mib(plan.state + plan.io),
+                  mib(plan.residency));
+    return text;
+}
 
 void report(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
     if (options.diagnostic_observer.callback) {
@@ -111,14 +128,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                "be paged out");
     }
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
-    auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
-    device.synchronize();
 
-    StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
-    auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
-    frontend.complete();
-
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     models::qwen4_exp::ProgramOptions program_options;
     program_options.max_context     = options.max_context;
     program_options.max_concurrency = options.max_concurrency;
@@ -135,14 +145,88 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;
-    program_options.route_trace = models::qwen4_exp::testing::route_trace();
+    program_options.route_trace   = models::qwen4_exp::testing::route_trace();
+    program_options.vram_headroom = options.vram_headroom_bytes;
+
+    // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
+    // Program's fixed allocations, the reserve for graph executables and the display headroom
+    // must leave room for the expert cache.
+    const auto device_plan =
+        models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
+    const std::uint64_t dense = plan.device_bytes();
+    auto vram                 = open_vram_budget_source(device.device);
+    const VramSnapshot before = vram->query();
+    models::qwen4_exp::VramDemand vram_demand;
+    vram_demand.headroom    = options.vram_headroom_bytes;
+    vram_demand.graphs      = device_plan.graph_bound;
+    vram_demand.fixed       = dense + device_plan.fixed_bytes();
+    vram_demand.frame_bytes = device_plan.expert_record_stride;
+    vram_demand.max_frames  = device_plan.max_frames;
+    const auto check        = models::qwen4_exp::size_expert_frames(before, vram_demand);
+    if (check.frame_bytes < 0) {
+        throw std::runtime_error(
+            "Qwen3.8-Flash-Next does not fit in device memory: " + std::to_string(mib(before.device_free)) +
+            " MiB free; " + device_contributors(dense, device_plan) + "; reserve " + std::to_string(mib(check.reserve)) +
+            "; headroom " + std::to_string(mib(check.headroom)) + " (" + check.describe() +
+            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
+            "--vram-headroom-mib, or free VRAM");
+    }
+    if (check.frames < kFewFrames) {
+        report(options, DiagnosticLevel::Warning,
+               "decode will be slow: only " + std::to_string(check.frames) + " expert frames fit in VRAM (" +
+                   std::to_string(kFewFrames) + " or more recommended); lower --max-context or --max-concurrency, "
+                   "or free VRAM");
+    }
+
+    // The dense arena must land in device memory (WDDM can place it in system memory silently).
+    SpillGuard guard(*vram);
+    guard.begin();
+    auto model = models::qwen4_exp::materialize_model(std::move(plan), device, &options.startup_observer);
+    device.synchronize();
+    if (const std::uint64_t spilled = guard.end(dense); spilled != 0) {
+        throw std::runtime_error(std::to_string(mib(spilled)) +
+                                 " MiB of the dense weights were placed in shared system memory by the driver's "
+                                 "sysmem fallback: free VRAM and start again");
+    }
+    const std::uint64_t after_weights = vram->query().device_free;
+
+    StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
+    auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
+    frontend.complete();
+
+    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program =
         std::make_unique<models::qwen4_exp::Program>(instance->parameters, device, std::move(program_options));
+    const auto& sizing = instance->program->vram_sizing();
+    const std::uint64_t frames_bytes =
+        static_cast<std::uint64_t>(sizing.frames) * device_plan.expert_record_stride;
+    const std::uint64_t after_startup = vram->query().device_free;
+    {
+        const char* display = before.display == DisplayState::Headless   ? "no display"
+                              : before.display == DisplayState::Attached ? "display attached"
+                                                                         : "display unknown";
+        char line[640];
+        std::snprintf(line, sizeof(line),
+                      "VRAM ledger: %llu MiB card, %s, %llu in use before loading; %s; reserve %llu (%u graphs); "
+                      "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
+                      mib(before.device_total), display, mib(before.device_total - before.device_free),
+                      device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
+                      mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
+                      static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
+        report(options, DiagnosticLevel::Info, line);
+    }
     const MemorySummary memory = instance->program->memory_summary();
-    instance->kv_capacity_resolution.mode                     = options.kv_capacity.mode;
-    instance->kv_capacity_resolution.main_page_groups         = memory.kv_capacity_page_groups;
-    instance->kv_capacity_resolution.maximum_main_page_groups = memory.kv_capacity_max_page_groups;
-    instance->kv_capacity_resolution.resolved_tokens          = memory.kv_capacity;
+    auto& resolution                         = instance->kv_capacity_resolution;
+    resolution.mode                          = options.kv_capacity.mode;
+    resolution.main_page_groups              = memory.kv_capacity_page_groups;
+    resolution.maximum_main_page_groups      = memory.kv_capacity_max_page_groups;
+    resolution.resolved_tokens               = memory.kv_capacity;
+    resolution.runtime_reservation_bytes     = device_plan.fixed_bytes() + frames_bytes;
+    resolution.available_after_weights_bytes = after_weights;
+    resolution.available_after_startup_bytes = after_startup;
+    resolution.automatic_headroom_bytes      = sizing.headroom;
+    resolution.planned_slack_bytes =
+        after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
     program.complete();
 
     const auto& stats = instance->model->storage_stats();
