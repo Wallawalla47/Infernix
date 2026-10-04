@@ -3,25 +3,34 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
+#include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/ple.h"
+#include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -56,14 +65,16 @@ struct ContractAccess {
 
     static PendingBatch make_pending(const void* owner, std::uint64_t transaction,
                                      std::span<const SequenceHandle> rows, std::span<const TokenId> tokens,
-                                     runtime::ExecutionTiming timing) {
+                                     runtime::ExecutionTiming timing, std::span<const std::int32_t> counts = {},
+                                     std::uint32_t stride = 1) {
         PendingBatch out;
         out.owner_       = owner;
         out.transaction_ = transaction;
         out.row_count_   = rows.size();
         for (std::size_t i = 0; i < rows.size(); ++i) { out.rows_[i] = rows[i]; }
         out.tokens_     = tokens;
-        out.row_stride_ = 1;
+        out.row_counts_ = counts;
+        out.row_stride_ = stride;
         out.timing_     = timing;
         return out;
     }
@@ -77,6 +88,7 @@ struct ContractAccess {
         p.transaction_ = 0;
         p.row_count_   = 0;
         p.tokens_      = {};
+        p.row_counts_  = {};
         p.row_stride_  = 0;
     }
 };
@@ -127,6 +139,8 @@ public:
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
         ExpertResidency::Stats cache_at_admission;
+        std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
+        SpeculativeStats speculative;
     };
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -145,7 +159,12 @@ public:
         vocab_             = dim(c_.vocab_size);
         token_domain_      = dim(parameters.model.resources().public_token_count);
         chunk_             = static_cast<std::int32_t>(std::min(options_.prefill_chunk, options_.max_context));
-        columns_           = std::max(chunk_, lanes);
+        if (options_.ngram_draft_tokens > 15 ||
+            (options_.ngram_draft_tokens > 0 && (options_.ngram_min_match < 4 || options_.ngram_min_match > 64))) {
+            throw std::invalid_argument("Qwen4Exp: n-gram drafts must be 0..15 with a minimum match of 4..64");
+        }
+        max_width_         = 1 + static_cast<std::int32_t>(options_.ngram_draft_tokens);
+        columns_           = std::max(chunk_, lanes * max_width_);
         pages_per_row_     = (dim(options_.max_context) + kPagedKVPageSize - 1) / kPagedKVPageSize;
         const auto kv_tokens = options_.kv_capacity_tokens != 0 ? options_.kv_capacity_tokens
                                                                  : options_.max_context * options_.max_concurrency;
@@ -214,8 +233,8 @@ public:
         io_device_ = DeviceBuffer(io_layout_.bytes);
         io_host_   = PinnedHostBuffer(io_layout_.bytes);
 
-        logits32_     = DeviceBuffer(sizeof(float) * vocab_ * lanes);
-        logits16_     = DeviceBuffer(2ULL * vocab_ * lanes);
+        logits32_     = DeviceBuffer(sizeof(float) * vocab_ * lanes * max_width_);
+        logits16_     = DeviceBuffer(2ULL * vocab_ * lanes * max_width_);
         sampled_      = DeviceBuffer(4ULL * lanes);
         sample_pos_   = DeviceBuffer(4ULL * lanes);
         configs_      = DeviceBuffer(sizeof(ops::SamplingConfig) * lanes);
@@ -251,6 +270,11 @@ public:
         experts.frames.assign(c_.num_hidden_layers, nullptr);
         work_capacity_ = execution::Forward::workspace_bytes(c_, columns_, dim(options_.max_context)) +
                          ops::sampling_workspace_capacity_bytes(token_domain_, 1, lanes);
+        if (max_width_ > 1) {
+            work_capacity_ += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                token_domain_, 1, max_width_ - 1, 1, lanes);
+            allocate_verification(lanes);
+        }
         work_    = std::make_unique<WorkspaceArena>(work_capacity_);
 
         // The VRAM expert cache takes the device memory left over, less a reserve.
@@ -260,6 +284,11 @@ public:
             banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
             record_stride = layer.moe.bank->planes.record_stride;
         }
+        // Staging slots for each layer call's misses (copied with a compact read window, design
+        // 8.6), allocated before the frames take the remaining memory.
+        staging_ = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * record_stride);
+        experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
+        experts.staging_slots = kStagingSlots;
         std::uint32_t frames = 0;
         if (options_.expert_cache) {
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -352,6 +381,14 @@ public:
         lane.history.reserve(lane.history.size() + q.summary.effective_output_tokens + 1);
         lane.prompt_tokens  = static_cast<std::uint32_t>(lane.history.size());
         lane.state_tokens   = 0;
+        lane.speculative    = {};
+        if (max_width_ > 1) {
+            lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+            for (const auto token : lane.history) { lane.proposer->append(token); }
+            lane.speculative.enabled      = true;
+            lane.speculative.draft_window = static_cast<std::uint32_t>(max_width_ - 1);
+            lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
+        }
         lane.sampling       = q.sampling;
         lane.sampling.token_counts =
             static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(q.lane) * token_domain_;
@@ -425,7 +462,7 @@ public:
         return out;
     }
 
-    PendingBatch decode(std::span<const SequenceHandle> sequences) {
+    PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets) {
         const auto start = Clock::now();
         const auto batch = static_cast<std::int32_t>(sequences.size());
         if (batch <= 0 || batch > static_cast<std::int32_t>(options_.max_concurrency)) {
@@ -441,11 +478,30 @@ public:
             }
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
+        // Copy proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one
+        // token fewer than it may still emit, so every verified position lies in its reservation.
+        std::int32_t width = 1;
+        for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
+            Lane& lane = lanes_[lanes[b]];
+            drafts_[b].clear();
+            const std::uint32_t remaining =
+                static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
+            if (remaining < 2) { continue; }
+            const auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
+            drafts_[b] = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
+            width      = std::max(width, 1 + static_cast<std::int32_t>(drafts_[b].size()));
+        }
+        if (width > 1) {
+            return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
+                          std::span<const std::int32_t>(positions.data(), batch), width, start);
+        }
+        for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
+        round_width_ = 1;
         stage_decode(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
         run_decode(batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
-        residency_->after_round(device_.stream, batch, kDecodePromotionsPerLayer);
+        residency_->after_round(device_.stream, batch, decode_budget());
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -473,6 +529,9 @@ public:
             // The model reads the pending input token and every forced token but the last, which
             // becomes the next decode input.
             lane.history.insert(lane.history.end(), forced.begin(), forced.end());
+            if (lane.proposer) {
+                for (const auto token : forced) { lane.proposer->append(token); }
+            }
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
             run(1, static_cast<std::int32_t>(stride), 1);
@@ -492,6 +551,7 @@ public:
         }
         const auto rows = ContractAccess::rows(pending);
         if (decisions.size() != rows.size()) { throw std::logic_error("Qwen4Exp: commit decisions are not row aligned"); }
+        if (round_width_ > 1) { return commit_verified(std::move(pending), decisions); }
         CommitResult out;
         out.row_count = rows.size();
         for (std::size_t row = 0; row < rows.size(); ++row) {
@@ -500,12 +560,14 @@ public:
             const auto& d    = decisions[row];
             if (d.cancelled) {
                 out.rows[row].timings     = timings(lane);
+                out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
                 release(index);
                 continue;
             }
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
             lane.history.push_back(pending_tokens_[row]);
+            if (lane.proposer) { lane.proposer->append(pending_tokens_[row]); }
             if (lane.phase == Phase::Prefill) { lane.phase = Phase::Decode; }
             if (d.terminal) {
                 lane.phase                = Phase::Finishable;
@@ -541,7 +603,8 @@ public:
         try {
             const auto index = lane_of(sequence);
             if (lanes_[index].phase != Phase::Finishable) { return out; }
-            out.timings = timings(lanes_[index]);
+            out.timings     = timings(lanes_[index]);
+            out.speculative = lanes_[index].speculative;
             report_cache(lanes_[index].cache_at_admission);
             release(index);
             out.status      = runtime::ConsumeStatus::Consumed;
@@ -555,6 +618,7 @@ public:
         try {
             const auto index = lane_of(sequence);
             out.timings      = timings(lanes_[index]);
+            out.speculative  = lanes_[index].speculative;
             release(index);
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (...) {}
@@ -599,6 +663,20 @@ private:
     // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
     // promotion moves as many PCIe bytes as serving the expert once zero-copy.
     static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
+    // Once the frames are full, decode promotes only every kDecodePromotionInterval-th round: a
+    // promotion moves as many PCIe bytes as serving its expert once, and fewer of them measured
+    // faster at 512 tokens (design section 19.2). Until then every round promotes, so a cold cache
+    // fills at the full rate.
+    static constexpr std::uint64_t kDecodePromotionInterval = 4;
+    // Misses staged per pass of a layer's experts: every decode and verify call's misses in one
+    // pass; a prefill chunk's in several.
+    static constexpr std::int32_t kStagingSlots = 64;
+    std::size_t decode_budget() {
+        ++budget_round_;
+        if (residency_->stats().promotions < residency_->frames()) { return kDecodePromotionsPerLayer; }
+        return budget_round_ % kDecodePromotionInterval == 0 ? kDecodePromotionsPerLayer : 0;
+    }
+    std::uint64_t budget_round_ = 0;
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
@@ -658,6 +736,7 @@ private:
         lane.row = KVExecutionRowLease{};
         lane.history.clear();
         lane.history.shrink_to_fit();
+        lane.proposer.reset();
         lane.phase        = Phase::Free;
         lane.state_tokens = 0;
         ++revision_;
@@ -769,7 +848,8 @@ private:
         residency_->enqueue_route_download(s, batch);
     }
 
-    void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns) {
+    void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
+                      const execution::ForwardVerify* verify = nullptr) {
         const std::int32_t cols = batch * width;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch fb;
@@ -784,8 +864,264 @@ private:
         fb.host_table_rows = fb.host_slots;
         fb.batch           = batch;
         fb.width           = width;
+        fb.verify          = verify;
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
+    }
+
+    // ---------------------------------------------------------------- speculative verification
+    // Device I32 arrays of a verification round, each with room for every lane and width.
+    struct SpecLayout {
+        std::size_t target = 0, drafts = 0, extents = 0, lengths = 0, anchors = 0, licensed = 0, counts = 0,
+                    accepted = 0, commit = 0, words = 0;
+    };
+
+    void allocate_verification(std::int32_t lanes) {
+        const GdnReplayRecordSpec spec{.layers          = dim(c_.gdn_layers),
+                                       .record_capacity = lanes,
+                                       .width           = max_width_,
+                                       .conv_channels   = dim(c_.gdn.conv_channels()),
+                                       .qk_heads        = dim(c_.gdn.key_heads),
+                                       .value_heads     = dim(c_.gdn.value_heads),
+                                       .key_dim         = dim(c_.gdn.key_head_dim),
+                                       .value_dim       = dim(c_.gdn.value_head_dim)};
+        LayoutBuilder builder;
+        const auto layout = plan_gdn_replay_records(builder, spec);
+        records_backing_  = DeviceBuffer(builder.finish(256));
+        records_          = GdnReplayRecords(DeviceSpan{records_backing_.p, records_backing_.bytes}, layout);
+        ple_records_      = DeviceBuffer(2ULL * width_ * max_width_ * lanes);
+        qsa_records_      = DeviceBuffer(2ULL * di_ * max_width_ * lanes * c_.attention_layers);
+        folds_.resize(static_cast<std::size_t>(max_width_) + 1);
+        verify_graphs_.resize(static_cast<std::size_t>(lanes) * max_width_);
+        const std::size_t cells = static_cast<std::size_t>(lanes) * max_width_;
+        std::size_t at          = 0;
+        const auto take = [&](std::size_t words) {
+            const std::size_t begin = at;
+            at += (words + 63) / 64 * 64;
+            return begin;
+        };
+        spec_layout_.target   = take(cells);
+        spec_layout_.drafts   = take(cells);
+        spec_layout_.extents  = take(lanes);
+        spec_layout_.lengths  = take(lanes);
+        spec_layout_.anchors  = take(lanes);
+        spec_layout_.licensed = take(cells);
+        spec_layout_.counts   = take(lanes);
+        spec_layout_.accepted = take(lanes);
+        spec_layout_.commit   = take(lanes);
+        spec_layout_.words    = at;
+        spec_device_          = DeviceBuffer(4ULL * at);
+        spec_host_            = PinnedHostBuffer(4ULL * at);
+        pending_tokens_.assign(cells, 0);
+        live_.assign(cells, 0);
+        proposer_tokens_ = std::bit_ceil(std::max<std::size_t>(64, options_.max_context + 64ULL));
+    }
+
+    std::int32_t* spec_host(std::size_t offset) const { return static_cast<std::int32_t*>(spec_host_.data()) + offset; }
+    std::int32_t* spec_device(std::size_t offset) const { return static_cast<std::int32_t*>(spec_device_.p) + offset; }
+
+    execution::ForwardVerify verify_view(std::int32_t batch, std::int32_t width) const {
+        execution::ForwardVerify v;
+        v.gdn        = records_.narrowed(width);
+        v.ple_inputs = Tensor(ple_records_.p, DType::BF16, {width_, width, batch});
+        v.qsa_keys   = Tensor(qsa_records_.p, DType::BF16, {di_, width, batch, dim(c_.attention_layers)});
+        return v;
+    }
+
+    const ops::GdnReplayFoldPlan& fold(std::int32_t width) {
+        auto& plan = folds_.at(static_cast<std::size_t>(width));
+        if (!plan) { plan.emplace(records_.narrowed(width), gdn_->all_layers_view()); }
+        return *plan;
+    }
+
+    // One verification round: every row's anchor and drafts (rows with fewer drafts are padded with
+    // filler drafts past their extent), one forward over batch x width columns that leaves all
+    // recurrent state in place, then on-device acceptance. The pending batch licenses each row's
+    // accepted drafts and its correction or bonus token; commit folds the accepted prefix in.
+    PendingBatch verify(std::span<const SequenceHandle> sequences, std::span<const std::uint32_t> lanes,
+                        std::span<const std::int32_t> positions, std::int32_t width, Clock::time_point start) {
+        const cudaStream_t s = device_.stream;
+        const auto batch     = static_cast<std::int32_t>(lanes.size());
+        const std::int32_t W = width, K = width - 1;
+        auto* ids     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
+        auto* pos     = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
+        auto* columns = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.columns);
+        auto* slots   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
+        auto* rows    = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            const Lane& lane          = lanes_[lanes[b]];
+            const auto& d             = drafts_[b];
+            const auto n              = static_cast<std::int32_t>(d.size());
+            const std::int32_t anchor = lane.history.back();
+            sequence_.assign(lane.history.begin(), lane.history.end());
+            for (std::int32_t j = 0; j < K; ++j) {
+                const std::int32_t token = j < n ? d[static_cast<std::size_t>(j)] : (n > 0 ? d.back() : anchor);
+                sequence_.push_back(token);
+                spec_host(spec_layout_.drafts)[b * K + j] = token;
+            }
+            for (std::int32_t j = 0; j < W; ++j) {
+                ids[b * W + j]     = sequence_[static_cast<std::size_t>(positions[b] + j)];
+                pos[b * W + j]     = positions[b] + j;
+                columns[b * W + j] = b * W + j;
+            }
+            slots[b]       = static_cast<std::int32_t>(lanes[b]);
+            rows[b]        = static_cast<std::int32_t>(lanes[b]);
+            host_lanes_[b] = static_cast<std::int32_t>(lanes[b]);
+            stage_ngram(sequence_, positions[b], W, static_cast<std::size_t>(b * W));
+            spec_host(spec_layout_.extents)[b] = n;
+            spec_host(spec_layout_.lengths)[b] = positions[b];
+            spec_host(spec_layout_.anchors)[b] = anchor;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed,
+                                   cudaMemcpyHostToDevice, s));
+        residency_->before_round(s);
+        DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+        const auto body    = [&] {
+            const execution::ForwardVerify view = verify_view(batch, W);
+            forward_call(batch, W, batch * W, &view);
+        };
+        if (graph.executable.ready()) {
+            graph.executable.launch(s);
+        } else if (!graph.warmed) {
+            body();
+            graph.warmed = true;
+        } else {
+            graph.definition.capture(s, body);
+            graph.executable.instantiate(graph.definition);
+            graph.executable.launch(s);
+        }
+        residency_->enqueue_route_download(s, batch * W);
+
+        // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
+        Tensor wide(logits32_.p, DType::FP32, {vocab_, batch * W});
+        Tensor narrow(logits16_.p, DType::BF16, {vocab_, batch * W});
+        ops::cast_fp32_to_bf16(wide, narrow, s);
+        Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
+        ops::argmax(narrow, target, token_domain_, s);
+        auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
+        for (std::int32_t b = 0; b < batch; ++b) { configs[b] = lanes_[lanes[b]].sampling; }
+        CUDA_CHECK(cudaMemcpyAsync(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, cudaMemcpyHostToDevice, s));
+        Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
+        Tensor extents(spec_device(spec_layout_.extents), DType::I32, {batch});
+        Tensor lengths(spec_device(spec_layout_.lengths), DType::I32, {batch});
+        Tensor anchors(spec_device(spec_layout_.anchors), DType::I32, {batch});
+        Tensor licensed(spec_device(spec_layout_.licensed), DType::I32, {W, batch});
+        Tensor counts(spec_device(spec_layout_.counts), DType::I32, {batch});
+        Tensor accepted(spec_device(spec_layout_.accepted), DType::I32, {batch});
+        {
+            auto scope = work_->scope();
+            ops::speculative_accept_greedy_drafts(target.view({W, batch}), narrow.view({vocab_, W, batch}), drafts,
+                                                  extents, lengths, anchors, licensed, counts, accepted,
+                                                  token_domain_, static_cast<const ops::SamplingConfig*>(configs_.p),
+                                                  *work_, s);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
+                                   4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
+        device_.synchronize();
+
+        const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            Lane& lane     = lanes_[lanes[b]];
+            const auto n   = static_cast<std::uint64_t>(drafts_[b].size());
+            const auto L   = spec_host(spec_layout_.counts)[b];
+            const auto A   = spec_host(spec_layout_.accepted)[b];
+            if (L < 1 || L > W || A != L - 1) { throw std::logic_error("Qwen4Exp: acceptance returned an invalid extent"); }
+            for (std::int32_t j = 0; j < W; ++j) {
+                pending_tokens_[static_cast<std::size_t>(b * W + j)] = j < L ? licensed_host[b * W + j] : 0;
+                live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
+            }
+            pending_counts_[b] = L;
+            auto& stats        = lane.speculative;
+            if (n == 0) {
+                ++stats.fallback_steps;
+                continue;
+            }
+            ++stats.rounds;
+            ++stats.ngram_rounds;
+            stats.drafted_tokens += n;
+            stats.ngram_drafted_tokens += n;
+            stats.accepted_tokens += static_cast<std::uint64_t>(A);
+            stats.ngram_accepted_tokens += static_cast<std::uint64_t>(A);
+            for (std::int32_t j = 0; j < A; ++j) { ++stats.accepted_per_position[static_cast<std::size_t>(j)]; }
+        }
+        residency_->after_round(s, batch * W, decode_budget(),
+                                std::span<const std::uint8_t>(live_.data(), static_cast<std::size_t>(batch * W)));
+        round_width_ = W;
+        runtime::ExecutionTiming timing;
+        timing.submit_host_ns = elapsed_ns(start);
+        for (std::int32_t b = 0; b < batch; ++b) {
+            lanes_[lanes[b]].decode_ns += timing.submit_host_ns;
+            lanes_[lanes[b]].decode_share_ns += timing.submit_host_ns / static_cast<std::uint64_t>(batch);
+        }
+        pending_transaction_ = ++next_transaction_;
+        return ContractAccess::make_pending(this, pending_transaction_, sequences,
+                                            {pending_tokens_.data(), static_cast<std::size_t>(batch * W)}, timing,
+                                            {pending_counts_.data(), static_cast<std::size_t>(batch)},
+                                            static_cast<std::uint32_t>(W));
+    }
+
+    // Commits a verification round: each row keeps its first accepted_tokens licensed tokens, so
+    // the model state advances by that many columns (the anchor and the accepted drafts before the
+    // last kept token). The GDN fold, the QSA tails and the PLE history replay those columns' records.
+    CommitResult commit_verified(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
+        const cudaStream_t s = device_.stream;
+        const auto rows      = ContractAccess::rows(pending);
+        const auto batch     = static_cast<std::int32_t>(rows.size());
+        const std::int32_t W = round_width_;
+        CommitResult out;
+        out.row_count = rows.size();
+        std::array<ops::GdnReplayFoldRow, kMaximumConcurrency> fold_rows{};
+        std::int32_t* commit = spec_host(spec_layout_.commit);
+        for (std::int32_t row = 0; row < batch; ++row) {
+            const auto index = ContractAccess::lane(rows[row]);
+            Lane& lane       = lanes_.at(index);
+            const auto& d    = decisions[static_cast<std::size_t>(row)];
+            fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
+            commit[row]      = 0;
+            if (d.cancelled) {
+                out.rows[row].timings     = timings(lane);
+                out.rows[row].speculative = lane.speculative;
+                out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
+                continue;
+            }
+            const auto k = static_cast<std::int32_t>(d.accepted_tokens);
+            if (k < 1 || k > pending_counts_[row]) { throw std::logic_error("Qwen4Exp: commit exceeds the licensed tokens"); }
+            for (std::int32_t j = 0; j < k; ++j) {
+                const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
+                lane.history.push_back(token);
+                lane.proposer->append(token);
+            }
+            fold_rows[row].commit_columns = k;
+            commit[row]                   = k;
+            lane.state_tokens += static_cast<std::uint32_t>(k);
+            if (d.terminal) {
+                lane.phase                = Phase::Finishable;
+                out.rows[row].disposition = runtime::CommitDisposition::Finishable;
+            } else {
+                out.rows[row].disposition = runtime::CommitDisposition::Active;
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(spec_device(spec_layout_.commit), commit, 4ULL * batch, cudaMemcpyHostToDevice, s));
+        fold(W).execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), static_cast<std::size_t>(batch)), s);
+        auto* io = static_cast<std::byte*>(io_device_.p);
+        const Tensor commit_columns(spec_device(spec_layout_.commit), DType::I32, {batch});
+        const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
+        const Tensor positions(io + io_layout_.positions, DType::I32, {W, batch});
+        const auto layers = dim(c_.attention_layers);
+        Tensor tails(tails_backing_.p, DType::BF16, {di_, r_ - 1, dim(options_.max_concurrency), layers});
+        ops::qsa_commit_tails(Tensor(qsa_records_.p, DType::BF16, {di_, W, batch, layers}), positions, commit_columns,
+                              tails, slots, execution::qsa_geometry(c_), s);
+        Tensor ple_states(ple_backing_.p, DType::BF16, {width_, span_, dim(options_.max_concurrency)});
+        ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
+                             slots, s);
+        for (std::int32_t row = 0; row < batch; ++row) {
+            if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
+        }
+        ContractAccess::consume(pending);
+        pending_transaction_ = 0;
+        round_width_         = 1;
+        return out;
     }
 
     // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
@@ -829,7 +1165,7 @@ private:
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
-    DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_;
+    DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
     IoLayout io_layout_;
@@ -846,10 +1182,25 @@ private:
         bool warmed = false;
     };
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
+    std::vector<DecodeGraph> verify_graphs_; // (batch - 1) * max_width_ + width - 1
 
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};
-    std::array<TokenId, kMaximumConcurrency> pending_tokens_{};
+    std::vector<TokenId> pending_tokens_ = std::vector<TokenId>(kMaximumConcurrency, 0);
+    std::array<std::int32_t, kMaximumConcurrency> pending_counts_{};
+
+    // Speculative verification (max_width_ > 1).
+    std::int32_t max_width_   = 1;
+    std::int32_t round_width_ = 1;
+    std::size_t proposer_tokens_ = 0;
+    DeviceBuffer records_backing_, ple_records_, qsa_records_, spec_device_;
+    PinnedHostBuffer spec_host_{1};
+    SpecLayout spec_layout_;
+    GdnReplayRecords records_;
+    std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
+    std::array<std::vector<std::int32_t>, kMaximumConcurrency> drafts_;
+    std::vector<std::int32_t> sequence_;
+    std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;
     std::optional<std::uint32_t> transaction_lane_;
@@ -903,9 +1254,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     return impl_->advance_prefill(sequence);
 }
 
-PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget>,
+PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming*) {
-    return impl_->decode(sequences);
+    return impl_->decode(sequences, budgets);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceHandle> sequences,

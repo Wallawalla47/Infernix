@@ -2409,8 +2409,9 @@ the user asked, not part of the Qwen3.5 family.
 | M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
 | M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. Not yet: CausalScoring, vision, prefix cache, MTP. |
-| M5 expert cache | First version: free VRAM (less 1.5 GiB) as frames (7,804 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream, at most one promotion per layer call in decode and 16 in prefill. No prefetch, loans, CPU expert engine or saved profile yet. |
+| M5 expert cache | Free VRAM (less 1.5 GiB and 64 staging slots) as frames (7,739 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream: one per layer call per round until the frames fill, then every fourth decode round; 16 per layer call in prefill. Misses are staged through device slots (below). No prefetch, loans, CPU expert engine or saved profile yet. |
 | M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
+| M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); n-gram copy proposals only. Greedy output equals plain decode. MTP not started. |
 
 **Measured** (`ninfer_bench`, INT8 KV, C = 1, greedy, warm cache, recipe A): prefill 167-180 tok/s
 at 512 tokens; decode 42.8 tok/s for 128 tokens and 32.5 tok/s for 512 tokens. Progression of
@@ -2447,10 +2448,111 @@ LFRU promotes heavily, so misses and promotions together move 0.2-0.4 GB per tok
 - **KV append.** Decode appends all sequences' K/V through device-chosen table rows
   (`kv_cache_append_batch`) so a round has no host-dependent value and can be a CUDA graph.
 
-**Next, in order of expected gain:** speculative decoding (MTP drafter, verify rounds with GDN
-replay and PLE/QSA state rollback; amortizes the 5.5 ms of dense reads over ~2.8 tokens), fewer
-misses (admission doorkeeper, saved profile, lookahead prefetch, CPU-served misses), recipe B's
-8-bit dense weights (a measured quality gate, §16.3), and tuned dense kernels.
+#### Miss path and speculative verification (2026-10-04, second session)
+
+**Platform.** The 5090 links at **PCIe Gen5 x8**, not x16 (`nvidia-smi`; likely lane sharing with
+an M.2 slot on the Z790 board). Copy-engine H2D DMA measures 27.6 GB/s. A probe
+(`local/workdirs/fn/zc/zc_probe.cu`) shows that SM reads of pinned host memory depend on the
+**access window**, not the CTA count alone:
+
+| Pattern | GB/s |
+|---|---:|
+| 8-32 CTAs, interleaved 4-16 KiB chunks of one region (window ≤ ~0.5 MiB) | 23.5-24.0 |
+| 16 CTAs, each streaming its own 16 MiB | 23.1 |
+| 64-170 CTAs on separate regions, or 64 KiB chunks over ≥ 32 CTAs | 11.3-15.7 |
+| The expert kernels' pattern: 40 CTAs per expert, each staging its own 46 KiB slice | 11.9-13.9 |
+
+An nsys profile of decode put 38.5 of 48 ms per round in `gate_up`/`down` on a cold cache: the
+zero-copy misses ran at ~10 GB/s.
+
+**Staged misses (adopted).** `moe_experts` now runs each layer's jobs in passes of up to 64.
+A 16-CTA stage kernel copies the pass's non-resident records into 64 device slots (177 MB, shared
+by every layer) with interleaved 16 KiB chunks. The expert kernels then read VRAM, so every miss
+crosses PCIe once at ~24 GB/s. Placement does not change a bit: the new layer-route test checks
+0, 1, 3 and 64 slots against the CPU engine, and greedy token ids are unchanged. Same build,
+`NINFER_Q4_NOSTAGE` A/B, identical cache decisions:
+
+| Workload | Zero-copy misses | Staged misses |
+|---|---:|---:|
+| `ninfer_bench` tg512 | 31.39 tok/s | 35.25 (+12.3 %) |
+| `ninfer_bench` tg128 | 45.49 | 47.14 (+3.6 %) |
+| `ninfer` code-rewrite prompt, cold cache | 25.2 | 29.9 (+19 %) |
+
+**Promotion interval (adopted: 4 once the frames are full).** Promotions are about 30 % of
+PCIe bytes per token. Promoting every N decode rounds, tg512 after staging:
+
+| N | tok/s | Hits | Promotions / 512 tokens |
+|---:|---:|---:|---:|
+| 1 | 35.19 | 83.2 % | 17.6 K |
+| 2 | 35.87 | 81.0 % | 9.6 K |
+| 4 | 36.24 | 79.7 % | 5.1 K |
+| 8 | 32.68 ± 4.59 | 78.0 % | 2.4 K |
+
+Sparse promotion fills a cold cache slowly; N = 8 never warmed up in this bench. So every round
+promotes until the promotions reach the frame count, and every fourth round after that. Final
+build: tg512 36.25 tok/s.
+
+**Speculative verification with n-gram copy proposals (M7, functional).** Verify rounds of B
+sequences × W ≤ 16 columns run as CUDA graphs per (B, W). The round leaves every state in place
+and records what its commit needs:
+
+- GDN: `causal_conv1d_silu_from_states` (new read-only form) and `gated_delta_net_replay_record`
+  into `GdnReplayRecords`. The commit folds the accepted prefix with `GdnReplayFoldPlan`, which
+  now registers the 36-layer geometry.
+- PLE: `ple_conv_inject` with no destination slots. Its convolution inputs are recorded, and
+  `ple_conv_commit` applies the prefix.
+- QSA: `qsa_pool_keys` with `update_tails = false`. The raw index keys are recorded, and
+  `qsa_commit_tails` applies the prefix. Pooled keys and K/V past the prefix are rewritten before
+  any later query reads them.
+
+Acceptance is `speculative_accept_greedy_drafts` on the device, so greedy and sampled rows are
+both handled. Experts routed only by rejected columns are not credited to the cache. The n-gram
+proposer is Qwen3.5's (`--ngram-draft-tokens`, `--ngram-min-match`); for this model it may run
+without a neural drafter. Each state Op is checked bit for bit against its committing form
+(`ninfer_speculative_state_ops_test`).
+
+End to end, greedy token ids with K = 7 at min-match 12 or 4 equal plain decode across 24-32
+verify rounds, with full and partial acceptance. Results:
+
+- **Code-rewrite prompt:** 92 % acceptance, 7.46 tokens per round, 33.2 tok/s against 30.5
+  plain.
+- **Prose:** no drafts, no cost (27.1 vs 27.0 tok/s).
+- **Cost of a verify round.** Before staging, a W = 8 round cost 170-390 ms, 5-8× a decode round,
+  because its 80 routed columns miss far more experts. Verification pays only with staged (or
+  CPU-served) misses and high acceptance.
+
+**Next-layer prediction (studied, not adopted).** Router l applied to earlier activations of the
+same token, against the true top-10 (450-token code text, all 48 layers):
+
+| Input to router l | Recall@10 | @16 | @24 |
+|---|---:|---:|---:|
+| Layer l−1's MoE input | 65 % | 78 % | 85 % |
+| Layer l's mixer input | 55 % | 68 % | 77 % |
+
+Some layers are far worse: layer 39 reaches 31 % with the previous-layer input. With PCIe already
+saturated by misses, wrong prefetches would cost about as much as they save, so lookahead prefetch
+waits for a better predictor or spare bandwidth.
+
+**CPU expert team throughput** (`fn/cpu/cpu_bench.cpp`, cold 2.76 MB records, i9-13900K
+AVX-VNNI, DDR5-5800):
+
+- One column: 52-55 µs per expert with 8 workers (~50 GB/s), against ~115 µs for a staged miss
+  over PCIe.
+- More workers are slower (E-cores, barriers): 12-24 workers give 59-83 µs per expert.
+
+CPU and PCIe draw DRAM bandwidth in parallel, so splitting a layer's misses between them should
+roughly halve the miss stall. That is §10's CPU-served miss path, next.
+
+**Next, in order of expected gain:**
+
+1. CPU-served misses beside the PCIe stage (§10), with the GPU computing hits meanwhile.
+2. MTP drafter (needs BF16 → FP8 MTP experts and an MTP expert pool).
+3. Recipe B's 8-bit dense weights: ~1,450 more frames and half the dense bytes, behind the §16.3
+   quality gate.
+4. Overlap of the stage with hit compute.
+5. Tuned dense kernels.
+
+**For the user:** an x16 link would roughly double miss bandwidth.
 
 ---
 

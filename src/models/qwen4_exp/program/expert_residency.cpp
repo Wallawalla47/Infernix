@@ -99,7 +99,8 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
                                cudaMemcpyDeviceToHost, compute));
 }
 
-void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget) {
+void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
+                                  std::span<const std::uint8_t> live) {
     const auto* routes = static_cast<const std::int32_t*>(route_host_.data());
     auto* table        = static_cast<std::int32_t*>(table_host_.data());
     const std::size_t used = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(columns);
@@ -109,6 +110,7 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         group_.clear();
         const std::int32_t* ids = routes + static_cast<std::size_t>(layer) * route_stride_;
         for (std::size_t i = 0; i < used; ++i) {
+            if (!live.empty() && live[i / top_k_] == 0) { continue; }
             const auto expert = static_cast<std::uint32_t>(ids[i]);
             if (expert >= experts_ || seen_[expert]) { continue; }
             seen_[expert] = 1;

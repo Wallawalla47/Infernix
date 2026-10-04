@@ -57,8 +57,11 @@ public:
     void enqueue_route_download(cudaStream_t compute, std::int32_t columns);
     // After the round completed (the compute stream was synchronized): runs the policy over the
     // round's routes and issues its evictions and promotions. `per_layer_budget` caps the
-    // promotions one layer's routes may start.
-    void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget);
+    // promotions one layer's routes may start. A non-empty `live` (one flag per column) credits
+    // only the flagged columns' experts: a verification round's rejected draft columns neither
+    // count as uses nor start promotions (design section 11.3).
+    void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
+                     std::span<const std::uint8_t> live = {});
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 

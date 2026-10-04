@@ -38,5 +38,8 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
                                    const Tensor& valid_columns, const Tensor& initial_state_slots,
                                    const Tensor& snapshot_base_slots, Tensor& out,
                                    cudaStream_t stream);
+void causal_conv1d_from_states_launch(const Tensor& x, const Tensor& weight,
+                                      const Tensor& conv_states, const Tensor& initial_state_slots,
+                                      Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

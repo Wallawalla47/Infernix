@@ -156,7 +156,9 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
                              spec.conv_channels == 10240;
     const bool geometry_30 = spec.layers == 30 && spec.qk_heads == 16 && spec.value_heads == 32 &&
                              spec.conv_channels == 8192;
-    return geometry_48 || geometry_30;
+    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
+                             spec.conv_channels == 10240;
+    return geometry_48 || geometry_30 || geometry_36;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

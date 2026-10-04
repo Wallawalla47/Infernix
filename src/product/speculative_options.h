@@ -102,14 +102,12 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument("ngram archive requires ngram drafting and session capacity "
                                     "between 1 MiB and total archive capacity");
     }
+    // Which drafter combinations a model supports is the model Program's decision (Qwen3.5
+    // verifies copy proposals only beside a neural drafter; Qwen4Exp also alone).
     if (options.ngram_draft_tokens != 0 &&
-        ((options.backend != SpeculativeBackend::DFlash2 &&
-          options.backend != SpeculativeBackend::DFlash &&
-          options.backend != SpeculativeBackend::Mtp) ||
-         options.ngram_draft_tokens > 63 || options.ngram_min_match < 4 ||
+        (options.ngram_draft_tokens > 63 || options.ngram_min_match < 4 ||
          options.ngram_min_match > 64)) {
-        throw std::invalid_argument(
-            "ngram requires --spec mtp|dflash|dflash2, drafts 1..63 and match 4..64");
+        throw std::invalid_argument("ngram drafts must be 1..63 with a minimum match of 4..64");
     }
     if (draft_tree_enabled(options)) {
         if (options.backend != SpeculativeBackend::DFlash2) {

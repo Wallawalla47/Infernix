@@ -145,6 +145,29 @@ __global__ void state_kernel(const bf16* __restrict__ normalized, int span, int 
     }
 }
 
+// ple_conv_commit: the state_kernel shift with a per-row column count, reading row b's columns
+// at b * stride.
+__global__ void commit_kernel(const bf16* __restrict__ normalized, int span, int channels, int stride,
+                              const std::int32_t* __restrict__ commit_columns, bf16* __restrict__ states,
+                              const std::int32_t* __restrict__ slots) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int b = blockIdx.y;
+    if (c >= channels) { return; }
+    const int n = commit_columns[b];
+    if (n <= 0) { return; }
+    const int slot = slots[b];
+    for (int k = 0; k < span; ++k) {
+        const int index = n - span + k;
+        bf16 v;
+        if (index >= 0) {
+            v = normalized[static_cast<std::size_t>(b * stride + index) * channels + c];
+        } else {
+            v = states[(static_cast<std::size_t>(slot) * span + (span + index)) * channels + c];
+        }
+        states[(static_cast<std::size_t>(slot) * span + k) * channels + c] = v;
+    }
+}
+
 } // namespace
 
 void ple_embed(const Tensor& rows, const Tensor& scale, Tensor& out, cudaStream_t stream) {
@@ -190,13 +213,14 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
     require(contiguous(gated, DType::BF16) && contiguous(normalized, DType::BF16) &&
                 contiguous(weight, DType::BF16) && contiguous(states, DType::BF16) &&
                 contiguous(residual, DType::BF16) && contiguous(source_slots, DType::I32) &&
-                contiguous(destination_slots, DType::I32),
+                (destination_slots.data == nullptr || contiguous(destination_slots, DType::I32)),
             "conv requires contiguous tensors");
     const int channels = gated.ne[0], columns = gated.ne[1], taps = weight.ne[1];
     const int sequences = source_slots.ne[0];
+    const bool update   = destination_slots.data != nullptr;
     require(dilation > 0 && taps > 1 && weight.ne[0] == channels && normalized.ne[0] == channels &&
                 normalized.ne[1] == columns && residual.ne[0] == channels && residual.ne[1] == columns &&
-                sequences > 0 && destination_slots.ne[0] == sequences && columns % sequences == 0,
+                sequences > 0 && (!update || destination_slots.ne[0] == sequences) && columns % sequences == 0,
             "conv shapes disagree");
     const int span = (taps - 1) * dilation;
     require(states.ne[0] == channels && states.ne[1] == span, "conv state must be [C, span, slots]");
@@ -207,11 +231,28 @@ void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor
         static_cast<const bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
         columns, static_cast<bf16*>(residual.data));
     check_launch("conv");
+    if (!update) { return; }
     state_kernel<<<dim3((channels + kThreads - 1) / kThreads, sequences), kThreads, 0, stream>>>(
         static_cast<const bf16*>(normalized.data), span, channels, width, sequences,
         static_cast<bf16*>(states.data), static_cast<const std::int32_t*>(source_slots.data),
         static_cast<const std::int32_t*>(destination_slots.data));
     check_launch("state");
+}
+
+void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Tensor& states,
+                     const Tensor& slots, cudaStream_t stream) {
+    require(contiguous(normalized, DType::BF16) && contiguous(commit_columns, DType::I32) &&
+                contiguous(states, DType::BF16) && contiguous(slots, DType::I32),
+            "commit requires contiguous tensors");
+    const int channels = normalized.ne[0], width = normalized.ne[1], rows = normalized.ne[2];
+    require(rows > 0 && width > 0 && commit_columns.ne[0] == rows && slots.ne[0] == rows &&
+                states.ne[0] == channels && states.ne[1] > 0,
+            "commit shapes disagree");
+    commit_kernel<<<dim3((channels + kThreads - 1) / kThreads, rows), kThreads, 0, stream>>>(
+        static_cast<const bf16*>(normalized.data), states.ne[1], channels, width,
+        static_cast<const std::int32_t*>(commit_columns.data), static_cast<bf16*>(states.data),
+        static_cast<const std::int32_t*>(slots.data));
+    check_launch("commit");
 }
 
 } // namespace ninfer::ops

@@ -62,6 +62,9 @@ struct QsaBatch {
     Tensor tail_slots;    // I32 [batch]: raw-key tail state slot of each sequence
     std::int32_t batch = 0;
     std::int32_t width = 0;
+    // False leaves the tails unchanged (speculative verification, committed later by
+    // qsa_commit_tails); pooled keys of blocks completing in the call are still written.
+    bool update_tails = true;
 };
 
 /// q: BF16 [Di, index_heads, T] in place: q = RoPE(norm(q; weight), positions).
@@ -74,6 +77,17 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& positio
 void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& tails,
                    const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
                    cudaStream_t stream);
+
+/// Commits verified columns to the raw-key tails of L layers at once. raw_keys: BF16
+/// [Di, W, B, L], the un-normalized index keys a verification call produced; positions: I32
+/// [W, B], consecutive per row; commit_columns: I32 [B], each in [0, W]; tails: BF16
+/// [Di, R - 1, slots, L]; tail_slots: I32 [B]. For row b and n = commit_columns[b], the tails
+/// become what qsa_pool_keys would leave after a call over that row's first n columns. Pooled
+/// keys are untouched: the verification call already wrote those of every block its committed
+/// columns complete.
+void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
+                      Tensor& tails, const Tensor& tail_slots, const QsaGeometry& geometry,
+                      cudaStream_t stream);
 
 [[nodiscard]] std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry,
                                                         std::int32_t columns,

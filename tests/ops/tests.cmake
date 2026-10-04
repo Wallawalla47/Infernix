@@ -195,3 +195,13 @@ ninfer_add_op_test(ninfer_offloaded_moe_team_test
 ninfer_add_op_test(ninfer_offloaded_moe_cuda_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
   LIBRARIES ninfer_ops)
+
+# The layer route (routing, dispatch, staged or zero-copy misses) against the CPU engine.
+# Speculative verification's state Ops against their committing forms, bit for bit.
+ninfer_add_op_test(ninfer_speculative_state_ops_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_offloaded_moe_layer_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
+  LIBRARIES ninfer_ops)
