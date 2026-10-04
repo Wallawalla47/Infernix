@@ -60,9 +60,9 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. With several
-    lanes, speculative verification can round differently and flip a near-tie (design §19.2),
-    and two lanes measured slower than one, so `--max-concurrency 1` is recommended with
-    speculation.
+    lanes, a verification block wider than 8 columns uses other GEMM tiles, so it can round
+    differently and flip a near-tie (design §19.2), as upstream speculation also can. Two lanes
+    also measured slower than one, so `--max-concurrency 1` is recommended with speculation.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. See [ngram copy proposals](ngram.md).
