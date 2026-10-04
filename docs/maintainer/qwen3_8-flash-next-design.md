@@ -2980,13 +2980,15 @@ selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
 server, then each alone.
 
 - **Robustness:** no crash or hang. MTP acceptance was 94.8 % and 63.0 %.
-- **Output equality (open defect).** The code answer is identical concurrent and alone. The story
-  diverges after ~30 tokens. The same check without MTP gives identical answers for both prompts
-  at C = 2, so plain batching is invariant. One-row MTP output has equalled plain decode in every
-  run. The difference therefore lies in multi-row verification or its commit: rows with different
-  draft lengths padded to one width, or the GDN fold with different commit counts per row.
-  n-gram verification at C > 1 shares that path. Not investigated yet; use `--max-concurrency 1`
-  with speculation until it is.
+- **Output equality (open: batch variance of multi-row verification).** The code answer is
+  identical concurrent and alone; the story diverges after ~30 tokens at a near-tie. The same
+  check without speculation is identical for both prompts, so plain batching is invariant.
+  With n-gram copy proposals and no MTP (`--ngram-draft-tokens 7`), the story also diverges, and
+  it had no drafts of its own: it only rode in the code row's verification rounds. So the cause
+  predates MTP and is not corruption (the text agrees up to a near-tie). Some verification-path
+  kernel rounds differently with two rows × W columns than with one row. This is the
+  verify-width invariance question of §11.3, extended to rows. Greedy output with speculation
+  equals plain decode at C = 1 in every run; at C > 1 it may differ at near-ties.
 - **Throughput:** concurrent decode reached 24.9 + 21.7 tok/s on the cold cache, below one cold
   request (~55-67 tok/s). Two unrelated sequences double the distinct experts per round. C > 1
   under MTP is not tuned; C = 1 is the recommended setting for now.
