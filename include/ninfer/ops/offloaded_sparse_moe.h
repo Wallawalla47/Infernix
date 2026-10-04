@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <cuda_runtime.h>
@@ -67,6 +68,27 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// runs at under half the copy rate on the RTX 5090 (design section 8.6). The jobs run in passes
 /// of staging_slots jobs, so every miss is staged; staging_slots == 0 reads misses zero-copy.
 /// The staging slots are scratch of this call and are shared by every layer.
+/// CPU-served misses (design section 10.3). When enabled for a call (max_jobs > 0 and the call
+/// has at most max_columns columns), up to max_jobs of its non-resident experts with at most
+/// kMaxCpuColumns columns, the fewest-column ones first, are
+/// published as a request in mapped host memory and computed by the host's expert engine
+/// (offloaded_moe::CpuMissService) while the GPU computes the other jobs. moe_experts returns
+/// after placing the host's outputs. The arithmetic is the same exact W4A4, so where an expert
+/// is computed never changes a bit. A host that does not answer within 2 s traps the kernel.
+struct MoeCpuChannel {
+    offloaded_moe::MissRequest* request = nullptr; // mapped host memory
+    std::uint16_t* x                    = nullptr; // mapped BF16 [H, max_columns]
+    const std::uint16_t* y              = nullptr; // mapped BF16 [H, kMaxCpuJobs * kMaxCpuColumns]
+    const std::uint32_t* done           = nullptr; // mapped; the host writes the answered sequence
+    std::uint32_t* sequence             = nullptr; // device counter of published requests
+    std::int32_t layer                  = 0;
+    std::int32_t max_jobs               = 0;       // 0 disables
+    std::int32_t max_columns            = 0;
+    // misses / pcie_divisor of a call's misses stay on the GPU stage (0: the CPU takes up to
+    // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
+    std::int32_t pcie_divisor           = 3;
+};
+
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
@@ -75,15 +97,25 @@ struct MoeExpertSource {
     const offloaded_moe::ExpertScales* scales = nullptr;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
+    MoeCpuChannel cpu;
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).
+///
+/// With wait_for_cpu == false the call returns before placing CPU-served outputs; the caller may
+/// enqueue unrelated work (the shared expert) and must call moe_experts_cpu_wait with the same
+/// arguments before reading `outputs`. The workspace stays reserved until then.
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream);
+                 cudaStream_t stream, bool wait_for_cpu = true);
+
+/// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
+/// its outputs; a no-op when that call published no request.
+void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
+                          std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream);
 
 /// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T].
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,

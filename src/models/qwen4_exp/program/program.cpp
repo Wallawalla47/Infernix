@@ -16,6 +16,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/gdn_replay.h"
@@ -139,6 +140,7 @@ public:
         std::uint64_t decode_ns       = 0;
         std::uint64_t decode_share_ns = 0;
         ExpertResidency::Stats cache_at_admission;
+        std::uint64_t cpu_served_at_admission = 0;
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
     };
@@ -289,6 +291,28 @@ public:
         staging_ = DeviceBuffer(static_cast<std::size_t>(kStagingSlots) * record_stride);
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        // CPU-served misses for decode and verify calls (prefill chunks stay on the GPU).
+        const std::uint32_t cpu_workers = options_.cpu_expert_workers;
+        const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
+        if (cpu_workers > 0 && cpu_jobs > 0) {
+            std::vector<ops::offloaded_moe::CpuMissService::Layer> service_layers;
+            for (const auto& layer : parameters_.layers) {
+                service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
+                                          .record_stride = layer.moe.bank->planes.record_stride,
+                                          .scales        = layer.moe.bank->scales.data()});
+            }
+            cpu_service_ = std::make_unique<ops::offloaded_moe::CpuMissService>(
+                std::move(service_layers),
+                ops::offloaded_moe::CpuMissService::Options{
+                    .workers     = static_cast<int>(cpu_workers),
+                    .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
+                    .max_columns = lanes * max_width_,
+                    .pcie_divisor = options_.cpu_pcie_divisor,
+                    .cpus        = {}});
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
+            }
+        }
         std::uint32_t frames = 0;
         if (options_.expert_cache) {
             std::size_t free_bytes = 0, total_bytes = 0;
@@ -398,6 +422,7 @@ public:
         lane.decode_ns       = 0;
         lane.decode_share_ns = 0;
         lane.cache_at_admission = residency_->stats();
+        lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         transaction_lane_ = q.lane;
         published_        = false;
         ++revision_;
@@ -605,7 +630,7 @@ public:
             if (lanes_[index].phase != Phase::Finishable) { return out; }
             out.timings     = timings(lanes_[index]);
             out.speculative = lanes_[index].speculative;
-            report_cache(lanes_[index].cache_at_admission);
+            report_cache(lanes_[index]);
             release(index);
             out.status      = runtime::ConsumeStatus::Consumed;
             out.disposition = runtime::FinishDisposition::Released;
@@ -681,18 +706,21 @@ private:
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
     // or on stderr without an observer.
-    void report_cache(const ExpertResidency::Stats& at_admission) noexcept {
+    void report_cache(const Lane& lane) noexcept {
         try {
+            const auto& at_admission = lane.cache_at_admission;
             const auto& s       = residency_->stats();
             const auto routed   = s.routed - at_admission.routed;
             const auto hits     = s.hits - at_admission.hits;
             const auto promoted = s.promotions - at_admission.promotions;
-            char text[256];
+            const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
+            char text[320];
             std::snprintf(text, sizeof(text),
-                          "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions; "
-                          "since start %.1f%%",
+                          "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
+                          "%llu misses CPU-served; since start %.1f%%",
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
+                          static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0);
             if (options_.diagnostics.callback) {
                 options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
@@ -1175,6 +1203,7 @@ private:
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
     std::unique_ptr<ExpertResidency> residency_;
+    std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
     std::unique_ptr<execution::Forward> forward_;
     struct DecodeGraph {
         DecodeGraphDefinition definition;

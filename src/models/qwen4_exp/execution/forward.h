@@ -11,6 +11,7 @@
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/parameters.h"
+#include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
 
 #include <cstdint>
@@ -46,6 +47,8 @@ struct ForwardExperts {
     // every layer; see ops::MoeExpertSource).
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
+    // Per layer: the channel to the host expert engine for CPU-served misses (empty disables).
+    std::vector<ops::MoeCpuChannel> cpu;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It

@@ -112,7 +112,7 @@ constexpr int kMaxPassJobs = 512;
 // concatenated miss records is copied by CTA c % gridDim.x, keeping the CTAs' reads adjacent.
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, int job_base, int pass_jobs,
-                 const std::uint8_t** __restrict__ job_records) {
+                 const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records) {
     __shared__ int miss_jobs[kMaxPassJobs];
     __shared__ int misses;
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
@@ -120,6 +120,7 @@ __global__ void __launch_bounds__(kThreads)
     if (threadIdx.x == 0) {
         int n = 0;
         for (int j = 0; j < jobs; ++j) {
+            if (cpu_flags != nullptr && cpu_flags[job_base + j] != 0) { continue; } // served by the CPU
             const int expert = dispatch.jobs[job_base + j];
             const int frame  = source.frames[expert];
             const std::uint8_t* record;
@@ -328,11 +329,11 @@ struct GateUpShared {
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
                    MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
-                   int job_base, canon::A4Block* __restrict__ h_blocks) {
+                   const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm       = *reinterpret_cast<GateUpShared*>(smem_raw);
     const int job  = job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count) { return; }
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
     const int slice  = blockIdx.x; // row groups 2*slice, 2*slice+1; h block `slice`
     const std::uint8_t* record = job_records[job];
@@ -394,12 +395,13 @@ struct DownShared {
 
 __global__ void __launch_bounds__(kThreads)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                const std::uint8_t* const* __restrict__ job_records, int job_base,
-                const canon::A4Block* __restrict__ h_blocks, int columns_out, bf16* __restrict__ outputs) {
+                const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
+                int job_base, const canon::A4Block* __restrict__ h_blocks, int columns_out,
+                bf16* __restrict__ outputs) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared*>(smem_raw);
     const int job = job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count) { return; }
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
     const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
     const std::uint8_t* down = job_records[job] + moe::kGateUpBytes;
@@ -437,6 +439,108 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
     (void)columns_out;
+}
+
+// ------------------------------------------------------------------------------ CPU-served misses
+
+// Device bookkeeping of a call's CPU jobs, in the caller's workspace.
+struct CpuCall {
+    std::int32_t pending; // the published sequence, 0 when nothing was published
+    std::int32_t jobs;
+    std::int32_t job[offloaded_moe::kMaxCpuJobs];
+};
+
+// One CTA: picks the CPU jobs (about two thirds of the misses, fewest columns first, each with at
+// most kMaxCpuColumns columns), marks them in cpu_flags, publishes x and the request, then the
+// sequence after a system-scope fence.
+__global__ void __launch_bounds__(kThreads)
+    cpu_plan_kernel(MoeDispatch dispatch, MoeExpertSource source, const bf16* __restrict__ x, int columns,
+                    int top_k, int max_jobs, std::int32_t* __restrict__ cpu_flags, CpuCall* __restrict__ call) {
+    __shared__ int chosen;
+    const int jobs = min(*dispatch.job_count, max_jobs);
+    for (int j = threadIdx.x; j < max_jobs; j += blockDim.x) { cpu_flags[j] = 0; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const auto& channel = source.cpu;
+        int misses = 0;
+        for (int j = 0; j < jobs; ++j) { misses += source.frames[dispatch.jobs[j]] < 0 ? 1 : 0; }
+        const int want = min(channel.max_jobs, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        int n = 0;
+        for (int width = 1; width <= offloaded_moe::kMaxCpuColumns && n < want; ++width) {
+            for (int j = 0; j < jobs && n < want; ++j) {
+                const int expert = dispatch.jobs[j];
+                if (source.frames[expert] >= 0) { continue; }
+                const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+                if (count != width) { continue; }
+                cpu_flags[j] = 1;
+                call->job[n]                = j;
+                channel.request->expert[n] = expert;
+                channel.request->ncols[n]  = count;
+                for (int c = 0; c < count; ++c) { channel.request->column[n][c] = dispatch.entries[first + c] / top_k; }
+                ++n;
+            }
+        }
+        call->jobs = n;
+        chosen     = n;
+        if (n > 0) {
+            channel.request->layer = channel.layer;
+            channel.request->jobs  = n;
+        }
+    }
+    __syncthreads();
+    if (chosen == 0) {
+        if (threadIdx.x == 0) { call->pending = 0; }
+        return;
+    }
+    const auto* src = reinterpret_cast<const std::uint32_t*>(x);
+    auto* dst       = reinterpret_cast<std::uint32_t*>(source.cpu.x);
+    for (int i = threadIdx.x; i < columns * moe::kHidden / 2; i += blockDim.x) { dst[i] = src[i]; }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const std::uint32_t sequence = atomicAdd(source.cpu.sequence, 1U) + 1U;
+        *reinterpret_cast<volatile std::uint32_t*>(&source.cpu.request->sequence) = sequence;
+        __threadfence_system();
+        call->pending = static_cast<std::int32_t>(sequence);
+    }
+}
+
+// One CTA: waits for the host's answer to this call's request and places the CPU-served outputs.
+__global__ void __launch_bounds__(kThreads)
+    cpu_wait_kernel(MoeDispatch dispatch, MoeExpertSource source, const CpuCall* __restrict__ call, int hidden,
+                    bf16* __restrict__ outputs) {
+    __shared__ int ready;
+    if (threadIdx.x == 0) {
+        const auto sequence = static_cast<std::uint32_t>(call->pending);
+        ready = 0;
+        if (sequence != 0) {
+            std::uint64_t start;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+            const auto* done = reinterpret_cast<const volatile std::uint32_t*>(source.cpu.done);
+            while (*done != sequence) {
+                std::uint64_t now;
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+                if (now - start > 2000000000ULL) { asm volatile("trap;"); }
+                __nanosleep(200);
+            }
+            __threadfence_system();
+            ready = 1;
+        }
+    }
+    __syncthreads();
+    if (!ready) { return; }
+    const int n = call->jobs;
+    for (int i = 0; i < n; ++i) {
+        const int expert = dispatch.jobs[call->job[i]];
+        const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+        for (int c = 0; c < count; ++c) {
+            const int entry = dispatch.entries[first + c];
+            const auto* y = reinterpret_cast<const unsigned short*>(source.cpu.y) +
+                            (static_cast<std::size_t>(i) * offloaded_moe::kMaxCpuColumns + c) * hidden;
+            auto* out = reinterpret_cast<unsigned short*>(outputs) + static_cast<std::size_t>(entry) * hidden;
+            for (int d = threadIdx.x; d < hidden; d += blockDim.x) { out[d] = __ldcv(y + d); }
+        }
+    }
 }
 
 // --------------------------------------------------------------------------------------- combine
@@ -513,12 +617,41 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
     return (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256 +
-           (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256;
+           (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256 +
+           (static_cast<std::size_t>(max_jobs) * sizeof(std::int32_t) + 255) / 256 * 256 + 256;
+}
+
+namespace {
+
+// The CPU bookkeeping of a call, after the expert outputs and job records in its workspace.
+CpuCall* cpu_call_of(void* workspace, std::int32_t max_jobs, std::int32_t entries, std::int32_t** flags) {
+    const std::size_t h_bytes =
+        (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
+    const std::size_t records_bytes = (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256;
+    auto* cpu_flags = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(workspace) + h_bytes + records_bytes);
+    if (flags != nullptr) { *flags = cpu_flags; }
+    return reinterpret_cast<CpuCall*>(reinterpret_cast<std::byte*>(cpu_flags) +
+                                      (static_cast<std::size_t>(max_jobs) * sizeof(std::int32_t) + 255) / 256 * 256);
+}
+
+bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
+    return source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
+}
+
+} // namespace
+
+void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
+                          std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
+    if (!cpu_served(x, source)) { return; }
+    CpuCall* call = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
+    cpu_wait_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, call, moe::kHidden,
+                                                static_cast<bf16*>(outputs.data));
+    check_launch("cpu wait");
 }
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, bool wait_for_cpu) {
     require(contiguous(x, DType::BF16) && contiguous(outputs, DType::BF16), "experts need BF16 x and outputs");
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
@@ -539,21 +672,35 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const std::size_t h_bytes =
         (static_cast<std::size_t>(outputs.ne[1]) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
     auto** job_records = reinterpret_cast<const std::uint8_t**>(static_cast<std::byte*>(workspace) + h_bytes);
+    std::int32_t* cpu_flags = nullptr;
+    CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
+    const bool cpu          = cpu_served(x, source);
+    if (cpu) {
+        require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
+                    source.cpu.done != nullptr && source.cpu.sequence != nullptr &&
+                    source.cpu.max_jobs <= offloaded_moe::kMaxCpuJobs,
+                "CPU channel is incomplete");
+        cpu_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, static_cast<const bf16*>(x.data), x.ne[1], top_k,
+                                                    max_jobs, cpu_flags, cpu_call);
+        check_launch("cpu plan");
+    }
+    const std::int32_t* flags = cpu ? cpu_flags : nullptr;
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
-                                                                                       job_records);
+                                                                                       flags, job_records);
         check_launch("stage");
         gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
-            static_cast<const bf16*>(x.data), moe::kHidden, dispatch, source, top_k, job_records, base, h_blocks);
+            static_cast<const bf16*>(x.data), moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks);
         check_launch("gate/up");
         down_kernel<<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared), stream>>>(
-            dispatch, source, moe::kHidden, job_records, base, h_blocks, outputs.ne[1],
+            dispatch, source, moe::kHidden, job_records, flags, base, h_blocks, outputs.ne[1],
             static_cast<bf16*>(outputs.data));
         check_launch("down");
     }
+    if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
