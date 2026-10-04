@@ -30,6 +30,10 @@ This example is not a memory-sizing recommendation.
 | MTP | 1..5 | 1..63 | 1..15 |
 | DFlash | 1..15 | 1..63 | 1..15 |
 | DFlash2 | 1..15 | 1..63 | 1..15 |
+| none (Qwen3.8-Flash-Next only) | — | 1..15 | 1..15 |
+
+Qwen3.8-Flash-Next verifies copy proposals without a neural drafter. Each verified column routes its
+own experts, so wide rounds pay off only at high acceptance (repeated code or text).
 
 The artifact must contain the selected drafter. Qwen3.6-35B-A3B uses original DFlash;
 that is distinct from the DFlash2 companion in supported Qwen3.8-27B artifacts.

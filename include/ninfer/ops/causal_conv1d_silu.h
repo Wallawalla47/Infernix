@@ -59,4 +59,17 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream);
 
+/**
+ * Read-only batched form, for speculative verification whose state is committed later by a
+ * replay fold. `x` and `out` are contiguous BF16 [C,W,B], `conv_states` is contiguous BF16
+ * [C,3,Slots] and is only read, and `initial_state_slots` is contiguous I32 [B] in [0,Slots).
+ * Row b starts from the window in slot initial_state_slots[b] and `ideal` is unchanged. B is
+ * 1..8 and W is 1..64. Each output is evaluated with the snapshot form's per-column arithmetic,
+ * so a column equals the snapshot form's output for the same window and input. No state is
+ * written and no workspace is used; out does not overlap any input.
+ */
+void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
+                                    const Tensor& conv_states, const Tensor& initial_state_slots,
+                                    Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -59,13 +59,22 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 
 /// The layer's routed expert records: expert e's record is at frame_base + frames[e] *
 /// record_stride when frames[e] >= 0, else at host_records + e * record_stride (pinned host
-/// memory the device reads zero-copy). scales: device [E] ExpertScales of the layer.
+/// memory). scales: device [E] ExpertScales of the layer.
+///
+/// Non-resident records are first copied to `staging_slots` device slots (staging_base + i *
+/// record_stride) by a few CTAs that keep their reads within a compact address window, then read
+/// from there: pinned memory read by many CTAs at scattered offsets, as the expert kernels would,
+/// runs at under half the copy rate on the RTX 5090 (design section 8.6). The jobs run in passes
+/// of staging_slots jobs, so every miss is staged; staging_slots == 0 reads misses zero-copy.
+/// The staging slots are scratch of this call and are shared by every layer.
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
     const std::uint8_t* host_records = nullptr;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
+    std::uint8_t* staging_base  = nullptr;
+    std::int32_t staging_slots  = 0;
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

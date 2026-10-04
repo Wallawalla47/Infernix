@@ -154,6 +154,26 @@ __global__ void tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __
     }
 }
 
+// One CTA per (sequence, layer): the tail after the first commit_columns[sequence] columns.
+__global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
+                                   const std::int32_t* __restrict__ commit_columns,
+                                   const std::int32_t* __restrict__ tail_slots, int width, int batch, int ratio,
+                                   int slots, bf16* __restrict__ tails) {
+    const int sequence = blockIdx.x, layer = blockIdx.y, d = threadIdx.x;
+    const int n = commit_columns[sequence];
+    if (n <= 0) { return; }
+    const int start = positions[sequence * width];
+    const int last  = start + n - 1;
+    const int base  = (last + 1) - (last + 1) % ratio;
+    const bf16* layer_raw = raw + static_cast<std::size_t>(layer) * batch * width * kIndexDim;
+    bf16* layer_tails     = tails + static_cast<std::size_t>(layer) * slots * (ratio - 1) * kIndexDim;
+    for (int q = base > start ? base : start; q <= last; ++q) {
+        const int column = sequence * width + (q - start);
+        layer_tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) * kIndexDim + d] =
+            layer_raw[static_cast<std::size_t>(column) * kIndexDim + d];
+    }
+}
+
 // ----------------------------------------------------------------------------------- selection
 
 __device__ __forceinline__ std::uint32_t sortable(float x) {
@@ -562,11 +582,30 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
         batch.width, geometry.ratio, geometry.rotary_dim, geometry.theta, geometry.eps,
         static_cast<bf16*>(layer.pooled_pages.data));
     check_launch("pool");
+    if (!batch.update_tails) { return; }
     tail_kernel<<<batch.batch, kIndexDim, 0, stream>>>(
         static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
         static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
         static_cast<bf16*>(tails.data));
     check_launch("tail");
+}
+
+void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Tensor& commit_columns,
+                      Tensor& tails, const Tensor& tail_slots, const QsaGeometry& geometry,
+                      cudaStream_t stream) {
+    require_geometry(geometry);
+    const int width = raw_keys.ne[1], batch = raw_keys.ne[2], layers = raw_keys.ne[3];
+    require(contiguous(raw_keys, DType::BF16) && raw_keys.ne[0] == kIndexDim && width > 0 && batch > 0 &&
+                layers > 0 && contiguous(positions, DType::I32) && positions.numel() == std::int64_t(width) * batch &&
+                contiguous(commit_columns, DType::I32) && commit_columns.ne[0] == batch &&
+                contiguous(tail_slots, DType::I32) && tail_slots.ne[0] == batch && contiguous(tails, DType::BF16) &&
+                tails.ne[0] == kIndexDim && tails.ne[1] == geometry.ratio - 1 && tails.ne[3] == layers,
+            "commit tail shapes disagree");
+    commit_tail_kernel<<<dim3(batch, layers), kIndexDim, 0, stream>>>(
+        static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(commit_columns.data), static_cast<const std::int32_t*>(tail_slots.data),
+        width, batch, geometry.ratio, tails.ne[2], static_cast<bf16*>(tails.data));
+    check_launch("commit tails");
 }
 
 std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns,

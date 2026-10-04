@@ -21,9 +21,8 @@ void validate(const EngineOptions& options) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation only (causal scoring is not wired yet)");
     }
     if (options.enable_vision) { throw std::invalid_argument("Qwen3.8-Flash-Next vision is not supported yet"); }
-    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.ngram_draft_tokens != 0 ||
-        options.speculative.ngram_archive_bytes != 0) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next speculative decoding is not supported yet");
+    if (options.speculative.backend != SpeculativeBackend::None || options.speculative.ngram_archive_bytes != 0) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next speculates with n-gram copy proposals only (no MTP yet)");
     }
     if (options.kv_cache != KvCacheStorage::BFloat16 && options.kv_cache != KvCacheStorage::Int8Group64) {
         throw std::invalid_argument("Qwen3.8-Flash-Next supports --kv-dtype bf16 or int8");
@@ -81,6 +80,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;
+    program_options.ngram_draft_tokens = options.speculative.ngram_draft_tokens;
+    program_options.ngram_min_match    = options.speculative.ngram_min_match;
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;

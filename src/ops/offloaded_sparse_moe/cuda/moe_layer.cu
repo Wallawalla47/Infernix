@@ -101,6 +101,68 @@ __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& 
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
+// ------------------------------------------------------------------------------------- staging
+
+constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
+constexpr int kStageChunk = 16384;
+constexpr int kMaxPassJobs = 512;
+
+// Resolves the record of every job in [job_base, job_base + pass_jobs) and copies the pass's
+// non-resident records to the staging slots (pass_jobs <= slots, so all fit). Chunk c of the
+// concatenated miss records is copied by CTA c % gridDim.x, keeping the CTAs' reads adjacent.
+__global__ void __launch_bounds__(kThreads)
+    stage_kernel(MoeDispatch dispatch, MoeExpertSource source, int job_base, int pass_jobs,
+                 const std::uint8_t** __restrict__ job_records) {
+    __shared__ int miss_jobs[kMaxPassJobs];
+    __shared__ int misses;
+    const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
+    if (jobs <= 0) { return; }
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int j = 0; j < jobs; ++j) {
+            const int expert = dispatch.jobs[job_base + j];
+            const int frame  = source.frames[expert];
+            const std::uint8_t* record;
+            if (frame >= 0) {
+                record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
+            } else if (source.staging_slots > 0) {
+                record       = source.staging_base + static_cast<std::uint64_t>(n) * source.record_stride;
+                miss_jobs[n] = job_base + j;
+                ++n;
+            } else {
+                record = source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+            }
+            if (blockIdx.x == 0) { job_records[job_base + j] = record; }
+        }
+        misses = n;
+    }
+    __syncthreads();
+    constexpr int kChunks = (static_cast<int>(moe::kRecordBytes) + kStageChunk - 1) / kStageChunk;
+    constexpr int kVec    = kStageChunk / 16;
+    const int total       = misses * kChunks;
+    for (int c = blockIdx.x; c < total; c += gridDim.x) {
+        const int m = c / kChunks, offset = (c % kChunks) * kStageChunk;
+        const int bytes = min(kStageChunk, static_cast<int>(moe::kRecordBytes) - offset);
+        const int expert = dispatch.jobs[miss_jobs[m]];
+        const auto* src = reinterpret_cast<const uint4*>(
+            source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride + offset);
+        auto* dst = reinterpret_cast<uint4*>(source.staging_base + static_cast<std::uint64_t>(m) * source.record_stride +
+                                             offset);
+        const int vectors = bytes / 16;
+        uint4 v[kVec / kThreads];
+#pragma unroll
+        for (int u = 0; u < kVec / kThreads; ++u) {
+            const int i = threadIdx.x + u * kThreads;
+            if (i < vectors) { v[u] = __ldcs(src + i); }
+        }
+#pragma unroll
+        for (int u = 0; u < kVec / kThreads; ++u) {
+            const int i = threadIdx.x + u * kThreads;
+            if (i < vectors) { dst[i] = v[u]; }
+        }
+    }
+}
+
 // -------------------------------------------------------------------------------------- routing
 
 // One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
@@ -265,14 +327,15 @@ struct GateUpShared {
 
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
-                   MoeExpertSource source, int top_k, canon::A4Block* __restrict__ h_blocks) {
+                   MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
+                   int job_base, canon::A4Block* __restrict__ h_blocks) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm       = *reinterpret_cast<GateUpShared*>(smem_raw);
-    const int job  = blockIdx.y;
+    const int job  = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count) { return; }
     const int expert = dispatch.jobs[job];
     const int slice  = blockIdx.x; // row groups 2*slice, 2*slice+1; h block `slice`
-    const std::uint8_t* record = record_of(source, expert);
+    const std::uint8_t* record = job_records[job];
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -331,15 +394,15 @@ struct DownShared {
 
 __global__ void __launch_bounds__(kThreads)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
-                const canon::A4Block* __restrict__ h_blocks, int columns_out,
-                bf16* __restrict__ outputs) {
+                const std::uint8_t* const* __restrict__ job_records, int job_base,
+                const canon::A4Block* __restrict__ h_blocks, int columns_out, bf16* __restrict__ outputs) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared*>(smem_raw);
-    const int job = blockIdx.y;
+    const int job = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count) { return; }
     const int expert = dispatch.jobs[job];
     const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
-    const std::uint8_t* down = record_of(source, expert) + moe::kGateUpBytes;
+    const std::uint8_t* down = job_records[job] + moe::kGateUpBytes;
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -449,8 +512,8 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 }
 
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
-    (void)max_jobs;
-    return (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
+    return (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256 +
+           (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256;
 }
 
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
@@ -460,7 +523,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
     require(max_jobs > 0 && max_jobs <= 65535 && source.scales != nullptr && source.frames != nullptr &&
-                source.host_records != nullptr && source.record_stride >= moe::kRecordBytes,
+                source.host_records != nullptr && source.record_stride >= moe::kRecordBytes &&
+                source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
+                (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
     static bool configured = [] {
         cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -471,12 +536,24 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     }();
     (void)configured;
     auto* h_blocks = static_cast<canon::A4Block*>(workspace);
-    gate_up_kernel<<<dim3(kGateUpCtas, max_jobs), kThreads, sizeof(GateUpShared), stream>>>(
-        static_cast<const bf16*>(x.data), moe::kHidden, dispatch, source, top_k, h_blocks);
-    check_launch("gate/up");
-    down_kernel<<<dim3(kDownCtas, max_jobs), kThreads, sizeof(DownShared), stream>>>(
-        dispatch, source, moe::kHidden, h_blocks, outputs.ne[1], static_cast<bf16*>(outputs.data));
-    check_launch("down");
+    const std::size_t h_bytes =
+        (static_cast<std::size_t>(outputs.ne[1]) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
+    auto** job_records = reinterpret_cast<const std::uint8_t**>(static_cast<std::byte*>(workspace) + h_bytes);
+    // Passes of at most staging_slots jobs (one pass covering every job without staging).
+    const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
+    for (int base = 0; base < max_jobs; base += pass_jobs) {
+        const int jobs = std::min(pass_jobs, max_jobs - base);
+        stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
+                                                                                       job_records);
+        check_launch("stage");
+        gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
+            static_cast<const bf16*>(x.data), moe::kHidden, dispatch, source, top_k, job_records, base, h_blocks);
+        check_launch("gate/up");
+        down_kernel<<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared), stream>>>(
+            dispatch, source, moe::kHidden, job_records, base, h_blocks, outputs.ne[1],
+            static_cast<bf16*>(outputs.data));
+        check_launch("down");
+    }
 }
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,

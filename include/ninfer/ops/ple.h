@@ -40,11 +40,21 @@ void ple_gate(const Tensor& key, const Tensor& value, const Tensor& residual,
 
 /// The T columns form `sequences` runs of T / sequences consecutive columns. Sequence i reads its
 /// convolution history from state slot source_slots[i] and writes the updated history to slot
-/// destination_slots[i] (both I32 [sequences]; equal slots update in place). weight: BF16 [C, K]
-/// (tap j of channel c at j*C + c); states: BF16 [C, span, slots] with span = (K-1) * dilation,
-/// oldest column first. residual is updated in place.
+/// destination_slots[i] (both I32 [sequences]; equal slots update in place). An empty
+/// destination_slots leaves every state unchanged (speculative verification, committed later by
+/// ple_conv_commit). weight: BF16 [C, K] (tap j of channel c at j*C + c); states: BF16
+/// [C, span, slots] with span = (K-1) * dilation, oldest column first. residual is updated in
+/// place.
 void ple_conv_inject(const Tensor& gated, const Tensor& normalized, const Tensor& weight,
                      std::int32_t dilation, Tensor& states, const Tensor& source_slots,
                      const Tensor& destination_slots, Tensor& residual, cudaStream_t stream);
+
+/// Commits the first commit_columns[b] (I32 [B], each in [0, W]) of row b's verified columns to
+/// slot slots[b] (I32 [B]): the history becomes the trailing span columns of the old history
+/// followed by normalized[:, 0:n, b] (normalized: BF16 [C, W, B], the conv inputs ple_gate
+/// produced for those columns). Zero leaves the row's history unchanged. The result equals the
+/// in-place ple_conv_inject state update over those n columns.
+void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Tensor& states,
+                     const Tensor& slots, cudaStream_t stream);
 
 } // namespace ninfer::ops

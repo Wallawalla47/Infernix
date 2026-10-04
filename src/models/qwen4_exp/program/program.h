@@ -131,7 +131,8 @@ public:
     PendingBatch(PendingBatch&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), transaction_(std::exchange(other.transaction_, 0)),
           rows_(other.rows_), row_count_(std::exchange(other.row_count_, 0)),
-          tokens_(std::exchange(other.tokens_, {})), row_stride_(std::exchange(other.row_stride_, 0)),
+          tokens_(std::exchange(other.tokens_, {})), row_counts_(std::exchange(other.row_counts_, {})),
+          row_stride_(std::exchange(other.row_stride_, 0)),
           timing_(std::exchange(other.timing_, {})) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
@@ -139,7 +140,8 @@ public:
 
     [[nodiscard]] std::size_t row_count() const noexcept { return row_count_; }
     [[nodiscard]] std::span<const TokenId> tokens() const noexcept { return tokens_; }
-    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return {}; }
+    // Licensed tokens per row; empty when every row licenses one.
+    [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
@@ -149,6 +151,7 @@ private:
     std::array<SequenceHandle, kMaximumConcurrency> rows_{};
     std::size_t row_count_ = 0;
     std::span<const TokenId> tokens_;
+    std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
 
@@ -250,6 +253,11 @@ struct ProgramOptions {
     // Device memory left free after the expert frames take the rest (0 disables the cache).
     std::size_t expert_cache_reserve_bytes = std::size_t{1536} << 20;
     bool expert_cache                      = true;
+    // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
+    // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
+    // ngram_min_match tokens (4..64) earlier in the request.
+    std::uint32_t ngram_draft_tokens = 0;
+    std::uint32_t ngram_min_match    = 12;
     DiagnosticObserver diagnostics;
 };
 

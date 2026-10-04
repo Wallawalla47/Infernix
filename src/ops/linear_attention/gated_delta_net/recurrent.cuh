@@ -454,6 +454,8 @@ struct FoldGeometry {
 
 using FoldGeometry48x48 = FoldGeometry<48, 16, 48, 10240>;
 using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
+// Qwen3.8-Flash-Next: 36 GDN layers with the 48x48 head and channel geometry.
+using FoldGeometry36x48 = FoldGeometry<36, 16, 48, 10240>;
 
 template <class Geometry>
 struct FoldAccess {

@@ -7,6 +7,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/parameters.h"
@@ -41,6 +42,20 @@ struct ForwardExperts {
     // route_log + l * route_stride.
     std::int32_t* route_log  = nullptr;
     std::size_t route_stride = 0;
+    // Device slots the MoE stages non-resident records into before computing them (shared by
+    // every layer; see ops::MoeExpertSource).
+    std::uint8_t* staging_base  = nullptr;
+    std::int32_t staging_slots  = 0;
+};
+
+// A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
+// leaves every recurrent state, PLE history and QSA tail unchanged and records what the commit of
+// an accepted prefix needs instead; K/V and pooled keys are written as usual, since positions past
+// the accepted prefix are rewritten before any later query reads them.
+struct ForwardVerify {
+    GdnReplayRecords gdn; // narrowed to the call's width; physical record row b = sequence b
+    Tensor ple_inputs;    // BF16 [S*H, W, B]: the PLE convolution inputs
+    Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
 };
 
 struct ForwardBatch {
@@ -55,6 +70,7 @@ struct ForwardBatch {
     std::span<const std::int32_t> host_table_rows; // the same rows on the host
     std::int32_t batch = 0;
     std::int32_t width = 0;
+    const ForwardVerify* verify = nullptr; // set for a speculative verification call
 };
 
 // Optional observation of every block, for reference comparison.
@@ -68,6 +84,9 @@ struct ForwardTap {
     std::vector<Tensor>* moe_inputs    = nullptr;
     std::vector<Tensor>* moe_outputs   = nullptr;
 };
+
+// The QSA geometry of the configuration.
+[[nodiscard]] ops::QsaGeometry qsa_geometry(const TextConfig& config);
 
 class Forward {
 public:

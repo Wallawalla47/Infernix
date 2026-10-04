@@ -378,4 +378,29 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                           initial_state_slots, snapshot_base_slots, out, stream);
 }
 
+void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
+                                    const Tensor& conv_states, const Tensor& initial_state_slots,
+                                    Tensor& out, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
+        out.dtype != DType::BF16 || initial_state_slots.dtype != DType::I32) {
+        throw std::invalid_argument("causal_conv1d: from-states operands must be BF16 with I32 slots");
+    }
+    const std::int32_t width = x.ne[1], batch = x.ne[2];
+    if (x.ne[0] <= 0 || width <= 0 || width > 64 || batch <= 0 || batch > 8 || x.ne[3] != 1 ||
+        !x.is_contiguous() || !out.is_contiguous() || !conv_states.is_contiguous() ||
+        !initial_state_slots.is_contiguous()) {
+        throw std::invalid_argument("causal_conv1d: unsupported from-states [C,W,B] shape");
+    }
+    require_weight_shape(weight, x.ne[0]);
+    if (conv_states.ne[0] != x.ne[0] || conv_states.ne[1] != 3 || conv_states.ne[2] <= 0 ||
+        conv_states.ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: conv_states must have shape [C,3,S]");
+    }
+    require_selector_shape(initial_state_slots, batch, "initial_state_slots");
+    require_out_shape(x, out);
+    require_non_empty_accessible(x, weight, conv_states, out);
+    require_metadata_accessible(initial_state_slots, "initial_state_slots");
+    detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream);
+}
+
 } // namespace ninfer::ops

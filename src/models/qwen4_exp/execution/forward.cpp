@@ -31,6 +31,8 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, p.policy, work, s);
 }
 
+} // namespace
+
 ops::QsaGeometry qsa_geometry(const TextConfig& c) {
     return {.heads          = dim(c.attention.heads),
             .kv_heads       = dim(c.attention.kv_heads),
@@ -43,8 +45,6 @@ ops::QsaGeometry qsa_geometry(const TextConfig& c) {
             .theta          = c.rope.theta,
             .eps            = c.rms_norm_eps};
 }
-
-} // namespace
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
                  ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context)
@@ -85,6 +85,10 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
     const std::int32_t T = batch.ids.ne[0];
+    if (batch.verify != nullptr && (batch.width < 2 || batch.verify->gdn.spec.width != batch.width ||
+                                    batch.verify->gdn.spec.record_capacity < batch.batch)) {
+        throw std::invalid_argument("Qwen4Exp forward: verification records do not match the call");
+    }
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
         logits.dtype != DType::FP32 || logits.ne[1] != batch.logit_columns.ne[0] ||
         logits.ne[0] != dim(config_.vocab_size)) {
@@ -173,11 +177,13 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     Tensor* parts[] = {&key, &value};
     ops::split_rows(kv, parts, s);
     Tensor gated      = work_.alloc(DType::BF16, {W, T});
-    Tensor normalized = work_.alloc(DType::BF16, {W, T});
+    // A verification call records the convolution inputs for its commit and leaves the history.
+    Tensor normalized = batch.verify != nullptr ? batch.verify->ple_inputs.view({W, T})
+                                                : work_.alloc(DType::BF16, {W, T});
     ops::ple_gate(key, value, residual, p.key_norm, p.query_norm, p.conv_norm, dim(config_.hc.streams),
                   config_.rms_norm_eps, gated, normalized, s);
     ops::ple_conv_inject(gated, normalized, p.convolution, dim(config_.ple.conv_dilation), state_.ple_conv,
-                         batch.slots, batch.slots, residual, s);
+                         batch.slots, batch.verify != nullptr ? Tensor{} : batch.slots, residual, s);
 }
 
 Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index, const ForwardBatch& batch) {
@@ -189,7 +195,10 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
                        DV = dim(g.value_head_dim);
     Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
     project(x, p.projection, projected, work_, s);
-    Tensor qkv = work_.alloc(DType::BF16, {C, T});
+    // A verification call projects its convolution inputs straight into the replay records.
+    GdnReplayRecordLayer records;
+    if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
+    Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T});
     Tensor z   = work_.alloc(DType::BF16, {VW, T});
     {
         Tensor* parts[] = {&qkv, &z};
@@ -212,7 +221,22 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     Tensor v = work_.alloc(DType::BF16, {VW, T});
     Tensor o = work_.alloc(DType::BF16, {DV, NV, T});
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(DK)));
-    if (batch.width > 1) {
+    if (batch.verify != nullptr) {
+        // Speculative verification: the convolution and recurrence run from the live states
+        // without changing them, and the recurrence's inputs are recorded for the commit fold.
+        const std::int32_t Wd = batch.width, B = batch.batch;
+        auto layer = state_.gdn->layer_view(index);
+        Tensor conv_out = work_.alloc(DType::BF16, {C, Wd, B});
+        ops::causal_conv1d_silu_from_states(qkv.view({C, Wd, B}), p.convolution, layer.conv, batch.slots,
+                                            conv_out, s);
+        Tensor* parts[] = {&q, &k, &v};
+        ops::split_rows(conv_out.view({C, T}), parts, s);
+        Tensor o_rows = o.view({DV, NV, Wd, B});
+        ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}), v.view({DV, NV, Wd, B}),
+                                           gate.view({NV, Wd, B}), beta.view({NV, Wd, B}), scale, layer.recurrent,
+                                           Tensor{}, batch.slots, records.key, records.value, records.gate,
+                                           o_rows, s);
+    } else if (batch.width > 1) {
         // One sequence of several positions (a prefill chunk): chunked recurrence.
         if (batch.batch != 1) { throw std::invalid_argument("Qwen4Exp GDN: multi-position calls hold one sequence"); }
         if (batch.host_slots.empty()) { throw std::invalid_argument("Qwen4Exp GDN: missing host slot"); }
@@ -261,7 +285,9 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     Tensor k = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor v = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
     Tensor iq = work_.alloc(DType::BF16, {ID, IH, T});
-    Tensor ik = work_.alloc(DType::BF16, {ID, T});
+    // A verification call records the raw index keys for the tail commit.
+    Tensor ik = batch.verify != nullptr ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(index), 1).view({ID, T})
+                                        : work_.alloc(DType::BF16, {ID, T});
     {
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
         Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
@@ -295,7 +321,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, std::ui
     }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
     const ops::QsaBatch qsa_batch{kv_.block_tables, batch.table_rows, batch.positions, batch.slots, batch.batch,
-                                  batch.width};
+                                  batch.width, /*update_tails=*/batch.verify == nullptr};
     ops::qsa_index_query(iq, p.index_query_norm, batch.positions, geometry, s);
     ops::qsa_pool_keys(ik, p.index_key_norm, state_.qsa_tails.at(index), layer, qsa_batch, geometry, s);
 
@@ -342,7 +368,9 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.records),
                                 .record_stride = p.bank->planes.record_stride,
-                                .scales        = p.device_scales};
+                                .scales        = p.device_scales,
+                                .staging_base  = experts_.staging_base,
+                                .staging_slots = experts_.staging_slots};
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
     }
