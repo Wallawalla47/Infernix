@@ -296,19 +296,8 @@ public:
         }
         execution::ForwardExperts experts;
         experts.frames.assign(c_.num_hidden_layers, nullptr);
-        work_capacity_ = execution::Forward::workspace_bytes(c_, columns_, dim(options_.max_context)) +
-                         ops::sampling_workspace_capacity_bytes(token_domain_, 1, lanes);
-        if (max_width_ > 1) {
-            work_capacity_ += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
-                token_domain_, 1, max_width_ - 1, 1, lanes);
-            allocate_verification(lanes);
-        }
-        if (mtp_) {
-            const auto& head = parameters_.draft_head;
-            work_capacity_ += execution::Forward::mtp_workspace_bytes(
-                c_, std::max(lanes * max_width_, std::min(chunk_, 512)), lanes,
-                head.rows ? head.rows->weight.n : vocab_, dim(options_.max_context));
-        }
+        work_capacity_ = workspace_capacity(lanes);
+        if (max_width_ > 1) { allocate_verification(lanes); }
         work_    = std::make_unique<WorkspaceArena>(work_capacity_);
 
         // The VRAM expert cache takes the device memory left over, less a reserve.
@@ -365,6 +354,7 @@ public:
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context));
         device_.synchronize();
+        report_lane_cost(lanes, record_stride);
     }
 
     // ---------------------------------------------------------------- admission
@@ -552,13 +542,18 @@ public:
         // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
         // fewer than it may still emit, so every verified position lies in its reservation. Each
         // row's MTP draft length maximizes its expected tokens per round time; a longer n-gram copy
-        // proposal replaces the drafts.
+        // proposal replaces the drafts. Only one-row rounds speculate (design 11.3, 19.3.5 S1): at
+        // B >= 2 every row decodes plain, which shares the dense reads without padding rows to the
+        // longest draft and keeps the round's B <= 8 columns on the column-invariant dense routes,
+        // so greedy output at C > 1 is meant to equal C = 1. The plain round's W = 1 catch-up keeps
+        // each drafter current, and a row's draft-length policy advances only in its one-row rounds.
+        const bool speculate = batch == 1;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
         if (mtp_) {
             std::int32_t steps = 0;
             for (std::int32_t b = 0; b < batch; ++b) {
                 Lane& lane = lanes_[lanes[b]];
-                wanted[b]  = lane.mtp_live ? choose_draft_length(lane) : 0;
+                wanted[b]  = speculate && lane.mtp_live ? choose_draft_length(lane) : 0;
                 steps      = std::max(steps, wanted[b]);
             }
             mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps);
@@ -576,7 +571,7 @@ public:
                 const auto n = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b]));
                 drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + n);
             }
-            if (lane.proposer) {
+            if (speculate && lane.proposer) {
                 auto copy = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
                 if (copy.size() > drafts_[b].size()) {
                     drafts_[b]     = std::move(copy);
@@ -840,12 +835,73 @@ private:
                           static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
-            if (options_.diagnostics.callback) {
-                options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
-            } else {
-                std::fprintf(stderr, "[engine] %s\n", text);
-            }
+            diagnostic(text);
         } catch (...) {}
+    }
+
+    // The workspace arena of a Program with `lanes` lanes: the forward at its widest call (a prefill
+    // chunk or every lane's widest round), sampling, acceptance and the drafter.
+    std::size_t workspace_capacity(std::int32_t lanes) const {
+        std::size_t bytes =
+            execution::Forward::workspace_bytes(c_, std::max(chunk_, lanes * max_width_), dim(options_.max_context)) +
+            ops::sampling_workspace_capacity_bytes(token_domain_, 1, lanes);
+        if (max_width_ > 1) {
+            bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(token_domain_, 1, max_width_ - 1, 1,
+                                                                                    lanes);
+        }
+        if (mtp_) {
+            const auto& head = parameters_.draft_head;
+            bytes += execution::Forward::mtp_workspace_bytes(c_, std::max(lanes * max_width_, std::min(chunk_, 512)),
+                                                             lanes, head.rows ? head.rows->weight.n : vocab_,
+                                                             dim(options_.max_context));
+        }
+        return bytes;
+    }
+
+    // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
+    // (design 19.3.5): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
+    // and QSA-tail state; its verification and drafter records; its logit columns and penalty
+    // counts; and its share of the workspace. Every other allocation is independent of the lane
+    // count, so one more lane costs these frames.
+    void report_lane_cost(std::int32_t lanes, std::uint64_t record_stride) noexcept {
+        try {
+            const auto n         = static_cast<std::size_t>(lanes);
+            const bool fixed_kv  = options_.kv_capacity_tokens != 0;
+            const std::size_t kv = fixed_kv ? 0 : kv_backing_.bytes / n;
+            const std::size_t state =
+                (state_backing_.bytes + ple_backing_.bytes + tails_backing_.bytes + logits32_.bytes + logits16_.bytes +
+                 token_counts_.bytes + records_backing_.bytes + ple_records_.bytes + qsa_records_.bytes +
+                 mtp_residuals_.bytes + mtp_saved_.bytes + mtp_chain_.bytes + mtp_records_.bytes) /
+                n;
+            // The workspace grows with the lane count by its sampling, acceptance and drafter rows:
+            // the mean step from one lane to this count, or the second lane's at one lane.
+            const std::size_t wide   = workspace_capacity(lanes > 1 ? lanes : 2);
+            const std::size_t narrow = workspace_capacity(1);
+            const std::size_t workspace = wide > narrow ? (wide - narrow) / (lanes > 1 ? n - 1 : 1) : 0;
+            const double lane_frames = static_cast<double>(kv + state + workspace) /
+                                       static_cast<double>(std::max<std::uint64_t>(record_stride, 1));
+            char kv_text[64];
+            if (fixed_kv) {
+                std::snprintf(kv_text, sizeof(kv_text), "KV in the fixed --kv-capacity pool");
+            } else {
+                std::snprintf(kv_text, sizeof(kv_text), "KV %zu MiB", kv >> 20);
+            }
+            char text[320];
+            std::snprintf(text, sizeof(text),
+                          "expert cache: %u frames of %.2f MiB at %d lane%s; each lane holds %.1f frames (%s; "
+                          "recurrent state, records and workspace %zu MiB)",
+                          residency_->frames(), static_cast<double>(record_stride) / 1048576.0, lanes,
+                          lanes == 1 ? "" : "s", lane_frames, kv_text, (state + workspace) >> 20);
+            diagnostic(text);
+        } catch (...) {}
+    }
+
+    void diagnostic(const char* text) const {
+        if (options_.diagnostics.callback) {
+            options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
+        } else {
+            std::fprintf(stderr, "[engine] %s\n", text);
+        }
     }
 
     struct IoLayout {
@@ -1391,12 +1447,16 @@ private:
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::size_t column = 2ULL * width_;
         bool any = false, unwritten = false;
+        for (std::int32_t b = 0; b < batch; ++b) {
+            any |= lanes_[lanes[b]].mtp_live;
+            unwritten |= lanes_[lanes[b]].mtp_live && !lanes_[lanes[b]].mtp_written;
+        }
+        // Without drafts (a gated or zero-length round) only unwritten pending cells need the drafter.
+        if (!any || (steps == 0 && !unwritten)) { return; }
         auto* slots = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
         auto* rows  = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
         for (std::int32_t b = 0; b < batch; ++b) {
             const Lane& lane = lanes_[lanes[b]];
-            any |= lane.mtp_live;
-            unwritten |= lane.mtp_live && !lane.mtp_written;
             const std::int32_t cell  = static_cast<std::int32_t>(lane.state_tokens) - 1;
             const std::int32_t limit = static_cast<std::int32_t>(lane.pages.size()) * kPagedKVPageSize - 1;
             mtp_host(mtp_io_.ids)[b] = lane.history.back();
@@ -1408,7 +1468,6 @@ private:
             CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(mtp_chain_.p) + column * b, saved_column(lanes[b]).data,
                                        column, cudaMemcpyDeviceToDevice, s));
         }
-        if (!any || (steps == 0 && !unwritten)) { return; }
         auto* io = static_cast<std::byte*>(io_device_.p);
         upload_pinned(io + io_layout_.slots, slots, 4ULL * batch, s);
         upload_pinned(io + io_layout_.rows, rows, 4ULL * batch, s);

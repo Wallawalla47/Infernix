@@ -59,13 +59,27 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
     acceptance makes worthwhile, down to none on text it predicts poorly.
   - The drafter's 512 experts (1.34 GB), its workspace and the proposal head (178 MB) stay in
     VRAM, so the expert cache gets about 710 fewer frames.
-  - Greedy output is the same as without it when one request runs at a time. With several
-    lanes, a verification block wider than 8 columns uses other GEMM tiles, so it can round
-    differently and flip a near-tie (design §19.2), as upstream speculation also can. Two lanes
-    also measured slower than one, so `--max-concurrency 1` is recommended with speculation.
+  - Greedy output is the same as without it when one request runs at a time. For several lanes,
+    see `--max-concurrency` below.
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. See [ngram copy proposals](ngram.md).
+- `--max-concurrency N` (1-8) runs up to N requests at once. Its main gain is a shorter wait for
+  requests that would otherwise queue (time to first token): requests that decode together share
+  each round's dense weight reads, but their routed experts barely overlap.
+  - Speculation (`--spec mtp`, `--ngram-draft-tokens`) runs only while a single request is
+    decoding. When two or more requests decode together, each round decodes one token per
+    request without drafts, so no request is padded to another's draft length. Such rounds stay
+    within 8 columns, where concurrent requests are meant to give the same greedy output as each
+    alone (design §19.3.5).
+  - Each lane takes VRAM from the expert cache: its KV extent (14.6 KB per token of
+    `--max-context` with INT8 KV, unless `--kv-capacity` fixes one pool for all lanes) and its
+    recurrent state (113 MB), records and workspace. At startup the engine prints the cost per
+    lane, as `expert cache: <F> frames of 2.64 MiB at <N> lanes; each lane holds <n> frames (...)`.
+    With INT8 KV a lane holds about 130 frames at a 16K context and about 390 at 64K, of roughly
+    9,000.
+  - A request running alone at `--max-concurrency 2` therefore has a slightly smaller expert
+    cache than at 1 (estimated ~0.5 % slower decode at 16K and ~1.5 % at 64K).
 - The engine starts six CPU worker threads for missed experts (up to eight per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.

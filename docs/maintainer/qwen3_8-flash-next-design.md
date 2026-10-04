@@ -5205,6 +5205,28 @@ column-invariant for 1-8 columns (§19.2); experts are batch-invariant; MTP equa
 catch-up per round) ~68-72 fill and ~120-135 warm, against ~40-55 at HEAD. User guide: `--spec` at
 `--max-concurrency ≥ 2` speculates only while one request decodes.
 
+*S1 as implemented* (branch `claude/fn-conc`, 2026-10-04; built, not yet measured):
+
+- **Gate.** As planned: `speculate = batch == 1` gates both `choose_draft_length` and the n-gram
+  proposer, and `mtp_draft` returns before the chain copies when `steps == 0` and no pending cell
+  is unwritten. No product option.
+- **Per-lane startup line** (Strata A13, §19.3.6). The Program prints `expert cache: F frames of
+  2.64 MiB at C lanes; each lane holds N frames (KV x MiB; recurrent state, records and workspace
+  y MiB)`, with `KV in the fixed --kv-capacity pool` when `--kv-capacity` is set. N is exact, to
+  one decimal: every device buffer allocated per lane (its KV pool share unless the pool is fixed;
+  GDN state, PLE convolution, QSA tails; logits and penalty counts; GDN, PLE and QSA verification
+  records; drafter residuals and records), plus the workspace's per-lane growth,
+  (capacity(C) − capacity(1)) / (C − 1), or capacity(2) − capacity(1) at C = 1. The arena and the
+  line share one sizing function, `ProgramImpl::workspace_capacity(lanes)`.
+- **Tests.** No unit test, as planned: the gate is decision code inside `ProgramImpl`. The rig's
+  byte-identity check against each request alone at C = 1 and its per-(B, W) round counts cover
+  it.
+- **Measurement build, never committed** (`fn/rigs/conc/s1-meas-temporary.patch`). The override
+  `NINFER_Q4_CONC_UNGATED` (any value) lets B ≥ 2 rounds speculate as before S1. A temporary
+  per-(B, W) round table is printed with each request's cache line: rounds, submit time, and S2's
+  period (one `decode()` entry to the next, dropping intervals with a prefill or forced-token
+  call) with the tokens those rounds committed. S2 replaces it with the permanent table.
+
 **S2. Diagnostics and kernel constants (0.75 day)**, kept as the C > 1 tuning diagnostic (§11.3
 asks for U_T and h_now):
 
