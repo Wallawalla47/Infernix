@@ -58,11 +58,8 @@ CpuExpertTeam::CpuExpertTeam(Options options)
     if (workers_ < 1 || workers_ > kHBlocks) { throw std::invalid_argument("CpuExpertTeam: workers must be in [1, 40]"); }
     if (max_jobs_ < 1) { throw std::invalid_argument("CpuExpertTeam: max_jobs must be positive"); }
     if (!cpu_isa_supported(isa_)) { throw std::invalid_argument("CpuExpertTeam: unsupported CPU ISA"); }
-    scratch_.resize(static_cast<std::size_t>(workers_));
-    for (auto& s : scratch_) {
-        s.x_gate.resize(xs_index(max_jobs_, 0));
-        s.x_up.resize(xs_index(max_jobs_, 0));
-    }
+    x_gate_.resize(xs_index(max_jobs_, 0));
+    x_up_.resize(xs_index(max_jobs_, 0));
     h_.resize(h_index(max_jobs_, 0));
     threads_.reserve(static_cast<std::size_t>(workers_ - 1));
     for (int w = 1; w < workers_; ++w) {
@@ -93,38 +90,58 @@ void CpuExpertTeam::barrier() {
 }
 
 void CpuExpertTeam::work(int w) {
+    (void)w;
     const int n_jobs = static_cast<int>(jobs_.size());
-    WorkerScratch& s = scratch_[static_cast<std::size_t>(w)];
-    const int unit_begin = kHBlocks * w / workers_, unit_end = kHBlocks * (w + 1) / workers_;
-    const int rg_begin = kDownRowGroups * w / workers_, rg_end = kDownRowGroups * (w + 1) / workers_;
+    constexpr int kRowsPerItem = 4; // down row groups per item
 
-    // Phase A: every job's owned gate/up units, SwiGLU, and A4 of the owned h blocks.
-    for (int j = 0; j < n_jobs; ++j) {
+    // Phase 0: A4 of every job's columns, once for the team (gate scale, and up scale if distinct),
+    // in slices of a column's blocks: one decode job is otherwise a single serial item while the
+    // other workers wait at the barrier. Blocks quantize independently, so slicing changes no bit.
+    constexpr int kSlices = 8, kSliceBlocks = kGateUpBlocks / kSlices;
+    static_assert(kGateUpBlocks % kSlices == 0);
+    const int quantize_items = n_jobs * kMaxColumns * 2 * kSlices;
+    for (int i = next_quantize_.fetch_add(1, std::memory_order_relaxed); i < quantize_items;
+         i = next_quantize_.fetch_add(1, std::memory_order_relaxed)) {
+        const int slice = i % kSlices, column_item = i / kSlices;
+        const int j = column_item / (kMaxColumns * 2), c = (column_item / 2) % kMaxColumns, up = column_item % 2;
+        const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
+        if (c >= job.ncols || (up && job.scales.input_gate == job.scales.input_up)) { continue; }
+        const std::uint16_t* x = job.x[c] + static_cast<std::size_t>(slice) * kSliceBlocks * 16;
+        const std::size_t first = xs_index(j, c) + static_cast<std::size_t>(slice) * kSliceBlocks;
+        if (up) {
+            quantize_a4(x, kSliceBlocks * 16, job.scales.input_up, &x_up_[first]);
+        } else {
+            quantize_a4(x, kSliceBlocks * 16, job.scales.input_gate, &x_gate_[first]);
+        }
+    }
+    barrier();
+    // Phase A: gate/up 16-intermediate units with SwiGLU and A4 of their h block.
+    const int unit_items = n_jobs * kHBlocks;
+    for (int i = next_unit_.fetch_add(1, std::memory_order_relaxed); i < unit_items;
+         i = next_unit_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / kHBlocks, u = i % kHBlocks;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const bool shared = job.scales.input_gate == job.scales.input_up;
         const canon::A4Block* xg[kMaxColumns];
         const canon::A4Block* xu[kMaxColumns];
         canon::A4Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) {
-            quantize_a4(job.x[c], kHidden, job.scales.input_gate, &s.x_gate[xs_index(j, c)]);
-            xg[c] = &s.x_gate[xs_index(j, c)];
-            if (!shared) { quantize_a4(job.x[c], kHidden, job.scales.input_up, &s.x_up[xs_index(j, c)]); }
-            xu[c] = shared ? xg[c] : &s.x_up[xs_index(j, c)];
+            xg[c] = &x_gate_[xs_index(j, c)];
+            xu[c] = shared ? xg[c] : &x_up_[xs_index(j, c)];
             hb[c] = &h_[h_index(j, c)];
         }
-        if (unit_begin < unit_end) {
-            gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, unit_begin, unit_end, hb,
-                          prefetch_bytes_);
-        }
+        gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
     }
     barrier();
-    // Phase B: every job's owned down rows, reading all of A4(h).
-    for (int j = 0; j < n_jobs; ++j) {
+    // Phase B: down row groups, reading all of A4(h).
+    const int row_items = n_jobs * (kDownRowGroups / kRowsPerItem);
+    for (int i = next_rows_.fetch_add(1, std::memory_order_relaxed); i < row_items;
+         i = next_rows_.fetch_add(1, std::memory_order_relaxed)) {
+        const int j = i / (kDownRowGroups / kRowsPerItem), rg = (i % (kDownRowGroups / kRowsPerItem)) * kRowsPerItem;
         const CpuExpertJob& job = jobs_[static_cast<std::size_t>(j)];
         const canon::A4Block* hb[kMaxColumns];
-        std::uint16_t* const* y = job.y;
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(j, c)]; }
-        if (rg_begin < rg_end) { down_rows(isa_, job.record, job.scales, hb, job.ncols, rg_begin, rg_end, y, prefetch_bytes_); }
+        down_rows(isa_, job.record, job.scales, hb, job.ncols, rg, rg + kRowsPerItem, job.y, prefetch_bytes_);
     }
 }
 
@@ -159,6 +176,9 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
     }
     jobs_ = jobs;
     finished_.store(0, std::memory_order_relaxed);
+    next_quantize_.store(0, std::memory_order_relaxed);
+    next_unit_.store(0, std::memory_order_relaxed);
+    next_rows_.store(0, std::memory_order_relaxed);
     epoch_.fetch_add(1, std::memory_order_release);
     if (sleepers_.load(std::memory_order_acquire) > 0) { epoch_.notify_all(); }
     work(0);

@@ -41,7 +41,10 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     return total;
 }
 
-// One CTA per (stream, column).
+// One CTA per (stream, column). Each thread loads its elements d = tid, tid + 256, ... and their
+// weights before any arithmetic (one memory round trip instead of two serial passes) and keeps the
+// same per-thread order and block reduction.
+constexpr int kNormPerThread = 16; // hidden <= 4096
 __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__ residual,
                                                       const bf16* __restrict__ weight, int hidden,
                                                       int width, float eps, bf16* __restrict__ out) {
@@ -50,14 +53,28 @@ __global__ void __launch_bounds__(kThreads) norm_kernel(const bf16* __restrict__
     const bf16* x = residual + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     bf16* y       = out + static_cast<std::size_t>(t) * width + static_cast<std::size_t>(s) * hidden;
     const bf16* w = weight + static_cast<std::size_t>(s) * hidden;
+    bf16 xs[kNormPerThread], ws[kNormPerThread];
+#pragma unroll
+    for (int i = 0; i < kNormPerThread; ++i) {
+        const int d = threadIdx.x + i * kThreads;
+        if (d < hidden) {
+            xs[i] = x[d];
+            ws[i] = w[d];
+        }
+    }
     float sum = 0.0F;
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        const float v = __bfloat162float(x[d]);
-        sum += v * v;
+#pragma unroll
+    for (int i = 0; i < kNormPerThread; ++i) {
+        if (threadIdx.x + i * kThreads < hidden) {
+            const float v = __bfloat162float(xs[i]);
+            sum += v * v;
+        }
     }
     const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(hidden) + eps);
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        y[d] = __float2bfloat16_rn(__bfloat162float(x[d]) * inv * (1.0F + __bfloat162float(w[d])));
+#pragma unroll
+    for (int i = 0; i < kNormPerThread; ++i) {
+        const int d = threadIdx.x + i * kThreads;
+        if (d < hidden) { y[d] = __float2bfloat16_rn(__bfloat162float(xs[i]) * inv * (1.0F + __bfloat162float(ws[i]))); }
     }
 }
 
@@ -126,6 +143,7 @@ void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::in
                 weight.ne[1] == 1 && out.ne[0] == width && out.ne[1] == columns && columns > 0,
             "norm shapes disagree");
     require(eps > 0, "norm epsilon must be positive");
+    require(width / streams <= kThreads * kNormPerThread, "norm streams are wider than 4096");
     norm_kernel<<<dim3(streams, columns), kThreads, 0, stream>>>(
         static_cast<const bf16*>(residual.data), static_cast<const bf16*>(weight.data),
         width / streams, width, eps, static_cast<bf16*>(out.data));
