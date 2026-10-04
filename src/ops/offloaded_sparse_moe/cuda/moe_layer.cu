@@ -91,52 +91,6 @@ __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& 
 // -------------------------------------------------------------------------------------- routing
 
 // One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
-// One warp per router row; a CTA covers kWarps rows for kRouterColumns columns staged in shared
-// memory. Lane l accumulates the 8-element chunks l, l + 32, ... in order and the warp reduces by
-// a fixed butterfly, so a logit's bits depend only on H, never on T or the column's tile.
-constexpr int kRouterColumns = 8;
-
-__global__ void router_logits_kernel(const bf16* __restrict__ x, int hidden, int columns,
-                                     const bf16* __restrict__ router, const bf16* __restrict__ shared,
-                                     int experts, float* __restrict__ logits) {
-    extern __shared__ uint4 staged[];
-    const int first  = blockIdx.y * kRouterColumns;
-    const int count  = min(kRouterColumns, columns - first);
-    const int chunks = hidden / 8;
-    for (int i = threadIdx.x; i < count * chunks; i += blockDim.x) {
-        const int column = i / chunks, chunk = i % chunks;
-        staged[column * chunks + chunk] =
-            reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first + column) * hidden)[chunk];
-    }
-    __syncthreads();
-    const int lane = threadIdx.x % 32;
-    const int row  = blockIdx.x * kWarps + threadIdx.x / 32;
-    if (row > experts) { return; }
-    const auto* w = reinterpret_cast<const uint4*>(row < experts ? router + static_cast<std::size_t>(row) * hidden
-                                                                 : shared);
-    float sums[kRouterColumns] = {};
-    for (int chunk = lane; chunk < chunks; chunk += 32) {
-        const uint4 packed = w[chunk];
-        const bf16* wv     = reinterpret_cast<const bf16*>(&packed);
-        float wf[8];
-        for (int i = 0; i < 8; ++i) { wf[i] = __bfloat162float(wv[i]); }
-        for (int column = 0; column < kRouterColumns; ++column) {
-            if (column < count) {
-                const uint4 xp = staged[column * chunks + chunk];
-                const bf16* xv = reinterpret_cast<const bf16*>(&xp);
-                for (int i = 0; i < 8; ++i) { sums[column] = fmaf(wf[i], __bfloat162float(xv[i]), sums[column]); }
-            }
-        }
-    }
-    for (int column = 0; column < kRouterColumns; ++column) {
-        float v = sums[column];
-        for (int offset = 16; offset > 0; offset >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, offset); }
-        if (lane == 0 && column < count) {
-            logits[static_cast<std::size_t>(first + column) * (experts + 1) + row] = v;
-        }
-    }
-}
-
 __global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
                              std::int32_t* __restrict__ ids, float* __restrict__ weights,
                              float* __restrict__ shared_gate) {
@@ -415,28 +369,6 @@ __global__ void combine_kernel(const bf16* __restrict__ outputs, const float* __
 }
 
 } // namespace
-
-void moe_router_logits(const Tensor& x, const Tensor& router, const Tensor& shared_gate, Tensor& logits,
-                       cudaStream_t stream) {
-    require(contiguous(x, DType::BF16) && contiguous(router, DType::BF16) && contiguous(shared_gate, DType::BF16) &&
-                contiguous(logits, DType::FP32),
-            "router logits require contiguous BF16 operands and FP32 logits");
-    const int hidden = x.ne[0], columns = x.ne[1], experts = router.ne[1];
-    require(hidden > 0 && hidden % 8 == 0 && hidden <= 3072 && columns > 0 && experts > 0,
-            "router logits support H a multiple of 8 up to 3072");
-    require(router.ne[0] == hidden && shared_gate.numel() == hidden && logits.ne[0] == experts + 1 &&
-                logits.ne[1] == columns,
-            "router logits shapes disagree");
-    for (const Tensor* t : {&x, &router, &shared_gate}) {
-        require(reinterpret_cast<std::uintptr_t>(t->data) % 16 == 0, "router logits operands must be 16-byte aligned");
-    }
-    const dim3 grid((experts + 1 + kWarps - 1) / kWarps, (columns + kRouterColumns - 1) / kRouterColumns);
-    const std::size_t staged = static_cast<std::size_t>(kRouterColumns) * hidden * sizeof(bf16);
-    router_logits_kernel<<<grid, kThreads, staged, stream>>>(
-        static_cast<const bf16*>(x.data), hidden, columns, static_cast<const bf16*>(router.data),
-        static_cast<const bf16*>(shared_gate.data), experts, static_cast<float*>(logits.data));
-    check_launch("router logits");
-}
 
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream) {
     require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&

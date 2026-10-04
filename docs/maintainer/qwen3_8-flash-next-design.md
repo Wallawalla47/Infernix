@@ -2206,6 +2206,49 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
   - an agent stall;
   - a device spin timeout.
 
+### 16.5 Precision boundaries and measured quality (2026-10-04, RTX 5090)
+
+Every boundary was checked against the upstream code (Transformers `qwen4_exp` with its Qwen3.5 and
+Qwen3-Next parents, SGLang `qwen4_exp.py`) and against Strata's kernels. A boundary is never
+less precise than upstream. Where more precision was possible, it was **measured** on real text
+and kept only if it did not hurt.
+
+**Method.** Three frozen texts are scored teacher-forced on identical token ids: 511 positions
+of C++ (`src/core/layout.cpp`), 1,023 of a document (`README.md`) and 1,023 of a chat transcript
+in the model's chat template. Perplexity is taken over the actual next tokens. Differences are
+paired per position, as the mean ΔNLL ± its standard error. Tools:
+`ninfer_qwen4_exp_forward_real_test --dump-logits` and `tools/flash_next/strata_compare.py`.
+Strata runs the user's own `strata-unsloth-ud-q4_k_xl.json` (UD-Q4_K_XL, INT8 KV) plus
+`--short-read 4096` and `STRATA_LOGPOS`, as in its `docs/UNSLOTH_Q4.md`. Per-op error is checked
+separately on NInfer's own taps with `tools/flash_next/block_check.py` (FP64 oracle) and
+`upstream_check.py` (Transformers modules in BF16 with the real weights).
+
+| Boundary | Transformers / SGLang | Strata | NInfer | Evidence and decision |
+|---|---|---|---|---|
+| Dense weights | BF16 | Q4_K-Q8_0 mixes | BF16, word-exact | The main reason NInfer beats Strata on chat (below) |
+| Routed experts | NVFP4 W4A4 | Q4_K/Q5_K gate-up, Q5_1/Q8_0 down, Q8_1 activations | NVFP4 W4A4, canonical arithmetic | No 8- or 16-bit activation path is needed: NInfer's overall quality is already better than Strata's |
+| Residual stream (4 × 2,560) | BF16 | FP32 | **BF16** | FP32 tried. All op chains stayed exact (median residual error 0.105 % → 0.03 %), but perplexity got **worse**: +0.030 ± 0.009 nats overall, +0.051 ± 0.015 on chat. The model expects the BF16 rounding it was trained and calibrated with. Rejected |
+| Router logits | BF16 Linear output, FP32 softmax | FP32 | **FP32** (`projection_fp32`) | BF16 logits make experts within one BF16 step (0.03 at logit ≈ −4.3) tie, and the lower id always wins. Measured BF16 − FP32: +0.008 ± 0.008 nats (code +0.022 ± 0.010). No cost. Kept |
+| LM-head logits | BF16 | FP32 | **FP32** (`projection_fp32`) | Perplexity unchanged (BF16 − FP32 = −0.0002 ± 0.0004 nats). BF16 logits create exact ties that flip greedy top-1 at 1.3 % of positions. The 1 MB output row is free next to the 1.27 GB weight read. Kept, subject to its decode kernel matching the BF16 GEMV's bandwidth (M6) |
+| RMSNorm / hyper-connection norm | FP32 inside, one BF16 rounding | FP32 | Same | Attention-side mixer error 0.13-0.23 % vs Transformers' 0.27-0.35 % |
+| GDN gated norm | Three roundings (normalized value, weight product, output) | – | One rounding | GDN error 0.35-0.50 % vs Transformers' 0.42-0.65 % |
+| QSA v, gate, gated product | BF16 | – | BF16 | 0.43-1.8 % vs Transformers' 0.48-3.2 %. The excess over other ops is cancellation in deep layers' `o_proj` sums: emulating these three BF16 roundings leaves ≤ 0.09 % |
+| QSA indexer pooled key, scores | FP32 mean → BF16, FP32 scores | – | Same | – |
+| KV cache | BF16 | INT8 | INT8-G64 with Hadamard keys (primary), BF16 | INT8 costs +0.005 perplexity overall against BF16 KV (4.542 → 4.564) |
+
+**Result against Strata** (NInfer recipe A with INT8 KV, Strata UD-Q4_K_XL with INT8 KV):
+
+| Text | Positions | Perplexity NInfer | Perplexity Strata | ΔNLL (NInfer − Strata) | Top-1 = next: NInfer / Strata | Top-1 agreement | KL(Strata ‖ NInfer) mean / p99 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Code | 511 | 1.9052 | 1.9051 | +0.000 ± 0.016 | 84.0 % / 84.5 % | 95.1 % | 0.043 / 0.55 |
+| Document | 1,023 | 9.5874 | 9.7671 | −0.019 ± 0.017 | 51.7 % / 52.4 % | 84.1 % | 0.074 / 0.84 |
+| Chat | 1,023 | 3.3611 | 3.8692 | **−0.141 ± 0.024** | 71.0 % / 70.6 % | 90.7 % | 0.109 / 1.67 |
+| All | 2,557 | 4.564 | 4.864 | **−0.064 ± 0.012** | | | |
+
+NInfer ties Strata on code and the document, and is significantly better on chat. KL is taken over
+Strata's top 20 plus a bucket for the rest. With BF16 KV, NInfer's overall perplexity is 4.542.
+These texts are short (≤ 1,024 tokens); long-context quality is measured with M8.
+
 ---
 
 ## 17. High-reward options

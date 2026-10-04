@@ -45,7 +45,8 @@ struct ForwardBatch {
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's FP8 n-gram rows
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
-    Tensor last_columns; // I32 [batch]: the column whose logits each sequence produces
+    Tensor logit_columns; // I32 [n]: the columns whose logits are produced (each sequence's last
+                          // for generation, every column for teacher-forced scoring)
     std::span<const std::int32_t> host_slots;      // the same slots on the host
     std::span<const std::int32_t> host_table_rows; // the same rows on the host
     std::int32_t batch = 0;
@@ -69,7 +70,7 @@ public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
             ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context);
 
-    // Logits of each sequence's last column: BF16 [V, batch].
+    // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,

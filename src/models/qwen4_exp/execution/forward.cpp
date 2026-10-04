@@ -9,6 +9,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/ple.h"
+#include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/rows.h"
@@ -71,7 +72,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
                             std::size_t(c.qsa.index_heads + 1) * c.qsa.index_head_dim;
     bytes += qkv * t * bf * 2 + std::size_t(c.attention.query_width()) * t * bf * 2;
     bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context);
-    bytes += (c.moe.experts + 1) * t * bf + k * t * 8 + t * 4;
+    bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
     bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t));
     bytes += 2 * std::size_t(c.moe.shared_intermediate) * t * bf * 3;
@@ -85,7 +86,8 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
     const std::int32_t T = batch.ids.ne[0];
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
-        logits.ne[1] != batch.batch || logits.ne[0] != dim(config_.vocab_size)) {
+        logits.dtype != DType::FP32 || logits.ne[1] != batch.logit_columns.ne[0] ||
+        logits.ne[0] != dim(config_.vocab_size)) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
     const cudaStream_t s = device_.stream;
@@ -135,9 +137,10 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
         }
     }
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
-    Tensor last    = work_.alloc(DType::BF16, {H, batch.batch});
-    ops::gather_columns(final_x, batch.last_columns, last, s);
-    project(last, parameters_.output_head, logits, work_, s);
+    Tensor last = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
+    ops::gather_columns(final_x, batch.logit_columns, last, s);
+    const Tensor* head[] = {&parameters_.output_head};
+    ops::projection_fp32(last, head, logits, s);
 }
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
@@ -308,7 +311,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
     Tensor logits = work_.alloc(DType::FP32, {E + 1, T});
-    ops::moe_router_logits(x, p.router, p.shared_score, logits, s);
+    const Tensor* rows[] = {&p.router, &p.shared_score};
+    ops::projection_fp32(x, rows, logits, s);
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     ops::moe_route(logits, K, routing, s);
