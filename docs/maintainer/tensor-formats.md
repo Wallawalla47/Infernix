@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly eleven persistent numeric tensor formats in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -27,17 +27,19 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
 
-The block-scaled floating-point weight format is:
+The block-scaled floating-point weight formats are:
 
 | Canonical name | Code | K group | Block scale | Global field |
 |---|---|---:|---|---|
 | `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor |
+| `nvfp4_mul` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight multiplier |
 
-The row-scaled floating-point weight format is:
+The scaled FP8 weight formats are:
 
 | Canonical name | Code | Scale granularity | Scale |
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
+| `fp8_e4m3fn_block128_f32` | E4M3FN, 8 bits/weight | one multiplier per 128 x 128 tile | FP32 |
 
 Each name fixes a code and scale contract. The format registry is implemented in
 [`tools/artifact/formats.py`](../../tools/artifact/formats.py) and
@@ -302,6 +304,37 @@ The format does not define how a floating-point source is assigned a scale or ro
 A recipe either preserves already selected code and scale words exactly or names its
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
+
+### 3.5 `nvfp4_mul`
+
+`nvfp4_mul` has the code and block-scale words of `nvfp4` (Section 3.3), with the same validity
+rules, but its matrix field is a **multiplier** `m_w`: NVIDIA ModelOpt's `weight_scale_2`. For code
+`c[n,k]`, scale word `s[n,g]` and `g = floor(k/16)`:
+
+```text
+W[n,k] = decode_e2m1(c[n,k]) * decode_e4m3fn(s[n,g]) * m_w
+```
+
+`m_w` is a finite, strictly positive binary32 word. The product is exact in binary64. Storing
+`1/m_w` as an `nvfp4` divisor changes the represented weight unless `m_w` is a power of two, so the
+two formats are distinct. The only producer is `import_encoded`. ModelOpt's activation
+`input_scale` is a separate model-role tensor. The format's only layout is `nvfp4_expert_rg16_v1`
+([storage layouts §6](storage-layouts.md#6-nvfp4_expert_rg16_v1)).
+
+### 3.6 `fp8_e4m3fn_block128_f32`
+
+`fp8_e4m3fn_block128_f32` stores matrices `[..., N, K]` with one E4M3FN code word per weight and
+one FP32 multiplier per 128 x 128 tile; edge tiles are truncated. For tile scale
+`t[floor(n/128), floor(k/128)]`:
+
+```text
+W[n,k] = decode_e4m3fn(c[n,k]) * t[floor(n/128), floor(k/128)]
+```
+
+The E4M3FN rules are those of Section 3.4: both NaN words are invalid. A tile multiplier is a finite
+binary32 with sign bit zero; zero is allowed. The product is exact in binary64. The source name
+`weight_scale_inv` of Qwen's FP8 checkpoints notwithstanding, the stored value multiplies. The only
+producer is `import_encoded`.
 
 ## 4. Grouped signed-integer tensor model
 

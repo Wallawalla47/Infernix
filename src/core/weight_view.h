@@ -47,6 +47,9 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    // ExpertRg16 only: one expert's unit bytes and its 4 KiB-aligned pitch.
+    std::uint64_t record_bytes  = 0;
+    std::uint64_t record_stride = 0;
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
@@ -96,5 +99,31 @@ struct WeightRowPlanes {
 // Existing Weight ABI: complete quantized parents, direct regions, and RowSplit row views.
 // Arbitrary FP8/NVFP4 regions use their explicit planes until a native consumer supports them.
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
+
+// A routed-expert bank in nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2). Pointers are in
+// the parent's memory space; nothing is dereferenced.
+struct ExpertBankPlanes {
+    const std::byte* records     = nullptr; // expert e at records + e * record_stride
+    const float* multipliers     = nullptr; // [experts][3]: gate, up, down weight_scale_2
+    std::uint64_t record_bytes   = 0;
+    std::uint64_t record_stride  = 0;
+    std::uint64_t gate_up_bytes  = 0; // the down matrix starts here inside a record
+    std::uint32_t experts        = 0;
+    std::uint32_t hidden         = 0;
+    std::uint32_t intermediate   = 0;
+};
+[[nodiscard]] ExpertBankPlanes expert_bank_planes(const WeightParent& parent);
+
+// Block-scaled FP8 matrices in block128_scale_v1, leading axes flattened into a batch.
+struct Block128Planes {
+    const std::byte* codes   = nullptr; // [batch][n][k] E4M3FN
+    const float* scales      = nullptr; // [batch][scale_rows][scale_cols] FP32 multipliers
+    std::uint64_t batch      = 0;
+    std::uint64_t n          = 0;
+    std::uint64_t k          = 0;
+    std::uint64_t scale_rows = 0;
+    std::uint64_t scale_cols = 0;
+};
+[[nodiscard]] Block128Planes block128_planes(const WeightParent& parent);
 
 } // namespace ninfer

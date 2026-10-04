@@ -111,6 +111,40 @@ void geometry_and_views() {
     require(query.weight_scale_divisor == 2 && query.input_scale_divisor == 3 &&
                 context.input_scale_divisor == 4 && nv_parent.weight_scale_divisor == 2,
             "per-use native parameters changed the parent");
+
+    // Flash-Next expert banks and block-FP8: sizes equal tools/artifact/layouts.py's.
+    const auto bank = weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16,
+                                      std::array<std::uint64_t, 3>{3, 64, 32});
+    require(bank.record_bytes == 3456 && bank.record_stride == 4096 && bank.scale_offset == 12288 &&
+                bank.bytes == 12324 && bank.alignment == 4096,
+            "expert bank geometry differs from the Python layout");
+    const auto full = weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16,
+                                      std::array<std::uint64_t, 3>{512, 2560, 640});
+    require(full.record_bytes == 2764800 && full.record_stride == 2764800 && full.bytes == 1415583744,
+            "Flash-Next expert bank size differs from the Python layout");
+    std::vector<std::byte> bank_bytes(bank.bytes);
+    const WeightParent bank_parent{bank, bank_bytes.data()};
+    const auto bank_planes = expert_bank_planes(bank_parent);
+    require(bank_planes.experts == 3 && bank_planes.hidden == 64 && bank_planes.intermediate == 32 &&
+                bank_planes.gate_up_bytes == 2304 &&
+                reinterpret_cast<const std::byte*>(bank_planes.multipliers) == bank_bytes.data() + 12288,
+            "expert bank planes lost their geometry");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::NVFP4, QuantLayout::ExpertRg16, std::array<std::uint64_t, 3>{3, 64, 32}); },
+        "expert bank layout accepted the divisor nvfp4 format");
+    rejects<std::invalid_argument>(
+        [&] { (void)weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, std::array<std::uint64_t, 3>{3, 64, 40}); },
+        "expert bank layout accepted an intermediate size that is not a multiple of 16");
+    const auto block = weight_geometry(QType::FP8_E4M3FN_BLOCK128_F32, QuantLayout::Block128Scale,
+                                       std::array<std::uint64_t, 3>{2, 200, 130});
+    require(block.scale_offset == 52224 && block.bytes == 52256, "block128 geometry differs from the Python layout");
+    std::vector<std::byte> block_bytes(block.bytes);
+    const WeightParent block_parent{block, block_bytes.data()};
+    const auto bp = block128_planes(block_parent);
+    require(bp.batch == 2 && bp.n == 200 && bp.k == 130 && bp.scale_rows == 2 && bp.scale_cols == 2,
+            "block128 planes lost their geometry");
+    rejects<std::invalid_argument>([&] { (void)weight_row_planes({&block_parent, 0, 130}); },
+                                   "block-scaled FP8 exposed per-row planes");
 }
 
 void invalid_directories() {

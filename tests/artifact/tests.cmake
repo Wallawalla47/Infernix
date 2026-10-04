@@ -29,3 +29,8 @@ set_tests_properties(
 set_tests_properties(
   ninfer_artifact_materialization_test
   PROPERTIES SKIP_RETURN_CODE 77)
+
+# Flash-Next expert banks and block-scaled FP8 written by Python and accepted by the C++ reader.
+add_test(NAME ninfer_artifact_flash_next_interop_test
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/flash_next_interop.py"
+    $<TARGET_FILE:ninfer_artifact_reader_test>)
