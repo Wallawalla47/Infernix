@@ -11,6 +11,7 @@
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
+#include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/sampling.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -197,11 +199,6 @@ public:
         pool_   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, pool_layout);
         tables_ = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, table_layout, *pool_);
 
-        // Expert residency: every routed expert is read from the pinned bank until the VRAM
-        // expert cache owns these tables.
-        frames_backing_ = DeviceBuffer(sizeof(std::int32_t) * c_.moe.experts * c_.num_hidden_layers);
-        frames_backing_.fill(0xFF);
-
         // Per-call inputs, staged through pinned memory.
         const std::size_t heads     = hash_.heads();
         const std::size_t row_bytes = c_.ple.table.row_bytes;
@@ -249,12 +246,31 @@ public:
             kv.layers.push_back(layer);
         }
         execution::ForwardExperts experts;
-        for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
-            experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing_.p) + l * c_.moe.experts);
-        }
+        experts.frames.assign(c_.num_hidden_layers, nullptr);
         work_capacity_ = execution::Forward::workspace_bytes(c_, columns_, dim(options_.max_context)) +
                          ops::sampling_workspace_capacity_bytes(token_domain_, 1, lanes);
         work_    = std::make_unique<WorkspaceArena>(work_capacity_);
+
+        // The VRAM expert cache takes the device memory left over, less a reserve.
+        std::vector<const std::uint8_t*> banks;
+        std::uint64_t record_stride = 0;
+        for (const auto& layer : parameters_.layers) {
+            banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+            record_stride = layer.moe.bank->planes.record_stride;
+        }
+        std::uint32_t frames = 0;
+        if (options_.expert_cache) {
+            std::size_t free_bytes = 0, total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            const std::size_t reserve = options_.expert_cache_reserve_bytes;
+            frames = free_bytes > reserve ? static_cast<std::uint32_t>((free_bytes - reserve) / record_stride) : 0U;
+        }
+        residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, frames, columns_);
+        experts.frame_base   = residency_->frame_base();
+        experts.frame_stride = residency_->frame_stride();
+        experts.route_log    = residency_->route_log();
+        experts.route_stride = residency_->route_stride();
+        for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = residency_->table(l); }
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context));
         device_.synchronize();
@@ -377,6 +393,10 @@ public:
         stage_sequence(index, begin, width, lane.history);
         run(1, width, 1);
         lane.state_tokens += static_cast<std::uint32_t>(width);
+        if (!last) {
+            device_.synchronize();
+            residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
+        }
 
         PrefillProgress out;
         out.summary                 = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
@@ -388,6 +408,7 @@ public:
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
             sample(lanes, positions);
+            residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
             const SequenceHandle rows[] = {sequence};
             out.timing.submit_host_ns = elapsed_ns(start);
             lane.prefill_ns += out.timing.submit_host_ns;
@@ -421,6 +442,7 @@ public:
         run(batch, 1, batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
+        residency_->after_round(device_.stream, batch, kDecodePromotionsPerLayer);
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -451,6 +473,8 @@ public:
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
             run(1, static_cast<std::int32_t>(stride), 1);
+            device_.synchronize();
+            residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
             lane.state_tokens += stride;
         }
         runtime::ExecutionTiming timing;
@@ -515,6 +539,7 @@ public:
             const auto index = lane_of(sequence);
             if (lanes_[index].phase != Phase::Finishable) { return out; }
             out.timings = timings(lanes_[index]);
+            report_cache();
             release(index);
             out.status      = runtime::ConsumeStatus::Consumed;
             out.disposition = runtime::FinishDisposition::Released;
@@ -568,6 +593,23 @@ public:
     std::uint64_t revision() const noexcept { return revision_; }
 
 private:
+    static constexpr std::size_t kDecodePromotionsPerLayer  = 2;
+    static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
+
+    void report_cache() noexcept {
+        if (!options_.diagnostics.callback) { return; }
+        try {
+            const auto& s     = residency_->stats();
+            const double rate = s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0;
+            char text[256];
+            std::snprintf(text, sizeof(text),
+                          "expert cache: %u frames, %.1f%% of %llu routed experts hit since start, %llu promotions",
+                          residency_->frames(), rate, static_cast<unsigned long long>(s.routed),
+                          static_cast<unsigned long long>(s.promotions));
+            options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
+        } catch (...) {}
+    }
+
     struct IoLayout {
         std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, bytes = 0;
     };
@@ -700,7 +742,9 @@ private:
         fb.batch           = batch;
         fb.width           = width;
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
+        residency_->before_round(s);
         forward_->run(fb, logits);
+        residency_->enqueue_route_download(s, cols);
     }
 
     // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
@@ -744,7 +788,7 @@ private:
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 
-    DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, frames_backing_;
+    DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_;
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
     IoLayout io_layout_;
@@ -753,6 +797,7 @@ private:
     std::unique_ptr<KVExecutionTablePool> tables_;
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
+    std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::Forward> forward_;
 
     std::array<Lane, kMaximumConcurrency> lanes_{};

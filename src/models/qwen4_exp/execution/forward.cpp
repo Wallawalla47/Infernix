@@ -316,6 +316,13 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     ops::moe_route(logits, K, routing, s);
+    if (experts_.route_log != nullptr) {
+        if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
+            throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(experts_.route_log + layer * experts_.route_stride, routing.ids.data,
+                                   routing.ids.bytes(), cudaMemcpyDeviceToDevice, s));
+    }
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
             cudaSuccess) {

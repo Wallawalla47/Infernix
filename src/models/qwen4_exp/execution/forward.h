@@ -37,6 +37,10 @@ struct ForwardExperts {
     const std::uint8_t* frame_base = nullptr;
     std::uint64_t frame_stride     = 0;
     std::vector<const std::int32_t*> frames; // per layer, device I32 [E]: frame or -1
+    // Optional route log for the expert cache: layer l's routed ids (I32 [k, T]) are copied to
+    // route_log + l * route_stride.
+    std::int32_t* route_log  = nullptr;
+    std::size_t route_stride = 0;
 };
 
 struct ForwardBatch {

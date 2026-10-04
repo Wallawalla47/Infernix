@@ -78,6 +78,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.max_concurrency = options.max_concurrency;
     program_options.prefill_chunk   = options.prefill_chunk;
     program_options.kv_cache        = options.kv_cache;
+    program_options.diagnostics     = options.diagnostic_observer;
     program_options.kv_capacity_tokens =
         options.kv_capacity.mode == KvCapacityMode::Explicit ? options.kv_capacity.explicit_tokens : 0U;
     program_options.ngram_volume = options.ngram_volume_path.empty()
