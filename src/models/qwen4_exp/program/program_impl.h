@@ -140,6 +140,7 @@ public:
         std::uint64_t decode_share_ns = 0;
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
+        NgramVolume::Counters ngram; // this request's n-gram row traffic
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
         // MTP drafter: the residual of the last processed position (its pending cell) is in the
@@ -457,6 +458,7 @@ public:
         lane.decode_share_ns = 0;
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
+        lane.ngram                   = {};
         transaction_lane_ = q.lane;
         published_        = false;
         ++revision_;
@@ -716,6 +718,7 @@ public:
             out.timings     = timings(lanes_[index]);
             out.speculative = lanes_[index].speculative;
             report_cache(lanes_[index]);
+            report_ngram(lanes_[index]);
             release(index);
             out.status      = runtime::ConsumeStatus::Consumed;
             out.disposition = runtime::FinishDisposition::Released;
@@ -896,6 +899,22 @@ private:
         } catch (...) {}
     }
 
+    // Reports the finished request's n-gram row traffic (design 12.4). Every row is read on the host
+    // before the call that consumes it is launched.
+    void report_ngram(const Lane& lane) noexcept {
+        try {
+            const auto& n = lane.ngram;
+            char text[192];
+            std::snprintf(text, sizeof(text),
+                          "n-gram rows: %llu requested, %.1f%% host-cache hits, %llu NVMe reads, %.1f ms of reads",
+                          static_cast<unsigned long long>(n.rows),
+                          n.rows ? 100.0 * static_cast<double>(n.hits) / static_cast<double>(n.rows) : 0.0,
+                          static_cast<unsigned long long>(n.reads), static_cast<double>(n.read_ns) * 1e-6);
+            diagnostic(text);
+        } catch (...) {}
+    }
+
+    // An Info diagnostic for the Engine's observer, or stderr without one.
     void diagnostic(const char* text) const {
         if (options_.diagnostics.callback) {
             options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
@@ -975,8 +994,9 @@ private:
 
     std::byte* host_io() const { return static_cast<std::byte*>(io_host_.data()); }
 
-    // The n-gram rows of `count` positions starting at `begin`, from the tokens before them.
-    void stage_ngram(const std::vector<std::int32_t>& history, std::int32_t begin, std::int32_t count,
+    // The n-gram rows of `count` positions starting at `begin`, from the tokens before them; the
+    // traffic counts toward `lane`'s request.
+    void stage_ngram(Lane& lane, const std::vector<std::int32_t>& history, std::int32_t begin, std::int32_t count,
                      std::size_t column) {
         const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
         window_.clear();
@@ -987,8 +1007,14 @@ private:
         row_ids_.resize(static_cast<std::size_t>(count) * heads);
         hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
         const std::size_t row_bytes = c_.ple.table.row_bytes;
+        const NgramVolume::Counters before = volume_.counters();
         volume_.read_rows(row_ids_, std::span<std::byte>(host_io() + io_layout_.ngram + column * heads * row_bytes,
                                                          static_cast<std::size_t>(count) * heads * row_bytes));
+        const NgramVolume::Counters& after = volume_.counters();
+        lane.ngram.rows += after.rows - before.rows;
+        lane.ngram.hits += after.hits - before.hits;
+        lane.ngram.reads += after.reads - before.reads;
+        lane.ngram.read_ns += after.read_ns - before.read_ns;
     }
 
     void stage_sequence(std::uint32_t lane, std::int32_t begin, std::int32_t width,
@@ -1003,7 +1029,7 @@ private:
         columns[0] = width - 1;
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots)[0] = static_cast<std::int32_t>(lane);
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows)[0]  = static_cast<std::int32_t>(lane);
-        stage_ngram(history, begin, width, 0);
+        stage_ngram(lanes_[lane], history, begin, width, 0);
         host_lanes_[0] = static_cast<std::int32_t>(lane);
     }
 
@@ -1014,14 +1040,14 @@ private:
         auto* slots   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
         auto* rows    = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
         for (std::size_t b = 0; b < lanes.size(); ++b) {
-            const Lane& lane = lanes_[lanes[b]];
+            Lane& lane       = lanes_[lanes[b]];
             ids[b]           = lane.history[static_cast<std::size_t>(positions[b])];
             pos[b]           = positions[b];
             columns[b]       = static_cast<std::int32_t>(b);
             slots[b]         = static_cast<std::int32_t>(lanes[b]);
             rows[b]          = static_cast<std::int32_t>(lanes[b]);
             host_lanes_[b]   = static_cast<std::int32_t>(lanes[b]);
-            stage_ngram(lane.history, positions[b], 1, b);
+            stage_ngram(lane, lane.history, positions[b], 1, b);
         }
     }
 
@@ -1174,7 +1200,7 @@ private:
         auto* slots   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
         auto* rows    = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
         for (std::int32_t b = 0; b < batch; ++b) {
-            const Lane& lane          = lanes_[lanes[b]];
+            Lane& lane                = lanes_[lanes[b]];
             const auto& d             = drafts_[b];
             const auto n              = static_cast<std::int32_t>(d.size());
             const std::int32_t anchor = lane.history.back();
@@ -1192,7 +1218,7 @@ private:
             slots[b]       = static_cast<std::int32_t>(lanes[b]);
             rows[b]        = static_cast<std::int32_t>(lanes[b]);
             host_lanes_[b] = static_cast<std::int32_t>(lanes[b]);
-            stage_ngram(sequence_, positions[b], W, static_cast<std::size_t>(b * W));
+            stage_ngram(lane, sequence_, positions[b], W, static_cast<std::size_t>(b * W));
             spec_host(spec_layout_.extents)[b] = n;
             spec_host(spec_layout_.lengths)[b] = positions[b];
             spec_host(spec_layout_.anchors)[b] = anchor;

@@ -4765,8 +4765,8 @@ unchanged.
 **S0: measure first** (`program/ngram_volume.{h,cpp}`, `program.cpp`). Permanent: `NgramVolume`
 counters (rows requested, cache hits, NVMe block reads, read ns; today's `hits_`/`misses_` are never
 reported) and a per-request line beside `report_cache` (826-851): "n-gram rows: N requested,
-H % host-cache hits, R NVMe reads; T ms of reads (E ms before a launch, G ms behind the gate); gate
-waited k times, X µs" (S2 fields zero until S2). Temporary (never committed; kept as a local patch
+H % host-cache hits, R NVMe reads, T ms of reads". S2 extends it with the reads behind the gate and
+the gate's waits when the gate exists; no field is printed before its mechanism. Temporary (never committed; kept as a local patch
 re-applied to each step's measurement build through S3, because the S2 and S3 acceptance rows use
 the events, phase timers and cold toggle): `Clock::now()` phases per round (MTP: sync-1459
 return → staged → launched → tail enqueued → sync-1180 return; plain: `sample()` return → next
@@ -4979,6 +4979,89 @@ idle (`miss_service.cpp:111-116`) sleeps ≥ 1 ms, up to 15.6 ms, on Windows (in
 cheap to probe. Drafting on the device right after acceptance, as Qwen3.5 does, would remove the
 commit-to-draft gap; a larger design. NVMe power-state exits (50-150 ms on some drives, §12.4;
 unmeasured on G:) would hit a request's first gated round, and the slow-read warning will show them.
+
+#### S0 as built (branch `claude/fn-ngram`)
+
+**Permanent part** (`ab20254e3`).
+- `NgramVolume::counters()` replaces the unreported hit/miss pair: rows requested, rows served by
+  the host cache, 4 KiB blocks read from the volume, and the wall time of those reads.
+- `stage_ngram` adds each call's traffic to the lane it stages: prefill chunks, forced tokens, plain
+  rounds and verification rounds.
+- `finish()` reports the request's traffic as an Info diagnostic beside the expert-cache line:
+  "n-gram rows: N requested, H % host-cache hits, R NVMe reads, T ms of reads". Every read precedes
+  its launch until S2, which adds its gate fields to the line. Until S1, R counts one read per
+  missed occurrence.
+
+**Temporary part.** One commit labelled `TEMPORARY`, reverted once the S0 campaign has run and
+cherry-picked onto the S1-S3 measurement builds, whose acceptance rows use the same events, timers
+and toggle. The code is `program/s0_probe.h` plus one-line hooks marked `TEMPORARY`. The Program
+reads the environment once, at construction:
+
+| Variable | Effect |
+|---|---|
+| `NINFER_TMP_ARMS=a,b,...` | Arm per admission, cycled. Letters: `v` flush after the verify graph launch; `d` flush after the plain graph launch; `c` flush in `commit_verified` before `settle_round` (A11); `C` n-gram cold (`NgramVolume::invalidate()` at admission); `K` MTP draft length fixed at `--draft-tokens`. `-` is the baseline |
+| `NINFER_TMP_ARMS_FROM=n` | The first n admissions (bench priming, warm-up) run arm `pre` |
+| `NINFER_TMP_PHASES=1` | Host clock and CUDA timing events at fixed points of each round |
+| `NINFER_TMP_DRAFT_LOG=path` | The A12 draft-probability log (TSV, appended) |
+| `NINFER_TMP_FIXED_K=k` | MTP draft length fixed at k for every arm |
+
+- **Per-request line** (`S0 req=...`, printed at finish). It gives the arm, the MTP and plain round
+  counts, the n-gram rows and reads per round, and a **wall-clock decode rate**: decode tokens over
+  the time from the first `decode()` entry to the last commit return. `ninfer_bench`'s decode rate
+  divides by the time inside `decode()` only, so it omits commit and scheduler time, where the
+  commit-site flush acts.
+- **Phases.** With `NINFER_TMP_PHASES=1`, the line adds the mean µs and count of every consecutive
+  host-point and GPU-event pair.
+  - Host points: decode entry, drafts enqueued, draft sync return, verify staged, verify launched,
+    tail enqueued, verify sync return, plain staged, plain launched, sample enqueued, sample sync
+    return, decode return, commit entry, commit GPU work enqueued, `settle_round` return, commit
+    return.
+  - GPU events: decode entry, after the draft graph, after the drafts D2H, before the verify
+    uploads, after the licensed D2H, before the plain upload, after the sampled D2H, commit entry,
+    commit GPU work enqueued.
+  - The GPU pair "after the drafts D2H → before the verify uploads" is the **after-draft GPU idle**
+    that S3's go rule reads. "After the sampled D2H → before the next plain upload" is the plain
+    gap.
+  - Events are recorded outside graph capture, and the chain restarts after prefill and
+    forced-token calls.
+- **A12 draft log, as built.** It deviates from "an online softmax in the drafter's argmax" so that
+  temporary code stays out of the argmax Op.
+  - When logging, each draft step copies the draft head's BF16 logits into a probe buffer inside
+    the draft graph. After the draft sync, the host computes p1, the softmax top-1 probability at
+    T = 1, over the proposal rows (over the public tokens without a proposal head).
+  - For sampled rows the log also holds the drafter's sampler distribution q16: the top 16 after
+    the request's top-k, min-p and top-p. It also holds the target's sampler distribution p, the
+    top 20, at the draft's verify column. From these it gives Σ min(p, q16) and p(draft).
+    Penalties are not modelled; the log runs use none.
+  - The host work costs ~1 MB of D2H and ~0.5 M exponentials per round, so log runs are never
+    timing runs.
+- **Scope.** The probe is one per Program, not one per lane, so the S0 runs use C = 1.
+
+**Method and decision rules, fixed before measuring.**
+- **Arms.** They alternate per request inside one `ninfer_bench` process, in mirrored order
+  (A B C … C B A), after the priming request and one warm-up. All arms therefore share one model
+  load, one expert-cache history and the same greedy text.
+- **Repetitions.** 10 reps per arm for the flush A/B runs, which leave the phase timers off. The
+  attribution runs, with phases, use 4 reps per arm.
+- **Speed metric.** The wall-clock decode rate, with the bench rate reported beside it.
+- **Flush adoption.** A flush site is adopted if its deciding workload improves on the wall metric
+  by more than 2 × the pooled standard error, √(sd_A²/n_A + sd_B²/n_B). Neither its cold variant
+  nor the bench metric may be worse by more than 2 × its own pooled standard error.
+- **Deciding workloads.** W1 decides the verify and commit sites, with W2 as the cold variant. W3
+  plain decides the decode site, with W3 cold as the variant: that site runs only in W = 1 rounds,
+  which MTP tg512 rarely has, so reading §7.3's "W1 improves" literally would test a path W1
+  barely executes.
+- **A12.** O2 is built only if the replay shows ≥ 3 % on prose (story, tg512) net of draft cost.
+  O3 is built only if Σ min(p, q16) exceeds p(draft) by ≥ 5 acceptance points on sampled prose.
+- **Workloads as rigged.**
+  - W1, W2: tg512 MTP 4, arms `-`, `C`, `v`, `c`.
+  - W3: tg512 plain, arms `-`, `C`, `d`, `Cd`.
+  - W4: CLI code and story, 400 tokens, plain and MTP, one process each, phases on.
+  - W5: ninfer-serve C = 1 with phases on: an unrelated warm-up, then code and story for the first
+    time, then repeated.
+  - W7 baseline for S1: pp4096 at chunk 4096, cold against warm.
+  - A12 logs: tg512, and CLI code and story, greedy and sampled (T = 0.7, top-p 0.8, top-k 20),
+    with arms `-` and `K`.
 
 ### 19.3.5 Speculation and throughput at C > 1
 

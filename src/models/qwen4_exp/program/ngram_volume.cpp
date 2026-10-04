@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/program/ngram_volume.h"
 
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -58,13 +59,14 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         const std::size_t slot = slot_of(rows[i]);
         if (tags_[slot] == rows[i]) {
             std::memcpy(out.data() + i * row_bytes, cache_.data() + slot * row_bytes, row_bytes);
-            ++hits_;
+            ++counters_.hits;
         } else {
             missing_.push_back(i);
-            ++misses_;
         }
     }
+    counters_.rows += rows.size();
     if (missing_.empty()) { return; }
+    const auto start = std::chrono::steady_clock::now();
     // One block read per missing row, all in flight together.
     const std::size_t blocks = missing_.size();
     if (block_.size() < (blocks + 1) * table_.block_bytes) {
@@ -88,6 +90,9 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         tags_[slot]            = rows[i];
         std::memcpy(cache_.data() + slot * row_bytes, row, row_bytes);
     }
+    counters_.reads += blocks;
+    counters_.read_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
 std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact) {

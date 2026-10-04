@@ -84,6 +84,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
 - The expert cache fills all VRAM but 384 MiB (98.8 % used on the 5090).
+- After each request the engine logs two Info lines: the expert cache's hit rate, and the
+  request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
+  of reads`). The row cache outlives requests, so repeated text hits it, while new text reads most
+  of its rows from the volume.
 
 ## Performance
 
