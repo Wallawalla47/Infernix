@@ -119,14 +119,16 @@ std::string usage_text(const char* argv0) {
            "KV CACHE\n"
            "  --kv-capacity N|auto     KV-cache capacity in tokens\n"
            "                           (default = --max-context; auto sizes to free\n"
-           "                           VRAM, leaving " +
+           "                           VRAM less --vram-headroom-mib; Qwen3.8-Flash-Next:\n"
+           "                           auto = --max-context)\n"
+           "  --vram-headroom-mib N|auto\n"
+           "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
+           "                           after --kv-capacity auto (auto " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB headroom; configurable\n"
-           "                           via --vram-headroom-mib)\n"
-           "  --vram-headroom-mib N    VRAM headroom in MiB left by --kv-capacity auto\n"
-           "                           (default " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           ")\n"
+           "); Qwen3.8-\n"
+           "                           Flash-Next, after the expert cache, for the display\n"
+           "                           and other programs (auto: 1024 with a display on\n"
+           "                           the GPU, else 256)\n"
            "  --kv-dtype T             bf16 (default) | int8 | fp8 | nvfp4 | k8v4 | vq2 | k4v2\n"
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
@@ -210,7 +212,6 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
-    std::optional<std::size_t> vram_headroom_mib;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -237,11 +238,16 @@ Options parse_options(int argc, char** argv) {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
         } else if (arg == "--vram-headroom-mib") {
-            const std::uint64_t mib = parse_u64(value(arg), "vram-headroom-mib");
-            if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
-                throw std::invalid_argument("--vram-headroom-mib is out of range");
+            const char* text = value(arg);
+            if (std::string_view(text) == "auto") {
+                options.vram_headroom_bytes.reset();
+            } else {
+                const std::uint64_t mib = parse_u64(text, "vram-headroom-mib");
+                if (mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                    throw std::invalid_argument("--vram-headroom-mib is out of range");
+                }
+                options.vram_headroom_bytes = static_cast<std::size_t>(mib) << 20;
             }
-            vram_headroom_mib = static_cast<std::size_t>(mib);
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -362,12 +368,6 @@ Options parse_options(int argc, char** argv) {
 
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
-    }
-    if (vram_headroom_mib.has_value()) {
-        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
-        }
-        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
     }
 
     const bool has_prompt   = !options.prompt.empty();

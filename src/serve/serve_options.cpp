@@ -114,6 +114,16 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
     return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
 }
 
+// N MiB, or auto (empty: the model's automatic headroom).
+std::optional<std::size_t> parse_vram_headroom(const char* text) {
+    if (std::string_view(text) == "auto") { return std::nullopt; }
+    const std::uint64_t mib = parse_u64(text, "vram-headroom-mib");
+    if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+        throw std::invalid_argument("--vram-headroom-mib is out of range");
+    }
+    return static_cast<std::size_t>(mib) << 20;
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
@@ -187,14 +197,15 @@ std::string serve_usage_text(const char* argv0) {
            "  --kv-capacity N|auto       KV-cache capacity in tokens (default auto, or\n"
            "                             --max-context with the original prefix caching\n"
            "                             system or --no-prefix-reuse; auto sizes to free\n"
-           "                             VRAM, leaving " +
+           "                             VRAM less --vram-headroom-mib; Qwen3.8-Flash-Next:\n"
+           "                             auto = --max-context x --max-concurrency)\n"
+           "  --vram-headroom-mib N|auto VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
+           "                             after --kv-capacity auto (auto " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of headroom; configurable\n"
-           "                             via --vram-headroom-mib)\n"
-           "  --vram-headroom-mib N      VRAM headroom in MiB left by --kv-capacity auto\n"
-           "                             (default " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           ")\n"
+           "); Qwen3.8-Flash-\n"
+           "                             Next, after the expert cache, for the display and\n"
+           "                             other programs (auto: 1024 with a display on the\n"
+           "                             GPU, else 256)\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2\n"
            "  --host-context-mib N       pinned Host budget in decimal MiB that resolve to\n"
@@ -324,7 +335,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             strict parsers that reject choices:[] accept it\n"
            "\n"
            "NOTES\n"
-           "  --vram-headroom-mib requires --kv-capacity auto.\n"
+           "  Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto (the\n"
+           "  default with the new prefix caching system).\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
@@ -402,12 +414,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
         } else if (arg == "--vram-headroom-mib") {
-            const std::uint64_t mib =
-                parse_u64(require_value("--vram-headroom-mib"), "vram-headroom-mib");
-            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("--vram-headroom-mib is out of range");
-            }
-            vram_headroom_mib = static_cast<std::size_t>(mib);
+            options.vram_headroom_bytes =
+                parse_vram_headroom(require_value("--vram-headroom-mib"));
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
@@ -679,12 +687,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse && options.context_cache.mode == ContextCacheMode::Hybrid
                 ? KvCapacityPolicy::automatic()
                 : KvCapacityPolicy::explicit_capacity(options.max_context);
-    }
-    if (vram_headroom_mib.has_value()) {
-        if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
-            throw std::invalid_argument("--vram-headroom-mib requires --kv-capacity auto");
-        }
-        options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
     }
     if (!options.allow_prefix_reuse) {
         if (original_cache_selected) {

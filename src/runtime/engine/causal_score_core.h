@@ -97,7 +97,7 @@ public:
         out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
         out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
         out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.kv_capacity_headroom_bytes         = resolution.automatic_headroom_bytes;
+        out.vram_headroom_bytes                = resolution.automatic_headroom_bytes;
         out.planned_slack_bytes                = resolution.planned_slack_bytes;
         return out;
     }

@@ -306,6 +306,8 @@ std::string usage_text(std::string_view program) {
         << "  --ngram-volume <path>       Qwen3.8-Flash-Next n-gram volume (default: <weights>.ngram)\n"
         << "  --ram-headroom-mib <N>      physical Host RAM pinned weights and caches leave free (default "
         << (ninfer::kDefaultRamHeadroomBytes >> 20) << ")\n"
+        << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
+        << "                              display and other programs (default auto: 1024 with a display, else 256)\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -389,6 +391,22 @@ BenchOptions parse_args(int argc, char** argv) {
                 throw std::invalid_argument("--ram-headroom-mib must be a MiB count");
             }
             options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
+        } else if (arg == "--vram-headroom-mib") {
+            const std::string text = value("--vram-headroom-mib");
+            if (text == "auto") {
+                options.vram_headroom_bytes.reset();
+            } else {
+                std::size_t used       = 0;
+                unsigned long long mib = 0;
+                try {
+                    mib = std::stoull(text, &used);
+                } catch (const std::exception&) { used = 0; }
+                if (used != text.size() || text.empty() || text.front() == '-' ||
+                    mib > (std::numeric_limits<std::size_t>::max() >> 20)) {
+                    throw std::invalid_argument("--vram-headroom-mib must be a MiB count or auto");
+                }
+                options.vram_headroom_bytes = static_cast<std::size_t>(mib) << 20;
+            }
         } else if (arg == "-p" || arg == "--n-prompt") {
             auto parsed = parse_int_list(value("--n-prompt"), "n-prompt");
             options.n_prompt.insert(options.n_prompt.end(), parsed.begin(), parsed.end());
@@ -796,7 +814,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << ",\n"
         << "    \"available_after_startup_bytes\": " << env.memory.available_after_startup_bytes
         << ",\n"
-        << "    \"kv_capacity_headroom_bytes\": " << env.memory.kv_capacity_headroom_bytes << ",\n"
+        << "    \"vram_headroom_bytes\": " << env.memory.vram_headroom_bytes << ",\n"
         << "    \"planned_slack_bytes\": " << env.memory.planned_slack_bytes << ",\n"
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"

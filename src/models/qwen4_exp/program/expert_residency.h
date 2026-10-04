@@ -44,6 +44,11 @@ public:
     ExpertResidency(const ExpertResidency&)            = delete;
     ExpertResidency& operator=(const ExpertResidency&) = delete;
 
+    // Device bytes besides the frames: the frame tables and the route log.
+    [[nodiscard]] static std::uint64_t table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept;
+    // Frames the cache uses at most: every routed expert but one.
+    [[nodiscard]] static std::uint32_t max_frames(const TextConfig& config) noexcept;
+
     [[nodiscard]] const std::uint8_t* frame_base() const noexcept;
     [[nodiscard]] std::uint64_t frame_stride() const noexcept { return stride_; }
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;

@@ -272,7 +272,7 @@ int main() {
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
-                          server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
+                          server.at("memory").at("vram_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
     failures += check(server.at("memory").at("host_context_capacity_bytes") == (64ULL << 20) &&

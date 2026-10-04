@@ -37,8 +37,7 @@ int main() {
         const auto yarn = parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
         failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 8192 &&
                               yarn.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                              yarn.kv_capacity.automatic_headroom_bytes ==
-                                  ninfer::kDefaultKvCapacityHeadroomBytes,
+                              !yarn.vram_headroom_bytes,
                           "YaRN must not grow serving context or KV defaults");
     }
     for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
@@ -236,8 +235,7 @@ int main() {
                           defaults.context_cache.mode == ninfer::ContextCacheMode::Hybrid,
                       "the hybrid prefix cache is not the default");
     failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          defaults.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                          !defaults.vram_headroom_bytes,
                       "default KV capacity is not sized to free VRAM for the hybrid cache");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
@@ -600,6 +598,22 @@ int main() {
                           !hybrid_minimal.context_cache.hybrid.tap_ladder_tokens &&
                           !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens,
                       "the hybrid default must size KV automatically and leave tuning derived");
+    const ServeOptions hybrid_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "2048"});
+    failures += check(hybrid_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          hybrid_headroom.vram_headroom_bytes == (2048ULL << 20),
+                      "hybrid automatic KV capacity must accept --vram-headroom-mib");
+    // The headroom also applies to Qwen3.8-Flash-Next's expert cache, so the parser accepts it
+    // with an explicit capacity (Qwen3.5's Engine refuses that combination) and accepts auto.
+    const ServeOptions explicit_headroom =
+        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "8192", "--vram-headroom-mib", "512"});
+    failures += check(explicit_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          explicit_headroom.vram_headroom_bytes == (512ULL << 20),
+                      "--vram-headroom-mib must parse beside an explicit --kv-capacity");
+    failures += check(!parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "512",
+                              "--vram-headroom-mib", "auto"})
+                           .vram_headroom_bytes,
+                      "--vram-headroom-mib auto must select the automatic headroom");
     const ServeOptions hybrid_explicit_kv =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "8192", "--kv-capacity", "16384",
                "--host-context-mib", "0"});
@@ -807,8 +821,7 @@ int main() {
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                           automatic.kv_capacity.explicit_tokens == 0 &&
-                          automatic.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                          !automatic.vram_headroom_bytes,
                       "--kv-capacity auto did not select automatic sizing");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",

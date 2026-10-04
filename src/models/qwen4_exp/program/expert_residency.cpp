@@ -19,6 +19,17 @@ std::uint32_t slack_frames(std::uint32_t) { return 0; }
 
 } // namespace
 
+std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_t max_columns) noexcept {
+    const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
+    const std::uint64_t route =
+        static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
+    return (keys + route) * sizeof(std::int32_t);
+}
+
+std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
+    return config.num_hidden_layers * config.moe.experts - 1;
+}
+
 ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks,
                                  std::uint64_t record_stride, std::uint32_t frames, std::int32_t max_columns)
     : c_(config), banks_(std::move(banks)), stride_(record_stride), frames_(frames) {
@@ -28,7 +39,7 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
     if (banks_.size() != layers_) { throw std::invalid_argument("expert residency: one bank per layer"); }
     const std::size_t keys = static_cast<std::size_t>(layers_) * experts_;
     if (frames_ > 0) {
-        if (frames_ >= keys) { frames_ = static_cast<std::uint32_t>(keys) - 1; }
+        frames_       = std::min(frames_, max_frames(config));
         frame_memory_ = DeviceBuffer(static_cast<std::size_t>(frames_) * stride_);
         controller_   = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), frames_,
                                                          slack_frames(frames_), 1);

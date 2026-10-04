@@ -34,9 +34,10 @@ void validate_options(const EngineOptions& options) {
         if (options.kv_capacity.explicit_tokens == 0) {
             throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
         }
-        if (options.kv_capacity.automatic_headroom_bytes != 0) {
+        // Qwen3.5's headroom is what automatic KV capacity leaves; an explicit capacity has none.
+        if (options.vram_headroom_bytes.has_value()) {
             throw std::invalid_argument(
-                "Engine explicit kv_capacity must not carry automatic headroom");
+                "Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto");
         }
         break;
     case KvCapacityMode::Automatic:
@@ -261,8 +262,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
-    auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
-                                          current_free_device_bytes());
+    auto resolution = resolve_kv_capacity(
+        options.kv_capacity, planner.capacity_curve(), current_free_device_bytes(),
+        options.vram_headroom_bytes.value_or(kDefaultKvCapacityHeadroomBytes));
     auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
     if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
         sequence.kv_capacity() != resolution.resolved_tokens) {

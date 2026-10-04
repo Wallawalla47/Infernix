@@ -76,35 +76,34 @@ std::uint32_t SequenceCapacityCurve::resolved_tokens(std::uint32_t main_page_gro
 
 KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                          const SequenceCapacityCurve& curve,
-                                         std::size_t available_runtime_bytes) {
+                                         std::size_t available_runtime_bytes,
+                                         std::size_t automatic_headroom_bytes) {
     validate_curve(curve);
 
     std::uint32_t pages         = curve.minimum_main_page_groups;
     std::size_t capacity_budget = available_runtime_bytes;
+    std::size_t headroom        = 0;
     switch (policy.mode) {
     case KvCapacityMode::Explicit:
-        if (policy.automatic_headroom_bytes != 0) {
-            throw std::invalid_argument("explicit KV capacity must not carry automatic headroom");
-        }
         pages = explicit_page_groups(policy, curve);
         break;
     case KvCapacityMode::Automatic:
-        if (available_runtime_bytes < policy.automatic_headroom_bytes) {
+        headroom = automatic_headroom_bytes;
+        if (available_runtime_bytes < headroom) {
             throw std::invalid_argument(
-                "automatic KV headroom requires " +
-                std::to_string(policy.automatic_headroom_bytes) + " bytes, but only " +
-                std::to_string(available_runtime_bytes) + " bytes are available after weights");
+                "automatic KV headroom requires " + std::to_string(headroom) +
+                " bytes, but only " + std::to_string(available_runtime_bytes) +
+                " bytes are available after weights");
         }
-        capacity_budget -= policy.automatic_headroom_bytes;
+        capacity_budget -= headroom;
         if (capacity_budget < curve.minimum_device_reservation_bytes) {
-            const std::size_t required_total = checked_add(
-                curve.minimum_device_reservation_bytes, policy.automatic_headroom_bytes,
-                "automatic KV capacity requirement overflows size_t");
+            const std::size_t required_total =
+                checked_add(curve.minimum_device_reservation_bytes, headroom,
+                            "automatic KV capacity requirement overflows size_t");
             throw std::invalid_argument(
                 "automatic KV capacity requires " + std::to_string(required_total) +
                 " bytes total (" + std::to_string(curve.minimum_device_reservation_bytes) +
-                " bytes minimum Engine runtime reservation + " +
-                std::to_string(policy.automatic_headroom_bytes) +
+                " bytes minimum Engine runtime reservation + " + std::to_string(headroom) +
                 " bytes automatic headroom), but only " +
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
@@ -142,7 +141,7 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         .bytes_per_additional_main_page_group = curve.bytes_per_additional_main_page_group,
         .runtime_reservation_bytes            = reservation,
         .available_after_weights_bytes        = available_runtime_bytes,
-        .automatic_headroom_bytes             = policy.automatic_headroom_bytes,
+        .automatic_headroom_bytes             = headroom,
         .planned_slack_bytes                  = available_runtime_bytes - reservation,
     };
 }

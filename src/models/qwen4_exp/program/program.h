@@ -13,6 +13,8 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/qwen3_5/ngram.h"
+#include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/memory_plan.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
@@ -242,6 +244,26 @@ struct AbortResult {
     bool salvaged = false;
 };
 
+// Device memory a Program allocates besides its expert frames (design §19.3.7), from the options
+// and the model's configuration alone, so startup checks it before the weights are read. The
+// constructor allocates exactly these sizes.
+struct ProgramDevicePlan {
+    std::uint32_t kv_pages = 0;
+    std::uint64_t kv        = 0; // KV pages and execution tables
+    std::uint64_t workspace = 0; // the forward, sampling, acceptance and MTP workspace arena
+    std::uint64_t staging   = 0; // the expert miss staging slots
+    std::uint64_t state     = 0; // GDN, PLE and QSA tail state, verification records, MTP columns
+    std::uint64_t io        = 0; // per-call inputs, logits, sampling and round arrays
+    std::uint64_t residency = 0; // the expert frame tables and route log
+    std::uint64_t expert_record_stride = 0; // one expert frame
+    std::uint32_t max_frames           = 0; // the most frames the expert cache uses
+    std::uint32_t graph_bound          = 0; // CUDA graph executables the Program may instantiate
+
+    [[nodiscard]] std::uint64_t fixed_bytes() const noexcept {
+        return kv + workspace + staging + state + io + residency;
+    }
+};
+
 struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
@@ -250,11 +272,10 @@ struct ProgramOptions {
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
     std::filesystem::path ngram_volume;
-    // Device memory left free after the expert frames take the rest. 384 MiB (98.8 % of the 5090
-    // in use) measured safe through decode, 4K-token prefill chunks and verification graphs
-    // (design section 19.2).
-    std::size_t expert_cache_reserve_bytes = std::size_t{384} << 20;
-    bool expert_cache                      = true;
+    // Device memory left free for the display and other programs once the fixed allocations and
+    // the expert frames are made (design §19.3.7); empty selects it from the display state.
+    std::optional<std::uint64_t> vram_headroom;
+    bool expert_cache = true;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least
     // ngram_min_match tokens (4..64) earlier in the request.
@@ -281,6 +302,14 @@ class Program {
 public:
     Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options);
     ~Program() noexcept;
+
+    // The device plan of a Program with these options over a model with this configuration and
+    // public token count; validates the options.
+    [[nodiscard]] static ProgramDevicePlan plan_device(const ProgramOptions& options, const Config& config,
+                                                       std::uint32_t public_tokens);
+    [[nodiscard]] const ProgramDevicePlan& device_plan() const noexcept;
+    // How the expert frames were sized at construction.
+    [[nodiscard]] const VramSizing& vram_sizing() const noexcept;
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

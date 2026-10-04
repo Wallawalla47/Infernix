@@ -55,4 +55,68 @@ std::string HostMemoryLedger::describe() const {
     return line;
 }
 
+std::uint32_t graph_bound(std::uint32_t lanes, std::uint32_t max_width, std::uint32_t mtp_draft_tokens) {
+    std::uint32_t graphs = lanes;
+    if (max_width > 1) { graphs += lanes * max_width; }
+    if (mtp_draft_tokens > 0) { graphs += lanes * max_width + lanes * mtp_draft_tokens; }
+    return graphs;
+}
+
+std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional<std::uint64_t> requested) {
+    if (requested) { return *requested; }
+    if (display == DisplayState::Headless) { return 256 * kLedgerMiB; }
+    return (elastic ? 512 : 1024) * kLedgerMiB;
+}
+
+std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic) {
+    const std::uint64_t counted = elastic ? std::min<std::uint32_t>(graphs, 32) : graphs;
+    return std::max(256 * kLedgerMiB, 128 * kLedgerMiB + graph_bytes * counted);
+}
+
+VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand) {
+    VramSizing out;
+    out.snapshot = snapshot;
+    out.demand   = demand;
+    out.headroom = display_headroom(snapshot.display, demand.elastic, demand.headroom);
+    out.reserve  = internal_reserve(demand.graphs, demand.graph_bytes, demand.elastic);
+    const auto signed_bytes = [](std::uint64_t v) { return static_cast<std::int64_t>(v); };
+    std::int64_t room = signed_bytes(snapshot.device_free) - signed_bytes(demand.fixed) - signed_bytes(out.headroom);
+    if (snapshot.has_budget) {
+        const std::int64_t budget = signed_bytes(snapshot.local_budget) - signed_bytes(snapshot.local_usage) -
+                                    signed_bytes(demand.fixed) - signed_bytes(kVramBudgetMarginBytes);
+        if (budget < room) {
+            room               = budget;
+            out.budget_limited = true;
+        }
+    }
+    out.frame_bytes = room - signed_bytes(out.reserve);
+    if (out.frame_bytes > 0 && demand.frame_bytes > 0) {
+        const std::uint64_t frames = static_cast<std::uint64_t>(out.frame_bytes) / demand.frame_bytes;
+        out.frames = static_cast<std::uint32_t>(std::min<std::uint64_t>(frames, demand.max_frames));
+    }
+    return out;
+}
+
+std::string VramSizing::describe() const {
+    const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes / kLedgerMiB); };
+    const char* display = snapshot.display == DisplayState::Headless   ? "no display"
+                          : snapshot.display == DisplayState::Attached ? "display attached"
+                                                                       : "display unknown (treated as attached)";
+    char budget[96] = "";
+    if (snapshot.has_budget) {
+        std::snprintf(budget, sizeof(budget), "; OS budget %llu MiB, used %llu", mib(snapshot.local_budget),
+                      mib(snapshot.local_usage));
+    }
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "VRAM sizing: free %llu of %llu MiB; %s%s; to allocate %llu; reserve %llu (%u graphs); headroom "
+                  "%llu (%s) -> expert frames %u (%.2f GiB)%s%s",
+                  mib(snapshot.device_free), mib(snapshot.device_total), display, budget, mib(demand.fixed),
+                  mib(reserve), demand.graphs, mib(headroom), demand.headroom ? "set" : "auto", frames,
+                  gib(static_cast<std::uint64_t>(frames) * demand.frame_bytes),
+                  budget_limited ? ", limited by the OS budget" : "",
+                  frame_bytes < 0 ? "; the fixed allocations do not fit" : "");
+    return line;
+}
+
 } // namespace ninfer::models::qwen4_exp

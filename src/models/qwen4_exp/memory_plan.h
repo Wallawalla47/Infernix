@@ -1,13 +1,17 @@
 #pragma once
 
-// The startup Host RAM ledger of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md
-// §19.3.7): what the experts may take once a reserve stays free for the system and every other
-// allocation the engine will make is planned. One reserve covers every pinned allocation.
+// The startup memory plans of Qwen3.8-Flash-Next (docs/maintainer/qwen3_8-flash-next-design.md
+// §19.3.7). Host RAM: what the experts may take once a reserve stays free for the system and every
+// other allocation the engine will make is planned; one reserve covers every pinned allocation.
+// Device memory: what the expert frames may take once the fixed allocations, a reserve for
+// NInfer's own later allocations and a headroom for the display and other programs are left.
 
 #include "core/host_memory.h"
+#include "core/vram_budget.h"
 #include "ninfer/types.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace ninfer::models::qwen4_exp {
@@ -60,5 +64,60 @@ struct HostMemoryLedger {
 };
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);
+
+// ---------------------------------------------------------------- device memory
+
+inline constexpr std::uint64_t kLedgerMiB = 1ULL << 20;
+// The margin kept below the OS budget (Windows WDDM). The display headroom applies to device free
+// memory only, so a budget below free memory is not stacked on it.
+inline constexpr std::uint64_t kVramBudgetMarginBytes = 64 * kLedgerMiB;
+// Device memory one CUDA graph executable may take once instantiated (graphs are captured lazily,
+// after sizing).
+inline constexpr std::uint64_t kGraphExecutableBytes = 4 * kLedgerMiB;
+
+struct VramDemand {
+    // --vram-headroom-mib; empty selects it from the display state.
+    std::optional<std::uint64_t> headroom;
+    // The frame pool shrinks at runtime when the display or another program needs memory. Without
+    // that nothing absorbs their growth, so the automatic headroom and the graph reserve are larger.
+    bool elastic = false;
+    // CUDA graph executables the Program may instantiate after sizing, and what each may take.
+    std::uint32_t graphs      = 0;
+    std::uint64_t graph_bytes = kGraphExecutableBytes;
+    // Device allocations still to be made besides the frames (taken from free memory and budget).
+    std::uint64_t fixed = 0;
+    // One expert frame, and the most frames the residency uses.
+    std::uint64_t frame_bytes = 0;
+    std::uint32_t max_frames  = 0;
+};
+
+struct VramSizing {
+    VramSnapshot snapshot;
+    VramDemand demand;
+    std::uint64_t headroom = 0; // left free for the display and other programs
+    std::uint64_t reserve  = 0; // for NInfer's own allocations after sizing (graph executables)
+    // What the frames may take; negative when the fixed allocations alone do not fit.
+    std::int64_t frame_bytes = 0;
+    bool budget_limited      = false; // the OS budget, not free memory, bounded frame_bytes
+    std::uint32_t frames     = 0;
+
+    // One log line: the inputs and the outcome.
+    [[nodiscard]] std::string describe() const;
+};
+
+// CUDA graph executables a Program instantiates at most: one decode graph per batch size, and with
+// speculation a verification graph per batch size and width, and the MTP drafter's catch-up (per
+// batch size and width) and draft graphs (per batch size and step).
+[[nodiscard]] std::uint32_t graph_bound(std::uint32_t lanes, std::uint32_t max_width, std::uint32_t mtp_draft_tokens);
+// The headroom left for the display and other programs: the requested one, else 256 MiB without a
+// display and, with one (or when unknown), 512 MiB for an elastic pool or 1 GiB for a fixed one.
+[[nodiscard]] std::uint64_t display_headroom(DisplayState display, bool elastic, std::optional<std::uint64_t> requested);
+// The reserve for graph executables instantiated after sizing: max(256 MiB, 128 MiB + one
+// allowance per graph), the graph count capped at 32 for an elastic pool, which absorbs the rest.
+[[nodiscard]] std::uint64_t internal_reserve(std::uint32_t graphs, std::uint64_t graph_bytes, bool elastic);
+// frame_bytes = min(F - fixed - headroom, B - fixed - 64 MiB) - reserve, with F the device free
+// memory and B the OS budget less this process's usage (no budget: F's bound alone); frames =
+// clamp(frame_bytes / frame size, 0, max_frames).
+[[nodiscard]] VramSizing size_expert_frames(const VramSnapshot& snapshot, const VramDemand& demand);
 
 } // namespace ninfer::models::qwen4_exp

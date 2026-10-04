@@ -14,6 +14,15 @@ Program::Program(const execution::Parameters& parameters, DeviceContext& device,
 
 Program::~Program() noexcept = default;
 
+ProgramDevicePlan Program::plan_device(const ProgramOptions& options, const Config& config,
+                                       std::uint32_t public_tokens) {
+    return detail::ProgramImpl::plan_device(options, config, static_cast<std::int32_t>(public_tokens)).bytes;
+}
+
+const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->device_layout().bytes; }
+
+const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
+
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(prompt, options);
 }

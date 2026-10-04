@@ -76,21 +76,21 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
+// Qwen3.5's automatic KV capacity leaves this much device memory free unless
+// EngineOptions::vram_headroom_bytes says otherwise.
 inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
 
 struct KvCapacityPolicy {
-    KvCapacityMode mode                  = KvCapacityMode::Explicit;
-    std::uint32_t explicit_tokens        = 2048;
-    std::size_t automatic_headroom_bytes = 0;
+    KvCapacityMode mode           = KvCapacityMode::Explicit;
+    std::uint32_t explicit_tokens = 2048;
 
     [[nodiscard]] static constexpr KvCapacityPolicy
     explicit_capacity(std::uint32_t tokens) noexcept {
-        return KvCapacityPolicy{KvCapacityMode::Explicit, tokens, 0};
+        return KvCapacityPolicy{KvCapacityMode::Explicit, tokens};
     }
 
-    [[nodiscard]] static constexpr KvCapacityPolicy
-    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
-        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
+    [[nodiscard]] static constexpr KvCapacityPolicy automatic() noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Automatic, 0};
     }
 };
 
@@ -312,6 +312,11 @@ struct EngineOptions {
     // Extends only the allowed ceiling, never max_context itself or artifact metadata.
     float rope_yarn_factor             = 1.0F;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Device memory startup sizing leaves free; empty selects the model's automatic value.
+    // Qwen3.5: what --kv-capacity auto leaves after the KV cache (requires it; automatic 1 GiB).
+    // Qwen3.8-Flash-Next: what the expert cache leaves for the display and other programs once
+    // every fixed allocation is made (automatic: 1 GiB with a display attached, 256 MiB headless).
+    std::optional<std::size_t> vram_headroom_bytes;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -1176,7 +1181,7 @@ struct MemorySummary {
     std::size_t runtime_reservation_bytes         = 0;
     std::size_t available_after_weights_bytes     = 0;
     std::size_t available_after_startup_bytes     = 0;
-    std::size_t kv_capacity_headroom_bytes        = 0;
+    std::size_t vram_headroom_bytes               = 0;
     std::size_t planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
