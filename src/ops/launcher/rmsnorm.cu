@@ -28,9 +28,9 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     // gated epilogue loses a block per SM for them: warp 35 -> 50 and the wide row 38 -> 48, both
     // three blocks to two, while every other instantiation stays at three. So only that epilogue
     // consults the grid, and the un-prefetched instantiation is compiled only where it is reached.
-    constexpr bool kGateOnGrid = Epilogue == RmsEpilogue::Gated;
+    constexpr bool kGateOnGrid = rms_gated(Epilogue);
 
-    if constexpr (Epilogue != RmsEpilogue::Gated) {
+    if constexpr (!rms_gated(Epilogue)) {
         if (aligned2 && d == 5120) {
             // Fixed width removes the dynamic pair-count predicates. Ten pairs per thread
             // with hoisted gains wins the hidden-row sweep through prefill.
@@ -136,7 +136,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
 } // namespace
 
 void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                    const Tensor* z, Tensor& out, std::int32_t multiprocessor_count,
+                    const Tensor* z, bool sigmoid_gate, Tensor& out, std::int32_t multiprocessor_count,
                     cudaStream_t stream) {
     const std::int32_t d = x.ne[0];
     if (d <= 0) { throw std::invalid_argument("rmsnorm: ne[0] must be positive"); }
@@ -152,7 +152,10 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     const bool aligned2 =
         ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
-    if (z != nullptr) {
+    if (z != nullptr && sigmoid_gate) {
+        launch_rmsnorm<RmsEpilogue::SigmoidGated>(x, weight, z, out, d, rows, eps, aligned2,
+                                                  multiprocessor_count, stream);
+    } else if (z != nullptr) {
         launch_rmsnorm<RmsEpilogue::Gated>(x, weight, z, out, d, rows, eps, aligned2,
                                            multiprocessor_count, stream);
     } else if (unit_offset) {
