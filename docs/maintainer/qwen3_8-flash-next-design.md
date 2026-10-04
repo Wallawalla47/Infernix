@@ -2415,10 +2415,10 @@ the user asked, not part of the Qwen3.5 family.
 | M2 recipe B | Done (`qwen3_8_flash_next_nvfp4_dense8`): recipe A with the dense projection classes in `q8_g32_fp16`, passing the quality gate (ΔNLL +0.008 ± 0.010 nats) at +22 % decode (below). |
 | M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
-| M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. Not yet: CausalScoring, vision, prefix cache, MTP. |
-| M5 expert cache | Free VRAM (less 1.5 GiB and 64 staging slots) as frames (7,739 on the 5090), LFRU via `expert_cache::CacheController`, promotions on a copy stream: one per layer call per round until the frames fill, then every fourth decode round; 16 per layer call in prefill. Misses are shared between the CPU expert engine (six workers) and a PCIe stage through device slots (below). No prefetch, loans, warm list or saved profile yet. |
+| M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. MTP drafter (`--spec mtp`) since the third session. Not yet: CausalScoring, vision, prefix cache. |
+| M5 expert cache | Free VRAM (less a 384 MiB reserve and 64 staging slots) as frames (9,443 on the 5090 with recipe B), LFRU via `expert_cache::CacheController` with no slack frames, promotions on a copy stream: one per layer call per generated token until the frames fill, then one every fourth token; 16 per layer call in prefill. Misses are shared between the CPU expert engine (six workers) and a PCIe stage through device slots (below). No prefetch, loans, warm list or saved profile yet. |
 | M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
-| M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); n-gram copy proposals only. Greedy output equals plain decode. MTP not started. |
+| M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); MTP drafter (resident q4 experts, own QSA KV layer, catch-up after commit, chained draft graph, proposal head) with an acceptance-driven draft length, and n-gram copy proposals. Greedy output equals plain decode. tg512 133.5 tok/s with MTP against 88.7 plain (C = 1). |
 
 **Measured** (`ninfer_bench`, INT8 KV, C = 1, greedy, warm cache, recipe A): prefill 167-180 tok/s
 at 512 tokens; decode 42.8 tok/s for 128 tokens and 32.5 tok/s for 512 tokens. Progression of
@@ -2954,6 +2954,20 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   more, because the fork overlaps the PCIe stage with the hit compute. With 8 / 3 as the default
   (greedy ids unchanged): tg512 plain 88.70, MTP max 4 133.54. Cold CLI code plain 64.7 / MTP
   81.9, story plain 63.9 / MTP 65.4, so MTP is no longer slower on cold prose.
+- **Deferred cache update (adopted).** A round's `after_round` (routes, LFRU, promotions; ~0.5 ms
+  of host time) now runs in its commit, after the commit has enqueued its GPU work (the GDN fold,
+  tail commits, the drafter's catch-up), so the policy overlaps that work. A discarded round skips
+  it. Greedy ids are unchanged. tg512: plain 88.70 → **89.96**, MTP max 4 133.54 → **138.70**.
+  Cold CLI: code 65.5 plain / 83.7 MTP, story 64.4 / 66.5.
+
+**Long prompt.** 7,448-token prompt (past the 2,048-token QSA budget, so the drafter's indexer
+selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
+
+- **Output:** greedy ids with MTP equal plain decode.
+- **Decode:** 68.4 % draft acceptance, 2.51 tokens per round, 55.9 tok/s against 52.7 plain.
+- **Prefill:** the drafter's prompt K/V barely costs anything: 506 against 510 tok/s here, and
+  pp4096 664.7 against 665.5 tok/s.
+- **Frames:** 8,194 with the drafter against 8,912 at this context.
 
 **Two lanes (sanity check only).** `ninfer-serve --max-concurrency 2 --spec mtp --draft-tokens 3
 --lm-head-draft`, temperature 0, 200 tokens, code and story requests sent together on a cold
@@ -2970,15 +2984,20 @@ server, then each alone.
 
 **Next, in order of expected gain:**
 
-1. MTP measurements and tuning (draft length policy, §11.3).
+1. Prefix cache: agentic turns re-prefill the whole conversation today. A first increment keeps a
+   finished lane's state for the next turn that extends it.
 2. Prefill:
    - an A4 tensor-core wide route for experts with many columns (§13): `gate_up` + `down` are 45 %
      of a 4K prompt;
    - frames lent to the prefill arena, so large chunks cost no decode speed;
    - BF16 tensor-core shapes for the QSA group.
-3. Dense decode GEMV: the Q8 SIMT route reaches ~65 % of the byte floor.
-4. The QSA QKVG group split from the indexer (~0.3 GB per token).
-5. Overlap of the PCIe stage with hit compute, and fewer small kernels (~1,800 per round).
+3. The remaining host time per MTP round: ~0.58 ms of cache policy after verification and
+   ~0.56 ms of staging after drafting. Both could overlap GPU work.
+4. Concurrency with MTP: two lanes on a cold cache ran slower in aggregate than one. Also the
+   verify-width invariance of §11.3.
+5. Dense decode GEMV (the Q8 SIMT route at ~65 % of the byte floor), split-K for the HC down
+   shapes, and fewer small kernels (~1,800 per round).
+6. The QSA QKVG group split from the indexer (~1 % of decode; needs a reconversion).
 
 **For the user:** an x16 link would roughly double miss bandwidth.
 

@@ -598,7 +598,7 @@ public:
         run_decode(batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
-        residency_->after_round(device_.stream, batch, decode_budget(1));
+        deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -687,6 +687,7 @@ public:
             upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), device_.stream);
             mtp_catch_up(rows, 1, commit);
         }
+        settle_round();
         for (std::size_t row = 0; row < rows.size(); ++row) {
             if (decisions[row].cancelled) { release(ContractAccess::lane(rows[row])); }
         }
@@ -710,6 +711,7 @@ public:
         out.row_count = rows.size();
         ContractAccess::consume(pending);
         pending_transaction_ = 0;
+        deferred_.pending    = false;
         return out;
     }
 
@@ -797,6 +799,26 @@ private:
         return static_cast<std::size_t>(due) * kDecodePromotionsPerLayer;
     }
     std::uint64_t budget_tokens_ = 0;
+
+    // A decode or verification round's cache update (routes, LFRU, promotions) runs on the host
+    // after its commit has enqueued its GPU work (the GDN fold, tail commits, the drafter's
+    // catch-up), so the policy overlaps that work instead of idling the GPU after the round.
+    struct DeferredRound {
+        std::int32_t columns  = 0;
+        std::uint32_t tokens  = 0;
+        bool live             = false; // only the verification's accepted columns count
+        bool pending          = false;
+    };
+    DeferredRound deferred_;
+
+    void settle_round() {
+        if (!deferred_.pending) { return; }
+        deferred_.pending = false;
+        residency_->after_round(device_.stream, deferred_.columns, decode_budget(deferred_.tokens),
+                                deferred_.live ? std::span<const std::uint8_t>(live_.data(),
+                                                                               static_cast<std::size_t>(deferred_.columns))
+                                               : std::span<const std::uint8_t>{});
+    }
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
 
     // Reports the expert cache over the finished request (and since start) as an Engine diagnostic,
@@ -1195,8 +1217,7 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             advanced = std::max<std::uint32_t>(advanced, static_cast<std::uint32_t>(pending_counts_[b]));
         }
-        residency_->after_round(s, batch * W, decode_budget(advanced),
-                                std::span<const std::uint8_t>(live_.data(), static_cast<std::size_t>(batch * W)));
+        deferred_ = {.columns = batch * W, .tokens = advanced, .live = true, .pending = true};
         round_width_ = W;
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -1266,6 +1287,7 @@ private:
         ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
                              slots, s);
         if (mtp_) { mtp_catch_up(rows, W, commit); }
+        settle_round();
         for (std::int32_t row = 0; row < batch; ++row) {
             if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
         }
