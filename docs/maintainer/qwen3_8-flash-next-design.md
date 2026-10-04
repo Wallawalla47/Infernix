@@ -2431,8 +2431,16 @@ LFRU promotes heavily, so misses and promotions together move 0.2-0.4 GB per tok
   churn: N = 2 and 3 gave the same 17,397 promotions per 512-token request and 32.2-32.3 tok/s as
   N = 1, N = 5 cut promotions by 3 % with no speed change, and budget 2 with N = 3 was slower
   (30.9). Use counts grow too fast for a count threshold; the churn comes from LFRU's
-  recency-dominated score (f / (age + 1) with 48 ticks per token). A frequency-margin rule against
-  the victim, as Strata's `adapt()` uses, is the next candidate.
+  recency-dominated score (f / (age + 1) with 48 ticks per token).
+- **Strata-style adaptive policy (rejected).** Decayed use counts (×0.915 per round), free frames
+  filled at once, and every 4 rounds up to 96 swaps of the hottest misses for the coldest residents
+  when the candidate leads by 1.5. Same bench, same build, LFRU vs adaptive: on 512-token
+  generations LFRU won, 32.05 vs 29.57 tok/s (83.4 % vs 77.9 % hits, 17.3 K vs 8.0 K promotions per
+  request). On the 128-token test the adaptive policy won, 59.99 vs 47.07 tok/s, but that test
+  replays the identical greedy sequence every repetition. The adaptive policy then settles at
+  97.1 % hits with no promotions, against LFRU's 93.3 % with 2.6 K promotions. That is
+  memorization of one sequence, not tracking a drifting working set, so LFRU stays. The tg128
+  numbers above come from that replay effect, so only the 512-token figure is a fair decode number.
 - **Sampling logits.** Generation samples BF16-rounded logits through the existing sampler, whose
   top-k path keys on BF16; FP32 and BF16 logits measured equal in perplexity (§16.5). An FP32 sampler
   is a backlog item for exact greedy ties.
