@@ -247,6 +247,10 @@ struct ProgramOptions {
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
     std::filesystem::path ngram_volume;
+    // Device memory left free after the expert frames take the rest (0 disables the cache).
+    std::size_t expert_cache_reserve_bytes = std::size_t{1536} << 20;
+    bool expert_cache                      = true;
+    DiagnosticObserver diagnostics;
 };
 
 class Program {
