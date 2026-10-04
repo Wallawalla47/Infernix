@@ -17,6 +17,22 @@ void launch_q8_a16_simt_r8_t8(const Tensor& x, const Weight& w, Tensor& out, cud
         LinearIdentityEpilogue{}, stream);
 }
 
+void launch_q8_a16_simt_r1_t4_w8(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR1T4W8>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
+void launch_q8_a16_simt_r1_t8_w8(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    launch_q8_a16_simt<q8_instances::SimtR1T8W8>(
+        q8_linear_operands(x, w),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+}
+
 void launch_q8_a16_simt_r4_t4_w2_g16_s2(const Tensor& x, const Weight& w, Tensor& out,
                                         cudaStream_t stream) {
     launch_q8_a16_simt<q8_instances::SimtR4T4W2G16S2>(

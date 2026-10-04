@@ -78,12 +78,17 @@ warms up over the first few hundred tokens of a session.
 
 | Workload | tok/s |
 |---|---:|
-| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~139 |
-| `ninfer_bench` tg512, plain decode (warm cache) | ~90 |
-| Single CLI request, cold cache, plain | ~65 |
-| Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~66 |
+| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~134 |
+| `ninfer_bench` tg512, plain decode (warm cache) | ~87 |
+| Single CLI request, cold cache, plain: code rewrite / prose story | ~66 / ~65 |
+| Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~67 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |
 | Prompt, 4,096 tokens, default chunk 1024 | ~410 |
+
+tg512 generates its own greedy text, so it moves with any change in rounding. Its current text
+has a lower expert hit rate (88 % against 93 %) than before the last kernel change, which is
+why it reads ~139 / ~90 in earlier notes. On a prompt whose text stayed identical, that change
+was faster (design §19.2).
 
 MTP accepts most drafts on code and other predictable text, and fewer on free prose. The draft
 length follows the measured acceptance, so prose mostly drafts one token and stays at least as

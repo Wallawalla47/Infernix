@@ -28,6 +28,8 @@ using MmaR64x32T64K128A1 = Q8A16MmaSchedule<64, 64, 128, 32, 16, 1, 2>;
 
 using SimtR8T4         = Q8A16SimtSchedule<8, 4, 1, 32, 2, Cache::cg, 1>;
 using SimtR8T8         = Q8A16SimtSchedule<8, 8, 1, 32, 2, Cache::cg, 1>;
+using SimtR1T4W8       = Q8A16SimtSchedule<1, 4, 8, 32, 2, Cache::cg, 1>;
+using SimtR1T8W8       = Q8A16SimtSchedule<1, 8, 8, 32, 2, Cache::cg, 1>;
 using GemvR4W1K16384   = Q8A16GemvSchedule<4, 1, 2, 16384>;
 using SimtR4T4W2G16S2  = Q8A16SimtSchedule<4, 4, 2, 16, 2, Cache::cg, 1>;
 using SlicedR16T16W8S2 = Q8A16SlicedKMmaSchedule<16, 8, 2, 1, Q8ScaleAccess::Shared>;

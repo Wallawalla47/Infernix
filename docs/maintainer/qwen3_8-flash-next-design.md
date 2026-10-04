@@ -2978,6 +2978,36 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
   tail commits, the drafter's catch-up), so the policy overlaps that work. A discarded round skips
   it. Greedy ids are unchanged. tg512: plain 88.70 → **89.96**, MTP max 4 133.54 → **138.70**.
   Cold CLI: code 65.5 plain / 83.7 MTP, story 64.4 / 66.5.
+- **Few-row Q8 route for the hyper-connection down projections (adopted).**
+  - **Problem.** The MTP-round profile showed the [324, 10240] and [320, 10240] projections
+    (96 calls per token) on 41 eight-row CTAs at ~0.4 TB/s: 9.5 µs per call, ~0.9 ms per round,
+    a fifth of all Q8 time.
+  - **Change.** The generic route now gives shapes with fewer than 64 eight-row blocks and K ≥ 4096
+    one CTA per row, whose eight warps split K. This is the existing SIMT kernel with its
+    in-CTA reduction (`SimtR1T4W8` / `SimtR1T8W8`).
+  - **Microbenchmark.** CUDA graph of 200 calls, weights cycled through 256 MB so they come
+    from DRAM: T = 1 7.5 → 4.7 µs, T = 4 9.8 → 7.0, T = 5 12.1 → 8.5, T = 8 12.9 → 10.9.
+    The route is slower on [1024, 4096] and [1280, 2560], hence the threshold. Deeper pipelines
+    (20 groups × 3 stages, or 2 rows × 4 warps) were no faster.
+  - **Tests.** The FP64-oracle conformance passes. A new test pins column invariance for 1-8
+    columns on both routes, which the one-row speculation equality relies on (§11.3).
+  - **End to end.** The projection now rounds differently, so tg512 (empty prompt) generates a
+    different text with a lower expert hit rate: 88.4 % against 93.0 %, and 24.6 K against
+    15.6 K CPU-served misses per 512 tokens. Same binary, routes toggled, in ABBA order:
+
+    | Workload | Previous route | New route |
+    |---|---:|---:|
+    | tg512 plain | 89.89 / 89.70 | 86.96 / 86.77 |
+    | tg512 MTP max 4 | 138.62 / 138.69 | 134.00 / 133.90 |
+    | Code prompt, cold CLI, plain | 65.5 / 65.6 | **66.3 / 66.5** |
+    | Code prompt, cold CLI, MTP | 83.6 / 84.0 | 84.1 / 84.0 |
+
+    The code prompt's greedy ids are identical on both routes, and in plain and MTP runs, with
+    equal hit rates (69.2-69.3 %). On it, the new route is 1.3 % faster plain; MTP is within noise.
+    The kernel saving predicts ~0.27 ms per plain token (~2.4 % on a warm cache). The tg512 drop
+    is the new text's hit rate, not engine speed.
+  - **Measurement rule.** tg512's text depends on every rounding. A change that alters rounding is
+    judged on a workload whose greedy ids stay identical, with tg512 reported beside it.
 
 **Long prompt.** 7,448-token prompt (past the 2,048-token QSA budget, so the drafter's indexer
 selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
@@ -3031,8 +3061,9 @@ server, then each alone.
    draft column's rows as soon as its step publishes the token to mapped memory; only the last
    column would stay exposed. The cache-policy gap already overlaps (deferred `after_round`).
 4. Concurrency with MTP: two lanes on a cold cache ran slower in aggregate than one.
-5. Dense decode GEMV (the Q8 SIMT route at ~65 % of the byte floor), split-K for the HC down
-   shapes, and fewer small kernels (~1,800 per round).
+5. Dense decode GEMV: the HC up [10240, 320] (~0.6 TB/s) and shared expert gate/up [1280, 2560]
+   (~0.5 TB/s) shapes stay well below bandwidth (the HC down shapes have the few-row route).
+   Also fewer small kernels (~1,800 per round).
 6. The QSA QKVG group split from the indexer (~1 % of decode; needs a reconversion).
 
 **For the user:** an x16 link would roughly double miss bandwidth.

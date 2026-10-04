@@ -34,10 +34,16 @@ constexpr std::array kShapes{
 
 // Shapes without a tuned entry (Qwen3.8-Flash-Next's dense classes) use the runtime-shape
 // templates: predicated SIMT for decode and verification widths, MMA tiles beyond, each covering
-// any row count and any K padded to 128.
-Q8Launch select_q8_generic(std::int32_t t) {
-    if (t <= 4) return launch_q8_a16_simt_r8_t4;
-    if (t <= 8) return launch_q8_a16_simt_r8_t8;
+// any row count and any K padded to 128. A long, few-row shape (the hyper-connection down
+// projections, N 320-324 and K 10240: 41 eight-row blocks for 170 SMs) gives each row a CTA whose
+// eight warps split K: 7.5 -> 4.7 us at T = 1 and 12.1 -> 8.5 us at T = 5. With 128 blocks
+// ([1024, 4096]) or K 2560 it is slower than eight rows per CTA. Both SIMT widths of a schedule
+// pair reduce a column identically, so a column's output does not depend on how many columns
+// (up to 8) share the call.
+Q8Launch select_q8_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool few_rows = (n + 7) / 8 < 64 && k >= 4096;
+    if (t <= 4) return few_rows ? launch_q8_a16_simt_r1_t4_w8 : launch_q8_a16_simt_r8_t4;
+    if (t <= 8) return few_rows ? launch_q8_a16_simt_r1_t8_w8 : launch_q8_a16_simt_r8_t8;
     if (t <= 64) return launch_q8_a16_mma_r32_t64;
     if (t <= 96) return launch_q8_a16_mma_r32_t96;
     return launch_q8_a16_mma_r32_t128;
@@ -50,7 +56,7 @@ Q8Launch select_q8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
-    return select_q8_generic(t);
+    return select_q8_generic(n, k, t);
 }
 
 Q8Launch select_q8_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
