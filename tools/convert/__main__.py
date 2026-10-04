@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import importlib.util
+import os
 from pathlib import Path
 import sys
 from collections.abc import Mapping
@@ -12,6 +13,7 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
+from . import qwen4_exp
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -147,6 +149,11 @@ def main(argv=None):
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
+    parser.add_argument(
+        "--ngram-out",
+        type=Path,
+        help="Qwen4Exp n-gram volume (default: OUT + '.ngram'); it may live on another drive",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):
@@ -158,15 +165,28 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
-        companions = {
-            key: sources[key] for key in ("dflash", "dflash2") if key in components
-        }
-        model = build_model(
-            base,
-            components=components,
-            companions=companions,
-            resource_overrides=overrides,
-        )
+        qwen4 = qwen4_exp.is_qwen4_exp(base.config)
+        if qwen4:
+            model = qwen4_exp.build_model(
+                base, components=components, resource_overrides=overrides
+            )
+            # The volume id ties the separately placed n-gram volume to this artifact.
+            ngram_out = args.ngram_out or Path(str(args.out) + ".ngram")
+            if ngram_out.exists():
+                raise FileExistsError(f"n-gram volume already exists: {ngram_out}")
+            model.config["ngram_table"]["volume_id"] = os.urandom(16).hex()
+        else:
+            if args.ngram_out is not None:
+                raise ValueError("--ngram-out applies only to Qwen4Exp sources")
+            companions = {
+                key: sources[key] for key in ("dflash", "dflash2") if key in components
+            }
+            model = build_model(
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
+            )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:
@@ -207,6 +227,20 @@ def main(argv=None):
             f"wrote {args.out}: {report['objects']} objects, {len(report['files'])} files, {report['seconds']:.1f}s",
             flush=True,
         )
+        if qwen4:
+            table = model.config["ngram_table"]
+
+            def ngram_progress(index, total):
+                print(f"[ngram {index+1}/{total}]", flush=True)
+
+            qwen4_exp.write_ngram_volume(
+                base,
+                qwen4_exp.ngram_volume_shards(base, model.config),
+                ngram_out,
+                bytes.fromhex(table["volume_id"]),
+                progress=ngram_progress,
+            )
+            print(f"wrote {ngram_out}: {table['blocks']} blocks", flush=True)
 
 
 if __name__ == "__main__":
