@@ -2653,8 +2653,35 @@ python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4> --recipe qwen3_8_flas
   --ngram-reuse <recipe A volume>.ngram
 ```
 
-**Prefill** is still slow: 4K tokens take ~7 s. Chunk 4096 beats 1024 by 1.8× on recipe A
-(pp4096 427.5 vs 240.8 tok/s), because each chunk moves every non-resident expert once.
+**Prefill.** Chunk 4096 beats 1024 by 1.8× on recipe A (pp4096 427.5 vs 240.8 tok/s), because
+each chunk moves every non-resident expert once.
+
+An nsys profile of one 4,096-token prompt on recipe B (chunk 4096, 7.4 s of kernels) put 81 % in
+the experts:
+
+| Kernel | s |
+|---|---:|
+| `stage_kernel` | 2.67 |
+| `gate_up_kernel` | 2.49 |
+| `down_kernel` | 0.81 |
+| QSA attention | 0.69 |
+| BF16 SIMT GEMM (the QSA QKVG group) | 0.28 |
+| Q8 tensor-core GEMMs (every other dense class) | 0.17 |
+
+**Staging overlap (adopted).** Prefill chunks now split the 64 staging slots into two halves and
+stage pass p+1 on a side stream while pass p computes, ordered by events. The stream and events
+are Program-owned, and decode and verify graphs never use the path. Greedy ids are unchanged.
+Recipe B:
+
+| Prompt | Before | After |
+|---|---:|---:|
+| pp512, chunk 4096 | 219 tok/s | 265 (+21 %) |
+| pp4096, chunk 4096 | 566-573 | 673 (+18 %) |
+| pp4096, chunk 1024 | 325 | 413 (+27 %) |
+
+Each gate/up CTA quantizes its expert's activation columns to A4 itself. Hoisting that out would
+save ~20 % of `gate_up` by instruction count; the int64 per-column accumulation dominates. The
+real lever is the A4 tensor-core wide route of §13 for experts with more than 8 columns.
 
 **Next, in order of expected gain:**
 

@@ -9,6 +9,8 @@
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
+#include "core/device.h"
+
 #include "ops/common/canonical_math.h"
 
 #include <cuda_bf16.h>
@@ -687,6 +689,38 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const std::int32_t* flags = cpu ? cpu_flags : nullptr;
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
+    const int half      = source.staging_slots / 2;
+    if (source.overlap_stream != nullptr && half > 0 && max_jobs > half) {
+        // Double-buffered passes: stage pass p+1 on the side stream while pass p computes.
+        const auto* events = source.overlap_events;
+        CUDA_CHECK(cudaEventRecord(events[0], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[0], 0));
+        int pass = 0;
+        for (int base = 0; base < max_jobs; base += half, ++pass) {
+            const int jobs = std::min(half, max_jobs - base);
+            const int b    = pass % 2;
+            MoeExpertSource buffer = source;
+            buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * source.record_stride;
+            buffer.staging_slots   = half;
+            if (pass >= 2) { CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[3 + b], 0)); }
+            stage_kernel<<<kStageCtas, kThreads, 0, source.overlap_stream>>>(dispatch, buffer, base, jobs, flags,
+                                                                            job_records);
+            check_launch("stage");
+            CUDA_CHECK(cudaEventRecord(events[1 + b], source.overlap_stream));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, events[1 + b], 0));
+            gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
+                static_cast<const bf16*>(x.data), moe::kHidden, dispatch, buffer, top_k, job_records, flags, base,
+                h_blocks);
+            check_launch("gate/up");
+            down_kernel<<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared), stream>>>(
+                dispatch, buffer, moe::kHidden, job_records, flags, base, h_blocks, outputs.ne[1],
+                static_cast<bf16*>(outputs.data));
+            check_launch("down");
+            CUDA_CHECK(cudaEventRecord(events[3 + b], stream));
+        }
+        if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
+        return;
+    }
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,

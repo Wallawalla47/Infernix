@@ -98,6 +98,12 @@ struct MoeExpertSource {
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
+    // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
+    // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
+    // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;
+    // the stream is otherwise idle. Not for calls captured into a CUDA graph.
+    cudaStream_t overlap_stream = nullptr;
+    cudaEvent_t overlap_events[5] = {};
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

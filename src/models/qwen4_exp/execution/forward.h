@@ -14,6 +14,7 @@
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -49,6 +50,9 @@ struct ForwardExperts {
     std::int32_t staging_slots  = 0;
     // Per layer: the channel to the host expert engine for CPU-served misses (empty disables).
     std::vector<ops::MoeCpuChannel> cpu;
+    // Prefill chunks stage their next pass of misses on this stream while one pass computes.
+    cudaStream_t overlap_stream = nullptr;
+    std::array<cudaEvent_t, 5> overlap_events{};
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -118,6 +122,7 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::int32_t max_context_;
+    bool eager_chunk_ = false;
 };
 
 } // namespace ninfer::models::qwen4_exp::execution
