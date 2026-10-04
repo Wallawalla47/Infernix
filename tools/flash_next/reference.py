@@ -297,9 +297,14 @@ class Reference:
     def moe(self, layer: int, x: torch.Tensor) -> torch.Tensor:
         c, w = self.c, self.w
         p = f"layers.{layer}.mlp."
+        # Router logits are not rounded: NInfer keeps them FP32 (as its Qwen3.5 sparse MoE and
+        # llama.cpp-derived engines do), so near-boundary experts do not collapse into BF16 ties.
+        # Exact ties go to the lower expert id.
         logits = x @ w.text(p + "gate.weight").T
         probs = torch.softmax(logits, dim=-1)
-        top, idx = torch.topk(probs, c["num_experts_per_tok"], dim=-1)
+        order = torch.sort(probs, dim=-1, descending=True, stable=True).indices
+        idx = order[:, : c["num_experts_per_tok"]]
+        top = torch.gather(probs, -1, idx)
         top = top / top.sum(-1, keepdim=True)
         T = x.shape[0]
         routed = torch.zeros(T, self.H, dtype=F64)
@@ -363,7 +368,7 @@ class Reference:
         x = torch.stack([w.store.read_flat(name, i * self.H, (i + 1) * self.H) for i in ids]).to(F64)
         R = x.repeat(1, self.hc)
         count = c["num_hidden_layers"] if layers is None else layers
-        record = {"layer_residual_rms": [], "routed": [], "ngram_rows": None}
+        record = {"layer_residual_rms": [], "layer_residuals": [], "routed": [], "ngram_rows": None}
         start = time.time()
         for layer in range(count):
             if layer + 1 in self.ple_layers:
@@ -381,13 +386,20 @@ class Reference:
             R = self.inject(R, y, inj)
             record["layer_residual_rms"].append(float(R.pow(2).mean().sqrt()))
             record["routed"].append(idx.numpy())
+            record["layer_residuals"].append(R.to(torch.float32).numpy())
             log(f"layer {layer:2d} {self.layer_types[layer]:6s} rms {record['layer_residual_rms'][-1]:.5f} "
                 f"({time.time() - start:.0f}s)")
         record["final_residual"] = R.to(torch.float32).numpy()
         if layers is None or layers == c["num_hidden_layers"]:
             xf = self.hc_mix("hyper_connection_mixer.", R, combine=False)
-            logits = xf @ w.get("lm_head.weight").T
-            record["logits"] = logits.to(torch.float32).numpy()
+            # Row chunks keep the binary64 widening of the [V, H] head to ~0.3 GB at a time.
+            name, rows = "lm_head.weight", w.store.describe("lm_head.weight").shape[0]
+            chunks = []
+            for begin in range(0, rows, 16384):
+                end = min(rows, begin + 16384)
+                head = w.store.read_flat(name, begin * self.H, end * self.H).reshape(end - begin, self.H)
+                chunks.append(xf @ head.to(F64).T)
+            record["logits"] = torch.cat(chunks, dim=-1).to(torch.float32).numpy()
         return record
 
 
@@ -413,6 +425,7 @@ def main() -> int:
     if record["ngram_rows"] is not None:
         arrays["ngram_rows"] = record["ngram_rows"]
     arrays["routed"] = np.stack(record["routed"])
+    arrays["layer_residuals"] = np.stack(record["layer_residuals"])
     np.savez(args.out, **arrays)
     Path(str(args.out) + ".json").write_text(json.dumps({"layer_residual_rms": record["layer_residual_rms"]}))
     return 0
