@@ -143,10 +143,12 @@ public:
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
-        // MTP drafter: the residual of the last processed position (its pending cell) is in the
-        // lane's saved column; mtp_written says whether that cell's K/V is already written.
-        bool mtp_written = false;
-        bool mtp_live    = false;
+        // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
+        // every settled point the lane's saved column holds the residual of position
+        // state_tokens - 1, whose cell is written (mtp_cells == state_tokens) or pending
+        // (state_tokens - 1: the next call or round writes it).
+        std::uint32_t mtp_cells = 0;
+        bool mtp_live           = false;
         // Draft-length policy (design 11.3): conditional acceptance of each draft position.
         std::array<double, 8> mtp_accept{};
         std::uint64_t mtp_policy_rounds = 0;
@@ -317,7 +319,10 @@ public:
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
-        // CPU-served misses for decode and verify calls (prefill chunks stay on the GPU).
+        // CPU-served misses for decode and verify calls, and for every call of at most
+        // kMaxCpuColumns columns (short prompts, chunk remainders, forced tokens), whose experts are
+        // all thin and so give the same bits on either device (design 16.2); wider prefill chunks
+        // stay on the GPU.
         const std::uint32_t cpu_workers = options_.cpu_expert_workers;
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
@@ -332,7 +337,7 @@ public:
                 ops::offloaded_moe::CpuMissService::Options{
                     .workers     = static_cast<int>(cpu_workers),
                     .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
-                    .max_columns = lanes * max_width_,
+                    .max_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_),
                     .pcie_divisor = options_.cpu_pcie_divisor,
                     .cpus        = {}});
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
@@ -433,7 +438,7 @@ public:
         lane.prompt_tokens  = static_cast<std::uint32_t>(lane.history.size());
         lane.state_tokens   = 0;
         lane.speculative    = {};
-        lane.mtp_written = false;
+        lane.mtp_cells   = 0;
         lane.mtp_live    = mtp_;
         lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
@@ -658,6 +663,15 @@ public:
             const auto& d    = decisions[row];
             if (commit != nullptr) { commit[row] = 0; }
             if (d.cancelled) {
+                if (catch_up && lane.mtp_live) {
+                    // MR2: decode() advanced the state past the round's position at submission and
+                    // a cancelled row skips the catch-up, so that position's cell becomes the
+                    // pending one: its residual, which the round exported, becomes the saved one.
+                    CUDA_CHECK(cudaMemcpyAsync(saved_column(index).data,
+                                               static_cast<const std::byte*>(mtp_residuals_.p) + 2ULL * width_ * row,
+                                               2ULL * width_, cudaMemcpyDeviceToDevice, device_.stream));
+                    lane.mtp_cells = lane.state_tokens - 1;
+                }
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
@@ -682,6 +696,7 @@ public:
             upload_pinned(spec_device(spec_layout_.commit), commit, 4ULL * rows.size(), device_.stream);
             mtp_catch_up(rows, 1, commit);
         }
+        for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         settle_round();
         for (std::size_t row = 0; row < rows.size(); ++row) {
             if (decisions[row].cancelled) { release(ContractAccess::lane(rows[row])); }
@@ -715,6 +730,9 @@ public:
         try {
             const auto index = lane_of(sequence);
             if (lanes_[index].phase != Phase::Finishable) { return out; }
+            if (!mtp_settled(lanes_[index])) {
+                diagnostic("Qwen4Exp: a finished request's MTP cells are out of step with its state", DiagnosticLevel::Warning);
+            }
             out.timings     = timings(lanes_[index]);
             out.speculative = lanes_[index].speculative;
             report_cache(lanes_[index]);
@@ -914,13 +932,15 @@ private:
         } catch (...) {}
     }
 
-    // An Info diagnostic for the Engine's observer, or stderr without one.
-    void diagnostic(const char* text) const {
-        if (options_.diagnostics.callback) {
-            options_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Info, .message = text});
-        } else {
-            std::fprintf(stderr, "[engine] %s\n", text);
-        }
+    // A diagnostic (Info unless stated) for the Engine's observer, or stderr without one.
+    void diagnostic(const char* text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
+        try {
+            if (options_.diagnostics.callback) {
+                options_.diagnostics.callback(Diagnostic{.level = level, .message = text});
+            } else {
+                std::fprintf(stderr, "[engine] %s\n", text);
+            }
+        } catch (...) {}
     }
 
     struct IoLayout {
@@ -1367,6 +1387,7 @@ private:
         ops::ple_conv_commit(Tensor(ple_records_.p, DType::BF16, {width_, W, batch}), commit_columns, ple_states,
                              slots, s);
         if (mtp_) { mtp_catch_up(rows, W, commit); }
+        for (const auto& row : rows) { require_mtp_settled(lanes_[ContractAccess::lane(row)]); }
         settle_round();
         for (std::int32_t row = 0; row < batch; ++row) {
             if (decisions[static_cast<std::size_t>(row)].cancelled) { release(ContractAccess::lane(rows[row])); }
@@ -1411,13 +1432,24 @@ private:
         return Tensor(static_cast<std::byte*>(mtp_saved_.p) + 2ULL * width_ * lane, DType::BF16, {width_});
     }
 
+    // MR1's settled invariant (see Lane): the pending cell is the last processed position's.
+    bool mtp_settled(const Lane& lane) const noexcept {
+        return !mtp_ || !lane.mtp_live || lane.mtp_cells == lane.state_tokens ||
+               lane.mtp_cells + 1U == lane.state_tokens;
+    }
+    void require_mtp_settled(const Lane& lane) const {
+        if (!mtp_settled(lane)) {
+            throw std::logic_error("Qwen4Exp: the MTP drafter's cells are out of step with the model state");
+        }
+    }
+
     // The MTP cells of a chunk (prefill or forced tokens) of one lane. The pending cell (the
     // position before the chunk) is prepended unless written; the chunk's last cell is included
     // only when the token after it is known (forced tokens). Stages ids and cells into the io.
     std::optional<execution::MtpChunk> stage_mtp_chunk(Lane& lane, std::uint32_t index, std::int32_t begin,
                                                        std::int32_t width) {
         if (!mtp_) { return std::nullopt; }
-        const bool prepend = begin > 0 && !lane.mtp_written;
+        const bool prepend = begin > 0 && lane.mtp_cells < static_cast<std::uint32_t>(begin);
         const bool known   = static_cast<std::int32_t>(lane.history.size()) > begin + width;
         const std::int32_t columns = known ? width : width - 1;
         const std::int32_t first   = prepend ? begin - 1 : begin;
@@ -1428,8 +1460,8 @@ private:
             cells_host[i] = first + i;
             ids[i]        = lane.history[static_cast<std::size_t>(first + i + 1)];
         }
-        lane.mtp_written = known;
-        lane.mtp_live    = true;
+        lane.mtp_cells = static_cast<std::uint32_t>(begin + columns);
+        lane.mtp_live  = true;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::MtpChunk chunk;
         chunk.saved     = saved_column(index);
@@ -1475,7 +1507,7 @@ private:
         bool any = false, unwritten = false;
         for (std::int32_t b = 0; b < batch; ++b) {
             any |= lanes_[lanes[b]].mtp_live;
-            unwritten |= lanes_[lanes[b]].mtp_live && !lanes_[lanes[b]].mtp_written;
+            unwritten |= lanes_[lanes[b]].mtp_live && lanes_[lanes[b]].mtp_cells < lanes_[lanes[b]].state_tokens;
         }
         // Without drafts (a gated or zero-length round) only unwritten pending cells need the drafter.
         if (!any || (steps == 0 && !unwritten)) { return; }
@@ -1515,7 +1547,8 @@ private:
         }
         if (steps == 0) {
             for (std::int32_t b = 0; b < batch; ++b) {
-                if (lanes_[lanes[b]].mtp_live) { lanes_[lanes[b]].mtp_written = true; }
+                Lane& lane = lanes_[lanes[b]];
+                if (lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             }
             return;
         }
@@ -1542,7 +1575,7 @@ private:
         device_.synchronize();
         for (std::int32_t b = 0; b < batch; ++b) {
             Lane& lane = lanes_[lanes[b]];
-            if (unwritten && lane.mtp_live) { lane.mtp_written = true; }
+            if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
             }
@@ -1591,7 +1624,7 @@ private:
             CUDA_CHECK(cudaMemcpyAsync(saved_column(lane).data,
                                        static_cast<const std::byte*>(mtp_residuals_.p) + column * (b * W + k - 1),
                                        column, cudaMemcpyDeviceToDevice, s));
-            lanes_[lane].mtp_written = true;
+            lanes_[lane].mtp_cells = lanes_[lane].state_tokens;
         }
     }
 

@@ -138,16 +138,18 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
     pooled[pooled_offset(table, token, slot_width, d % slot_width)] = __float2bfloat16_rn(out);
 }
 
-// One CTA per sequence: the raw keys of the incomplete block after the call.
+// One CTA per sequence: the raw keys of the latest block's positions q % R < R - 1, up to the
+// call's last position. A block the call completes keeps them too: a later call that rewrites its
+// last position alone (the MTP drafter's prepend and draft step 0) re-pools it from the tails.
 __global__ void tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
                             const std::int32_t* __restrict__ tail_slots, int width, int ratio,
                             bf16* __restrict__ tails) {
     const int sequence = blockIdx.x, d = threadIdx.x;
     const int start    = positions[sequence * width];
     const int last     = positions[sequence * width + width - 1];
-    const int base     = (last + 1) - (last + 1) % ratio;
-    for (int q = base; q <= last; ++q) {
-        if (q < start) { continue; } // still in the tail from an earlier call
+    const int base     = last - last % ratio;
+    const int end      = min(last, base + ratio - 2);
+    for (int q = max(base, start); q <= end; ++q) { // positions before the call are in the tail already
         const int column = sequence * width + (q - start);
         tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) * kIndexDim + d] =
             raw[static_cast<std::size_t>(column) * kIndexDim + d];
@@ -164,10 +166,11 @@ __global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int3
     if (n <= 0) { return; }
     const int start = positions[sequence * width];
     const int last  = start + n - 1;
-    const int base  = (last + 1) - (last + 1) % ratio;
+    const int base  = last - last % ratio;
+    const int end   = min(last, base + ratio - 2);
     const bf16* layer_raw = raw + static_cast<std::size_t>(layer) * batch * width * kIndexDim;
     bf16* layer_tails     = tails + static_cast<std::size_t>(layer) * slots * (ratio - 1) * kIndexDim;
-    for (int q = base > start ? base : start; q <= last; ++q) {
+    for (int q = max(base, start); q <= end; ++q) {
         const int column = sequence * width + (q - start);
         layer_tails[(static_cast<std::size_t>(tail_slots[sequence]) * (ratio - 1) + (q % ratio)) * kIndexDim + d] =
             layer_raw[static_cast<std::size_t>(column) * kIndexDim + d];
