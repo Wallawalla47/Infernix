@@ -258,39 +258,86 @@ __launch_bounds__(512) __global__
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
 }
 
-// Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
-// implementation over another family of shape-specific paths.
-template <RmsEpilogue Epilogue>
-__launch_bounds__(256) __global__
-    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
-                                std::int64_t rows, float eps) {
-    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
-    if (row >= rows) { return; }
+// Rows the preloading instance of the generic kernel serves: wider than every fast route, at most
+// kRmsPreloadMaxD (the Qwen4Exp MTP hidden_norm, d = 10240).
+inline constexpr std::int32_t kRmsPreloadMinD = 8192;
+inline constexpr std::int32_t kRmsPreloadMaxD = 16384;
 
-    const std::int64_t base = row * static_cast<std::int64_t>(d);
-    float sum               = 0.0f;
-    for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
-        const float xv = __bfloat162float(x[base + i]);
-        sum += xv * xv;
-    }
-
-    __shared__ float scratch[256];
+// The generic kernel's reduction: the 256 per-thread sums by a fixed shared tree, then the inverse
+// RMS. Every thread of the CTA calls it with the kernel's 256-float scratch.
+__device__ __forceinline__ float rmsnorm_generic_inv(float sum, float* scratch, std::int32_t d, float eps) {
     scratch[threadIdx.x] = sum;
     __syncthreads();
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (threadIdx.x < stride) { scratch[threadIdx.x] += scratch[threadIdx.x + stride]; }
         __syncthreads();
     }
+    return rsqrtf(scratch[0] / static_cast<float>(d) + eps);
+}
 
-    const float inv = rsqrtf(scratch[0] / static_cast<float>(d) + eps);
-    for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
-        const std::int64_t index = base + i;
-        const float xv           = __bfloat162float(x[index]);
-        const float wv           = __bfloat162float(weight[i]);
-        float zv                 = 0.0f;
-        if constexpr (rms_gated(Epilogue)) { zv = __bfloat162float(z[index]); }
-        out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+// Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
+// implementation over another family of shape-specific paths. Thread i owns elements i, i + 256,
+// ... and sums their squares in that order; the shared tree is fixed.
+//
+// Preload > 0 is the instance for kRmsPreloadMinD < d <= Preload * 256 (ungated epilogues only):
+// a thread issues every load of its at most Preload elements of x and of the weight before its
+// first sum, so a row costs one memory round trip instead of a chain of dependent ones. The
+// arithmetic and its order are the same, so both instances return the same bits.
+template <RmsEpilogue Epilogue, int Preload = 0>
+__launch_bounds__(256) __global__
+    void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
+                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
+                                std::int64_t rows, float eps) {
+    static_assert(Preload >= 0 && (Preload == 0 || !rms_gated(Epilogue)),
+                  "the preloading instance serves the ungated epilogues");
+    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
+    if (row >= rows) { return; }
+
+    const std::int64_t base = row * static_cast<std::int64_t>(d);
+    __shared__ float scratch[256];
+    if constexpr (Preload > 0) {
+        __nv_bfloat16 xs[Preload];
+        __nv_bfloat16 ws[Preload];
+#pragma unroll
+        for (int j = 0; j < Preload; ++j) {
+            const std::int64_t i = threadIdx.x + static_cast<std::int64_t>(j) * blockDim.x;
+            if (i < static_cast<std::int64_t>(d)) {
+                xs[j] = x[base + i];
+                ws[j] = weight[i];
+            }
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < Preload; ++j) {
+            if (threadIdx.x + static_cast<std::int64_t>(j) * blockDim.x < static_cast<std::int64_t>(d)) {
+                const float xv = __bfloat162float(xs[j]);
+                sum += xv * xv;
+            }
+        }
+        const float inv = rmsnorm_generic_inv(sum, scratch, d, eps);
+#pragma unroll
+        for (int j = 0; j < Preload; ++j) {
+            const std::int64_t i = threadIdx.x + static_cast<std::int64_t>(j) * blockDim.x;
+            if (i < static_cast<std::int64_t>(d)) {
+                out[base + i] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(
+                    __bfloat162float(xs[j]), inv, __bfloat162float(ws[j]), 0.0f));
+            }
+        }
+    } else {
+        float sum = 0.0f;
+        for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
+            const float xv = __bfloat162float(x[base + i]);
+            sum += xv * xv;
+        }
+        const float inv = rmsnorm_generic_inv(sum, scratch, d, eps);
+        for (std::int64_t i = threadIdx.x; i < static_cast<std::int64_t>(d); i += blockDim.x) {
+            const std::int64_t index = base + i;
+            const float xv           = __bfloat162float(x[index]);
+            const float wv           = __bfloat162float(weight[i]);
+            float zv                 = 0.0f;
+            if constexpr (rms_gated(Epilogue)) { zv = __bfloat162float(z[index]); }
+            out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+        }
     }
 }
 

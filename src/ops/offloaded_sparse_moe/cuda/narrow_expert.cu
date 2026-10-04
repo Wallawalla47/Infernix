@@ -26,13 +26,7 @@ __host__ __device__ inline Workspace carve(void* base, int jobs) {
 __device__ __forceinline__ int row_quad(const std::uint8_t* unit, int r, int q) {
     const std::uint32_t word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * (r & 7));
     const int shift          = r < 8 ? 0 : 4;
-    int packed               = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int c2 = canon::e2m1_x2((word >> (8 * j + shift)) & 15U);
-        packed |= (c2 & 0xFF) << (8 * j);
-    }
-    return packed;
+    return static_cast<int>(canon::e2m1_x2_quad((word >> shift) & 0x0F0F0F0FU));
 }
 
 __device__ __forceinline__ int act_quad(const A4Block& a, int q) {

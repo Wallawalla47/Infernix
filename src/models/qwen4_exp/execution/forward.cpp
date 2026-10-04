@@ -420,12 +420,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
     ops::moe_route(logits, K, routing, s);
+    std::int32_t* route_log = nullptr;
     if (experts_.route_log != nullptr) {
         if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
             throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
         }
-        CUDA_CHECK(cudaMemcpyAsync(experts_.route_log + layer * experts_.route_stride, routing.ids.data,
-                                   routing.ids.bytes(), cudaMemcpyDeviceToDevice, s));
+        route_log = experts_.route_log + layer * experts_.route_stride; // written by moe_dispatch
     }
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
@@ -434,7 +434,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, s);
+    ops::moe_dispatch(routing, E, dispatch, route_log, s);
     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.records),

@@ -34,41 +34,76 @@ void require(bool condition, const char* message) {
 
 bool aligned16(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % 16 == 0; }
 
+// The total row count. Segment fields are read at compile-time indices only: a runtime index into
+// the kernel parameter would copy it to local memory and put a local load before the weight loads.
+__device__ __forceinline__ int total_rows(const Segments& segments) {
+    int rows = segments.begin[1];
+#pragma unroll
+    for (int s = 2; s <= kMaxSegments; ++s) {
+        if (s == segments.count) { rows = segments.begin[s]; }
+    }
+    return rows;
+}
+
+// Issues lane `lane`'s chunk loads of `row` (chunks lane, lane + 32, ...) into `loaded`.
+__device__ __forceinline__ void load_row(const Segments& segments, int row, int k, int chunks, int lane,
+                                         uint4 (&loaded)[kMaxLaneChunks]) {
+    const bf16* data = segments.data[0];
+    int begin        = 0;
+#pragma unroll
+    for (int s = 1; s < kMaxSegments; ++s) {
+        if (s < segments.count && row >= segments.begin[s]) {
+            data  = segments.data[s];
+            begin = segments.begin[s];
+        }
+    }
+    const auto* w = reinterpret_cast<const uint4*>(data + static_cast<std::size_t>(row - begin) * k);
+#pragma unroll
+    for (int i = 0; i < kMaxLaneChunks; ++i) {
+        const int chunk = lane + 32 * i;
+        if (chunk < chunks) { loaded[i] = w[chunk]; }
+    }
+}
+
 // Warp w of a CTA owns rows first + w, first + w + Warps, ...; lane l accumulates the 8-element
 // chunks l, l + 32, ... in order and the warp reduces by a fixed butterfly, so an output's bits
-// depend only on K. A lane issues all of a row's chunk loads before its FMAs. Decode-width calls
-// give each warp one row (Threads = 128, RowsPerWarp = 1: 129 CTAs for a 513-row router instead of
-// 17), so a router's latency is one DRAM round trip instead of ~40; wide calls keep four rows per
-// warp, which stages x in fewer CTAs. Both mappings produce the same bits.
+// depend only on K. A lane issues all of a row's chunk loads before its FMAs, and the first row's
+// loads before x is staged, so the weights' DRAM trip overlaps the staging instead of following
+// it. Decode-width calls give each warp one row (Threads = 128, RowsPerWarp = 1: 129 CTAs for a
+// 513-row router instead of 17), so a router's latency is one DRAM round trip instead of ~40; wide
+// calls keep four rows per warp, which stages x in fewer CTAs. Both mappings produce the same bits.
 template <int Threads, int RowsPerWarp>
 __global__ void __launch_bounds__(Threads)
     projection_kernel(const bf16* __restrict__ x, int k, int columns, Segments segments, float* __restrict__ out) {
     constexpr int Warps = Threads / 32;
+    // 16-byte x chunks of the CTA's columns, as one unrolled batch of at most this many per thread.
+    constexpr int kStagePerThread = (kColumns * kMaxK / 8 + Threads - 1) / Threads;
     extern __shared__ uint4 staged[];
     const int first_column = blockIdx.y * kColumns;
     const int count        = min(kColumns, columns - first_column);
     const int chunks       = k / 8;
-    for (int i = threadIdx.x; i < count * chunks; i += blockDim.x) {
-        const int column = i / chunks, chunk = i % chunks;
-        staged[column * chunks + chunk] =
-            reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column + column) * k)[chunk];
-    }
-    __syncthreads();
-    const int rows = segments.begin[segments.count];
-    const int lane = threadIdx.x % 32;
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const int row = blockIdx.x * (Warps * RowsPerWarp) + r * Warps + threadIdx.x / 32;
-        if (row >= rows) { return; }
-        int segment = 0;
-        while (row >= segments.begin[segment + 1]) { ++segment; }
-        const auto* w = reinterpret_cast<const uint4*>(segments.data[segment] +
-                                                       static_cast<std::size_t>(row - segments.begin[segment]) * k);
-        uint4 loaded[kMaxLaneChunks];
+    const int rows         = total_rows(segments);
+    const int lane         = threadIdx.x % 32;
+    const int first_row    = blockIdx.x * (Warps * RowsPerWarp) + threadIdx.x / 32;
+    uint4 loaded[kMaxLaneChunks];
+    if (first_row < rows) { load_row(segments, first_row, k, chunks, lane, loaded); }
+    // The CTA's columns of x are contiguous, so chunk i of the staging is chunk i of x from there.
+    const auto* xs = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(first_column) * k);
 #pragma unroll
-        for (int i = 0; i < kMaxLaneChunks; ++i) {
-            const int chunk = lane + 32 * i;
-            if (chunk < chunks) { loaded[i] = w[chunk]; }
+    for (int u = 0; u < kStagePerThread; ++u) {
+        const int i = static_cast<int>(threadIdx.x) + u * Threads;
+        if (i < count * chunks) {
+            const auto dst = static_cast<unsigned>(__cvta_generic_to_shared(staged + i));
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(xs + i) : "memory");
         }
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    __syncthreads();
+    for (int r = 0; r < RowsPerWarp; ++r) {
+        const int row = first_row + r * Warps;
+        if (row >= rows) { return; }
+        if (r > 0) { load_row(segments, row, k, chunks, lane, loaded); }
         float sums[kColumns] = {};
 #pragma unroll
         for (int i = 0; i < kMaxLaneChunks; ++i) {

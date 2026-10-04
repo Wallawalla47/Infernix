@@ -102,12 +102,32 @@ NINFER_CANON_HD std::uint16_t f32_to_bf16_rn(float x) {
 
 // ---------------------------------------------------------------------------- E2M1 and E4M3FN
 
-// Twice the E2M1 value of a 4-bit code: {0, 1, 2, 3, 4, 6, 8, 12}, negated by bit 3.
+// Twice the E2M1 value of a 4-bit code: {0, 1, 2, 3, 4, 6, 8, 12}, negated by bit 3. The
+// magnitudes are the bytes of a constant, selected by one byte permute on the device and a shift
+// on the host: an indexed array would live in local memory on the device and turn every lookup
+// into a stack store and load.
 NINFER_CANON_HD int e2m1_x2(unsigned code) {
-    constexpr signed char kMag[8] = {0, 1, 2, 3, 4, 6, 8, 12};
-    const int mag                 = kMag[code & 7U];
+#if defined(__CUDA_ARCH__)
+    const int mag = static_cast<int>(__byte_perm(0x03020100U, 0x0C080604U, code & 7U));
+#else
+    const int mag = static_cast<int>((0x0C08060403020100ULL >> (8U * (code & 7U))) & 0xFFU);
+#endif
     return (code & 8U) != 0 ? -mag : mag;
 }
+
+#if defined(__CUDACC__)
+// e2m1_x2 of four codes at once: the codes are the low nibbles of the bytes of `codes` (the high
+// nibbles zero), the result holds the four doubled values as signed bytes in the same order. Two
+// byte permutes select the positive and the negated magnitude; the sign bits choose between them.
+__device__ __forceinline__ std::uint32_t e2m1_x2_quad(std::uint32_t codes) {
+    const std::uint32_t pairs    = codes | (codes >> 4);                                // nibbles 2j, 2j+1 in byte 2j
+    const std::uint32_t selector = ((pairs & 0xFFU) | ((pairs >> 8) & 0xFF00U)) & 0x7777U; // magnitude index per byte
+    const std::uint32_t positive = __byte_perm(0x03020100U, 0x0C080604U, selector);
+    const std::uint32_t negative = __byte_perm(0xFDFEFF00U, 0xF4F8FAFCU, selector);
+    const std::uint32_t sign     = ((codes >> 3) & 0x01010101U) * 0xFFU;                // 0xFF where bit 3 is set
+    return (positive & ~sign) | (negative & sign);
+}
+#endif
 
 // E4M3FN value times 2^9 for a non-negative scale word (sign bit ignored): an integer in
 // [0, 229376]. Words 0x7F (NaN) are rejected by the format validators and never reach here.
