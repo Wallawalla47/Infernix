@@ -8,6 +8,7 @@
 // round-to-nearest-even, integer operations, and explicitly fused fmaf are used. Translation units
 // that include this header on the host must be compiled with -ffp-contract=off -fno-fast-math.
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -69,7 +70,7 @@ NINFER_CANON_HD float fma_rn(float a, float b, float c) {
 #if defined(__CUDA_ARCH__)
     return __fmaf_rn(a, b, c);
 #else
-    return __builtin_fmaf(a, b, c);
+    return std::fmaf(a, b, c); // correctly rounded on every supported C++ runtime
 #endif
 }
 
@@ -90,10 +91,11 @@ NINFER_CANON_HD float rint_rn(float x) {
 
 NINFER_CANON_HD float bf16_to_f32(std::uint16_t h) { return f32_from_bits(std::uint32_t{h} << 16); }
 
-// Round-to-nearest-even binary32 -> bfloat16. NaN keeps its sign and becomes a quiet NaN.
+// Round-to-nearest-even binary32 -> bfloat16. Every NaN becomes the canonical quiet NaN 0x7FC0:
+// NaN payloads and signs differ between x86 and CUDA arithmetic, so they are not part of the bits.
 NINFER_CANON_HD std::uint16_t f32_to_bf16_rn(float x) {
     const std::uint32_t u = f32_bits(x);
-    if ((u & 0x7FFFFFFFU) > 0x7F800000U) { return static_cast<std::uint16_t>((u >> 16) | 0x0040U); }
+    if ((u & 0x7FFFFFFFU) > 0x7F800000U) { return 0x7FC0U; }
     const std::uint32_t lsb = (u >> 16) & 1U;
     return static_cast<std::uint16_t>((u + 0x7FFFU + lsb) >> 16);
 }
@@ -221,10 +223,14 @@ NINFER_CANON_HD std::uint16_t a4_row_output(std::int64_t s, float alpha) {
     return f32_to_bf16_rn(mul_rn(mul_rn(i64_to_f32_rn(s), 1.0F / 1048576.0F), alpha));
 }
 
+// The one NaN the transcendental functions return: CUDA arithmetic produces a canonical NaN where
+// x86 propagates the input payload, so NaN inputs are mapped explicitly to keep the bits equal.
+inline constexpr std::uint32_t kCanonicalNan = 0x7FC00000U;
+
 // exp(x) with Cody-Waite reduction and a fixed degree-7 Taylor polynomial evaluated by explicit fma.
-// Overflow returns +inf and deep underflow +0; NaN propagates.
+// Overflow returns +inf, deep underflow +0, and NaN the canonical NaN.
 NINFER_CANON_HD float exp_c(float x) {
-    if (x != x) { return x; }
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
     if (x > 88.72283935546875F) { return f32_from_bits(0x7F800000U); }
     if (x < -103.97208404541015625F) { return 0.0F; }
     const float n  = rint_rn(mul_rn(x, 1.44269502162933349609375F));
@@ -249,10 +255,16 @@ NINFER_CANON_HD float exp_c(float x) {
 
 // SiLU(g) on a binary32, in the form that never overflows exp:
 //   g >= 0: g / (1 + exp_c(-g));   g < 0: (g * e) / (1 + e), e = exp_c(g).
+// A NaN result (a NaN input, or -inf * 0 at g = -inf) is the canonical NaN.
 NINFER_CANON_HD float silu_c(float g) {
-    if (g >= 0.0F) { return div_rn(g, add_rn(1.0F, exp_c(-g))); }
-    const float e = exp_c(g);
-    return div_rn(mul_rn(g, e), add_rn(1.0F, e));
+    float r;
+    if (g >= 0.0F) {
+        r = div_rn(g, add_rn(1.0F, exp_c(-g)));
+    } else {
+        const float e = exp_c(g);
+        r             = div_rn(mul_rn(g, e), add_rn(1.0F, e));
+    }
+    return r != r ? f32_from_bits(kCanonicalNan) : r;
 }
 
 // SiLU(g) * u on BF16 inputs, rounded to BF16: bf16_rn(silu_c(g) * u).
