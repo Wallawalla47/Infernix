@@ -128,9 +128,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     struct Config {
         int slots;
         const moe::CpuMissService* service;
+        bool fork = false;
     };
+    // The fork stream and its events, for the one-pass decode/verification route.
+    cudaStream_t fork_stream = nullptr;
+    cudaEvent_t fork_events[2] = {};
+    cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
     for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
-                                Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight}}) {
+                                Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
+                                Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -143,6 +150,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                             .staging_slots = slots,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : ninfer::ops::MoeCpuChannel{}};
+        if (config.fork) {
+            source.fork_stream    = fork_stream;
+            source.fork_events[0] = fork_events[0];
+            source.fork_events[1] = fork_events[1];
+        }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
@@ -151,12 +163,15 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
         long mismatches = 0;
         for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != expected[i]; }
-        std::printf("E=%d T=%d k=%d staging slots %2d, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
-                    experts, columns, top_k, slots, config.service != nullptr ? config.service->channel(0).max_jobs : 0,
+        std::printf("E=%d T=%d k=%d staging slots %2d%s, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
+                    experts, columns, top_k, slots, config.fork ? " (fork)" : "",
+                    config.service != nullptr ? config.service->channel(0).max_jobs : 0,
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
                     mismatches, got.size());
         check(mismatches == 0, "layer route equals the CPU engine for every placement and staging pass");
     }
+    for (auto event : fork_events) { cudaEventDestroy(event); }
+    cudaStreamDestroy(fork_stream);
     cudaFree(d_out);
     cudaFree(d_workspace);
     cudaFree(d_staging);

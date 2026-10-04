@@ -103,6 +103,27 @@ __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& 
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
+// A call takes the fork route when it has a fork stream and fits one staging pass; moe_experts and
+// moe_experts_cpu_wait decide it identically.
+bool forked(const MoeExpertSource& source, std::int32_t max_jobs) {
+    return source.fork_stream != nullptr && source.staging_slots > 0 &&
+           max_jobs <= std::min(source.staging_slots, 512);
+}
+
+// Which jobs a pass launch computes: all of them, only those resident in frames (their record is
+// resolved directly, so they need not wait for the stage kernel), or only the others.
+enum class PassPhase : int { All = 0, Resident = 1, Staged = 2 };
+
+__device__ __forceinline__ const std::uint8_t* pass_record(PassPhase phase, const MoeExpertSource& source,
+                                                           int expert, const std::uint8_t* const* job_records,
+                                                           int job) {
+    if (phase == PassPhase::All) { return job_records[job]; }
+    const bool resident = source.frames[expert] >= 0;
+    if (resident != (phase == PassPhase::Resident)) { return nullptr; }
+    return resident ? source.frame_base + static_cast<std::uint64_t>(source.frames[expert]) * source.record_stride
+                    : job_records[job];
+}
+
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
@@ -169,6 +190,8 @@ __global__ void __launch_bounds__(kThreads)
 // -------------------------------------------------------------------------------------- routing
 
 // One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
+// Every array index is a compile-time constant (unrolled loops guarded by top_k), so the values,
+// the selection and the weights stay in registers; the selection and softmax order are fixed.
 __global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
                              std::int32_t* __restrict__ ids, float* __restrict__ weights,
                              float* __restrict__ shared_gate) {
@@ -177,17 +200,22 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
     if (warp >= columns) { return; }
     const float* column = logits + static_cast<std::size_t>(warp) * (experts + 1);
     // 512 experts: 16 per lane.
-    constexpr int kPerLane = 16;
+    constexpr int kPerLane = 16, kMaxTopK = 16;
     float values[kPerLane];
+#pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
         const int e = lane + 32 * i;
         values[i]   = e < experts ? column[e] : -INFINITY;
     }
-    float selected[16];
-    int chosen[16];
-    for (int k = 0; k < top_k; ++k) {
+    const float score = lane == 0 ? column[experts] : 0.0F;
+    float selected[kMaxTopK];
+    int chosen[kMaxTopK];
+#pragma unroll
+    for (int k = 0; k < kMaxTopK; ++k) {
+        if (k >= top_k) { break; }
         float best   = -INFINITY;
         int best_id  = 0x7FFFFFFF;
+#pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
             const int e = lane + 32 * i;
             if (e < experts && (values[i] > best || (values[i] == best && e < best_id))) {
@@ -205,20 +233,28 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
         }
         selected[k] = best;
         chosen[k]   = best_id;
-        if (best_id % 32 == lane) { values[best_id / 32] = -INFINITY; }
+#pragma unroll
+        for (int i = 0; i < kPerLane; ++i) {
+            if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
+        }
     }
     if (lane == 0) {
         // softmax over all experts then renormalized over the selected ones equals the softmax of
         // the selected logits.
         const float top = selected[0];
         float sum       = 0.0F;
-        for (int k = 0; k < top_k; ++k) { sum += expf(selected[k] - top); }
-        for (int k = 0; k < top_k; ++k) {
-            ids[static_cast<std::size_t>(warp) * top_k + k]     = chosen[k];
-            weights[static_cast<std::size_t>(warp) * top_k + k] = expf(selected[k] - top) / sum;
+#pragma unroll
+        for (int k = 0; k < kMaxTopK; ++k) {
+            if (k < top_k) { sum += expf(selected[k] - top); }
         }
-        const float s     = column[experts];
-        shared_gate[warp] = 1.0F / (1.0F + expf(-s));
+#pragma unroll
+        for (int k = 0; k < kMaxTopK; ++k) {
+            if (k < top_k) {
+                ids[static_cast<std::size_t>(warp) * top_k + k]     = chosen[k];
+                weights[static_cast<std::size_t>(warp) * top_k + k] = expf(selected[k] - top) / sum;
+            }
+        }
+        shared_gate[warp] = 1.0F / (1.0F + expf(-score));
     }
 }
 
@@ -283,15 +319,15 @@ __device__ void quantize_columns(const bf16* __restrict__ x, int hidden, const s
 
 // Exact sums S[g][c] of row (lane & 15) of `groups` consecutive row groups starting at `rg0`,
 // over this warp's share of the units, for `n` columns. Lanes 0..15 hold the results.
-template <int Groups>
+template <int Groups, int Columns>
 __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const ActBlock* acts, int n,
-                          std::int64_t (&s)[Groups][kPassColumns]) {
+                          std::int64_t (&s)[Groups][Columns]) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int r = lane & 15, half = lane >> 4;
 #pragma unroll
     for (int g = 0; g < Groups; ++g) {
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) { s[g][c] = 0; }
+        for (int c = 0; c < Columns; ++c) { s[g][c] = 0; }
     }
     for (int u = warp; u < Groups * blocks; u += kWarps) {
         const int g = u / blocks, b = u % blocks;
@@ -300,7 +336,7 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const
         const int w1 = row_quad(unit, r, 2 * half + 1);
         const int sw = canon::e4m3_scaled(unit[128 + r]);
 #pragma unroll
-        for (int c = 0; c < kPassColumns; ++c) {
+        for (int c = 0; c < Columns; ++c) {
             if (c < n) { // n is uniform across the warp, so the shuffle below is converged
                 const ActBlock& a = acts[c * blocks + b];
                 int p             = __dp4a(w0, a.quads[2 * half], 0);
@@ -320,25 +356,29 @@ constexpr int kGateUpSliceBytes = kGateUpGroups * moe::kGateUpBlocks * static_ca
 constexpr int kDownSliceBytes   = kDownGroups * moe::kDownBlocks * static_cast<int>(moe::kUnitBytes);     // 23,040
 static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
 
+template <int Columns>
 struct GateUpShared {
     alignas(16) std::uint8_t stage[kGateUpSliceBytes];
-    ActBlock acts[kPassColumns * moe::kGateUpBlocks];          // 25,600 B
-    std::int64_t partial[kWarps][16 * kGateUpGroups][kPassColumns]; // 16,384 B
-    std::uint16_t y[kPassColumns][16 * kGateUpGroups];
-    std::uint16_t h[kPassColumns][16];
+    ActBlock acts[Columns * moe::kGateUpBlocks];
+    std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
+    std::uint16_t y[Columns][16 * kGateUpGroups];
+    std::uint16_t h[Columns][16];
 };
 
+template <int Columns>
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch,
                    MoeExpertSource source, int top_k, const std::uint8_t* const* __restrict__ job_records,
-                   const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks) {
+                   const std::int32_t* __restrict__ cpu_flags, int job_base, canon::A4Block* __restrict__ h_blocks,
+                   PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto& sm       = *reinterpret_cast<GateUpShared*>(smem_raw);
+    auto& sm       = *reinterpret_cast<GateUpShared<Columns>*>(smem_raw);
     const int job  = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
     const int slice  = blockIdx.x; // row groups 2*slice, 2*slice+1; h block `slice`
-    const std::uint8_t* record = job_records[job];
+    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
@@ -346,8 +386,8 @@ __global__ void __launch_bounds__(kThreads)
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytes);
 
-    for (int pass = 0; pass < count; pass += kPassColumns) {
-        const int n = min(kPassColumns, count - pass);
+    for (int pass = 0; pass < count; pass += Columns) {
+        const int n = min(Columns, count - pass);
         // Gate rows are even, up rows odd; with distinct input scales the up rows use their own A4.
         for (int parity = 0; parity < (split_input ? 2 : 1); ++parity) {
             __syncthreads();
@@ -356,13 +396,13 @@ __global__ void __launch_bounds__(kThreads)
                              moe::kGateUpBlocks);
             stage_wait();
             __syncthreads();
-            std::int64_t s[kGateUpGroups][kPassColumns];
-            unit_sums<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
+            std::int64_t s[kGateUpGroups][Columns];
+            unit_sums<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
             if (lane < 16) {
 #pragma unroll
                 for (int g = 0; g < kGateUpGroups; ++g) {
 #pragma unroll
-                    for (int c = 0; c < kPassColumns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+                    for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
                 }
             }
             __syncthreads();
@@ -389,44 +429,48 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+template <int Columns>
 struct DownShared {
     alignas(16) std::uint8_t stage[kDownSliceBytes];
-    ActBlock acts[kPassColumns * kHBlocks];                       // 6,400 B
-    std::int64_t partial[kWarps][16 * kDownGroups][kPassColumns]; // 32,768 B
+    ActBlock acts[Columns * kHBlocks];
+    std::int64_t partial[kWarps][16 * kDownGroups][Columns];
 };
 
+template <int Columns>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(MoeDispatch dispatch, MoeExpertSource source, int hidden,
                 const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
                 int job_base, const canon::A4Block* __restrict__ h_blocks, int columns_out,
-                bf16* __restrict__ outputs) {
+                bf16* __restrict__ outputs, PassPhase phase) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    auto& sm      = *reinterpret_cast<DownShared*>(smem_raw);
+    auto& sm      = *reinterpret_cast<DownShared<Columns>*>(smem_raw);
     const int job = job_base + static_cast<int>(blockIdx.y);
     if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
     const int expert = dispatch.jobs[job];
     const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
-    const std::uint8_t* down = job_records[job] + moe::kGateUpBytes;
+    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    if (record == nullptr) { return; }
+    const std::uint8_t* down = record + moe::kGateUpBytes;
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
                 kDownSliceBytes);
-    for (int pass = 0; pass < count; pass += kPassColumns) {
-        const int n = min(kPassColumns, count - pass);
+    for (int pass = 0; pass < count; pass += Columns) {
+        const int n = min(Columns, count - pass);
         __syncthreads();
         for (int i = threadIdx.x; i < n * kHBlocks; i += blockDim.x) {
             sm.acts[i] = to_act(h_blocks[static_cast<std::size_t>(first + pass) * kHBlocks + i]);
         }
         stage_wait();
         __syncthreads();
-        std::int64_t s[kDownGroups][kPassColumns];
-        unit_sums<kDownGroups>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
+        std::int64_t s[kDownGroups][Columns];
+        unit_sums<kDownGroups, Columns>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
         if (lane < 16) {
 #pragma unroll
             for (int g = 0; g < kDownGroups; ++g) {
 #pragma unroll
-                for (int c = 0; c < kPassColumns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+                for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
             }
         }
         __syncthreads();
@@ -441,6 +485,27 @@ __global__ void __launch_bounds__(kThreads)
         }
     }
     (void)columns_out;
+}
+
+template <int Columns>
+void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
+                        const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                        canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
+                        PassPhase phase = PassPhase::All) {
+    static const bool configured = [] {
+        cudaFuncSetAttribute(gate_up_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(GateUpShared<Columns>)));
+        cudaFuncSetAttribute(down_kernel<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(DownShared<Columns>)));
+        return true;
+    }();
+    (void)configured;
+    gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared<Columns>), stream>>>(
+        x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
+    check_launch("gate/up");
+    down_kernel<Columns><<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared<Columns>), stream>>>(
+        dispatch, source, moe::kHidden, job_records, flags, base, h_blocks, columns_out, outputs, phase);
+    check_launch("down");
 }
 
 // ------------------------------------------------------------------------------ CPU-served misses
@@ -529,18 +594,42 @@ __global__ void __launch_bounds__(kThreads)
             ready = 1;
         }
     }
+    // One lane per job finds its columns' output entries; slot i * kMaxCpuColumns + c of y holds
+    // column c of job i (entry -1: unused).
+    constexpr int kSlots = offloaded_moe::kMaxCpuJobs * offloaded_moe::kMaxCpuColumns;
+    __shared__ int entries[kSlots];
+    for (int s = threadIdx.x; s < kSlots; s += blockDim.x) { entries[s] = -1; }
     __syncthreads();
     if (!ready) { return; }
     const int n = call->jobs;
-    for (int i = 0; i < n; ++i) {
+    if (threadIdx.x < n) {
+        const int i      = threadIdx.x;
         const int expert = dispatch.jobs[call->job[i]];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-        for (int c = 0; c < count; ++c) {
-            const int entry = dispatch.entries[first + c];
-            const auto* y = reinterpret_cast<const unsigned short*>(source.cpu.y) +
-                            (static_cast<std::size_t>(i) * offloaded_moe::kMaxCpuColumns + c) * hidden;
-            auto* out = reinterpret_cast<unsigned short*>(outputs) + static_cast<std::size_t>(entry) * hidden;
-            for (int d = threadIdx.x; d < hidden; d += blockDim.x) { out[d] = __ldcv(y + d); }
+        for (int c = 0; c < count; ++c) { entries[i * offloaded_moe::kMaxCpuColumns + c] = dispatch.entries[first + c]; }
+    }
+    __syncthreads();
+    // The copy issues each thread's loads from mapped memory in batches before storing them, so a
+    // batch costs one PCIe round trip rather than one per load. .cv loads: y is rewritten by every
+    // layer's request.
+    constexpr int kBatch = 8;
+    const int vectors    = hidden * 2 / 16; // 16-byte vectors per column
+    const int items      = n * offloaded_moe::kMaxCpuColumns * vectors;
+    const auto* y        = reinterpret_cast<const int4*>(source.cpu.y);
+    auto* out            = reinterpret_cast<int4*>(outputs);
+    for (int base = threadIdx.x; base < items; base += kBatch * blockDim.x) {
+        int4 loaded[kBatch];
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const int item = base + b * blockDim.x;
+            if (item < items && entries[item / vectors] >= 0) { loaded[b] = __ldcv(y + item); }
+        }
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const int item = base + b * blockDim.x;
+            if (item >= items) { continue; }
+            const int entry = entries[item / vectors];
+            if (entry >= 0) { out[static_cast<std::size_t>(entry) * vectors + item % vectors] = loaded[b]; }
         }
     }
 }
@@ -644,6 +733,7 @@ bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
+    if (forked(source, max_jobs)) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
     CpuCall* call = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
     cpu_wait_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, call, moe::kHidden,
@@ -662,14 +752,6 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
-    static bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared)));
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared)));
-        return true;
-    }();
-    (void)configured;
     auto* h_blocks = static_cast<canon::A4Block*>(workspace);
     const std::size_t h_bytes =
         (static_cast<std::size_t>(outputs.ne[1]) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
@@ -708,16 +790,39 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             check_launch("stage");
             CUDA_CHECK(cudaEventRecord(events[1 + b], source.overlap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(stream, events[1 + b], 0));
-            gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
-                static_cast<const bf16*>(x.data), moe::kHidden, dispatch, buffer, top_k, job_records, flags, base,
-                h_blocks);
-            check_launch("gate/up");
-            down_kernel<<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared), stream>>>(
-                dispatch, buffer, moe::kHidden, job_records, flags, base, h_blocks, outputs.ne[1],
-                static_cast<bf16*>(outputs.data));
-            check_launch("down");
+            launch_expert_pass<kPassColumns>(static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records,
+                                             flags, base, jobs, h_blocks, outputs.ne[1],
+                                             static_cast<bf16*>(outputs.data), stream);
             CUDA_CHECK(cudaEventRecord(events[3 + b], stream));
         }
+        if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
+        return;
+    }
+    if (forked(source, max_jobs)) {
+        // One pass: the misses are staged and then computed on the fork stream while this stream
+        // computes the resident experts; both write disjoint outputs and h blocks, and every
+        // expert's arithmetic is the same as in a serial pass.
+        CUDA_CHECK(cudaEventRecord(source.fork_events[0], stream));
+        CUDA_CHECK(cudaStreamWaitEvent(source.fork_stream, source.fork_events[0], 0));
+        stage_kernel<<<kStageCtas, kThreads, 0, source.fork_stream>>>(dispatch, source, 0, max_jobs, flags,
+                                                                      job_records);
+        check_launch("stage");
+        const auto* xs = static_cast<const bf16*>(x.data);
+        auto* out      = static_cast<bf16*>(outputs.data);
+        if (x.ne[1] == 1) {
+            launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
+                                  outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
+            launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
+                                  outputs.ne[1], out, stream, PassPhase::Resident);
+        } else {
+            launch_expert_pass<kPassColumns>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
+                                             outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
+            launch_expert_pass<kPassColumns>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
+                                             outputs.ne[1], out, stream, PassPhase::Resident);
+        }
+        CUDA_CHECK(cudaEventRecord(source.fork_events[1], source.fork_stream));
+        // Joined here, or in moe_experts_cpu_wait so the caller's unrelated work (the shared
+        // expert) also overlaps the staging.
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
@@ -726,13 +831,16 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
                                                                                        flags, job_records);
         check_launch("stage");
-        gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
-            static_cast<const bf16*>(x.data), moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks);
-        check_launch("gate/up");
-        down_kernel<<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared), stream>>>(
-            dispatch, source, moe::kHidden, job_records, flags, base, h_blocks, outputs.ne[1],
-            static_cast<bf16*>(outputs.data));
-        check_launch("down");
+        // A one-token call has one column per job: the one-column kernels' smaller shared memory
+        // fits twice the CTAs per SM, so a decode layer's jobs run in one wave.
+        if (x.ne[1] == 1) {
+            launch_expert_pass<1>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base,
+                                  jobs, h_blocks, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
+        } else {
+            launch_expert_pass<kPassColumns>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records,
+                                             flags, base, jobs, h_blocks, outputs.ne[1],
+                                             static_cast<bf16*>(outputs.data), stream);
+        }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }

@@ -31,7 +31,7 @@ namespace ninfer::ops {
 
 /// out[s*H+d,t] = R[s*H+d,t] * rsqrt(mean_d R[s*H+d,t]^2 + eps) * (1 + weight[s*H+d]).
 /// residual, out: contiguous BF16 [S*H, T]; weight: contiguous BF16 [S*H]. H must be a multiple
-/// of 8. Inputs and output must not overlap.
+/// of 8 and at most 4096. Inputs and output must not overlap.
 void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
                            float eps, Tensor& out, cudaStream_t stream);
 

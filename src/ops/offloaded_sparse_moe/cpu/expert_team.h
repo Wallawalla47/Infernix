@@ -2,11 +2,11 @@
 
 // The CPU expert engine's worker team (docs/maintainer/qwen3_8-flash-next-design.md §10.3).
 //
-// Worker w of N owns the same parts of every expert: gate/up 16-intermediate units
-// [40w/N, 40(w+1)/N) and down row groups [160w/N, 160(w+1)/N). A round runs Phase A (A4 of x,
-// the owned gate/up units, SwiGLU and A4 of the owned h blocks) over every job, one barrier, then
-// Phase B (the owned down rows) over every job. Sums are exact int64, so the output bits do not
-// depend on N, the ISA or the order in which workers finish; they equal expert_forward's.
+// A round runs three phases separated by barriers, each handing out work through an atomic
+// counter so that faster cores (P-cores on hybrid CPUs) take more of it: A4 quantization of every
+// job's columns, the gate/up 16-intermediate units with SwiGLU and A4 of h, then the down row
+// groups. Sums are exact int64, so the output bits do not depend on N, the ISA, which worker took
+// which item, or the order in which workers finish; they equal expert_forward's.
 //
 // The calling thread is worker 0 and starts computing at once. Idle workers spin for a bounded
 // time, then park on a futex (std::atomic::wait).
@@ -53,10 +53,6 @@ public:
     [[nodiscard]] CpuIsa isa() const { return isa_; }
 
 private:
-    struct alignas(64) WorkerScratch {
-        std::vector<canon::A4Block> x_gate; // [job][col][kGateUpBlocks]
-        std::vector<canon::A4Block> x_up;
-    };
 
     void worker_main(int w);
     void work(int w);
@@ -67,7 +63,8 @@ private:
     int max_jobs_;
     int spin_iterations_;
     int prefetch_bytes_;
-    std::vector<WorkerScratch> scratch_;
+    std::vector<canon::A4Block> x_gate_; // [job][col][kGateUpBlocks]
+    std::vector<canon::A4Block> x_up_;
     std::vector<canon::A4Block> h_; // [job][col][kHBlocks], shared between the phases
     std::span<const CpuExpertJob> jobs_;
 
@@ -76,6 +73,9 @@ private:
     alignas(64) std::atomic<int> arrived_{0};
     alignas(64) std::atomic<std::uint32_t> barrier_generation_{0};
     alignas(64) std::atomic<int> finished_{0};
+    alignas(64) std::atomic<int> next_quantize_{0};
+    alignas(64) std::atomic<int> next_unit_{0};
+    alignas(64) std::atomic<int> next_rows_{0};
     alignas(64) std::atomic<bool> stop_{false};
     std::vector<std::thread> threads_;
 };

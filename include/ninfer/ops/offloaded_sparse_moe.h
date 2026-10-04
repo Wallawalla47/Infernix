@@ -104,6 +104,13 @@ struct MoeExpertSource {
     // the stream is otherwise idle. Not for calls captured into a CUDA graph.
     cudaStream_t overlap_stream = nullptr;
     cudaEvent_t overlap_events[5] = {};
+    // Optional fork for calls of one pass (decode and verification widths; may be captured into a
+    // CUDA graph): the pass's misses are staged and computed on `fork_stream` while the calling
+    // stream computes the resident experts. The calling stream joins the fork in
+    // moe_experts_cpu_wait (immediately when wait_for_cpu is true). The stream and both events
+    // (fork, join) are caller-owned; the stream is otherwise idle.
+    cudaStream_t fork_stream = nullptr;
+    cudaEvent_t fork_events[2] = {};
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);
