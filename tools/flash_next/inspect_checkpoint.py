@@ -83,6 +83,9 @@ def _model_shape(config: dict) -> dict:
         "num_experts_per_tok", "moe_intermediate_size", "shared_expert_intermediate_size",
         "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size",
         "max_position_embeddings", "mtp_num_hidden_layers", "layer_types",
+        # PLE n-gram hash (row ids depend on every one of these)
+        "ngram_size", "heads_per_ngram", "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by",
+        "seed", "eos_token_id",
     )
     found = {k: (config if k in config else text)[k] for k in keys if k in config or k in text}
     if "layer_types" in found:
