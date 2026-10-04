@@ -93,7 +93,7 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE]\n"
+           "       [--chat-template FILE] [--ngram-volume FILE]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
            "       [--vision] [--vision-offload on|off] [--vision-max-merged N]\n"
@@ -219,6 +219,8 @@ Options parse_options(int argc, char** argv) {
             options.prompt = value(arg);
         } else if (arg == "--chat-template") {
             options.chat_template_path = value(arg);
+        } else if (arg == "--ngram-volume") {
+            options.ngram_volume_path = value(arg);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {

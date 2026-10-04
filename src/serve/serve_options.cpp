@@ -170,6 +170,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             the server\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
            "                             startup; must match a template the target accepts\n"
+           "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume\n"
+           "                             (default: the artifact path + .ngram)\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
@@ -379,6 +381,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
             }
+        } else if (arg == "--ngram-volume") {
+            options.ngram_volume_path = require_value("--ngram-volume");
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
             if (options.chat_template_path.empty()) {
