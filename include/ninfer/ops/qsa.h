@@ -72,8 +72,12 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& positio
                      const QsaGeometry& geometry, cudaStream_t stream);
 
 /// raw_keys: BF16 [Di, T], the un-normalized index keys of the call's columns. Writes the pooled
-/// key of every block that completes inside the call and updates each sequence's tail of raw keys
-/// (tails: BF16 [Di, R - 1, slots]). Positions inside a sequence are consecutive.
+/// key of every block that completes inside the call, reading the keys of its positions before
+/// the call from the sequence's tail of raw keys (tails: BF16 [Di, R - 1, slots]), and updates the
+/// tail: afterwards slot q % R holds the raw key of every position q of the sequence's latest
+/// block with q % R < R - 1 up to its last position, also when that position completes the block
+/// (a later call that rewrites the position alone re-pools the same key). Positions inside a
+/// sequence are consecutive.
 void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& tails,
                    const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& geometry,
                    cudaStream_t stream);

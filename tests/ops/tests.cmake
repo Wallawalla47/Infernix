@@ -202,6 +202,11 @@ ninfer_add_op_test(ninfer_speculative_state_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
   LIBRARIES ninfer_ops)
 
+# QSA index queries, pooled keys and tails, selection and attention against FP64 oracles.
+ninfer_add_op_test(ninfer_qsa_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops)

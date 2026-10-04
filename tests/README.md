@@ -92,6 +92,12 @@ FP64 accumulation order; small cases remain serial. Cache fixtures populate the 
 prefix while reserving the full execution-envelope page table. The runner reports elapsed time
 per KV type.
 
+`ninfer_qsa_test` checks Qwen3.8-Flash-Next's QSA at the real geometry against FP64 oracles:
+index queries, pooled keys read back from the paged plane, the raw-key tails exactly (including
+rewriting the last position of a block completed inside a call or a verification commit, as the
+MTP drafter does), chunking invariance, block selection (exact, on a value grid where FP32 scores
+are exact), and attention over decoded `bf16` and `int8` K/V across the dense/selected boundary.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash

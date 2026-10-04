@@ -5,7 +5,10 @@
 //   ninfer_qwen4_exp_forward_real_test TOKENS [--kv bf16|int8] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
 //   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
+//   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv bf16|int8]
 //
+// With --cpu-columns the test checks that calls of at most 8 columns, which the Program serves
+// with the CPU expert service, give the GPU route's logits bit for bit (check_cpu_columns).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace.
 // With --dump-logits the test scores the text teacher-forced instead: it prefills it in chunks of N
 // (default 256) with FP32 logits at every position, writes them in Strata's --dump-logits layout
@@ -27,11 +30,13 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -201,11 +206,25 @@ struct Harness {
         }
         work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context);
         work          = std::make_unique<WorkspaceArena>(work_capacity);
+        state_view    = state;
+        kv_view       = kv;
+        experts_view  = experts;
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                            std::move(experts), context);
     }
 
+    // Another Forward over the same state, KV and workspace, with other expert sources.
+    std::unique_ptr<q4::execution::Forward>
+    forward_with(const q4::execution::Parameters& parameters, DeviceContext& device,
+                 q4::execution::ForwardExperts sources, std::int32_t context) const {
+        return std::make_unique<q4::execution::Forward>(parameters, device, *work, state_view,
+                                                        kv_view, std::move(sources), context);
+    }
+
     const q4::TextConfig& config;
+    q4::execution::ForwardState state_view;
+    q4::execution::ForwardKV kv_view;
+    q4::execution::ForwardExperts experts_view;
     std::size_t state_bytes = 0;
     DeviceBuffer state_backing, ple_backing, tails_backing, kv_backing, frames_backing;
     std::unique_ptr<LinearAttentionStatePool> gdn;
@@ -302,6 +321,98 @@ std::vector<int> top(const std::vector<float>& v, std::size_t offset, std::size_
     return index;
 }
 
+// The Program CPU-serves every call of at most kMaxCpuColumns columns (short prompts, chunk
+// remainders, forced tokens). Each expert of such a call has at most that many columns, so its
+// output is the same bits on the CPU and the GPU (design §16.2), and so are the call's logits. Two
+// sequences run the same prefix, then the last tokens as calls of 1, 2, 5 and 8 columns, through
+// the Program's MoE configuration (64 staging slots, the prefill overlap stream; no resident
+// experts here), one of them with the Program's CPU expert service as well.
+bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContext& device,
+                       const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
+                       std::int32_t context, KvCacheStorage kv) {
+    namespace moe               = ninfer::ops::offloaded_moe;
+    const auto& c               = parameters.model.config().text;
+    const auto n                = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t widths[] = {1, 2, 5, moe::kMaxCpuColumns};
+    const std::int32_t tail     = 1 + 2 + 5 + moe::kMaxCpuColumns;
+    if (n <= tail + moe::kMaxCpuColumns) {
+        throw std::invalid_argument("--cpu-columns needs more than 24 tokens");
+    }
+    const std::int32_t prefix = n - tail;
+    Harness harness(parameters, device, context, prefix, 2, kv);
+    std::uint64_t record_stride = 0;
+    std::vector<moe::CpuMissService::Layer> layers;
+    for (const auto& layer : parameters.layers) {
+        record_stride = layer.moe.bank->planes.record_stride;
+        layers.push_back(
+            {.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
+             .record_stride = record_stride,
+             .scales        = layer.moe.bank->scales.data()});
+    }
+    constexpr std::int32_t kStagingSlots = 64;
+    DeviceBuffer staging(static_cast<std::size_t>(kStagingSlots) * record_stride);
+    cudaStream_t overlap = nullptr;
+    std::array<cudaEvent_t, 5> events{};
+    check(cudaStreamCreateWithFlags(&overlap, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : events) {
+        check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "cudaEventCreate");
+    }
+    bool ok = true;
+    {
+        moe::CpuMissService service(layers, {.workers      = 6,
+                                             .max_jobs     = moe::kMaxCpuJobs,
+                                             .max_columns  = moe::kMaxCpuColumns,
+                                             .pcie_divisor = 3,
+                                             .cpus         = {}});
+        auto sources           = harness.experts_view;
+        sources.staging_base   = static_cast<std::uint8_t*>(staging.p);
+        sources.staging_slots  = kStagingSlots;
+        sources.overlap_stream = overlap;
+        sources.overlap_events = events;
+        const auto gpu         = harness.forward_with(parameters, device, sources, context);
+        for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
+            sources.cpu.push_back(service.channel(static_cast<int>(l)));
+        }
+        const auto cpu   = harness.forward_with(parameters, device, sources, context);
+        const auto vocab = static_cast<std::int32_t>(c.vocab_size);
+        DeviceBuffer logits(static_cast<std::size_t>(vocab) * moe::kMaxCpuColumns * sizeof(float));
+        const auto run = [&](q4::execution::Forward& forward, std::int32_t slot, std::int32_t first,
+                             std::int32_t width) {
+            const bool every = width <= moe::kMaxCpuColumns;
+            auto call        = make_call(c, volume, {tokens}, first, width, {slot}, {slot}, every);
+            Tensor out(logits.p, DType::FP32, {vocab, every ? width : 1});
+            forward.run(call.batch, out);
+            device.synchronize();
+            return to_float(logits, static_cast<std::size_t>(vocab) * (every ? width : 1));
+        };
+        (void)run(*gpu, 0, 0, prefix);
+        (void)run(*cpu, 1, 0, prefix);
+        if (service.served_experts() != 0) {
+            std::printf("FAIL: a %d-column call reached the CPU service\n", prefix);
+            ok = false;
+        }
+        std::int32_t first = prefix;
+        for (const std::int32_t width : widths) {
+            const auto before   = service.served_experts();
+            const auto expected = run(*gpu, 0, first, width);
+            const auto served   = run(*cpu, 1, first, width);
+            const auto experts  = service.served_experts() - before;
+            const bool same     = expected == served;
+            std::printf("%d-column call at position %d: %llu experts CPU-served, logits %s the GPU "
+                        "route's\n",
+                        width, first, static_cast<unsigned long long>(experts),
+                        same ? "equal" : "DIFFER FROM");
+            ok = ok && same && experts > 0;
+            first += width;
+        }
+    }
+    for (auto event : events) { cudaEventDestroy(event); }
+    cudaStreamDestroy(overlap);
+    std::printf(ok ? "CPU-served small calls equal the GPU route bit for bit\n"
+                   : "FAIL: CPU-served small calls differ from the GPU route\n");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -313,6 +424,8 @@ int main(int argc, char** argv) {
     std::string logits_path, residuals_path, routes_path, blocks_path, dump_path;
     std::int32_t chunk = 256;
     KvCacheStorage kv  = KvCacheStorage::BFloat16;
+    bool cpu_columns   = false;
+    for (int i = 2; i < argc; ++i) { cpu_columns |= std::string(argv[i]) == "--cpu-columns"; }
     for (int i = 2; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--logits") { logits_path = argv[i + 1]; }
         if (std::string(argv[i]) == "--residuals") { residuals_path = argv[i + 1]; }
@@ -390,6 +503,7 @@ int main(int argc, char** argv) {
                         scored, seconds_since(t0), nll / scored, std::exp(nll / scored), 100.0 * same_top1 / scored);
             return 0;
         }
+        if (cpu_columns) { return check_cpu_columns(parameters, device, volume, tokens, context, kv) ? 0 : 1; }
         Harness harness(parameters, device, context, n, 3, kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");

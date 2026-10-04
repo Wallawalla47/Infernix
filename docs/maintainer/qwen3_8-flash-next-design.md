@@ -3761,6 +3761,39 @@ the GPU lock and run as hidden console jobs. Effort (estimated): P0-P6 ≈ 12 en
 | **P8** C > 1 extras (1.5 d) | In-flight coalescing (`hybrid_await_sibling` mirror), blocked-head prefetch | Concurrent shared-prefix scenario at C = 2 |
 | **P9** shared helper (1.5 d, later) | Slab pool, write queue, restore batch/events, persistence I/O into `runtime/prefix_cache/host_tier.{h,cpp}` for both bindings | Qwen3.5 real tests (27B) + Qwen4Exp tests |
 
+**P0 as built** (branch `claude/fn-prefix-cache`; design decisions, results are recorded with the
+measurements):
+
+- **MR1.** `stage_mtp_chunk` prepends iff `mtp_cells < begin` and sets `mtp_cells = begin +
+  columns` (`state_tokens` for non-last prompt calls and forced tokens, `state_tokens − 1` for the
+  last prompt call); the drafter's pending-cell write and the catch-up set `state_tokens`. The
+  settled invariant is checked after every commit (plain and verified), throwing `logic_error` like
+  the Program's other invariant checks: it costs O(rows), and the code base has no debug-only check
+  convention. `finish` is `noexcept`, so there it is a Warning diagnostic.
+- **MR2** runs in `commit`'s cancelled branch for plain rounds only, on the compute stream: the
+  round's `residual_out` column of that row (`mtp_residuals_`) becomes the saved column and
+  `mtp_cells = state_tokens − 1`. The released lane does not use it today; it makes P3's abort
+  endpoint consistent.
+- **Small calls.** `max_columns = max(kMaxCpuColumns, lanes × max_width_)`: 8 for plain C = 1
+  (was 1), 8 for MTP at C = 1 with 4 drafts (was 5); larger products are unchanged.
+- **MR7 tails fix**: only the loop bounds of the existing `tail_kernel` and `commit_tail_kernel`
+  change (`base = last − last % R`, up to `min(last, base + R − 2)`), and the `qsa_pool_keys`
+  contract states the new tail. Main layers never read a tail from a call that starts at a 4-block
+  start, so the text model's bits are unchanged; only the drafter's re-pools of a block completed
+  inside one call or commit change, and pooled keys matter only once selection starts (more than
+  2,051 visible tokens). Short contexts therefore keep their MTP drafts exactly; long ones may
+  change acceptance.
+- **Tests.** `ninfer_qsa_test` (`tests/ops/test_qsa.cpp`) is the QSA FP64 oracle test of the
+  shared-code rule (§19.3.0): index queries; pooled keys from the paged plane; the tails exactly
+  after every call and commit; rewriting the last position of a block completed inside a call,
+  across calls or in a commit (draft step 0 without tail update, prepend with) re-pools the same
+  key; single-call invariance; attention per KV profile. Its selection fixture uses an exact value
+  grid, so the selected set, including the lower-id tie rule, is decided exactly instead of being
+  guarded against near ties. The CPU on/off exit check is Forward-level
+  (`ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns`: 1, 2, 5 and 8-column calls after a
+  prefix, logits bitwise with the Program's CPU service and without), since the Program has no
+  CPU on/off switch and a test-only one would sit in the shared `program_impl.h`.
+
 #### Tests
 
 `ninfer_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)
