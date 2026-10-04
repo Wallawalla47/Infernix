@@ -113,6 +113,9 @@ TextConfig text(const Json& value, bool mtp) {
     TextConfig out;
     out.architecture = resolve_architecture(
         architecture(value), artifact::require_id(value.at("model_type"), "model_type"));
+    if (out.architecture == Architecture::Qwen4Exp) {
+        throw ArtifactError("Qwen4Exp is not a Qwen3.5 architecture");
+    }
     out.hidden_size             = dimension(value, "hidden_size");
     out.vocab_size              = dimension(value, "vocab_size");
     out.num_hidden_layers       = dimension(value, "num_hidden_layers");
