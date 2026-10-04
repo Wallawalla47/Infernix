@@ -1,6 +1,10 @@
 #include "ops/linear/linear_test_common.h"
+#include "ops/op_tester.h"
+
+#include <cuda_runtime.h>
 
 #include <array>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <vector>
@@ -75,6 +79,70 @@ int q8_a16_conformance() {
     }
     return failures;
 }
+
+// Speculative verification relies on this for one row (design §11.3): on the runtime-shape SIMT
+// routes, an output column is bit-identical whether it is computed alone or beside up to seven
+// others. Covers the few-row route ([324, 10240]) and eight-row blocks with long and short K.
+int q8_a16_column_invariance() {
+    constexpr int kColumns = 8;
+    int failures           = 0;
+    for (const auto& shape :
+         {Geometry{324, 10240, 401U}, Geometry{2560, 4096, 409U}, Geometry{10240, 320, 419U}}) {
+        const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
+        std::vector<std::uint16_t> activation(static_cast<std::size_t>(shape.k) * kColumns);
+        std::uint32_t state = shape.seed;
+        for (auto& bits : activation) {
+            state = state * 1664525U + 1013904223U;
+            bits  = ninfer::test::f32_to_bf16(
+                static_cast<float>(static_cast<std::int32_t>(state >> 8) - (1 << 23)) /
+                static_cast<float>(1 << 23));
+        }
+        const std::size_t out_bytes = static_cast<std::size_t>(shape.n) * kColumns * 2;
+        void *weight = nullptr, *x = nullptr, *y = nullptr;
+        ninfer::test::cuda_check(cudaMalloc(&weight, host.payload.size()), "weight");
+        ninfer::test::cuda_check(cudaMalloc(&x, activation.size() * 2), "activation");
+        ninfer::test::cuda_check(cudaMalloc(&y, out_bytes), "output");
+        ninfer::test::cuda_check(
+            cudaMemcpy(weight, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice),
+            "upload weight");
+        ninfer::test::cuda_check(
+            cudaMemcpy(x, activation.data(), activation.size() * 2, cudaMemcpyHostToDevice),
+            "upload activation");
+        const ninfer::Weight w = host.device_weight(weight);
+        std::vector<std::uint16_t> alone(static_cast<std::size_t>(shape.n) * kColumns);
+        for (int column = 0; column < kColumns; ++column) {
+            ninfer::Tensor input(static_cast<std::uint16_t*>(x) +
+                                     static_cast<std::size_t>(column) * shape.k,
+                                 ninfer::DType::BF16, {shape.k, 1});
+            ninfer::Tensor output(y, ninfer::DType::BF16, {shape.n, 1});
+            ninfer::ops::linear(input, w, output, nullptr);
+            ninfer::test::cuda_check(
+                cudaMemcpy(alone.data() + static_cast<std::size_t>(column) * shape.n, y,
+                           static_cast<std::size_t>(shape.n) * 2, cudaMemcpyDeviceToHost),
+                "read single column");
+        }
+        for (int t = 2; t <= kColumns; ++t) {
+            ninfer::Tensor input(x, ninfer::DType::BF16, {shape.k, t});
+            ninfer::Tensor output(y, ninfer::DType::BF16, {shape.n, t});
+            ninfer::ops::linear(input, w, output, nullptr);
+            std::vector<std::uint16_t> together(static_cast<std::size_t>(shape.n) * t);
+            ninfer::test::cuda_check(
+                cudaMemcpy(together.data(), y, together.size() * 2, cudaMemcpyDeviceToHost),
+                "read columns");
+            std::size_t differing = 0;
+            for (std::size_t i = 0; i < together.size(); ++i) differing += together[i] != alone[i];
+            if (differing != 0) {
+                std::cerr << "Q8_A16 [" << shape.n << "," << shape.k << "] T=" << t << ": "
+                          << differing << " outputs differ from the columns computed alone\n";
+                ++failures;
+            }
+        }
+        cudaFree(weight);
+        cudaFree(x);
+        cudaFree(y);
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -83,7 +151,7 @@ int main() {
         return 77;
     }
     try {
-        const int failures = q8_a16_conformance();
+        const int failures = q8_a16_conformance() + q8_a16_column_invariance();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
