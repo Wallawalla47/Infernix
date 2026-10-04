@@ -265,6 +265,84 @@ cache large; replay at comparable capacity gives the Strata policy 0.87-0.92 (§
   slots on a 5090. It tunes the adaptive tier to every 2 rounds, decay 0.92 and 192 swaps, and
   reports 30-40% fewer misses than upstream.
 
+**Strata v0.1.39 (2026-10-04).** Strata was re-read at `6f32ec0`: 217 commits after `99f3dbd`,
+v0.1.39 plus the #465, #583 and #646 follow-ups. The numbers below are Strata's own, measured on its
+cards and GGUF packs. The table above stays as read at `99f3dbd`, but one statement in its
+Speculation row is now out of date: "drafts run serially after verify, with a stream sync per
+step". With the setup default `--spec 4 --spec-min-p 0.5`, each draft step is a launch followed by
+a host spin on a mapped word, and the window is cut at the first draft with probability below 0.5.
+With min_p 0 the steps launch back to back.
+
+- **Decode (#646: `cfd3b72`, `055122c`, `deee447`, `f945515`).** No CUDA speed numbers published.
+  - **Handshake.** A verify graph with no host handshake, used only when 100% of a stage's experts
+    are resident. Elsewhere the doorbell copies x only when a routed id misses.
+  - **Concurrency.**
+    - The shared expert runs on a stream forked at the MLP mixer output.
+    - A one-launch parallel resident planner replaces a one-thread loop.
+  - **Kernels.**
+    - Sub-warp packing for the K = 640 down kernel.
+    - IQ codebooks staged in shared memory, kept only in the grouped kernels: single-matrix mmvq
+      measured 10-20% slower with staging at 3-8 columns.
+    - A batched PLE K/V projection.
+  - **Drafting and submission.**
+    - MTP steps launched back to back, with per-step PLE prefetch.
+    - `cudaStreamQuery` kicks for WDDM submission.
+  - **Exactness.** Fusions that broke bit-exactness became opt-in.
+- **QSA.**
+  - `cce52db`: past the register kernel's reach, the top-k uses 1,024 threads with a histogram per
+    warp. Selection is 9-12× faster at 262K-524K cells, and a 243K-token prompt rose from 743 to
+    934 tok/s (RTX 3060).
+  - sm_90+ decode had already moved to an 8-CTA cluster top-k and multi-CTA block scoring that reads
+    each key once per window (`bbe3d2a`, `a20f3b5`, just before the window). On an RTX 5070 the
+    top-k fell from 200 to 22 µs at 262K.
+  - `fd95405`: decode attention reduce-scatters the 12 heads' sums in `warp_sum`'s pairing order
+    and issues four cells' V loads together, bit-exact.
+- **Prefill (#583).**
+  - The streamed ring is a byte budget shared with the chunk. The auto chunk is the largest one that
+    keeps the ring full: a ring slot was worth ~0.53 tok/s, a chunk token ~0.05.
+  - RTX 5070: 32K prompts +3 to +18.5%, 4K unchanged. Long-prompt bits change (another cached and
+    streamed mix), gated by teacher-forced KL.
+  - Chunks above 8,192 stay opt-in because chunk order changes output.
+  - `d541220`, just before the window: one event per 16-expert group replaces a wait/record pair per
+    expert, because each pair left ~10 µs of GPU idle under WDDM. RTX 5090 prompt time fell 8.6% at
+    32K and 12.6% at 2K.
+- **Batch slots on one GPU (#465).**
+  - Policy:
+    - A lone request runs the MTP path; two or more decode plain one-token rows; a request left
+      alone returns to MTP.
+    - Slots decode between a long prompt's chunks for half of each chunk's time.
+    - A long read yields at a chunk boundary to a waiting prompt under half its length.
+  - Measured on a 12 GB RTX 5070:
+    - Two concurrent requests: 61.0 against 71.6 tok/s one at a time.
+    - A lone request: 11-24% slower with slots configured.
+    - The last of four first tokens arrives at 1.8 s instead of 11.2 s.
+  - Setup recommends slots only where the cache still holds half the experts.
+- **Memory and host.**
+  - Opt-in hot VRAM resize through a VMM-segmented cache (#533): 4.3 GiB freed in 78 ms, decode 44 →
+    33 tok/s; grown back in 92 ms with identical tokens.
+  - P-cores plus half the E-cores on hybrid CPUs (#642), under Strata's static work split.
+  - Linux THP and a host-RAM check.
+  - Under WDDM, a device `cudaMalloc` failed after ~45 GiB of host pages were registered, so the
+    head now loads before the arena (#620).
+- **Serving and quality.**
+  - Opt-in `effort_position: end` (#458), the Responses API, and literal think tags encoded as text.
+  - A 256-repeat stop, added after non-finite q8_1 scales produced NaN (#606).
+  - A restore-speed check (#528), and slot and conversation-cache metrics.
+  - UD-IQ4_XS is a regular choice.
+  - `f23ea57`: a control that changes only the prefill chunk moves teacher-forced KL by
+    0.023-0.038 at 8.5K-99K tokens (V100).
+- **Unchanged:** the adaptive tier, `pcie_frac` and `DraftPolicy`. There is still no prefill CPU
+  assist upstream.
+
+Most of #646 removes a host handshake this design never had. The transferable mechanisms:
+- a codebook held in registers, which exposed a local-memory table in our expert kernels;
+- long-context QSA selection;
+- prefill streaming and lending;
+- a warm start;
+- C > 1 scheduling around long prompts.
+
+They are ranked in §19.3.6.
+
 ### 3.2 ninfer-ext
 
 ninfer-ext is a fork of NInfer.
@@ -324,9 +402,11 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
    and 4 tokens have the same misses per accepted token (§4.2). Only rejected drafts add misses. The
    drafter must never wait on the host, and the draft length comes from a cost model that includes
    misses (ninfer-ext's MTP regression).
-6. **NVMe reads must not wait for the host.** Row identification and the device row cache belong on
-   the GPU, and the NVMe latency should be hidden behind layer 0 (both engines gather
-   synchronously).
+6. **NVMe reads must stay off the critical path.** Every token is on the host before its rows are
+   needed, and a column's 2,560 B crosses PCIe in ~1-2 µs. So the host hashes and reads the rows,
+   hidden behind the draft and layer 0 by a gate before `ple_embed` (§12.3). A device row cache
+   does not pay, because decode misses are compulsory (§12.4). Both engines gather synchronously
+   before the window.
 7. **Scale handling decides fidelity.** Engines that re-derive NVIDIA's scales (ninfer-ext's reciprocal
    divisor and per-layer input scale, the merged scales of vLLM's MoE backends) silently run a
    different model. This design imports every quantized tensor bit-exactly, keeps each expert's own
@@ -456,7 +536,7 @@ How to read the table:
 
 ```text
  ┌──────────────────────────────── RTX 5090, 32 GB ────────────────────────────────┐
- │ Dense Text: BF16 8.6 GB (A) or 8-bit 4.4 GB (B) · MTP dense · MTP FP8 experts   │
+ │ Dense Text: BF16 8.6 GB (A) or 8-bit 4.4 GB (B) · MTP dense · MTP q4 experts    │
  │ GDN and conv state · decode workspace · n-gram landing area (io buffer)         │
  │ ┌─────── frame pool: 8,153 (A) or 9,675 (B) × 2,764,800 B (21-25 GiB) ────────┐ │
  │ │ cached experts │ staging │ KV pages + loans │ prefill arena │ vision        │ │
@@ -468,7 +548,7 @@ How to read the table:
  ┌──────┴─────────────────────┴─────────────────────────┴───────────┐  ┌────┴───────────┐
  │ 96 GB host                                                       │  │ NVMe           │
  │  pinned expert banks on huge pages: 24,576 NVFP4 records         │  │ n-gram table   │
- │    (67.9 GB) + 512 FP8 MTP experts (2.5 GB)                      │  │ 52.4 GB FP8,   │
+ │    (67.9 GB)                                                     │  │ 52.4 GB FP8,   │
  │  embedding rows · n-gram row cache · mailboxes · host tiers      │  │ 4 KiB blocks   │
  │  transfer agent ─ cache policy, all DMA, residency updates       │  └────▲───────────┘
  │  CPU expert engine ─ spin workers, exact W4A4 arithmetic         │       │
@@ -480,7 +560,7 @@ A decode round at C = 1 without speculation. The host loop is not on the critica
 host learns about a layer only when it has a CPU-served miss:
 
 ```text
-round r: embed(host row) ─ layer 0 ─ [layer 1: ple_embed; verify rounds gate on host-read rows, §12.3]
+round r: embed(host row) ─ layer 0 ─ [layer 1: ple_embed reads rows the host uploaded with the io prefix, §12.3]
  per layer l:
    K1a/K1b HC_attn ─ K2/K3 (GDN) or K2q/K2b/K3a/K3b (QSA) ─ K4 out_proj + inject ─ K5a/K5b HC_mlp (x → host)
    K6 router(l, l+1): top-10 ─ residency ─ jobs ─ [miss_req → CPU] ─ [prefetch_req → agent]
@@ -499,8 +579,8 @@ Four ideas carry the design:
 - **The dense path runs at the bandwidth roofline.** Every kernel streams weights with PDL
   pre-dependency prefetch, and any stall prefetches the next layer (§8.3). Recipe B halves the
   dense bytes where quality allows (§6.1).
-- **Device memory is one pool.** Expert frames, KV, prefill arenas and vision weights share it,
-  and reserved but unwritten KV holds experts on loan (§9.2).
+- **Device memory is one pool.** Expert frames, KV, prefill arenas and vision encode windows share
+  it, and reserved but unwritten KV holds experts on loan (§9.2).
 
 ---
 
@@ -605,7 +685,7 @@ mathematics:
 | Class | Backing | Users |
 |---|---|---|
 | `device` (existing) | Uploaded at load | Dense weights |
-| `host_pinned` | Read with `O_DIRECT` into a huge-page, `cudaHostRegister`ed host arena. Never staged through the page cache. | Routed expert banks (NVFP4 and the FP8 MTP experts), embedding |
+| `host_pinned` | Read with `O_DIRECT` into a huge-page, `cudaHostRegister`ed host arena. Never staged through the page cache. | Routed expert banks (NVFP4), embedding, and the vision tower under `--vision-offload` (856 MiB, §19.3.2) |
 | `stream` | Never materialized. The Model holds an open file region plus its layout. | N-gram table |
 
 Residency is a property of a Use and the startup options, not of the stored bytes. The same artifact
@@ -625,16 +705,16 @@ boundaries ([engine architecture](engine-architecture.md)).
 | Mathematics, config, binding, block order, MTP alignment, frontend reuse (Qwen3.5 tokenizer, template, vision) | Model | `src/models/qwen4_exp/` |
 | Host-pinned expert banks, embedding bank, n-gram file region | Immutable Model data, through a new artifact residency class (§6.3) | `src/artifact/materializer.*` |
 | Weight formats `nvfp4_mul` and `fp8_e4m3fn_block128_f32`, layout `nvfp4_expert_rg16_v1`, exact import of ModelOpt multipliers and input scales | Artifact format and layout registries; converter source | `src/artifact/formats.cpp`, `layouts.cpp`; `tools/convert/sources/` |
-| Pinned huge-page host arena; unbuffered batched file reads (`ReadOnlyFile`); `upload_pinned`, and the planned `upload_pinned_when` gate and `publish_pinned_word` (§12.3); mapped mailbox and ring primitives; spin-worker pool with barriers | Core (model-independent physical and transfer primitives) | `src/core/host_pinned_arena.*`, `read_only_file*`, `device.*`, `mapped_mailbox.*`, `spin_worker_pool.*` |
+| Pinned huge-page host arena; unbuffered batched file reads (`ReadOnlyFile`); `upload_pinned`, and the planned `upload_pinned_when` gate and `publish_pinned_word` (§12.3); mapped mailbox and ring primitives; spin-worker pool with barriers; planned `download_pinned` (prefix, only if M0 confirms D2H FIFO stalls) and the `Weight` L2 class `Stream`/`Reuse` (`src/core/weight.h`, Q8 Phase 2) | Core (model-independent physical and transfer primitives) | `src/core/arena.*` (pinned buffers), `read_only_file*`, `device.*`; as built the mailbox and spin-worker team live in the Op (`src/ops/offloaded_sparse_moe/cpu/miss_service.*`, `expert_team.*`) |
 | Frame pool, residency table, staging, loans and frame leases (§9.2), epochs; transfer agent (policy, DMA, residency writes); n-gram row cache, reads and gate state (`NgramVolume`, §12.3); prefix-cache binding (§19.3.1); vision window and lane RoPE state (§19.3.2); CPU-engine lifetime | **Program** (mutable state, placement, agents; all allocated at startup) | `src/models/qwen4_exp/program/` |
 | Cache policy algorithms (LFRU, shadow replay) | Program, behind a policy interface conformance-tested against `tools/expert_cache_replay` | `src/models/qwen4_exp/program/expert_cache/` |
 | Router + top-k + residency classification + prediction; narrow-route expert kernels (GPU and CPU); wide-route grouped GEMM; combine; the MTP drafter's masked routing | **Op family** `offloaded_sparse_moe` (closed contract: output = MoE(x) independent of residency; residency, agents and mailboxes are execution resources). The drafter's routing mask is a semantic input, because it changes the result. | `include/ninfer/ops/offloaded_sparse_moe.h`, `src/ops/offloaded_sparse_moe/{route,gpu,cpu,wide}/` |
 | HC mixer and HC inject | Op `hyper_connection` | `include/ninfer/ops/hyper_connection.h` |
 | QSA prep, index-key pooling, block select, sparse attention over every KV profile | Ops `qsa_prep`, `qsa_select`; extended `softmax_attention` consumer with the existing VQ2/K4V2 window read rule | `include/ninfer/ops/qsa.h` |
 | PLE gather, projections, gate and dilated conv (stateful) | Op `ple_ngram_injection` | `include/ninfer/ops/ple.h` |
-| N-gram row ids | Op `ngram_row_ids` (exact integer oracle) | same |
+| N-gram row ids | Model frontend `NgramHash::row_ids`, called by the Program on the host (§12.3); exact integer oracle in `ninfer_qwen4_exp_ngram_hash_test` | `src/models/qwen4_exp/frontend/ngram_hash.*` |
 | Canonical routed-expert arithmetic: A4 quantizer, E2M1/E4M3 integer decode, int64 block accumulation, `exp_c` (one header compiled for CPU and GPU) | Op common code | `src/ops/common/canonical_math.h` |
-| Draft-length policy with miss cost | Program speculative backend | `src/models/qwen4_exp/program/speculative/` |
+| Draft-length policy with miss cost; joint policy at B ≥ 2 (concurrency S7) | Program | `program/program_impl.h` (`choose_draft_length`); planned `src/models/qwen4_exp/program/draft_policy.{h,cpp}` |
 | Calibration | Runtime (profile schema), Core (probes), product (`ninfer-calibrate`) | §14.7 |
 
 Residency is an **execution resource** for `offloaded_sparse_moe`, like a stream or a workspace.
@@ -693,6 +773,7 @@ Each exchange has the same structure:
 | `land_seq[frame]` u32 | device | copy stream (`cuStreamWriteValue32` after the DMA) → GPU | Landing ticket for in-flight DMAs |
 | `round_started`, `round_done` u64 | host, mapped | GPU (first and last kernel of each round) → all agents | Safe frame reuse (§9.5) and the agents' watchdog |
 | `agent_error` u32 | host, mapped | GPU (bounded-spin timeout) → engine worker | Device-side timeout report |
+| gate ready word u32 | host, pinned | engine worker (`publish_pinned_word`) → GPU (gate kernel) | Strictly increasing round value; the rows follow in the io landing area (planned, n-gram S2, §12.3) |
 
 **Ordering rules.**
 
@@ -708,10 +789,14 @@ Each exchange has the same structure:
   shared-memory flag and `__syncthreads()`. No warp-wide polling over PCIe is allowed. When many
   CTAs wait for the same host word (K7b's row tiles waiting for `done_seq`), one designated CTA
   polls the host word and republishes it to a device-memory flag, which the others poll in L2.
+  Exception: each of the n-gram gate's ≤ 16 CTAs polls the pinned ready word itself (no
+  co-residency needed; §19.3.4).
 - **Bounded spins.** Every device spin has an iteration bound worth about 2 s. On expiry the thread
   writes `agent_error`, skips the computation (outputs are undefined), and the engine worker turns
   that round into an Engine-wide failure ([engine architecture §7.4](engine-architecture.md)). Host
-  agents have a 2 s watchdog on `round_done` progress.
+  agents have a 2 s watchdog on `round_done` progress. Exception (planned, n-gram S2, §12.3): the
+  gate before `ple_embed` (`upload_pinned_when`) traps after 120 s, above Windows' 60 s disk
+  timeout (decided default, 2026-10-04).
 
 ### 8.3 Per-layer kernel sequence and time budget
 
@@ -779,10 +864,12 @@ rate are 3.6 ms and 6.1 ms.
    on this card, more than a PDL boundary. The HC mixers are therefore two kernels each. If M6 finds
    that PDL overlap does not hold in the full graph, they fall back to one cooperative kernel each,
    which is the structure the conservative column of §4.2 assumes.
-3. **Stall-time warming.** A kernel that waits on the host (K7b for CPU misses, the PLE kernel for
-   rows) executes `griddepcontrol.launch_dependents` before it waits. The next kernel's CTAs then
-   start on the free slots and prefetch their weights, and the waiting CTAs prefetch the following
-   kernel's weights into L2 (bounded to half of L2). The stall becomes progress on the next layer.
+3. **Stall-time warming.** A kernel that waits on the host (K7b for CPU misses) executes
+   `griddepcontrol.launch_dependents` before it waits. The next kernel's CTAs then start on the
+   free slots and prefetch their weights, and the waiting CTAs prefetch the following kernel's
+   weights into L2 (bounded to half of L2). The stall becomes progress on the next layer. The
+   n-gram gate before `ple_embed` (§12.3) is a plain launch: a late row read stalls layer 1
+   without warming.
 4. **Deterministic reductions.** Routed-expert sums are exact int64 (§16.2), so their order is
    free. Every floating-point split-K or cross-CTA reduction writes partials to workspace and sums
    them in a fixed order. No floating-point atomics are used, and results are run-to-run
@@ -807,7 +894,8 @@ shared expert adds split and SiLU kernels, and dense Q8 takes 3.09 ms per main f
 - **K1a/K1b** become Op `hyper_connection_mix` (Phase 1b): FP32 split-K partials, one K slice per
   stream × 41 groups of 8 rows, summed by K1b in the fixed order s = 0..3. **Deviation:** K1a takes
   each stream's sum of squares from its own slice, not the previous epilogue, so the Ops stay closed
-  (≤ 0.3 µs exposed, est.). Est. 7.6-8.9 µs per mixer, 11.4-12.9 after Phase 1a (budget 5.4).
+  (≤ 0.3 µs exposed, est.). Est. 7.6-8.9 µs per mixer, against ~11.4-12.9 µs for the five-launch
+  mixer after Phase 1a (budget 5.4 µs for K1a + K1b, recipe B): −0.34 to −0.42 ms per forward.
 - **K4/K7b injects:** `hyper_connection_linear_inject` (epilogue of the [2560, 6144] projections)
   and an inject form of `moe_combine`, still its own kernel; no stream sums. The shared expert's
   gate/up and SiLU·up become one `linear_swiglu` call.
@@ -983,12 +1071,11 @@ but moves work off it:
 
 1. The decode graph ends with these steps:
    - sampling;
-   - the new token's n-gram row ids (§12.3);
-   - the L0 probe;
-   - NVMe request publication;
    - the token written to the mapped egress slot;
    - `round_done` (§8.2).
-2. Ingress needs no host gather: embedding and PLE inputs are device- or agent-produced.
+2. Ingress: the embedding row is host-resident. The engine worker hashes the n-gram row ids and
+   reads the rows (§12.3). As built, the rows go up with the io prefix before the launch. Planned
+   (n-gram S2): verify rounds read them after the launch, behind a gate before `ple_embed`.
 
 The engine's per-round host time is measured in M6. If the GPU idles more than 3% of a token
 between rounds, option H6 (chained rounds) is built.
@@ -1071,7 +1158,7 @@ allocation:
 | `kv` | KV pages. The paged KV store is backed by frames, and a KV page size that divides 2,764,800 B is chosen per KV format: 4 KiB multiples whose count divides 675 = 3³ × 5². |
 | `loan` | A frame inside a KV or prefill reservation that currently holds a clean expert (§9.2) |
 | `prefill` | Prefill staging and workspace (§13) |
-| `vision` | Vision tower weights and activations while a vision request runs |
+| `vision` | Lent to a vision request: its output handoff (5,120 B per image token, held until its last prefill chunk is enqueued) and, only when the encode window does not fit `work_` in one step, the window's weight staging and activations (placement L, §19.3.2). Offloaded tower weights stay in pinned host RAM. |
 
 The frame count is a startup decision (§15.1). In the primary configuration (`int8` KV, 262K
 context) the pool has 8,153 frames with recipe A and 9,675 with recipe B, of which the KV
@@ -1340,8 +1427,11 @@ the pool). M5 sets the value from the measured admission distribution.
 
 As built, the Program is synchronous: `after_round` runs on a quiescent compute stream, and its
 `on_quiescent` frees every retired frame and drains the queue before the next round. Slack
-frames would never hold an expert, so it uses none (D = 0). The code had reserved
-min(F/8, 512) = 512 frames. An asynchronous transfer agent that overlaps rounds needs slack again.
+frames would never hold an expert, so it uses none (slack 0). The controller is still built with one
+round in flight (`rounds_in_flight = 1`, `expert_residency.cpp:33-34`). Because `after_round`
+always reaches `on_quiescent` (`:130`), no evicted frame is pending at a round boundary; vision
+lending asserts this (§19.3.2). The code had reserved min(F/8, 512) = 512 frames. An asynchronous
+transfer agent that overlaps rounds needs slack again.
 
 When the engine worker has synchronized the compute stream (no round in flight, for example
 between requests or before a prefill), every pending frame is reusable at once. The same rule
@@ -1615,16 +1705,18 @@ tok/s (older build) against 72 aggregate for plain C = 2.
 - **Decided (default, 2026-10-04): the speculation gate.** Only one-row rounds draft; at B ≥ 2 rows
   decode plain (≤ 8 columns, SIMT routes) and the drafter follows by the W = 1 catch-up, so greedy
   output at C ≤ 8 should equal C = 1 (inference, checked by byte identity). Expected C = 2: ~68-72
-  tok/s fill, ~120-135 warm, against ~40-55 at HEAD (model). Internal until S7 decides.
+  tok/s fill, ~120-135 warm, against ~40-55 at HEAD (model). No product option: an environment
+  override in a local measurement build toggles it until S7 decides.
 - **Planned, only if it beats the gate at C = 2 and C = 4 in fill, turnover and warm:** masked
   fillers (route −1: no jobs, no n-gram reads) and a joint policy. For each W a Dinkelbach search
-  takes each row's K_b as the prefix with p_{b,j} ≥ λ·c_B, maximizing (B + Σ p) /
-  (1 + g_B (W − 1) + c_B ΣK); W = 1 stays a candidate, and B = 1 keeps the policy above
-  (`kWidthCost = g_1 + c_1`).
-  g_B and c_B are fitted per cache regime from the round table. Model: +20-30 % at C = 2, ~+16 % at
-  C = 4 cold, ~0 warm. Blocks of B·W > 8 columns may then differ from C = 1 at near-ties: dense Q8
-  is column-invariant to 16 columns (§19.3.3), BF16 dense, QSA verification attention and the GDN
-  record are not. Decided (default): no separate invariance task.
+  takes each row's K_b as the prefix with p_{b,j} ≥ λ·c_B, maximizing (B + Σ p) / (1 + g_B
+  (W − 1) + c_B ΣK); W = 1 stays a candidate, and B = 1 keeps the policy above
+  (`kWidthCost = g_1 + c_1`). g_B and c_B are fitted per cache regime from the round table. Model:
+  +20-30 % at C = 2 in fill, turnover and warm; ~+16 % at C = 4 cold or turnover; ~0 at C = 4 warm.
+  Blocks of B·W > 8 columns may then differ from C = 1 at near-ties: dense Q8 becomes
+  column-invariant to 16 columns only with Q8 Phase 1a-ii (§19.3.3; today it switches to MMA tiles
+  above 8 columns), and BF16 dense, QSA verification attention and the GDN record are not. **Decided
+  (default, 2026-10-04):** no separate invariance task.
 
 ### 11.4 Overlap
 
@@ -1649,8 +1741,9 @@ tok/s (older build) against 72 aggregate for plain C = 2.
   hiding window is layer 0: ≈ 84 µs with recipe B and ≈ 134 µs with recipe A on the §8.3 budget,
   longer when layer 0 has a CPU miss. In the replay traces, layer 0 is among the most-missed
   layers.
-- Measured random 4 KiB reads at QD1 on current PCIe 4.0/5.0 NVMe drives take 33-44 µs with polled
-  completion, inside that window.
+- Random 4 KiB reads at QD1 on current PCIe 4.0/5.0 NVMe drives take 33-44 µs with polled io_uring
+  completion (published figures, other drives); this machine's Windows path is unmeasured at QD 1
+  (§12.4).
 - The table must stay off the page cache. RAM is fully budgeted (§15.2).
 
 ### 12.2 NVMe layout
@@ -1679,9 +1772,14 @@ the host io buffer and up with the io prefix (`upload_pinned`; prefill: the whol
 
 **Planned.**
 
+- **S0, first.** Permanent `NgramVolume` counters and a per-request diagnostic line; temporary
+  host-phase timers, event-timed after-draft GPU idle, an n-gram-cold toggle, and S0b, a
+  `device_.flush()` probe after the verify launch. S0's table replaces the §12.4 estimates and
+  decides S3.
 - **S1.** `ReadOnlyFile::read_direct_blocks`: a rolling, polled ring of 64 in-flight 4 KiB reads,
   no per-call events, no deadline; misses deduped per block; the bounce buffer (up to ~268 MB
-  today) fixed at 256 KiB; counters on a per-request diagnostic line.
+  today) fixed at 256 KiB; counters on a per-request diagnostic line. S1b: a standalone
+  multi-issuer probe (1, 2, 4 issuers); ≥ 1.6× one issuer triggers S4c.
 - **S2, gated verification.** A Core gate, `upload_pinned_when`, copies the rows in the verify graph
   before `ple_embed` once a pinned ready word equals the round's device word (strictly increasing,
   so a stale word never matches). The engine thread reads anchor columns while the drafter runs and
@@ -1690,7 +1788,7 @@ the host io buffer and up with the io prefix (`upload_pinned`; prefill: the whol
   verify round; other calls unchanged.
 - **S3, conditional.** A new exact Op, `speculative_assemble_verify_tokens`, builds the verify ids
   on the device: no host round trip between drafting and verification (~10-15 µs of nodes). Only if
-  S0 measures ≥ 0.15 ms of after-draft GPU idle per round.
+  S0's events still measure ≥ 0.15 ms of after-draft GPU idle per round after S0b and S2.
 - **Parked (S4):** draft-token mailbox, plain-round gate, multi-issuer reads, gated prefill.
   **Rejected:** an agent thread (the engine thread already spins there), speculative prefetch, a
   larger or associative decode cache, filler-row reuse, a read deadline that fails the round.
@@ -1702,7 +1800,7 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
 ### 12.4 Exposure and its acceptance
 
 - **Inputs.** ~4.3-4.8 µs per random 4 KiB read, one issuer (measured, §19.2); QD-1 latency
-  unmeasured. First-time text hits 1.5-64 %, within 0.2-2.5 pp of an infinite cache; repeated text
+  unmeasured. First-time text hits 1.5-64 %, within 0-2.5 pp of an infinite cache; repeated text
   misses 0.3-0.7 rows per MTP round (simulated, real tokenizer).
 - **Today every read is exposed.** The ~0.5 ms after-draft gap (§19.2) was measured on tg512, whose
   repetitions regenerate one text into a cache that outlives the request: host turnaround, not
@@ -1710,12 +1808,18 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
 - **With the gate** reads hide behind block 0 (~0.5-0.59 ms at W = 4-5) and the draft (~0.8-1.2 ms,
   est.); a slow read stalls the GPU at layer 1, not the engine. Reads over 100 ms per round warn,
   which also shows NVMe power-state exits (50-150 ms on some drives).
-- **Expected (est.):** warm MTP +0.5-1.9 %, first-time MTP +1.2-3.4 %, plain 0-0.3 %, cold prefill
-  −87 to −148 ms per 4K chunk (29-50 % fewer reads).
+- **Expected (est.), after S2 + S3 (S3 only past its S0 threshold):** warm MTP +0.5-1.9 % (S2 alone
+  ~0-0.15 %), first-time MTP +1.2-3.4 % (S2 alone +0.7-1.7 %), plain 0-0.3 % (S0b flush only),
+  cold prefill −87 to −148 ms per 4K chunk (S1, 29-50 % fewer reads).
 - **Acceptance.** Greedy ids unchanged (C = 1 plain and MTP, the C = 2 MTP pair); ABBA, ≥ 5 reps.
-  S2: n-gram-cold MTP faster beyond noise, warm within noise, mean gate wait ≤ 10 µs. S3: hit rate
-  within ±0.5 pp. Refit `kWidthCost` if its slope moves > 0.02. tg512 and repeated serve requests
-  are n-gram-warm, so n-gram changes are judged on n-gram-cold runs.
+  S0b: warm MTP better by > 2 × the pooled standard error, nothing worse beyond its noise. S1:
+  cold-prefill block reads equal the distinct missing blocks (−29 to −50 % per 4K chunk) and pp4096
+  is not slower; decode within noise; bounce memory fixed at 256 KiB. S2: n-gram-cold MTP faster
+  beyond noise, warm within noise, mean gate wait ≤ 10 µs. S3 (built only if S0's events still
+  measure ≥ 0.15 ms of after-draft idle after S0b and S2): warm and cold MTP faster beyond noise,
+  expert hit rate within ±0.5 pp, C = 2 ids identical. Refit `kWidthCost` if its slope moves by more
+  than 0.02. tg512 and repeated serve requests are n-gram-warm, so n-gram changes are judged on
+  n-gram-cold runs.
 
 ---
 
@@ -1771,8 +1875,10 @@ process-wide fault seam for the engine test; S3 only past its threshold; S4 park
   block** when the block completes. They are stored in a BF16 index-key plane beside KV (§8.10), so
   select scans one 128-wide key per block. This is the same insight as ninfer-ext's `697ff0c7`,
   built into the KV layout rather than recomputed per call.
-- **PLE rows** for chunk i+1 are computed on the GPU, deduplicated, probed in L0/L1, sorted by
-  block and read at QD 256 while chunk i computes (§12.3).
+- **PLE rows** for a chunk are hashed and read on the host before its launch and uploaded with the
+  io layout (§12.3). After n-gram S1, each distinct 4 KiB block is read once (−29 to −50 % reads
+  per cold 4K chunk, −87 to −148 ms). Reading chunk i+1's rows while chunk i computes (gated
+  prefill, S4d) is parked (§19.3.4).
 - **MTP KV for the prompt** is built in batch from the chunk residuals.
 
 ---
@@ -1805,7 +1911,7 @@ configurations that give the same numerical results: it changes speed, never out
 - Online adaptation can only explore what it can change safely mid-request: continuous knobs with
   smooth effects.
 - Worker count and placement, page backing (THP vs hugetlbfs 2 MiB or 1 GiB), the CPU kernel
-  variant, NVMe I/O mode, the RAM split between the PLE L1 cache and the KV host tier, and the
+  variant, NVMe I/O mode, the RAM split between the prefix Host tier and the KV host tier, and the
   long-context KV-tier threshold are **structural**. They need a restart or a reallocation, or they
   behave discontinuously. Exploring them online would cause latency spikes.
 - A calibrated starting point also means the first requests run at full speed. Online estimators
@@ -1820,7 +1926,7 @@ configurations that give the same numerical results: it changes speed, never out
 - CPU model, ISA flags, P/E or CCD topology (cpuid, sysfs);
 - installed memory, DIMM count and speed (sysfs/SMBIOS when readable);
 - NUMA layout;
-- NVMe model and firmware, and whether polled queues are enabled (`nvme poll_queues`);
+- NVMe model and firmware;
 - huge-page pools, THP mode, `RLIMIT_MEMLOCK`;
 - the kernel version.
 
@@ -1845,9 +1951,9 @@ repetitions and reports median and range:
 | **DRAM contention curve:** CPU read bandwidth while H2D DMA runs at 0 / 25 / 50 / 100% | Concurrent runs | Arbiter and token-bucket model (§8.6, §8.7). Host DRAM is the shared bottleneck. |
 | CPU W4A4 expert kernel: each compiled variant (AVX-512 VNNI, AVX-VNNI-INT8, AVX-VNNI, AVX2), T ∈ {1, 2, 4, 8}, worker counts, SMT on/off, prefetch distance, cold and L2-warmed | Real expert records | Kernel variant, worker set, service-rate table t_cpu(n_experts, T), warmed-miss time for H2 |
 | GPU↔CPU mailbox round trip | Mapped-memory publish → host spin → completion → device acquire | Handshake term in the cost model |
-| NVMe random 4 KiB reads at QD 1-256 on the n-gram file, for `O_DIRECT` + io_uring with and without SQPOLL/IOPOLL | Random row ids | I/O mode, queue depth, expected PLE latency; whether layer 0 hides it (§12.3) |
+| NVMe random 4 KiB unbuffered reads on the n-gram file: QD-1 latency, and batches of 64-4,096 with 1, 2 and 4 issuers (n-gram S1b) | Random row ids | Whether multi-issuer reads (S4c) pay; expected exposure behind the gate (§12.4) |
 | Huge pages | DMA and CPU bandwidth over THP 2 MiB, hugetlbfs 2 MiB and 1 GiB; `cudaHostRegister` time of the 70 GB arena for each backing | Page backing of the expert arena; startup time |
-| Host RAM budget | Free and reclaimable RAM after the pinned expert arena, the page cache the n-gram volume needs and the OS reserve | One joint budget for pinned arena, L1 PLE row cache and KV host tier, so pinning never starves the page cache (TensorSharp sizes these separately and can over-commit) |
+| Host RAM budget | Free and reclaimable RAM after the pinned expert arena, the page cache the n-gram volume needs and the OS reserve | One joint budget for the pinned arena, Vision pins, the prefix Host tier (§19.3.1) and the KV host tier (the n-gram row cache is a fixed ~168 MB, §12.3), so pinning never starves the page cache (TensorSharp sizes these separately and can over-commit) |
 | Worker wake-up | Spin-then-park threshold and futex wake latency per core type | The CPU team's idle policy (§10.3) |
 | Copy-engine submission latency | `cudaMemcpyBatchAsync` call → `land_seq` visible on the device, for 1-16 experts | Prefetch window model (§8.7) |
 | GPU sanity | HBM read probe vs the 1,674.5 GB/s sustained-read reference, memory clock under CUDA load, fixed-shape decode kernels vs the §8.3 budget | Detects power or memory-clock limits, a downtrained link or a busy GPU, and refuses to calibrate on a disturbed machine |
@@ -1876,9 +1982,9 @@ The fitted model replaces the generic assumptions in §4.2 for this host. It als
      - worker set (incl. E-cores, SMT);
      - CPU kernel variant;
      - page backing;
-     - NVMe mode and queue depth;
+     - n-gram read issuers (S1b);
      - prefetch on/off, k′ and depth;
-     - RAM split between the L1 row cache and the KV host tier;
+     - RAM split between the prefix Host tier and the KV host tier;
      - KV-tier threshold;
      - maximum prefill chunk and the CPU-assist threshold;
      - maximum draft length and n-gram copy proposals.
@@ -1945,7 +2051,7 @@ A different GPU is outside the product scope (§1.4).
 | `--calibrate`: `pcie_frac` {0, 0.2, 0.35, 0.55, 0.75}, `spec_min_p` {0.3, 0.5, 0.7}, workers {default, ⅔, ½}; keep if > 3% | Miss split and draft length become **online** cost-model decisions, seeded by Stage 2. Workers are chosen in Stage 1 by measured service rate and verified in Stage 3. The acceptance rule is noise-aware. |
 | PCIe probe, which only matters below 20 GB/s | Full DMA size curve, plus the DRAM contention curve that the arbiter needs |
 | CPU ISA detection | ISA dispatch plus measured variant choice per ISA |
-| Static PLE I/O settings (256 in flight, 1M-row cache) | Measured NVMe mode and queue depth; L1 size from the RAM plan and Stage 3 |
+| Static PLE I/O settings (256 in flight, 1M-row cache) | A fixed 2^20-row host cache and a 64-deep rolling read ring (§12.3); issuer count from the S1b probe |
 | 4 KiB fallback when no huge pages | Huge pages measured. Missing huge pages produce explicit advice, not a silent slowdown. |
 | Prefill chunk ladder, ring sizes | Planned per request from the frame pool (§13). Ring sizes are fixed. |
 | Adaptive tier constants | LFRU with Stage 4 fit and online shadow replay |
@@ -1991,8 +2097,7 @@ frames (§9.1), so the frame pool below includes the KV reservation.
 | MTP expert pool (128 × 4.9 MB FP8) | 0.59 | 0.59 |
 | GDN, PLE, conv state | 0.12 | 0.12 |
 | Workspace (decode), mailboxes, residency/score tables | 0.60 | 0.60 |
-| L0 PLE row cache | 0.06 | 0.06 |
-| Slack | 0.40 | 0.40 |
+| Slack (includes the 0.06 GiB of the removed device row cache; n-gram rows land in the decode io buffer, §12.3) | 0.46 | 0.46 |
 | **Frame pool, including the KV reservation** | **≈ 20.99** | **≈ 24.91** |
 | Frames (2.64 MiB each) | 8,153 | 9,675 |
 
@@ -2027,11 +2132,11 @@ the context has filled, without the host tier:
 Each GB of KV costs ~362 frames. The host tier holds every profile near its 4K frame count, at the
 host-RAM cost in §15.2.
 
-### 15.2 Host RAM: 96 GB (2 × 48 GB = 96 GiB; ≈ 93 GiB ≈ 100 GB visible)
+### 15.2 Host RAM: 96 GB (2 × 48 GB = 96 GiB; 95.8 GiB visible)
 
 | Item | GB |
 |---|---:|
-| Expert banks: 24,576 × 2.7648 MB NVFP4 + 512 × 4.9164 MB FP8, pinned huge pages | 70.5 |
+| Expert banks: 24,576 × 2.7648 MB NVFP4, pinned huge pages (MTP experts are device-resident q4, §6.1) | 67.95 |
 | Embedding (BF16), pinned | 1.27 |
 | N-gram row cache, 2^20 rows, pageable (§12.3) | 0.17 |
 | Mailboxes, io and landing buffers | 0.2 |
@@ -2039,8 +2144,8 @@ host-RAM cost in §15.2.
 | Vision offload: pinned tower 0.90 (856 MiB) + live media ≥ 0.4 (§19.3.2) | 0-1.3 |
 | QSA KV host tier (§9.6) at 262K: **3.6 (`int8`, primary)**; 0.9 (`vq2`), 3.5 (`fp8`), 7.0 (`bf16`) | 0-7.0 |
 | Process: tokenizer, server, frontend | ~1.5 |
-| **Total NInfer** | **~81.5 in the primary configuration at 262K** (~83 with Vision); ~78 below the tier threshold; ~85 with a `bf16` tier |
-| OS, desktop, page cache headroom | ~18.5 in the primary configuration (~17 with Vision); ~22 or ~15 |
+| **Total NInfer** | **~79 in the primary configuration at 262K** (~80.3 with Vision); ~75.4 below the tier threshold; ~82.4 with a `bf16` tier |
+| OS, desktop, page cache headroom (of 102.8 GB = 95.8 GiB visible) | ~24 in the primary configuration (~22.5 with Vision); ~27.5 or ~20.5 |
 
 Additional rules:
 
@@ -2049,13 +2154,13 @@ Additional rules:
   `cudaHostRegister` time for each page backing (§14.2).
 - **Startup check.** Startup verifies `RLIMIT_MEMLOCK` and `MemAvailable` against this plan,
   including the host tier the chosen context and KV profile need, and fails with a precise message.
-  It does not swap.
-  As built, the loader refuses a pinned block that would leave < 8 GiB available
+  It does not swap. As built, the loader refuses a pinned block that would leave < 8 GiB available
   (`kPinnedHostReserveBytes`); 64.47 GiB is pinned (§19.2). The prefix tier is resolved after model
   and Vision load: the request, or `min(4 GiB, available − 8 GiB − vision media reserve)`. An
-  explicit size below that floor fails; under 126 slabs (≈ 118 MB) the tier is off with a warning.
-  **Decided (default, 2026-10-04):** 4 GiB; alternative 8-12 GiB for ~100K-token agentic sessions
-  when ≥ 16 GiB stays free.
+  explicit size that would leave less than 8 GiB plus the vision media reserve available fails at
+  startup with the materializer's message; under 126 slabs (≈ 118 MB) the tier is off with a
+  warning. **Decided (default, 2026-10-04):** 4 GiB; alternative 8-12 GiB for ~100K-token agentic
+  sessions when ≥ 16 GiB stays free.
 - **Machines with less than ~88 GB of RAM** are outside the supported range. Exclusive VRAM/host
   residency (an expert lives in exactly one tier) could support 64 GB machines later. It is listed
   as a future option and is not designed here.
@@ -2266,23 +2371,26 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
 - **Exact import.** Recipe A's word equality (§16.3) runs on the real artifact.
 - **KV profiles.** Decode and prefill run under every `--kv-dtype`; selection is identical across
   profiles on near-tie-free fixtures.
-- **PLE.** L0, L1 and NVMe service give exact equality.
+- **PLE.** Host-cache hits and NVMe reads give exact equality, and a delayed, poisoned producer
+  behind the gate gives the same ids (§19.3.4 tests 2, 3 and 5).
 - **Policy conformance.** For recorded route logs, the transfer agent's LFRU victim and promotion
   decisions equal `tools/expert_cache_replay`'s decisions, step for step. Ties are broken by expert
   id.
 - **Protocol stress.** Injected random delays (0-500 µs) are applied in:
   - CPU workers;
   - the transfer agent;
-  - the NVMe agent;
+  - the n-gram reads (producer delay behind the gate);
   - DMA completion.
 
   Outputs stay exact, and no frame is reused before its retire epoch. The latter is checked by a
   debug build that poisons retired frames.
 - **Fault injection.** Each of these reaches the Engine-wide failure path within the 2 s bound:
-  - an NVMe read error;
   - CPU worker death;
   - an agent stall;
   - a device spin timeout.
+
+  An NVMe read error is rethrown unchanged after the gate is published and takes the worker-crash
+  path (§12.3; §19.3.4 test 5c).
 
 ### 16.5 Precision boundaries and measured quality (2026-10-04, RTX 5090)
 
@@ -2396,8 +2504,10 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 | `--cache-state PATH\|off` | state dir | Load and save the LFRU state and ranking |
 | `--record-routing PATH` | off | Opt-in route log, expert ids only, for calibration Stage 4 and M1 |
 | `--ngram-volume FILE` | `<artifact>.ngram` | N-gram table volume, which may sit on another NVMe drive (§12.3) |
-| `--no-prefix-reuse` | existing | **Changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
+| `--no-prefix-reuse` | existing (reuse on in `ninfer-serve`; `ninfer` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
 | `--host-cache-mib N`, `--device-snapshot-slots N` | 4096 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
+| `--prefix-cache-file PATH` | existing (off) | Prefix-cache persistence; for this model blocks also store `mtp_next` and snapshots their meta. Decided (default, 2026-10-04): built after P6, since any rebuild invalidates it (§19.3.1) |
+| `--kv-capacity N\|auto` | existing | Plus one copy-on-write page per lane (0.34 frames each) for prefix resumes (§19.3.1) |
 | `--vision-offload auto\|on\|off` | `auto`: on here, off for Qwen3.5 | Vision weights in pinned host RAM, streamed per window (§19.3.2) |
 | `--kv-host-tier auto\|off\|TOKENS` | `auto` (65,536) | QSA KV host tier threshold (§9.6) |
 | `--hugepages auto\|1g\|2m\|thp` | `auto` | Backing of the pinned expert arena |
@@ -3123,25 +3233,32 @@ server, then each alone.
   under MTP is not tuned; C = 1 is the recommended setting for now.
 
 **Next.** Five tracks, planned and adversarially reviewed on 2026-10-04, are in §19.3 with their
-decisions, steps, tests and exit criteria. Order by expected gain (est.):
+decisions, steps, tests and exit criteria. Listed by track with expected gains (est.); the work and
+merge order is §19.3.0's:
 
 1. **Prefix cache** (§19.3.1), P0-P6, ~12 days: a 32K chat turn from 50-75 s to ~2.4-2.8 s to first
    token; P7 (CPU assist) if its gate passes.
 2. **Concurrency gate and diagnostics** (§19.3.5, S1-S2), ~1 day: C = 2 with MTP from ~40-55 to
    ~68-72 tok/s cold.
-3. **Q8 kernels** (§19.3.3), Phase 0 and 1a, ~5 days, bit-exact at T ≤ 8: −0.7 to −1.1 ms per main
-   forward at T = 1, and no T = 9-64 MMA cliff (~14-20 ms per forward, inferred); then 1b and 2.
+3. **Q8 kernels** (§19.3.3), Phase 0 and 1a, ~5 days, bit-exact at T ≤ 8: −0.7 to −0.9 ms per main
+   forward at T = 1 (−1.1 to −1.5 ms at W = 4), and no T = 9-64 MMA cliff (~14-20 ms per forward,
+   inferred); then 1b and 2.
 4. **N-gram reads** (§19.3.4), S0-S2, ~3 days: +0.7-1.7 % on first-time MTP text.
-5. **Vision** (§19.3.2), ~12-13 days, a new capability; steps 0 and 3 can land earlier.
-6. Concurrency S3-S5; S6 + S7 last, only against the gate.
+5. **Vision** (§19.3.2), ~12.5-13.5 days, a new capability; V3 (the load-serial ABA fix) merges
+   early, and V0, V1, V3 and V5 can be developed in parallel (§19.3.0).
+6. **Concurrency S3-S5** (§19.3.5), ~4-4.5 days: C = 1 MTP fill 69/63 → 89/78 tok/s and C = 4 fill
+   85 → 107 (model, DRAM 70 / 55 GB/s; S3 gains nothing at C = 1 at 55 GB/s); S6 + S7 last, only if
+   they beat the gate at C = 2 and C = 4 in every regime and the user accepts concurrency-dependent
+   output at near-ties.
 
-Tracks share code (§21). Not in a track yet: the A4 tensor-core wide route for experts with > 8
-columns (§13; `gate_up` + `down` are 45 % of a 4K prompt); frames lent to the prefill arena (§9.2);
-BF16 tensor-core routes for text prefill, whose QSA QKVG group runs on the scalar fallback at
-13.2 TFLOP/s (measured; ~0.45 s per 8K prefill, est.; decided (default, 2026-10-04): a separate task
-with its own quality gate, after vision step 0); the QSA QKVG split from the indexer (~1 % of
-decode; reconversion); plain-round commit overlap (`after_round` ~0.5 ms of host time with no GPU
-work queued); the CPU miss service's idle `sleep_for(50 µs)` (≥ 1 ms on Windows, est.).
+Tracks share code; the rules and merge order are in §19.3.0 (risk in §21). Not in a track yet: the
+A4 tensor-core wide route for experts with > 8 columns (§13; `gate_up` + `down` are 45 % of a 4K
+prompt); frames lent to the prefill arena (§9.2); BF16 tensor-core routes for text prefill, whose
+QSA QKVG group runs on the scalar fallback at 13.2 TFLOP/s (measured; ~0.45 s per 8K prefill, est.;
+decided (default, 2026-10-04): a separate task with its own quality gate, after vision V0); the QSA
+QKVG split from the indexer (~1 % of decode; reconversion); plain-round commit overlap
+(`after_round` ~0.5 ms of host time with no GPU work queued); the CPU miss service's idle
+`sleep_for(50 µs)` (≥ 1 ms on Windows, est.).
 
 **For the user:** an x16 link would roughly double miss bandwidth.
 
@@ -3150,59 +3267,55 @@ work queued); the CPU miss service's idle `sleep_for(50 µs)` (≥ 1 ms on Windo
 On 2026-10-04 the user asked for five next items, designed in parallel (fan-out allowed): a prefix
 cache, vision with the tower offloaded, faster dense Q8 decode kernels for the small Flash-Next
 shapes, n-gram row reads overlapped with the round, and speculative throughput at C > 1. Each was
-designed read-only against `46a56fc8f` and revised after two adversarial reviews whose findings
-were checked in code. Nothing is implemented. Numbers are **measured** (with the source),
-**model** (`concurrency_model.py`, about ±30 %) or **estimated**. The plans and their review
-dispositions are in `local/workdirs/fn/plans/`. Step and measurement names are local to each
-track (prefix P0-P9 and M0-M9, vision steps 0-8, kernels Phase 0-3, n-gram S0-S4, concurrency
-S1-S7), not the milestones of §19.
+designed read-only against `46a56fc8f` and revised after adversarial review (two rounds for the
+prefix cache and vision, one for the other three), whose findings were checked in code. Nothing is
+implemented. Numbers are **measured** (with the source), **model** (`concurrency_model.py`, about
+±30 %) or **estimated**. The plans and their review dispositions are in `local/workdirs/fn/plans/`.
+§19.3.6 adds the options taken from Strata v0.1.39 on 2026-10-04 (`strata-review.md`,
+`strata-amendments.md` there) and names the steps they amend.
+Step and measurement names are local to each track (prefix P0-P9 and M0-M9, vision V0-V8, VT1-VT9
+and VM1-VM8, kernels Phase 0-3 and M0-M4, n-gram S0-S4 and W1-W7, concurrency S1-S7 and the deferred
+ragged layout P6), not the milestones of §19; outside their own section they are qualified with the
+track name.
 
-**Can Qwen4Exp use NInfer's existing prefix cache?** Yes, with no new system, but not as-is. The
-Engine surface (`HybridResourceManager`, `EngineCore`) and the frontend keys and hints
-(`block_hashes`, `block_extras`, `tap_hints`, the generation opener) are reused unchanged. The
-index, tap planner, cost model and Host-restore planner (`src/runtime/prefix_cache/`) gain four
-generic extensions: Host-born snapshots, zero Device snapshot slots, `insert_block` without Device
-adoption, and a saturating per-call prefill cost. The binding is a new Qwen4Exp sibling of
-`HybridPrefixCache`, and the orchestration mirrors `hybrid_program.cpp`, because four facts
-differ. VRAM is expert frames: cached blocks live in idle KV pages, 110.3 MiB state snapshots go
-to pinned Host RAM, and the only new VRAM is one 0.93 MB copy-on-write page per lane (0.34
-frames). A prefill call's fixed cost is staging its distinct non-resident experts (~1.28 s from
-≳ 200 tokens), so exact taps must not add calls and tiny calls are CPU-served. The MTP drafter's
-KV is a 13th layer of the same page group, so nodes and snapshots record the next token their last
-MTP cell encodes. The copy engines run FIFO across streams (H2D measured, §19.2), so restores
-queue behind the inputs of the call they feed. Estimated: a 32K-token chat turn reaches its first
-token in ~2.4-2.8 s instead of 50-75 s, a 50-token tool result in ~0.85-0.95 s (~0.3-0.45 s with
-prefill CPU assist); decode is unchanged.
+**Can Qwen4Exp use NInfer's existing prefix cache?** Yes, with no new system but not as-is: a
+Qwen4Exp binding plus four generic index and cost extensions, estimated to bring a 32K chat turn's
+first token from 50-75 s to ~2.4-2.8 s with decode unchanged (§19.3.1, Answer).
 
 ### 19.3.0 Order of work and integration
 
 #### Tracks
 
 Efforts are estimates in engineer-days; gains are estimates unless marked. Concurrency pairs such
-as 75/64 are model results at 70/55 GB/s of host DRAM bandwidth.
+as 75/64 are model results (`concurrency_model.py`, ±30 %) at 70/55 GB/s of host DRAM bandwidth;
+figures that include verification rounds are already scaled by ~0.8 for the model's measured
+optimism (§19.3.5), plain-round figures are not. The Strata v0.1.39 review (2026-10-04) added
+steps to the kernels, n-gram, concurrency and prefix tracks and proposed three items outside them
+(§19.3.6). The rows below include those additions.
 
 | Track | Goal | Steps | Effort | Expected gain | Main risk | Depends on |
 |---|---|---|---|---|---|---|
-| **Prefix cache** (§19.3.1) | Resume a turn from cached KV blocks and state snapshots instead of re-prefilling the conversation | P0 prep (`mtp_cells`, CPU-served calls ≤ 8 columns, QSA tails fix); P1 generic index and cost extensions; P2 state image; P3 binding and orchestration; P4 per-layer pipelining, copy-engine order; P5 tap-aware call planner; P6 Engine, serve, docs; P7 prefill CPU assist (gated by prefix M6); P8 C > 1 extras; P9 shared Host-tier helper | P0-P6 ≈ 12 d, with P7 ≈ 15 d; P8 and P9 1.5 d each; ~3-4K lines + ~1.3K test lines | 32K chat turn 2.4-2.8 s vs 50-75 s; 50-token tool result after a 32K echo 0.85-0.95 s (0.3-0.45 s with P7); decode unchanged | MTP drafter-state edge cases, invisible at C = 1 greedy (bitwise drafter oracle D1); copy-engine FIFO stalls; pinned Host RAM | Base split; concurrency S3-S5 before P7; vision's prompt RoPE state for image suffixes |
-| **Vision** (§19.3.2) | Images and video for Qwen4Exp, tower weights (898 MB BF16) in pinned host RAM, streamed per encode window | 0 tensor-core BF16 routes for 8 tower shapes; 1 QSA M-RoPE op; 2 RoPE plumbing (`[T,3]` in every call); 3 load serial (ABA fix); 4 frame lending; 5 shared tower refactor, loading, flags; 6 Program window; 7 FP64 references and real tests; 8 measurements and docs | ≈ 12-13 d | No reconversion. Tower GEMMs for a 256-token image 6-9 ms vs 65 ms on today's scalar fallback; offload adds ~22-30 ms per small image, ~2 ms at ≥ 1K image tokens; resident weights would cost 325 frames ≈ 1.3 % of all decode | M-RoPE plumbing touches every attention call (text logits must stay bitwise equal) and is invisible below 2,051 tokens; three-stream ordering with lent frames; Qwen3.5 and Quasar requalification | Prefix P0 tails fix in `qsa.cu`; n-gram S1 de-duplication; concurrency S4 in the frame pool |
-| **Q8 kernels** (§19.3.3) | Dense Q8 decode near DRAM bandwidth at T ≤ 8 (small shapes run at 0.6-0.7 TB/s, **measured**) and off the MMA-tile cliff at T = 9-64 | Phase 0 bit-exact non-Q8 fixes (one small dispatch kernel with the route log, router reorder, RMSNorm d = 10240); 1a-i register-streamed K1 for all 10 shapes, bit-exact at T ≤ 8; 1a-ii T = 9-64; 1b fused mixer, inject and SwiGLU (rounding change); 2 PDL, L2 warming in `cpu_wait`, `Weight` L2 class; 3 tensor-core K2 only on trigger | 9.5-12 agent-days, + 2-3 for Phase 3 | Per main forward: Phase 0 −0.33 to −0.6 ms; 1a −0.41 to −0.51 ms at T = 1 (of 3.09), −0.75 to −0.91 at W = 4 (of 3.62), ≈ −11 to −17 ms at T = 9-16; 1b −0.55 to −0.7 ms; 2 −0.15 to −0.45 ms. End to end typically 50-80 % of kernel deltas | The T > 8 case rests on one measured point ([2560,2560], 31.1 µs at 12-16 columns); K1 bit-exactness; 1b moves the tg512 text, hit-rate and acceptance baselines | Nothing for Phase 0 and 1a; `moe_layer.cu` with concurrency S3 and S6 |
-| **n-gram overlap** (§19.3.4) | Hide PLE row reads and the after-draft host turnaround | S0 attribution and flush probe; S1 deduplicated, ring-buffered volume reads; S1b multi-issuer probe; S2 gated verification (rows read after the graph launch); S3 device-assembled verification (conditional); S4 parked follow-ons | ~5.5 d + 4-5 h GPU | Warm tg512 MTP +0.5-1.9 %; first-time text MTP +1.2-3.4 %; plain 0-0.3 %; cold prefill −87 to −148 ms per 4K chunk | Gains near run-to-run noise (±0.4-0.75 tok/s); long gate waits under WDDM; host stalls move inside the graph | Core `device` primitives (additive); `verify()` and `mtp_draft` shared with concurrency S1, S6, S7 |
-| **Concurrency** (§19.3.5) | C > 1 with speculation no slower than plain C > 1, and faster cold C = 1 | S1 per-round speculation gate (draft only when B = 1); S2 diagnostics; S3 CPU cap 8 → 32 (swept), parallel plan and wait; S4 fill-phase landing; S5 fork at every width; S6 masked fillers + S7 joint draft lengths, only if they beat the gate; P6 ragged layout deferred | S1-S5 5-6 d + ~5 h GPU; S6-S7 2.5-3 d more | Model: C = 2 fill ~43 → 75/64 (S1) → 80/69 (S1-S4) → 97/85 (S1-S7); C = 2 warm ~95 → 136/122 → 163/158; C = 1 MTP fill 69/63 → 89/78 (S3, S4) | Model uncertainty; CPU and PCIe paths share DRAM, so S3 gains nothing at C = 1 at 55 GB/s; S7 gives up C > 1 = C = 1 greedy equality at near-ties (MMA tiles above 8 columns) | Owns `cpu_plan`, `cpu_wait`, `stage_kernel`; frame pool with vision lending; kernels 1a-ii if S7 lands |
+| **Prefix cache** (§19.3.1) | Resume a turn from cached KV blocks and state snapshots instead of re-prefilling the conversation | P0 prep (`mtp_cells`, CPU-served calls ≤ 8 columns, QSA tails fix); P1 generic index and cost extensions; P2 state image; P3 binding and orchestration; P4 per-layer pipelining, copy-engine order; P5 tap-aware call planner; P6 Engine, serve, docs; persistence (`--prefix-cache-file`, X12) after P6; P7 prefill CPU assist (gated by prefix M6); P8 C > 1 extras (after the concurrency track); P9 shared Host-tier helper | P0-P6 ≈ 12 d (including persistence), with P7 ≈ 15 d; P8 and P9 1.5 d each; ~3-4K lines + ~1.3K test lines | 32K chat turn 2.4-2.8 s vs 50-75 s; 50-token tool result after a 32K echo 0.85-0.95 s (0.3-0.45 s with P7); decode unchanged | MTP drafter-state edge cases, invisible at C = 1 greedy (bitwise drafter oracle D1); copy-engine FIFO stalls; pinned Host RAM | `program_impl.h` split (`54deaa2bc`, done); concurrency S3-S5 before P7, the whole concurrency track before P8; vision's prompt RoPE state for image suffixes |
+| **Vision** (§19.3.2) | Images and video for Qwen4Exp, tower weights (898 MB BF16) in pinned host RAM, streamed per encode window | V0 tensor-core BF16 routes for 8 tower shapes; V1 QSA M-RoPE op; V2 RoPE plumbing (`[T,3]` in every call); V3 load serial (ABA fix); V4 frame lending; V5 shared tower refactor, loading, flags; V6 Program window; V7 FP64 references and real tests; V8 measurements and docs | ≈ 12.5-13.5 d | No reconversion. Tower GEMMs for a 256-token image 6-9 ms vs 65 ms on today's scalar fallback; offload adds ~22-30 ms per small image, ~2 ms at ≥ 1K image tokens; resident weights would cost 325 frames ≈ 1.3 % of all decode | M-RoPE plumbing touches every attention call (text logits must stay bitwise equal) and is invisible below 2,051 tokens; three-stream ordering with lent frames; Qwen3.5 and Quasar requalification | Prefix P0 tails fix in `qsa.cu`; n-gram S1 de-duplication; concurrency S4 in the frame pool |
+| **Q8 kernels** (§19.3.3) | Dense Q8 decode near DRAM bandwidth at T ≤ 8 (small shapes run at 0.6-0.7 TB/s, **measured**) and off the MMA-tile cliff at T = 9-64 | Phase 0 bit-exact non-Q8 fixes (one small dispatch kernel with the route log, router reorder, RMSNorm d = 10240; E2M1 decode in registers in the expert kernels, the GDN control GEMV on more SMs, QSA attention accumulators in registers); 1a-i register-streamed K1 for all 10 shapes, bit-exact at T ≤ 8; 1a-ii T = 9-64; 1b fused mixer, inject and SwiGLU (rounding change); 2 PDL, L2 warming in `cpu_wait`, `Weight` L2 class, the shared expert on its own graph branch; 3 tensor-core K2 only on trigger | 11.5-15 d, + 2-3 d for Phase 3 | Per main forward: Phase 0 −0.28 to −0.4 ms plain, −0.33 to −0.6 ms MTP, plus −0.18 to −0.42 ms at T = 1 and −0.7 to −1.6 ms per MTP round from the 2026-10-04 items; 1a −0.41 to −0.51 ms at T = 1 (of 3.09), −0.75 to −0.91 at W = 4 (of 3.62), ≈ −11 to −17 ms at T = 9-16; 1b −0.55 to −0.7 ms; 2 −0.15 to −0.45 ms. End to end typically 50-80 % of kernel deltas | The T > 8 case rests on one measured point ([2560,2560], 31.1 µs at 12-16 columns); K1 bit-exactness; 1b moves the tg512 text, hit-rate and acceptance baselines | Nothing for Phase 0 and 1a; `moe_layer.cu` with concurrency S3 and S6 |
+| **n-gram overlap** (§19.3.4) | Hide PLE row reads and the after-draft host turnaround | S0 attribution, flush probe (three sites) and a temporary draft-probability log; S1 deduplicated, ring-buffered volume reads; S1b multi-issuer probe; S2 gated verification (rows read after the graph launch); S3 device-assembled verification (conditional); S4d cross-chunk prefill reads after S1; S4a-c parked follow-ons | ~7-7.5 d + 5-6 h GPU | With S2 + S3: warm tg512 MTP +0.5-1.9 %, first-time text MTP +1.2-3.4 %; S2 alone ~0-0.15 % warm and +0.7-1.7 % first-time (S3 is built only past its threshold); plain 0-0.3 % (S0b only); cold prefill −87 to −148 ms per 4K chunk | Gains near run-to-run noise (±0.4-0.75 tok/s); long gate waits under WDDM; host stalls move inside the graph | Core `device` primitives (additive); `verify()` and `mtp_draft` shared with concurrency S1, S6, S7 |
+| **Concurrency** (§19.3.5) | C > 1 with speculation no slower than plain C > 1, and faster cold C = 1 | S1 per-round speculation gate (draft only when B = 1); S2 diagnostics; S3 CPU job capacity 8 → 32 with one swept cap (12-24 accepted if faster), parallel plan and wait; S4 fill-phase landing; S4b warm start (saved LFRU state, bulk fill at load); S5 fork at every width; S8 decode share between prefill chunks; S6 masked fillers + S7 joint draft lengths, only if they beat the gate; ragged layout (concurrency P6) deferred | S1-S5 5-6 d + ~5 h GPU; S4b 1-1.5 d, S8 0.5-1 d + ~1.5 h GPU; S6-S7 2.5-3 d more | Model: C = 2 fill ~43 → 75/64 (S1) → 80/69 (S1-S4) → 97/85 (S1-S7); C = 2 warm ~95 → 136/122 → 163/158; C = 1 MTP fill 69/63 → 89/78 (S3, S4); S4b: the first ~200-500 tokens after a restart near the warm rate when the saved state matches the workload (est.); S8: a decoding lane beside a long cold prompt gets ~1.2-3 s of decode per chunk instead of one round per chunk (est.) | Model uncertainty; CPU and PCIe paths share DRAM, so S3 gains nothing at C = 1 at 55 GB/s; S7 gives up C > 1 = C = 1 greedy equality at near-ties (MMA tiles above 8 columns) | Owns `cpu_plan`, `cpu_wait`, `stage_kernel`; frame pool with vision lending; kernels 1a-ii if S7 lands |
 
 #### Shared code and conflicts
 
 | Shared code | What the tracks change | Rule |
 |---|---|---|
-| `ProgramImpl` (`program.cpp`) | All five | Its declaration moved to `program/program_impl.h` first, on the base branch, and every track branches from that commit. New code goes into track-owned files (`prefix/`, `vision_window`, `rope_positions`, `draft_policy`) |
-| `decode`, `verify`, `mtp_draft`, `commit`; `kWidthCost` | Concurrency S1 gate, S6/S7 joint policy; n-gram S2/S3 restructure `verify` and `mtp_draft` and re-measure the width cost; prefix `mtp_cells` and the cancelled-round repair; vision RoPE staging for verify, drafts and catch-up | Concurrency S1 first, then n-gram S2/S3; vision step 2 rebases; S6/S7 last. A change to round cost re-measures W = 3/4/5 |
+| `ProgramImpl` (`program.cpp`) | All five | Its declaration moved to `program/program_impl.h` on the base branch (`54deaa2bc`, which is prefix P0 step 1, so prefix P0 starts at its step 2), and every track branches from that commit. New code goes into track-owned files (`prefix/`, `vision_window`, `rope_positions`, `draft_policy`) |
+| `decode`, `verify`, `mtp_draft`, `commit`; `kWidthCost` | Concurrency S1 gate, S6/S7 joint policy; n-gram S2/S3 restructure `verify` and `mtp_draft` and re-measure the width cost; prefix `mtp_cells` and the cancelled-round repair; vision RoPE staging for verify, drafts and catch-up | Concurrency S1 first, then n-gram S2/S3; vision V2 rebases; S6/S7 last. A change to round cost re-measures W = 3/4/5 |
 | Io layout and uploads | Vision `rope`/`block_rope` before `ngram`; n-gram gate word; prefix prefill uploads of `io_prefix(width)`, with `upload_pinned` up to 64 columns | Vision's io-placement assertion runs after every merge |
 | `execution/forward.{h,cpp}` | Prefix `layer_waits`; vision scatter, M-RoPE, MTP visual input; kernels `mix`, inject, `linear_swiglu`; n-gram gate before `ple_embed`; concurrency counters, landing, verify extents | Merge order below; the text bit-identity gate after each merge |
 | `moe_layer.cu`, `offloaded_sparse_moe.h`, `miss_request.h`, `miss_service` | Kernels: small dispatch, `moe_combine` inject form, `L2Warm` in `cpu_wait`. Concurrency: cap 32, block-parallel plan that publishes only chosen columns, multi-CTA `cpu_wait`, landing, fork lists, route mask. Prefix P7: wide-call gather and per-layer cap J | Concurrency owns plan, wait and stage: S3-S5 land before kernels Phase 2 and prefix P7, which rebase onto them, and one `cpu_wait` grid serves both copying and L2 warming. Kernels Phase 0 lands before S6, which then skips id −1 in the small dispatch too |
-| `expert_cache`, `expert_residency` | Vision load serial and lending; concurrency all-column stats, device counters, landing reservations | Vision step 3 first (the ABA hole is latent today); whichever of lending and landing merges second adds a test that lends during the fill phase |
-| `src/ops/qsa/` | Prefix tails fix (`tail_kernel`, `commit_tail_kernel`); vision M-RoPE (`qsa_index_query`, `pool_kernel`, `QsaBatch`) | Prefix P0 first; vision's new FP64 QSA test covers both |
-| `NgramVolume::read_rows` | n-gram S1 dedupe, ring, counters; vision step 6 in-call de-duplication | n-gram S1 owns it; vision step 6 drops its copy |
+| `expert_cache`, `expert_residency` | Vision load serial and lending; concurrency all-column stats, device counters, landing reservations, S4b warm-start seed and save | Vision V3 first (the ABA hole is latent today); whichever of lending and landing merges second adds a test that lends during the fill phase; S4b follows S4 and keys the fill-phase rule on seeded frames too |
+| `src/ops/qsa/` | Prefix tails fix (`tail_kernel`, `commit_tail_kernel`); vision M-RoPE (`qsa_index_query`, `pool_kernel`, `QsaBatch`); kernels Phase 0 attention registers (`attention_kernel`); the proposed long-context selection (§19.3.6, `select_kernel`) | Prefix P0 first, and P0 adds the new FP64 QSA oracle test with the tails case (4-blocks completed inside a call or commit); vision V1 extends that test with VT2's M-RoPE cases rather than creating a second QSA test, and keeps the tails case; kernels Phase 0 and the selection work rerun that test and do not create another |
+| Engine scheduler (`src/runtime/engine/scheduler.h`) | Concurrency S8 decode budget between prefill units | Per-model default: Qwen3.5 keeps today's 1:1 alternation (share 0) and its scheduler tests unchanged |
+| `NgramVolume::read_rows` | n-gram S1 dedupe, ring, counters; vision V6 in-call de-duplication | n-gram S1 owns it; vision V6 drops its copy |
 | `src/core/device.{h,cu}` | n-gram `upload_pinned_when`, `publish_pinned_word`; prefix `download_pinned` (only if prefix M0 confirms D2H FIFO stalls) | Additive |
-| Copy-engine FIFO | Prefix restores and write-through; vision weight stream; promotions; landing | Per-round small copies use `upload_pinned`; bulk copies queue after the inputs of the call they feed |
+| Copy-engine FIFO | Prefix restores and write-through; vision weight stream; promotions; landing | Per-round small H2D copies use `upload_pinned`; bulk H2D copies queue after the inputs of the call they feed; bulk D2H copy-outs (prefix endpoint images, write-through) never precede a round's readbacks, which include n-gram S3's drafts D2H and concurrency S2's counter download: prefix M0 decides `download_pinned` for them or ≤ 4 MB write-through pacing |
 | Host RAM (96 GB) | Model 64.5 GiB pinned; vision +856 MiB weights and ≥ 0.4 GB media; prefix Host tier 4 GiB; n-gram row cache ~168 MB; 8 GiB loader floor | Prefix resolves its tier after Vision is loaded, with a media reserve (§19.3.1) |
 
 #### Execution
@@ -3211,32 +3324,45 @@ as 75/64 are model results at 70/55 GB/s of host DRAM bandwidth.
   `NInfer-V3-fn-prefix`, `-fn-vision`, `-fn-kernels`, `-fn-ngram`, `-fn-conc`; the base branch
   `claude/wonderful-ritchie-65xtnh` stays in `NInfer-V3-flashnext`.
 - **GPU and builds.** Every GPU run holds `E:\NInfer-V3\local\gpu.lock` as a hidden detached job,
-  its rig dry-run validated first; model runs wait for ≥ 72 GiB free RAM. Timing runs also hold
-  `fn\locks\quiet.lock`: no build starts and running builds finish first, since a build disturbs
-  the CPU-served experts. At most two builds run at once, one during a model run (≥ 20 GiB free).
-  Helpers: `fn\tools\gpu.ps1` (GPU lock, `-Model`, `-Bench`, writes `<log>.exit`) and
-  `fn\tools\build.ps1` (a worktree's `build-windows` targets under a build slot).
+  its rig dry-run validated first; model runs wait for ≥ 72 GiB free RAM, and runs with the prefix
+  Host tier wait for ≥ 77 GiB (64.5 GiB model + 8 GiB loader floor + 4 GiB tier), ≥ 78 GiB with
+  Vision as well (+0.84 GiB tower + the media reserve, §19.3.1); `fn\tools\gpu.ps1 -Model` (fixed at
+  72 GiB today) must take that threshold. Timing runs also hold `fn\locks\quiet.lock`: no build
+  starts and running builds finish first, since a build disturbs the CPU-served experts. At most two
+  builds run at once, one during a model run (≥ 20 GiB free). Helpers: `fn\tools\gpu.ps1` (GPU lock,
+  `-Model`, `-Bench`, writes `<log>.exit`) and `fn\tools\build.ps1` (a worktree's `build-windows`
+  targets under a build slot).
+- **Volume probe.** n-gram S1b (CPU only, saturates `G:` for a few minutes) runs while holding
+  `gpu.lock` and `fn\locks\quiet.lock`, so no model run reads the volume meanwhile (§19.3.4).
 - **Artifacts.** `E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer`, volume
   `G:\ninfer\qwen3_8_flash_next_nvfp4.ninfer.ngram`, INT8 KV, unless a plan says otherwise.
 
 #### Merge order and documentation
 
 Tracks merge onto the base branch when ready, within the rules above; each merge rebases, builds
-and re-runs the global gates on the merged tree. Rounding changes come after the bit-exact work,
-so the others re-baseline their identical-id workloads once. Expected order:
+and re-runs the global gates on the merged tree. Rounding changes come late: kernels 1a-ii (item 4)
+keeps C = 1 greedy ids but moves MTP acceptance, so tracks re-measure their MTP speed baselines
+after it; vision V0 (item 5) moves only the Qwen3.5 and Quasar towers; Phase 1b (item 6) moves the
+tg512 text, after which every track re-baselines its identical-id workloads. Expected order:
 
 1. Concurrency S1 + S2: the default C > 1 policy and the diagnostics the others measure with.
-2. Kernels Phase 0 and 1a-i (bit-exact); vision step 3; prefix P0 and P1.
-3. n-gram S0-S2; concurrency S3-S5.
-4. Kernels 1a-ii (rounds the C = 1 drafter catch-up and C ≥ 2 verification) and Phase 2.
-5. Prefix P2-P6; vision steps 0-2 and 4-8 (step 0 changes the Qwen3.5 and Quasar tower routes).
-6. Kernels Phase 1b (rounding change), then re-baselining.
-7. Once their gates pass: n-gram S3, concurrency S6 + S7, prefix P7 and P8; prefix P9 last.
+2. Kernels Phase 0 and 1a-i (bit-exact); vision V3; prefix P0 and P1.
+3. n-gram S0-S2 and S4d; concurrency S3-S5, S4b and S8 (S8 after S1 + S2).
+4. Kernels 1a-ii (rounds the C = 1 drafter catch-up and C ≥ 2 verification).
+5. Prefix P2-P6; vision V0-V2 and V4-V8 (V0 changes the Qwen3.5 and Quasar tower routes).
+6. Kernels Phase 1b (rounding change), then re-baselining, then Phase 2 (PDL for K1, the fused Ops
+   and the router; `cpu_wait` L2 warming; `Weight::l2`), which §19.3.3 makes depend on 1b.
+7. Once their gates pass: prefix persistence (`--prefix-cache-file`, X12), n-gram S3, concurrency
+   S6 + S7 (also after the user's determinism decision, §19.3.5), prefix P7 and P8, Q8 Phase 3 and
+   n-gram S4 items only on their triggers; prefix P9 last.
 
-**Documentation.** In its branch, a track edits only its own §19.3.x and its own subsection of the
-user guide (`docs/qwen3_8-flash-next.md`). Shared sections (§8.3, §9, §10.3, §11.3, §12, §13,
-§18, the §19.2 "Next" list, §20, §21) and this §19.3.0 change on the base branch at merge time,
-by the merging track, so parallel edits never meet.
+**Documentation.** In its branch, a track edits only its own §19.3.x, its own subsection of the
+user guide (`docs/qwen3_8-flash-next.md`) and documents or parts no other track edits (the Hybrid
+spec's Qwen4Exp binding section, its own curves in `linear-tuning.md`, its own entries in
+`tests/README.md`; Op contract comments change with their code under the shared-code rules above).
+Every other section of this file (§3-§18, §19.2's results and "Next" list, §20, §21), this
+§19.3.0, `docs/cli.md`, `docs/serving.md` and README change on the base branch at merge time, by
+the merging track, so parallel edits never meet.
 
 #### Acceptance rules for every track
 
@@ -3244,24 +3370,30 @@ by the merging track, so parallel edits never meet.
   tg512 (bench corpus) and the code and story CLI prompts, plain and MTP; a difference is a defect,
   not noise. MTP ids equal plain ids at C = 1 after every step; with the speculation gate,
   concurrent output at C ≤ 8 is byte-identical to each request alone.
-- **Rounding changes** (kernels 1a-ii, 1b): forward-real residual and logit errors no larger, and
-  perplexity on the frozen texts not higher beyond noise (§16.5).
+- **Rounding changes.** Kernels 1a-ii: FP64-oracle conformance at T = 9-64 and column invariance
+  to 16/64; C = 1 ids identical, MTP acceptance reported; forward-real errors and perplexity no
+  worse, since prefill remainder calls of 9-64 columns change route too. Kernels 1b: forward-real
+  residual and logit errors no larger, and perplexity on the frozen texts not higher beyond noise
+  (§16.5). Vision V0: the 8 tower shapes against the FP64 Linear oracle (VT1), Qwen3.5
+  requalified (VT8). Concurrency S7: only with the user's determinism decision (§19.3.5).
 - **Speed** is judged on prompts whose greedy ids stay identical between the arms, with tg512 and
   its hit rate reported beside them (§19.2 measurement rule); n-gram-sensitive changes on
   n-gram-cold runs, since tg512 repetitions and repeated serve requests are n-gram-warm (§19.3.4).
   Arms run ABBA on one binary with temporary toggles; median, range and worst case are reported.
-- **Every adverse result is recorded** in the track's §19.3.x, with rejected approaches and failed
-  attempts. Acceptance criteria are fixed before measuring and not changed after (§1.3).
+- **Every adverse result is recorded**, with rejected approaches and failed attempts: in the
+  track's §19.3.x while on its branch, and in §19.2 (status and measurements) when the track
+  merges, as §19.3.2-§19.3.5 and §20 specify. Acceptance criteria are fixed before measuring and
+  not changed after (§1.3).
 
 #### Default decisions
 
-The orchestrator took these defaults on 2026-10-04; the user may override any of them.
+These defaults were set on 2026-10-04, before any measurement; the user may override any of them.
 
 | Track | Decided (default, 2026-10-04) | Alternative |
 |---|---|---|
 | Prefix | Host tier 4 GiB by default; `--host-cache-mib` may set more, with the startup guard | 8-12 GiB for ~100K-token agentic sessions, if ≥ 16 GiB stays free after model and Vision |
 | Prefix | Zero Device snapshot slots (needs the P1 index extension) | Qwen3.5-style C + 1: ~84 frames at C = 1, ≈ 0.35 % decode |
-| Prefix | Exactness as upstream: a resume equals the capturing request's own computation, may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold-run equality, which only grid-aligned flexible taps give; every other resume would be refused |
+| Prefix | Exactness as upstream: a resume equals the capturing request's own computation, may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold-run equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included, so echo turns lose endpoint reuse |
 | Prefix | P7 prefill CPU assist implemented, kept only if prefix M6 shows ≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged | No P7 (it changes shared offloaded-MoE Op code) |
 | Prefix | Exact Structural and Explicit taps kept even when they add a call (~1.3 s once per new preamble) | Demote them to flexible when they cost > 0.1 s |
 | Prefix | Generation-opener tap kept after endpoint resumes (~25-40 ms and 116 MB Host per turn), with a fallback counter | Drop it as Qwen3.5 does; revisit if fallbacks stay ≈ 0 |
@@ -3269,41 +3401,46 @@ The orchestrator took these defaults on 2026-10-04; the user may override any of
 | Prefix | QSA tails fix in P0 (drafter-only; exact prepends, fixes today's step-0 pooled-key corruption) | Leave it and count stale pooled keys |
 | Prefix | `download_pinned` for per-round readbacks only if prefix M0 confirms D2H FIFO stalls | Pace write-through in ≤ 4 MB pieces |
 | Prefix | Later: the shared Host-tier helper P9 (sibling binding now); persistence (`--prefix-cache-file`) after P6, since any rebuild invalidates it; C > 1 extras P8 (in-flight coalescing, blocked-head prefetch) after the concurrency track | Each now; P9 touches Qwen3.5 and needs a 27B rerun |
-| Prefix | Serving prefill chunk decided after prefix M9 (4096 costs ~491 frames, ~4.6 % tg512, against 1024) | Fix 2048 or 4096 now |
+| Prefix | Serving prefill chunk decided after prefix M9 (4096 costs ~491 frames, ~4.6 % tg512, against 1024), fixed per Engine and gated by the long-prompt chunk check (§19.3.1 M9) | Fix 2048 or 4096 now |
 | Vision | `--vision-offload auto\|on\|off`, `auto` = on for Flash-Next, off for Qwen3.5 | A model-dependent `on\|off`, or off everywhere (325 frames resident) |
 | Vision | Keep the 16,384 merged-token per-item cap (~25-40 s prefill plus a 5-9 s tower at that size) | A lower default such as 4,096, trading resolution for TTFT |
 | Vision | MTP visual embeddings follow vLLM and Qwen3.5 | Placeholder embeddings; only acceptance changes |
 | Vision | Video in scope (same code, one 4-frame smoke test) | Images only first |
 | Vision | Frame floor 25 % (frames vision may never borrow); `kVisionStepSeconds` 0.25 s initially | Another floor; shorter steps (less stall for other lanes, more steps) |
-| Vision | Step 0 registers all 8 shapes, including Quasar's merger [5120,4608]; Qwen3.5 vision is requalified | Leave Quasar's seventh shape on the fallback |
-| Vision | Tensor-core routes for Flash-Next's text BF16 prefill projections (~0.45 s per 8K prefill) are a separate later task with its own quality gate | Fold them into step 0 (text prefill numerics change) |
-| Q8 | Phase 1b rounding changes accepted; all are more precise than HEAD and upstream | Stop at the bit-exact Phase 1a and 2 |
+| Vision | V0 registers all 8 shapes, including Quasar's merger [5120,4608]; Qwen3.5 vision is requalified | The 7 Flash-Next shapes only; Quasar's merger fc2 [5120,4608] stays on the fallback |
+| Vision | Tensor-core routes for Flash-Next's text BF16 prefill projections (~0.45 s per 8K prefill) are a separate later task with its own quality gate | Fold them into V0 (text prefill numerics change) |
+| Q8 | Phase 1b rounding changes accepted; all are more precise than HEAD and upstream | Stop at Phases 0, 1a and 2 (bit-exact except 1a-ii's T = 9-64 rounding change) |
 | Q8 | The two-kernel split-K mixer of §8.3, with the norm statistic computed inside K1a | The three-kernel K1 mixer, or §8.3's producer-epilogue sums |
 | Q8 | T = 17-64 chosen per shape by the sweep (MMA tile or 16-column K1 slices) | MMA tiles above 16 columns |
 | Q8 | Recipe A served by the fused Ops' composed route (no new BF16 kernels, today's speed) | Fused BF16 kernels for recipe A |
-| Q8 | No separate full C = 2 invariance task; the speculation gate gives C ≤ 8 equality | Invariance of BF16 dense shapes, QSA verification attention and the GDN record |
+| Q8 | No separate full C = 2 invariance task: with the speculation gate, C ≤ 8 rounds stay at T ≤ 8, where dense Q8 is column-invariant, so C ≤ 8 output is expected to equal C = 1 (inference; concurrency campaign step 1 checks byte identity; revisit if S7 replaces the gate) | Invariance of BF16 dense shapes, QSA verification attention and the GDN record |
 | Q8 | Phase 0 bit-exact non-Q8 fixes included in this track | A separate track |
 | Q8 | Phase 2: PDL for K1, the fused Ops and the router; a `Weight` L2 class (`Stream`/`Reuse`) added to Core, drafter evict-last measured | PDL for every Flash-Next decode kernel; no Core field |
 | Q8 | Thread-block clusters allowed for HC down if Phase 3 triggers | No clusters |
 | n-gram | Gate trap 120 s, verified once with a 3-5 s producer delay while the GPU is otherwise idle; 2 s if WDDM preemption fails | 2 s like `cpu_wait`: a 2-120 s NVMe stall then loses the context |
 | n-gram | Internal process-wide fault seam (`qwen4_exp::testing::set_ngram_faults`) for the engine test | Env var read at Program construction (one load per case), or primitive tests only |
-| n-gram | S3 built only if S0 measures ≥ 0.15 ms per round of after-draft GPU idle | Another threshold, or build it regardless |
-| n-gram | S4 items (mailbox, plain gate, multi-issuer reads, gated prefill) parked until their triggers fire | Build some now |
+| n-gram | S3 built only if W1's after-draft GPU idle is still ≥ 0.15 ms per round after the S0b flush probe and S2 | Another threshold, or build it (~2 days) regardless |
+| n-gram | S4a-c (mailbox, plain gate, multi-issuer reads) parked until their triggers fire; S4d built after S1 as the cross-chunk prefill read (§19.3.6) | Build some now; S4d as the within-chunk gate |
+| n-gram | S1b runs while holding `gpu.lock` and `fn\locks\quiet.lock` | A separately agreed window |
 | n-gram | §12.3 and §12.4 rewritten to the host-hashed, gated design, as the single authority | Keep the L0 device cache and NVMe agent as the target |
-| Concurrency | Optimise C = 2 first, check C = 4 | C = 4, or C ≥ 7, as the primary target |
-| Concurrency | The speculation gate (S1) is the default C > 1 policy; S6 + S7 replace it only if they beat it at C = 2 and C = 4 in fill, turnover and warm | Speculate at B ≥ 2 regardless, or split wide verification blocks into ≤ 8-column launches to keep equality with C = 1 |
+| Concurrency | Optimise C = 2 first, check C = 4 | C = 4, or C ≥ 7, as the primary target (then S5 and campaign step 5 extend to C = 8) |
+| Concurrency | The speculation gate (S1) is the default C > 1 policy; S6 + S7 replace it only if they beat it at C = 2 and C = 4 in fill, turnover and warm **and** the user accepts concurrency-dependent greedy output at near-ties (open; asked at the decision point after S5) | Never speculate at B ≥ 2; or split wide verification blocks into ≤ 8-column SIMT launches (one extra dense pass per round) to keep equality with C = 1 |
 | Concurrency | Higher CPU caps (12-24 jobs per layer call) accepted if measured faster, despite more CPU load and power; cap, divisor and worker count stay internal defaults, and the gate stays internal until S7 decides | Keep 8; CLI options (`--cpu-expert-jobs` and so on) and a documented gate option |
 | Concurrency | Fill-phase landing (S4): every staged miss is cached while frames are free | Keep LFRU promotions within the budget |
 | Concurrency | S5 compacted grids, subject to the C = 1 no-regression gates | Fork at every width without the lists |
+| Concurrency | S4b warm start on by default from the user's own saved state; a shipped fallback profile only if the replay gate passes (§19.3.5) | Start empty, as today |
+| Concurrency | S8 decode share for Qwen4Exp at C ≥ 2, its value chosen by S8's measurement (0.5 proposed); Qwen3.5 keeps 1:1 | Today's 1:1 alternation for both |
 
 ### 19.3.1 Prefix cache
 
-Design, reviewed twice adversarially, nothing implemented (HEAD `46a56fc8f`, 2026-10-04;
-`file:line` at that commit). **Measured** means §19.2 unless stated ("Hybrid spec" is
-[hybrid-prefix-cache-spec.md](hybrid-prefix-cache-spec.md), the existing cache's authority);
+Design, reviewed twice adversarially, nothing implemented (designed against `46a56fc8f`, 2026-10-04;
+`file:line` at that commit; the base split `54deaa2bc` moved `ProgramImpl` into
+`program/program_impl.h`, so a `program.cpp:N` citation is now `program_impl.h:N−2` and Files lists
+naming `program.cpp` mean `program_impl.h`). **Measured** means §19.2 unless stated ("Hybrid spec"
+is [hybrid-prefix-cache-spec.md](hybrid-prefix-cache-spec.md), the existing cache's authority);
 **estimated** means arithmetic, not executed. Local IDs: MTP rules MR1-MR9, guarantees E1-E6, phases
-P0-P9, tests U/X/D1, measurements M0-M9 (not the §19 milestones). Recipe B dense8m, INT8 KV,
-C = 1, chunk 4096 unless stated.
+P0-P9, tests U/X/D1, measurements M0-M9 (not the §19 milestones). Recipe B dense8m, INT8 KV, C = 1,
+chunk 4096 unless stated.
 
 #### Answer
 
@@ -3314,8 +3451,8 @@ C = 1, chunk 4096 unless stated.
 |---|---|---|
 | Engine surface (`HybridResourceManager`; `EngineCore` admission, progress, terminal flow; protocol usage; logs) | **Reused unchanged**; Qwen4Exp already runs on it with stub hooks | `engine.cpp:161-163`; `qwen4_exp/program/program.h:295-302` |
 | Frontend keys and hints (`block_hashes`, `block_extras`, `tap_hints`, generation opener) | **Reused unchanged** (`qwen3_5::make_frontend`) | `qwen4_exp_instance.cpp:44-55` |
-| Index, block hash, tap planner, cost model, Host-restore planner (`src/runtime/prefix_cache/*`) | **Reused with four extensions** | `publish_snapshot` needs a staging slot and a Device tail; Host-only nodes adopt the inserting page; cost is `chunks × chunk_seconds` |
-| Physical binding (page references, slabs, write-through, restore batches, persistence) | **New sibling of `HybridPrefixCache`**, same mechanisms | That binds Qwen3.5's `LogicalKVPageStore`/`StateImageStore` (`hybrid_cache.h:91-96`); Qwen4Exp has a `DeviceKVPagePool` with move-only leases and per-lane slots |
+| Index, block hash, tap planner, cost model, Host-restore planner (`src/runtime/prefix_cache/*`) | **Reused with four extensions** | `publish_snapshot` needs a staging slot and a Device tail (`prefix_index.cpp:889-896`); Host-only nodes adopt the inserting page (`prefix_index.cpp:485-496`); cost is `chunks × chunk_seconds` (`cost.h`) |
+| Physical binding (page references, slabs, write-through, restore batches, persistence) | **New sibling of `HybridPrefixCache`**, same mechanisms | That binds Qwen3.5's `LogicalKVPageStore`/`StateImageStore` (`hybrid_cache.h:91-96`); Qwen4Exp has a `DeviceKVPagePool` with move-only leases (`paged_kv_cache.h:155-178`) and per-lane slots (`program.cpp:188-213`) |
 | Orchestration (quote, stage, activate, taps, publication, endpoint, release) | **New**, a line-by-line mimic of `qwen3_5/program/prefix/hybrid_program.cpp` | — |
 
 Four Qwen4Exp facts change the binding, not the design:
@@ -3338,10 +3475,11 @@ taken, and fewer prefill calls churn the expert cache less.
 
 - **Turns.** OpenAI-chat and Anthropic clients (e.g. Qwen Code) resend the conversation plus a new
   user or tool turn; contexts are 8K-64K+.
-- **Echo.** The template keeps reasoning in history, so history matches the last generation only if
-  the client echoes it: Anthropic tool loops do; OpenAI clients often drop `reasoning_content` (the
-  turn re-renders as `<think>\n\n</think>\n\n{content}`). Trimming, the `\n\n<tool_call>` prefix
-  and `tojson` arguments (`chat_template.jinja:115-140`) can make even echoes diverge.
+- **Echo.** The template keeps reasoning in history by default (`preserve_thinking` undefined or
+  true, and always for turns after the last user query), so history matches the last generation only
+  if the client echoes it: Anthropic tool loops do; OpenAI clients often drop `reasoning_content`
+  (the turn re-renders as `<think>\n\n</think>\n\n{content}`). Trimming, the `\n\n<tool_call>`
+  prefix and `tojson` arguments (`chat_template.jinja:115-140`) can make even echoes diverge.
 - **Reuse points.** An exact echo resumes from the previous **endpoint**; anything else from the
   previous **opener tap** (the generation prompt, or the first assistant turn after the last user
   query when history is rewritten, `chat_template.cpp:452-476`), kept after endpoint resumes.
@@ -3374,18 +3512,19 @@ taken, and fewer prefill calls churn the expert cache less.
 Meta: `mtp_written` (cell F−1 final), `mtp_next` (`history[F]`, the token that cell encodes),
 `lineage_echo` (captured after an endpoint resume), optional `mtp_accept[8]` (§11.3 EWMA, if
 measured useful). Copies are byte copies, never requantized; experts are placement-invariant
-(§16.2), so a restore changes only speed. **Image layout** (`prefix/state_image.{h,cpp}`):
-`header | layers 0..47: GDN (recurrent, conv) or QSA tail, PLE before layer 1 | MTP: saved, tails`,
-parts 256-B aligned; byte o is in slab `o / slab_bytes` (124 non-contiguous slabs, as Qwen3.5's
-`hybrid_host_layout.cpp`), one `cudaMemcpyAsync` per segment. Optional Device slots use the same
-packed layout, allocated before the frames. Page records move by plane range
-(`copy_to_host_records` / `copy_from_host_records`) into any page, cache-owned or lane-private.
+(§16.2), so expert residency, which is not captured, affects only speed. **Image layout**
+(`prefix/state_image.{h,cpp}`): `header | layers 0..47: GDN (recurrent, conv) or QSA tail, PLE
+before layer 1 | MTP: saved, tails`, parts 256-B aligned; byte o is in slab `o / slab_bytes` (124
+non-contiguous slabs, as Qwen3.5's `hybrid_host_layout.cpp`), one `cudaMemcpyAsync` per segment.
+Optional Device slots use the same packed layout, allocated before the frames. Page records move by
+plane range (`copy_to_host_records` / `copy_from_host_records`) into any page, cache-owned or
+lane-private.
 
 #### Generic extensions (`src/runtime/prefix_cache/`, ~170 lines; Qwen3.5 behaviour unchanged)
 
 | # | Extension |
 |---|---|
-| 1 | **Host-born snapshots.** `reserve_host_image(tail, claim)` takes free slabs (the image's, then one tail slab), GDSF-evicting like `begin_snapshot_host_fill` but never past `claim` (`estimate_priority`); `release_host_image` returns them. `publish_host_snapshot(anchor, frontier, tail, optional tail_device_id, reservation, kind)` publishes a landed image and tail (`device_slot = kNoId`, Host Resident); a duplicate frees its slabs and Device tail and returns the existing snapshot with `created = false`. The Host tail is mandatory: `snapshot_valid`, `refresh_tail`, tail eviction and `begin_snapshot_host_fill` assume a Host-resident snapshot has one (`prefix_index.cpp:124-129, 369-379, 629-637, 734-736`). `check_invariants` counts reserved slabs |
+| 1 | **Host-born snapshots.** `reserve_host_image(tail, claim)` takes free slabs (the image's, then one tail slab when `tail`), GDSF-evicting like `begin_snapshot_host_fill` but never past `claim` (`estimate_priority`); `release_host_image` returns them. `publish_host_snapshot(anchor, frontier, tail, optional tail_device_id, reservation, kind)` publishes a landed image and tail (`device_slot = kNoId`, Host Resident); a non-empty `tail` requires the reservation's tail slab and `host_blocks`; a duplicate frees its slabs and Device tail and returns the existing snapshot with `created = false`. The Host tail is mandatory: `snapshot_valid`, `refresh_tail`, tail eviction and `begin_snapshot_host_fill` assume a Host-resident snapshot has one (`prefix_index.cpp:124-129, 369-379, 629-637, 734-736`). `check_invariants` counts reserved slabs |
 | 2 | **Zero Device snapshot slots** are legal (`acquire_device_slot` returns `nullopt`) |
 | 3 | **`insert_block(…, bool attach)`**: `false` pins an existing Host-only child without adopting `device_id`; the caller keeps its page. Qwen3.5 passes `true` |
 | 4 | **Saturating call cost** (`cost.h`): ρ = `call_route_fraction` (default 0), `call_seconds(t) = chunk_seconds × (ρ > 0 ? 1 − (1 − ρ)^t : 1)`; `prefill_seconds` charges `⌊s/c⌋ × call_seconds(c) + call_seconds(s mod c)` plus token and attention terms. ρ = 0 is today's formula |
@@ -3408,7 +3547,8 @@ the `PrefixIndexBackend` callbacks and `poll`/`drain`/`clear`.
   `restore_bytes` by `image_bytes`. Duplicates (another lineage) get no shortcut.
 
 **MTP rules.** Cell c pairs the residual at c with the token at c + 1, at KV slot c; pooling runs
-when a column completes a 4-block, reading earlier positions from the tails (`qsa.cu:103-138`).
+when a column completes a 4-block, reading positions before the call start from the tails
+(`qsa.cu:103-138`).
 
 | Rule | Content |
 |---|---|
@@ -3426,14 +3566,18 @@ when a column completes a 4-block, reading earlier positions from the tails (`qs
 
 | Flow | Mechanism |
 |---|---|
-| **Quote** (mirror of `hybrid_quote`) | (1) `poll()` lands copy-outs, publishes their snapshots, retires write-through. (2) **Drain endpoint copy-outs the prompt extends:** on a block-hash and tail match (O(F/64)), `cudaEventSynchronize` the last event (≤ 4.5 ms; endpoints go first on the transfer stream), then `poll()`; unrelated requests at C > 1 do not wait. (3) `match(tokens, block_hashes, block_extras, n)`; drop candidates with filling blocks or a frontier inside a Vision span; lane-resident adjustment; `choose`. (4) **Fit:** COW source per MR6, `shared = k − (cow == anchor ? 1 : 0)`, need `(E − shared) + host_only([0, shared)) ≤ available_pages() + device_evictable_blocks() − evictable_on_path([0, k)) − (cow on Device and unpinned ? 1 : 0)`, replacing `available_pages() < pages` (`program.cpp:405`). Try the chosen candidate, the others deepest first, then the root; `PermanentlyInfeasible` only if the root misses an empty pool; if nothing fits and write-through is pending, `drain()` and retry, else `TemporarilyBlocked`. (5) Report `reusable_prompt_tokens = F`, `PrivateEndpoint` or `SharedStablePrefix`, `service_work_quanta` = suffix-plan calls + `effective_output − 1` |
+| **Quote** (mirror of `hybrid_quote`) | (1) `poll()` lands copy-outs, publishes their snapshots, retires write-through. (2) **Drain endpoint copy-outs the prompt extends:** on a block-hash and tail match (O(F/64)), `cudaEventSynchronize` the last event (≤ 4.5 ms; endpoints go first on the transfer stream), then `poll()`; unrelated requests at C > 1 do not wait. (3) `match(tokens, block_hashes, block_extras, n)`; drop candidates with filling blocks or a frontier strictly inside a Vision span; lane-resident adjustment; `choose`. (4) **Fit:** COW source per MR6, `shared = k − (cow == anchor ? 1 : 0)`, need `(E − shared) + host_only([0, shared)) ≤ available_pages() + device_evictable_blocks() − evictable_on_path([0, k)) − (cow on Device and unpinned ? 1 : 0)`, replacing `available_pages() < pages` (`program.cpp:405`). Try the chosen candidate, the others deepest first, then the root; `PermanentlyInfeasible` only if the root does not fit an empty pool (`feasible`, `program.cpp:399-402`); if nothing fits and write-through is pending, `drain()` and retry, else `TemporarilyBlocked`. (5) Report `reusable_prompt_tokens = F`, `prefix_reuse_path = PrivateEndpoint` for an endpoint candidate, else `SharedStablePrefix`, `service_work_quanta` = suffix-plan calls + `effective_output − 1` |
 | **Reserve, stage** (mirror of `hybrid_stage`; never waits) | Re-validate against a fresh match; `acquire_path([0, k))` (an anchor being COWed included), `pin_snapshot`. Evict the Device LRU (backed first) until `need` fits; `reserve(need)`: `E − shared` private leases into `lane.pages`, Host-only cache-owned leases into the binding (`begin_device_fill`). Only if something is Host-only, one restore batch for the first call: Host-only blocks → new cache pages; a Host-only COW source (tail or anchor slab) → **straight into the lane's first private page**, not adopted; a Host-only image → the lane slot (skipped when lane-resident). Forward-order groups, one event per layer (48), then a final MTP group (MTP planes, saved, tails; one event) |
 | **Activate** (mirror of `hybrid_activate`) | Block table = shared handles + private leases (`tables_->publish(row, 0, span<const DeviceKVPageHandle>)`); a Device-resident COW source is copied with `copy_page` on the compute stream, then unpinned. Lane: `state_tokens = F`, `history = prompt`, `mtp_cells` per MR6, proposer rebuilt; `reset_slot` for a root admission, only `token_counts` zeroed on a resume; slot from lane-resident state, the restore batch or a Device slot (D2D). Taps: `plan_taps` without opener erasure, then the call planner. Path pins move to the lane; `note_hit`; supersession as in Qwen3.5. `reused_prompt_tokens = F` (today 0, `program.cpp:515`); diagnostics `cached_prefix_tokens`, `restored_host_bytes` |
-| **Restore waits** | First call: table publish and io upload (compute stream) → `ev_inputs` → restore stream waits → restore groups → forward, so no restore precedes its call's inputs. `ForwardBatch::layer_waits` (`std::array<std::span<const cudaEvent_t>, 2>`): `[0]` restore events (48 + MTP), `[1]` this slot's copy-out events (tap image, endpoint in flight); `Forward::run` waits on `[k][l]` just before layer l touches its state or pages, and on the MTP entries before the MTP chunk. Events are taken by ticket at call time (`take_layer_ready`, the upstream use-after-free fix). A lane released before its first pass orders the compute stream after the batch. Until P4, the first call waits for the whole batch and the next call for the whole copy-out |
+| **Restore waits** | First call: table publish and io upload (compute stream) → `ev_inputs` → restore stream waits → restore groups → forward, so no restore precedes its call's inputs. `ForwardBatch::layer_waits` (`std::array<std::span<const cudaEvent_t>, 2>`): `[0]` restore events (48 + MTP), `[1]` this slot's copy-out events (tap image, endpoint in flight); `Forward::run` waits on `[i][l]` (i = 0 restore, 1 copy-out) just before layer l touches its state or pages, and on the MTP entries before the MTP chunk. Events are taken by ticket at call time (`take_layer_ready`, the use-after-free fix of Hybrid spec §16.4). A lane released before its first pass orders the compute stream after the batch. Until P4, the first call waits for the whole batch and the next call for the whole copy-out |
 | **Block publication** (mirror of `hybrid_publish_blocks`) | Publish block b iff 64(b+1) ≤ P: P = `state_tokens` without a drafter; `mtp_cells` when finishing or in Prefill; `min(mtp_cells, state_tokens − 1)` in Decode (step 0 rewrites cell `state_tokens − 1`). **Invariant:** every remaining write of a live lane (main K/V, prepend, step 0, drafts, catch-up) is at ≥ P and its pooled key in page ⌊cell/64⌋ ≥ ⌊P/64⌋ (4 \| 64), so no published block is written; U3 covers P % 64 == 63, where the first revision was off by one. Insert at every commit (`commit`, `commit_verified`), prefill call and `append_forced`; record `mtp_next`, apply MR5, `publish_pending()`. An optional step-0 `write_cell` fix would make Decode P = `mtp_cells` |
-| **Taps** (Host-born, no Device page) | (1) Check the Host-image budget (`estimate_priority`) and `reserve_host_image(tail = p % 64 ≠ 0, claim)`, else count `taps_skipped`. (2) After a compute event the transfer stream copies the partial page into the tail slab first (36 µs; columns < p are final, later writes hit only don't-care regions), then the image parts in forward order, one event per layer group: the next call's `layer_waits[1]`; part l (≤ 3.2 MB, 0.12 ms) lands long before compute reaches layer l (estimated). (3) The anchor is already a node; on landing `poll` calls `publish_host_snapshot(…, Tap\|Boundary)` and supersedes, with no wait for the tail block (Qwen3.5 waits for it or for finish: for the opener, the whole decode). (4) With Device slots: the existing D2D path |
+| **Taps** (Host-born, no Device page) | (1) Check the Host-image budget (`estimate_priority`) and `reserve_host_image(tail = p % 64 ≠ 0, claim)`, else count `taps_skipped`. (2) After a compute event the transfer stream copies the partial page into the tail slab first (36 µs; columns < p are final, later writes hit only don't-care regions), then the image parts in forward order, one event per layer group: the next call's `layer_waits[1]`, with the tail-page event at layer 0; part l (≤ 3.2 MB, 0.12 ms) lands long before compute reaches layer l (estimated). (3) The anchor is already a node; on landing `poll` calls `publish_host_snapshot(…, Tap\|Boundary)` and supersedes, with no wait for the tail block (Qwen3.5 waits for it or for finish: for the opener, the whole decode). (4) With Device slots: the existing D2D path |
 | **Finish, abort** | Abort only with no unit in flight (rows settle first, prefill calls synchronize). (1) MR3 flush, publish remaining blocks, abandon unpublishable taps and their reservations. (2) **Endpoint** iff F ≥ deepest snapshot + 64 and `mtp_cells ≥ 64⌊F/64⌋` (Qwen3.5's `backend_caught_up`); after a cancelled plain round at F % 64 == 0 it fails: `endpoint_skipped_mtp`. (3) `reserve_host_image`; tail D2H (36 µs), then image D2H (4.5 ms); the partial page is also handed over as Device tail (no copy). (4) On landing `publish_host_snapshot(…, Endpoint)`, supersede the resume snapshot, `lane.resident` only if `created` |
 | **Release, eviction** | Write-through of Device-only path blocks after the endpoint copy-out; `release_path` deepest first into the Device LRU; private pages freed except a handed-over tail. `Disabled` requests (`allow_prefix_reuse = false`, warmup) insert nothing. A later lane-resident admission waits on the copy-out via `layer_waits[1]`. Eviction is the index's: Device LRU (backed first), Host GDSF (superseded first, dead-KV sweep), supersession, slots when D > 0. `hybrid_reclaim_device_kv` is never reached (leases never grow); `hybrid_prefetch` is P8 |
+
+#### Checkpoints
+
+Where snapshots are taken and what they cost (estimated):
 
 | Checkpoint | Where | Kind | Compute | Copy | Notes |
 |---|---|---|---|---|---|
@@ -3446,21 +3590,27 @@ when a column completes a 4-block, reading earlier positions from the tails (`qs
 
 #### Copy-engine discipline
 
-H2D copies share one FIFO copy engine across streams (measured: a 4-byte round input waited
-~3.4 ms behind promotions until `upload_pinned`). Rounds also make small D2H readbacks (verify,
-drafts, sample: `program.cpp:1178-1180, 1457-1459, 1539-1540`; route log:
+**Facts.** H2D copies share one FIFO copy engine across streams (measured: a 4-byte round input
+waited ~3.4 ms behind promotions until `upload_pinned`). Rounds also make small D2H readbacks
+(verify, drafts, sample: `program.cpp:1178-1180, 1457-1459, 1539-1540`; route log:
 `expert_residency.cpp:101-102`); whether D2H queues behind bulk D2H on another stream is unverified
-(a 27B trace shows restores overlapping a pass). Rules: (1) restores follow the first call's
-inputs; (2) per lane, the transfer stream runs endpoint tail, endpoint image, then write-through;
-(3) M0 precedes P4, and if D2H stalls, P4 adds a Core `download_pinned` beside `upload_pinned`
-(`src/core/device.{h,cu}`; a kernel storing into mapped pinned memory) for those readbacks at
-decode and verify widths (output-neutral, re-checked by tg512 and greedy ids; prefill keeps bulk
-copies), with `poll()` pacing write-through in ≤ 4 MB pieces, one per round, as the fallback;
-(4) at C > 1 a restore still shares the x8 link with other lanes' staging (bandwidth; M4).
+(a 27B trace shows restores overlapping a pass).
+
+**Rules:**
+
+1. Restores follow the first call's inputs.
+2. Per lane, the transfer stream runs endpoint tail, endpoint image, then write-through.
+3. M0 precedes P4. If D2H stalls, P4 adds a Core `download_pinned` beside `upload_pinned`
+   (`src/core/device.{h,cu}`; a kernel storing into mapped pinned memory) for those readbacks at
+   decode and verify widths (output-neutral, re-checked by tg512 and greedy ids; prefill keeps
+   bulk copies). If `download_pinned` is rejected, `poll()` paces write-through in ≤ 4 MB pieces,
+   at most one outstanding per round.
+4. At C > 1 a restore still shares the x8 link with other lanes' staging (bandwidth; M4).
+
 **Expert cache** (estimated): a 30K re-prefill makes ~6,100 promotions (16 per layer per call,
 ~65 % of 9,443 frames), replacing decode-hot experts with prompt-hot ones; a hit runs one call or
-small calls on decode budgets (M2b). If loans (§9.2) arrive, Free lanes' latest paths keep their
-pages, other (Host-backed) cached blocks yield, and spare COW pages are never lent.
+small calls on decode budgets (M2 (b)). If loans (§9.2) arrive, Free lanes' latest paths keep
+their pages, other (Host-backed) cached blocks yield, and spare COW pages are never lent.
 
 #### Exactness
 
@@ -3490,14 +3640,19 @@ documented as a reproducibility trade-off, not a quality one.
 - **Device snapshot slots: 0.** `--device-snapshot-slots N` adds packed slots (115.7 MB = 41.8
   frames each; D2D capture under the existing slot policy); N ≥ 1 is required with
   `--host-cache-mib 0`.
-- **Host tier: one pinned slab pool, 4 GiB** (replaces §15.2's 2.0 GB checkpoint tier). Of 95.8 GiB
-  the model pins 64.5 GiB, leaving ≈ 31 GiB; Vision adds 856 MiB of tower weights and ≥ 0.4 GB of
-  media buffers (§19.3.2). Resolved in the Program constructor after materialization: `host_bytes
-  = explicit, or min(4 GiB, available − 8 GiB − C × Vision's per-lane pinned result capacity)`.
-  An explicit value breaking that guard fails at startup with the materializer's message
-  (`kPinnedHostReserveBytes`); the default clamps to whole slabs and below 126 slabs (≈ 118 MB)
-  disables the tier with a warning; the startup ledger logs model and Vision pins, the reserve, the
-  n-gram row cache and the tier.
+- **Host tier: one pinned slab pool, 4 GiB** (the §15.2 row; it replaced the earlier 2.0 GB
+  checkpoint tier). Of 95.8 GiB the model pins 64.5 GiB, leaving ≈ 31 GiB; Vision adds 856 MiB of
+  tower weights and ≥ 0.4 GB of pageable media buffers (§19.3.2). Resolved in the Program
+  constructor after materialization:
+  `host_bytes = explicit, or min(4 GiB, available − 8 GiB − media reserve)`, where the media
+  reserve is the pageable live-media budget (`--media-live-mib`, ≥ 402 MB for the prompt cap) with
+  Vision and 0 without; Vision pins only its 856 MiB of tower weights, which are already counted
+  (§19.3.2). An explicit value breaking that guard fails at startup with the materializer's
+  message (`kPinnedHostReserveBytes`); the default clamps to whole slabs and below 126 slabs
+  (≈ 118 MB) disables the tier with a warning; with the default 0 Device snapshot slots the prefix
+  cache is then off (no snapshot store), and the warning says so and names
+  `--device-snapshot-slots` as the alternative. The startup ledger logs model and Vision pins, the
+  reserve, the n-gram row cache and the tier.
 - **4,096 MiB = 4,599 slabs:** ~5 working sets of a 32K conversation (500 blocks + 3 snapshots
   ≈ 875 slabs) or one 128K conversation plus ~16 snapshots; pinned in ≤ 4 GiB chunks no slab
   crosses (WDDM rule, Hybrid spec §5.4). Index: `max_nodes = kv_pages + slabs + 1`,
@@ -3527,8 +3682,17 @@ columns so they never queue behind copy-engine traffic.
 
 **Cost model** (`CacheCostModel` in `ProgramOptions`; Qwen4Exp gets `ContextMachineCostModel{}`
 today, `engine.cpp:181`) ranks choices and values snapshots, never decides feasibility:
-`chunk_seconds` 1.28, `chunk_tokens` = chunk, `token_seconds` 1.17e-3, ρ 0.0195 until M6 refits it,
-`attention_pair_seconds` 0 until M1, `h2d_bytes_per_second` 26e9, `transfer_batch_seconds` 20e-6.
+
+| Field | Value |
+|---|---|
+| `chunk_seconds` | 1.28 |
+| `chunk_tokens` | `--prefill-chunk` |
+| `token_seconds` | 1.17e-3 |
+| `call_route_fraction` (ρ) | 10/512 = 0.0195 until M6 refits it |
+| `attention_pair_seconds` | 0 until M1 |
+| `h2d_bytes_per_second` | 26e9 |
+| `transfer_batch_seconds` | 20e-6 |
+
 After P7, an EWMA of measured call seconds per width class feeds `index.set_cost` and the planner.
 
 #### Prefill CPU assist (P7, gated by M6)
@@ -3539,7 +3703,8 @@ tool results: ~1.2-4.8 s, estimated). A thin expert (n_e ≤ 8) costs a full 2.7
 parallel with the link. §13's "routed staging + CPU assist" is not built: prefill stays on the GPU
 (`program.cpp:332`), `cpu_served` needs `columns ≤ max_columns` (`moe_layer.cu:741-743`),
 `cpu_plan_kernel` copies all x columns (`:575-577`) into a `[H, max_columns]` buffer, and jobs are
-≤ 8 of ≤ 8 columns. Strata measured 1.35-1.49× at 200-1,000 tokens on PCIe 3 / DDR4 (§3.1).
+≤ 8 of ≤ 8 columns today (concurrency S3 raises the cap before P7 lands). The architectds/Strata
+fork claims 1.35-1.49× at 200-1,000 tokens and ≈ 1.0× at 4K, on PCIe 3 / DDR4 (§3.1).
 **Op extension** (`src/ops/offloaded_sparse_moe/`): (1) `cpu_served` means "the CPU channel
 exists"; above `max_columns` the plan kernel gathers only the selected jobs' columns (≤ J × 8),
 remapping `request->column`, and y becomes `[H, J × 8]`; (2) a per-layer cap J for wide calls
@@ -3584,15 +3749,15 @@ the GPU lock and run as hidden console jobs. Effort (estimated): P0-P6 ≈ 12 en
 
 | Phase | Work | Exit |
 |---|---|---|
-| **P0** prep (0.75 d) | (1) `ProgramImpl` declaration into `program/program_impl.h` (own translation unit for prefix code); (2) `mtp_cells` (MR1) with debug invariant checks at commit and finish, MR2 repair; (3) `max_columns = max(8, lanes × max_width_)`; (4) QSA tails fix (MR7) with an oracle case for blocks completed inside a call or commit | tg512 and code-prompt greedy ids unchanged at C = 1, plain and MTP; acceptance ≥ before; a ≤ 8-column forced call bit-identical with the CPU on and off; QSA op test passes |
+| **P0** prep (0.75 d) | (1) done on the base branch: `ProgramImpl` moved into `program/program_impl.h` (`54deaa2bc`, §19.3.0); (2) `mtp_cells` (MR1) with debug invariant checks at commit and finish, MR2 repair; (3) `max_columns = max(8, lanes × max_width_)`; (4) QSA tails fix (MR7) with an oracle case for blocks completed inside a call or commit | tg512 and code-prompt greedy ids unchanged at C = 1, plain and MTP; acceptance ≥ before; a ≤ 8-column forced call bit-identical with the CPU on and off; QSA op test passes |
 | **P1** generic extensions (1.25 d) | `prefix_index.{h,cpp}`, `cost.h`, Qwen3.5's `insert_block` caller: extensions 1-4, reserved slabs in the invariants | U1, U4; `ninfer_prefix_cache_index_test` and Qwen3.5 unit tests unchanged |
 | **P2** state image, page records (1 d) | `prefix/state_image.{h,cpp}`; slots allocated before the frames: layout, per-part D2H/H2D with per-layer events and the MTP group, page records into any page by plane range, optional Device slots | X8 |
 | **P3** binding and orchestration, unpipelined (3.5 d) | `prefix/prefix_cache.{h,cpp}`, `prefix_program.cpp`; `program.cpp` (`plan_request`, `quote`, `reserve`, `progress`, `advance_prefill`, `commit*`, `append_forced`, `finish`, `abort`, `release`, `fail_all_cleanup`, `usage`, `memory`); `ProgramOptions` (enable, host bytes, slots, taps, cost). Spare pages; chunked pinning and the Host guard; quote; reserve/activate (whole-batch wait); publication (MR4, MR5); Host-born flexible taps; finish/abort. Stats: `admissions`, `free_device_snapshot_slots`, `host_tail_restores`, `mtp_continuation_mismatches`, `mtp_branch_mismatches`, `endpoint_skipped_mtp`, `endpoint_mismatch_fallbacks`, `taps_skipped`. Test hooks: `force_call_boundaries`, `defer_mtp_cell_at`, `delay_streams(restore_ms, transfer_ms)` (a `cudaLaunchHostFunc` sleep heading each batch), `drafter_state(lane)` | X1, X2, X4, X10, X11, X13, X15-X18, D1 |
 | **P4** pipelining, copy-engine discipline (2.5 d) | M0 first; `ForwardBatch::layer_waits`, ticketed events; restore after the first call's inputs; copy-outs in `layer_waits[1]`; io prefix uploads; `download_pinned` or write-through pacing; failure cleanup | X7, X9, X14; `compute-sanitizer memcheck` on X9 and X14; M3 shows per-layer overlap |
 | **P5** call planner, exact taps (1.5 d) | `prefix/call_plan.{h,cpp}`, `advance_prefill`, `test_call_plan.cpp`: Δ admission, opener kept with `lineage_echo`, structural and explicit taps, Vision `TapExclusion`, quanta from the plan | U2, X3, X5, X6; cold-prompt calls unchanged for F = 0 |
 | **P6** Engine, serve, docs (1.5 d) | `model_instance.cpp`, `qwen4_exp_instance.cpp`, `engine.cpp`, `serve_options.cpp`: per-model resolution, Host default and guard, `--help`, `MaterializationDiagnostics`. Docs: a "Qwen4Exp binding" section in the Hybrid spec (the authority), §19.2 status, user-guide trade-offs | Serve protocol usage check; `git diff --check` |
-| Persistence (after P6, decided default) | `prefix/persist.cpp` (`mtp_next`, snapshot meta), Engine save/report wiring | X12 |
-| **P7** prefill CPU assist (2.5-3 d, gated) | `moe_layer.cu`, `miss_request.h`, `miss_service.{h,cpp}`, per-layer EMAs, Op tests | M6: TTFT ≥ 10 % better for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged |
+| Persistence (after P6, decided default; its effort is inside P6's 1.5 d and the P0-P6 ≈ 12 d total; merges after P6) | `prefix/persist.cpp` (`mtp_next`, snapshot meta), Engine save/report wiring | X12 |
+| **P7** prefill CPU assist (2.5-3 d, gated; after concurrency S3-S5, §19.3.0) | `moe_layer.cu`, `miss_request.h`, `miss_service.{h,cpp}`, per-layer EMAs, Op tests; the wide-call gather and cap J build on S3's block-parallel `cpu_plan_kernel` and its CPU job capacity (8 → 32), not on today's plan | M6: TTFT ≥ 10 % better for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged |
 | **P8** C > 1 extras (1.5 d) | In-flight coalescing (`hybrid_await_sibling` mirror), blocked-head prefetch | Concurrent shared-prefix scenario at C = 2 |
 | **P9** shared helper (1.5 d, later) | Slab pool, write queue, restore batch/events, persistence I/O into `runtime/prefix_cache/host_tier.{h,cpp}` for both bindings | Qwen3.5 real tests (27B) + Qwen4Exp tests |
 
@@ -3636,7 +3801,9 @@ and X14 checks event lifetimes.
 #### Measurements
 
 Runs take `E:\NInfer-V3\local\gpu.lock`, run as hidden console jobs, are dry-run validated before
-arming, and A/B within one binary (control `--no-prefix-reuse`). Base command:
+arming, and A/B within one binary (control `--no-prefix-reuse`), except M2 (a): spare pages and P0
+changes have no toggle, so it compares the pre-cache build, alternating the two binaries ABBA on
+identical-id workloads. Base command:
 
 ```text
 build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer ^
@@ -3649,14 +3816,14 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 |---|---|---|---|
 | M0 | Copy-engine behaviour (before P4) | ~100-line `local\workdirs\fn\prefix\m0_copy_engines.cu`: `asyncEngineCount`; 4-byte D2H latency on one stream during a 116 MB D2H on another; the same for H2D; `upload_pinned` under bulk H2D; D2H during H2D | Latencies, FIFO yes/no per direction → copy-engine rule 3 |
 | M1 | Multi-turn TTFT, 8K and 32K | `local\workdirs\fn\prefix\multiturn_ttft.py` (stdlib HTTP + SSE): one conversation grown to ~8K then ~32K, frozen texts; 6 turns × 4 types: OpenAI without reasoning echo, Anthropic with thinking echoed, 50-token and 3K-token tool results; greedy, 300 output tokens; zero think time (quote step 2) | TTFT both arms and ratio, reused tokens, prefill s, restored bytes, `endpoint_mismatch_fallbacks`; worst cases |
-| M2 | Decode impact | (a) `ninfer_bench` tg512 (§19.2 command) and the cold code-prompt CLI vs the pre-cache build, then `--device-snapshot-slots 1` vs 0; (b) M1 logs, cached vs uncached turns | tok/s, hit rate, frames, compared only on identical-id workloads; per-turn decode tok/s and hit rate |
+| M2 | Decode impact | (a) `ninfer_bench` tg512 (§19.2 command) and the cold code-prompt CLI vs the pre-cache build, then `--device-snapshot-slots 1` vs 0; (b) M1 logs, cached vs uncached turns; (c) restore speed (Strata's #528 check, with interference held fixed): two alternating 32K conversations with the same unrelated request between turns, lane-resident or Device resume against a forced Host restore (X1's two-Engine setup with long outputs), ≥ 256 decode tokens after each resume, ABBA | tok/s, hit rate, frames, compared only on identical-id workloads; per-turn decode tok/s and hit rate; (c) ids equal (E1), decode tok/s and hit rate per arm |
 | M3 | Attribution | `nsys profile -t cuda,nvtx`: one Host-restore turn at 32K, one tap-heavy cold 32K prompt | Restore ms, layer waits, copy-out overlap, call times |
 | M4 | Copy-outs vs decode, C = 2 | One lane decodes while the other finishes a 32K turn (write-through + image), before and after the rule-3 change | Round-time distribution during vs outside the copy |
 | M5 | Tap overhead | Cold 16K with taps vs `--cache-taps-per-request 0` | Prefill s (target < 0.5 %) |
 | M6 | Suffix cost curve, P7 gate | After 32K and 8K endpoint resumes: suffixes of 1-2,048 tokens (powers of 2) of tool-output text; P7 on/off (temporary env toggle, ABBA); with and without `--spec` | TTFT per length, per-call ms, CPU-served experts per layer, staged bytes; refit ρ |
 | M7 | Agentic mix | `bench/agentic_ab` (`--scale 0.3`, `--max-context 65536`); needs per-arm extra args in `runner.py` | Cache tokens, TTFT p50/p90 continuing vs new, decode tok/s, `endpoint_mismatch_fallbacks` |
 | M8 | Existing TTFT cases (secondary) | `py -3.13 tools\bench\run_serve_ttft.py`, cases `session-hot-continuation`, `shared-tools-sequential`, `resume-after-interference-state-host`, `cancel-after-first` | TTFT per role |
-| M9 | Chunk trade-off with the cache | M1 + M7 at `--prefill-chunk` 1024 / 2048 / 4096 (§19.2: 8,791 / 8,614 / 8,300 frames, tg512 61.46 / 60.37 / 58.63) | TTFT p50/p90 vs decode tok/s → serving chunk |
+| M9 | Chunk trade-off with the cache | M1 + M7 at `--prefill-chunk` 1024 / 2048 / 4096 (§19.2: 8,791 / 8,614 / 8,300 frames, tg512 61.46 / 60.37 / 58.63; the 1024 row at max-ctx 4096, the others at 8192). Before a default changes, a long-prompt quality check: teacher-forced (`--dump-logits`) 8K and 32K prompts at each candidate chunk, against a rounding-order-only control (Strata `f23ea57`: a chunk-only change moved KL by 0.023-0.038, argmax agreement 94.8-97.9 %) and bitwise reruns | TTFT p50/p90 vs decode tok/s → serving chunk, fixed per Engine; pairwise KL and argmax agreement within the control's band |
 
 | Prediction (estimated; chunk 4096, attention excluded) | Today | P0-P6 | + P7 |
 |---|---:|---:|---:|
@@ -3668,6 +3835,14 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 | New subagent after a 20K shared preamble, 1.5K task | ~35 s | ~3.0 s | ~2.8 s |
 
 `--spec none` is predicted the same (small calls CPU-served after P0), and tg512 unchanged.
+
+**Acceptance (fixed before measuring, §19.3.0).** P0-P6 are kept when: M2 (a) tg512 and the cold
+code-prompt run are unchanged within run-to-run noise on identical ids; M2 (c) restored and
+resident arms decode the same ids at the same speed and hit rate within noise (a slower restored arm
+is a defect: lost residency, a rebuilt proposer, n-gram re-hashing or MTP state); M5 tap overhead
+is < 0.5 % of cold prefill; and every M1 turn type and M7 show lower TTFT than the
+`--no-prefix-reuse` arm, reported against the predictions above with worst cases. P7 keeps its own
+M6 gate.
 
 #### Rejected alternatives
 
@@ -3681,7 +3856,7 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 | Multi-call narrow suffix route (≤ 8-column calls) | Dominated: each call re-stages its distinct experts and the CPU takes ≤ 8 misses per layer per call; 50 prompt-hot tokens as 7 narrow calls ≈ 0.6-0.7 s vs ~0.3 s for one assisted call. A single small call stays CPU-served |
 | MTP cell c at KV slot c + 1 | A QSA op change (pooled 4-blocks would straddle pages) plus requalification; the per-node next token solves it in the binding |
 | "Every prefill call leaves its last MTP cell pending" (first revision) | Withdrawn: changed cold-run drafter order for nothing; MR4 makes boundary snapshots exact |
-| Zero-split GDN state tap (Hybrid spec §7.2-7.3) | Not needed: the planner keeps useful exact taps ≤ 40 ms |
+| Zero-split GDN state tap (Hybrid spec §7.2-7.3) | Not built: automatic exact taps are admitted only at Δ ≤ 0.1 s (the opener costs ~25-40 ms). The remaining cost is ~1.3 s once per new prefix, for an Explicit or Structural tap that splits a chunk. That does not justify a GDN kernel state tap, which is not implemented for any model |
 | Review proposals | **Two spare pages per lane:** one suffices (lemma); the second served a removed early-tail D2D copy. **E1 for C = 1 greedy only:** MR5 removes the mechanism, so E1 holds at any C (E5 and the drafter risk stay C = 1 greedy). **Lane-resident pending capture as a candidate, or publishing with host = Filling:** needs a snapshot state `snapshot_valid` lacks; the bounded drain closes the gap. **Capping a resumed lane at pool − 1 pages:** silently cuts whole-extent output. **Pacing bulk D2H as primary:** D2H FIFO unverified, and `download_pinned` fixes it without delaying write-through; pacing is the fallback. **Single-kernel page copy:** `copy_page`'s ~0.1-0.3 ms per Device-COW resume is immaterial against ≥ 25 ms of suffix |
 
 #### Risks
@@ -3696,7 +3871,7 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 | Whole-extent reservations evict other conversations' Device blocks | Host-backed (~20 ms per 30K); lease windows deferred |
 | P7 gains less than predicted (DRAM contention) | M6 gate; P7 is independent of P0-P6 |
 | The opener after endpoint resumes costs ~30 ms per agentic turn for nothing if echoes are always exact | Counter; drop later if M1/M7 show ≈ 0 fallbacks |
-| P0 `program.cpp` refactor breaks something; duplication with Qwen3.5's binding; persistence invalidated by every rebuild | Pure move with greedy-id and tg512 checks; P9; expected (useful across restarts of one binary) |
+| Duplication with Qwen3.5's binding; persistence invalidated by every rebuild | P9; expected (useful across restarts of one binary) |
 
 #### Decisions and open questions
 
@@ -3704,16 +3879,16 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 |---|---|---|
 | Host tier size | **4 GiB**, more by `--host-cache-mib` | 8-12 GiB for ~100K-token agentic sessions if ≥ 16 GiB stays free after model and Vision |
 | Device snapshot slots | **0** (frame-free; needs P1) | `C + 1` as Qwen3.5 (~84 frames ≈ 0.35 % decode) |
-| Exactness contract | **As upstream** (E1-E6): a resume equals the capturing request's own computation and may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold equality: grid-aligned resumes and no exact taps (~1.3 s per misaligned resume), still not for endpoints |
-| P7 prefill CPU assist (shared offloaded-MoE Op change) | **Implemented, kept only if M6 passes** | No P7 (it is the main post-hit lever and also speeds short cold prompts) |
+| Exactness contract | **As upstream** (E1-E6): a resume equals the capturing request's own computation and may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included (echo turns lose endpoint reuse) |
+| P7 prefill CPU assist (shared offloaded-MoE Op change) | **Implemented, kept only if M6 passes** (≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged): it is the main post-hit lever and also speeds short cold prompts | No P7 (it changes shared offloaded-MoE Op code) |
 | Exact Structural/Explicit taps that add a call (~1.3 s once per new preamble) | **Kept** | Demote when Δ > 0.1 s |
-| Generation opener after endpoint resumes | **Kept**: ~25-40 ms + 116 MB Host per turn; it rescues echoes that diverge inside the generated turn, saving the tool result's re-prefill; break-even ~1-3 % mismatches for 1-3K-token results (estimated); `lineage_echo` → `endpoint_mismatch_fallbacks` | Drop as Qwen3.5 does (`hybrid_program.cpp:986-996`, a ~15 ms split on 27B), or later for echo lineages if fallbacks stay ≈ 0 |
+| Generation opener after endpoint resumes | **Kept**: ~25-40 ms + 116 MB Host per turn; it rescues echoes that diverge inside the generated turn, saving the tool result's re-prefill; break-even ~1-3 % mismatches for 1-3K-token results (estimated); each snapshot records `lineage_echo`, and an admission that resumes from an opener snapshot with `lineage_echo` set counts `endpoint_mismatch_fallbacks` (reported by M1 and M7) | Drop as Qwen3.5 does (`hybrid_program.cpp:986-996`, a ~15 ms split on 27B), or later for echo lineages if fallbacks stay ≈ 0 |
 | Decode-time `</think>` tap | **Not for now** | Flexible tap at `</think>` (~4.5 ms stall + 116 MB Host per turn) for echo mismatches in content or tool calls |
 | QSA tails fix | **In P0** (exact mismatched prepends; fixes today's step-0 pooled-key corruption; drafter-only) | Leave it, count stale prepends |
 | `download_pinned` for per-round readbacks | **Only if M0 confirms D2H FIFO stalls** (decode path, output-neutral) | Write-through pacing |
 | Code sharing | **Sibling binding now, shared Host-tier helper (P9) later** | Extract now (touches Qwen3.5, needs a 27B rerun) |
 | Persistence (`--prefix-cache-file`) | **After P6** (any rebuild invalidates the file) | Inside P6 |
-| Serving prefill chunk | **After M9.** 4096 costs ~491 frames (~4.6 % tg512) vs 1024 (§19.2; that 1024 row was at max-ctx 4096); with long cold prefills rare, 2048 may be better | Switch now |
+| Serving prefill chunk | **After M9.** 4096 costs ~491 frames (~4.6 % tg512) vs 1024 (§19.2; that 1024 row was at max-ctx 4096); with long cold prefills rare, 2048 may be better. The chosen chunk is fixed per Engine (never derived from free frames or loans, which would break E3) and passes M9's long-prompt quality check | Switch now |
 | Idle-time re-render warming (product change) | **Not designed** | Background prefill of the predicted re-rendered history after a turn, so a no-echo suffix is only the new message (~1-2 s per chat turn); needs preemptible background lane work |
 | C > 1 extras (P8) | **After the concurrency track** (§19.3.5) | Now |
 
@@ -3723,8 +3898,11 @@ Design, reviewed twice (18 findings, all confirmed in code and folded in), nothi
 (worktree `NInfer-V3-flashnext`, HEAD `46a56fc8f`, 2026-10-04). The investigation was read-only: no
 build, no GPU run, no weights loaded, one CPU-only query of the nsys trace
 `local/workdirs/fn/prof/prefill1.sqlite`. Labels: **measured** (with its source), **code**
-(`file:line`; model paths relative to `src/models/qwen4_exp/`, or to `src/models/qwen3_5/` where
-the context is Qwen3.5), **estimated**. This delivers the Vision part of §1.1 and refines the
+(`file:line`; paths beginning `qwen3_5/` are relative to `src/models/`, other model paths to
+`src/models/qwen4_exp/`; bare Qwen3.5 file names in the baseline rows are under
+`src/models/qwen3_5/frontend/`, `program/` or `execution/`), **estimated**. Local IDs: steps V0-V8,
+tests VT1-VT9, measurements VM1-VM8 (not the §19 milestones). This delivers the Vision part of
+§1.1 and refines the
 `vision` frame role of §9.1-§9.2: the encode normally runs in the prefill workspace, and frames
 are lent only for the output handoff and oversize windows.
 
@@ -3754,7 +3932,7 @@ Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
 |---|---|
 | Frontend | Media acquisition and `MediaPreprocessCache` (`--media-cache-mib`, `--media-live-mib`). The processor smart-resizes and packs BF16 `[raw_patches, 1536]` as **pageable** payloads (`prepared_prompt.h:35-47`). `--vision-max-merged N` caps an item at N × 1024 px; hard caps are 32,768 merged tokens per prompt and 16,384 per item. `assign_positions` (`processor.cpp:634-708`) stores M-RoPE positions axis-major `[3,n]` with `rope_delta`: text has equal axes, an image run `(cur, cur+y, cur+x)` then `cur += max(gh,gw)`, a text-only prompt the index on every axis. `block_hashes` / `block_extras` hold a cumulative vision key per 64-token block. |
 | Vision control (`vision_control.cpp:37-211`) | 2-D RoPE ids; 4-tap bilinear indices and weights into the 48 × 48 table; scatter indices; segments (`segment_length = h·w`, `segment_count = t`) |
-| Tower (`VisionContext::encode`, `qwen3_5/execution/vision.cpp:322-464`) | One item per call: pageable H2D → patch projection + bias → bilinear position embedding → 27 × [LN → fused QKV + bias → 2-D RoPE (D72, θ 10,000) → non-causal attention per segment (`packed_softmax_attention`, equal-length form) → proj + bias + residual → LN → fc1 + bias → tanh-GELU → fc2 + bias + residual] → merger LN → view [4608, V] → fc1 → exact GELU → fc2 → BF16 [out, V]. Residual `x` 2,304 B/patch across all layers; the MLP scope peaks at 8,608 + 2,304, so 13,216 B/patch plus a 1,280 B/patch handoff, which `encode()` requires as its output (`vision.cpp:333-341`). |
+| Tower (`VisionContext::encode`, `qwen3_5/execution/vision.cpp:322-464`) | One item per call: pageable H2D → patch projection + bias → bilinear position embedding → 27 × [LN → fused QKV + bias → 2-D RoPE (D72, θ 10,000) → non-causal attention per segment (`packed_softmax_attention`, equal-length form) → proj + bias + residual → LN → fc1 + bias → tanh-GELU → fc2 + bias + residual] → merger LN → view [4608, V] → fc1 → exact GELU → fc2 → BF16 [out, V]. Residual `x` 2,304 B/patch across all layers; the MLP scope (MLP-up 8,608 + MLP-norm 2,304 B/patch) peaks on top of `x`, so 13,216 B/patch plus a 1,280 B/patch handoff, which `encode()` requires as its output (`vision.cpp:333-341`). |
 | Injection | `ops::embedding` → `ops::scatter`; `[T,3]` RoPE for multimodal chunks, else `positions + rope_delta`; the MTP takes visual embeddings at image cells; at most one item per chunk (one-item handoff). |
 | Offload (commit `5f7350f`) | HostPinned weights. A VMM `EvictableWeightPool` lends the weight arena's tail and re-uploads it from a mirror afterwards. `VisionWeightStream` streams prelude, merger and two layer slots on `transfer_stream`; it uploads prelude and merger before any compute fence exists (safe only because the overlay VA is fresh) and re-streams the tower per item. The window ends with a host sync, a D2H of each item to pinned memory and a re-upload during prefill. |
 
@@ -3781,7 +3959,7 @@ Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
 | The QSA indexer rotates by KV index; QSA equals causal attention below 2,051 visible tokens (B 2048, R 4), so wiring errors are invisible there | `src/ops/qsa/qsa.cu:62-67, 87, 112-133`; `include/ninfer/ops/qsa.h:20, 29-30` |
 | MTP input is a token gather; `reserve()` keeps only token ids and the `PreparedPrompt` dies at return | `forward.cpp:510-511`; `program.cpp:423-476` |
 | Decode and verify upload only the io prefix before `ngram`, MTP drafts only the words before `drafts`; MTP sub-chunks slice `positions` along dim 0 (`kMtpChunkColumns = 512`) and check `numel`; `ops::rope` needs contiguous positions | `program.cpp:863-865, 991, 1146, 1417`; `forward.cpp:34, 176-178, 195`; `src/ops/wrapper/rope.cpp:75-78` |
-| Every vision projection runs `bf16_general_gemm`, a scalar 32×32-tile `fmaf` kernel without MMA; `linear.h:79` lists 3 BF16 problems | `src/ops/linear/bf16/bf16_dispatch.cpp:13-28`, `bf16_general.cuh:15-75` |
+| Every vision projection runs `bf16_general_gemm`, a scalar 32×32-tile `fmaf` kernel without MMA; `include/ninfer/ops/linear.h:79` lists only 3 BF16 problems | `src/ops/linear/bf16/bf16_dispatch.cpp:13-28`, `bf16_general.cuh:15-75` |
 | Load publication ignores the generation (ABA); `FramePool::acquire` is LIFO; entries go `Ready` at issue | `expert_residency.cpp:84-89`; `expert_cache.cpp:144-149, 193-199` |
 | Only compute is synchronized at round ends: up to 16 promotions per layer × 48 = 768 × 2,764,800 B ≈ 2.1 GB ≈ 77 ms of DMA stay in flight after a prefill chunk | `device.cu:175`; `program.cpp:509-510, 523, 822` |
 | PLE row reads have no in-call de-duplication | `program/ngram_volume.cpp:47-95` |
@@ -3803,7 +3981,7 @@ host's publication test does not use it.
 
 | Piece | Design |
 |---|---|
-| Shared, Program-free tower `src/models/qwen3_5/execution/vision_tower.{h,cpp}` (new) | Takes `VisionWorkspacePlan` from `qwen3_5/program/planning/startup.h:108-116`, so Qwen4Exp does not include `qwen3_5/program/internal.h`. `VisionTowerItem{patches BF16 [1536, P]; const VisionItemControl* (grid, position ids, interpolation, segments); Tensor output BF16 [out, V], caller-owned}`. `plan_vision_pass(config, params, item_patches) → VisionPassLayout{bytes}`. `VisionTowerPass(device, config, weights, items, DeviceSpan arena, layout, VisionWeightStream* /* null when resident */)` is resumable and layer-major: `advance(end_stage)` over `stages(depth) = depth + 2` (0: patch and position embedding of every item; 1-27: that layer for every item; 28: the mergers into their outputs), `next_stage()`. No internal handoff. |
+| Shared, Program-free tower `src/models/qwen3_5/execution/vision_tower.{h,cpp}` (new) | `VisionWorkspacePlan` moves into it from `qwen3_5/program/planning/startup.h:108-116`, so Qwen4Exp does not include `qwen3_5/program/internal.h`. `VisionTowerItem{patches BF16 [1536, P]; const VisionItemControl* (grid, position ids, interpolation, segments); Tensor output BF16 [out, V], caller-owned}`. `plan_vision_pass(config, params, item_patches) → VisionPassLayout{bytes}`. `VisionTowerPass(device, config, weights, items, DeviceSpan arena, layout, VisionWeightStream* /* null when resident */)` is resumable and layer-major: `advance(end_stage)` over `stages(depth) = depth + 2` (0: patch and position embedding of every item; 1-27: that layer for every item; 28: the mergers into their outputs), `next_stage()`. No internal handoff. |
 | Batch invariance by construction | Every GEMM, norm, RoPE and attention call runs per item with its own T = P_i. Attention uses the equal-length form, one call per item, whose tile depends only on the segment length (`src/ops/softmax_attention/dense/packed/launch.cu:54-75`); the `cu_seqlens` form always uses 64 × 64 tiles (`kernel.cuh:16-17`) and is not used. An item's embedding is bitwise the same alone or with other items, whatever Linear routes do with T, and each layer's weights still stream once for all items. |
 | Pass layout | `x` for every item plus per-layer scope tensors shared and sized for the largest item: the MLP scope (10,912·P_max) dominates attention (9,216) and patch (~3,112); the merger's normalized buffer is P_max-sized, its hidden aliases `x`. `pass_bytes ≈ 2,304·ΣP + 10,912·P_max` (one item: 13,216·P). |
 | Qwen3.5 contract | `VisionContext::encode` keeps its plan, `bind_output` and handoff check and becomes a one-item pass over its layout: same op sequence, bit-identical output. Using the pass in Qwen3.5's offload window (no per-item re-stream) is optional and out of scope. |
@@ -3819,8 +3997,9 @@ host's publication test does not use it.
 - **Problems [N,K]:** patch [1152,1536], QKV [3456,1152], proj [1152,1152], fc1 [4304,1152], fc2
   [1152,4304], merger fc1 [4608,4608], merger fc2 [2560,4608], and [5120,4608], the merger fc2 of
   Qwen3.8-27B-Quasar (the published Qwen3.5-architecture artifact whose BF16 vision also runs the
-  fallback, `tests/ops/linear/test_bf16_a16.cpp:278-297`; its other six shapes change route anyway).
-  Registered for every positive T as the BF16 contract requires (`linear.h:79` updated):
+  fallback, `tests/ops/linear/test_bf16_a16.cpp:278-297`; its other six shapes change route anyway,
+  so registering the seventh moves its whole tower off the fallback). Registered for every positive
+  T as the BF16 contract requires (`include/ninfer/ops/linear.h:79` updated):
   `src/ops/linear/bf16/shapes/n1152_k1536.cu` … `n5120_k4608.cu`, `bf16_shapes.h`,
   `bf16_dispatch.cpp` (`kShapes`), `sources.cmake`.
 - **Kernels.** All N and K except 4304 are multiples of 64, so the existing `Bf16A16MmaSchedule` /
@@ -3859,7 +4038,7 @@ IoLayout: ids | positions | rope [3·columns_] | block_rope [3·lanes] | slots |
 | Prompt RoPE (`program/rope_positions.{h,cpp}`) | `reserve()` consumes the `PreparedPrompt`, so `Lane` keeps `LaneRope{prompt: I32 [3, prompt_tokens] axis-major, empty for text-only; delta: rope_delta, 0 for text-only}`, moved in only for prompts with media (12 B/token). One pure, unit-tested helper `rope_of(lane_rope, prompt_tokens, index)` returns `prompt[a·n + index]` for a prompt token of a media prompt, else `index + delta` on all three axes. It serves prefill chunks, forced tokens (`append_forced` begins ≥ `prompt_tokens`), decode, verify, MTP prompt cells and drafts, catch-up and every block start. |
 | io placement | `rope` and `block_rope` precede `ngram`, so `io_prefix(columns)` uploads them in decode and verify; the rest is prefill-only (`run()` uploads everything). Axis a of a `cols`-column call sits at word offset `a·cols`, so `[cols,3]` is contiguous. A constructor check asserts that `block_rope` ends at or before `ngram`. `mtp_io_` gains `rope_cells` and `block_rope_cells` [K][3][lanes] before `drafts`, inside the existing `4·mtp_io_.drafts` upload; draft step j of lane b uses `rope_of(cell + j)`, block start `rope_of(R·⌊(cell+j)/R⌋)`. |
 | Block starts | `block_rope[a·batch + b] = rope_of(lane_b, R·⌊start_b/R⌋)` for every call: chunks need not start at multiples of 4 (`--prefill-chunk` is any value ≥ 1; forced tokens and verify windows start anywhere). |
-| MTP sub-chunks | The 512-column loop slices along dim 0, which `[cells,3]` cannot do contiguously. `kMtpChunkColumns` moves to `forward.h`; `stage_mtp_chunk` writes sub-chunk k as its own `[n_k,3]` block at word offset `3·512·k`, with block start `rope_of(R·⌊(first+512k)/R⌋)` (with a prepended cell `first+512k` is not a multiple of R); `MtpChunk` carries the base and `block_start_rope [3, subchunks]`; the geometry check compares `ne[0]`, not `numel`. |
+| MTP sub-chunks | The 512-column loop slices along dim 0, which `[cells,3]` cannot do contiguously. `kMtpChunkColumns` moves to `forward.h`; `stage_mtp_chunk` writes sub-chunk k as its own `[n_k,3]` block at word offset `3·512·k`, with block start `rope_of(R·⌊(first+512k)/R⌋)` (with a prepended cell, `first+512k` is not a multiple of R); `MtpChunk` carries the base and `block_start_rope [3, subchunks]`; the geometry check compares `ne[0]`, not `numel`. |
 | Forward (`execution/forward.{h,cpp}`) | `ForwardBatch` gains `rope_positions`, `block_start_rope`, `const VisionInput* vision`; `MtpCall` gains `rope_positions`, `block_start_rope`, `input_embeddings`. `AttentionCall` passes them to `ops::rope` (`forward.cpp:374`), `QsaBatch` and `qsa_index_query`; KV append keeps `call.positions`. `ForwardTap` gains `qsa_index_queries` (rotated `[Di, heads, T]` per attention layer) for VT6. |
 
 #### Embedding injection and the MTP mapping
@@ -3892,7 +4071,7 @@ IoLayout: ids | positions | rope [3·columns_] | block_rope [3·lanes] | slots |
 | Parameters (`execution/parameters.cpp`) | `qwen3_5::execution::VisionParameters`: fused QKV through `ops::prepare_linear_weight({q,k,v})`, joined bias |
 | Engine (`qwen4_exp_instance.cpp`) | Drop the rejection; `vision_enabled = options.enable_vision`; pass `vision_max_merged_tokens` to `make_frontend`; report `vision` in `weight_formats` |
 | Frames | The handoff needs frames. The cache is always on (`ProgramOptions::expert_cache = true`, no setter), so frames are 0 only below the 384 MiB reserve; startup then fails with "vision needs at least N expert frames". |
-| Host RAM | Offload pins 856 MiB more, 64.47 → ~65.3 GiB, inside the loader's 8 GiB-free rule on this 95.8 GB machine (estimated) |
+| Host RAM | Offload pins 856 MiB more, 64.47 → ~65.3 GiB, inside the loader's 8 GiB-free rule on this 95.8 GiB machine (estimated) |
 
 #### The encode window and its memory
 
@@ -3925,8 +4104,9 @@ with offload (`R_gemm`, `R_attn` measured in VM2, documented in code). Two place
 #### Frame lending and the two expert-cache fixes
 
 The fixes: **lease waits** (window writes into lent frames could race promotion DMAs still landing
-there, review finding R2-1, so a lease makes its users wait on every in-flight batch that targets
-the run) and the **load serial** (the ABA hole above). The rest is the lending API.
+there (review finding R2-1, `local/workdirs/fn/plans/vision.md` §14), so a lease makes its users
+wait on every in-flight batch that targets the run) and the **load serial** (the ABA hole above).
+The rest is the lending API.
 
 | Component | Change |
 |---|---|
@@ -3940,10 +4120,11 @@ the run) and the **load serial** (the ABA hole above). The rest is the lending A
 
 #### Costs and the offload default
 
-Frame 2,764,800 B; weights 897,862,112 B; staging 135,886,912 B (50 frames). At the measured
-27.6 GB/s (§19.2, PCIe Gen5 x8) the stream takes 32.5 ms per window: prelude 0.32 ms, 1.10 ms per
-layer, merger 2.39 ms. GEMM per patch: 27 × 30.45 + 3.54 (patch) + 16.5 (merger) = **842 MFLOP**;
-attention 27·4·P²·1152 FLOP. Only the fallback rate is measured; the other rates are estimates.
+Frame 2,764,800 B; weights 897,862,112 B; staging 135,886,912 B (50 frames). At the measured 27.6
+GB/s (§19.2, PCIe Gen5 x8) the stream takes 32.5 ms per window: prelude 0.32 ms, 1.10 ms per layer,
+merger 2.39 ms. GEMM per patch: 27 × 30.45 MFLOP (layers) + 3.54 MFLOP (patch) + 16.5 MFLOP (merger,
+per patch) = **842 MFLOP**; attention 27·4·P²·1152 FLOP. Only the fallback rate is measured; the
+other rates are estimates.
 
 | P (V tokens) | GEMM | Attn | GEMM, fallback 13.2 TF/s | GEMM, TC 100-150 TF/s | Attn, 60-120 TF/s | W_ws (offload) | Handoff frames |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -3955,8 +4136,8 @@ attention 27·4·P²·1152 FLOP. Only the fallback rate is measured; the other r
 | 65,536 (16,384), item cap | 55.2 | 534 | 4.2 s | 0.37-0.55 s | 4.5-8.9 s | 1,002 MB (363 frames) | 31 |
 
 - **Placement.** At chunk 1024 (`work_` ≈ 0.5 GB) with 0.25 s steps, images up to P ≈ 8-12K
-  (V ≈ 2-3K tokens) take W: one step, no expert evicted. The P = 65,536 item lends ~394 frames
-  (4.2 %) and runs in ~20-40 steps.
+  (V ≈ 2-3K tokens) take W: one step; only the 1-4-frame handoff run is lent, so at most that many
+  experts are evicted. The P = 65,536 item lends ~394 frames (4.2 %) and runs in ~20-40 steps.
 - **Offload overhead against resident, TC routes.** Stream-bound below ~1.1 ms of compute per
   layer: +30 ms at P = 256, +22 ms at P = 1,024. Compute-bound above: +2 ms at P ≥ 4,096 (prelude
   and layer 0 exposed ~1.4 ms, merger tail ≤ 0.6 ms). On the fallback every size is compute-bound
@@ -3997,9 +4178,11 @@ attention 27·4·P²·1152 FLOP. Only the fallback rate is measured; the other r
   shim. **Protocol** unchanged (`image_url`, `input_image`, `video_url`, `input_video`,
   `vision_disabled`).
 - **Docs.** `docs/qwen3_8-flash-next.md:10` ("Not yet supported: vision") becomes usage notes (TTFT
-  per image token, offload default, frames lent, steps for huge items); `docs/cli.md:231-233`; the
-  README Flash-Next section; §9.2 (vision lending, ABA fix) and §19.2 (status, measurements);
-  `docs/maintainer/linear-tuning.md`; the `linear.h` and `qsa.h` contracts.
+  per image token, offload default, frames lent, steps for huge items, video token cost: 2 fps, up
+  to 768 frames); `docs/cli.md:231-233`; the README Flash-Next section;
+  `docs/maintainer/linear-tuning.md`; the `include/ninfer/ops/linear.h` and `qsa.h` contracts; at
+  merge time on the base branch (§19.3.0): §9.1-§9.2 (vision frame role, lending, ABA fix) and
+  §19.2 (status and a summary of VM1-VM8).
 - **Video** takes the same paths (per-frame spans and timestamps in the frontend, `segment_count =
   t` in the per-item equal-length attention, per-frame grids in `get_rope_index`): no extra
   mechanism, one 4-frame smoke test, and a documented token cost (2 fps, up to 768 frames).
@@ -4007,30 +4190,35 @@ attention 27·4·P²·1152 FLOP. Only the fallback rate is measured; the other r
 #### Steps
 
 Each step builds and tests on its own. V0, V1, V3 and V5 can run in parallel; V2 needs V1, V4 needs
-V3, V6 needs V0-V5, and V7-V8 follow V6. Total ≈ 12-13 working days.
+V3, V6 needs V0-V5, and V7-V8 follow V6. Total ≈ 12.5-13.5 working days plus V7's long CPU reference
+runs. Across tracks (§19.3.0): V1 rebases onto prefix P0's QSA tails fix and QSA oracle test, which
+land first. V6 needs n-gram S1 (§19.3.4). V2 rebases after concurrency S1 and n-gram S2/S3, which
+restructure `verify` and `mtp_draft`. V3 merges early (merge order item 2); V0-V2 and V4-V8 merge
+in item 5. Whichever of V4 and concurrency S4 (fill-phase landing) merges second adds a VT4 case
+that lends during the fill phase with landing reservations outstanding.
 
 | Step | Work | Main files | Effort, GPU | Exit criteria |
 |---|---|---|---|---|
-| **V0** | BF16 TC routes for the 8 shapes, 4304 tail TMA variant, tests, bench, contract, tuning doc | `src/ops/linear/bf16/{shapes/*.cu, bf16_a16_tma_mma.cuh, bf16_mma_common.cuh, bf16_dispatch.cpp, bf16_shapes.h, sources.cmake}`, `linear.h`, `test_bf16_a16.cpp`, `linear-tuning.md` | 1.5-2 d, yes | VT1; VM1 ≥ 5× fallback at T ≥ 1,024 |
-| **V1** | QSA M-RoPE op and its FP64 test | `qsa.h`, `qsa.cu`, `tests/ops/test_qsa_rope.cpp`, `tests/ops/*.cmake` | 1 d, yes | VT2 |
+| **V0** | BF16 TC routes for the 8 shapes, 4304 tail TMA variant, tests, bench, contract, tuning doc | `src/ops/linear/bf16/{shapes/*.cu, bf16_a16_tma_mma.cuh, bf16_mma_common.cuh, bf16_dispatch.cpp, bf16_shapes.h, sources.cmake}`, `include/ninfer/ops/linear.h`, `test_bf16_a16.cpp`, `linear-tuning.md` | 1.5-2 d, yes | VT1; VM1 ≥ 5× fallback at T ≥ 1,024 |
+| **V1** | QSA M-RoPE op and its FP64 cases | `qsa.h`, `qsa.cu`, the QSA oracle test from prefix P0 (§19.3.0), `tests/ops/*.cmake` | 1 d, yes | VT2 |
 | **V2** | RoPE plumbing: uniform `[T,3]`, `LaneRope`/`rope_of`, io and `mtp_io_` placement, block starts, MTP sub-chunks, Forward/MtpCall/AttentionCall/QsaBatch wiring, ForwardTap index queries | `program.cpp`, `program/rope_positions.{h,cpp}`, `execution/forward.{h,cpp}`, `test_rope_positions.cpp` | 1.5 d, gate | VT3; VM3 (ids and teacher-forced logits bitwise equal HEAD) |
 | **V3** | Load serial (ABA fix), independent of vision | `expert_cache.{h,cpp}`, `expert_residency.{h,cpp}`, `test_expert_cache.cpp` | 0.5 d, no | VT4 ABA cases; LFRU-equals-replay unchanged |
 | **V4** | Lending API, `quote`/`feasible` hooks, host tests | same, `program.cpp` | 1 d, no | VT4 lending cases |
 | **V5** | Shared tower refactor (Qwen3.5 encode on top), weight-stream fixes, overlay builder, config parse; Qwen4Exp config, binding, resources, parameters; engine and frontend flags; `--vision-offload` | `qwen3_5/execution/{vision_tower.*, vision.*, vision_overlay.*}`, `qwen3_5/load/vision_overlay.*`, `qwen3_5/config.*`, `qwen4_exp/{config.cpp, load.cpp, weights.h, execution/parameters.*}`, `qwen4_exp_instance.cpp`, `types.h`, `load_options.h`, `serve_options.cpp`, `apps/cli/options.cpp`, option tests | 1.5-2 d, Qwen3.5 regression | VT8 (Qwen3.5 embedding bit-identical); option tests |
-| **V6** | Program window: `LaneVision`, placements W/L, steps and `InProgress`, cancellation, guards, scatter, MTP visual embeddings, release paths, telemetry; n-gram de-duplication (§19.3.4 S1) | `program/vision_window.{h,cpp}`, `program.cpp`, `ngram_volume.cpp`, `execution/forward.{h,cpp}` | 2.5 d, yes | VT7, including C = 2, stress and lease accounting |
+| **V6** | Program window: `LaneVision`, placements W/L, steps and `InProgress`, cancellation, guards, scatter, MTP visual embeddings, release paths, telemetry. Needs n-gram S1's de-duplication (§19.3.4) and adds no copy of it | `program/vision_window.{h,cpp}`, `program.cpp`, `execution/forward.{h,cpp}` | 2.5 d, yes | VT7, including C = 2, stress and lease accounting |
 | **V7** | FP64 tower and multimodal reference, real tests | `tools/flash_next/reference.py`, `test_vision_real.cpp`, `test_forward_real.cpp`, `tests/test_flash_next_tools.py` | 2 d + long CPU runs, yes | VT5, VT6 a-c, VT9 |
-| **V8** | Measurements and docs | docs listed above | 1 d, yes | VM1-VM8 recorded in §19.2; defaults confirmed or revised |
+| **V8** | Measurements and docs | docs listed above | 1 d, yes | VM1-VM8 recorded in §19.3.2, adverse results and rejected approaches included; defaults confirmed or revised; §9.1-§9.2 and §19.2 updated on the base branch at merge (§19.3.0) |
 
 #### Tests
 
 | # | Test | Checks |
 |---|---|---|
 | VT1 | Op BF16 routes (`tests/ops/linear/test_bf16_a16.cpp`) | The 8 shapes at V0's T set against the FP64 Linear oracle, full comparison to T = 4,100 and sampled beyond; 4304 tails at T not a tile multiple; weight preservation |
-| VT2 | QSA M-RoPE (`tests/ops/test_qsa_rope.cpp`, new; QSA has no standalone oracle test yet, §19.2 M3) | Naive FP64 oracle for `qsa_index_query` and `qsa_pool_keys`: distinct axes (an image grid inside a sequence); a block start before the call (start ≡ 1, 2, 3 mod 4); prefill width 1,024, decode W = 1, verify W ∈ {5, 8}, B ∈ {1, 2}; pooled planes read back from the paged plane |
+| VT2 | QSA M-RoPE (cases added to the FP64 QSA oracle test that prefix P0 creates with its tails case, §19.3.0; QSA has no standalone oracle test at HEAD, §19.2 M3) | Naive FP64 oracle for `qsa_index_query` and `qsa_pool_keys`: distinct axes (an image grid inside a sequence); a block start before the call (start ≡ 1, 2, 3 mod 4); prefill width 1,024, decode W = 1, verify W ∈ {5, 8}, B ∈ {1, 2}; pooled planes read back from the paged plane; the prefix P0 tails fix (`tail_kernel`, `commit_tail_kernel`), which lands first, stays checked against the same oracle (§19.3.0) |
 | VT3 | RoPE staging (`tests/models/qwen4_exp/test_rope_positions.cpp`, new, host) | Over a synthetic image prompt from the real `assign_positions`: `rope_of` for prompt tokens, forced tokens past the prompt, decode, verify and draft cells; MTP sub-chunk blocks (prepend; `first` not a multiple of 4 or 512) and block starts; visual columns for chunks and MTP cells, including an image starting exactly at a chunk boundary and a last MTP cell whose token is the next chunk's first image token; io invariants (`rope`, `block_rope` before `ngram`; draft RoPE before `drafts`) |
-| VT4 | Expert cache (`test_expert_cache.cpp`, host) | LFRU-equals-replay unchanged; rev 1's "victims equal replay at changed capacity" dropped (`replay.py:565` runs one fixed capacity). `choose_run` picks the minimum-score run, skips loaned and avoids busy frames; `lend` evicts every held key in the run (entries `Absent`, no `frame_key_` into it) and shrinks capacity; `set_capacity` evicts the excess; `give_back` restores capacity and drains; **ABA**: load K→f (serial s1), lend f, give back, re-admit K→f (s2), then `complete_load(K, f, s1)` false and `(K, f, s2)` true; the no-lending variant K→K2→K; `loaned_count() == 0` after every release path |
+| VT4 | Expert cache (`test_expert_cache.cpp`, host) | LFRU-equals-replay unchanged; the first revision's "victims equal replay at changed capacity" check is dropped (`replay.py:565` runs one fixed capacity). `choose_run` picks the minimum-score run, skips loaned and avoids busy frames; `lend` evicts every held key in the run (entries `Absent`, no `frame_key_` into it) and shrinks capacity; `set_capacity` evicts the excess; `give_back` restores capacity and drains; **ABA**: load K→f (serial s1), lend f, give back, re-admit K→f (s2), then `complete_load(K, f, s1)` false and `(K, f, s2)` true; the no-lending variant K→K2→K; `loaned_count() == 0` after every release path |
 | VT5 | Tower oracle (`reference.py` gains CPU FP64 `vision_tower(store, patches, grid)` over `model.visual.*`, BF16 rounding at block boundaries as for text, checked once against transformers `Qwen4ExpVisionModel` in FP32); `test_vision_real.cpp` (skips without `NINFER_QWEN4_ARTIFACT`) | 256 × 256 (P = 256) and 448 × 320 (odd grid) by relative RMS; offload against resident **bit-identical**; an item alone against the same item in a 2-item pass **bit-identical**; placement W against L bit-identical |
-| VT6 | Multimodal model oracle (`test_forward_real.cpp`; `reference.py --patches npz --grid t,h,w` with an independent `get_rope_index` port, scatter before expand, 3-axis RoPE for main q/k, indexer query and pooled keys) | (a) ~150-token prompt with a 64-token image: per-layer residuals and last logits, plus the wiring check selection cannot hide: rotated index queries (new tap) and the pooled-key plane read from the KV pool against the reference's M-RoPE values. (b) Teacher-forced: W = 1 decode steps until ≥ 2 pooled blocks complete, the first starting inside the prompt, then one W = 5 verify-shaped call; logits there (`block_start_rope`, `index + delta`, verify widths). (c) **Mandatory** > 2,051 tokens: ~200 text, a 32 × 32 merged-grid image (1,024 tokens), ~900 text (~2,130 in all); last-position logits and residual RMS, so selection runs over M-RoPE pooled keys. CPU FP64 run 15-40 min (estimated), only while the engine holds no host RAM. |
+| VT6 | Multimodal model oracle (`test_forward_real.cpp`; `reference.py --patches npz --grid t,h,w` with an independent `get_rope_index` port, scatter before expand, 3-axis RoPE for main q/k, indexer query and pooled keys) | (a) ~150-token prompt with a 64-token image: per-layer residuals and last logits, plus the wiring check selection cannot hide: rotated index queries (new tap) and the pooled-key plane read from the KV pool against the reference's M-RoPE values. (b) Teacher-forced continuation of (a): W = 1 decode steps until ≥ 2 pooled blocks complete, the first starting inside the prompt, then one W = 5 verify-shaped call; logits there (`block_start_rope`, `index + delta`, verify widths). (c) **Mandatory** > 2,051 tokens: ~200 text, a 32 × 32 merged-grid image (1,024 tokens), ~900 text (~2,130 in all); last-position logits and residual RMS, so selection runs over M-RoPE pooled keys. CPU FP64 run 15-40 min (estimated), only while the engine holds no host RAM. |
 | VT7 | Engine end to end (GPU, gpu.lock) | Text gate: tg512, code and story greedy ids equal HEAD, teacher-forced logits bitwise equal (`--dump-logits`, three frozen texts). Image chart question, greedy: sensible answer; ids equal with offload on and off, and plain against `--spec mtp` (C = 1). Image at a chunk boundary with `--prefill-chunk 128`: no error, MTP acceptance close to chunk 1024. **C = 2:** lane B decodes greedily while lane A (an image, `max_tokens 1`) is admitted right after B's prefill chunk with the promotion backlog live; B's ids equal B alone (B is at batch 1, so exactly). **Stress:** 10 back-to-back image admissions, each right after another lane's prefill chunk; each image's ids equal its C = 1 resident run. **Lease accounting:** cancel a large image after its first `InProgress`; run abort, discard, finish and `fail_all`; after each, frames lent = 0 and capacity restored (idle log line). Serve `image_url` and `input_image`; one 4-frame video. After §19.3.1: a second turn on the same image whose `cached_tokens` cover it and whose answer equals a cold run. |
 | VT8 | Qwen3.5 regression | `test_vision_workspace` and the vision op tests; a Qwen3.5 image embedding bit-identical before and after the refactor; a Qwen3.5 image smoke if an artifact is available; a Quasar vision smoke (its BF16 tower changes route; within oracle tolerance) |
 | VT9 | Python | `py_compile` and `tests/test_flash_next_tools.py` for the reference changes |
@@ -4070,7 +4258,7 @@ V3, V6 needs V0-V5, and V7-V8 follow V6. Total ≈ 12-13 working days.
 | MTP visual embeddings | vLLM / Qwen3.5 convention | Placeholder embedding (only acceptance changes) |
 | Video | In scope: same code, one smoke test | Images only first |
 | Frame floor vision never borrows | 25 % | Another share |
-| `kVisionStepSeconds` | 0.25 s initially, tuned by VM7 (a few hundred ms of stall per step, against ~2 s per prefill chunk today) | Another value, chosen from VM7 |
+| `kVisionStepSeconds` | 0.25 s initially, tuned by VM7 (a few hundred ms of stall per step, against ~2 s per prefill chunk today) | Shorter steps (less stall for other lanes, more steps) |
 | V0 shapes | All 8, including Quasar's merger [5120,4608]; Qwen3.5 vision requalified (VT8) | The 7 Flash-Next shapes; Quasar's merger fc2 stays on the fallback |
 | Text BF16 prefill projections on tensor cores | A separate later task with its own quality gate | Fold into V0 (changes text numerics) |
 
@@ -4101,20 +4289,22 @@ V3, V6 needs V0-V5, and V7-V8 follow V6. Total ≈ 12-13 working days.
 
 ### 19.3.3 Dense Q8 decode kernels
 
-A read-only design at `46a56fc8f` (nothing built or run; `file:line` references are at that
-commit). Labels: **measured** (an nsys trace or a §19.2 microbenchmark), **verified** (read in the
-code), **estimate** (the fit below), **inference** (from one measured point or from code structure;
-M1/M2 confirm it). Trace analysis: `fn/plans/q8-trace-analysis.py`.
+Design, adversarially reviewed, nothing implemented or run on the GPU (worktree
+`NInfer-V3-flashnext`, designed against `46a56fc8f`, 2026-10-04; `file:line` references are at that
+commit, where `program.cpp:N` is now `program/program_impl.h:N−2`, §19.3.1). Labels: **measured**
+(an nsys trace or a §19.2 microbenchmark), **verified** (read in the code), **estimate** (the fit
+below), **inference** (from one measured point or from code structure; M1/M2 confirm it). Trace
+analysis: `fn/plans/q8-trace-analysis.py`.
 
 The dense Q8 decode routes lose time to how they schedule memory, not to compute, and fall off a
 cliff above 8 columns. Estimated savings per main forward:
 
 | Phase | Content | Numerics | T = 1 | W = 4 | T = 9-16 |
 |---|---|---|---|---|---|
-| 0 | Fused small MoE dispatch with the route log; router weight loads before x staging; preloaded RMSNorm for the MTP `hidden_norm` | Bit-exact | −0.33 to −0.6 ms | similar | — |
-| 1a | K1, a register-streamed Q8 kernel, for all 10 Flash-Next Q8 geometries | Bit-exact at T ≤ 8; T = 9-16 rounds differently, column-consistent with T ≤ 8 | −0.41 to −0.51 ms (of 3.09) | −0.75 to −0.91 ms (of 3.62) | ≈ −11 to −17 ms (inference; HEAD's MMA times unmeasured but for one shape) |
+| 0 | Fused small MoE dispatch with the route log; router weight loads before x staging; preloaded RMSNorm for the MTP `hidden_norm`; since 2026-10-04 (§19.3.6): E2M1 decode in registers in the expert kernels, the GDN control GEMV on more SMs, QSA attention accumulators in registers | Bit-exact | −0.28 to −0.4 ms (plain), plus −0.18 to −0.42 ms from the 2026-10-04 items | −0.33 to −0.6 ms, plus −40 µs per round for `hidden_norm` (MTP), plus −0.7 to −1.6 ms per W = 4-5 round from the 2026-10-04 items | — |
+| 1a | K1, a register-streamed Q8 kernel, for all 10 Flash-Next Q8 geometries | Bit-exact at T ≤ 8; T = 9-64 rounds differently where K1 replaces the MMA tiles (1a-ii), column-consistent with T ≤ 8 | −0.41 to −0.51 ms (of 3.09) | −0.75 to −0.91 ms (of 3.62) | ≈ −11 to −17 ms (inference; HEAD's MMA times unmeasured but for one shape) |
 | 1b | Split-K HC mixer (§8.3 K1a/K1b), inject folded into its producers, shared expert through `linear_swiglu`: 10 fewer launches per layer | Rounding change, more precise than HEAD and upstream | −0.55 to −0.7 ms | −0.55 to −0.7 ms | — |
-| 2 | PDL weights-first, L2 warming during `cpu_wait_kernel`, a per-weight L2 class | Bit-exact | −0.15 to −0.45 ms (unmeasured mechanisms) | — | — |
+| 2 | PDL weights-first, L2 warming during `cpu_wait_kernel`, a per-weight L2 class; the shared expert on its own graph branch (2026-10-04) | Bit-exact | −0.15 to −0.45 ms (unmeasured mechanisms), plus −0.1 to −0.25 ms for the branch | — | — |
 | 3 | Tensor-core K2, only if its trigger fires | Rounding change | — | — | — |
 
 End-to-end gains are typically 50-80 % of kernel deltas: the fork overlaps work, CPU-served misses
@@ -4122,13 +4312,15 @@ are often the long pole, and the GPU is ~11 % idle in MTP decode.
 
 #### Shapes, widths and measured times
 
-Scope: every `dense8m` Q8_G32_FP16 RowSplit weight (verified in its conversion report). The 8-bit
-head uses `projection_fp32`; the main QSA projection [13952, 2560] and GDN control [96, 2560] are
-BF16. Sources: **A** `fn/mtp/prof/mtp3b.sqlite` (MTP max 3, T ≤ 4, 400 rounds, before the few-row
-route of `ecaf50e16`); **B** `fn/prof/bench3_old.sqlite` (plain tg512, SIMT); **C**
-`fn/prof/bench4.sqlite` (plain tg512, the rejected skinny GEMV: a warp per 2 rows, register loads,
-16-code chunks); **D** §19.2 microbenchmarks (CUDA graph, weights cycled through 256 MB). µs per
-call; per-forward totals use B at T = 1 and A's T = 4 at W = 4 (D's 7.0 for HC down).
+Scope: every `dense8m` Q8_G32_FP16 RowSplit weight, verified in
+`out/flash-next/qwen3_8_flash_next_nvfp4_dense8m.ninfer.conversion.json`, which lists exactly these
+Q8 matrices plus the 8-bit head. The 8-bit head uses `projection_fp32`; the main QSA projection
+[13952, 2560] and GDN control [96, 2560] are BF16. Sources: **A** `fn/mtp/prof/mtp3b.sqlite` (MTP
+max 3, T ≤ 4, 400 rounds, before the few-row route of `ecaf50e16`); **B**
+`fn/prof/bench3_old.sqlite` (plain tg512, SIMT); **C** `fn/prof/bench4.sqlite` (plain tg512, the
+rejected skinny GEMV: a warp per 2 rows, register loads, 16-code chunks); **D** §19.2
+microbenchmarks (CUDA graph, weights cycled through 256 MB). µs per call; per-forward totals use B
+at T = 1 and A's T = 4 at W = 4 (D's 7.0 for HC down).
 
 | Weight [N, K] | MB | Calls: main / drafter per round | T = 1 (B) | T = 1-3 / 4 (A) | T = 5 / 8 (D) | Skinny T = 1 (C), CTAs | Per forward T = 1 / W = 4 | Why HEAD is slow (verified; slope inferred) |
 |---|---:|---|---:|---:|---:|---:|---:|---|
@@ -4156,22 +4348,23 @@ runs `run_mtp` at T = W × batch (`:1488-1497`), the hidden projection has 4T co
 Under the speculation gate (§19.3.5), main forwards exceed 8 columns only if S6 + S7 replace it;
 the gated W = 1 catch-up still has 4B hidden-projection columns (inference: B ≥ 3 crosses 8).
 
-**Calibrated floor (measured fit).** Trace C fits **t ≈ 1.4 µs + bytes / 1.6745 TB/s** within
-0.16 µs ([16384, 2560] 28.09 against 28.0, PLE 22.46 / 22.2, HC up 3.52 / 3.5, shared down
-2.56 / 2.4). 1,674.5 GB/s is the sustained-read probe ([linear benchmark §9](linear-benchmark.md));
-1.6 TB/s overshoots [16384, 2560] by 1.2 µs, and an earlier 0.9 µs fixed cost (L2-resident tiny
-kernels) was too optimistic. The fit holds for grids of at least one wave at 2 CTAs per SM
-([2560, 6144] at 160 one-per-SM CTAs is 0.5 µs above it). K1 is the same class of kernel and cannot
-beat it.
+**Calibrated floor (measured fit).** Trace C fits **t ≈ 1.4 µs + bytes / 1.6745 TB/s** within 0.27
+µs ([16384, 2560] 28.09 against 28.0, PLE 22.46 / 22.2 (the largest residual), HC up 3.52 / 3.5,
+shared down 2.56 / 2.4). 1,674.5 GB/s is the sustained-read probe ([linear benchmark
+§9](linear-benchmark.md)); 1.6 TB/s overshoots [16384, 2560] by 1.2 µs, and an earlier 0.9 µs fixed
+cost (L2-resident tiny kernels) was too optimistic. The fit holds for grids of at least one wave at
+2 CTAs per SM ([2560, 6144] at 160 one-per-SM CTAs is 0.5 µs above it). K1 is the same class of
+kernel and cannot beat it.
 
 **SIMT route at T ≤ 8 (verified).** `select_q8_generic` (`q8_dispatch.cpp:43-50`) uses
-`SimtR8T4`/`SimtR8T8` (eight rows per CTA, a warp per row, 1 KB of codes per stage, 2 stages,
-`cg`), or the few-row `SimtR1T4W8`/`SimtR1T8W8` when N/8 < 64 and K ≥ 4096 (a row per CTA, eight
-warps splitting K on scale-pair boundaries). Codes and scales reach shared memory by `cp.async`; an
-iteration issues stage s + 1, waits `cp_wait<S-1>` and consumes s; x is loaded inside the consume
-loop, a dependent L2 trip (`q8_a16_simt.cuh:162-188`). Lane l takes the 8-code chunk at
+`SimtR8T4`/`SimtR8T8` (eight rows per CTA, a warp per row, 1 KB of codes per stage, 2 stages, `cg`),
+or the few-row `SimtR1T4W8`/`SimtR1T8W8` when ⌈N/8⌉ < 64 (N ≤ 504) and K ≥ 4096 (a row per CTA,
+eight warps splitting K on scale-pair boundaries). Codes and scales reach shared memory by
+`cp.async`; an iteration issues stage s + 1, waits `cp_wait<S-1>` and consumes s; x is loaded inside
+the consume loop, a dependent L2 trip (`q8_a16_simt.cuh:162-188`). Lane l takes the 8-code chunk at
 k = 1024s + 256p + 8l in an `fmaf` chain in increasing k, then `warp_reduce_sum` (`shfl_down`
-16 → 1) and K-warp partials in warp order (`:212-232`). Small shapes reach 0.6-0.7 TB/s, big 1.3-1.4.
+16 → 1) and K-warp partials in warp order (`:212-232`). Small shapes reach 0.6-0.7 TB/s, big
+1.3-1.4.
 
 **Drafter L2 reuse (measured, A).** 397 of 1,290 [13952, 2560] calls take ~16.6 µs (2.28 TB/s,
 above DRAM peak), each ~21 kernels (median 167 µs) after a ~29.6 µs call of the same weight: the
@@ -4181,20 +4374,28 @@ forward. Evict-first on drafter weights would destroy this.
 **Lessons of §19.2's attempts.** Skinny (net 3.39 against 3.36 ms per round) shows register-direct
 streaming reaching the DRAM peak, but +4.0 µs on HC down (21 CTAs: it needs a K split), and its
 16-code mapping changed the text. Runtime-K `q8_a16_gemv` (HC up 4.39, gate/up 6.74, [2560, 6144]
-15.2 µs; 3.73 ms per round) shows two rows per CTA without a K split losing on long shapes.
+15.2 µs; 3.73 ms per round in `fn/prof/bench3.sqlite`, 3.72 in §19.2, which marks that profile
+inconclusive because it overlapped another session's GPU work) suggests, without a clean
+measurement, that two rows per CTA without a K split lose on long shapes.
 
 **The MMA cliff above 8 columns.** Measured (A): `q8_a16_mma_kernel`, grid 80, 128 threads, 343
 calls in 400 rounds at 31.12 µs (p10-p90 30.6-31.7, 0.22 TB/s), each after `rmsnorm_generic_kernel`
 with grid 3 (201) or 4 (142), i.e. the MTP `hidden_norm` and then the hidden projection at 12 or 16
-columns (`forward.cpp:517, 521`). Verified: T > 8 selects `MmaR32T64` (`q8_dispatch.cpp:47`) =
-`Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>`: 4 warps, 32 rows per CTA, BlockK 64, 2 weight stages
-(`q8_schedule.cuh:73`), no K split (`q8_mma_launch.cuh:18-20`). 0.78 µs per 64-wide K step is about
-one DRAM latency each, so narrow or long-K shapes become chains of 40-160 steps: ≈ 14-20 ms per
-forward at T = 9-64 against ~3.6 ms at T ≤ 8 (per-shape inference in the K1 table). It is reached by
-C = 2 with MTP max 4 (T = 10) or n-gram 7 (T = 16), by C ≥ 3 with any speculation, and at C = 1
-only by the catch-up hidden projection (16 columns at max 3, 20 at max 4). It does **not** explain
-the §19.2 two-lane throughput: `--draft-tokens 3` kept that run's main verification at T ≤ 2 × 4 = 8
-and only the catch-up (≤ 32 columns) hit MMA, so §19.2's cause (twice the distinct experts) stands.
+columns (`forward.cpp:517, 521`). Verified: T = 9-64 selects `MmaR32T64` (`q8_dispatch.cpp:47`;
+`MmaR32T96` and `MmaR32T128` above) = `Q8A16MmaSchedule<32, 64, 64, 32, 16, 2, 3>`: 4 warps, 32 rows
+per CTA, BlockK 64, 2 weight stages (`q8_schedule.cuh:73`), no K split (`q8_mma_launch.cuh:18-20`).
+0.78 µs per 64-wide K step is about one DRAM latency each, so narrow or long-K shapes become chains
+of 40-160 steps: ≈ 14-20 ms per forward at T = 9-64 against ~3.6 ms at T ≤ 8 (per-shape inference in
+the K1 table). It is reached by C = 2 with MTP max 4 (T = 10) or n-gram 7 (T = 16), by C ≥ 3 with
+any speculation, and at C = 1 only by the catch-up hidden projection (16 columns at max 3, 20 at max
+4). It is not shown to explain the §19.2 two-lane throughput: `--draft-tokens 3` kept that run's
+main verification at T ≤ 2 × 4 = 8 (in its build `5429c31a4` too) and only the catch-up (≤ 32
+columns) hit MMA, so §19.2's stated cause (twice the distinct experts) is not contradicted. For the
+same reason the MTP story divergence in that run did not come from the dense Q8 MMA tiles, as
+§19.2's "Two rows verify 2 × W columns, so they cross into MMA" assumes; only the n-gram run (16
+columns) crossed. Another width- or batch-dependent route (BF16 dense, QSA verification attention,
+the GDN record) must explain it (inference), and the gate's byte-identity check (§19.3.5, campaign
+step 1) must cover it.
 
 **Constraints.** FP32 accumulation and exact decode of codes × FP16 scales; per-column invariance for
 T = 1..8 (`q8_a16_column_invariance`, `tests/ops/linear/test_q8_a16.cpp:86`), on which the C = 1
@@ -4215,9 +4416,12 @@ Trace A, per main forward: router `projection_kernel` (grid 129) 6.63 µs × 50.
 | Route-log copy and dispatch memset/count/scan/scatter | D2D `cudaMemcpyAsync` (`forward.cpp:427-428`), counts memset (`moe_layer.cu:709`), three kernels (`:712-719`). Inference: the D2D node queues behind promotions on the copy engine (the p90) | For `entries ≤ 1024` (T ≤ 102 at top-10), one `dispatch_small_kernel<<<1,1024>>>`: zero counts in shared memory, shared-atomic count, today's scan, offsets/cursor/jobs/job_count, scatter, ids to an optional `route_log` destination. Larger calls keep today's path; the memcpy and memset nodes leave decode graphs. Rejected: zeroing in `count_kernel` races (160 CTAs at a 4096-token chunk) | −0.25 to −0.45 ms (MTP), −0.2 to −0.25 (plain) |
 | Router [513, 2560] BF16 | Row loads already precede FMAs (`projection_fp32.cu:66-71`), but x is staged first by a runtime-bound `uint4` loop (`:51-55`) and `__syncthreads` (`:56`). 5.2 / 5.7 / 6.6 / 7.3 µs at T = 1-4 | Weight loads to registers first, then x as one unrolled `cp.async` batch, then sync | −0.08 to −0.15 ms |
 | MTP `hidden_norm`, d = 10240 | Generic route for d > 8192 (`rmsnorm.cu:115-136`), median 16.1-16.5 µs × 3.2 per round (48.5 µs per forward) | Preloaded variant for 8192 < d ≤ 16384: each thread loads its 40 strided elements before summing; same order and shared tree (`rmsnorm.cuh:265-287`) | −40 µs per round (MTP) |
+| E2M1 decode in the GPU expert kernels (2026-10-04, §19.3.6) | `canon::e2m1_x2` indexes `constexpr signed char kMag[8]` (`canonical_math.h:106-110`), which compiles to a stack store of the table and a local byte load per lookup. `cuobjdump` of the current `moe_layer.obj`: `gate_up_kernel<1>` 688 STL.64 + 656 LDL.S8 + 32 LDL.U8, `down_kernel<1>` 160 + 160, the 8-column instances the same plus spills. Each `unit_sums` unit does 8 lookups against ~5 LDS and 2 dp4a, so the compute after `stage_wait` is load/store-bound. Strata keeps codebooks in registers (`prmt`); its SYCL port measured an expert down call 80.8 → 43.1 µs and decode +7.5 % from that change (`20a2ccf`) | `canon::e2m1_x2` without a memory table: a 64-bit-constant shift or one `prmt` over the magnitude bytes {0, 1, 2, 3 \| 4, 6, 8, 12} with the sign applied by mask, fixed at compile time. It also serves `quantize_a4_block` and the CPU scalar reference. Exact integer transform | −0.3 to −0.38 ms of kernel time at T = 1 (realized −0.1 to −0.3 ms, less where CPU misses are the long pole); −0.5 to −1.3 ms per W = 4-5 round; prefill 8-column kernels unmeasured |
+| GDN control [96, 2560] (2026-10-04, moved from "listed") | BF16 skinny GEMV on 6 CTAs (16 rows per CTA, 10 dependent 16-byte loads per lane): 3.21 µs at T = 1, 5.41 µs at MTP widths, × 36. Strata spread its equivalent over 4× the blocks (`cfd3b72`) | A small-N instantiation: one row per warp, all chunk loads issued before the FMAs in today's lane order and butterfly, 24-48 CTAs; the [13952, 2560] QSA projection keeps today's instance (872 CTAs, near the floor) | −0.04 to −0.05 ms (T = 1), ~−0.12 ms (W = 4-5) |
+| QSA decode attention (2026-10-04) | `float acc[kMaxGroup = 16]` with runtime-bound loops lives in local memory (~2,498 LDL/STL per instantiation); the value loop is one page-table load and one dependent V load per token; 11.5 µs per call at T = 1, 16.2 µs at MTP widths, 12-14 calls per forward | Group size as a template parameter (accumulators in registers); four cells' V loads issued together and folded in order; the 12 head sums reduce-scattered in `warp_sum`'s xor order (Strata `fd95405`); the serial softmax sum keeps its order | −0.04 to −0.07 ms (T = 1), −0.1 to −0.2 ms (W = 4-5); does not grow with context (attention ≤ 2,051 tokens) |
 
-Listed, not scheduled: GDN control [96, 2560] (BF16 skinny, 5.41 µs × 36 plus split and
-`gdn_gating`; `gdn_gating_proj` would change rounding); `split_rows` after GDN/QSA projections
+Listed, not scheduled: the fused `gdn_gating_proj` form of the GDN control (a rounding change, a
+further −0.06 to −0.08 ms); `split_rows` after GDN/QSA projections
 (2.5 + 1.7 + 1.2 µs per GDN layer, QSA 2.0); `recurrent_record_kernel` (5.4 µs × 35.5);
 `cpu_plan_kernel`; `route_kernel` (already a warp per column: a 10-step top-k latency, withdrawn).
 
@@ -4234,7 +4438,9 @@ may change, ids cannot); at C ≥ 2 verification rounding changes and dense Q8 b
 concurrency-invariant to T = 16 (the column-invariant range §11.3 relies on grows from 8 to 16).
 
 **Mechanism.** One launch, no shared-memory weight staging: all of a warp's weight loads are in
-registers before any FMA, and several rows share each x load. `Q8A16StreamSchedule` has static `K` (K % 64 == 0), `R` rows per warp, `KSplit` (1,
+registers before any FMA, and several rows share each x load.
+
+**Schedule.** `Q8A16StreamSchedule` has static `K` (K % 64 == 0), `R` rows per warp, `KSplit` (1,
 or 8 warps splitting K on scale-pair boundaries), `Warps`, `MaxCols` 4/8/16 with `ColsPerPass` 4/8
 (two passes over **register-resident** weights give 16), `Window` (8-code chunks per lane per row in
 flight; `all` for K ≤ 2560 at R ≤ 2), `XStage` (`Shared`: `cp.async` once per CTA per pass;
@@ -4259,15 +4465,16 @@ load in `src/ops/common/memory.cuh`. Fused Ops reuse the header, as `gdn_input_p
 
 **Dispatch.** Ten exact entries in `q8_shapes.h` and `kShapes` (`q8_dispatch.cpp:24-33`), one file
 per shape under `src/ops/linear/q8/shapes/`. Each `select_*` returns K1 MaxCols 4 at T ≤ 4 and 8 at
-T ≤ 8 (step 1a-i); K1 MaxCols 16 at T = 9-16 (1a-ii) unless M1 shows HEAD's MMA tile faster there
-by more than 0.3 µs (inference: only HC up, MMA ~5 µs, is a candidate); at T = 17-64 per shape M1's
-winner between the MMA tile and K1 in 16-column slices (`for_each_token_slice`); above 64 today's
-MMA tiles.
-Expected (inference): K1 slices win for the HC down shapes (T = 32: 2 × ~6 µs against ~100),
-[1280, 2560], [2560, 6144] and [2560, 2560] (20 columns: ~6 + ~5.6 against ~31); MMA wins above
-T ≈ 24 for [16384, 2560], [13952, 2560], [12800, 2560] and [10240, 320]. The sliced-K MMA schedules
-(`Q8SlicedKDefault<8|16,…>`) join the T ≤ 16 sweep as a zero-code baseline but, not bit-exact with
-K1, must win by > 0.5 µs.
+T ≤ 8 (step 1a-i; [2560, 6144] only if M1 shows K1 faster by ≥ 0.8 µs per call at T = 4, otherwise
+it keeps HEAD's SIMT route at T ≤ 8); K1 MaxCols 16 at T = 9-16 (1a-ii) unless M1 shows HEAD's MMA
+tile faster there by more than 0.3 µs (inference: only HC up, MMA ~5 µs, is a candidate); at
+T = 17-64 per shape M1's winner between the MMA tile and K1 in 16-column slices
+(`for_each_token_slice`); above 64 today's MMA tiles. Expected (inference): K1 slices win for the HC
+down shapes (T = 32: 2 × ~6 µs against ~100), [1280, 2560], [2560, 6144] and [2560, 2560] (20
+columns: ~6 + ~5.6 against ~31); MMA wins above T ≈ 24 for [16384, 2560], [13952, 2560], [12800,
+2560] and [10240, 320]. The sliced-K MMA schedules (`Q8SlicedKDefault<8|16,…>`) join the T ≤ 16
+sweep as a baseline that needs no new code; since they are not bit-exact with K1, they must win
+by > 0.5 µs.
 
 Default configuration (sweep candidates in brackets); K1 estimates are 1.4 + bytes / 1.6745 TB/s
 plus an exposed issue tail of ~(2 + T + 1.125·T/R) lane-ops per weight on 21,760 FP32 lanes at
@@ -4298,9 +4505,9 @@ T = 9-64 is inferred at ~0.6-0.8 µs per K step per CTA:
 
 **Per main forward (estimate).** T = 1: −0.41 to −0.51 ms of 3.09 ([16384, 2560] −95 to −113 µs, HC
 down −68 to −107, HC up −175 to −194, gate/up −52 to −67, shared down −15 to −24, PLE −3); W = 4:
-−0.75 to −0.91 ms of 3.62; T = 9-16: ≈ −11 to −17 ms (HEAD ~14-20 → K1 ~3.1-3.8 ms; inference,
-gated by M1). [2560, 6144] is excluded: K1 stays there only if M1 shows ≥ 0.8 µs at T = 4 (it would
-add 0 to −27 µs at T = 1, −34 to −58 µs at W = 4).
+−0.75 to −0.91 ms of 3.62; T = 9-16: ≈ −11 to −17 ms (HEAD ~14-20 → K1 ~3.1-3.8 ms; inference, gated
+by M1). [2560, 6144] is excluded: K1 serves it at T ≤ 8 only if M1 shows a gain of ≥ 0.8 µs per call
+at T = 4 (it would add 0 to −27 µs at T = 1, −34 to −58 µs at W = 4).
 
 **The few-row route of `ecaf50e16` is superseded.** Its branch (`q8_dispatch.cpp:44`), `SimtR1T4W8`
 / `SimtR1T8W8` and their launchers are deleted: among `dense8m` weights only the HC-down shapes meet
@@ -4317,7 +4524,8 @@ route (today's kernels inside the Op, caller workspace, BF16 intermediates as a 
 choice under the Op's criterion), so the Ops serve any T and weight with no new BF16 kernels.
 
 **`hyper_connection_mix`** (new, §8.3 K1a/K1b): `(residual, norm_weight, down, up, streams, rank,
-eps, x, Tensor* inject, WorkspaceArena&, stream)` plus a workspace-capacity query. Contract:
+eps, x, Tensor* inject, WorkspaceArena&, stream)` plus
+`hyper_connection_mix_workspace_capacity_bytes(...)`. Contract:
 Rn = per-stream offset RMSNorm(R); z = W_down·Rn; m = SiLU(z[:rank]/S); inject = 2σ(z[rank:]/S);
 u = W_up·m; x = (1/S)·Σ_s σ(u[sH+d])·Rn[sH+d]. x is BF16 [H, T]; inject FP32 [S, T], optional (the
 final mixer passes none). `Forward::mix` (`forward.cpp:223-238`) becomes one call: 5 → 2 launches.
@@ -4337,8 +4545,9 @@ Today the five kernels cost, per forward (A): `norm_kernel` 1.36 µs, `gates_ker
   T = 8, 13 MB at 16, from L2) and hidden at T ≤ 8; if M1 shows them exposed at 9-16, K1a gets a
   last-arriver reduction with a Program-owned zeroed counter (permitted by §8.3 rule 6, new here).
 
-**Inject folded into its producers, shared expert through `linear_swiglu`.** The inject replaces a
-deferred `inject_norm` (see Rejected); the MTP input fusion (`forward.cpp:523`, inject = ones) keeps
+**Inject folded into its producers, shared expert through `linear_swiglu`.** Folding the inject into
+the [2560, 6144] projection epilogue and `moe_combine` replaces the deferred `inject_norm` of an
+earlier draft (see Rejected); the MTP input fusion (`forward.cpp:523`, inject = ones) keeps
 `hyper_connection_inject`.
 
 | Op | Math | T ≤ 16 | T > 16 | Model sites | Removes; estimate per forward |
@@ -4355,26 +4564,30 @@ the same Ops. `hyper_connection_norm`, `_gates` and `_collapse` become private k
 
 | Item | Mechanism | Estimate per forward |
 |---|---|---|
-| PDL weights-first | K1, K1a, K1b, the fused Ops and the router launch with `pdl::launch_with(Dependency::Programmatic, …)`: weights, wait, `trigger_dependents()` after the streaming loop (`enter_streaming`) | −0.3 to −0.6 µs on each of ~200-290 small calls: −0.06 to −0.15 ms, measured per call site (DFlash2 measured −10 % from an entry-time trigger) |
-| L2 warming while the CPU is the long pole (§8.3 rule 3) | `cpu_wait_kernel` runs after the fork join (`moe_layer.cu:747-755`) with the GPU otherwise idle: 18.56 µs × 48 = 891 µs per forward (median 6.94, p90 49.6). It gains an optional `L2Warm{const void* ptr[4]; std::size_t bytes[4];}`: the next layer's attn-mixer W_down and W_up (7.0 MB) and the first ≤ 16 MB of its input projection. The grid grows from 1 to 1 + P CTAs: CTA 0 polls, CTAs 1..P issue `cp.async.bulk.prefetch.L2.global` for 1/P of the spans and exit (one SM's prefetch rate is unknown). No extra launch, no semantic effect | −0.1 to −0.3 ms (unmeasured); only waits ≥ ~4 µs gain; 23 MB stays under half of the 96 MB L2 |
+| PDL weights-first | K1, K1a, K1b, the fused Ops and the router launch with `pdl::launch_with(Dependency::Programmatic, …)`: weights, wait, `trigger_dependents()` after the streaming loop (`enter_streaming`) | −0.3 to −0.6 µs on each of ~200-290 small calls: −0.06 to −0.15 ms, measured per call site (op development §4.3: an entry-time trigger measured about 10 % slower on the RTX 5090 DFlash2 round) |
+| L2 warming while the CPU is the long pole (§8.3 rule 3) | `cpu_wait_kernel` runs after the fork join (`moe_layer.cu:747-755`) with the GPU otherwise idle: 18.56 µs × 48 = 891 µs per forward (median 6.94, p90 49.6). It gains an optional `L2Warm{const void* ptr[4]; std::size_t bytes[4];}`: the next layer's attn-mixer W_down and W_up (7.0 MB) and the first ≤ 16 MB of its input projection. Concurrency S3 lands first (§19.3.0) and makes the wait `min(8, kMaxCpuJobs)` CTAs that all poll and copy jobs. Phase 2 adds P CTAs to that grid, which issue `cp.async.bulk.prefetch.L2.global` for 1/P of the spans and exit (one SM's prefetch rate is unknown), so one `cpu_wait` grid serves copying and L2 warming. No extra launch, no semantic effect | −0.1 to −0.3 ms (unmeasured); only waits ≥ ~4 µs gain; 23 MB stays under half of the 96 MB L2 |
 | L2 class per weight | New Core `Weight` field `l2` ∈ {`Stream`, `Reuse`} set at Qwen4Exp binding: main-forward dense weights `Stream` (K1 adds an evict-first `createpolicy` hint), drafter dense weights `Reuse` (default policy). Narrows §8.3 rule 5. Drafter evict-last is a measured variant, kept only if M4 shows a gain | Protects the measured drafter L2 reuse |
+| Shared expert on its own branch (2026-10-04, Strata `cfd3b72`) | The shared expert depends only on the MLP mixer output, but runs on the main stream after the resident expert pass (`forward.cpp:458-477`), so it overlaps staging and CPU misses but not the routing chain (router, route, dispatch, `cpu_plan`; a 10.5 µs mean route → count gap) or the resident experts. Fork it at the mixer output onto a Program-owned stream (not the miss-staging fork stream, where it would queue behind `stage_kernel`), join before `moe_experts_cpu_wait`; two events per layer, graph-captured | −0.1 to −0.25 ms at T = 1 in GPU-bound layers (estimate); less in miss-heavy MTP rounds and after 1b's two-kernel shared chain (~8-9 µs). Kept only if M4 shows it beyond noise |
 
 #### Phase 3: tensor-core K2 (conditional)
 
 `mma.m16n8k16` BF16 → FP32 per 32-code group with exact int8 → BF16 decode (`q8_bf16_pair_from_s8`),
-scale per group after the MMA: ~3 lane-ops per weight, flat in T, not bit-exact with K1. Trigger,
-after Phase 1: T = 5 Q8 time per round > T = 4 by 10 %, T = 16 > T = 8 by 25 %, or big shapes at
-T = 16 compute-bound (> 1.15 × the fit). HC down then needs a cross-CTA K split, as in K1a, or a
-cluster.
+scale per group after the MMA: ~3 lane-ops per weight, flat in T, not bit-exact with K1. To keep the
+per-column invariance required above, K2 serves a shape at every T from 1 to 16 or not at all, never
+at T = 5-8 beside K1 at T ≤ 4. Adopting it is a rounding change gated like Phase 1b (§19.3.0).
+Trigger, after Phase 1: T = 5 Q8 time per round > T = 4 by 10 %, T = 16 > T = 8 by 25 %, or big
+shapes at T = 16 compute-bound (> 1.15 × the fit). HC down then needs a cross-CTA K split, as in
+K1a, or a cluster.
 
 #### Rejected
 
 | Item | Reason |
 |---|---|
 | 16-code skinny mapping | Changes the text; K1 reaches the same bandwidth exactly |
-| One row per CTA for long K; deeper `cp.async` stages | x re-read; §19.2 records no gain |
+| One row per CTA for long K | x re-read per CTA (HEAD's few-row HC down route) |
+| Deeper `cp.async` stage counts | §19.2 records no gain |
 | Cross-CTA split-K inside `ops::linear` | The A16 overload promises zero workspace; split-K lives in the mixer Op, which owns workspace |
-| Deferred `inject_norm` | The residual taps, `residual_out` (set on every MTP decode and verification call), the `mtp_chunk` copies and the MTP `residual_out` read the residual between blocks, and `ym`/`inject` live in a `work_.scope()` that rolls back (`forward.cpp:116`) |
+| Deferred `inject_norm` (earlier draft) | The residual taps, `residual_out` (set on every MTP decode and verification call), the `mtp_chunk` copies and the MTP `residual_out` read the residual between blocks, and `ym`/`inject` live in a `work_.scope()` that rolls back (`forward.cpp:116`) |
 | Persistent 340-CTA [16384, 2560] grid as default | 1024 row groups / 340 = 3.01 iterations: 4 CTAs run a 4th (~1-1.5 µs tail × 36); HEAD's 2048 on 510 slots has the same flaw. Balanced sweep candidate only |
 | Two 8-column launches for T = 9-16 (§19.2) | Reads the weights twice; two passes in one launch over register-resident weights read them once |
 | Evict-first on every K1 weight | Removes the drafter's L2 reuse |
@@ -4391,40 +4604,54 @@ Phase 2's warming turns into progress. Per-round kernel time and wall clock are 
 | `tests/ops/linear/test_q8_a16.cpp` | Add [2560, 2560] and [13952, 2560] to `kGeometries` (keep [2560, 4096] only if an artifact uses it). FP64-oracle conformance at every seam: T = 1, 4, 5, 8, 9, 15, 16, 17; 24, 32, 33, 64, 65 where slices are selected; an interior value. `q8_a16_column_invariance` over every Flash-Next shape at T = 2..16 (≤ 64 where slices are selected), with the policy overload. A graph-captured producer → K1 case (pattern `linear_add_test_common.cpp:371-388`): eager launches are never programmatic (`pdl.cuh:40-64`) |
 | `tests/ops/linear_swiglu/test_q8_a16.cpp` | [1280, 2560] at T = 1..16, 17, 33, 512 against FP64; invariance T = 1..16; one graph-captured case |
 | New `tests/ops/test_hyper_connection.cpp` | `hyper_connection_mix`: FP64 closed formula from R at Q8 and BF16 weights, T ∈ {1, 4, 5, 8, 9, 16, 17, 64}, with and without inject, invariance T = 1..16, graph-captured. `hyper_connection_linear_inject`: FP64 with untouched rows, `y_tap` on and off, aliasing rejection |
-| MoE, Phase 0 | `moe_combine` inject form against FP64. `moe_dispatch` against an exact oracle (counts, offsets, jobs, job_count, route log exact; entries per expert as a multiset) at entries 1, 10, 1024, 1025, 40960, plus a graph replay that restarts counts from zero. RMSNorm d = 10240 at rows 1..5; `projection_fp32` [513, 2560] at T = 1..8 if absent |
+| MoE and Phase 0 (`tests/ops/test_offloaded_moe_layer.cu`, `tests/ops/test_rmsnorm.cpp`) | `moe_combine` inject form against FP64. `moe_dispatch` against an exact oracle (counts, offsets, jobs, job_count, route log exact; entries per expert as a multiset) at entries 1, 10, 1024 (small kernel) and 1025, 40960 (multi-CTA path), plus a graph replay that restarts counts from zero. RMSNorm d = 10240 at rows 1..5 against FP64; `projection_fp32` [513, 2560] at T = 1..8 if absent |
 | Development only, then deleted | Each K1 instance bitwise equal to HEAD's SIMT route, 10 shapes × T = 1..8 (evidence, not qualification); preloaded RMSNorm equal to generic. `compute-sanitizer` memcheck and initcheck on K1 (one small, one big shape) at T = 1, 5, 7, 9, 13 (partial passes) and K1a/K1b at T = 1, 7, 13 |
-| Model | `test_forward_real` (real artifact, FP64 reference, `--residuals --blocks`) before and after 1b: residual-tap and logit error must not grow, `--dump-logits` perplexity must not rise beyond noise. Greedy MTP ids equal plain at C = 1 after every phase |
+| Model | `test_forward_real` (real artifact, FP64 reference, `--residuals --blocks`) before and after 1a-ii and before and after 1b (§19.3.0 applies the rounding-change gates to both): residual-tap and logit error must not grow, `--dump-logits` perplexity must not rise beyond noise. Greedy MTP ids equal plain at C = 1 after every phase |
 
-M0-M4 are local to this section, not the §19 milestones; each run takes `local/gpu.lock` with a
-dry-run-validated rig.
+M0-M4 are local to this section, not the §19 milestones; each run follows §19.3.0's execution rules
+(`local/gpu.lock`, plus `fn\locks\quiet.lock` for timing runs) with a dry-run-validated rig.
 
 | Id | Scope | Method and pass criterion |
 |---|---|---|
-| M0 | Phase 0 | Greedy ids identical on tg512 and the code and story CLI, plain and MTP; tg512 plain and MTP max 4 `--lm-head-draft`, ABBA; nsys route → count gap |
-| M1 | Op sweep (temporary executable, op development §7) | All K1 candidates, HEAD SIMT, MMA and `Q8SlicedKDefault` × 10 shapes × T ∈ {1..8, 9, 12, 16, 20, 24, 32, 48, 64}; ⌈256 MiB / bytes⌉ + 1 weight copies cycled by a 200-call CUDA graph (weights from DRAM, x in L2), 3 warm-up + 10 timed replays; median, min/max, GB/s, % of 1,674.5. HEAD MMA at T = 9-64 first. **Go/no-go at T = 1:** HC up 3.72, shared down 2.76, [16384, 2560] 28.3, PLE 22.7 µs (skinny + 0.2), others fit + 0.3; a miss gets one ncu look. HC down > 5 µs at T = 8: one `lts__t_bytes` ncu run. 1b chain graphs: unfused, K1a/K1b, three-kernel; T = 1, 4, 5, 8, 16; Programmatic against Serialized |
-| M2 | Phase 1a end to end | 1a-i: greedy ids **and** MTP acceptance identical to HEAD (tg512, code, story; plain and MTP); any difference is a defect. 1a-ii: C = 1 ids identical, acceptance reported; C = 2 serve with `--draft-tokens 4` and with `--ngram-draft-tokens 7`: tok/s per request and an nsys of verification rounds. Speed: tg512 plain and MTP max 4, cold CLI, serve warm, ABBA. nsys per-round Q8 time and per-shape times at W = 1, 4, 5; drafter timings ([13952, 2560] second call ~16.6 µs, HC up ~4.3) to catch lost L2 reuse |
-| M3 | Phase 1b | M2 checks plus forward_real error and perplexity; speed from per-round nsys kernel time; end to end on prompts whose greedy ids stay identical (check code, story, the 7,448-token prompt; report which), tg512 and its hit rate beside them (§19.2 rule) |
-| M4 | Phase 2 | Greedy ids identical. PDL per call site (Programmatic against Serialized, then nsys per round); warming on/off with HC down/up times after a wait; `Stream`/`Reuse` against default and drafter evict-last, with drafter timings |
+| M0 | Phase 0 | Greedy ids identical on tg512 and the code and story CLI, plain and MTP; tg512 plain and MTP max 4 `--lm-head-draft`, ABBA; nsys route → count gap. 2026-10-04 items: `cuobjdump -sass` shows no local memory in the `gate_up_kernel`/`down_kernel` instances and `attention_kernel`; the offloaded-MoE layer-route and Op tests bit-exact; the GDN control instance bitwise equal to today's at T = 1..8 (development check); the FP64 QSA oracle test per KV profile; ncu load/store throughput of `gate_up`/`down` and nsys per-kernel times (gate_up 39.2, down 16.4, control 3.21, attention 11.5 µs at T = 1) before and after |
+| M1 | Op sweep (temporary executable, op development §7) | All K1 candidates, HEAD SIMT, MMA and `Q8SlicedKDefault` × 10 shapes × T ∈ {1..8, 9, 12, 16, 20, 24, 32, 48, 64}; ⌈256 MiB / bytes⌉ + 1 weight copies cycled by a 200-call CUDA graph (weights from DRAM, x in L2), 3 warm-up + 10 timed replays; median, min/max, GB/s, % of 1,674.5. HEAD MMA at T = 9-64 first: every T > 8 claim stands or falls with it. **Go/no-go at T = 1:** HC up 3.72, shared down 2.76, [16384, 2560] 28.3, PLE 22.7 µs (skinny + 0.2), others fit + 0.3; a shape that misses gets one ncu look before it is registered. HC down > 5 µs at T = 8: one `lts__t_bytes` ncu run. 1b chain graphs: unfused, K1a/K1b, three-kernel; T = 1, 4, 5, 8, 16; Programmatic against Serialized |
+| M2 | Phase 1a end to end | 1a-i: greedy ids **and** MTP acceptance identical to HEAD (tg512, code, story; plain and MTP); any difference is a defect. 1a-ii: C = 1 ids identical, acceptance reported, forward_real error and perplexity no worse; C = 2 serve with the speculation gate off (§19.3.5 S1's local environment override), with `--draft-tokens 4` and with `--ngram-draft-tokens 7`, plus C = 3 with the gate on (W = 1 catch-up hidden projection of 12 columns): tok/s per request and an nsys of verification rounds. Speed: tg512 plain and tg512 MTP max 4 `--lm-head-draft`, cold CLI code and story, serve warm, ABBA. nsys per-round Q8 time and per-shape times at W = 1, 4, 5; drafter timings ([13952, 2560] second call ~16.6 µs, HC up ~4.3) to catch lost L2 reuse |
+| M3 | Phase 1b | M2 checks plus forward_real error and perplexity; speed from per-round nsys kernel time; end to end on prompts whose greedy ids stay identical (check code, story, the 7,448-token prompt; report which), tg512 and its hit rate beside them (§19.2 measurement rule) |
+| M4 | Phase 2 | Greedy ids identical. PDL per call site (Programmatic against Serialized, then nsys per round); warming on/off with HC down/up times after a wait; `Stream`/`Reuse` against default and drafter evict-last, with drafter timings; the shared-expert branch on/off (nsys overlap with routing and resident experts, tg512 plain and MTP ABBA) |
 
 #### Steps, risks and decisions
 
 | Step | Content | Depends on | Agent-days |
 |---|---|---|---:|
-| 0 | Phase 0, tests, M0 | — | 1 |
+| 0 | Phase 0 (with the 2026-10-04 E2M1, GDN control and QSA attention items), tests, M0 | — | 2.5-3 |
 | 1a-i | K1 MaxCols 4/8, 10 registrations, few-row removal, tests, M1 (T ≤ 8), M2 | — | 2.5-3 |
 | 1a-ii | MaxCols 16 two-pass instances, T = 17-64 slices, invariance to 16/64, M1 (T > 8), M2 at C = 2 | 1a-i | 1-1.5 |
 | 1b | `hyper_connection_mix`, `hyper_connection_linear_inject`, `moe_combine` inject form, `linear_swiglu` profile, model composition and workspace sizing (`forward.h`), superseded public Ops removed, tests, M3 | 1a-ii | 3.5-4.5 |
-| 2 | PDL, `cpu_wait` warming, `Weight::l2`, graph-captured tests, M4 | 1a (and 1b) | 1.5-2 |
+| 2 | PDL, `cpu_wait` warming, `Weight::l2`, the shared-expert branch, graph-captured tests, M4 | 1a (and 1b); concurrency S3-S5, whose `cpu_wait` grid Phase 2 rebases onto (§19.3.0) | 2-3 |
 | 3 | K2, only on its trigger | 1-2 | 2-3 |
 
-Step 0 is independent; 1a-i alone is a complete bit-exact deliverable. Each step records results and
-decisions in §19.2 (K1a statistic, KS = 4, inject placement, the rule-6 deviation, rejected items),
-notes deviations in §8.3, and updates `docs/qwen3_8-flash-next.md` if C ≥ 2 guidance changes.
-Other files: `q8_instances.cuh`, `q8_launch.h`, `q8_simt.cu` (the r1_w8 launchers go) and
-`sources.cmake` in `src/ops/linear/q8/`; `include/ninfer/ops/linear.h` and `hyper_connection.h`
-(norm/gates/collapse leave the contract); `src/ops/hyper_connection/` with new
-`hyper_connection_mix_q8.cu` and `hyper_connection_linear_inject_q8.cu`; `src/core/weight.h`;
-`tests/ops/tests.cmake`.
+Step 0 is independent; 1a-i alone is a complete bit-exact deliverable. In its branch each step
+records its results and decisions (the K1a statistic, K1a's four K slices, inject placement, the
+rule-6 deviation, rejected items) in this §19.3.3, and in its own subsection of
+`docs/qwen3_8-flash-next.md` if C ≥ 2 guidance changes. The §8.3 deviation notes, §19.2 results
+and the §19.2 "Next" list change on the base branch at merge time (§19.3.0).
+
+Other files: `q8_schedule.cuh` (`Q8A16StreamSchedule`), `q8_instances.cuh` (`SimtR1T*W8`
+removed), `q8_launch.h`, `q8_shapes.h`, `q8_dispatch.cpp`, `q8_simt.cu` (the r1_w8 launchers go)
+and `sources.cmake` in `src/ops/linear/q8/`; `include/ninfer/ops/linear.h`, `linear_swiglu.h`,
+`hyper_connection.h` (norm/gates/collapse leave the contract) and `offloaded_sparse_moe.h`
+(`moe_combine` inject form, `moe_dispatch` route-log output, `cpu_wait` `L2Warm`);
+`src/ops/hyper_connection/hyper_connection.cu`, new `hyper_connection_mix_q8.cu` and
+`hyper_connection_linear_inject_q8.cu`, and its `sources.cmake`;
+`src/ops/linear_swiglu/q8/q8_linear_swiglu_plan.cpp` and its decode kernel file;
+`src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`; `src/ops/projection_fp32/projection_fp32.cu`;
+`src/ops/kernel/rmsnorm.cuh` and `src/ops/launcher/rmsnorm.cu`; `src/core/weight.h` and the
+Qwen4Exp binding that sets `l2`; `src/models/qwen4_exp/execution/forward.cpp` and `forward.h`
+(`workspace_bytes`, `mtp_workspace_bytes`); `tests/ops/test_offloaded_moe_layer.cu`,
+`tests/ops/test_rmsnorm.cpp` and `tests/ops/tests.cmake`. The 2026-10-04 items add
+`src/ops/common/canonical_math.h` (`e2m1_x2`), `src/ops/linear/bf16/bf16_general.cu` (the small-N
+instance), `src/ops/qsa/qsa.cu` (`attention_kernel`), and a Program-owned stream with two events
+per layer for the shared-expert branch (`program/program_impl.h`, `execution/forward.cpp`).
 
 **Risks.** One measured MMA point carries the T > 8 claims, and the traces predate the few-row route
 and cover T ≤ 4 (T = 5-8 baselines are microbenchmarks); the 1.4 µs fixed cost is fitted without
@@ -4442,7 +4669,7 @@ Each decision below is **Decided (default, 2026-10-04)**; the user may override 
 
 | Question | Decided (default, 2026-10-04) | Alternative |
 |---|---|---|
-| Phase 1b rounding changes | Accepted: Rn, z, m, u in FP32, injects from FP32 products and sums, gate/up unrounded; includes the inject folding (a rounding change under op development §6.1, though a review thought it bit-exact) | Stop at the bit-exact Phases 0, 1a and 2 |
+| Phase 1b rounding changes | Accepted: Rn, z, m, u in FP32, injects from FP32 products and sums, gate/up unrounded; includes the inject folding (a rounding change under op development §6.1, though a review thought it bit-exact) | Stop at Phases 0, 1a and 2 (bit-exact except 1a-ii's T = 9-64 rounding change) |
 | Mixer structure | §8.3 two-kernel split-K mixer with K1a's in-kernel norm statistic (−3.5 to −4.3 µs per mixer, 4× less x traffic) | Three-kernel K1-based mixer (norm; down + gates; up + collapse), or §8.3's producer-epilogue statistic |
 | T = 17-64 | Per-shape M1 choice between MMA tiles and 16-column K1 slices (C ≥ 3; the C = 1 max-4 catch-up at 20 columns) | MMA tiles above 16 columns |
 | Recipe A (BF16 dense) | Served by the fused Ops' composed route, no new kernels, today's speed | Fused BF16 kernels |
@@ -4455,10 +4682,12 @@ Each decision below is **Decided (default, 2026-10-04)**; the user may override 
 ### 19.3.4 N-gram row reads overlapped with the GPU
 
 Design, adversarially reviewed, nothing implemented (worktree `NInfer-V3-flashnext`, HEAD
-`46a56fc8f`, 2026-10-04). It drops the reviewed version's n-gram thread, "warm" prefetch jobs,
-plain-round gate and filler-row reuse. Bare line numbers are Qwen4Exp `program.cpp`. **Simulated**
-means CPU only, real tokenizer, exact row-id specification, no weights or GPU
-(`ngram-overlap-sim.py`, `ngram-warm-repeat-sim.py` in `local/workdirs/fn/plans`).
+`46a56fc8f`, 2026-10-04). It drops the earlier draft's dedicated n-gram thread, "warm" prefetch
+jobs and filler-row reuse, and no longer gates plain rounds by default (parked as S4b). Bare line
+numbers are Qwen4Exp `program.cpp` at `46a56fc8f`. Since `54deaa2bc` that code is in
+`program/program_impl.h`, where every cited line sits two lines earlier (sync 1180 is
+`program_impl.h:1178`). **Simulated** means CPU only, real tokenizer, exact row-id specification,
+no weights or GPU (`ngram-overlap-sim.py`, `ngram-warm-repeat-sim.py` in `local/workdirs/fn/plans`).
 
 #### Premise (corrects §19.2)
 
@@ -4477,25 +4706,42 @@ means CPU only, real tokenizer, exact row-id specification, no weights or GPU
   `sequence_` (1127), hashing and probes, two `upload_pinned` launches, `before_round`
   (`expert_residency.cpp:72-93`), graph launch, route download, five tail operations, and WDDM
   submission, only at sync 1180 (this path never calls `device_.flush()`). The warm reads add ~10-50
-  µs at an unmeasured QD-1 latency (estimated 20-80 µs each). nsys inflates host gaps here (Qwen3.5:
-  0.80 ms under nsys, ~0.30 ms in logs), so the real gap may be ~0.2-0.4 ms.
-- **First-time text reads rows** (new serve request, agentic turn, cold CLI; simulated, cold). The
-  2^20 cache hits 63.6 % of C++ (`program.cpp`, 24,879 tokens; 5.8 of 16 rows miss per token),
-  43.3 % of Python (9.1), 44.4 % of prose (72,207 tokens; 8.9), 30.7 % of generated code (11.1) and
-  1.5 % of a generated story (15.8); 49.7 % of all 104,192 tokens (8.0). An infinite cache gains only
-  0.2-2.5 pp (51.9 % overall, as does LRU at 2^20; 2^22 gives 51.3 %): decode misses are compulsory,
-  so a larger or associative cache does not help decode. Capacity helps only re-prefill (30K prose
-  re-read: 85.4 / 92.2 / 96.0 % at 2^20 / 2^21 / 2^22), which the prefix cache (§19.3.1) addresses.
-- **Per-round reads on first-time text** (estimated, C = 1, one issuer at the §19.2 probe's ~4.3-4.8
-  µs per read): plain 6-16 reads, 25-87 µs; MTP W = 4 prose-like (miss share ≈ 0.9) ~58, ~270 µs;
-  W = 5 code-like (≈ 0.6) ~48, ~220 µs; W = 5 generated prose (simulated 75) ~340 µs; C = 2, W = 4
-  ~115, ~520 µs. Reads add **~0.2-0.37 ms per MTP round** on top of the turnaround. The probe had one
+  µs per round on average at an unmeasured QD-1 latency (estimated 20-80 µs each). nsys inflates
+  host gaps here (Qwen3.5: 0.80 ms under nsys, ~0.30 ms in logs), so the real gap may be ~0.2-0.4
+  ms.
+- **First-time text reads rows** (new serve request, agentic turn, cold CLI; simulated, cold cache).
+  Decode misses are compulsory, so a larger or associative cache does not help decode (an infinite
+  cache gains 0-2.5 pp). Capacity helps only re-prefill (30K prose re-read: 85.4 / 92.2 / 96.0 % at
+  2^20 / 2^21 / 2^22), which the prefix cache (§19.3.1) addresses.
+
+  | Stream | Tokens | Hit rate, 2^20 direct-mapped | Hit rate, infinite cache | Misses per token (of 16) |
+  |---|---:|---:|---:|---:|
+  | C++ (`program.cpp`) | 24,879 | 63.6 % | 64.2 % | 5.8 |
+  | Python (`reference.py`) | 6,605 | 43.3 % | 43.5 % | 9.1 |
+  | Prose (design doc) | 72,207 | 44.4 % | 46.9 % | 8.9 |
+  | Generated code | 295 | 30.7 % | 30.7 % | 11.1 |
+  | Generated story | 201 | 1.5 % | 1.5 % | 15.8 |
+  | All, one cache | 104,192 | 49.7 % (2^22: 51.3 %) | 51.9 % (LRU at 2^20 equal) | 8.0 |
+
+- **Per-round reads on first-time text** (estimated, one issuer at the §19.2 probe's ~4.3-4.8 µs
+  per read). Reads add **~0.2-0.37 ms per MTP round** on top of the turnaround. The probe had one
   issuing thread, so "device-bound" is unproven: ~210K IOPS also fits a per-thread I/O-stack cost.
+
+  | Round | Rows | Reads (miss share m) | Single-issuer time |
+  |---|---:|---:|---:|
+  | Plain, C = 1 | 16 | 6-16 | 25-87 µs |
+  | MTP W = 4, prose-like (m ≈ 0.9), C = 1 | 64 | ~58 | ~270 µs |
+  | MTP W = 5, code-like (m ≈ 0.6), C = 1 | 80 | ~48 | ~220 µs |
+  | MTP W = 5, generated prose (simulated first pass), C = 1 | 80 | ~72-75 | ~340 µs |
+  | MTP W = 4, C = 2 | 128 | ~115 | ~520 µs |
+
 - **Hiding windows** (estimated). Rows are consumed once, by `ple_embed` at the top of layer 1
   (`forward.cpp:117, 245`; one PLE layer), after the embedding, HC expand and all of layer 0, a
   most-missed layer. Block 0 of a W = 4 / 5 round is ~0.50 / 0.59 ms (2.13 / 2.54 plain rounds of
-  ~11.2 ms over 48 layers); a draft step is ~0.2-0.3 ms. At C = 1 the ≤ 64 draft-column rows (≤ ~300
-  µs cold) fit in block 0 with ~0.2 ms margin, and the anchor column's rows fit in the draft.
+  ~11.2 ms over 48 layers); a draft step is ~0.2-0.3 ms (§12.1's ≈ 84-134 µs layer-0 window is the
+  §8.3 plain-decode budget at T = 1, not this measured verify-round average; S0's events decide). At
+  C = 1 the ≤ 64 draft-column rows (≤ ~300 µs cold) fit in block 0 with ~0.2 ms margin, and the
+  anchor column's rows fit in the draft.
 
 Two levers follow: hide the reads (first-time text), and remove the host round trip between
 drafting and verification (all text, including the headline benchmarks).
@@ -4507,41 +4753,53 @@ drafting and verification (all text, including the headline benchmarks).
 | **S0** | Counters, host-phase timers, event-timed GPU idle, n-gram-cold toggle; flush probe (S0b) | attribution; maybe the warm gap | always first | 0.5 day + ~1 h GPU |
 | **S1** | One read per distinct 4 KiB block; 256 KiB, 64-deep rolling ring; no per-call events. S1b: multi-issuer probe | cold prefill (−29 to −50 % reads per chunk), memory | always | 1 day + ~0.5 h GPU; S1b 2 h |
 | **S2** | Gate kernel before `ple_embed` in verify graphs; engine-thread reads after the launch; anchor reads during drafting; no new thread | n-gram-cold MTP | always | 1.5 days + ~1.5 h GPU |
-| **S3** | Device-assembled verification: no host sync between drafting and verification | every MTP workload | S0 measures ≥ 0.15 ms per round of after-draft GPU idle after S0b | 2 days + ~1.5 h GPU |
-| **S4** | Mailbox, plain gate, multi-issuer reads, gated prefill | C ≥ 2, plain, prefill | each on its trigger | 0.5-1 day each |
-| Docs | §12.3 and §12.4 rewritten (§5, §7, §8.1, §11.2 aligned); §19.2 results, corrections and "Next" list; the diagnostic line in `docs/qwen3_8-flash-next.md`; `tests/README.md` | one authority | as each step lands | 0.5 day |
+| **S3** | Device-assembled verification: no host sync between drafting and verification | every MTP workload | W1 after-draft GPU idle ≥ 0.15 ms per round, measured with S0's events after S0b and S2 | 2 days + ~1.5 h GPU |
+| **S4** | Mailbox, plain gate, multi-issuer reads (parked); S4d cross-chunk prefill reads (scheduled since 2026-10-04) | C ≥ 2, plain, prefill | S4a-c each on its trigger; S4d after S1 | 0.5-1 day each; S4d 1-1.5 days |
+| Docs | §12.3 "As built" and §12.4 updated as each step lands (§5, §7, §8.1, §11.2, §12.3 and §12.4 already state this design, and since 2026-10-04 so do §3.4, §8.9, §13, §14, §15.1 and §16.4); at merge, the M6 row's "device-driven PLE" and §19.1's "device kernel (§12.3)" are corrected; §19.2 results, corrections and "Next" list; the diagnostic line in `docs/qwen3_8-flash-next.md`; `tests/README.md` | one authority | as each step lands | 0.5 day |
 
-Total ~5.5 days and ~4-5 h of GPU rig time. No numerical change: the same bytes reach `ple_embed`,
-the same ids reach the verify graph, and the filler rule is unchanged.
+Total ~5.5 days and ~4-5 h of GPU rig time, plus ~1.5-2 days and ~1 h for the 2026-10-04
+additions (S4d, the S0 draft-probability log, the third flush site). No numerical change: the
+same bytes reach `ple_embed`, the same ids reach the verify graph, and the filler rule is
+unchanged.
 
 **S0: measure first** (`program/ngram_volume.{h,cpp}`, `program.cpp`). Permanent: `NgramVolume`
 counters (rows requested, cache hits, NVMe block reads, read ns; today's `hits_`/`misses_` are never
-reported) and a per-request line beside `report_cache` (826-851): "n-gram rows: N requested, H %
-host-cache hits, R NVMe reads; T ms of reads (E ms before a launch, G ms behind the gate); gate
-waited k times, X µs" (S2 fields zero until S2). Temporary, removed before commit: `Clock::now()`
-phases per round (MTP: sync-1459 return → staged → launched → tail enqueued → sync-1180 return;
-plain: `sample()` return → next launch; commit: enter → GPU enqueues done → after `settle_round`);
-events after the draft graph and before `verify()`'s first upload (and `sample()` → next plain
-launch) for GPU idle without nsys; a cold toggle (`NgramVolume::invalidate()` at each admission, so
-tg512 reads like first-time text); **S0b**, `device_.flush()` after `replay()` in `verify()`
-(1148-1152) and `run_decode()` (993).
+reported) and a per-request line beside `report_cache` (826-851): "n-gram rows: N requested,
+H % host-cache hits, R NVMe reads; T ms of reads (E ms before a launch, G ms behind the gate); gate
+waited k times, X µs" (S2 fields zero until S2). Temporary (never committed; kept as a local patch
+re-applied to each step's measurement build through S3, because the S2 and S3 acceptance rows use
+the events, phase timers and cold toggle): `Clock::now()` phases per round (MTP: sync-1459
+return → staged → launched → tail enqueued → sync-1180 return; plain: `sample()` return → next
+launch; commit: enter → GPU enqueues done → after `settle_round`); events after the draft graph and
+before `verify()`'s first upload (and `sample()` → next plain launch) for GPU idle without nsys; a
+cold toggle (`NgramVolume::invalidate()` at each admission, so tg512 reads like first-time text);
+**S0b**, `device_.flush()` after `replay()` in `verify()` (1148-1152) and `run_decode()` (993),
+and, since 2026-10-04, in `commit_verified` before `settle_round`, where the fold, tails, PLE commit
+and catch-up are enqueued and ~0.5 ms of host work follows with no flush. Each site gets one flush,
+never a poll: Strata kicks all three sites (`cfd3b72`) and measured ~−3 % when it polled the final
+wait (`0e23f57`). Also temporary since 2026-10-04: an online-softmax top-1 probability in the
+drafter's argmax over the proposal rows, logged per draft as (step, p_j, accepted), with the target
+p and the drafter's top-16 q for sampled rows. An offline replay of that log decides the
+confidence-width and sampled-draft options (§19.3.6) and costs ~0.5 day.
 
-**S1: volume reads.** Today (`ngram_volume.cpp:47-91`) misses are per occurrence: a cold
-4,096-token chunk makes 65,536 reads for 32,598 (C++) or 46,138 (prose) distinct blocks; the bounce
-buffer grows to (misses + 1) × 4 KiB and never shrinks (~268 MB); `read_direct_batch`
+**S1: volume reads.** Today (`ngram_volume.cpp:47-91`) misses are per occurrence: a cold 4,096-token
+chunk makes 65,536 reads for 32,598 (C++) or 46,138 (prose) distinct blocks; the bounce buffer grows
+to (misses + 1) × 4 KiB and never shrinks (~268 MB); `read_direct_batch`
 (`read_only_file_win32.cpp:125-180`) drains each group of 64 overlapped reads before the next and
 creates Win32 events per call. Core `ReadOnlyFile::read_direct_blocks(offsets, block_bytes, ring,
 consume)` replaces it (only user `NgramVolume`): at most `ring.size() / block_bytes` unbuffered
 reads in flight; `consume(i, bytes)` runs on the caller in completion order, then the block is
 reused; returns when all are done; a failed or short read stops issuing, drains and throws
 `system_error` / `runtime_error`. Windows: one `OVERLAPPED` per slot, `hEvent = nullptr`,
-`HasOverlappedIoCompleted` polled with `_mm_pause()` (no syscall), `GetOverlappedResult(..., FALSE)`,
-reissue; no deadline, as today. POSIX (WSL): serial `pread`. `read_rows` keeps its signature: copy
-hits; sort misses as one u64 key (block < 2^24, index < 2^20); read each distinct block into
-`ring_` (64 × 4 KiB = **256 KiB**, allocated once), whose `consume` copies every row it serves and
-fills the cache. Keys reach ≤ 0.5-1 MB per 4K chunk; dedupe saves 50 % / 29 % of a cold chunk's
-reads (~148 / 87 ms). **S1b** (standalone, CPU and NVMe only, while no engine reads G:): random 4 KiB
-batches of 64, 256 and 4,096 with 1, 2 and 4 issuers, 64-deep rings; ≥ 1.6× one issuer → S4c.
+`HasOverlappedIoCompleted` polled with `_mm_pause()` (no syscall), `GetOverlappedResult(...,
+FALSE)`, reissue; no deadline, as today. POSIX (WSL): serial `pread`. `read_rows` keeps its
+signature: copy hits; sort misses as one u64 key (block < 2^24, index < 2^20); read each distinct
+block into `ring_` (64 × 4 KiB = **256 KiB**, allocated once), whose `consume` copies every row it
+serves and fills the cache. Keys reach ≤ 0.5-1 MB per 4K chunk; dedupe saves 50 % / 29 % of a cold
+chunk's reads (~148 / 87 ms). **S1b** (standalone, CPU and NVMe only, while no engine reads G:):
+random 4 KiB batches of 64, 256 and 4,096 with 1, 2 and 4 issuers, 64-deep rings; ≥ 1.6× one
+issuer → S4c. Vision V6 (§19.3.2) relies on this dedupe for image chunks (~16,000 reads to ~48) and
+adds no second version.
 
 #### S2 and S3: gated, then device-assembled, verification
 
@@ -4551,10 +4809,12 @@ batches of 64, 256 and 4,096 with 1, 2 and 4 issuers, 64-deep rings; ≥ 1.6× o
   wait ns and count. `publish_pinned_word(ready, value)` is `_mm_sfence()` (orders non-temporal
   stores memcpy may use; an x86 release fence emits nothing), then a volatile store.
   `min(16, ceil(bytes / 32 KiB))` CTAs of 256 threads; each CTA's thread 0 polls with
-  `__nanosleep(200)` (no co-residency needed; ≤ 16 pollers, a deliberate exception to §8.2), then
-  `__threadfence_system()`, `__syncthreads()`, `__ldcv` loads (eight 16-byte vectors per thread per
-  batch, so no stale line is read), as in the CPU miss handshake (`moe_layer.cu:575-640`). Trap
-  after `kPinnedGateTimeoutNs` = 120 s. `ple_embed` is a plain launch without PDL (`ple.cu:181`), so
+  `__nanosleep(200)` (no co-residency needed; ≤ 16 pollers instead of §8.2's one designated
+  poller, and a trap at 120 s instead of §8.2's ~2 s bounded spin with `agent_error`: both
+  deliberate exceptions to §8.2), then `__threadfence_system()`, `__syncthreads()`, then `__ldcv`
+  loads, which never use a stale cache line from an earlier round (eight 16-byte vectors per thread
+  per batch), as in the CPU miss handshake (`moe_layer.cu:575-640`). Trap after
+  `kPinnedGateTimeoutNs` = 120 s. `ple_embed` is a plain launch without PDL (`ple.cu:181`), so
   stream order holds it behind the copy. 12,800 B at C = 1, W = 5 (one CTA) to 327,680 B (8 lanes ×
   W = 16, `ngram_draft_tokens ≤ 15`; 10 CTAs); ~3-4 µs per round, net ~+2-3 µs (~0.01 %).
 - **Forward hook.** `ForwardBatch::ngram_gate` (`NgramRowGate`: `pinned_rows`, `pinned_ready`,
@@ -4566,7 +4826,7 @@ batches of 64, 256 and 4,096 with 1, 2 and 4 issuers, 64-deep rings; ≥ 1.6× o
   `io_layout_.ngram`, so the prefix upload shrinks by the rows); `gate_wait_` (`DeviceBuffer(16)`,
   read by a 16 B D2H at request finish); `gate_sequence_` (u32, +1 per gated round, skips 0;
   strictly increasing, so a stale word never matches; wraps after ~1.3 years at 100 rounds/s).
-- **S3 Op** `speculative_assemble_verify_tokens(anchors [B], step_drafts [S,B], copy_drafts [K,B],
+- **S3 Op** `speculative_assemble_verify_tokens(anchors [B], step_drafts [B,S], copy_drafts [K,B],
   extents [B], from_device [B], verify_ids [W,B], drafts [K,B], stream)`, all I32, in
   `include/ninfer/ops/speculative_round.h`: drafts are `step_drafts[j*B + b]` (step-major,
   1441-1453) when `from_device[b]`, else `copy_drafts[b*K + j]`; K = W - 1; one CTA per row; exact
@@ -4585,7 +4845,7 @@ Round protocol, MTP or copy-proposal verification with W > 1 (W = 1 keeps the pl
 | Reads | MTP columns 1..W-1: (h[p-1], h[p], d0), (h[p], d0, d1), then (d[j-3], d[j-2], d[j-1]); fillers d.back(), the anchor when n = 0 (1129); 16 rows, 2,560 B per column | anchor and copy-row columns; if `steps > 0`, `cudaEventSynchronize(drafts_ready_)` (spin), then MTP columns from `mtp_host_` |
 | Finish | `publish_pinned_word(gate_host_, g)`; sync 1180 and the rest as today | n is the staged extent; `pending_tokens_` comes from `licensed` |
 | Exception | scope guard: zero-fill unwritten columns, publish g so an enqueued gate passes, rethrow unchanged | same |
-| Why safe | the engine thread reads where it already spins idle (`cudaDeviceScheduleSpin`, `device.cu:28-29`); every Program call ends in a stream sync (509, 636, 1180, 1459, 1540), so a gate never reads the landing area across calls, and prefill and plain decode still write rows before their own upload | `drafts_ready_` precedes the gate in stream order (no deadlock); io `slots`/`rows` are uploaded twice but staged once; the previous commit's pending spec `commit` and mtp `up_ids` uploads cover regions this round does not write; `host_configs_` and `table_host_` keep one writer; the rule is documented in `verify()`. Copy-only mode (no drafter) omits the assemble op and stages as S2 |
+| Why safe | the engine thread reads where it already spins idle (`cudaDeviceScheduleSpin`, `device.cu:28-29`); every call that writes or uploads the landing area ends in a stream sync (509, 636, 1180, 1459, 1540); commit, which leaves its spec `commit` and mtp `up_ids` uploads pending, never touches it. So a gate never reads the landing area across calls, and prefill and plain decode still write rows before their own upload | `drafts_ready_` precedes the gate in stream order (no deadlock); io `slots`/`rows` are uploaded twice but staged once; the previous commit's pending spec `commit` and mtp `up_ids` uploads cover regions this round does not write; `host_configs_` and `table_host_` keep one writer; the rule is documented in `verify()`. Copy-only mode (no drafter) omits the assemble op and stages as S2 |
 
 **S3 timeline at C = 1** (estimated). Draft graph ~0.8-1.2 ms; D2H and event ~3-8 µs; 2-3 uploads
 ~3-5 µs; assemble ~2 µs; embedding; block 0 ~0.5 ms; gate ~3 µs (waits only if rows are late);
@@ -4594,14 +4854,14 @@ cold, ~1-5 µs warm) start ~5 µs after it and end inside block 0. New nodes cos
 `before_round` runs ~1 ms earlier in GPU time, so a promotion landing during drafting is published
 a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel like `upload_pinned`.
 
-**S4, parked until a trigger fires:**
+**S4** (a-c parked until a trigger fires; d scheduled after S1 since 2026-10-04):
 
 | Item | Mechanism | Trigger or bound |
 |---|---|---|
 | a. Mailbox | Core `publish_pinned` kernel after each draft step writes its tokens and a sequence word (`moe_layer.cu:575-585` pattern); draft columns read during drafting; ~2-3 µs per step | S3 mean gate wait > 10 µs per round at C = 1 on cold text, or any C ≥ 2 use (§19.3.5) |
 | b. Plain-round gate | plain graphs gated, reads after launch; ~3 µs per round plus trap exposure | ≤ 0.8 % cold, −0.03 % warm; adopt only if cold plain gains beyond noise and warm does not regress |
 | c. Multi-issuer reads | fixed issuer pool in `NgramVolume` for batches ≥ 256 reads (prefill, C ≥ 4); decode stays single-issuer | S1b ≥ 1.6× |
-| d. Gated prefill | `run()` splits its bulk copy around the landing area (`[0, ngram)`, `[mtp_ids, bytes)`), multi-CTA gate up to 10.5 MB; block 0 of a 4K chunk (~130 ms) hides most of the 150-210 ms of deduped reads | ~2-3 % of cold prefill; out of scope; may wait for the prefix cache |
+| d. Cross-chunk prefill reads (2026-10-04; replaces the within-chunk gate) | Every prompt token is known up front. So while chunk i computes, the engine thread hashes and reads chunk i+1's rows into a second landing area. The area is uploaded in stream order before chunk i+1, after `advance_prefill`'s sync, so the GPU no longer idles during the reads (today `stage_ngram` runs after the sync, `program_impl.h:493-510, 923-936`). The first chunk's rows are still read before its launch, as today. Strata's CUDA path has done this since 0.1.13: 762 → 790 tok/s at chunk 4096, bit-identical (RTX 5070, 32K prompt). Strata's short first chunk is rejected, since each of our calls pays ~1.28 s of staging. The earlier within-chunk gate (`run()` splitting its copy around the landing area, a multi-CTA gate hiding the reads behind block 0, ~2-3 %) remains the alternative | Built after S1; 2-4 % per cold 4K chunk after S1's dedupe (estimate), more once chunks take ~2 s (§19.3.6 prefill item), ~0 on row-warm text |
 
 #### Stalls, errors and rejected options
 
@@ -4610,22 +4870,23 @@ a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel li
   Windows' default 60 s disk timeout, so the OS completes or fails the read first; it only turns a
   producer bug into an error instead of a hang. Reads > 100 ms in a gated round emit a Warning
   diagnostic (silent today).
-- **Errors keep their class.** The guard publishes, so the stream drains, then rethrows. Row-id
-  and vocabulary errors (`out_of_range`, `invalid_argument`) take the `logic_error` recover path
+- **Errors keep their class.** The guard publishes, so the stream drains, then rethrows. Row-id and
+  vocabulary errors (`out_of_range`, `invalid_argument`) take the `logic_error` recover path
   (`engine_core.h:2419-2435`: fail the active requests, `release_all`, keep the worker); I/O errors
   (`system_error`, `runtime_error`) end the worker and set `failed_` (same file, 2232 and
   2436-2453), so the engine needs a restart and model reload. Both release every lane (745-753); a
   verify round changes no lane state before sync 1180 and cannot be redone (acceptance bumps
   `token_counts`), so nothing stale resumes. Cancel, abort or a terminal at commit find the round
-  and its gate complete; Program destruction finds every call synchronized; process exit takes the
-  context.
-- **Rejected:** a dedicated n-gram thread (a ninth spinner, a queue and cross-thread errors where the
-  engine thread already idles; its borrowed 50 µs sleep is ≥ 1 ms on Windows); speculative top-k
-  prefetch (k × 16 extra reads on an IOPS-limited drive, nothing left to hide); a larger or
-  associative decode cache (compulsory misses); filler-row reuse (≤ 24 rows per row per round after
-  dedupe, C > 1 only; filler ids and rows would disagree and change routing); a host read deadline
-  that zero-fills and fails the round, or converting post-launch errors to `runtime_error` (both
-  turn a slow read or a recoverable error into a model reload); gating plain rounds by default.
+  and its gate complete; Program destruction finds every gate complete (each gated round ended at
+  sync 1180); process exit takes the context.
+- **Rejected:** a dedicated n-gram thread (a ninth spinner, a queue and cross-thread errors where
+  the engine thread already idles; its borrowed 50 µs sleep is ≥ 1 ms on Windows, inferred);
+  speculative top-k prefetch (k × 16 extra reads on an IOPS-limited drive, nothing left to hide); a
+  larger or associative decode cache (compulsory misses); filler-row reuse (≤ 24 rows per row per
+  round after dedupe, C > 1 only; filler ids and rows would disagree and change routing); a host
+  read deadline that zero-fills and fails the round, or converting post-launch errors to
+  `runtime_error` (both turn a slow read or a recoverable error into a model reload); gating plain
+  rounds by default.
 
 #### Expected gain (estimated; S0 replaces it)
 
@@ -4646,16 +4907,21 @@ a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel li
 | 2 | `NgramVolume`, CPU: new `tests/models/qwen4_exp/test_ngram_volume.cpp` | Synthetic volume (60-byte header, row r byte k = f(r, k)), oracle f. Random rows; duplicates and two rows of one block make one read (counters); > 64 blocks wrap the ring; hit after miss; two ids on one cache slot; id ≥ rows throws `out_of_range`; size mismatch throws at open |
 | 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap is not tested (it destroys the context). Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
 | 4 | Assemble op, GPU (`tests/ops/test_speculative_round.cpp`) | B = 1-8, W = 2-16, extents 0..K, mixed `from_device`, S ≥ the largest device extent; oracle a host loop of `verify()`'s rule (1122-1135); exact |
-| 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `NINFER_QWEN4_ARTIFACT`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
+| 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `NINFER_QWEN4_ARTIFACT`; volume from `NINFER_QWEN4_NGRAM` (default `<artifact>.ngram`), as in `ninfer_qwen4_exp_forward_real_test`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
 | 6 | Product checks, CLI | `--print-token-ids` equal to the baseline build: code and story at C = 1, plain and `--spec mtp`; the MTP pair at C = 2; MTP ids still equal plain at C = 1 |
 | 7 | Existing | `ninfer_qwen4_exp_forward_real_test` calls `read_rows` with the same signature; `ninfer_qwen4_exp_ngram_hash_test` unchanged |
 
+Tests 1 and 2 land with S1, tests 3 and 5 with S2, and test 4 with S3; tests 6 and 7 run at every
+step.
+
 #### Measurement plan and acceptance
 
-GPU runs use the `gpu.lock` protocol, detached hidden rigs validated by a dry run, and ABBA order on
+GPU runs use the `gpu.lock` protocol (timing runs also hold `fn\locks\quiet.lock` and model runs
+wait for ≥ 72 GiB free RAM, §19.3.0), detached hidden rigs validated by a dry run, and ABBA order on
 one binary with temporary toggles, ≥ 5 reps (run-to-run noise is ±0.4-0.75 tok/s). Per arm: tok/s
-mean ± sd and worst rep, after-draft GPU idle (events), host-phase µs, reads per round with exposed
-and hidden µs, gate waits, expert hit rate, greedy ids.
+median, range and worst rep (§19.3.0), plus mean ± sd for S0b's pooled-standard-error test,
+after-draft GPU idle (events), host-phase µs, reads per round with exposed and hidden µs, gate
+waits, expert hit rate, greedy ids.
 
 | ID | Workload | n-gram state | Decides |
 |---|---|---|---|
@@ -4671,15 +4937,16 @@ and hidden µs, gate waits, expert hit rate, greedy ids.
 |---|---|
 | All | Greedy ids identical (test 6); any difference blocks the step |
 | S0 | Deliver the attribution table (W1, W2: reads, host phases, GPU idle per round; W3: `sample`-to-launch gap), replacing the estimates above |
-| S0b | W1 better by > 2 × the pooled standard error; no workload worse beyond its own noise |
-| S1 | W7 reads per chunk fall as predicted and W7 is not slower; W1-W3 within noise; peak bounce memory 256 KiB |
-| S2 | W2, W4-MTP and W5-first faster beyond noise; W1 within noise (expected −0.01 %); mean C = 1 gate wait ≤ 10 µs per round |
+| S0b | Per flush site (verify, decode, commit): W1 better by > 2 × the pooled standard error; no workload worse beyond its own noise |
+| S1 | W7's NVMe block reads per chunk equal its distinct missing blocks (S0 counters), the C++ and prose chunks show −50 % / −29 %, and W7 is not slower; W1-W3 within noise; peak bounce memory 256 KiB |
+| S2 | W2, W4-MTP and W5-first faster beyond noise; W1 within noise (expected −0.01 to +0.15 %: the gate's +2-3 µs against 10-50 µs of hidden conflict reads); mean C = 1 gate wait ≤ 10 µs per round |
 | S3 | Go: W1 after-draft idle ≥ 0.15 ms per round after S0b and S2. Accept: W1 and W2 faster beyond noise, hit rate within ±0.5 pp, W6 ids identical |
+| S4d | W7 (cold n-gram cache, a multi-chunk prompt) faster beyond noise; W7 row-warm within noise; prefill logits bitwise identical (`--dump-logits`); a delayed-producer test of the second landing area (poison, then real rows) gives the same ids |
 | Width cost | After S2 and after S3, re-measure W = 3/4/5 round costs; if the slope moves > 0.02, update `kWidthCost` (1607) and c = 0.38 in §19.2 |
-| Record | Every result, adverse ones included, in §19.2, correcting two claims there: that the after-draft gap is device-bound n-gram reads ("I/O ring" bullet, "Next" item 3), and "reused events changed nothing" (measured n-gram-warm) |
+| Record | Every result, adverse ones included, in this §19.3.4 while the track is on its branch (§19.3.0), then in §19.2 at merge on the base branch, correcting two claims there: that the after-draft gap is device-bound n-gram reads (the "Pinned uploads" sentence "~0.56 ms after drafting (verification staging, n-gram rows)", and the "Reused n-gram read events" and "I/O ring" bullets), and "reused events changed nothing" (measured n-gram-warm) |
 
-**Measurement rule** (added to §19.2): tg512 repetitions and repeated serve requests are
-n-gram-warm, so n-gram-sensitive changes are judged on n-gram-cold runs.
+**Measurement rule** (already in §19.3.0 and §12.4; added to §19.2 at merge): tg512 repetitions and
+repeated serve requests are n-gram-warm, so n-gram-sensitive changes are judged on n-gram-cold runs.
 
 #### Risks, decisions and open questions
 
@@ -4688,8 +4955,8 @@ n-gram-warm, so n-gram-sensitive changes are judged on n-gram-cold runs.
 | Gains near noise: warm S2 ~0, S3 ~0.5-1.7 %; S3 may be inconclusive (a similar Qwen3.5 host-gap item was ≤ 0.2 % and dropped) | The S3 go rule stops it being built on an unmeasured premise |
 | A multi-second read stall keeps one gate polling under WDDM; avoiding a TDR relies on Blackwell compute preemption (unverified); a TDR resets the whole GPU and other processes, a 2 s trap only this context | Expected waits are µs; one 3-5 s producer-delay test (below) |
 | Stalls and NVMe errors surface inside or after the verify graph (GPU idles at layer 1) | Same total time; error classes and handling unchanged; nsys shows the time elsewhere |
-| S3: the expert table is published ~1 ms earlier, which can lower the hit rate slightly; a pinned byte rewritten under a pending upload corrupts it | ±0.5 pp hit-rate gate; single-staging rule and region check, documented in `verify()` |
-| C ≥ 2 or high-miss text: one issuer can exceed block 0 (e.g. C = 8) | The gate waits, never worse than today; S4a or S4c |
+| S3: the expert table is published ~1 ms earlier, which can lower the hit rate slightly; a pinned byte rewritten under a pending upload corrupts it | ±0.5 pp hit-rate gate; single-staging rule and region check, documented in `verify()`; all later staging, including vision's `rope`/`block_rope` regions and prefix prefill uploads (§19.3.0), must keep the rule |
+| C ≥ 2: concurrency S1's speculation gate (the default C > 1 policy, merged before n-gram S2; §19.3.0, §19.3.5) makes B ≥ 2 rounds plain, so only B = 1 rounds are gated. Test 5 and W6 therefore interleave B = 1 gated rounds with B = 2 plain rounds. The C = 2 read estimate, S4a's C ≥ 2 trigger and the 327,680 B maximum apply only if S6 + S7 replace the gate. High-miss text: one issuer can exceed block 0 | The gate waits, never worse than today; S4a or S4c |
 | A process-wide test seam in product code | Narrow, internal namespace, documented |
 | Block 0 and draft times are layer averages | S0's events check them before S2 and S3 are judged |
 
@@ -4697,27 +4964,31 @@ n-gram-warm, so n-gram-sensitive changes are judged on n-gram-cold runs.
 |---|---|
 | Gate trap 120 s, verified once by a gate test with a 3-5 s producer delay while the GPU is otherwise idle; 2 s if WDDM preemption fails that test | 2 s like `cpu_wait`: bounded GPU waits, but a 2-120 s NVMe stall then loses the context and needs a model reload |
 | Internal process-wide fault seam for the engine test: one model load, public options untouched | A test-only environment variable read at Program construction (one load per configuration), or primitive tests only |
-| S3 only if S0 measures ≥ 0.15 ms per round of after-draft GPU idle | Another bar, or build S3 (~2 days) unconditionally |
-| S4 items parked until their triggers fire | Build some now; S4d may instead wait for the prefix cache (§19.3.1) |
-| §12.3 and §12.4 rewritten to this host-hashed, gated design as the single authority: the L0 device cache, device-driven requests and NVMe agent go, since every token is on the host before its rows are needed and a column's 2.5 KB crosses PCIe in ~1-2 µs | Keep §12.3 as a long-term device-driven target |
+| S3 only if S0's events measure ≥ 0.15 ms per round of after-draft GPU idle after S0b and S2 | Another bar, or build S3 (~2 days) unconditionally |
+| S4a-c parked until their triggers fire; S4d built after S1 as the cross-chunk read (2026-10-04, §19.3.6) | Build some now; S4d as the within-chunk gate, or after the prefix cache (§19.3.1) |
+| §12.3 and §12.4 state this host-hashed, gated design as the single authority (done); the L0 device cache, device-driven requests and NVMe agent are removed from the other sections listed in the Docs step (most on 2026-10-04, the rest at merge), since every token is on the host before its rows are needed and a column's 2.5 KB crosses PCIe in ~1-2 µs | Keep §12.3 as a long-term device-driven target |
 
 **Open: S1b timing.** It reads G: heavily for a few minutes and needs a window with no engine runs.
-Proposed default: run it while holding `gpu.lock`.
+Proposed default: run it holding `gpu.lock` and `fn\locks\quiet.lock`, since its issuer threads
+compete with builds for CPU (§19.3.0).
 
-**Outside this task.** Plain rounds leave the GPU idle during commit (no GPU work before
-`settle_round`, 645-698 and 814-821, while `after_round` takes ~0.5 ms of host), possibly a larger
-plain item; the S0 plain timers measure it. The miss service's `sleep_for(50 µs)` after 20 ms idle
-(`miss_service.cpp:111-116`) sleeps ≥ 1 ms, up to 15.6 ms, on Windows: cheap to probe. Drafting on
-the device right after acceptance, as Qwen3.5 does, would remove the commit-to-draft gap; a larger
-design. NVMe power-state exits (50-150 ms on some drives, §12.3; unmeasured on G:) would hit a
-request's first gated round, and the slow-read warning will show them.
+**Outside this task.** Plain rounds without a drafter leave the GPU idle during commit (no GPU work
+before `settle_round`, 645-698 and 814-821, while `after_round` takes ~0.5 ms of host), possibly a
+larger plain item; the S0 plain timers measure it. The miss service's `sleep_for(50 µs)` after 20 ms
+idle (`miss_service.cpp:111-116`) sleeps ≥ 1 ms, up to 15.6 ms, on Windows (inferred, unmeasured):
+cheap to probe. Drafting on the device right after acceptance, as Qwen3.5 does, would remove the
+commit-to-draft gap; a larger design. NVMe power-state exits (50-150 ms on some drives, §12.4;
+unmeasured on G:) would hit a request's first gated round, and the slow-read warning will show them.
 
 ### 19.3.5 Speculation and throughput at C > 1
 
 Design, adversarially reviewed (revision 2), nothing implemented or run on the GPU (worktree
 `NInfer-V3-flashnext`, HEAD `46a56fc8f`, 2026-10-04). Labels: **measured** (log named), **code**
 (`file:line` at HEAD), **model** (`fn/plans/concurrency_model.py`, a planning tool of about
-±30 %), **inference** (names the check that settles it).
+±30 %), **inference** (names the check that settles it). Code references are at `46a56fc8f`. Since
+`54deaa2bc` (the base commit, §19.3.0) `ProgramImpl` is in `program/program_impl.h`, where
+`program.cpp:N` is line N − 2 (e.g. `choose_draft_length` 561, the n-gram proposer 579,
+`decode_budget` 792-798, the chain copies 1408-1409, `kWidthCost` 1605).
 
 #### Why C = 2 with speculation is slow
 
@@ -4737,8 +5008,9 @@ A speculative C = 2 round costs more than the two rows' rounds run one after the
    test so far ran in this **fill** phase, where the x8 link limits verification, **at C = 1 too**.
 
 Calls of ≤ 4 columns use one-column expert kernels (two CTAs per SM, one pass per column); wider
-calls use 8-column kernels (one CTA per SM) that stage a job's slice once and repeat only the dp4a
-work per column (`moe_layer.cu:323-351, 394-397`), so their cost follows the **job count**.
+calls use 8-column kernels (one CTA per SM). Both stage a job's weight slice once
+(`moe_layer.cu:394-397`); the 8-column kernel repeats only the dp4a work per column
+(`moe_layer.cu:323-351`), so its cost follows the **job count** much more than the column count.
 
 #### Measured facts
 
@@ -4747,7 +5019,7 @@ together to a fresh server, then each alone (`fn/mtp/{c1,c2,c2p,c2n}/serve.err`)
 
 | Run (build) | Mode | Code tok/s | Story tok/s | Notes |
 |---|---|---:|---:|---|
-| c1 (`6e5d93500-dirty`, ≈ HEAD) | C = 1, MTP max 4, `--lm-head-draft` | 70.6 fill / 147.2 warm | 61.8 turnover / 97.5 warm | queued; acceptance 92.6 / 61.6 % |
+| c1 (`6e5d93500-dirty`, committed as `ecaf50e16`, §19.2; ≈ HEAD) | C = 1, MTP max 4, `--lm-head-draft` | 70.6 fill / 147.2 warm | 61.8 turnover / 97.5 warm | queued; acceptance 92.6 / 61.6 % |
 | c2 (`5429c31a4-dirty`, older) | C = 2, MTP max 3 | 24.9 | 21.7 | 39.7 tok/s aggregate at batch 2.00 |
 | c2p (`69b57d6d4`) | C = 2, plain | 35.9 | 36.1 | alone and warm: 82.8 / 82.6 |
 | c2n (`69b57d6d4`) | C = 2, n-gram K = 7, min-match 4 | 27.0 | 21.7 | code: 24 rounds, 134/168 accepted; story: no drafts |
@@ -4759,14 +5031,16 @@ together to a fresh server, then each alone (`fn/mtp/{c1,c2,c2p,c2n}/serve.err`)
   only. Fill-phase promotions: c1 code 8,378 over ~49 rounds, c2 code 8,624 over ~55, c2p 9,059
   over 199, against 8,664-9,381 frames. c1 story is the **turnover** regime (frames full, new
   topic, one promotion per layer every 4 tokens): 3,069 promotions, 58.5 % hits.
-- **Plain C = 2, fill:** 199 rounds in 5.54 s, **27.8 ms per B = 2 round** (≈ 72 tok/s);
-  (194,423 − 4,549) / 199 / 48 ≈ **19.9** distinct live experts per layer against 10 at B = 1.
+- **Plain C = 2, fill:** 199 rounds in 5.54 s of `decode_ns`, **27.8 ms per B = 2 round** (≈ 72
+  tok/s); (194,423 − 4,549) / 199 / 48 ≈ **19.9** distinct live experts per layer against 10 at
+  B = 1.
 - **N-gram C = 2, fill:** 24 rounds yield 158 tokens; less the other 41 tokens' plain rounds,
   **~260 ms per B = 2, W = 8 round** against ~56 ms alone and warm; joint aggregate ≈ 36 tok/s.
-- **MTP C = 2 (older build):** ~150 ms per verification round, without the pinned uploads,
-  two-CTA kernels, 8 CPU jobs, deferred cache update and few-row Q8 route (+24 % at C = 1
-  together); S2 re-measures at HEAD. Revision 1's ρ_2 = 27.8 / 15.1 mixed serve `decode_ns` with
-  CLI wall time on different texts; S2 measures ρ_B within one metric.
+- **MTP C = 2 (older build):** ~150 ms per verification round, without the pinned uploads, two-CTA
+  kernels, 8 CPU jobs, deferred cache update and few-row Q8 route (+24 % at C = 1 together); S2
+  re-measures at HEAD. Revision 1's ρ_2 = 27.8 / 15.1 mixed serve `decode_ns` with CLI wall time on
+  different texts; S2 measures ρ_B (the period of a B-row round over that of a one-row round) within
+  one metric.
 
 #### Where the time goes
 
@@ -4784,21 +5058,24 @@ A draft column adds ~5 experts per layer; unrelated rows are almost fully additi
 have one column, so a CPU cap fills mostly with one-column jobs.
 
 - **Expert kernels cost per job plus per column.** Profiles (§19.2): warm C = 1 plain ~2.9 ms per
-  round for 480 one-column jobs (~6 µs each); W = 4 on the 8-column kernel, before the two-CTA
-  fix, 12.9 ms for ~1,270 jobs and 1,920 entries. Assumed until S2: 8-column c_job ≈ 8 µs,
-  c_col ≈ 1.5 µs; one-column 3 + 3 µs. So a filler costs little compute; it costs its
-  **filler-only experts**, each a job and usually a recurring miss (52-115 µs). Revision 1's
-  2.4 ms per filler column overstated the compute.
+  round for 480 one-column jobs (~6 µs each); W = 4 on the 8-column kernel, before the two-CTA fix,
+  12.9 ms for ~1,270 jobs and 1,920 entries. Assumed until S2: 8-column c_job ≈ 8 µs, c_col ≈ 1.5
+  µs; one-column c_job ≈ 3 µs, c_col ≈ 3 µs. So a filler costs little compute; it costs its
+  **filler-only experts**, each a job and usually a recurring miss (52-115 µs). Revision 1's 2.4 ms
+  per filler column overstated the compute.
 - **CPU jobs** (`fn/cpu/run.log`, cold, 8 workers): 51.5-59.9 µs per expert at one column, 102-124
-  at four, so **52 + 18·(n − 1) µs**. 12-24 workers were slower (75-88, 175-190 µs), 6 won end to
-  end (§19.2), only warm one-column records (`dyn.log`) favoured more: no gain from workers is
-  assumed. A higher cap pulls in 2-5-column jobs (70-124 µs). The split adapts to each call's
-  misses M, so the cap binds only when M − M/3 > cap (M ≥ 13 at cap 8): C = 1 MTP cold or turnover
-  (M ≈ 13-15), C = 4 plain (≈ 15), padded C = 2 verification; not plain B = 2 (M ≈ 7-8). CPU,
-  stage and promotions share host DRAM (8/0 lost to 8/3, 130.5 vs 133.6 tok/s, §19.2).
-- **The x8 link** (27.6 GB/s, 2.76 MB, ~100 µs per record), fill phase, below. C = 1 cold MTP sits
-  on the link limit: a higher cap alone moves little, removing the second crossing (S4) frees it.
-  In turnover and warm, promotions fall to ~54 per round, ~5 ms of link per MTP round.
+  at four, so **52 + 18·(n − 1) µs**. 12-24 workers were slower (this log: 75-88 µs per expert at
+  one column, 175-190 at four; §19.2's `cpu_bench` summary: 59-83 at one column). Six workers won
+  end to end (§19.2), and only warm one-column records (`dyn.log`) favoured more, so no gain from
+  more workers is assumed. A higher cap pulls in 2-5-column jobs (70-124 µs). The split adapts to
+  each call's misses M, so the cap binds only when M − M/3 > cap (M ≥ 13 at cap 8): C = 1 MTP cold
+  or turnover (M ≈ 13-15), C = 4 plain (≈ 15), padded C = 2 verification; not plain B = 2
+  (M ≈ 7-8). CPU, stage and promotions share host DRAM: in §19.2's tg512 MTP sweep, giving the CPU
+  every miss up to the cap (jobs / divisor 8 / 0) ran 130.5 tok/s against 133.6 at 8 / 3.
+- **The x8 link** (27.6 GB/s; ~100 µs per 2.76 MB record). The table below gives fill-phase link
+  time per round. C = 1 cold MTP sits on the link limit: a higher cap alone moves little, removing
+  the second crossing (S4) frees it. In turnover and warm, promotions fall to ~54 per round, ~5 ms
+  of link per MTP round.
 
   | Round (fill) | Staged | Promotions | Link | Round |
   |---|---:|---:|---:|---:|
@@ -4806,15 +5083,21 @@ have one column, so a CPU cap fills mostly with one-column jobs.
   | C = 1 MTP K = 4, cap 8 | ~310 | ~217 | **~53 ms** | ~54 ms (CLI 83.7 tok/s) |
   | C = 2 MTP K = (4, 0), cap 16, no landing (model) | ~270 | ~217 | ~49 ms | ~53 ms |
 
-- **Fork and empty CTAs.** Serial calls cost ~0.1-0.2 ms per layer at C = 2 cold (model), the
-  largest term of a warm C = 2 verification round. Forked calls launch `(40, max_jobs)` CTAs per
-  kernel per phase: 8,000 per layer for ~31 jobs at T = 5, 16,000 for ~45 at T = 10; an 8-column
-  CTA reserves ~72 KB, so the early exits run one per SM in turn. Unmeasured (S2).
+- **Fork and empty CTAs.** Calls of ≥ 7 columns run serially and lose the overlap of staging with
+  resident compute: ~0.1-0.2 ms per layer at C = 2 cold (model). In a warm C = 2 verification
+  round this loss is the largest term. Forked calls launch `(40, max_jobs)` CTAs per kernel per
+  phase: 8,000 per layer for ~31 jobs at T = 5, and 16,000 for ~45 at T = 10 once S5 item 1 lets it
+  fork (serial today: 8,000, review finding 7); an 8-column CTA reserves ~72 KB, so the early
+  exits run one per SM in turn. Unmeasured (S2).
 - **Fillers.** c2n 8 + 1 real of 16 columns, 44 %; MTP K = (4, 1) 5 + 2 of 10, 30 %; (4, 0) 40 %.
-  Besides filler-only experts each costs ~0.19 ms of non-MoE work (dense, QSA, GDN record,
-  LM-head column, catch-up cell) plus a drafter step per extra W; NVMe rows for the first
-  `ngram_size − 1` fillers (~4.5 µs per row; later ones hit the host row cache); and B·W > 8 puts
-  dense Q8 on the MMA tiles (§19.2, two lanes), a rounding change.
+  Besides its filler-only experts (their count is unknown until S2 measures it), each filler costs
+  ~0.19 ms of non-MoE work (dense, QSA, GDN record, LM-head column, catch-up cell) plus a drafter
+  step per extra W; NVMe rows for the first `ngram_size − 1` fillers (~4.5 µs per row; later ones
+  hit the host row cache); and B·W > 8 puts dense Q8 on the MMA tiles (§19.2, "Two lanes"). That
+  is a rounding change and, until §19.3.3's K1 covers T = 9-16, also a cost: ≈ 14-20 ms per
+  forward against ~3.6 ms at T ≤ 8 (§19.3.3, inference). The round model has no MMA term, so the
+  T > 8 estimates below (C = 2 HEAD K = (4, 1); C = 2 S1-S6 and S1-S7; C = 4 S1-S7) are optimistic
+  by up to that amount per round.
 
 **Round model** (revision 2):
 
@@ -4830,9 +5113,11 @@ round    = max(fixed(T) + 48 t_layer, link, DRAM)
   DRAM     = (48 x (CPU + staged) + promotions) x 2.76 MB / DRAM
 ```
 
-CPU jobs take the fewest-column misses first, with the column distribution above. Regimes as
-(live hit rate, promotions per layer per advanced token): fill (0.54, 1), turnover (0.58, 0.25),
-warm (0.84, 0.25); with S4, fill promotions are max(0, budget − landed).
+DRAM is the host DRAM bandwidth that CPU jobs, staging and promotions share (70 or 55 GB/s in the
+tables); h is the live expert hit rate. CPU jobs take the fewest-column misses first, with the
+column distribution above. Regimes as (live hit rate, promotions per layer per advanced token): fill
+(0.54, 1), turnover (0.58, 0.25), warm (0.84, 0.25); with S4, fill promotions are max(0,
+budget − landed).
 
 | Calibration | Model, DRAM 70 / 55 GB/s | Measured |
 |---|---:|---:|
@@ -4841,15 +5126,27 @@ warm (0.84, 0.25); with S4, fill promotions are max(0, budget − landed).
 | C = 1 MTP K = 4 code, fill | 86 / 79 tok/s | CLI 83.7 (h ~0.69); serve 70.6 (h 0.54) |
 | C = 1 MTP K = 4 code, warm | 181 / 170 tok/s | serve 147 |
 
-Plain rounds fit within −8 % to +16 %; verification rounds are ~20 % optimistic against serve.
-The per-layer DRAM floor explains most of the plain C = 2 fill time. Rejected variant: promotions
-as full link contention on the stage give C = 1 MTP fill 66 tok/s against 83.7 measured.
+At 70 GB/s plain rounds fit within −8 % to +16 % ((measured − model) / measured); at 55 GB/s plain
+fill is 22 % high (18.4 against 15.1 ms) and the others within 5 %. Verification rounds are
+~20 % optimistic against serve. The per-layer DRAM floor explains most of the plain C = 2 fill time.
+Rejected variant: promotions as full link contention on the stage give C = 1 MTP fill 66 tok/s
+against 83.7 measured.
 
 **Estimates** (model, aggregate tok/s, DRAM 70 / 55; a code and a story row; conditional
 acceptance code ~0.95, story 0.62, 0.5, 0.45, 0.4). Verification figures are undiscounted; expect
-~0.8× (C = 1 MTP fill 69 / 63 at HEAD, serve measured 70.6, → 89 / 78 after S1-S4; C = 2 at HEAD
-~43 / ~47 / ~95, old build measured ~40; C = 2 S1-S7 97 / 85, 103 / 86, 163 / 158; C = 4 S1-S7
-124 / 134 / 213). Plain rows stand as they are.
+~0.8×. Expected aggregate tok/s, verification discounted, DRAM 70 / 55:
+
+| Workload | HEAD | After S1 | After S1-S4 | After S1-S7 (if accepted) |
+|---|---:|---:|---:|---:|
+| C = 1 MTP, fill | 69 / 63 (serve measured 70.6) | same | 89 / 78 | same as S1-S4 |
+| C = 1 MTP, turnover | 84 / 78 | same | 93 / 78 | same |
+| C = 1 MTP, warm | 145 / 136 (measured 147) | same | same | same |
+| C = 2, fill | ~43 (old build measured ~40) | 75 / 64 (plain measured 72) | 80 / 69 | 97 / 85 |
+| C = 2, turnover | ~47 | 84 / 72 | 84 / 72 | 103 / 86 |
+| C = 2, warm | ~95 | 136 / 122 | 136 / 122 | 163 / 158 |
+| C = 4, fill / turnover / warm | — | 85 / 100 / 211 | 107 / 115 / 211 (DRAM 70) | 124 / 134 / 213 |
+
+Undiscounted model figures (plain rows need no discount):
 
 | Configuration | Fill | Turnover | Warm |
 |---|---:|---:|---:|
@@ -4871,23 +5168,42 @@ acceptance code ~0.95, story 0.62, 0.5, 0.45, 0.4). Verification figures are und
 #### Steps
 
 Each step is a separate commit with its own tests and A/B; S2-S6 change no token at fixed draft
-decisions. S1-S5 take ~5-6 working days and ~5 h of GPU; S6-S7 ~2.5-3 more, only if accepted.
-Docs per step: §10.3 (cap, plan, wait), §9 (landing), §11.3 (gate, joint policy), §19.2
-(results), the user guide's C > 1 advice (~0.5 day in all).
+decisions. S1-S5 take ~5-6 working days and ~5 h of GPU; S4b and S8, added from the Strata review
+on 2026-10-04 (§19.3.6), take ~1.5-2.5 days and ~1.5 h more; S6-S7 ~2.5-3 more, only if accepted.
+Docs: per step, results (including adverse ones) in this §19.3.5 (§19.3.0). At merge time, on the
+base branch: §10.3 (cap, plan, wait), §9 (landing; §9.3 item 4 for S4b), §11.3 (gate, joint
+policy), the scheduler description for S8 and the §19.2 "Next" list, plus the C > 1 advice in the
+user guide (`docs/qwen3_8-flash-next.md`): C > 1 mainly buys TTFT for queued requests, and each
+lane costs ~387 frames (~1.5 % decode for a request alone, estimate) at 64K INT8 without
+`--kv-capacity`, ~42 frames (~0.2 %) with a fixed `--kv-capacity`; a startup line prints frames
+per lane (~0.6 day in all).
+
+| Step | Changes a token? | Affects C = 1? |
+|---|---|---|
+| S1 | no; C > 1 output should equal C = 1 | no |
+| S2 | no | adds a report line |
+| S3 | no | speed only (cold and turnover MTP; faster plan and wait) |
+| S4 | no | speed only (fill phase) |
+| S4b | no (placement-invariant) | speed only (first tokens after a restart); +~1 s at startup |
+| S5 | no | speed only (launch shapes; n-gram W ≥ 7 forks) |
+| S8 | no (prefill keeps its chunk grid) | no (C ≥ 2 only) |
+| S6 | no for valid columns | no (one row has no fillers) |
+| S7 | yes at B ≥ 2 (MMA above 8 columns) | no (B = 1 keeps `choose_draft_length`) |
 
 **S1. Speculation gate (default; 0.25 day).** In `ProgramImpl::decode`, `speculate = batch == 1`;
 `wanted[b] = speculate && lane.mtp_live ? choose_draft_length(lane) : 0` and the n-gram proposer
 runs only when `speculate` (`program.cpp:563, 581`). B ≥ 2 rounds decode plain, sharing the dense
 reads without padding; the W = 1 catch-up keeps the drafter current. `mtp_draft` still runs for
-unwritten pending cells (a lane fresh from prefill); it returns before the per-row chain copies
-(`:1410-1411`) when `steps == 0 && !unwritten`. `mtp_policy_rounds` advances only in B = 1
+unwritten pending cells (a lane fresh from prefill). S1 moves its early `return`
+(`program.cpp:1413`) ahead of the per-row chain copies (`program.cpp:1410-1411`) when `steps == 0 &&
+!unwritten`, since those copies only serve drafting. `mtp_policy_rounds` advances only in B = 1
 rounds. A local build reads an environment override (as the `NINFER_Q4_*` sweeps did), not
 committed. **Numerics** unchanged: B ≥ 2 rounds are plain with T = B ≤ 8 on SIMT dense routes,
 column-invariant for 1-8 columns (§19.2); experts are batch-invariant; MTP equals plain at C = 1
 (measured). So C ≤ 8 greedy output equals C = 1 (**inference**, checked in campaign step 1).
 **Expected:** plain C = 2 measured 72 on a plain-only server; with MTP loaded (~700 fewer frames, a
-catch-up per round) ~68-72 fill and ~120-135 warm, against ~40-55 at HEAD. User guide: `--spec`
-at `--max-concurrency ≥ 2` speculates only while one request decodes.
+catch-up per round) ~68-72 fill and ~120-135 warm, against ~40-55 at HEAD. User guide: `--spec` at
+`--max-concurrency ≥ 2` speculates only while one request decodes.
 
 **S2. Diagnostics and kernel constants (0.75 day)**, kept as the C > 1 tuning diagnostic (§11.3
 asks for U_T and h_now):
@@ -4927,18 +5243,19 @@ CTA; `CpuCall` sits in a fixed 256-byte tail (`8 + 4·kMaxCpuJobs` bytes: overfl
 3. `MoeCpuChannel::max_job_columns` (default 8) bounds the width loop; an option only if < 8 wins.
 4. **Block-parallel plan:** thread j mod 256 flags misses and columns; a block reduction gives M and
    `want`; for w = 1..max_job_columns a block prefix sum ranks w-column misses in job order and
-   takes rank < want − n. The selection and its order in `call->job` are today's.
+   takes those with rank < want − n, n being the misses already taken at narrower widths. The
+   selection and its order in `call->job` are today's.
 5. **Publish only the chosen columns** (a shared bitmap, T ≤ 64) at their original offsets; the
    request format is unchanged. At T = 10 the mapped write per layer falls from ~51 to ~5-15 KB.
 6. **Multi-CTA wait:** `min(8, kMaxCpuJobs)` CTAs all poll `done` (same 2 s trap); CTA c copies
    jobs i ≡ c (mod gridDim.x), 8× the mapped reads in flight.
 
-CPU and GPU results are bit-identical (§10.3), so no token changes; C = 1 cold and turnover MTP
-change speed, plain C = 1 (M ≈ 3) only gets the faster plan and wait. **Sweep** (environment
-overrides): cap {8, 12, 16, 24, 32} × divisor {2, 3, 4} × job columns {1, 2, 8} × workers {6, 8},
-staged: cap × divisor (8 columns, 6 workers) on C = 1 MTP fill and turnover and C = 4 plain fill,
-then columns and workers on the top three, then every workload. Verification-heavy rounds must be
-in it; the single winner is committed.
+CPU and GPU results are bit-identical (§16.2; the layer-route test, §19.2), so no token changes;
+C = 1 cold and turnover MTP change speed, plain C = 1 (M ≈ 3) only gets the faster plan and wait.
+**Sweep** (environment overrides): cap {8, 12, 16, 24, 32} × divisor {2, 3, 4} × job columns {1, 2,
+8} × workers {6, 8}, staged: cap × divisor (8 columns, 6 workers) on C = 1 MTP fill and turnover and
+C = 4 plain fill, then columns and workers on the top three, then every workload. Verification-heavy
+rounds must be in it; the single winner is committed.
 
 **S4. Fill-phase landing (1.5 days).** While free frames remain, a staged miss lands in a reserved
 free frame instead of a staging slot and becomes resident, replacing its later promotion.
@@ -4963,11 +5280,41 @@ CPU-served misses are still promoted within the budget.
   with budget **max(0, budget − landed_l)**; release unused reservations; count `Stats::landed`.
   `decode_budget`'s fill test becomes `promotions + landed < frames`.
 - **Effect** (model): C = 1 MTP stages ~4.8-6.5 misses per layer against a budget of ~4.5, so
-  promotions fall to ~0 and link time per round from ~53 to ~23 ms; the fill ends sooner.
-  Fill-phase admission becomes every staged miss instead of the LFRU's highest-count misses
-  (§9.3); LFRU eviction governs once full; with no free frames nothing changes. Bit-neutral (a
-  landed frame holds the identical record). C = 1: the first ~100-200 decode tokens after start
-  and every cold benchmark.
+  promotions fall to ~0 and link time per round from ~53 to ~23 ms; the fill ends sooner. Fill-phase
+  admission becomes every staged miss instead of the LFRU's highest-score misses (LFRU score
+  f / (now − last + 1), §9.3); LFRU eviction governs once full; with no free frames nothing changes.
+  Bit-neutral (a landed frame holds the identical record). C = 1: the first ~100-200 decode tokens
+  after start and every cold benchmark.
+
+**S4b. Warm start (2026-10-04, from Strata; 1-1.5 days).** §9.3 item 4 plans seed and persistence,
+but `LfruPolicy::seed` has no caller, so every start begins with 0 resident experts. Strata fills
+VRAM at start from a ranking: the user's saved state if one exists (VRAM experts, then counted
+routing, written at quit and every 10 minutes through a temporary file and a rename, #477), else a
+shipped profile. It published no gain.
+
+- **Save.** Per key count and last use, the resident set and the clock (~300 KB), with artifact
+  identity, recipe and frame count. Written via temporary file and rename at stop and every
+  N minutes between requests (never during a round).
+- **Load.** After the frames exist and before the first admission:
+  - reject a file from another artifact, recipe or frame count;
+  - seed `LfruPolicy` with the counts scaled or capped, so stale experts are not sticky under
+    f / (age + 1);
+  - copy the residents on the copy stream (9,443 × 2.76 MB = 26.1 GB, ~0.95 s at 27.6 GB/s) and
+    upload the table.
+- **Budget rule.** `decode_budget` keys the fill rate on `promotions < frames`, and S4 makes it
+  `promotions + landed < frames`. S4b adds the seeded frames. Otherwise a seeded cache would keep
+  promoting at the link-bound fill rate (~53 ms of link per MTP round) for ~9,443 promotions.
+- **Fallback profile.** A shipped profile, built from our own mixed code, prose and multilingual
+  route logs (never Strata's data), only if `tools/expert_cache_replay` shows seed ≥ empty over the
+  first 256 tokens on a mismatched workload. §9.3 measured a static profile at +82 % misses on B.
+- **Effect** (estimate; C = 1, the first ~200 tokens after a restart, partly to ~500).
+  - Same workload as the saved state: up to the measured cold-to-warm gap (cold CLI code
+    64.7 / 81.9 tok/s plain / MTP against tg512 warm 88.7 / 133.5). That is an upper bound, since
+    tg512 warm is partly replay.
+  - Unrelated workload: about the turnover regime (model C = 1 MTP 69/63 → 84/78 at HEAD, but only
+    89/78 → 93/78 after S3 + S4).
+  - Bit-neutral: expert arithmetic is placement-invariant. Cold benchmarks state whether a seed
+    was used.
 
 **S5. Fork at every width, compacted phase lists (1.5 days).** (1) `forked()` needs only a fork
 stream and `staging_slots > 0`. (2) S3's kernel becomes `plan_kernel`, run before every fork (also
@@ -4980,27 +5327,59 @@ i += gridDim.y)`, `__syncthreads()` between jobs); forked phases launch `(40, G)
 and eager paths unchanged. (4) `kMaxPassJobs` (512) still bounds `max_jobs`. Item 1 is needed for
 B ≥ 2 speculation and helps plain B ≥ 7 and C = 1 n-gram W ≥ 7; items 2-3 ship only if empty grids
 cost ≥ ~5 µs per layer at T = 5 (max_jobs 50) or T = 10, else item 1 ships alone with the
-overflow. Bit-neutral: only which CTA computes a job changes. C = 1: every forked call's launch
-shape changes, and n-gram W ≥ 7 rounds start forking.
+overflow. Bit-neutral: only which CTA computes a job changes. C = 1: if items 2-3 ship, every forked
+call's launch shape changes; with item 1, n-gram W ≥ 7 rounds start forking.
+
+**S8. Decode share between prefill chunks (2026-10-04, from Strata #465; 0.5-1 day; after S1 + S2).**
+
+- **Today.** `Scheduler::choose_execution` (`scheduler.h:248-255`) alternates one prefill unit with
+  one decode round, and Qwen4Exp ignores `PrefillStepWidth` and the `ExecutionTiming*` argument
+  (`program.cpp:41-44`). One call costs ~1.28 s + 1.17 ms per token (§19.3.1 `cost(t)`): ~2.5 s
+  at the default chunk 1024 and ~6.1 s at 4096. So a lane decoding beside a long cold prompt gets
+  one round per 2.5-6 s.
+- **Change.** After each non-last prefill unit, the Scheduler runs decode units until a budget of
+  share × that unit's wall time is spent. For Qwen4Exp the wall time is
+  `PrefillProgress.timing.submit_host_ns`, which is wall time because `advance_prefill`
+  synchronizes after non-last chunks; otherwise an engine clock.
+  - No decode follows the last chunk.
+  - The prompt keeps its chunk grid, so its arithmetic and E3 are unchanged.
+  - Per-model default: Qwen4Exp non-zero (0.5 proposed, Strata's default); Qwen3.5 0, today's 1:1,
+    because its prefill units are asynchronous.
+  - A serve flag sets the share.
+  - Shrinking the chunk instead is no substitute: every call re-pays ~1.28 s of staging.
+- **Interactions.** Decode rounds between chunks run in a turnover-like regime, since each chunk's
+  16 promotions per layer replace decode-hot experts. If frames are later lent to a prefill arena
+  (§19.3.6), these rounds see the lent frames as non-resident; this is bit-neutral here, unlike in
+  Strata, which needs `--no-prefill-borrow` for exactness.
+- **Effect** (estimate; C ≥ 2 while one lane reads a long cold prompt; aggregate roughly neutral;
+  C = 1 unchanged).
+  - Chunk 1024: ~1.2 s of decode after each chunk (~75-170 tokens) instead of one round per ~2.5 s.
+    The long prompt's TTFT grows ~48 % (79 → ~117 s for 32K).
+  - Chunk 4096: ~3 s of decode per chunk; TTFT 49 → ~70 s (+43 %).
+- **Optional companion.** A length-aware yield: serve the lane whose remaining prompt is under half
+  the current one's, at most twice per request, as Strata's BYIELD does. Plain
+  `--prefill-round-robin` would also interleave two long prompts and roughly double the first's
+  TTFT. Neither preempts at C = 1.
 
 **Decision point after S5** (campaign steps 1-5). S6 + S7 proceed only if the user wants B ≥ 2
 speculation (the open question at the end), S2's ungated runs show ≥ ~3 filler-only experts per
 layer per padded round, and the refit model still predicts ≥ 10 % over the gate at C = 2.
 
-**S6. Masked fillers (only with S7; 1-1.5 days).** `ops::moe_route` takes an optional
-`MoeColumnMask { extents /* I32 [B] */, width }`: column b·W + j is valid iff j ≤ extents[b]
-(column n_b yields the correction or bonus token); masked columns route −1 with weight 0.
-`count_kernel`/`scatter_kernel` skip ids < 0; `combine_kernel` skips them, so a masked y is
-`bf16(s · shared)`, finite. CPU plan, stage and expert kernels see only valid entries; `max_jobs`
-stays the static bound. `Forward::moe` masks when `batch.verify` (`ForwardVerify::extents`; not
-the drafter); `verify()` passes the uploaded `spec_layout_.extents` and stages n-gram rows for
-n_b + 1 columns, zero-filling fillers. Route log and taps hold −1 (consumers skip it;
-`after_round` already skips ids ≥ E); filler-only counts become 0, rejected-draft counts remain,
-and masked columns give no route data (P2b uses live and rejected columns). Valid columns stay
-bit-identical (**inference**, checked by the forward test): at fixed (B, W) every dense route and
-tile is unchanged and per-column; experts are placement- and batch-invariant; causal state Ops
-read only earlier positions of their row; filler residuals reach only the drafter's catch-up K/V
-at uncommitted positions, rewritten before any read.
+**S6. Masked fillers (only with S7; 1-1.5 days).** `ops::moe_route` takes an optional `MoeColumnMask
+{ extents /* I32 [B] */, width }`: column b·W + j is valid iff j ≤ extents[b] (column n_b yields the
+correction or bonus token); masked columns route −1 with weight 0. `count_kernel`/`scatter_kernel`
+skip ids < 0; `combine_kernel` skips them, so a masked y is `bf16(s · shared)`, finite. CPU plan,
+stage and expert kernels see only valid entries; `max_jobs` stays the static bound. `Forward::moe`
+masks when `batch.verify` (`ForwardVerify::extents`; not the drafter); `verify()` passes the
+uploaded `spec_layout_.extents` and stages n-gram rows for n_b + 1 columns, zero-filling fillers.
+Route log and taps hold −1 (consumers skip it; `after_round` already skips −1, since it compares ids
+as unsigned against E, `expert_residency.cpp:117-118`); filler-only counts become 0, rejected-draft
+counts remain, and masked columns give no route data (P2b uses live and rejected columns). Valid
+columns stay bit-identical (**inference**, checked by the forward test): at fixed (B, W) every dense
+route and tile is unchanged and per-column; experts are placement- and batch-invariant; causal state
+Ops read only positions at or before a column of their own row, and fillers come after their row's
+valid columns, so they never enter a valid column's or another row's state; filler residuals reach
+only the drafter's catch-up K/V at uncommitted positions, rewritten before any read.
 
 **S7. Joint draft lengths with an exact search over W (1-1.5 days)**, `draft_policy.{h,cpp}`, pure
 host:
@@ -5021,9 +5400,10 @@ choose_joint(rows b: a_{b,1..Kmax}, limit_b; g_B, c_B; probe flags) -> (W, K_b)
 ```
 
 - **Cost** follows W through g_B and live drafts through c_B; revision 1's separable rule ignored
-  the W term and chose K = (4, 0) on a cold cache (67 tok/s against 78 plain, model). At most Kmax
-  passes of B × Kmax comparisons. At B = 1 it reduces to `choose_draft_length` with
-  `kWidthCost = g_1 + c_1`; B = 1 keeps calling that function, so decisions and probes are equal.
+  the W term and chose K = (4, 0) on a cold cache (67 tok/s against 78 plain, model). At most 4·Kmax
+  passes (Kmax widths, up to 4 Dinkelbach iterations each) of B × Kmax comparisons per round. At
+  B = 1 it reduces to `choose_draft_length` with `kWidthCost = g_1 + c_1`; B = 1 keeps calling that
+  function, so decisions and probes are equal.
 - **Integration** at B > 1: row limits (`budgets`) before drafting, `choose_joint`, draft
   `steps = W − 1`, rows with K_b = 0 join as masked rows. N-gram: `Lane::ngram_accept[16]`, an EWMA
   updated in `verify()`, turns a proposal into an acceptance vector cut by the same rule; a row
@@ -5031,8 +5411,11 @@ choose_joint(rows b: a_{b,1..Kmax}, limit_b; g_B, c_B; probe flags) -> (W, K_b)
 - **Constants.** P2a fits g_B and c_B per B and regime from the S2 table (period against W − 1 and
   ΣK, in plain-B periods), from g_B ≈ 0.54 ms / t_plain(B) (0.19 ms per column + 0.35 ms drafter
   step) and c_B ≈ (0.38 · t_plain(1) − 0.54 ms) / t_plain(B). P2b, only if P2a mis-tunes across
-  regimes: per round c_col = 48 (10 c_e + u (m c_miss(M_B) + (1 − m) c_hit)), u = new distinct
-  experts per live or rejected column, m their miss share, c_miss(M_B) the marginal miss cost.
+  regimes: a miss-aware c_B updated every round from S2's counters, from the per-live-column cost
+  48 (10 c_e + u (m c_miss(M_B) + (1 − m) c_hit)) (not the kernel constant c_col above). Here c_e
+  is an expert entry's compute, c_hit a resident new expert's job cost, u the new distinct experts
+  per live or rejected column, m their miss share and c_miss(M_B) the marginal miss cost at the
+  round's miss level.
 - **Output.** Draft lengths change only which positions are verified; greedy output at C > 1 can
   differ from C = 1 at near-ties once B·W > 8.
 
@@ -5043,54 +5426,88 @@ choose_joint(rows b: a_{b,1..Kmax}, limit_b; g_B, c_B; probe flags) -> (W, K_b)
 | S1 | None in code (decision inside `ProgramImpl`); campaign step 1 checks byte identity and that no B ≥ 2 round has W > 1 |
 | S2 | `test_offloaded_moe_layer.cu`: counters equal the expected CPU and staged counts (`Config{3, &service_two}` stages misses − 2, serves 2) |
 | S3 | `test_offloaded_moe_layer.cu`, `test_offloaded_moe_team.cpp`: 16- and 32-job services; T = 8 and 16 at E = 512, top-k 10 (multi-column CPU jobs); served count = `min(cap, M − ⌊M/div⌋, misses of ≤ max_job_columns columns)` from the S2 counters (the knobs' contract); `max_job_columns = 1` serves one-column jobs only; team test to 32 jobs |
-| S4 | `test_expert_cache.cpp`: reserve/adopt/release keep `resident_count() ≤ capacity()` and `free + held + pending = frames`; an adopted key is Ready at its frame; an adopted queued key is dequeued; adopting into a full LFRU evicts exactly one victim. Layer: fork with 3 landing frames and 9 misses; `landed` = the first 3 staged misses in job order; each landing frame memcmp-equals the host record; `landing = nullptr` matches today |
+| S4 | `test_expert_cache.cpp`: reserve/adopt/release keep `resident_count() ≤ capacity()` and `free + held + pending = frames`; an adopted key is Ready at its frame; an adopted queued key is dequeued; adopting into a full LFRU evicts exactly one victim. Layer: fork with 3 landing frames and 9 misses; `landed` = the first 3 staged misses in job order; each landing frame memcmp-equals the host record; `landing = nullptr` matches today; after vision V4: lending during the fill phase with reservations outstanding (§19.3.0) |
+| S4b | `test_expert_cache.cpp`: save and load round trip (counts, last use, residents, clock); a file with another artifact identity, recipe or frame count is rejected; seeded `resident_count() ≤ capacity()`; the fill-phase test counts seeded frames. Engine (real artifact): greedy ids seeded = empty on code and story |
 | S5 | Layer: fork with 3 slots and 9 misses (zero-copy overflow); T = 8 and 16 at E = 512 (max_jobs > 64); CPU flags present (lists exclude CPU jobs); landing with overflow; existing configurations pass, and `Config{3, nullptr, true}`, silently serial today, forks |
+| S8 | Scheduler unit test (`src/runtime/engine`): with a share s and a fake prefill unit of t seconds, decode units run until s·t is spent, none after the last chunk; share 0 reproduces today's 1:1 order (Qwen3.5 tests unchanged) |
 | S6 | `test_offloaded_moe_cuda.cu`: the mask writes −1, dispatch excludes it. Layer (B = 2, W = 4, extents {3, 0}; B = 3, W = 5): no job for masked-only experts; valid columns exact with and without the mask; masked columns equal the FP64 shared-only formula. `test_forward_real.cpp`, the actual claim: bit-identical logits for every valid column with and without the mask at B = 2, W = 4 (T = 8, SIMT) and W = 5 (T = 10, MMA); masked logits finite |
 | S7 | `test_draft_policy.cpp` (host): B = 1 equals `choose_draft_length` over an acceptance grid; B ≤ 4, Kmax ≤ 4 equals brute force over (W, K) on random inputs; K monotone in acceptance; limits respected; probes never widen W |
+
+**Files.** `include/ninfer/ops/offloaded_sparse_moe.h` (`MoeExpertSource` counters and landing
+fields, `MoeCpuChannel::max_job_columns`, `MoeColumnMask`, documentation);
+`src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`; `src/ops/offloaded_sparse_moe/cpu/miss_request.h`
+(`kMaxCpuJobs`, `static_assert`) and `miss_service.{h,cpp}`;
+`src/models/qwen4_exp/execution/forward.{h,cpp}` (`ForwardExperts`, `ForwardVerify::extents`,
+`ForwardTap` documentation); `program/program_impl.h` and `program.{h,cpp}`;
+`program/expert_residency.{h,cpp}`; `program/expert_cache/expert_cache.{h,cpp}`; new
+`program/draft_policy.{h,cpp}` in `program_sources.cmake`; the tests named above, new
+`test_draft_policy.cpp` in `tests.cmake`; new `bench/ops/offloaded_moe_bench.cu` in
+`bench/ops/benchmarks.cmake`. S4b: the save/load in `program/expert_cache/` (a new
+`expert_cache/warm_state.{h,cpp}`) and its call sites in `program/program_impl.h`; S8:
+`src/runtime/engine/scheduler.h`, the per-model default in the Qwen4Exp and Qwen3.5 instances and a
+serve option in `src/serve/serve_options.cpp`.
 
 **Deferred and rejected.** P6, a ragged layout of only Σ(1 + n_b) columns (per-row offsets in every
 state Op, new graph keys), only if S2 shows filler non-MoE work above ~5 % of a C ≥ 4 round
 (~1-3 ms). Rejected: sub-rounds or time-slicing (batched rounds share ~7-9 ms of dense, head and
 small kernels; the gate keeps that without padding); a per-B cap table; revision 1's P5, the summed
 advance as promotion budget (more link bytes in exactly the link-bound rounds); ≤ 8-column SIMT
-splits (an extra dense pass; only relevant if S7 lands); scheduler changes (the 1:1 prefill
-alternation, 0.5-1.6 s stalls, is a TTFT/ITL trade-off outside this plan); more than 64 staging
+splits (an extra dense pass; only relevant if S7 lands); narrower prefill steps beside decoding
+lanes (each call re-pays ~1.28 s of staging). The first revision also rejected scheduler changes
+as "a TTFT/ITL trade-off outside this plan" with "0.5-1.6 s stalls"; §19.3.1's `cost(t)` gives
+~2.5 s per 1024-token call and ~6.1 s per 4096, so the rejection was withdrawn on 2026-10-04 and
+S8 adds a decode share; more than 64 staging
 slots (staged misses stay well under 64 to C = 8 at W = 5, model; S5's overflow covers the tail);
 landing into victim frames outside the fill phase (a later layer's victim may still be read this
 round; ~5 ms of link per MTP round is not worth the hazard).
 
 #### Measurement campaign and acceptance
 
-Rules: GPU lock, hidden detached rigs dry-run-validated before arming, ABBA where the text is
-identical, one server start per configuration. Regimes: **fill** (fresh server or CLI process),
-**turnover** (an unrelated 600-token request first; it fills the frames within ~200 tokens),
-**warm** (repeated). Workloads: C = 1 queued; C = 2 code + story and code + code (different
-prompts); C = 4 two of each. Rig `fn/conc/serve_conc.ps1` (C, plain / MTP / n-gram, pair, regime);
-C = 1 CLI cold runs and tg512 as in §19.2. Metrics: **joint-phase tok/s** (Σ tokens / Σ periods of
-B = C rounds); **makespan throughput** (output / (last completion − first submit), like-for-like
-with C = 1 queued); per request tok/s, TTFT, acceptance, hits; the S2 table. Output: gated runs
-must be byte-identical to each request alone; ungated, a mismatch fails only if the runs' (B, W)
-sequences match.
+Rules (§19.3.0): GPU lock and the quiet lock (`fn\locks\quiet.lock`: no build during timing runs,
+which disturbs the CPU-served experts and the S3 sweep), ≥ 72 GiB free RAM, hidden detached rigs
+dry-run-validated before arming, ABBA where the text is identical, one server start per
+configuration. Regimes: **fill** (fresh server or CLI process), **turnover** (an unrelated 600-token
+request first; it fills the frames within ~200 tokens), **warm** (repeated). Workloads: C = 1
+queued; C = 2 code + story and code + code (different prompts); C = 4 two of each. Rig
+`fn/conc/serve_conc.ps1` (C, plain / MTP / n-gram, pair, regime); C = 1 CLI cold runs and tg512 as
+in §19.2. Metrics: **joint-phase tok/s** (Σ tokens / Σ periods of B = C rounds); **makespan
+throughput** (output / (last completion − first submit), like-for-like with C = 1 queued); per
+request tok/s, TTFT, acceptance, hits; the S2 table. Output: gated runs must be byte-identical to
+each request alone; ungated, a mismatch fails only if the runs' (B, W) sequences match.
 
 | # | Campaign step | GPU |
 |---|---|---|
-| 1 | S1 + S2 baseline, gate toggled: C = 1, 2 (both pairs), 4; plain, MTP gated and ungated, n-gram ungated at C = 2; all regimes. Yields HEAD's real C = 2 MTP figure, the gate's gain and byte identity, ρ_B, filler-only counts, CPU jobs and columns per call, the refit model | 1.5-2 h |
+| 1 | S1 + S2 baseline, gate toggled: C = 1, 2 (both pairs), 4; plain, MTP gated and ungated, n-gram ungated at C = 2; all regimes. Yields HEAD's real C = 2 MTP figure, the gate's gain and byte identity, ρ_B, filler-only counts, CPU jobs and columns per call, the refit model. Since 2026-10-04 also: C = 1 queued as the baseline (makespan and per-request TTFT), and a lone request at `--max-concurrency 2` against 1 (the per-lane frame cost; Strata measured −11 % / −24 % per request with 2 / 4 slots on a card where most experts miss) | 1.5-2 h |
 | 2 | S2 microbenchmark | ~10 min |
 | 3 | S3 sweep; the winner then: tg512 plain and MTP max 4 within noise, cold CLI code and story plain and MTP not slower, C = 2 and 4 gated not slower in any regime | ~2 h |
 | 4 | S4 A/B (off/on, budget rule vs unchanged): C = 1 MTP and plain fill, C = 2 and 4 gated fill; turnover and warm as no-change checks | ~45 min |
 | 5 | S5 A/B: C = 1 MTP and plain, warm and fill; C = 1 n-gram K = 7 code; C = 8 plain if C ≥ 7 matters; ungated C = 2 MTP | ~45 min |
 | 6 | S6 + S7 vs the gate (after the decision point): C = 2 both pairs, C = 4, all regimes, 3 repetitions, per-row K distribution | ~1.5 h |
+| 7 | S4b A/B (seeded against empty, new process per run): first 256 and 512 decode tokens of code and story after a restart, with the saved state from the same workload and from an unrelated one; startup time; the replay gate for any shipped profile (CPU) | ~45 min |
+| 8 | S8 at C = 2: one lane decoding while the other reads a cold 32K prompt, share {0, 0.25, 0.5} at chunk 1024 and 4096: the decoder's ITL p50/p99 and tokens per chunk gap, the long prompt's TTFT, aggregate tok/s | ~45 min |
 
 Acceptance. **Every step, C = 1:** greedy ids unchanged; tg512 plain and MTP within noise (ABBA);
 cold CLI code and story not slower. **S1:** C = 2 and 4 makespan ≥ HEAD's ungated MTP in every
-regime; output byte-identical to alone. **S3, S4, S5:** each ≥ its predecessor on every workload
-and regime; ids identical where (B, W) sequences match; one cap value. **S6 + S7** replace the gate
+regime; output byte-identical to alone; reported against C = 1 queued, with the lone-request cost
+of `--max-concurrency 2`. **S3, S4, S5:** each ≥ its predecessor on every workload
+and regime; ids identical where (B, W) sequences match; one cap value. **S4b:** greedy ids seeded =
+empty; the first 256 tokens faster beyond noise with the same-workload state and not slower with
+an unrelated one; a file from another artifact or frame count rejected. **S8:** output
+byte-identical to each request alone; the decoder's p99 gap during a long read below one chunk
+call; the share recorded with the long prompt's TTFT cost; C = 1 and Qwen3.5 unchanged. **S6 + S7** replace the gate
 only if joint-phase **and** makespan throughput beat it at C = 2 and C = 4 in fill, turnover and
 warm, with no regime worse; otherwise neither is merged.
 
 #### Corrections to the review
 
-All eleven findings were checked against the code and adopted, three with a correction:
+All eleven findings of the adversarial review of revision 1 were checked against the code and
+adopted. Findings 2, 3 and 9 carry a correction of magnitude, attribution or fact (table); 1, 6
+and 7 carry the additions in the last row. The rest are adopted as stated: 4 (CPU cost grows with
+columns, and more workers do not help: the 52 + 18·(n − 1) µs model and the column sweep), 5 (the
+per-entry cost does not fit the 8-column kernels: per-job and per-column terms, refitted by S2), 8
+(the single-thread `cpu_plan` selection: S3 item 4), 10 (masked equals unmasked tests and the
+hidden `CpuCall` limit: the S6 forward test, S3 item 1) and 11 (byte identity at C > 1 and the
+aggregate metric: the gated/ungated output rule and the two throughput metrics).
 
 | Finding | Correction |
 |---|---|
@@ -5107,24 +5524,197 @@ All eleven findings were checked against the code and adopted, three with a corr
 | Gate byte identity is an inference | Campaign step 1; a mismatch fails S1 |
 | CPU, stage and promotions share host DRAM: S3 gains nothing at C = 1 at 55 GB/s and adds CPU load and power | Staged sweep including C = 1 MTP; the cap rises only if measured faster |
 | S4: a discarded round leaves reservations | `before_round` releases them first |
+| S4's landing reservations and vision's frame lending (§9.2, §19.3.2) both draw on free frames during the fill phase | Whichever of lending and landing merges second adds a test that lends during the fill phase with landing reservations outstanding (§19.3.0) |
 | S7: the model has no MMA-tile term. Dense Q8 at T = 9-16 measured 0.22 TB/s ([2560, 2560], 12-16 columns; ~14-20 ms per forward estimated against ~3.6 ms at T ≤ 8, §19.3.3); C = 4 at W = 5 is T = 20 | Measure S7 after §19.3.3's K1 (T ≤ 16) and its T = 17-64 choice (**inference**) |
 | S7: greedy output at C > 1 differs from C = 1 at near-ties | Decision point, open question below |
+| S4b: stale seeded counts keep cold experts resident; a mismatched state costs more than an empty start | Counts scaled or capped at load; LFRU adapts from the first round; the replay gate before any shipped profile; campaign step 7 measures the unrelated-state case |
+| S8: decode rounds between chunks and the chunk's promotions evict each other's experts | Measured in campaign step 8 (decoder hit rate and the prompt's TTFT per share); the share is a flag |
 | Shared code: S3 and prefix P7 both change `cpu_plan_kernel`'s x publication; S3 and Q8 Phase 2 both change `cpu_wait_kernel`'s grid; S6's −1 skip must also cover Q8's fused small-dispatch kernel and `moe_combine` | This track owns plan, wait and stage: S3-S5 land first and Q8 Phase 2 and prefix P7 rebase onto them; one `cpu_wait` grid serves copying and L2 warming; Q8 Phase 0 lands before S6 (§19.3.0) |
 
 | Decided (default, 2026-10-04) | Alternative |
 |---|---|
-| Optimise C = 2 first, check C = 4 | C ≥ 7: S5 and campaign step 5 extended to C = 8 |
-| The gate is the C > 1 policy; S6 + S7 replace it only if they beat it at C = 2 and C = 4 in all three regimes | Never speculate at B ≥ 2; or split wide blocks into ≤ 8-column SIMT launches (one extra dense pass per round) |
+| Optimise C = 2 first, check C = 4 | C = 4, or C ≥ 7, as the primary target (then S5 and campaign step 5 extend to C = 8) |
+| The gate is the C > 1 policy; S6 + S7 replace it only if they beat it at C = 2 and C = 4 in all three regimes **and** the user accepts concurrency-dependent greedy output at near-ties (open question below) | Never speculate at B ≥ 2; or split wide verification blocks into ≤ 8-column SIMT launches (one extra dense pass per round) to keep equality with C = 1 |
 | A higher CPU cap (12-24 jobs) is accepted if measured faster | Keep 8 to bound CPU load and power |
-| Fill-phase landing (S4) accepted: every staged miss is cached while frames are free (bit-neutral; the first ~100-200 tokens after a start) | The LFRU's highest-count picks within the promotion budget |
+| Fill-phase landing (S4) accepted: every staged miss is cached while frames are free (bit-neutral; the first ~100-200 tokens after a start) | The LFRU's highest-score picks within the promotion budget |
 | S5's compacted grids accepted subject to the C = 1 no-regression gates (bit-exact launch-shape change) | S5 item 1 only |
 | CPU cap, divisor and workers stay internal defaults; the gate stays internal (an environment override in a local measurement build) until S7 decides | `--cpu-expert-jobs` and the like; a documented gate option |
+| S4b warm start on by default from the user's own saved state; no shipped profile unless the replay gate passes (2026-10-04) | Start empty, as today; or a shipped profile without the gate |
+| S8 decode share for Qwen4Exp at C ≥ 2, value from campaign step 8 (0.5 proposed); Qwen3.5 keeps 1:1; a length-aware yield only as an option (2026-10-04) | Keep 1:1 alternation; plain `--prefill-round-robin` as the Qwen4Exp default |
 
 **Open, asked at the decision point after S5:** is concurrency-dependent greedy output at
 near-ties acceptable if S7 wins (+20-30 % at C = 2, model)?
 
 Dense Q8 needs no separate concurrency-invariance task (§19.3.3): the gate keeps C ≤ 8 rounds at
 T ≤ 8. The prefix cache's C > 1 extras (P8, §19.3.1) follow this track.
+
+### 19.3.6 Strata-derived options (2026-10-04)
+
+Strata was re-read at `6f32ec0` (§3.1, "Strata v0.1.39"). The review ran six area sweeps: expert
+cache, prefill, speculation, serving, kernels, and vision/KV/quality. An adversarial verifier
+checked each sweep against both code bases, and its "missed" items were re-checked in Strata's
+history. The full ranked review is `local/workdirs/fn/plans/strata-review.md`; the per-track
+changes with their acceptance measurements are `strata-amendments.md`. Nothing is implemented.
+Labels are as in §19.3, and no Strata code is copied (§1.4).
+
+Strata's numbers are its own and measure a mechanism, not a prediction for this card. Our
+baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; cold first request
+70.6 / 61.8; pp4096 413 at chunk 1024 and 659-673 at 4096.
+
+**Adopt, ranked.** Each item names the step it amends; the amended text is in that section.
+
+1. **E2M1 decode in registers in the GPU expert kernels** (§19.3.3 Phase 0).
+   - Defect: `canon::e2m1_x2`'s 8-entry table compiles to a stack store plus a local load on every
+     lookup. `cuobjdump` counts 688 STL + 688 LDL in `gate_up_kernel<1>` and 160 + 160 in
+     `down_kernel<1>`.
+   - Strata keeps codebooks in registers; its SYCL port measured an expert call 80.8 → 43.1 µs and
+     decode +7.5 % from that change.
+   - Estimate: −0.1 to −0.3 ms per plain token and −0.5 to −1.3 ms per W = 4-5 round. Bit-exact,
+     0.5 day.
+2. **QSA block selection that scales with context.** Not in a track; a proposed "QSA long context"
+   item.
+   - Today `select_kernel` gives each column one CTA, which scores every block and runs a
+     single-histogram radix select. Measured ~19 µs + 32 ns per block per launch.
+   - Extrapolation: 1.0 / 3.4 / 12.8 ms per plain token at 8K / 32K / 128K, against an 11.5 ms
+     token. That alone would miss M8's ≥ 85 %-of-4K target.
+   - Strata on sm_90+ scores on many CTAs and selects with an 8-CTA cluster; `cce52db` adds a
+     per-warp-histogram top-k (9-12× at 262K-524K cells).
+   - Steps:
+     - Q0: nsys at 8K / 32K / 128K (~1 h).
+     - Q1: prefill groups of ≥ 170 columns (0.5 day, exact; ~5× on prefill selection).
+     - Q2: multi-CTA scoring with today's per-block arithmetic, plus a cluster or two-pass top-k
+       (2-3 days). Ids stay bit-exact.
+   - Estimate: plain decode +8 % at 8K, +27 % at 32K, 2× at 128K. It lands after prefix P0 and
+     extends P0's QSA oracle test.
+3. **Warm start** (§19.3.5 S4b).
+   - Save the LFRU state; at load, seed it and bulk-fill the frames (26.1 GB, ~0.95 s).
+     `LfruPolicy::seed` has no caller today.
+   - Estimate, first ~200-500 tokens after a restart: up to +37 % plain and +63 % MTP with the
+     user's own state; ~0-24 % with an unrelated one. Bit-neutral, 1-1.5 days.
+   - A shipped profile only behind a replay gate.
+4. **Prefill track.** Not in a track; a proposed "prefill" item (M8), steps F0-F6.
+   - F1, the A4 wide route (§13): gate_up + down from 3.3 s to ≤ 0.3 s per 4K chunk.
+   - F2, a copy-engine streamed ring of frames across layers (§13 streamed walk). One event per
+     layer or group, never per copy: Strata measured ~10 µs of WDDM idle per wait/record pair.
+   - F3, frames lent to the prefill arena (§9.2, after vision V4).
+   - Estimate: pp4096 413-673 → ~2,100-2,400 tok/s at the x8 link floor (~1.63 s per 4K chunk),
+     and 32K prompts ~3× faster. ~12-17 days.
+   - Rules:
+     - The chunk is fixed per Engine from configuration and prompt length, never from free frames
+       or loans. Chunk size changes bits, and E3 holds only on a fixed grid.
+     - io is enqueued before any ring DMA of its chunk.
+     - The walk is gated on the DMA-able share of non-resident experts.
+     - At merge, §13's "⌈n/max⌉ equal chunks" with a lending-derived max is replaced by a chunk
+       fixed per Engine (ring depth first, then the largest chunk).
+   - F1 changes prefill bits once and is qualified against the FP64 oracle. Ring and lending are
+     placement changes and stay bit-exact.
+5. **Decode share between prefill chunks** (§19.3.5 S8).
+   - At C ≥ 2, decoding lanes run for share × each chunk's wall time instead of one round per
+     2.5-6 s chunk call (Strata's #465 default share is 0.5).
+   - Estimate: ~1.2-3 s of decode per chunk; the long prompt's TTFT +43-48 %. 0.5-1 day.
+   - It corrects the earlier "0.5-1.6 s stalls" rejection.
+6. **Shared expert on its own graph branch from the mixer output** (§19.3.3 Phase 2, measured in
+   M4). Estimate −0.1 to −0.25 ms per T = 1 forward; bit-exact.
+7. **GDN control GEMV on more SMs** (§19.3.3 Phase 0, moved from "listed"). Estimate −0.04 to
+   −0.05 ms at T = 1 and −0.12 ms at W = 4-5; bit-exact.
+8. **The next prefill chunk's PLE rows read during the current chunk** (§19.3.4 S4d, reshaped from
+   the within-chunk gate and scheduled after S1). Strata CUDA measured +3.7 % at chunk 4096.
+   Estimate 2-4 % per cold 4K chunk.
+9. **QSA KV host tier** (§9.6, not in a track).
+   - Estimate: ~+4-5 % decode on every request at `--max-context 262144` as built (~1,139 frames
+     returned); 0 at the guide's 16K.
+   - Worth building only for long max-context serving. Its pinned memory is allocated before the
+     frames: Strata #620 found that WDDM refused a `cudaMalloc` after ~45 GiB of host
+     registration.
+10. **QSA decode attention: register accumulators, batched V loads** (§19.3.3 Phase 0, low
+    priority). Estimate −0.04 to −0.07 ms at T = 1; bit-exact.
+11. **Measurement amendments.**
+    - A third S0b flush site at commit (§19.3.4 S0).
+    - A temporary draft-probability log for the replays of options 2 and 3 below (§19.3.4 S0).
+    - C = 1 queued and lone-request baselines for S1, and per-lane cost in the docs (§19.3.5 S1,
+      campaign step 1, docs).
+    - A restore-speed criterion with interference held fixed (§19.3.1 M2 (c)).
+    - A long-prompt chunk check against a rounding-order-only control (§19.3.1 M9). Strata
+      `f23ea57`: a chunk-only change moved KL by 0.023-0.038.
+
+Already planned and confirmed by Strata, no change:
+- n-gram S2: Strata gathers rows after layer 0 starts.
+- Concurrency S1: Strata switches between solo MTP and plain batch rows.
+- Prefix taps: Strata's ~118 MB turn checkpoint matches our 115.7 MB image.
+- Vision offload: Strata's resident encoder with a static reserve stalls on 12 GB cards.
+- Batch output equal to solo: Strata needs four flags for this, we need none.
+
+**Options, ranked** (gains estimated; each with the measurement that decides it):
+
+1. **KV loans** (§9.2). Up to +4-6 % at 262K max-context while the context is short. Mostly
+   superseded by item 9 above. 3-5 days.
+2. **Confidence-gated verify width.** Strata `--spec-min-p 0.5`; for us an on-device column mask
+   (S6), so S3 keeps no host decision. 0-5 % on prose. Built only if the S0 log's replay shows
+   ≥ 3 % net of draft cost: Strata never published a CUDA A/B.
+3. **Sampled drafts for T > 0** through the existing sparse rejection Op. The sign is unknown, −2 to
+   +8 % on sampled prose: Σ min(p, q) can fall below p(argmax q). Built only if the replay shows
+   ≥ ~5 acceptance points.
+4. **MTP-or-lookup choice at C = 1** (S7's `ngram_accept` at B = 1).
+   - A copy proposal only when its first token equals the first MTP draft.
+   - Copy windows capped at W ≤ 6.
+   - +0-5 % on edit sessions; lets n-gram default on.
+5. **Length-aware prefill yield at C ≥ 2** (with S8). Never at C = 1, which would be a product
+   change.
+6. **No promotions between prefill chunks.** Up to ~77 ms of link per chunk once F2 makes the link
+   the bound.
+7. **Prefill io off the copy-engine FIFO** (`upload_pinned`). 0-77 ms per non-last chunk; one
+   nsys first.
+8. **Ring before chunk, chosen once per Engine** (#583's rule). A few %.
+9. **Expert-kernel structure after item 1.**
+   - ncu first, then a cp.async ring, PDL for `down`'s weights, and parallel `h` quantization.
+   - Plus a carveout co-residency check.
+   - −0.3 to −0.8 ms at T = 1, low confidence.
+10. **One routing launch** (Phase 0 dispatch merged with S3/S5's `plan_kernel`). −0.05 to −0.15 ms.
+11. **Large pages for the pinned bank.**
+    - ≤ ~1-2 %, unmeasured in both engines. A locked-memory `cpu_bench` A/B first.
+    - Allocation order under WDDM (Strata #620).
+12. **Lane affinity for resumed turns** (prefix P8). ~4.5 ms per resumed turn at C ≥ 2.
+13. **Miss-service diagnostics.** Log the exception that `miss_service.cpp:141-145` swallows; opt-in
+    breadcrumbs.
+14. **BF16 KV recommended at ≤ 32K max-context.** −0.6 % decode for upstream KV precision; needs a
+    measured quality gain.
+15. **`effort_position: end`.** Opt-in, after P6, only if the request log shows effort switches,
+    and with an effort-following quality check.
+16. **UD-IQ4_XS as a second Strata baseline** in M10.
+17. **Elastic VRAM through VMM segments.** A capability without a product requirement.
+
+Unchanged by Strata:
+- n-gram S4a (mailbox), kept parked on its trigger.
+- Prefix P7 (CPU assist): upstream Strata still has none.
+- Q8 Phase 1b. Strata's two-kernel HC read measured −4 to −6 % on an Intel B70, but its
+  column-sliced GR down measured +7.8 % on the same card, so M1 decides the form.
+
+**Skip.**
+
+| Item | Reason |
+|---|---|
+| Zero-doorbell verify graph | We have it in general form: hits never involve the host |
+| CPU/PCIe split, adaptive tier | Have the split; the adaptive tier measured 5.5 points of hit rate below LFRU |
+| Hybrid-CPU worker rule | Our measured optimum and dynamic handout (6/12/16/24 workers: 62.25/62.01/61.51/58.89). An optional EcoQoS check for hidden launches |
+| Router lookahead | No file tier; recall@10 65 % (§19.2) |
+| Hit-rate PCIe share, window profiler | Our hit rate never excluded PCIe misses; S2 covers the profiler |
+| Mmapped arena, multi-GPU helpers | Breaks clean frames; one GPU |
+| BF16X2 activations, finite q8_1 scales | Not our numerics (BF16 activations; saturating A4 encoders) |
+| Draft vocabulary per language | 131K proposal rows: 99.09 % held-out coverage, worst domain 97.53 %; full-head fallback |
+| Window routing, batched PLE, one-graph draft chain, GDN commit split, sub-warp packing | Have |
+| GPU-side commit/draft overlap | ~0 until the next draft is enqueued before `settle_round` |
+| Dropping the drafter catch-up on stale K/V | ≤ ~1 % of a B ≥ 2 round; relaxing MR5/MR6 breaks E1 for sampled requests |
+| 256-repeat stop, `/metrics` | No loop observed; `max_tokens` defaults to 8192; it truncates legitimate output and changes an external contract. The request log covers metrics |
+| Q8 vision weights, lower vision token cap | Below upstream precision; we have `--vision-max-merged` |
+| BF16 rounding of q·s in the Q8 MMA route | ≪ 0.001 nats for recipe B (≤ 2^-9 relative per weight) |
+| UD per-layer precision exceptions | They are routed-expert formats; ours are NVIDIA's NVFP4, imported exactly |
+
+**Changes at merge time** (on the base branch, §19.3.0):
+- §9.3 item 4 (S4b built).
+- §9.2 status (prefill loans, once the prefill item is scheduled).
+- §13 "Chunks" (the per-Engine rule) and "PLE rows" (S4d).
+- §19.2's "Next" list and "not in a track yet" line.
+- The user guide's C > 1 and context advice.
 
 ---
 
@@ -5162,7 +5752,9 @@ When the implementation lands:
 - [CLI](../cli.md), [serving](../serving.md), README, `--help`: the §18 rows; `--kv-capacity` adds one
   copy-on-write page per lane; `--use-original-prefix-caching` is rejected for this model.
 - Contracts `linear.h`, `qsa.h`, `hyper_connection.h`, `linear_swiglu.h`, `offloaded_sparse_moe.h`,
-  `speculative_round.h`; [linear tuning](linear-tuning.md) (BF16 vision, Q8 curves); `tests/README.md`.
+  `speculative_round.h`; [linear tuning](linear-tuning.md) (BF16 vision, Q8 curves);
+  `tests/README.md`; `bench/README.md`: the expert-kernel microbenchmark
+  `bench/ops/offloaded_moe_bench.cu` (concurrency S2).
 - §19.2: each track's results, adverse ones included, and the n-gram track's corrections (the
   after-draft gap is host turnaround; the "reused events" A/B was n-gram-warm).
 - This file is deleted.
@@ -5190,12 +5782,13 @@ When the implementation lands:
 | Calibration overfits the bundled corpus or a noisy measurement | Settings slower on real workloads | Held-out check in M9; noise-aware acceptance; defaults on ties |
 | 96 GB is tight with a desktop session, Vision pins, the prefix Host tier, or a `bf16` KV host tier at 256K | OOM, swap or pagefile | The 8 GiB-available floor; prefix tier sized after model and Vision load (4 GiB, clamped, logged; §15.2); configurable KV host tier (3.6 GB at 262K for `int8`) |
 | Engine contract changes for chained rounds (H6) | Large change to transactions | Built only if its gate passes; otherwise the synchronous boundary stays |
-| Prefix cache: drafter state wrong after a resume; copy-engine FIFO (restores ahead of inputs, bulk D2H ahead of readbacks: unverified) | Lower acceptance, invisible at C = 1 greedy; stalled rounds | Bitwise drafter oracle D1, `mtp_cells`, counters; restores after the call's inputs; M0 decides `download_pinned` (§19.3.1) |
+| Prefix cache: drafter state wrong after a resume; copy-engine FIFO (restores ahead of inputs: H2D FIFO measured, §19.2; bulk D2H ahead of per-round readbacks: unverified, prefix M0) | Lower acceptance, invisible at C = 1 greedy; stalled rounds | Bitwise drafter oracle D1, `mtp_cells`, counters; restores after the call's inputs; M0 decides `download_pinned` (§19.3.1) |
 | Vision: M-RoPE plumbing in every attention call, invisible below 2,051 tokens; lending across three streams; new BF16 routes also change Qwen3.5 and Quasar vision | Silent output change; corrupt frames; slower images | Bitwise text logits against HEAD, index-key taps, a mandatory > 2K case; load serial, lease waits, C = 2 stress; routes measured first, Qwen3.5 requalified (§19.3.2) |
 | Q8: T > 8 costs rest on one measured MMA point; K1b's redundant partial reads; Phase 1b moves tg512 baselines | Smaller gains | M1 sweep with per-shape thresholds; last-arriver fallback; identical-id workloads (§19.3.3) |
 | N-gram gate: a long spin under WDDM relies on compute preemption; a TDR resets the whole GPU | Display and other sessions reset | 120 s trap verified once with a 3-5 s delay on an idle GPU, else 2 s (§12.3) |
 | Gains near noise (n-gram) and a ±30 % C > 1 model (verification ~20 % optimistic) | Inconclusive steps | Measure-first gates (S0; S3 at ≥ 0.15 ms; concurrency S2 table); ABBA; S6 + S7 only if they beat the gate everywhere |
-| Tracks edit the same code | Conflicts, silent regressions | One mechanism each: n-gram S1's dedupe serves vision; prefix P7 and concurrency S3 both change `cpu_plan_kernel`'s x publication; Q8 warming and S3 both change `cpu_wait_kernel`'s grid; S6's −1 skip covers Q8's new dispatch and `moe_combine`; vision RoPE and the n-gram gate both extend the io prefix, and prefix prefill uploads must keep vision's regions; the prefix tier's media reserve follows vision rev 2 (pageable payloads) |
+| Tracks edit the same code | Conflicts, silent regressions | §19.3.0's rules and merge order: `ProgramImpl` declared in `program_impl.h` first (`54deaa2bc`); concurrency owns `cpu_plan`, `cpu_wait` and `stage_kernel` (S3-S5 before Q8 Phase 2 and prefix P7; one `cpu_wait` grid for copying and L2 warming); Q8 Phase 0 before S6, whose −1 skip covers the small dispatch and `moe_combine`; n-gram S1 owns `read_rows` (vision V6 adds no copy); vision's io-placement assertion and the text bit-identity gate after every merge; the prefix tier reserves Vision's pageable media budget (vision rev 2 pins only the tower) |
+| Concurrency S7: greedy output at C > 1 differs from C = 1 at near-ties once B·W > 8 | Concurrency-dependent output | Asked at the decision point after S5 (+20-30 % at C = 2, model); otherwise the gate stays (§19.3.5) |
 
 Open questions answered by measurement, not assumption:
 
@@ -5205,7 +5798,8 @@ Open questions answered by measurement, not assumption:
 - the MTP pool size against acceptance;
 - the KV host tier threshold for each profile, `int8` first;
 - the A4 mismatch rate against NVIDIA's runtimes;
-- H1-H13 adoption (§17 gates).
+- H1-H13 adoption (§17 gates);
+- the n-gram multi-issuer read rate (S1b), which decides S4c;
 - D2H copy-engine FIFO (prefix M0), the route fraction ρ (M6) and the serving prefill chunk (M9);
 - after-draft GPU idle (n-gram S0), QD-1 read latency; c_job, c_col and filler-only experts (S2);
 - HEAD's Q8 MMA times at T = 9-64, HC down's L2 bandwidth (Q8 M1); vision `kVisionStepSeconds`.
@@ -5225,6 +5819,23 @@ Open questions answered by measurement, not assumption:
   `expert_cache.cpp`, `expert_source.cpp`, `kernels/cpu/pool.cpp`, `ngram/ple_reader.*`,
   `docs/DETAILS.md`, `docs/paper/Strata-Paper.pdf`, and
   `bench/results/2026-09-30-community-rtx-5090/`.
+- Strata re-read at `6f32ec0` (2026-10-04; engine 0.1.39 plus the #465, #583 and #646 follow-ups)
+  for §3.1 "Strata v0.1.39" and §19.3.6.
+  - **History.** The 217 commits of `99f3dbd..6f32ec0` by subject. The diffs or messages of
+    `cfd3b72`, `055122c`, `deee447`, `f945515` (#646); `2fbbfa2`, `bebfca9`, `9556298`, `1a56d71`,
+    `4795f98` (#465); `895a77b`, `a93c2ac`, `5423a69`, `5f19911` (#583); `cce52db`, `fd95405`,
+    `d595a2b` (#533), `7c77eae` (#620), `61479a8` (#458), `1807086` (#528), `e90fbb4` (#587),
+    `0e9814a`, `2b47285` (#642), `6d51272`, `d5469a9`, `f23ea57`, `96ccd2a`, `20a2ccf`, `dcf251c`,
+    `882764d`, `ccc09c2`, `e809f7f` and `c2d1f19`.
+  - **Pre-window commits the review relies on.** `d541220`, `3e31eea`, `bbe3d2a`, `a20f3b5` and
+    `0e23f57`.
+  - **Docs.** `README.md`, `docs/DETAILS.md`, `docs/HOW_IT_WORKS.md`, `docs/BATCHING.md`,
+    `docs/MULTI_GPU.md`, `docs/SECOND_GPU.md`, `docs/UNSLOTH_Q4.md` and `docs/INTEL.md`.
+  - **Results.** `bench/results/2026-09-28-prefill-speed/` and `2026-10-03-v100-prompt-attn/`.
+  - **Source and setup.** `src/kernels/cuda/qsa_select.cu`, `src/core/mtp.cpp` and
+    `src/program/generate.cpp` (scheduling and `adapt()`), and `setup.py`'s defaults.
+  - The review, its verifier dispositions and the per-track amendments are in
+    `local/workdirs/fn/plans/strata-review.md` and `strata-amendments.md`.
 - ninfer-ext: https://github.com/giveen/ninfer-ext. Read from source at `259e819`: `README.md`,
   `docs/maintainer/qwen4-exp-model.md`, `tools/convert/qwen4_exp.py`,
   `src/models/qwen3_5/execution/qwen4_*`, `src/ops/offload_moe/`, and
