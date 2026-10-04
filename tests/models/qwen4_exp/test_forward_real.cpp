@@ -3,8 +3,13 @@
 //
 //   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram]
 //   ninfer_qwen4_exp_forward_real_test TOKENS [--logits OUT.bin] [--residuals OUT.bin]
+//       [--routes OUT.bin] [--blocks OUT.bin]
+//   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
 //
-// TOKENS is a comma-separated id list. The test prefills all but the last token as one chunk,
+// TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace.
+// With --dump-logits the test scores the text teacher-forced instead: it prefills it in chunks of N
+// (default 256) with FP32 logits at every position, writes them in Strata's --dump-logits layout
+// (int32 vocabulary, int32 rows, then one FP32 row per position) and prints the perplexity. The test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
 // every token at the last position. It writes the prefill logits of the last position (FP32) for
@@ -32,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -55,13 +61,20 @@ void check(cudaError_t e, const char* what) {
     if (e != cudaSuccess) { throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e)); }
 }
 
-std::vector<std::int32_t> parse_tokens(const std::string& text) {
+std::vector<std::int32_t> parse_tokens(const std::string& argument) {
+    std::string text = argument;
+    if (!text.empty() && text.front() == '@') {
+        std::ifstream file(text.substr(1));
+        if (!file) { throw std::invalid_argument("cannot read " + text.substr(1)); }
+        text.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+    }
+    for (char& ch : text) {
+        if (ch == ',' || ch == '\n' || ch == '\r' || ch == '\t') { ch = ' '; }
+    }
     std::vector<std::int32_t> out;
     std::stringstream stream(text);
-    std::string item;
-    while (std::getline(stream, item, ',')) {
-        if (!item.empty()) { out.push_back(std::stoi(item)); }
-    }
+    std::int32_t id = 0;
+    while (stream >> id) { out.push_back(id); }
     return out;
 }
 
@@ -87,7 +100,7 @@ double seconds_since(std::chrono::steady_clock::time_point t) {
 // Every slot's recurrent state, KV pages for `rows` sequences of up to `context` tokens, and no
 // resident experts (every expert is read zero-copy from the pinned bank).
 struct Harness {
-    Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context,
+    Harness(const q4::execution::Parameters& parameters, DeviceContext& device, std::int32_t context, std::int32_t columns,
             std::int32_t rows, KvCacheStorage storage)
         : config(parameters.model.config().text) {
         const auto& c = config;
@@ -186,7 +199,7 @@ struct Harness {
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
-        work_capacity = q4::execution::Forward::workspace_bytes(c, context, context);
+        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context);
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         forward = std::make_unique<q4::execution::Forward>(parameters, device, *work, std::move(state), std::move(kv),
                                                            std::move(experts), context);
@@ -215,7 +228,8 @@ struct Call {
 };
 
 Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std::vector<std::vector<std::int32_t>>& histories,
-               std::int32_t first, std::int32_t width, std::vector<std::int32_t> slots, std::vector<std::int32_t> rows) {
+               std::int32_t first, std::int32_t width, std::vector<std::int32_t> slots, std::vector<std::int32_t> rows,
+               bool every_column = false) {
     const auto batch = static_cast<std::int32_t>(histories.size());
     const std::int32_t columns = batch * width;
     const q4::NgramHash hash(c.ple.ngram, 0);
@@ -235,7 +249,11 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
             ids.push_back(history[first + i]);
             positions.push_back(first + i);
         }
-        last.push_back(b * width + width - 1);
+        if (every_column) {
+            for (std::int32_t i = 0; i < width; ++i) { last.push_back(b * width + i); }
+        } else {
+            last.push_back(b * width + width - 1);
+        }
     }
     Call call;
     const std::size_t i32 = sizeof(std::int32_t);
@@ -256,7 +274,8 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     call.batch.positions  = Tensor(put(positions.data(), positions.size() * i32), DType::I32, {columns});
     call.batch.slots      = Tensor(put(slots.data(), slots.size() * i32), DType::I32, {batch});
     call.batch.table_rows = Tensor(put(rows.data(), rows.size() * i32), DType::I32, {batch});
-    call.batch.last_columns = Tensor(put(last.data(), last.size() * i32), DType::I32, {batch});
+    call.batch.logit_columns =
+        Tensor(put(last.data(), last.size() * i32), DType::I32, {static_cast<std::int32_t>(last.size())});
     call.batch.ngram_rows = Tensor(put(ngram.data(), ngram.size()), DType::U8,
                                    {static_cast<std::int32_t>(row_bytes), static_cast<std::int32_t>(heads), columns});
     call.host_slots       = std::move(slots);
@@ -269,10 +288,8 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
 }
 
 std::vector<float> to_float(const DeviceBuffer& logits, std::size_t count) {
-    std::vector<__nv_bfloat16> raw(count);
-    logits.copy_to_host(raw.data(), count * sizeof(__nv_bfloat16));
     std::vector<float> out(count);
-    for (std::size_t i = 0; i < count; ++i) { out[i] = __bfloat162float(raw[i]); }
+    logits.copy_to_host(out.data(), count * sizeof(float));
     return out;
 }
 
@@ -293,12 +310,21 @@ int main(int argc, char** argv) {
         std::printf("SKIP: set NINFER_QWEN4_ARTIFACT and pass a token list\n");
         return 77;
     }
-    std::string logits_path, residuals_path, routes_path, blocks_path;
+    std::string logits_path, residuals_path, routes_path, blocks_path, dump_path;
+    std::int32_t chunk = 256;
+    KvCacheStorage kv  = KvCacheStorage::BFloat16;
     for (int i = 2; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--logits") { logits_path = argv[i + 1]; }
         if (std::string(argv[i]) == "--residuals") { residuals_path = argv[i + 1]; }
         if (std::string(argv[i]) == "--routes") { routes_path = argv[i + 1]; }
         if (std::string(argv[i]) == "--blocks") { blocks_path = argv[i + 1]; }
+        if (std::string(argv[i]) == "--dump-logits") { dump_path = argv[i + 1]; }
+        if (std::string(argv[i]) == "--chunk") { chunk = std::stoi(argv[i + 1]); }
+        if (std::string(argv[i]) == "--kv") {
+            const std::string value = argv[i + 1];
+            if (value != "bf16" && value != "int8") { throw std::invalid_argument("--kv takes bf16 or int8"); }
+            kv = value == "int8" ? KvCacheStorage::Int8Group64 : KvCacheStorage::BFloat16;
+        }
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
@@ -327,15 +353,51 @@ int main(int argc, char** argv) {
                                      c.ple.table);
         const auto n = static_cast<std::int32_t>(tokens.size());
         const std::int32_t context = std::max<std::int32_t>(256, (n + 63) / 64 * 64);
-        Harness harness(parameters, device, context, 3, KvCacheStorage::BFloat16);
         const std::size_t vocab = c.vocab_size;
-        DeviceBuffer logits(vocab * 2 * sizeof(__nv_bfloat16));
+        if (!dump_path.empty()) {
+            // Teacher-forced scoring: chunked prefill of the whole text in slot 0.
+            if (chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
+            chunk = std::min(chunk, n);
+            Harness harness(parameters, device, context, chunk, 1, kv);
+            DeviceBuffer logits(vocab * chunk * sizeof(float));
+            std::ofstream out(dump_path, std::ios::binary);
+            const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n};
+            out.write(reinterpret_cast<const char*>(header), sizeof(header));
+            double nll = 0.0;
+            std::int32_t scored = 0, same_top1 = 0;
+            t0 = std::chrono::steady_clock::now();
+            for (std::int32_t first = 0; first < n; first += chunk) {
+                const std::int32_t width = std::min(chunk, n - first);
+                auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
+                Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
+                harness.forward->run(call.batch, chunk_logits);
+                device.synchronize();
+                const auto rows = to_float(logits, vocab * width);
+                out.write(reinterpret_cast<const char*>(rows.data()),
+                          static_cast<std::streamsize>(rows.size() * sizeof(float)));
+                for (std::int32_t i = 0; i < width && first + i + 1 < n; ++i) {
+                    const float* row = rows.data() + static_cast<std::size_t>(i) * vocab;
+                    const float peak = *std::max_element(row, row + vocab);
+                    double sum = 0.0;
+                    for (std::size_t v = 0; v < vocab; ++v) { sum += std::exp(double(row[v]) - peak); }
+                    const std::int32_t next = tokens[first + i + 1];
+                    nll -= double(row[next]) - peak - std::log(sum);
+                    same_top1 += std::max_element(row, row + vocab) - row == next;
+                    ++scored;
+                }
+            }
+            std::printf("scored %d positions in %.1f s: mean NLL %.5f nats, perplexity %.4f, top-1 = next %.1f%%\n",
+                        scored, seconds_since(t0), nll / scored, std::exp(nll / scored), 100.0 * same_top1 / scored);
+            return 0;
+        }
+        Harness harness(parameters, device, context, n, 3, KvCacheStorage::BFloat16);
+        DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");
 
         // 1. All tokens as one prefill chunk in slot/row 0: logits of the last position, and
         //    optionally every block's residual and routed experts.
         auto full = make_call(c, volume, {tokens}, 0, n, {0}, {0});
-        Tensor full_logits(logits.p, DType::BF16, {static_cast<std::int32_t>(vocab), 1});
+        Tensor full_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
         const auto blocks = static_cast<std::size_t>(c.num_hidden_layers);
         const auto W = static_cast<std::int32_t>(c.residual_width());
         const auto K = static_cast<std::int32_t>(c.moe.top_k);
@@ -385,11 +447,11 @@ int main(int argc, char** argv) {
         // 2. All but the last token in slots/rows 1 and 2, then one batched decode step of both.
         for (std::int32_t slot : {1, 2}) {
             auto head = make_call(c, volume, {tokens}, 0, n - 1, {slot}, {slot});
-            Tensor head_logits(logits.p, DType::BF16, {static_cast<std::int32_t>(vocab), 1});
+            Tensor head_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 1});
             harness.forward->run(head.batch, head_logits);
         }
         auto step = make_call(c, volume, {tokens, tokens}, n - 1, 1, {1, 2}, {1, 2});
-        Tensor step_logits(logits.p, DType::BF16, {static_cast<std::int32_t>(vocab), 2});
+        Tensor step_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), 2});
         t0 = std::chrono::steady_clock::now();
         harness.forward->run(step.batch, step_logits);
         device.synchronize();

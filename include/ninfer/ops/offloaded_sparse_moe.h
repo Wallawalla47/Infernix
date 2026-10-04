@@ -14,7 +14,7 @@ namespace ninfer::ops {
  * Routed experts of one MoE layer with experts held outside device memory
  * (docs/maintainer/qwen3_8-flash-next-design.md §8.4-8.5, §16.2). For each column t:
  *
- *   logits     = FP32 [router; shared gate] x[:, t]             -> moe_router_logits
+ *   logits     = FP32 [router; shared gate] x[:, t]             -> projection_fp32
  *   p          = softmax(router logits[0:E, t]);  ids = top-k of p (lower id wins exact ties)
  *   w_i        = p[ids_i] / sum_j p[ids_j]                      -> moe_route
  *   s          = sigmoid(logits[E, t])  (the shared-expert gate)  -> moe_route
@@ -37,12 +37,6 @@ struct MoeRouting {
     Tensor weights;     // FP32 [k, T]
     Tensor shared_gate; // FP32 [T]
 };
-
-/// logits = FP32 [E + 1, T]: rows 0..E-1 apply `router` (BF16 [H, E], one expert row per column
-/// of the view), row E applies `shared_gate` (BF16 [H]) to x (BF16 [H, T]). H is a multiple of 8
-/// and at most 3072.
-void moe_router_logits(const Tensor& x, const Tensor& router, const Tensor& shared_gate, Tensor& logits,
-                       cudaStream_t stream);
 
 /// logits: FP32 [E + 1, T], the router rows followed by the shared-expert gate row.
 void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cudaStream_t stream);

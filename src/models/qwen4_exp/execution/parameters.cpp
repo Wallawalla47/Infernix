@@ -75,7 +75,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
     token_embedding = with_context(embedding.name, [&] { return native_weight(embedding.view); });
-    output_head     = prepare.linear({w.output_head});
+    output_head     = prepare.tensor(w.output_head);
     final_mixer     = prepare.hc(w.final_mixer);
 
     const auto banks = source.expert_banks();

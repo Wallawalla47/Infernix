@@ -43,7 +43,7 @@ struct GdnParameters {
 
 struct MoeParameters {
     Tensor router;                   // BF16 [H, E]: one expert row per column (FP32 logits)
-    Tensor shared_score;             // BF16 [H]: the shared-expert gate row
+    Tensor shared_score;             // BF16 [H, 1]: the shared-expert gate row
     LinearParameters shared_gate_up; // [2 * I_shared, H]: gate rows, then up rows
     LinearParameters shared_down;    // [H, I_shared]
     const ExpertBank* bank = nullptr;
@@ -73,7 +73,7 @@ public:
 
     const Model& model;
     Weight token_embedding; // BF16 rows in pinned host memory, read zero-copy
-    LinearParameters output_head;
+    Tensor output_head; // BF16 [H, V]: one vocabulary row per column (FP32 logits)
     HyperConnectionParameters final_mixer;
     std::vector<BlockParameters> layers;
 
