@@ -2,7 +2,7 @@
 // (tools/flash_next/reference.py). Skips unless NINFER_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram]
-//   ninfer_qwen4_exp_forward_real_test TOKENS [--logits OUT.bin] [--residuals OUT.bin]
+//   ninfer_qwen4_exp_forward_real_test TOKENS [--kv bf16|int8] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
 //   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
 //
@@ -390,7 +390,7 @@ int main(int argc, char** argv) {
                         scored, seconds_since(t0), nll / scored, std::exp(nll / scored), 100.0 * same_top1 / scored);
             return 0;
         }
-        Harness harness(parameters, device, context, n, 3, KvCacheStorage::BFloat16);
+        Harness harness(parameters, device, context, n, 3, kv);
         DeviceBuffer logits(vocab * 2 * sizeof(float));
         print_memory("harness");
 

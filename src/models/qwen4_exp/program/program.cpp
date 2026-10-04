@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/program/program.h"
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -439,7 +440,7 @@ public:
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
         stage_decode(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
-        run(batch, 1, batch);
+        run_decode(batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
         sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
         residency_->after_round(device_.stream, batch, kDecodePromotionsPerLayer);
@@ -722,12 +723,41 @@ private:
         }
     }
 
-    // Runs one Forward call over the staged inputs; logits of `logit_columns` columns land in
-    // logits32_.
+    // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
+    // `logit_columns` columns land in logits32_.
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns) {
-        const cudaStream_t s    = device_.stream;
-        const std::int32_t cols = batch * width;
+        const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        residency_->before_round(s);
+        forward_call(batch, width, logit_columns);
+        residency_->enqueue_route_download(s, batch * width);
+    }
+
+    // One decode round of `batch` sequences: its inputs are staged at fixed device addresses and
+    // every row is chosen on the device, so one CUDA graph per batch size serves every round. The
+    // first round of a size runs eagerly (it also performs the Ops' one-time setup); the next is
+    // captured and later rounds replay it.
+    void run_decode(std::int32_t batch) {
+        const cudaStream_t s = device_.stream;
+        CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        residency_->before_round(s);
+        DecodeGraph& graph = graphs_[static_cast<std::size_t>(batch - 1)];
+        const auto body    = [&] { forward_call(batch, 1, batch); };
+        if (graph.executable.ready()) {
+            graph.executable.launch(s);
+        } else if (!graph.warmed) {
+            body();
+            graph.warmed = true;
+        } else {
+            graph.definition.capture(s, body);
+            graph.executable.instantiate(graph.definition);
+            graph.executable.launch(s);
+        }
+        residency_->enqueue_route_download(s, batch);
+    }
+
+    void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns) {
+        const std::int32_t cols = batch * width;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch fb;
         fb.ids           = Tensor(base + io_layout_.ids, DType::I32, {cols});
@@ -742,9 +772,7 @@ private:
         fb.batch           = batch;
         fb.width           = width;
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
-        residency_->before_round(s);
         forward_->run(fb, logits);
-        residency_->enqueue_route_download(s, cols);
     }
 
     // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
@@ -799,6 +827,12 @@ private:
     std::unique_ptr<WorkspaceArena> work_;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::Forward> forward_;
+    struct DecodeGraph {
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable executable;
+        bool warmed = false;
+    };
+    std::array<DecodeGraph, kMaximumConcurrency> graphs_;
 
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::array<std::int32_t, kMaximumConcurrency> host_lanes_{};
