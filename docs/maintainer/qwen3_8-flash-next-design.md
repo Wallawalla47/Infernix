@@ -7026,7 +7026,7 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   resolved like a resident one by `stage_kernel` (never staged, never CPU-served; calls with
   CPU-served misses take no table). Results are unchanged by construction (the same record bytes).
 - **F3, lent frames.** At the first chunk of ≥ 256 columns the Program lends
-  2 × min(384, the largest non-resident count of any layer) + 1 frames (`ExpertResidency::lend`, the
+  2 × (the largest non-resident count of any layer) + 1 frames (`ExpertResidency::lend`, the
   Vision window's mechanism: the cheapest run is evicted, promotions into it are waited for), and
   returns them when no lane is prefilling (after the prompt's last chunk is enqueued, on release, or
   before a Vision window lends). A Vision quote counts the ring as lendable. The VRAM monitor's
@@ -7047,6 +7047,11 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   (+45.8 %), pp4096 at chunk 1024 508.9 → 526.7 (+3.5 %); tg512 100.3 → 100.1 (−0.25 %, within
   noise). The ring was 769 lent frames and every half filled (384 experts per layer per chunk: a
   cold cache has more misses than that), so a larger ring would gain more.
+- **Ring size (2026-10-05).** Halves sized to the worst layer (512 records on a cold cache, 1,025
+  lent frames, 2.8 GB) against the 384-record cap, ABBA in one build: pp4096 at chunk 4096 1,522 →
+  1,662 tok/s (+9.2 %), pp16384 1,958 → 1,997 (+2.0 %), the 7,448-token CLI prompt 908 / 960 →
+  975 / 989 tok/s, decode after it 71.6 / 72.6 → 72.5 / 72.7, ids identical. The cap is gone: a
+  half holds every non-resident expert of the worst layer at lend time.
 - **Exactness of F2 itself:** with the wide route off (narrow arithmetic everywhere), the
   7,448-token prompt's greedy ids are identical with the stream on and off and equal the pre-F2
   build. The layer test's streamed placements are bitwise exact.
