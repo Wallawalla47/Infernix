@@ -17,7 +17,9 @@
 #include "core/arena.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "core/startup.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
+#include "ninfer/types.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -27,7 +29,10 @@
 #include <cstdint>
 #include <deque>
 #include <optional>
+#include <filesystem>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -68,6 +73,21 @@ struct PrefixHostLayout {
 
 [[nodiscard]] PrefixHostLayout plan_prefix_host_layout(const KvPageGeometry& pages, const StateImageLayout& image,
                                                        std::uint64_t host_bytes);
+
+// The outcome of saving or loading the Host tier (persist.cpp).
+struct PersistResult {
+    bool ok = false;
+    std::string message; // why nothing was saved or loaded
+    std::uint64_t blocks    = 0;
+    std::uint64_t snapshots = 0;
+    std::uint64_t bytes     = 0;
+    double seconds          = 0.0;
+    // Load only: the file's entries and the Host tier bytes they all take, against this tier.
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
+};
 
 struct PrefixCacheConfig {
     runtime::prefix_cache::PrefixIndexConfig index; // capacities filled by the cache from the layouts
@@ -182,6 +202,17 @@ public:
 
     // Releases every reference the cache holds; the index is rebuilt empty.
     void clear() noexcept;
+
+    // ---- persistence (persist.cpp) -------------------------------------------------------------
+    // Writes every Host-backed snapshot and its Host block path to `path` (through `path.tmp`,
+    // renamed when complete). Requires idle transfers. `abandoned` stops the save, deleting the
+    // temporary file; the previous file stays.
+    [[nodiscard]] PersistResult save(const std::filesystem::path& path, std::string_view fingerprint,
+                                     const CancellationView& abandoned) const;
+    // Rebuilds a saved Host tier into this empty cache when the fingerprint and geometry match; a
+    // smaller tier restores the snapshots it values most. A mismatch or damaged file loads nothing.
+    [[nodiscard]] PersistResult load(const std::filesystem::path& path, std::string_view fingerprint,
+                                     const StartupObserver& observer);
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;

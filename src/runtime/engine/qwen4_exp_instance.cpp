@@ -12,6 +12,7 @@
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/registry.h"
+#include "runtime/engine/model_instance.h"
 
 #include <algorithm>
 #include <chrono>
@@ -169,6 +170,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_cost.call_route_fraction    = 10.0 / 512.0;
         program_options.prefix_cost.h2d_bytes_per_second   = 26.0e9;
         program_options.prefix_cost.transfer_batch_seconds = 20.0e-6;
+        program_options.prefix_save                        = cache.hybrid.persistent_save;
     }
     program_options.route_trace   = models::qwen4_exp::testing::route_trace();
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
@@ -253,6 +255,25 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     resolution.automatic_headroom_bytes      = sizing.headroom;
     resolution.planned_slack_bytes =
         after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
+    LoadSummary::PrefixCacheRestore restore;
+    if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid && !file.empty()) {
+        const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
+            file, hybrid_cache_fingerprint(options, "qwen4_exp"), options.startup_observer);
+        restore = LoadSummary::PrefixCacheRestore{
+            .attempted           = true,
+            .restored            = loaded.ok,
+            .message             = loaded.message,
+            .blocks              = loaded.blocks,
+            .snapshots           = loaded.snapshots,
+            .bytes               = loaded.bytes,
+            .seconds             = loaded.seconds,
+            .saved_blocks        = loaded.saved_blocks,
+            .saved_snapshots     = loaded.saved_snapshots,
+            .required_host_bytes = loaded.required_host_bytes,
+            .host_bytes          = loaded.host_bytes,
+        };
+    }
     program.complete();
 
     const auto& stats = instance->model->storage_stats();
@@ -268,6 +289,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul"};
+    summary.prefix_cache         = std::move(restore);
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

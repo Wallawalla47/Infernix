@@ -106,10 +106,11 @@ prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& mo
     return cost;
 }
 
-// Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
-// file records itself): the exact artifact, its execution signature, the KV and speculative
-// formats, RoPE scaling and the product binary's build identity. Any difference makes the saved
-// state meaningless, so the file is ignored.
+} // namespace
+
+// The exact artifact, its execution signature, the KV and speculative formats, RoPE scaling and the
+// product binary's build identity. Any difference makes the saved state meaningless, so the file is
+// ignored.
 std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
     std::error_code error;
     const auto size = std::filesystem::file_size(options.artifact_path, error);
@@ -124,6 +125,8 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }
+
+namespace {
 
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
@@ -196,10 +199,6 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             if (hybrid.device_snapshot_slots.value_or(0U) != 0) {
                 throw std::invalid_argument(
                     "Qwen3.8-Flash-Next's prefix cache has no Device snapshot slots");
-            }
-            if (!hybrid.persistent_file.empty()) {
-                throw std::invalid_argument(
-                    "--prefix-cache-file is not available for Qwen3.8-Flash-Next");
             }
             hybrid.device_snapshot_slots = 0U;
         }

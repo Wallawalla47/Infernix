@@ -8,8 +8,7 @@ design, measurements and open work are in the
 
 Generation works through `ninfer`, `ninfer-serve` and `ninfer_bench`, with the model's MTP
 drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
-`ninfer-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity), prefix-cache
-persistence (`--prefix-cache-file`).
+`ninfer-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity).
 
 ## Requirements
 
@@ -117,8 +116,10 @@ tokens; KV blocks are shared across requests. `ninfer` (one request) runs withou
 - **Exactness.** A resumed request computes what the request that left the snapshot computed; it
   may differ from an uncached run where two tokens are near ties. `--no-prefix-reuse` gives
   uncached runs.
-- Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`,
-  `--prefix-cache-file`.
+- `--prefix-cache-file PATH` saves the Host tier when the server stops and restores it at the next
+  start, as for Qwen3.5 ([serving](serving.md)); a file from another artifact, KV format, drafter
+  or `ninfer-serve` build is ignored and replaced.
+- Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`.
 
 ## VRAM
 
