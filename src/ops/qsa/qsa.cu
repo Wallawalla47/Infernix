@@ -6,6 +6,8 @@
 
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/qsa/page_spaces.cuh"
+#include "ops/qsa/qsa_prompt.h"
 #include "ops/qsa/qsa_select.h"
 
 #include <cuda_bf16.h>
@@ -93,10 +95,12 @@ __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict_
 
 // --------------------------------------------------------------------------------- pooled keys
 
-__device__ __forceinline__ std::int64_t pooled_offset(const std::int32_t* table, int position,
-                                                      int slot_width, int lane) {
-    const int page = table[position >> kPagedKVPageShift];
-    return static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
+// The pooled-key element of `position` (its page's space resolved: the pool's plane or the spaces').
+__device__ __forceinline__ bf16* pooled_element(bf16* pool, const QsaPageSpaces& spaces, const std::int32_t* table,
+                                                int position, int slot_width, int lane) {
+    int page;
+    bf16* plane = detail::qsa_pooled_plane(spaces, pool, table[position >> kPagedKVPageShift], page);
+    return plane + static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
            static_cast<std::int64_t>(slot_width) * (position & kPagedKVPageMask) + lane;
 }
 
@@ -108,7 +112,7 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
                             const std::int32_t* __restrict__ tail_slots,
                             const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
                             int batch, int width, int ratio, int rotary, float theta, float eps,
-                            bf16* __restrict__ pooled) {
+                            bf16* __restrict__ pooled, QsaPageSpaces spaces) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     const int t = blockIdx.x, d = threadIdx.x;
@@ -143,7 +147,7 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[sequence]) * table_stride;
     const int slot_width      = kIndexDim / ratio;
     const int token           = first + d / slot_width;
-    pooled[pooled_offset(table, token, slot_width, d % slot_width)] = __float2bfloat16_rn(out);
+    *pooled_element(pooled, spaces, table, token, slot_width, d % slot_width) = __float2bfloat16_rn(out);
 }
 
 // One CTA per sequence: the raw keys of the latest block's positions q % R < R - 1, up to the
@@ -196,30 +200,33 @@ struct KVReader;
 template <>
 struct KVReader<KvCacheStorage::BFloat16> {
     static constexpr bool kRotatedKeys = false;
-    // Element d of the key / value of `token` for `head`.
-    __device__ static float key(const PagedKVLayerView& kv, const std::int32_t* table, int head, int token, int d,
-                                int kv_heads) {
-        const int page = table[token >> kPagedKVPageShift];
+    // Element d of the key / value of `token` for `head` (its page's space resolved).
+    __device__ static float key(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
+                                int head, int token, int d, int kv_heads) {
+        int page;
+        const auto* plane = static_cast<const bf16*>(detail::qsa_space_plane(
+            spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, table[token >> kPagedKVPageShift], page));
         const std::int64_t i = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
                                static_cast<std::int64_t>(kHeadDim) * (token & kPagedKVPageMask) + d;
-        return __bfloat162float(static_cast<const bf16*>(kv.k_pages.data)[i]);
+        return __bfloat162float(plane[i]);
     }
-    __device__ static float value(const PagedKVLayerView& kv, const std::int32_t* table, int head, int token,
-                                  int d, int kv_heads) {
-        const int page = table[token >> kPagedKVPageShift];
+    __device__ static float value(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
+                                  int head, int token, int d, int kv_heads) {
+        int page;
+        const auto* plane = static_cast<const __half*>(detail::qsa_space_plane(
+            spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v, table[token >> kPagedKVPageShift], page));
         const std::int64_t i = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
                                static_cast<std::int64_t>(kHeadDim) * (token & kPagedKVPageMask) + d;
-        return __half2float(static_cast<const __half*>(kv.v_pages.data)[i]);
+        return __half2float(plane[i]);
     }
 };
 
 template <>
 struct KVReader<KvCacheStorage::Int8Group64> {
     static constexpr bool kRotatedKeys = true;
-    __device__ static float read(const void* codes, const void* scales, const std::int32_t* table, int head,
-                                 int token, int d, int kv_heads) {
-        const int page = table[token >> kPagedKVPageShift];
-        const int off  = token & kPagedKVPageMask;
+    __device__ static float read(const void* codes, const void* scales, int page, int head, int token, int d,
+                                 int kv_heads) {
+        const int off = token & kPagedKVPageMask;
         const std::int64_t ci = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
                                 static_cast<std::int64_t>(kHeadDim) * off + d;
         const std::int64_t si = static_cast<std::int64_t>(4) * kPagedKVPageSize * (head + kv_heads * page) +
@@ -227,13 +234,23 @@ struct KVReader<KvCacheStorage::Int8Group64> {
         return static_cast<float>(static_cast<const std::int8_t*>(codes)[ci]) *
                __half2float(static_cast<const __half*>(scales)[si]);
     }
-    __device__ static float key(const PagedKVLayerView& kv, const std::int32_t* table, int head, int token, int d,
-                                int kv_heads) {
-        return read(kv.k_pages.data, kv.k_scale_pages.data, table, head, token, d, kv_heads);
+    __device__ static float key(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
+                                int head, int token, int d, int kv_heads) {
+        const int id = table[token >> kPagedKVPageShift];
+        int page;
+        const void* codes  = detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, id, page);
+        const void* scales = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
+                                                     spaces.lent_k_scale, id, page);
+        return read(codes, scales, page, head, token, d, kv_heads);
     }
-    __device__ static float value(const PagedKVLayerView& kv, const std::int32_t* table, int head, int token,
-                                  int d, int kv_heads) {
-        return read(kv.v_pages.data, kv.v_scale_pages.data, table, head, token, d, kv_heads);
+    __device__ static float value(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
+                                  int head, int token, int d, int kv_heads) {
+        const int id = table[token >> kPagedKVPageShift];
+        int page;
+        const void* codes  = detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v, id, page);
+        const void* scales = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
+                                                     spaces.lent_v_scale, id, page);
+        return read(codes, scales, page, head, token, d, kv_heads);
     }
 };
 
@@ -299,7 +316,7 @@ constexpr int kValueBatch = 8;
 // fold) does not depend on Group.
 template <KvCacheStorage Storage, int Group>
 __global__ void __launch_bounds__(256)
-    attention_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv,
+    attention_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv, QsaPageSpaces spaces,
                      const std::int32_t* __restrict__ tables, int table_stride,
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      int width, int ratio, const std::int32_t* __restrict__ selected,
@@ -364,14 +381,14 @@ __global__ void __launch_bounds__(256)
         float k[8];
         if (warp < n) {
 #pragma unroll
-            for (int r = 0; r < 8; ++r) { k[r] = Reader::key(kv, table, kv_head, tokens[warp], lane + 32 * r, kv_heads); }
+            for (int r = 0; r < 8; ++r) { k[r] = Reader::key(kv, spaces, table, kv_head, tokens[warp], lane + 32 * r, kv_heads); }
         }
         for (int j = warp; j < n; j += 8) {
             float next[8];
             if (j + 8 < n) {
 #pragma unroll
                 for (int r = 0; r < 8; ++r) {
-                    next[r] = Reader::key(kv, table, kv_head, tokens[j + 8], lane + 32 * r, kv_heads);
+                    next[r] = Reader::key(kv, spaces, table, kv_head, tokens[j + 8], lane + 32 * r, kv_heads);
                 }
             }
             float part[Group];
@@ -415,7 +432,7 @@ __global__ void __launch_bounds__(256)
             float v[kValueBatch];
 #pragma unroll
             for (int u = 0; u < kValueBatch; ++u) {
-                if (j0 + u < n) { v[u] = Reader::value(kv, table, kv_head, tokens[j0 + u], d_own, kv_heads); }
+                if (j0 + u < n) { v[u] = Reader::value(kv, spaces, table, kv_head, tokens[j0 + u], d_own, kv_heads); }
             }
 #pragma unroll
             for (int u = 0; u < kValueBatch; ++u) {
@@ -560,7 +577,7 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
         static_cast<const std::int32_t*>(batch.positions.data), static_cast<const std::int32_t*>(batch.tail_slots.data),
         static_cast<const std::int32_t*>(batch.rope_positions.data),
         static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
-        geometry.rotary_dim, geometry.theta, geometry.eps, static_cast<bf16*>(layer.pooled_pages.data));
+        geometry.rotary_dim, geometry.theta, geometry.eps, static_cast<bf16*>(layer.pooled_pages.data), layer.spaces);
     check_launch("pool");
     if (!batch.update_tails) { return; }
     tail_kernel<<<batch.batch, kIndexDim, 0, stream>>>(
@@ -618,11 +635,18 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     const auto* rows     = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* pos      = static_cast<const std::int32_t*>(batch.positions.data);
     detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
-                       {ws.selected, ws.counts}, stream);
+                       {ws.selected, ws.counts}, stream, layer.spaces);
+    // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
+    // width-invariance class, so a column's bits still do not depend on its call's width there.
     const int splits = attention_splits(columns, geometry.kv_heads);
+    if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
+        detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream);
+        return;
+    }
     const dim3 grid(splits, geometry.kv_heads, columns);
     const auto launch = [&](auto kernel) {
         kernel<<<grid, 256, 0, stream>>>(static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv,
+                                         layer.spaces,
                                          tables, stride, rows, pos, batch.width, geometry.ratio, ws.selected, ws.counts,
                                          top_blocks, splits, scale, ws.partial, static_cast<bf16*>(out.data));
     };

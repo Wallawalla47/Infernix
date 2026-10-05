@@ -52,10 +52,32 @@ struct QsaGeometry {
     float eps                   = 0;
 };
 
+/// KV pages outside the device pool (docs/maintainer/qwen3_8-flash-next-design.md §19.3.11). Block
+/// tables hold page ids p of one range: p < device_pages is a page of `kv` and `pooled_pages` (as
+/// without spaces); the next host_pages ids are pages p - device_pages of the host planes (pinned,
+/// GPU-mapped memory, read zero-copy); the ids after them are pages of the lent planes (device
+/// memory). The pooled keys of every id at or past device_pages live in `pooled`, a device array
+/// [Di/R, 64, 1, host_pages + lent_pages] in the same order. The planes have `kv`'s geometry. Only
+/// readers translate: every write (K/V append, pooled keys) targets a page below device_pages.
+struct QsaPageSpaces {
+    std::int32_t device_pages = 0x7FFFFFFF; // the default: every page is a pool page
+    std::int32_t host_pages   = 0;
+    const void* host_k        = nullptr;
+    const void* host_v        = nullptr;
+    const void* host_k_scale  = nullptr;
+    const void* host_v_scale  = nullptr;
+    const void* lent_k        = nullptr;
+    const void* lent_v        = nullptr;
+    const void* lent_k_scale  = nullptr;
+    const void* lent_v_scale  = nullptr;
+    void* pooled              = nullptr;
+};
+
 /// One attention layer's paged planes.
 struct QsaKVLayer {
     PagedKVLayerView kv;  // K/V planes in the configured storage (block_table unused here)
     Tensor pooled_pages;  // BF16 [Di/R, 64, 1, pages]
+    QsaPageSpaces spaces; // pages outside the pool (none by default)
 };
 
 /// The call's columns: `batch` sequences of `width` consecutive positions each.

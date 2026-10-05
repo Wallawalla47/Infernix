@@ -760,7 +760,114 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
                        nullptr);
     synchronize("attention");
     const auto got = t::from_device_bf16(dout, static_cast<std::size_t>(kD) * kHeads * columns);
+    // Width invariance inside the unsplit class: the row's last 100 columns as a call of their own
+    // (also unsplit) give the same bits; the prefix cache resumes rely on it.
+    if (rows == 1 && width >= 186) {
+        constexpr int kSub = 100;
+        const int first    = width - kSub;
+        const ops::QsaBatch sub{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                                .table_rows   = Tensor(drows.p, DType::I32, {1}),
+                                .positions = Tensor(static_cast<std::int32_t*>(dpos.p) + first, DType::I32, {kSub}),
+                                .tail_slots = Tensor(dslots.p, DType::I32, {1}),
+                                .batch      = 1,
+                                .width      = kSub};
+        DeviceBuffer dsub(static_cast<std::size_t>(kD) * kHeads * kSub * 2);
+        Tensor sub_out(dsub.p, DType::BF16, {kD, kHeads, kSub});
+        ops::qsa_attention(Tensor(static_cast<std::uint16_t*>(dq.p) + static_cast<std::size_t>(first) * kD * kHeads,
+                                  DType::BF16, {kD, kHeads, kSub}),
+                           Tensor(static_cast<std::uint16_t*>(diq.p) +
+                                      static_cast<std::size_t>(first) * kDi * kIndexHeads,
+                                  DType::BF16, {kDi, kIndexHeads, kSub}),
+                           layer, sub, kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, sub_out,
+                           nullptr);
+        synchronize("attention sub-call");
+        const auto part = t::from_device_bf16(dsub, static_cast<std::size_t>(kD) * kHeads * kSub);
+        bool same = true;
+        for (std::size_t i = 0; i < part.size() && same; ++i) {
+            same = part[i] == got[static_cast<std::size_t>(first) * kD * kHeads + i];
+        }
+        expect(same, std::string("qsa_attention ") + (int8 ? "int8 " : "bf16 ") + c.name +
+                         ": a 100-column call equals the same columns of the wider call bit for bit");
+    }
 
+    // Page spaces (design §19.3.11): the same KV with every page whose id is 1 mod 3 in a mapped host
+    // plane and every page 2 mod 3 in a separate device ("lent") plane, their pool copies zeroed so
+    // only the translated reads can find them; selection and attention must give the same bits.
+    {
+        const std::size_t kv_page    = static_cast<std::size_t>(kD) * kPage * kKvHeads * (int8 ? 1 : 2);
+        const std::size_t sc_page    = static_cast<std::size_t>(kD / 64) * kPage * kKvHeads * 2;
+        const std::size_t pool_page  = static_cast<std::size_t>(kSlotWidth) * kPage * 2;
+        std::vector<int> host_of(pages, -1), lent_of(pages, -1);
+        int host_pages = 0, lent_pages = 0;
+        for (int p = 0; p < pages; ++p) {
+            if (p % 3 == 1) { host_of[p] = host_pages++; }
+            if (p % 3 == 2) { lent_of[p] = lent_pages++; }
+        }
+        const auto planes = [&](std::size_t page_bytes, int count) { return page_bytes * std::max(count, 1); };
+        void* host_mem = nullptr;
+        const std::size_t host_bytes = 2 * planes(kv_page, host_pages) + (int8 ? 2 * planes(sc_page, host_pages) : 0);
+        expect(cudaHostAlloc(&host_mem, host_bytes, cudaHostAllocMapped) == cudaSuccess, "host planes allocate");
+        auto* host_k  = static_cast<std::byte*>(host_mem);
+        auto* host_v  = host_k + planes(kv_page, host_pages);
+        auto* host_ks = host_v + planes(kv_page, host_pages);
+        auto* host_vs = host_ks + planes(sc_page, host_pages);
+        DeviceBuffer lent_k(planes(kv_page, lent_pages)), lent_v(planes(kv_page, lent_pages));
+        DeviceBuffer lent_ks(planes(sc_page, lent_pages)), lent_vs(planes(sc_page, lent_pages));
+        DeviceBuffer spaces_pooled(planes(pool_page, host_pages + lent_pages));
+        const auto move = [&](const DeviceBuffer& pool, std::size_t page_bytes, int p, void* host_plane,
+                              const DeviceBuffer& lent_plane) {
+            auto* source = static_cast<std::byte*>(pool.p) + page_bytes * p;
+            void* target = host_of[p] >= 0 ? static_cast<std::byte*>(host_plane) + page_bytes * host_of[p]
+                                           : static_cast<std::byte*>(lent_plane.p) + page_bytes * lent_of[p];
+            expect(cudaMemcpy(target, source, page_bytes, cudaMemcpyDefault) == cudaSuccess, "page copy");
+            expect(cudaMemset(source, 0, page_bytes) == cudaSuccess, "pool page cleared");
+        };
+        std::vector<std::int32_t> moved(tables.size());
+        for (int p = 0; p < pages; ++p) {
+            if (host_of[p] < 0 && lent_of[p] < 0) { continue; }
+            move(dk, kv_page, p, host_k, lent_k);
+            move(dv, kv_page, p, host_v, lent_v);
+            if (int8) {
+                move(dks, sc_page, p, host_ks, lent_ks);
+                move(dvs, sc_page, p, host_vs, lent_vs);
+            }
+            const int slot = host_of[p] >= 0 ? host_of[p] : host_pages + lent_of[p];
+            auto* source   = static_cast<std::byte*>(dpooled.p) + pool_page * p;
+            expect(cudaMemcpy(static_cast<std::byte*>(spaces_pooled.p) + pool_page * slot, source, pool_page,
+                              cudaMemcpyDeviceToDevice) == cudaSuccess,
+                   "pooled page copy");
+            expect(cudaMemset(source, 0, pool_page) == cudaSuccess, "pool pooled page cleared");
+        }
+        for (std::size_t i = 0; i < tables.size(); ++i) {
+            const int p = tables[i];
+            moved[i]    = host_of[p] >= 0 ? pages + host_of[p] : lent_of[p] >= 0 ? pages + host_pages + lent_of[p] : p;
+        }
+        DeviceBuffer dmoved = upload(moved);
+        ops::QsaKVLayer spaced = layer;
+        spaced.spaces = ops::QsaPageSpaces{.device_pages = pages,
+                                           .host_pages   = host_pages,
+                                           .host_k       = host_k,
+                                           .host_v       = host_v,
+                                           .host_k_scale = int8 ? host_ks : nullptr,
+                                           .host_v_scale = int8 ? host_vs : nullptr,
+                                           .lent_k       = lent_k.p,
+                                           .lent_v       = lent_v.p,
+                                           .lent_k_scale = int8 ? lent_ks.p : nullptr,
+                                           .lent_v_scale = int8 ? lent_vs.p : nullptr,
+                                           .pooled       = spaces_pooled.p};
+        ops::QsaBatch moved_batch = batch;
+        moved_batch.block_tables  = Tensor(dmoved.p, DType::I32, {pages_per_row, rows});
+        DeviceBuffer dspaced(static_cast<std::size_t>(kD) * kHeads * columns * 2);
+        Tensor spaced_out(dspaced.p, DType::BF16, {kD, kHeads, columns});
+        ops::qsa_attention(Tensor(dq.p, DType::BF16, {kD, kHeads, columns}),
+                           Tensor(diq.p, DType::BF16, {kDi, kIndexHeads, columns}), spaced, moved_batch, kGeometry,
+                           1.0F / 16.0F, max_context, workspace.p, workspace_bytes, spaced_out, nullptr);
+        synchronize("attention over page spaces");
+        const auto spaced_got = t::from_device_bf16(dspaced, static_cast<std::size_t>(kD) * kHeads * columns);
+        expect(spaced_got == got, std::string("qsa_attention ") + (int8 ? "int8 " : "bf16 ") + c.name +
+                                      ": pages in host and lent spaces give the pool's bits");
+        cudaFreeHost(host_mem);
+    }
     std::vector<double> ref(got.size());
     const std::string tag = std::string("qsa_attention ") + (int8 ? "int8" : "bf16") + " " + c.name;
     for (int r = 0; r < rows; ++r) {
@@ -868,10 +975,20 @@ int main() {
         // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
         // verification across a page boundary, prefill columns crossing the boundary inside one
         // call (one attention split), and a split-K prefill width.
+        // Calls the FP32 kernel would run unsplit (86+ columns here) take the Tensor Core prompt
+        // route: dense columns, the dense/selected boundary inside the call, selected blocks with
+        // tails over several pages, two rows, a list length off the 16-token tile, and the class's
+        // narrowest call. Every column of a prompt-route call must also equal, bit for bit, the
+        // same column computed in a call of another width of the class (checked below).
         const AttentionCase cases[] = {{"decode W=1 B=2", 1, {2050, 2051}},
                                        {"verify W=5 B=2", 5, {3001, 4093}},
                                        {"prefill W=192 B=1", 192, {1900}},
-                                       {"prefill W=40 B=1", 40, {5000}}};
+                                       {"prefill W=40 B=1", 40, {5000}},
+                                       {"prompt W=256 B=1 dense", 256, {0}},
+                                       {"prompt W=300 B=1 boundary", 300, {1901}},
+                                       {"prompt W=256 B=2 selected", 256, {6001, 9013}},
+                                       {"prompt W=257 B=1 selected", 257, {4093}},
+                                       {"prompt W=86 B=1 class edge", 86, {7000}}};
         for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64}) {
             std::uint32_t seed = 31;
             for (const auto& c : cases) { test_attention(storage, c, seed++); }
