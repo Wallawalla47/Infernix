@@ -213,7 +213,7 @@ void run_point(Fixture& fixture, int tokens, const Options& options, cudaStream_
     ops::moe_route(Tensor(d_logits.p, DType::FP32, {kExperts + 1, tokens}), kTopK, routing, stream);
     DeviceBuffer dispatch_memory(ops::moe_dispatch_bytes(kExperts, entries));
     ops::MoeDispatch dispatch = ops::carve_moe_dispatch(dispatch_memory.p, kExperts, entries);
-    ops::moe_dispatch(routing, kExperts, dispatch, stream);
+    ops::moe_dispatch(routing, kExperts, dispatch, nullptr, stream);
     std::vector<std::int32_t> offsets(kExperts + 1);
     CUDA_CHECK(cudaMemcpyAsync(offsets.data(), dispatch.offsets, offsets.size() * sizeof(std::int32_t),
                                cudaMemcpyDeviceToHost, stream));
