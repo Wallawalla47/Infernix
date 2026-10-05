@@ -6,9 +6,11 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 namespace ninfer {
 namespace {
@@ -122,61 +124,70 @@ std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
     return static_cast<std::uint64_t>(size.QuadPart);
 }
 
-void ReadOnlyFile::read_direct_batch(std::span<const DirectRead> reads) const {
-    constexpr std::size_t kInFlight = 64;
-    OVERLAPPED operations[kInFlight];
-    HANDLE events[kInFlight];
-    for (std::size_t i = 0; i < kInFlight; ++i) { events[i] = nullptr; }
-    struct Events {
-        HANDLE* handles;
-        ~Events() {
-            for (std::size_t i = 0; i < kInFlight; ++i) {
-                if (handles[i] != nullptr) { ::CloseHandle(handles[i]); }
-            }
-        }
-    } guard{events};
-    for (std::size_t begin = 0; begin < reads.size(); begin += kInFlight) {
-        const std::size_t count = std::min(kInFlight, reads.size() - begin);
-        for (std::size_t i = 0; i < count; ++i) {
-            const DirectRead& read = reads[begin + i];
-            if (read.destination.size() > std::numeric_limits<DWORD>::max()) {
-                throw std::overflow_error("direct batch read exceeds platform I/O limits");
-            }
-            if (events[i] == nullptr) {
-                events[i] = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
-                if (events[i] == nullptr) {
-                    throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(), "CreateEventW");
-                }
-            }
-            ::ResetEvent(events[i]);
-            operations[i]            = OVERLAPPED{};
-            operations[i].Offset     = static_cast<DWORD>(read.offset & 0xffffffffULL);
-            operations[i].OffsetHigh = static_cast<DWORD>(read.offset >> 32U);
-            operations[i].hEvent     = events[i];
-            DWORD bytes = 0;
-            if (!::ReadFile(impl_->direct_file, read.destination.data(), static_cast<DWORD>(read.destination.size()),
-                            &bytes, &operations[i])) {
-                const auto error = ::GetLastError();
-                if (error != ERROR_IO_PENDING) {
-                    // Drain the reads already issued before reporting.
-                    for (std::size_t j = 0; j < i; ++j) {
-                        DWORD ignored = 0;
-                        (void)::GetOverlappedResult(impl_->direct_file, &operations[j], &ignored, TRUE);
-                    }
-                    throw std::system_error(static_cast<int>(error), std::system_category(), "direct batch read");
-                }
-            }
-        }
-        bool short_read = false;
-        for (std::size_t i = 0; i < count; ++i) {
-            DWORD bytes = 0;
-            if (!::GetOverlappedResult(impl_->direct_file, &operations[i], &bytes, TRUE) ||
-                bytes != reads[begin + i].destination.size()) {
-                short_read = true;
-            }
-        }
-        if (short_read) { throw std::runtime_error("direct batch read: a read did not complete in full"); }
+void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, std::size_t block_bytes,
+                                      std::span<std::byte> ring,
+                                      const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const {
+    if (block_bytes == 0 || block_bytes > std::numeric_limits<DWORD>::max() || ring.size() < block_bytes) {
+        throw std::invalid_argument("direct block reads need a ring of at least one block");
     }
+    const std::size_t slots = ring.size() / block_bytes;
+    constexpr std::size_t kIdle = std::numeric_limits<std::size_t>::max();
+    // One OVERLAPPED per ring slot and no event objects: completion is polled, which is a memory
+    // read (HasOverlappedIoCompleted), not a system call.
+    std::vector<OVERLAPPED> operations(slots);
+    std::vector<std::size_t> reading(slots, kIdle);
+    std::vector<std::size_t> idle;
+    idle.reserve(slots);
+    for (std::size_t s = slots; s-- > 0;) { idle.push_back(s); }
+    std::size_t next = 0, in_flight = 0;
+    DWORD failure      = ERROR_SUCCESS;
+    bool short_read    = false;
+    std::exception_ptr consume_error;
+    const auto failed = [&] { return failure != ERROR_SUCCESS || short_read || consume_error; };
+    while (in_flight > 0 || (next < offsets.size() && !failed())) {
+        while (next < offsets.size() && !idle.empty() && !failed()) {
+            const std::size_t slot = idle.back();
+            OVERLAPPED& op         = operations[slot];
+            op                     = OVERLAPPED{};
+            op.Offset              = static_cast<DWORD>(offsets[next] & 0xffffffffULL);
+            op.OffsetHigh          = static_cast<DWORD>(offsets[next] >> 32U);
+            if (!::ReadFile(impl_->direct_file, ring.data() + slot * block_bytes, static_cast<DWORD>(block_bytes),
+                            nullptr, &op)) {
+                const DWORD error = ::GetLastError();
+                if (error != ERROR_IO_PENDING) {
+                    failure = error;
+                    break;
+                }
+            }
+            idle.pop_back();
+            reading[slot] = next++;
+            ++in_flight;
+        }
+        bool progressed = false;
+        for (std::size_t slot = 0; slot < slots && in_flight > 0; ++slot) {
+            if (reading[slot] == kIdle || !HasOverlappedIoCompleted(&operations[slot])) { continue; }
+            DWORD bytes = 0;
+            if (!::GetOverlappedResult(impl_->direct_file, &operations[slot], &bytes, FALSE)) {
+                if (failure == ERROR_SUCCESS) { failure = ::GetLastError(); }
+            } else if (bytes != block_bytes) {
+                short_read = true;
+            } else if (!failed()) {
+                try {
+                    consume(reading[slot], std::span<const std::byte>(ring.data() + slot * block_bytes, block_bytes));
+                } catch (...) { consume_error = std::current_exception(); }
+            }
+            reading[slot] = kIdle;
+            idle.push_back(slot);
+            --in_flight;
+            progressed = true;
+        }
+        if (!progressed && in_flight > 0) { YieldProcessor(); }
+    }
+    if (consume_error) { std::rethrow_exception(consume_error); }
+    if (failure != ERROR_SUCCESS) {
+        throw std::system_error(static_cast<int>(failure), std::system_category(), "direct block read");
+    }
+    if (short_read) { throw std::runtime_error("direct block read: a read did not complete in full"); }
 }
 
 std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,

@@ -8,6 +8,11 @@ ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   LIBRARIES ninfer_model_loading
   NEEDS_SOURCE_DIR)
 
+# The n-gram volume reader on a synthetic volume (CPU and disk only).
+ninfer_add_test(ninfer_qwen4_exp_ngram_volume_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_volume.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # The forward pass on the real artifact (NINFER_QWEN4_ARTIFACT) against the FP64 reference.
 ninfer_add_test(ninfer_qwen4_exp_forward_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp"

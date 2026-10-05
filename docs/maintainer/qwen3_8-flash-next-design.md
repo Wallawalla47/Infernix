@@ -1780,6 +1780,15 @@ the host io buffer and up with the io prefix (`upload_pinned`; prefill: the whol
   no per-call events, no deadline; misses deduped per block; the bounce buffer (up to ~268 MB
   today) fixed at 256 KiB; counters on a per-request diagnostic line. S1b: a standalone
   multi-issuer probe (1, 2, 4 issuers); ≥ 1.6× one issuer triggers S4c.
+  **S1 as built and measured (2026-10-05).** Win32: one OVERLAPPED per ring slot, completion
+  polled with `HasOverlappedIoCompleted` and `YieldProcessor`; POSIX: serial reads. Misses are
+  deduplicated by sorted `(block << 32 | index)` keys. Cold 16K-token prompt, ABBA, 64 new tokens:
+  NVMe reads 108,468 → 86,388 (−20 %), read time ~1.84 → ~1.46 s, prefill 507.1 → 518.5 tok/s
+  (+2.2 %; runs 494.5-513.7 against 503.8-526.2), ids identical. Decode looked −0.8 % on those
+  1.6 s windows; a 512-token ABBA settled it: 80.1 / 80.2 against 80.3 / 79.9 tok/s (−0.06 %,
+  inside the spread), ids identical. Tests: `ninfer_read_only_file_test` (ring wrap, offsets,
+  errors) and `ninfer_qwen4_exp_ngram_volume_test` (closed-form row oracle: dedup, ring wrap,
+  cache hits, slot collisions, bounds, wrong-size volume).
 - **S2, gated verification.** A Core gate, `upload_pinned_when`, copies the rows in the verify graph
   before `ple_embed` once a pinned ready word equals the round's device word (strictly increasing,
   so a stale word never matches). The engine thread reads anchor columns while the drafter runs and
