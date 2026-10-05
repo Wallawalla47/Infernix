@@ -298,7 +298,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     const int entries = top_k * columns;
     cuda_check(cudaMalloc(&d_dispatch, ninfer::ops::moe_dispatch_bytes(experts, entries)), "cudaMalloc");
     auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, entries);
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr);
+    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
     cuda_check(cudaDeviceSynchronize(), "dispatch");
 
     const auto x = fixtures::random_activations(rng, columns);
