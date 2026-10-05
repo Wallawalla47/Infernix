@@ -43,6 +43,7 @@
 #include "ninfer/ops/qsa.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/token_constraint.h"
 
 #include <cuda_runtime.h>
 
@@ -67,12 +68,24 @@ struct VisionAdmission {
     VisionWindowPlan window;
 };
 
+// A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written into
+// the lane's set columns when it is first constrained) and each output step's descriptor relative to
+// the lane (a set index, or the forced-token encoding -2 - token).
+struct ConstraintPlan {
+    std::vector<std::vector<TokenId>> sets;
+    std::vector<std::int32_t> steps;
+    std::uint64_t serial = 0; // unique per planned request: a lane's uploaded sets name their plan
+};
+
 struct BasePlanImpl {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    std::vector<TokenId> readout_tokens;               // read at the prompt's frontier (/v1/decide)
+    std::shared_ptr<const ConstraintPlan> constraint;  // null: unconstrained
     std::uint32_t pages = 0; // KV page groups the request needs
     bool reuse          = false; // the prefix cache may resume and publish this request
     std::shared_ptr<const VisionAdmission> vision;
+    std::shared_ptr<const PreparedPrompt> prompt; // the request's prompt, moved in by plan_request
 };
 
 // The copy-on-write source of a resume (design §19.3.1, rule MR6): the snapshot's tail page (the
@@ -284,6 +297,7 @@ public:
     struct Lane {
         Phase phase          = Phase::Free;
         std::uint64_t epoch  = 0;
+        runtime::BeginSummary begin; // the Begin of the binding
         std::vector<std::int32_t> history; // prompt, then committed output
         std::uint32_t prompt_tokens = 0;
         std::uint32_t state_tokens  = 0; // positions already in the model state
@@ -294,6 +308,12 @@ public:
         std::unique_ptr<LaneVision> vision; // the encode window and handoff of a media prompt
         double vision_seconds = 0;          // the tower's GPU time
         ops::SamplingConfig sampling;
+        // /v1/decide: the tokens the prompt's readout names, the constraint, the draws of the pending
+        // round's tokens (one per licensed token) and the committed trace they move into.
+        std::vector<TokenId> readout;
+        std::shared_ptr<const ConstraintPlan> constraint;
+        std::shared_ptr<const PreparedPrompt> prompt; // a waiting sibling compares its media
+        std::vector<ConstrainedDraw> constraint_round, constraint_trace;
         std::optional<DeviceKVPageReservation> reservation;
         std::vector<DeviceKVPageLease> pages;
         KVExecutionRowLease row;
@@ -485,7 +505,7 @@ public:
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
-               4ULL * d.mtp_io.words + kGateStatsBytes * lanes;
+               4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W);
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
@@ -614,6 +634,8 @@ public:
         host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
         allocate(gate_stats_, kGateStatsBytes * lanes, allocated);
         gate_stats_.fill(0);
+        allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
+        constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
         publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
 
         execution::ForwardState state;
@@ -790,7 +812,7 @@ public:
     const VramSizing& vram_sizing() const noexcept { return sizing_; }
 
     // ---------------------------------------------------------------- admission
-    RequestBasePlan plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
+    RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
         const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
         std::shared_ptr<const VisionAdmission> vision;
         if (data.has_media()) { vision = plan_vision(data); }
@@ -798,7 +820,14 @@ public:
         if (n == 0 || n > options_.max_context) {
             throw std::invalid_argument("Qwen4Exp: the prompt is empty or exceeds max_context");
         }
+        for (const TokenId id : options.readout_tokens) {
+            if (id < 0 || id >= token_domain_) {
+                throw std::invalid_argument("readout token is outside the public token domain");
+            }
+        }
         auto base                       = std::make_unique<BasePlanImpl>();
+        base->readout_tokens            = options.readout_tokens;
+        base->constraint                = compile_constraint(options.constraint);
         base->summary.prompt_tokens     = n;
         base->summary.requested_output_tokens = options.requested_output_tokens;
         const std::uint32_t capacity_output   = options_.max_context - n + 1U;
@@ -806,16 +835,13 @@ public:
         base->summary.effective_limit_reason  = options.requested_output_tokens <= capacity_output
                                                     ? FinishReason::OutputLimit
                                                     : FinishReason::ContextCapacity;
-        base->summary.prefix_reuse_path       = PrefixReusePath::Root;
         base->reuse                           = prefix_ != nullptr && options.allow_prefix_reuse && data.identity.reusable;
         base->summary.publish_continuation    = base->reuse;
-        base->summary.service_work_quanta =
-            service_quanta(plan_prefill(data, 0, {}, base->reuse).ends.size(), base->summary.effective_output_tokens,
-                           vision.get());
         base->vision   = std::move(vision);
         base->sampling = translate(options.sampling);
         const std::uint32_t positions = std::min(options_.max_context, n + base->summary.effective_output_tokens);
-        base->pages = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        base->pages  = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        base->prompt = std::make_shared<const PreparedPrompt>(std::move(prompt));
         return RequestBasePlan(std::move(base));
     }
 
@@ -827,78 +853,84 @@ public:
                base.impl_->pages <= static_cast<std::uint32_t>(pages_per_row_);
     }
 
-    HybridAdmissionQuote quote(const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination) {
-        HybridAdmissionQuote out;
-        out.destination = destination;
-        out.summary     = base.summary();
-        if (destination.value >= options_.max_concurrency || lanes_[destination.value].phase != Phase::Free ||
-            transaction_lane_) {
-            out.readiness = runtime::Readiness::TemporarilyBlocked;
-            return out;
-        }
+    static PrefixReusePath reuse_path_for(runtime::prefix_cache::SnapshotKind kind) noexcept {
+        return kind == runtime::prefix_cache::SnapshotKind::Endpoint ? PrefixReusePath::HybridEndpoint
+                                                                     : PrefixReusePath::HybridSnapshot;
+    }
+
+    // A source over `selection` (absent: a root start without a prefix cache).
+    SourceCandidate make_source(const BasePlanImpl& base, const qwen3_5::PreparedPromptData& data,
+                                std::optional<PrefixSelection> selection) const {
         auto impl      = std::make_shared<QuoteImpl>();
-        impl->summary  = base.summary();
-        impl->sampling = base.impl_->sampling;
-        impl->pages    = base.impl_->pages;
-        impl->lane     = destination.value;
-        impl->vision   = base.impl_->vision;
-        if (prefix_) {
-            const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
-            impl->prefix     = prefix_select(data, *base.impl_, destination.value);
-            if (!impl->prefix) {
-                out.readiness = runtime::Readiness::TemporarilyBlocked;
-                return out;
-            }
-            const PrefixSelection& s = *impl->prefix;
-            if (s.snapshot) {
-                impl->summary.reusable_prompt_tokens = s.frontier;
-                impl->summary.prefix_reuse_path      = reuse_path_for(prefix_->index().snapshot(*s.snapshot).kind);
+        impl->summary  = base.summary;
+        impl->sampling = base.sampling;
+        impl->pages    = base.pages;
+        impl->vision   = base.vision;
+        SourceCandidate out;
+        std::size_t calls = plan_prefill(data, 0, {}, base.reuse).ends.size();
+        if (selection) {
+            if (selection->snapshot) {
                 // Items inside the reused prefix are not encoded again (design §19.3.2).
-                if (impl->vision && s.frontier > 0) { impl->vision = plan_vision(data, s.frontier); }
+                if (impl->vision && selection->frontier > 0) { impl->vision = plan_vision(data, selection->frontier); }
+                out.reused_tokens = selection->frontier;
+                out.reuse_path    = reuse_path_for(prefix_->index().snapshot(*selection->snapshot).kind);
             }
-            impl->summary.service_work_quanta =
-                service_quanta(s.plan.ends.size(), impl->summary.effective_output_tokens, impl->vision.get());
-        } else if (pool_->available_pages() < base.impl_->pages && !kv_growable(base.impl_->pages)) {
-            out.readiness = runtime::Readiness::TemporarilyBlocked;
-            return out;
+            calls        = selection->plan.ends.size();
+            impl->prefix = std::move(selection);
         }
-        // A window lends frames other lanes' handoffs may hold now.
-        if (impl->vision &&
-            residency_->lendable() + (walk_.active ? 0U : stream_lease_.count) < impl->vision->window.frames) {
-            out.readiness = runtime::Readiness::TemporarilyBlocked;
-            return out;
-        }
-        out.summary   = impl->summary;
-        out.impl      = std::move(impl);
-        out.readiness = runtime::Readiness::Ready;
+        out.remaining_work.chunks = calls;
+        out.remaining_work.tokens = base.summary.prompt_tokens - out.reused_tokens;
+        out.hybrid                = std::move(impl);
         return out;
     }
 
-    static PrefixReusePath reuse_path_for(runtime::prefix_cache::SnapshotKind kind) noexcept {
-        return kind == runtime::prefix_cache::SnapshotKind::Endpoint ? PrefixReusePath::PrivateEndpoint
-                                                                     : PrefixReusePath::SharedStablePrefix;
+    // The prefix cache's choice for the request (without a lane: a lane-resident snapshot is credited
+    // at start_binding), then a root start.
+    std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
+        const BasePlanImpl& b = *base.impl_;
+        const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
+        std::vector<SourceCandidate> out;
+        if (prefix_) {
+            std::optional<PrefixSelection> chosen = prefix_select(data, b, kNoLane);
+            const std::uint32_t reuse = chosen && chosen->snapshot ? chosen->frontier : 0U;
+            // Coalescing only defers a fresh request (an empty list: the Engine asks again).
+            if (b.reuse && maximum_frontier == UINT32_MAX && prefix_await_sibling(data, reuse)) { return {}; }
+            if (chosen && chosen->snapshot && chosen->frontier > 0 && chosen->frontier <= maximum_frontier) {
+                out.push_back(make_source(b, data, std::move(chosen)));
+            }
+            out.push_back(make_source(b, data, prefix_root(data, b)));
+        } else {
+            out.push_back(make_source(b, data, std::nullopt));
+        }
+        return out;
     }
 
-    runtime::ContextTransactionReserveStatus reserve(HybridAdmissionQuote&& quote, PreparedPrompt&& prompt,
-                                                     runtime::CancellationFlagView cancellation) {
-        if (cancellation.requested() || quote.impl == nullptr) { return runtime::ContextTransactionReserveStatus::Aborted; }
-        const QuoteImpl& q = *quote.impl;
-        Lane& lane         = lanes_.at(q.lane);
-        kv_busy();
-        if (lane.phase != Phase::Free || transaction_lane_) {
-            throw std::logic_error("Qwen4Exp: admission destination is not free");
+    // Stages the binding of `source` on `lane`: re-selects against the cache as it is now (crediting
+    // a lane-resident snapshot), reserves the whole KV extent and maps the cached blocks. The Begin
+    // the Engine published names the source's frontier, so a changed choice is refused and the Engine
+    // falls back to the next source (the root).
+    runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,
+                                               const SourceCandidate& source, ResumeState* resume) {
+        if (resume != nullptr) { throw std::logic_error("Qwen4Exp: a request is never paused, so none resumes"); }
+        if (source.hybrid == nullptr) { throw std::logic_error("Qwen4Exp: a binding source carries no quote"); }
+        const QuoteImpl& q = *source.hybrid;
+        const std::uint32_t index = destination.value;
+        if (index >= options_.max_concurrency || lanes_[index].phase != Phase::Free || transaction_lane_) {
+            throw std::logic_error("Qwen4Exp: the binding destination is not free");
         }
-        const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
+        Lane& lane = lanes_[index];
+        kv_busy();
+        const BasePlanImpl& b = *base.impl_;
+        const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::optional<PrefixSelection> selection;
         if (prefix_) {
-            // Re-select against the cache as it is now; the quote's choice may have been evicted.
-            BasePlanImpl base{q.summary, q.sampling, q.pages, q.summary.publish_continuation};
-            selection = prefix_select(data, base, q.lane);
-            if (!selection) { return runtime::ContextTransactionReserveStatus::Aborted; }
-            // The Engine published the quote's frontier; a cache that changed since (an eviction,
-            // a capture landing) is a stale quote, which the Engine re-quotes.
-            if (selection->frontier != q.summary.reusable_prompt_tokens) {
-                return runtime::ContextTransactionReserveStatus::Aborted;
+            if (q.prefix && q.prefix->snapshot) {
+                selection = prefix_select(data, b, index);
+                if (!selection || !selection->snapshot || selection->frontier != source.reused_tokens) {
+                    return {}; // the quoted snapshot changed: no shortage, the Engine moves to the root source
+                }
+            } else {
+                selection = prefix_root(data, b);
             }
             prefix_pin(*selection);
         }
@@ -913,13 +945,18 @@ public:
         } else {
             lane.rope.prompt.clear();
         }
-        if (q.vision) { vision_reserve(lane, q.vision, data); }
+        // Reset before activation: a resume's activation sets the lane's frontier and state.
         lane.state_tokens   = 0;
         lane.vision_seconds = 0;
         lane.speculative    = {};
-        lane.mtp_cells   = 0;
-        lane.mtp_live    = mtp_;
-        lane.row         = tables_->acquire(static_cast<std::int32_t>(q.lane));
+        lane.mtp_cells      = 0;
+        lane.mtp_live       = mtp_;
+        lane.row = tables_->acquire(static_cast<std::int32_t>(index));
+        const auto shortage_of = [&](std::uint32_t need) {
+            runtime::ResourceReservation out;
+            out.shortage.main_kv_pages = need > pool_->available_pages() ? need - pool_->available_pages() : 0;
+            return out;
+        };
         if (selection) {
             lane.prefix.reuse  = q.summary.publish_continuation;
             lane.prefix.hashes = data.block_hashes;
@@ -927,19 +964,20 @@ public:
             lane.prefix.trailing_extra = prefix_trailing_extra(data);
             lane.prefix.hints  = data.tap_hints.hints;
             lane.prefix.exclusions = prefix_exclusions(data);
-            // Make room before reserving: the quote counted evictable cache pages as available. An
-            // elastic pool grows only for what eviction cannot free, so idle cache blocks never hold
-            // memory the expert frames could use (design §19.3.11).
+            // Make room before reserving: an elastic pool grows only for what eviction cannot free, so
+            // idle cache blocks never hold memory the expert frames could use (design §19.3.11).
             pc_make_room(selection->need);
             if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
             auto reservation = pool_->reserve(selection->need);
             if (!reservation) {
+                const auto out = shortage_of(selection->need);
                 prefix_unpin(*selection);
                 lane.row = KVExecutionRowLease{};
-                return runtime::ContextTransactionReserveStatus::Aborted;
+                return out;
             }
+            if (q.vision) { vision_reserve(lane, q.vision, data); }
             const std::uint64_t restored = prefix_->counters().host_restore_bytes;
-            prefix_activate(lane, q.lane, *selection, *reservation, q.pages);
+            prefix_activate(lane, index, *selection, *reservation, q.pages);
             lane.prefix.cached_tokens  = selection->cached_tokens;
             lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.reservation    = std::move(*reservation);
@@ -949,15 +987,17 @@ public:
             if (pool_->available_pages() < q.pages) { (void)grow_kv(q.pages); }
             auto reservation = pool_->reserve(q.pages);
             if (!reservation) {
+                const auto out = shortage_of(q.pages);
                 lane.row = KVExecutionRowLease{};
-                return runtime::ContextTransactionReserveStatus::Aborted;
+                return out;
             }
+            if (q.vision) { vision_reserve(lane, q.vision, data); }
             lane.pages.clear();
             lane.pages.reserve(q.pages);
             pool_->materialize(*reservation, q.pages, lane.pages);
             lane.reservation = std::move(*reservation);
             tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages), device_.stream);
-            reset_slot(q.lane);
+            reset_slot(index);
             lane.calls = plan_prefill(data, 0, {}, false).ends;
         }
         lane.next_call = 0;
@@ -975,8 +1015,13 @@ public:
             lane.speculative.accepted_per_position.assign(static_cast<std::size_t>(max_width_ - 1), 0);
         }
         lane.sampling       = q.sampling;
+        lane.readout        = b.readout_tokens;
+        lane.prompt         = b.prompt;
+        lane.constraint     = b.constraint;
+        lane.constraint_round.clear();
+        lane.constraint_trace.clear();
         lane.sampling.token_counts =
-            static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(q.lane) * token_domain_;
+            static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
         lane.epoch           = ++next_epoch_;
         lane.phase           = Phase::Prefill;
         lane.prefill_ns      = 0;
@@ -986,48 +1031,69 @@ public:
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         lane.ngram                   = {};
         lane.gate                    = {};
-        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * q.lane, 0, kGateStatsBytes,
+        lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
+                                           .reused_prompt_tokens = source.reused_tokens,
+                                           .prefix_reuse_path =
+                                               source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * index, 0, kGateStatsBytes,
                                    device_.stream));
-        transaction_lane_ = q.lane;
-        published_        = false;
+        transaction_lane_ = index;
         ++revision_;
-        return runtime::ContextTransactionReserveStatus::Reserved;
+        runtime::ResourceReservation out;
+        out.reserved = true;
+        return out;
     }
 
-    ContextTransactionProgress progress(runtime::CancellationFlagView cancellation) {
-        if (!transaction_lane_ || published_) { throw std::logic_error("Qwen4Exp: no admission to progress"); }
+    // Advances the binding: a media prompt's encode window one step per call (design §19.3.2; other
+    // lanes run between steps), then the lane is published.
+    ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
+        if (!transaction_lane_) { throw std::logic_error("Qwen4Exp: there is no context operation"); }
+        ContextProgress out{.kind = ContextOperationKind::Bind};
         Lane& admitted = lanes_[*transaction_lane_];
+        if (cancellation.requested()) {
+            release(*transaction_lane_);
+            transaction_lane_.reset();
+            out.complete = true;
+            return out;
+        }
         if (admitted.vision && !vision_encoded(admitted)) {
-            // The encode window, one step per call (design §19.3.2); other lanes run between steps.
-            if (cancellation.requested()) {
-                release(*transaction_lane_);
-                MaterializationResult aborted;
-                aborted.status = runtime::ContextTransactionStatus::Aborted;
-                return aborted;
-            }
             try {
                 vision_step(admitted);
             } catch (...) {
                 release(*transaction_lane_);
+                transaction_lane_.reset();
                 throw;
             }
-            if (!vision_encoded(admitted)) { return runtime::ContextTransactionInProgress{}; }
+            out.advanced = true;
+            if (!vision_encoded(admitted)) { return out; }
         }
-        published_ = true;
-        MaterializationResult out;
-        out.status    = runtime::ContextTransactionStatus::Published;
-        out.published = StartResult{handle(*transaction_lane_)};
-        out.diagnostics.cached_prefix_tokens = admitted.prefix.cached_tokens;
-        out.diagnostics.restored_host_bytes  = admitted.prefix.restored_bytes;
+        out.advanced  = true;
+        out.complete  = true;
+        out.published = true;
+        out.sequence  = handle(*transaction_lane_);
+        transaction_lane_.reset();
         return out;
     }
 
-    void finalize() noexcept {
-        transaction_lane_.reset();
-        published_ = false;
+    [[nodiscard]] bool in_transaction() const noexcept { return transaction_lane_.has_value(); }
+
+    // Whether the open binding holds `sequence` back (its lane is still being published).
+    // A lane's context is blocked while it is being bound, and a prefilling lane while another
+    // lane's layer walk holds the expert stream and the lent workspace (the walk's layers are at
+    // different positions until its span ends, so no other prefill call may run in between).
+    [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept {
+        const std::uint32_t index = ContractAccess::lane(sequence);
+        if (transaction_lane_ && *transaction_lane_ == index) { return true; }
+        return walk_.active && walk_.lane != index && index < lanes_.size() && lanes_[index].phase == Phase::Prefill;
     }
 
-    [[nodiscard]] bool in_transaction() const noexcept { return transaction_lane_.has_value(); }
+    // The Engine's reclaim for a binding shortage: evict cached Device blocks until it is covered.
+    bool hybrid_reclaim(runtime::ContextResourceUsage shortage) {
+        if (!prefix_ || shortage.main_kv_pages == 0) { return false; }
+        const std::uint32_t before = pool_->available_pages();
+        pc_make_room(before + shortage.main_kv_pages);
+        return pool_->available_pages() > before;
+    }
 
     // ---------------------------------------------------------------- execution
     PrefillProgress advance_prefill(SequenceHandle sequence) {
@@ -1106,6 +1172,7 @@ public:
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
             sample(lanes, positions);
+            if (!lane.readout.empty()) { out.readout = read_prompt_frontier(lane); }
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
@@ -1128,15 +1195,9 @@ public:
         return out;
     }
 
-    runtime::BeginSummary prefill_summary(const Lane& lane) const {
-        return runtime::BeginSummary{
-            .prompt_tokens        = lane.prompt_tokens,
-            .reused_prompt_tokens = lane.prefix.reused,
-            .prefix_reuse_path    = lane.prefix.reused == 0 || !lane.prefix.resume ? PrefixReusePath::Root
-                                    : prefix_->index().valid(*lane.prefix.resume)
-                                        ? reuse_path_for(prefix_->index().snapshot(*lane.prefix.resume).kind)
-                                        : PrefixReusePath::SharedStablePrefix};
-    }
+    // The Begin the Engine admitted the request with, fixed at binding (a snapshot evicted since
+    // must not change it).
+    const runtime::BeginSummary& prefill_summary(const Lane& lane) const noexcept { return lane.begin; }
 
     PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets) {
         const auto start = Clock::now();
@@ -1322,12 +1383,14 @@ public:
                                                2ULL * width_, cudaMemcpyDeviceToDevice, device_.stream));
                     lane.mtp_cells = lane.state_tokens - 1;
                 }
+                lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
                 continue;
             }
             if (d.accepted_tokens != 1) { throw std::logic_error("Qwen4Exp: a row commits exactly one token"); }
+            commit_constraint_draws(lane, 1);
             lane.history.push_back(pending_tokens_[row]);
             if (commit != nullptr && lane.mtp_live) {
                 commit[row] = 1;
@@ -1385,19 +1448,27 @@ public:
         FinishResult out;
         try {
             const auto index = lane_of(sequence);
-            if (lanes_[index].phase != Phase::Finishable) { return out; }
+            if (lanes_[index].phase != Phase::Finishable) {
+                diagnostic("Qwen4Exp: finish of a lane that is not finishable", DiagnosticLevel::Error);
+                return out;
+            }
             if (!mtp_settled(lanes_[index])) {
                 diagnostic("Qwen4Exp: a finished request's MTP cells are out of step with its state", DiagnosticLevel::Warning);
             }
-            out.timings     = timings(lanes_[index]);
-            out.speculative = lanes_[index].speculative;
+            out.timings           = timings(lanes_[index]);
+            out.speculative       = lanes_[index].speculative;
+            out.constrained_draws = std::move(lanes_[index].constraint_trace);
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
             prefix_finish(lanes_[index], index);
             release(index);
-            out.status      = runtime::ConsumeStatus::Consumed;
-            out.disposition = runtime::FinishDisposition::Released;
-        } catch (...) {}
+            out.status = runtime::ConsumeStatus::Consumed;
+        } catch (const std::exception& error) {
+            // The Engine fails a terminal sequence that does not finish; say why.
+            diagnostic(std::string("Qwen4Exp: finish failed: ") + error.what(), DiagnosticLevel::Error);
+        } catch (...) {
+            diagnostic("Qwen4Exp: finish failed", DiagnosticLevel::Error);
+        }
         return out;
     }
 
@@ -1423,18 +1494,18 @@ public:
             if (lanes_[i].phase != Phase::Free) { release(i); }
         }
         transaction_lane_.reset();
-        published_           = false;
         pending_transaction_ = 0;
         try { device_.synchronize(); } catch (...) {}
     }
 
     PhysicalUsageSnapshot usage() const noexcept {
         PhysicalUsageSnapshot out;
-        out.resource_revision.value = revision_;
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
-            if (lanes_[i].phase != Phase::Free) { ++out.device_state_slots; }
+            if (lanes_[i].phase != Phase::Free) { ++out.occupied.state_slots; }
         }
-        out.device_main_kv_pages = pool_->allocated_pages();
+        out.capacity.state_slots   = options_.max_concurrency;
+        out.occupied.main_kv_pages = pool_->allocated_pages();
+        out.capacity.main_kv_pages = pool_->capacity_pages();
         return out;
     }
 
@@ -1868,6 +1939,11 @@ private:
         lane.rope = {};
         if (lane.vision) { vision_release(lane); }
         lane.proposer.reset();
+        lane.readout.clear();
+        lane.constraint.reset();
+        lane.prompt.reset();
+        lane.constraint_round.clear();
+        lane.constraint_trace.clear();
         lane.phase        = Phase::Free;
         lane.state_tokens = 0;
         ++revision_;
@@ -2444,6 +2520,8 @@ private:
         ops::cast_fp32_to_bf16(wide, narrow, s);
         Tensor target(spec_device(spec_layout_.target), DType::I32, {batch * W});
         ops::argmax(narrow, target, token_domain_, s);
+        const bool constrained = stage_constraints(lanes, W);
+        if (constrained) { constrain(narrow, &target); }
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
         for (std::int32_t b = 0; b < batch; ++b) { configs[b] = lanes_[lanes[b]].sampling; }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
@@ -2481,6 +2559,11 @@ private:
                 live_[static_cast<std::size_t>(b * W + j)]           = j <= A ? 1 : 0;
             }
             pending_counts_[b] = L;
+            if (constrained) {
+                take_constraint_draws(lane, static_cast<std::size_t>(b * W),
+                                      std::span<const std::int32_t>(&pending_tokens_[static_cast<std::size_t>(b * W)],
+                                                                    static_cast<std::size_t>(L)));
+            }
             auto& stats        = lane.speculative;
             if (n == 0) {
                 ++stats.fallback_steps;
@@ -2541,6 +2624,7 @@ private:
             fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
             commit[row]      = 0;
             if (d.cancelled) {
+                lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
                 out.rows[row].speculative = lane.speculative;
                 out.rows[row].disposition = runtime::CommitDisposition::CancelledReleased;
@@ -2548,6 +2632,7 @@ private:
             }
             const auto k = static_cast<std::int32_t>(d.accepted_tokens);
             if (k < 1 || k > pending_counts_[row]) { throw std::logic_error("Qwen4Exp: commit exceeds the licensed tokens"); }
+            commit_constraint_draws(lane, static_cast<std::size_t>(k));
             for (std::int32_t j = 0; j < k; ++j) {
                 const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
                 lane.history.push_back(token);
@@ -2869,6 +2954,8 @@ private:
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         upload_pinned(sample_pos_.p, sample_positions, 4ULL * batch, s);
+        const bool constrained = stage_constraints(lanes, 1);
+        if (constrained) { constrain(narrow, nullptr); }
         Tensor out(sampled_.p, DType::I32, {batch});
         Tensor logical(sample_pos_.p, DType::I32, {batch});
         {
@@ -2881,6 +2968,12 @@ private:
         device_.synchronize();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }
+        if (constrained) {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                take_constraint_draws(lanes_[lanes[b]], static_cast<std::size_t>(b),
+                                      std::span<const std::int32_t>(&pending_tokens_[b], 1));
+            }
+        }
     }
 
     const execution::Parameters& parameters_;
@@ -2907,9 +3000,32 @@ private:
 
     // ---------------------------------------------------------------- prefix cache (prefix_program.cpp)
     void create_prefix_cache();
+    // A lane index meaning "no lane yet" (a quote before the Engine picks the destination).
+    static constexpr std::uint32_t kNoLane = 0xFFFFFFFFU;
+    // The root start of a request with a prefix cache: every page reserved, the cold call grid.
+    PrefixSelection prefix_root(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base) {
+        PrefixSelection root;
+        root.need = base.pages;
+        root.plan = plan_prefill(prompt, 0, {}, base.reuse);
+        return root;
+    }
     std::optional<PrefixSelection> prefix_select(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base,
                                                  std::uint32_t lane);
     void pc_make_room(std::uint32_t pages);
+    // Whether a fresh prompt reusing `reuse` tokens should wait for a prefilling sibling's snapshot
+    // inside their shared prefix; plans that snapshot as a boundary tap of the sibling when so.
+    bool prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse);
+    // A restore batch prefetching a blocked head's blocks (none once it has landed).
+    std::optional<prefix::RestoreTicket> prefetch_ticket_;
+    [[nodiscard]] bool prefetch_landing() const noexcept {
+        return prefetch_ticket_ && !prefix_->restore_events(*prefetch_ticket_).empty();
+    }
+
+public:
+    std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+
+private:
     void prefix_pin(const PrefixSelection& selection);
     void prefix_unpin(const PrefixSelection& selection) noexcept;
     void prefix_activate(Lane& lane, std::uint32_t index, const PrefixSelection& selection,
@@ -2948,12 +3064,6 @@ private:
     // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize.
     [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
                                                 std::span<const std::uint32_t> existing, bool taps) const;
-    // Engine work quanta of a request: its prefill calls, decode rounds and Vision steps.
-    [[nodiscard]] static std::uint64_t service_quanta(std::size_t calls, std::uint32_t output,
-                                                      const VisionAdmission* vision) noexcept {
-        return calls + (output == 0 ? 0ULL : output - 1ULL) + (vision ? vision->window.steps : 0ULL);
-    }
-
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
     // ---- elastic KV (design §19.3.11) ----
     static constexpr std::size_t kKvChunkBytes   = 2ULL << 20;
@@ -3066,6 +3176,34 @@ private:
                    " -> " + std::to_string(residency_->frames()) + " frames");
     }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
+
+    // ---- /v1/decide (constraint.cpp) ----
+    // The constraint controls: each lane's kMaximumConstraintSets sets of up to
+    // ops::kTokenConstraintChoices tokens and their counts, then one descriptor and one probability
+    // record per round column (lanes x max width).
+    static std::size_t constraint_bytes(std::int32_t lanes, std::int32_t width) noexcept {
+        const auto sets    = static_cast<std::size_t>(lanes) * kMaximumConstraintSets;
+        const auto columns = static_cast<std::size_t>(lanes) * static_cast<std::size_t>(width);
+        return 4ULL * (sets * ops::kTokenConstraintChoices + sets + columns + columns * ops::kTokenConstraintRecord);
+    }
+    [[nodiscard]] std::shared_ptr<const ConstraintPlan> compile_constraint(const TokenConstraint& constraint);
+    // Writes the round's descriptors (`width` columns per row, rows in `lanes` order) and the
+    // constrained lanes' sets; false (and nothing written) when no row is constrained.
+    bool stage_constraints(std::span<const std::uint32_t> lanes, std::int32_t width);
+    // Masks the staged round's columns of `logits` [vocab, columns] and rewrites `argmax` for them.
+    void constrain(Tensor& logits, Tensor* argmax);
+    // After the round synchronized: the draws of `tokens`, chosen by consecutive columns from
+    // `first_column` for the lane's next output steps (none for an unconstrained lane).
+    void take_constraint_draws(Lane& lane, std::size_t first_column, std::span<const std::int32_t> tokens);
+    // Moves the first `accepted` draws of the pending round into the lane's trace.
+    static void commit_constraint_draws(Lane& lane, std::size_t accepted);
+    // The readout of the lane's prompt from its last prefill call's logits (column 0).
+    [[nodiscard]] PromptReadout read_prompt_frontier(const Lane& lane);
+    DeviceBuffer constraint_;
+    std::vector<std::int32_t> constraint_host_;
+    std::int32_t constraint_columns_ = 0; // the staged round's columns
+    std::array<std::uint64_t, kMaximumConcurrency> constraint_serials_{};
+    std::uint64_t next_constraint_serial_ = 1;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
     IoLayout io_layout_;
     std::unique_ptr<LinearAttentionStatePool> gdn_;
@@ -3180,7 +3318,6 @@ private:
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;
     std::optional<std::uint32_t> transaction_lane_;
-    bool published_                    = false;
     std::uint64_t next_epoch_          = 0;
     std::uint64_t next_transaction_    = 0;
     std::uint64_t pending_transaction_ = 0;

@@ -12,6 +12,7 @@
 
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
@@ -32,7 +33,6 @@
 #include <optional>
 #include <span>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace ninfer {
@@ -60,19 +60,12 @@ using NgramArchive    = qwen3_5::NgramArchive;
 
 // Read-only diagnostics of the Program's physical stores.
 struct PhysicalUsageSnapshot {
-    runtime::ProgramResourceRevision resource_revision;
-    std::uint32_t device_state_slots            = 0;
-    std::uint32_t host_state_slots              = 0;
-    std::uint32_t device_main_kv_pages          = 0;
-    std::uint32_t device_backend_kv_pages       = 0;
-    std::uint32_t device_main_kv_lease_pages    = 0;
-    std::uint32_t device_backend_kv_lease_pages = 0;
-    std::size_t host_kv_bytes                   = 0;
-};
-
-struct DeviceKVLeaseShortfall {
-    std::uint32_t main_pages    = 0;
-    std::uint32_t backend_pages = 0;
+    runtime::ContextResourceUsage occupied;
+    runtime::ContextResourceUsage capacity;
+    std::size_t host_reserved_bytes      = 0;
+    std::size_t host_peak_occupied_bytes = 0;
+    std::uint32_t host_state_slots       = 0;
+    std::size_t host_kv_bytes            = 0;
 };
 
 // The hybrid prefix cache's statistics; all zero without a prefix cache.
@@ -95,7 +88,8 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_image_writes       = 0;
     std::uint64_t host_block_writes       = 0;
     std::uint64_t host_image_restores     = 0;
-    std::uint64_t host_block_restores     = 0;
+    std::uint64_t host_block_restores     = 0; // prefetched blocks included
+    std::uint64_t prefetched_blocks       = 0;
     std::uint64_t host_write_bytes        = 0;
     std::uint64_t host_restore_bytes      = 0;
     std::uint64_t evicted_blocks          = 0;
@@ -106,9 +100,10 @@ struct HybridPrefixCacheStats {
 
 class SequenceHandle {
 public:
-    SequenceHandle() noexcept                                 = default;
-    SequenceHandle(const SequenceHandle&) noexcept            = default;
-    SequenceHandle& operator=(const SequenceHandle&) noexcept = default;
+    SequenceHandle() noexcept                                       = default;
+    SequenceHandle(const SequenceHandle&) noexcept                  = default;
+    SequenceHandle& operator=(const SequenceHandle&) noexcept       = default;
+    friend bool operator==(SequenceHandle, SequenceHandle) noexcept = default;
 
 private:
     const void* owner_   = nullptr;
@@ -118,14 +113,68 @@ private:
     friend struct detail::ContractAccess;
 };
 
-// Qwen4Exp offers no prefix captures; the type exists for the common Engine surface.
-class CaptureOffer {
+// The key of an original-cache demand record. Qwen4Exp has no original cache, so none is ever made.
+struct PrefixShortlistKey {
+    std::array<std::uint64_t, 2> digests{};
+    std::uint32_t frontier                                                  = 0;
+    std::uint32_t identity_tag                                              = 0;
+    friend bool operator==(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
+};
+
+// A reclaim plan of the original cache's checkpoints; Qwen4Exp has none.
+struct ContextReclaimPlan {};
+
+// Qwen4Exp keeps no checkpoints (its prefix cache's snapshots live in the block tree, and a request
+// is never paused); the handle exists for the common Engine surface and is never minted.
+struct CheckpointHandle {
+    const void* owner                                                   = nullptr;
+    std::uint32_t index                                                 = 0;
+    std::uint64_t generation                                            = 0;
+    friend bool operator==(CheckpointHandle, CheckpointHandle) noexcept = default;
+};
+
+struct CheckpointSummary {
+    std::uint32_t frontier       = 0;
+    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
+    bool leased                  = false;
+    runtime::ContextResourceUsage evictable_resources;
+};
+
+// One admission source: a quote of the prefix cache's chosen path and snapshot to resume from, or
+// of a root start (docs/maintainer/hybrid-prefix-cache-spec.md §17).
+struct SourceCandidate {
+    std::optional<CheckpointHandle> checkpoint; // never set
+    std::uint32_t reused_tokens = 0;
+    runtime::PrefillWork remaining_work;
+    std::vector<runtime::ContextTransferRequirement> transfers;
+    std::vector<CheckpointHandle> private_points; // never set
+    std::shared_ptr<const detail::QuoteImpl> hybrid;
+    PrefixReusePath reuse_path = PrefixReusePath::Root;
+};
+
+// A paused request's recovery state. Qwen4Exp reserves a request's whole KV extent at admission and
+// never pauses one, so no ResumeState is ever produced; the type completes the Engine surface.
+class ResumeState {
 public:
-    CaptureOffer() noexcept                          = default;
-    CaptureOffer(CaptureOffer&&) noexcept            = default;
-    CaptureOffer& operator=(CaptureOffer&&)          = delete;
-    CaptureOffer(const CaptureOffer&)                = delete;
-    CaptureOffer& operator=(const CaptureOffer&)     = delete;
+    ResumeState(ResumeState&&) noexcept            = default;
+    ResumeState& operator=(ResumeState&&) noexcept = default;
+    ResumeState(const ResumeState&)                = delete;
+    ResumeState& operator=(const ResumeState&)     = delete;
+    [[nodiscard]] bool has_snapshot() const noexcept { return false; }
+    [[nodiscard]] std::optional<CheckpointHandle> snapshot_handle() const noexcept { return std::nullopt; }
+    [[nodiscard]] std::uint32_t frontier() const noexcept { return 0; }
+
+private:
+    ResumeState() noexcept = default;
+};
+
+enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, Normalize };
+
+struct ExecutionUnit {
+    SequenceHandle sequence;
+    ExecutionUnitKind kind = ExecutionUnitKind::Decode;
+    // Decode: remaining output budget. Control: exact forced span. Other kinds: zero.
+    std::uint32_t tokens = 0;
 };
 
 // The sampled tokens of one model unit, awaiting the Engine's commit decisions. Its token span
@@ -173,56 +222,40 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
+    [[nodiscard]] std::optional<PrefixShortlistKey> prefix_shortlist_key(std::uint32_t) const noexcept {
+        return std::nullopt;
+    }
 
     std::unique_ptr<detail::BasePlanImpl> impl_;
 };
-
-// Never minted: the hybrid manager never overtakes a blocked FIFO head.
-class PersistentBackfillProof {
-public:
-    [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept { return {}; }
-};
-
-struct AdmissionCandidate {};
-
-struct HybridAdmissionQuote {
-    runtime::Readiness readiness = runtime::Readiness::TemporarilyBlocked;
-    runtime::LaneId destination{};
-    runtime::RequestPlanSummary summary;
-    std::shared_ptr<detail::QuoteImpl> impl;
-};
-
-struct StartResult {
-    SequenceHandle sequence;
-};
-
-struct MaterializationResult {
-    runtime::ContextTransactionStatus status = runtime::ContextTransactionStatus::Aborted;
-    std::optional<StartResult> published;
-    MaterializationDiagnostics diagnostics;
-};
-
-using ContextTransactionProgress = std::variant<runtime::ContextTransactionInProgress, MaterializationResult>;
 
 struct PrefillProgress {
     runtime::BeginSummary summary;
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
-    bool completes_service_unit           = true;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
-    std::optional<CaptureOffer> capture;
+    bool capture_ready = false; // never: Qwen4Exp captures through its own prefix cache
+    std::optional<PromptReadout> readout;
 };
 
 struct CommitRowResult {
     runtime::CommitDisposition disposition = runtime::CommitDisposition::Active;
     GenerationTimings timings;
     SpeculativeStats speculative;
+
+    // Fixed-size cumulative observation, including active rows without copying per-position data.
+    struct SpeculativeCounters {
+        std::uint64_t rounds          = 0;
+        std::uint64_t drafted_tokens  = 0;
+        std::uint64_t accepted_tokens = 0;
+        std::uint64_t fallback_steps  = 0;
+    } speculative_counters;
 };
 
 struct CommitResult {
     std::array<CommitRowResult, kMaximumConcurrency> rows{};
-    std::array<std::optional<CaptureOffer>, kMaximumConcurrency> captures{};
+    std::array<bool, kMaximumConcurrency> capture_ready{};
     std::size_t row_count = 0;
     runtime::ExecutionTiming timing;
 };
@@ -233,18 +266,50 @@ struct DiscardResult {
 };
 
 struct FinishResult {
-    runtime::ConsumeStatus status          = runtime::ConsumeStatus::InvariantMismatch;
-    runtime::FinishDisposition disposition = runtime::FinishDisposition::Released;
+    runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    bool salvaged = false;
+    std::vector<ConstrainedDraw> constrained_draws;
+    std::optional<CheckpointHandle> checkpoint; // never set
 };
 
 struct AbortResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
-    bool salvaged = false;
+};
+
+struct ReplayProgress {
+    bool capture_ready             = false;
+    std::uint32_t processed_tokens = 0;
+    bool complete                  = false;
+    runtime::ExecutionTiming timing;
+};
+
+struct CapturePreparation {
+    std::uint32_t frontier = 0;
+    bool reserved          = false;
+    runtime::ContextResourceUsage shortage;
+    std::size_t host_bytes = 0;
+};
+
+enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
+
+struct ContextProgress {
+    ContextOperationKind kind = ContextOperationKind::Bind;
+    bool advanced             = false;
+    bool complete             = false;
+    bool published            = false;
+    std::optional<SequenceHandle> sequence;
+    std::optional<ResumeState> paused;
+    bool replaying = false;
+    std::vector<CheckpointHandle> private_points;
+    std::vector<CheckpointHandle> retired_checkpoints;
+    std::vector<CheckpointHandle> captured_checkpoints;
+    std::vector<runtime::ContextTransferObservation> transfers;
+    runtime::ContextOperationCounts operations;
+    std::optional<GenerationTimings> request_timings;
+    SpeculativeStats request_speculative;
 };
 
 // Device memory a Program allocates besides its expert frames (design §19.3.7), from the options
@@ -328,6 +393,11 @@ struct ProgramOptions {
     std::uint64_t prefix_host_bytes  = 0;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
+    // What a cut that ends a layer walk's span costs (the next span streams the experts again).
+    double prefix_span_seconds = 0.0;
+    // The longest predicted wait for a prefilling sibling's snapshot a fresh request accepts instead
+    // of prefilling the shared prefix itself (0: no coalescing).
+    double prefix_coalesce_wait_seconds = 0.0;
     // The product's control over the shutdown save of a persistent prefix cache.
     PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
@@ -363,57 +433,81 @@ public:
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 
-    [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+    [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
-    [[nodiscard]] HybridAdmissionQuote hybrid_quote(const PreparedPrompt& prompt, const RequestBasePlan& base,
-                                                    runtime::LaneId destination);
-    [[nodiscard]] runtime::ContextTransactionReserveStatus
-    hybrid_reserve_materialization(HybridAdmissionQuote&& quote, PreparedPrompt&& prompt,
-                                   runtime::CancellationFlagView cancellation);
-    [[nodiscard]] ContextTransactionProgress progress_context_transaction(runtime::CancellationFlagView cancellation);
-    void finalize_context_transaction() noexcept;
+    // ---- admission: hybrid_sources quotes, start_binding stages, poll_context activates ----
+    // The prefix cache's quotes in preference order: its chosen path and snapshot, then a root start
+    // (a root start only, without a prefix cache).
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
+                                                              std::uint32_t maximum_frontier);
+    // Reserves the request's whole KV extent on `lane` and stages its prefix restore; a shortage
+    // reports the pages missing. Qwen4Exp never pauses, so `resume` must be null.
+    [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                                             const SourceCandidate& source,
+                                                             ResumeState* resume           = nullptr,
+                                                             ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
+                                                             std::uint32_t resume_tokens   = 1);
+    [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
-    [[nodiscard]] bool wait_context_transfer() noexcept { return false; }
-    [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t, std::uint32_t) { return 0; }
-    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPrompt&, const RequestBasePlan&) {
-        return 0U;
-    }
-    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
+    [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
+    // Evicts unpinned cached Device blocks until the shortage is covered; whether anything was freed.
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
+    // Copies the blocked FIFO head's Host-only blocks into spare Device cache while it waits: the
+    // blocks started (nullopt while a transaction or an earlier prefetch is in flight).
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // The Device pages a prefetch could fill now (free plus Host-backed cached).
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
-    void skip_capture(CaptureOffer&&) noexcept {}
 
-    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing,
-                                                  runtime::PrefillStepWidth width);
+    // ---- execution units: the whole extent is reserved at admission, so every unit fits ----
+    [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>) {
+        return {.reserved = true};
+    }
+    void release_units(std::span<const SequenceHandle>) noexcept {}
+    [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
+
+    // ---- pause, replay, checkpoints and captures: never offered by Qwen4Exp ----
+    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr) { return false; }
+    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming* = nullptr);
+    [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept { return false; }
+    [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState&) const { return {}; }
+    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const { return std::nullopt; }
+    [[nodiscard]] std::size_t release_redundant_host(std::span<const CheckpointHandle>,
+                                                     std::optional<SequenceHandle> = std::nullopt) {
+        return 0;
+    }
+    [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept { return false; }
+    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>, std::span<const CheckpointHandle>,
+                                                  runtime::ContextResourceUsage) const {
+        return {};
+    }
+    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage) { return false; }
+    [[nodiscard]] bool start_capture(SequenceHandle) { return false; }
+    [[nodiscard]] bool capture_is_input(SequenceHandle) const { return false; }
+    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle) { return std::nullopt; }
+    void skip_capture(SequenceHandle) {}
+
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing);
+                                      runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences, std::span<const TokenId> row_major_tokens,
                          std::uint32_t row_stride,
                          std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
-                         runtime::ExecutionTiming* failed_timing);
+                         runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions,
-                                      runtime::CommitObservation observation,
-                                      runtime::ExecutionTiming* failed_timing);
+                                      runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,
+                                      runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
 
-    // The whole KV extent is reserved at admission, so leases never need to grow.
-    [[nodiscard]] std::optional<std::uint32_t> device_kv_lease_settlement_tokens(SequenceHandle,
-                                                                                 std::uint32_t) const noexcept {
-        return std::nullopt;
-    }
-    [[nodiscard]] std::optional<DeviceKVLeaseShortfall> device_kv_lease_shortfall(SequenceHandle) const noexcept {
-        return std::nullopt;
-    }
-    [[nodiscard]] bool resume_device_kv_lease(SequenceHandle) noexcept { return true; }
-
-    [[nodiscard]] std::optional<PhysicalUsageSnapshot> fail_all_cleanup() noexcept;
-    // Releases every lane, then saves the prefix cache's Host tier to its file when one is attached.
-    [[nodiscard]] std::optional<PhysicalUsageSnapshot> shutdown_cleanup() noexcept;
+    void fail_all_cleanup() noexcept;
+    // Releases every lane, saves the expert cache's state and then the prefix cache's Host tier
+    // when a file is attached.
+    void shutdown_cleanup() noexcept;
     // Loads the Host tier from `path` into the empty prefix cache and keeps `path` for the shutdown
     // save. `fingerprint` names everything the saved bytes depend on besides their geometry.
     [[nodiscard]] PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path,
@@ -422,7 +516,6 @@ public:
     // The shutdown save's result; absent before shutdown or without a file.
     [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const;
 
-    [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept {}
@@ -433,26 +526,29 @@ private:
 
 // The common EngineCore is instantiated once for this model.
 struct RuntimeTypes {
-    using Frontend                = qwen4_exp::Frontend;
-    using PreparedPrompt          = qwen4_exp::PreparedPrompt;
-    using NgramArchive            = qwen4_exp::NgramArchive;
-    using OutputSession           = qwen4_exp::OutputSession;
-    using PublishedOutput         = qwen4_exp::PublishedOutput;
-    using RequestBasePlan         = qwen4_exp::RequestBasePlan;
-    using AdmissionCandidate      = qwen4_exp::AdmissionCandidate;
-    using PersistentBackfillProof = qwen4_exp::PersistentBackfillProof;
-    using SequenceHandle          = qwen4_exp::SequenceHandle;
-    using CaptureOffer            = qwen4_exp::CaptureOffer;
-    using HybridAdmissionQuote    = qwen4_exp::HybridAdmissionQuote;
-    using MaterializationResult   = qwen4_exp::MaterializationResult;
-    using StartResult             = qwen4_exp::StartResult;
-    using PendingBatch            = qwen4_exp::PendingBatch;
-    using PrefillProgress         = qwen4_exp::PrefillProgress;
-    using CommitResult            = qwen4_exp::CommitResult;
-    using DiscardResult           = qwen4_exp::DiscardResult;
-    using FinishResult            = qwen4_exp::FinishResult;
-    using AbortResult             = qwen4_exp::AbortResult;
-    using Program                 = qwen4_exp::Program;
+    using Frontend          = qwen4_exp::Frontend;
+    using PreparedPrompt    = qwen4_exp::PreparedPrompt;
+    using NgramArchive      = qwen4_exp::NgramArchive;
+    using OutputSession     = qwen4_exp::OutputSession;
+    using PublishedOutput   = qwen4_exp::PublishedOutput;
+    using RequestBasePlan   = qwen4_exp::RequestBasePlan;
+    using SequenceHandle    = qwen4_exp::SequenceHandle;
+    using CheckpointHandle  = qwen4_exp::CheckpointHandle;
+    using CheckpointSummary = qwen4_exp::CheckpointSummary;
+    using SourceCandidate   = qwen4_exp::SourceCandidate;
+    using ResumeState       = qwen4_exp::ResumeState;
+    using ExecutionUnit     = qwen4_exp::ExecutionUnit;
+    using ExecutionUnitKind = qwen4_exp::ExecutionUnitKind;
+    using ContextProgress   = qwen4_exp::ContextProgress;
+    using PendingBatch      = qwen4_exp::PendingBatch;
+    using PrefillProgress   = qwen4_exp::PrefillProgress;
+    using ReplayProgress    = qwen4_exp::ReplayProgress;
+    using CommitResult      = qwen4_exp::CommitResult;
+    using DiscardResult     = qwen4_exp::DiscardResult;
+    using FinishResult      = qwen4_exp::FinishResult;
+    using AbortResult       = qwen4_exp::AbortResult;
+    using Program           = qwen4_exp::Program;
+    using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
 
 } // namespace ninfer::models::qwen4_exp

@@ -1366,7 +1366,8 @@ are interval deltas. `snapshot_hits` counts admissions that resumed from a snaps
 `taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
 `endpoints_created` end-of-answer snapshots. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
-Host-tier write-through and restores. `evicted_blocks` counts Device block evictions,
+Host-tier write-through and restores; `prefetched_blocks` counts the restored blocks copied for a
+waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
 with no Host copy, which remove them and the blocks after them from the cache.

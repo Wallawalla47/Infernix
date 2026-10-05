@@ -377,7 +377,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool request_log_keep_explicit = false;
-    std::optional<std::size_t> vram_headroom_mib;
     bool host_context_explicit   = false;
     bool original_cache_selected = false;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.

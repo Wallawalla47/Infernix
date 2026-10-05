@@ -11,6 +11,7 @@
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -115,6 +116,24 @@ int main() {
             const q4::CallPlan plan = q4::plan_calls(0, 4096, 4096, taps, cost);
             check(plan.ends == std::vector<std::uint32_t>{2000, 4096} && plan.taps[0].placement == pc::TapPlacement::Exact,
                   "a boundary tap splits regardless of cost");
+        }
+        // With the layer walk's span restart priced: a grid-shifting tap now costs a span and is
+        // demoted, while the opener's cut before a CPU-served tail restarts nothing and is kept.
+        {
+            q4::CallCost spans = cost;
+            spans.span_seconds = 1.67;
+            const pc::PlannedTap shift[] = {exact(2000)};
+            check(q4::plan_calls(0, 10000, 4096, shift, spans).taps[0].placement == pc::TapPlacement::Flexible,
+                  "a split that restarts the walk's span is demoted");
+            const pc::PlannedTap opener[] = {exact(9995)};
+            const q4::CallPlan kept = q4::plan_calls(0, 10000, 4096, opener, spans);
+            check(kept.taps[0].placement == pc::TapPlacement::Exact &&
+                      kept.seconds == q4::plan_calls(0, 10000, 4096, opener, cost).seconds,
+                  "a cut before a CPU-served call costs no span");
+            const pc::PlannedTap boundary[] = {exact(2000, true)};
+            check(std::fabs(q4::plan_calls(0, 10000, 4096, boundary, spans).seconds -
+                            q4::plan_calls(0, 10000, 4096, boundary, cost).seconds - 1.67) < 1e-9,
+                  "a boundary cut before a GPU-staged call is charged one span");
         }
         // Flexible taps never cut.
         {

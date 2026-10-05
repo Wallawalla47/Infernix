@@ -18,8 +18,9 @@
 namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+} // namespace
 
-void validate_options(const EngineOptions& options) {
+void validate_engine_options(const EngineOptions& options, models::Architecture architecture) {
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -34,8 +35,9 @@ void validate_options(const EngineOptions& options) {
         if (options.kv_capacity.explicit_tokens == 0) {
             throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
         }
-        // Qwen3.5's headroom is what automatic KV capacity leaves; an explicit capacity has none.
-        if (options.vram_headroom_bytes.has_value()) {
+        // Qwen3.5's headroom is what automatic KV capacity leaves; an explicit capacity has none
+        // (Qwen3.8-Flash-Next's is what its expert cache leaves, with any KV capacity).
+        if (architecture == models::Architecture::Qwen3_5 && options.vram_headroom_bytes.has_value()) {
             throw std::invalid_argument(
                 "Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto");
         }
@@ -76,6 +78,8 @@ void validate_options(const EngineOptions& options) {
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
 }
+
+namespace {
 
 // The hybrid index ranks admission sources and values snapshots with the same calibrated
 // prefill and Host-to-Device coefficients as the original cache's ResourceManager.
@@ -172,9 +176,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
-    if (qwen4_exp && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
+    if (qwen4_exp && cache.enabled && cache.mode == ContextCacheMode::Original) {
         throw std::invalid_argument(
-            "Qwen3.8-Flash-Next has no original (Legacy) prefix cache: use the hybrid prefix cache or "
+            "Qwen3.8-Flash-Next has no original prefix cache: use the hybrid prefix cache or "
             "disable the context cache");
     }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
@@ -194,7 +198,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             if (!host_tier) {
                 throw std::invalid_argument(
                     "Qwen3.8-Flash-Next's prefix cache keeps its snapshots in the Host tier: "
-                    "--host-cache-mib must be positive");
+                    "--host-context-mib must be positive");
             }
             if (hybrid.device_snapshot_slots.value_or(0U) != 0) {
                 throw std::invalid_argument(
@@ -264,7 +268,7 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 ModelInstance::~ModelInstance() = default;
 
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
-    validate_options(options);
+    validate_engine_options(options, models::Architecture::Qwen3_5);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);

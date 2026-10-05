@@ -15,6 +15,9 @@ namespace pc = runtime::prefix_cache;
 namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
+constexpr std::size_t kFlushWords = 10; // an MR3 flush call's staging words
+// Blocks one prefetch batch copies at most (one page each; 256 pages are ~240 MB, ~9 ms of H2D).
+constexpr std::uint32_t kPrefetchBatchBlocks = 256;
 
 PrefixCachePersistence public_result(const prefix::PersistResult& result) {
     return PrefixCachePersistence{.ok                  = result.ok,
@@ -52,8 +55,9 @@ void ProgramImpl::create_prefix_cache() {
                                                             options_.prefix_host_bytes);
     if (mtp_) {
         // The MR3 flush cell's inputs: token, cell, slot and table row.
-        flush_host_   = PinnedHostBuffer(4 * sizeof(std::int32_t));
-        flush_device_ = DeviceBuffer(4 * sizeof(std::int32_t));
+        // id, cell, slot, row, then the cell's RoPE position and its pooled-block start (3 each).
+        flush_host_   = PinnedHostBuffer(kFlushWords * sizeof(std::int32_t));
+        flush_device_ = DeviceBuffer(kFlushWords * sizeof(std::int32_t));
         CUDA_CHECK(cudaEventCreateWithFlags(&flush_uploaded_, cudaEventDisableTiming));
     }
 }
@@ -106,22 +110,28 @@ void ProgramImpl::pc_make_room(std::uint32_t pages) {
 void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
     const cudaStream_t stream = device_.stream;
     CUDA_CHECK(cudaEventSynchronize(flush_uploaded_)); // the previous flush has read the staging words
-    auto* words = static_cast<std::int32_t*>(flush_host_.data());
-    words[0]    = lane.history[lane.state_tokens];
-    words[1]    = static_cast<std::int32_t>(lane.state_tokens - 1U);
-    words[2]    = static_cast<std::int32_t>(index);
-    words[3]    = static_cast<std::int32_t>(index);
-    CUDA_CHECK(cudaMemcpyAsync(flush_device_.p, words, 4 * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
+    auto* words      = static_cast<std::int32_t*>(flush_host_.data());
+    const auto cell  = lane.state_tokens - 1U;
+    words[0]         = lane.history[lane.state_tokens];
+    words[1]         = static_cast<std::int32_t>(cell);
+    words[2]         = static_cast<std::int32_t>(index);
+    words[3]         = static_cast<std::int32_t>(index);
+    stage_rope_value(rope_of(lane.rope, cell), std::span<std::int32_t>(words + 4, 3), 1, 0);
+    stage_rope_value(block_start_rope(lane.rope, cell, static_cast<std::uint32_t>(r_)), std::span<std::int32_t>(words + 7, 3),
+                     1, 0);
+    CUDA_CHECK(cudaMemcpyAsync(flush_device_.p, words, kFlushWords * sizeof(std::int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaEventRecord(flush_uploaded_, stream));
     auto* device = static_cast<std::int32_t*>(flush_device_.p);
-    execution::MtpCall call{.residuals  = saved_column(index).view({width_, 1}),
-                            .ids        = Tensor(device, DType::I32, {1}),
-                            .positions  = Tensor(device + 1, DType::I32, {1}),
-                            .slots      = Tensor(device + 2, DType::I32, {1}),
-                            .table_rows = Tensor(device + 3, DType::I32, {1}),
-                            .batch      = 1,
-                            .width      = 1,
-                            .kv_only    = true};
+    execution::MtpCall call{.residuals        = saved_column(index).view({width_, 1}),
+                            .ids              = Tensor(device, DType::I32, {1}),
+                            .positions        = Tensor(device + 1, DType::I32, {1}),
+                            .rope_positions   = Tensor(device + 4, DType::I32, {1, 3}),
+                            .block_start_rope = Tensor(device + 7, DType::I32, {1, 3}),
+                            .slots            = Tensor(device + 2, DType::I32, {1}),
+                            .table_rows       = Tensor(device + 3, DType::I32, {1}),
+                            .batch            = 1,
+                            .width            = 1,
+                            .kv_only          = true};
     forward_->run_mtp(call);
     lane.mtp_cells = lane.state_tokens;
 }
@@ -170,6 +180,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             // The endpoint this prompt continues has just been published.
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
+        if (prefetch_landing() && std::any_of(match.candidates.begin(), match.candidates.end(),
+                                              [](const pc::MatchCandidate& c) { return c.filling_blocks != 0; })) {
+            // A prefetch is copying blocks this prompt resumes over: they land within a batch's copy
+            // time, and skipping them would pick a shallower source.
+            prefix_->await_restore(*prefetch_ticket_);
+            match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        }
         cached_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
         // A frontier strictly inside a Vision item would resume half an image (design §19.3.1).
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
@@ -177,7 +194,8 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans);
         });
         // A lane-resident snapshot needs no image restore: its state is still in the lane.
-        const std::optional<pc::SnapshotRef> resident = prefix_resident(lanes_[lane]);
+        const std::optional<pc::SnapshotRef> resident =
+            lane < lanes_.size() ? prefix_resident(lanes_[lane]) : std::nullopt;
         for (pc::MatchCandidate& c : match.candidates) {
             if (resident && *resident == c.snapshot && c.restore_bytes >= image_layout_.image_bytes) {
                 c.restore_bytes -= image_layout_.image_bytes;
@@ -191,6 +209,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         for (std::size_t i = 0; i < match.candidates.size(); ++i) {
             if (!choice.candidate || i != *choice.candidate) { order.push_back(i); }
         }
+        const auto select = [&]() -> std::optional<PrefixSelection> {
         for (const std::size_t i : order) {
             const pc::MatchCandidate& c = match.candidates[i];
             PrefixSelection s;
@@ -211,6 +230,15 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             s.existing      = frontiers;
             if (fits(s)) { return planned(std::move(s)); }
         }
+        return std::nullopt;
+        };
+        if (std::optional<PrefixSelection> s = select()) { return s; }
+        if (!match.candidates.empty() && prefix_->transfers_pending()) {
+            // Blocks pinned only by in-flight Host writes become evictable once those land: a cached
+            // source is not given up for the root while a finished lane's writes land.
+            prefix_->drain();
+            if (std::optional<PrefixSelection> s = select()) { return s; }
+        }
     }
     if (fits(root)) { return planned(std::move(root)); }
     if (prefix_->transfers_pending()) {
@@ -219,6 +247,189 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         if (fits(root)) { return planned(std::move(root)); }
     }
     return std::nullopt;
+}
+
+// The blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
+// (hybrid-prefix-cache-spec §6.6): its matched path is pinned while room is made from free pages and
+// Host-backed cached blocks, least recently used first, so a prefetch never waits for a transfer,
+// never grows the pool into the expert frames, and never drops a block's last copy.
+std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan& base) {
+    if (!prefix_ || !prefix_->host_tier() || base.impl_ == nullptr || !base.impl_->reuse || !base.impl_->prompt) {
+        return 0U;
+    }
+    if (transaction_lane_ || prefix_->restore_open()) { return std::nullopt; }
+    prefix_->poll();
+    if (prefetch_landing()) { return std::nullopt; }
+    prefetch_ticket_.reset();
+    const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base.impl_->prompt);
+    const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { return 0U; }
+    // The source the admission would choose now, as in prefix_select.
+    pc::PrefixCacheIndex& index = prefix_->index();
+    pc::MatchResult match       = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+    const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+    std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+        return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans);
+    });
+    const pc::AdmissionChoice choice = index.choose(match, n);
+    if (!choice.candidate || match.candidates[*choice.candidate].host_only_blocks == 0) { return 0U; }
+    const std::span<const pc::NodeRef> path(match.path.data(), match.candidates[*choice.candidate].path_blocks);
+    index.acquire_path(path);
+    std::uint32_t started = 0;
+    try {
+        std::uint32_t wanted = std::min(match.candidates[*choice.candidate].host_only_blocks, kPrefetchBatchBlocks);
+        while (pool_->available_pages() < wanted && index.evict_backed_device_blocks(1) != 0) {}
+        wanted = std::min(wanted, pool_->available_pages());
+        std::optional<DeviceKVPageReservation> reservation;
+        if (wanted != 0) { reservation = pool_->reserve(wanted); }
+        if (reservation) {
+            std::vector<DeviceKVPageLease> pages;
+            pages.reserve(wanted);
+            pool_->materialize(*reservation, wanted, pages);
+            prefix_->open_restore(device_.stream);
+            for (const pc::NodeRef node : path) {
+                if (started == wanted) { break; }
+                const pc::NodeView view = index.node(node);
+                if (view.device != pc::CopyState::Absent || view.host != pc::CopyState::Resident) { continue; }
+                prefix_->restore_block(node, std::move(pages[started]));
+                ++started;
+            }
+            if (started != 0) {
+                prefetch_ticket_ = prefix_->submit_restore();
+                prefix_->counters().prefetched_blocks += started;
+            } else {
+                prefix_->abort_restore();
+            }
+        }
+    } catch (...) {
+        prefix_->abort_restore();
+        index.release_path(path);
+        throw;
+    }
+    index.release_path(path);
+    return started;
+}
+
+std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
+    if (!prefix_ || !prefix_->host_tier()) { return 0U; }
+    return pool_->available_pages() + prefix_->index().device_backed_evictable_blocks();
+}
+
+// A fresh request whose prompt shares a prefix with a lane still prefilling waits for that lane's
+// snapshot at the divergence instead of prefilling the shared part again (the coalescing of the
+// Qwen3.5 hybrid cache, hybrid-prefix-cache-spec): a /v1/decide fan-out's questions over one state,
+// or concurrent requests over one image, prefill the shared part once.
+bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt, std::uint32_t reuse) {
+    if (options_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
+    const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
+    if (n < 2) { return false; }
+    const pc::CacheCostModel& cost = options_.prefix_cost;
+    struct Wait {
+        std::uint32_t lane   = 0;
+        std::uint32_t target = 0;
+        bool plan_tap        = false;
+    };
+    std::optional<Wait> best;
+    const auto consider = [&](const Wait& wait) {
+        if (!best || wait.target > best->target) { best = wait; }
+    };
+    for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+        const Lane& lane = lanes_[i];
+        if (lane.phase == Phase::Free || !lane.prefix.reuse || !lane.prompt) { continue; }
+        const auto& sibling = qwen3_5::PreparedPromptAccess::view(*lane.prompt);
+        // The waiting request keeps at least one prompt token to prefill.
+        const std::size_t limit = std::min<std::size_t>(n - 1U, lane.prompt_tokens);
+        const auto equal        = static_cast<std::uint32_t>(
+            std::mismatch(prompt.token_ids.begin(), prompt.token_ids.begin() + static_cast<std::ptrdiff_t>(limit),
+                          lane.history.begin())
+                .first -
+            prompt.token_ids.begin());
+        // A sibling encoding the same image saves this request the encode as well as the prefill.
+        const std::uint32_t shared = qwen3_5::detail::media_agreed_prefix(prompt, sibling, equal);
+        if (shared <= reuse) { continue; }
+        // A capture of the lane's inside the shared prefix that has not landed publishes within a
+        // copy time.
+        if (lane.prefix.capture != 0 && !prefix_->capture_result(lane.prefix.capture) &&
+            lane.prefix.deepest > reuse && lane.prefix.deepest <= shared) {
+            consider(Wait{.lane = i, .target = lane.prefix.deepest, .plan_tap = false});
+        }
+        if (lane.phase != Phase::Prefill) { continue; }
+        // Taps after the lane's frontier can still be realized, except inside a running layer walk's
+        // span: its calls are enqueued, and its span end is realized when the span completes.
+        const bool walking            = walk_.active && walk_.lane == i;
+        const std::uint32_t walk_end  = walking ? lane.calls[walk_.end_call - 1] : 0U;
+        const auto realizable = [&](std::uint32_t position) {
+            return position > lane.state_tokens && (!walking || position >= walk_end);
+        };
+        // A new tap goes on the block boundary below the divergence (its block publishes with it);
+        // inside an image both prompts carry it moves to the image's end, so the waiting request
+        // resumes past the whole image and encodes nothing for it.
+        std::uint32_t aligned = shared / kBlock * kBlock;
+        for (const pc::TapExclusion& span : lane.prefix.exclusions) {
+            if (span.begin < aligned && aligned < span.end && span.end <= shared) { aligned = span.end; }
+        }
+        std::optional<Wait> wait;
+        if (realizable(aligned) && aligned > reuse && aligned < lane.prompt_tokens) {
+            wait = Wait{.lane = i, .target = aligned, .plan_tap = true};
+        }
+        // An exact tap the lane already plans near the divergence serves instead, unless prefilling
+        // the tokens between it and the new tap costs more than the split.
+        for (const pc::PlannedTap& tap : lane.prefix.taps) {
+            if (tap.position > shared) { break; }
+            if (tap.placement != pc::TapPlacement::Exact || !realizable(tap.position) || tap.position <= reuse) { continue; }
+            if (tap.position >= aligned || cost.prefill_seconds(tap.position, aligned - tap.position) <= cost.chunk_seconds) {
+                wait = Wait{.lane = i, .target = tap.position, .plan_tap = false};
+            }
+        }
+        if (!wait || prefix::inside_exclusion(wait->target, lane.prefix.exclusions) ||
+            wait->target < lane.prefix.deepest + kBlock) {
+            continue;
+        }
+        // Waiting saves this request's prefill of the shared tokens; a new tap costs the sibling what
+        // its cut adds: a call unless the tap is a call end already, and a span restart when
+        // walk-eligible calls meet there (nothing at a running walk's span end). The sibling's
+        // remaining prefill to the snapshot is the wait, doubled because other lanes' decode rounds
+        // interleave with it.
+        const double saved     = cost.prefill_seconds(reuse, wait->target - reuse);
+        const double predicted = 2.0 * cost.prefill_seconds(lane.state_tokens, wait->target - lane.state_tokens);
+        double split           = 0.0;
+        if (wait->plan_tap && !(walking && wait->target == walk_end)) {
+            // The pending call ends with the tap inserted; the calls meeting at it are [left, target)
+            // and [target, right).
+            std::vector<std::uint32_t> ends(lane.calls.begin() + static_cast<std::ptrdiff_t>(lane.next_call), lane.calls.end());
+            const auto at = std::lower_bound(ends.begin(), ends.end(), wait->target);
+            const bool cut = at == ends.end() || *at != wait->target;
+            const auto tap = cut ? ends.insert(at, wait->target) : at;
+            const std::uint32_t left  = tap == ends.begin() ? lane.state_tokens : *std::prev(tap);
+            const std::uint32_t right = *std::next(tap); // the tap is before the prompt's end
+            const auto streamed       = static_cast<std::uint32_t>(kStreamMinColumns);
+            if (cut) { split += cost.chunk_seconds; }
+            if (wait->target - left >= streamed && right - wait->target >= streamed) { split += options_.prefix_span_seconds; }
+        }
+        if (saved > split && predicted <= options_.prefix_coalesce_wait_seconds) {
+            consider(*wait);
+        }
+    }
+    if (!best) { return false; }
+    // The snapshot the waiting request resumes from is where two conversations diverge: it is
+    // published as a boundary, so neither lineage supersedes it.
+    Lane& lane = lanes_[best->lane];
+    if (lane.phase != Phase::Prefill) { return true; } // an in-flight capture: nothing to plan
+    auto& taps = lane.prefix.taps;
+    const auto at = std::lower_bound(taps.begin(), taps.end(), best->target,
+                                     [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });
+    if (at != taps.end() && at->position == best->target) {
+        at->boundary = true;
+        if (at->placement == pc::TapPlacement::Exact) { return true; }
+        at->placement = pc::TapPlacement::Exact;
+    } else if (best->plan_tap) {
+        taps.insert(at, pc::PlannedTap{.position = best->target, .placement = pc::TapPlacement::Exact, .boundary = true});
+    }
+    // An exact tap ends a call: split the call that spans it (it is not enqueued yet).
+    auto& calls = lane.calls;
+    const auto end = std::lower_bound(calls.begin() + static_cast<std::ptrdiff_t>(lane.next_call), calls.end(), best->target);
+    if (end != calls.end() && *end != best->target) { calls.insert(end, best->target); }
+    return true;
 }
 
 // Pins what a selection reads (its matched path up to the anchor and the snapshot) before room is
@@ -346,7 +557,7 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
         planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
     }
     return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned,
-                              prefix::CallCost{.model = options_.prefix_cost});
+                              prefix::CallCost{.model = options_.prefix_cost, .span_seconds = options_.prefix_span_seconds});
 }
 
 HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
@@ -373,6 +584,7 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.host_block_writes       = count.host_block_writes;
     out.host_image_restores     = count.host_image_restores;
     out.host_block_restores     = count.host_block_restores;
+    out.prefetched_blocks       = count.prefetched_blocks;
     out.host_write_bytes        = count.host_write_bytes;
     out.host_restore_bytes      = count.host_restore_bytes;
     out.evicted_blocks          = index.device_block_evictions;
@@ -453,7 +665,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     c.meta.mtp_next    = lane.history.size() > F ? lane.history[F] : -1;
     c.meta.lineage_echo = lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume) &&
                           prefix_->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
-    c.meta.opener = kind == pc::SnapshotKind::Tap &&
+    c.meta.opener = kind != pc::SnapshotKind::Endpoint &&
                     std::any_of(lane.prefix.hints.begin(), lane.prefix.hints.end(), [&](const pc::TapHint& hint) {
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
@@ -485,13 +697,15 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     // at the start of the prompt's final call.
     const bool final_next = lane.next_call + 1U == lane.calls.size();
     bool due              = false;
+    bool boundary         = false;
     std::erase_if(lane.prefix.taps, [&](const pc::PlannedTap& tap) {
         const bool now = tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
         due            = due || now;
+        boundary       = boundary || (now && tap.boundary);
         return now;
     });
     if (due && B >= lane.prefix.deepest + kBlock) {
-        prefix_capture(lane, index, pc::SnapshotKind::Tap, false);
+        prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
     }
 }
 

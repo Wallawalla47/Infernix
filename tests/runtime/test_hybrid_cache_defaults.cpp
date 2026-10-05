@@ -116,6 +116,46 @@ int main() {
         failures += check(rejected, "a Host budget below one snapshot was accepted");
     }
 
+    // Qwen3.8-Flash-Next resolves its own hybrid defaults: a 4 GiB Host tier, no Device snapshot
+    // slots (its snapshots are Host-born), the common tap budget; Qwen3.5 keeps C + 1 slots and 8 GiB.
+    {
+        EngineOptions options;
+        options.max_concurrency    = 2;
+        options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+        const ninfer::ContextCacheOptions qwen4 =
+            normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp).context_cache;
+        failures += check(qwen4.host_capacity_bytes == ninfer::kDefaultQwen4ExpHybridHostCacheBytes &&
+                              qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
+                          "Qwen3.8-Flash-Next hybrid defaults are wrong");
+        const ninfer::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
+        failures += check(qwen35.host_capacity_bytes == ninfer::kDefaultHybridHostCacheBytes &&
+                              qwen35.hybrid.device_snapshot_slots == 3U,
+                          "Qwen3.5 hybrid defaults changed");
+    }
+    // ... and refuses what its binding cannot serve: no Host tier, Device snapshot slots and the
+    // original prefix cache.
+    for (int variant = 0; variant < 3; ++variant) {
+        EngineOptions options;
+        options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+        if (variant == 0) { options.context_cache.host_capacity_bytes = 0; }
+        if (variant == 1) { options.context_cache.hybrid.device_snapshot_slots = 1; }
+        if (variant == 2) { options.context_cache.mode = ninfer::ContextCacheMode::Original; }
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "Qwen3.8-Flash-Next normalization accepted an unservable cache");
+    }
+    {
+        EngineOptions options;
+        options.context_cache.enabled = false;
+        bool accepted = true;
+        try {
+            (void)normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp);
+        } catch (const std::invalid_argument&) { accepted = false; }
+        failures += check(accepted, "Qwen3.8-Flash-Next refused a disabled context cache");
+    }
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

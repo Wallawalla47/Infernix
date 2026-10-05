@@ -24,7 +24,7 @@
 namespace ninfer::runtime {
 namespace {
 
-// The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-cache-mib is not given.
+// The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-context-mib is not given.
 // Planning allowance for the Program's pinned and mapped buffers (I/O staging, sampling, the CPU
 // expert service's mapped records); the measured total is well below it.
 constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
@@ -122,7 +122,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.later_pinned = kProgramPinnedAllowance;
     // The prefix cache pins its whole Host tier at startup, beside the experts.
     if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid) {
-        demand.prefix_cache = options.context_cache.host_cache_budget_bytes.value();
+        demand.prefix_cache = options.context_cache.host_capacity_bytes.value();
     }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
     demand.load_staging = kLoadStagingBytes;
@@ -176,17 +176,24 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const std::uint32_t chunk         = options.prefill_chunk;
         program_options.prefix_cache      = true;
         // normalize_engine_options resolved every value for this architecture.
-        program_options.prefix_host_bytes          = cache.host_cache_budget_bytes.value();
+        program_options.prefix_host_bytes          = cache.host_capacity_bytes.value();
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
-        program_options.prefix_cost.chunk_seconds          = 1.28;
+        // Fitted 2026-10-05 (RTX 5090, INT8 KV; design §19.4): 1.67 s per layer-walk span, 0.16 s per
+        // further call, 22 us per token and 1.06 ns per attention pair, within 5 % from 4K to 128K.
+        program_options.prefix_cost.chunk_seconds          = 0.1645;
         program_options.prefix_cost.chunk_tokens           = chunk;
-        program_options.prefix_cost.token_seconds          = 1.17e-3;
+        program_options.prefix_cost.token_seconds          = 2.23e-5;
+        program_options.prefix_cost.attention_pair_seconds = 1.06e-9;
         program_options.prefix_cost.call_route_fraction    = 10.0 / 512.0;
+        program_options.prefix_span_seconds                = 1.67;
         program_options.prefix_cost.h2d_bytes_per_second   = 26.0e9;
         program_options.prefix_cost.transfer_batch_seconds = 20.0e-6;
         program_options.prefix_save                        = cache.hybrid.persistent_save;
+        // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait is
+        // kept well inside its queue timeout.
+        program_options.prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0;
     }
     program_options.route_trace   = models::qwen4_exp::testing::route_trace();
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();

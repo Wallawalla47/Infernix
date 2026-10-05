@@ -82,4 +82,38 @@ void prompt_block_keys(const PreparedPromptData& prompt, std::vector<std::uint64
     hashes = pc::block_lookup_hashes(prompt.token_ids, extras);
 }
 
+namespace {
+
+bool same_vision_item(const VisionItem& lhs, const VisionItem& rhs) noexcept {
+    const auto same_span = [](const TokenSpan& a, const TokenSpan& b) {
+        return a.begin == b.begin && a.count == b.count;
+    };
+    return lhs.modality == rhs.modality && lhs.grid.temporal == rhs.grid.temporal &&
+           lhs.grid.height == rhs.grid.height && lhs.grid.width == rhs.grid.width &&
+           lhs.patch_begin == rhs.patch_begin && lhs.patch_count == rhs.patch_count &&
+           lhs.content_digest == rhs.content_digest && lhs.timestamps == rhs.timestamps &&
+           std::equal(lhs.token_spans.begin(), lhs.token_spans.end(), rhs.token_spans.begin(),
+                      rhs.token_spans.end(), same_span);
+}
+
+} // namespace
+
+// How much of `shared` equal leading tokens `waiting` really shares with `sibling`. Vision
+// placeholders are equal tokens for every image, so the agreement ends where the first media item
+// the two prompts do not carry identically (content, grid, timing, placement) begins.
+std::uint32_t media_agreed_prefix(const PreparedPromptData& waiting,
+                                  const PreparedPromptData& sibling,
+                                  std::uint32_t shared) noexcept {
+    for (std::size_t item = 0; item < waiting.vision_items.size(); ++item) {
+        const VisionItem& own = waiting.vision_items[item];
+        const std::size_t begin = own.token_spans.empty() ? 0 : own.token_spans.front().begin;
+        if (begin >= shared) { break; }
+        if (item >= sibling.vision_items.size() ||
+            !same_vision_item(own, sibling.vision_items[item])) {
+            return static_cast<std::uint32_t>(begin);
+        }
+    }
+    return shared;
+}
+
 } // namespace ninfer::models::qwen3_5::detail

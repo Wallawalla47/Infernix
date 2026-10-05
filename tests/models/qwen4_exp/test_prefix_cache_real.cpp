@@ -90,7 +90,7 @@ ninfer::EngineOptions base_options(const char* artifact, const char* ngram) {
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
     options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;
-    options.context_cache.host_cache_budget_bytes = 2ULL << 30;
+    options.context_cache.host_capacity_bytes = 2ULL << 30;
     return options;
 }
 

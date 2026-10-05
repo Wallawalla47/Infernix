@@ -123,7 +123,7 @@ conversation's next turn resumes from a snapshot of the model state and prefills
 tokens; KV blocks are shared across requests. `ninfer` (one request) runs without it.
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
-  `--host-cache-mib` (default 4096, must be positive). It is pinned at startup and counted in the
+  `--host-context-mib` (default 4096, must be positive). It is pinned at startup and counted in the
   RAM ledger (`prefix cache` in the ledger line). `--no-prefix-reuse` turns the cache off and frees
   that RAM for the experts.
 - **Snapshots.** Each turn leaves one at the generation opener (the assistant turn's start) and one

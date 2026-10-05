@@ -2521,7 +2521,7 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 | `--record-routing PATH` | off | Opt-in route log, expert ids only, for calibration Stage 4 and M1 |
 | `--ngram-volume FILE` | `<artifact>.ngram` | N-gram table volume, which may sit on another NVMe drive (§12.3) |
 | `--no-prefix-reuse` | existing (reuse on in `ninfer-serve`; `ninfer` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
-| `--host-cache-mib N`, `--device-snapshot-slots N` | 4096 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
+| `--host-context-mib N`, `--device-snapshot-slots N` | 4096 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
 | `--prefix-cache-file PATH` | existing (off) | Prefix-cache persistence; for this model blocks also store `mtp_next` and snapshots their meta. Decided (default, 2026-10-04): built after P6, since any rebuild invalidates it (§19.3.1) |
 | `--kv-capacity N\|auto` | existing | Plus one copy-on-write page per lane (0.34 frames each) for prefix resumes (§19.3.1) |
 | `--vision-offload auto\|on\|off` | `auto`: on here, off for Qwen3.5 | Vision weights in pinned host RAM, streamed per window (§19.3.2) |
@@ -3407,7 +3407,7 @@ These defaults were set on 2026-10-04, before any measurement; the user may over
 
 | Track | Decided (default, 2026-10-04) | Alternative |
 |---|---|---|
-| Prefix | Host tier 4 GiB by default; `--host-cache-mib` may set more, with the startup guard | 8-12 GiB for ~100K-token agentic sessions, if ≥ 16 GiB stays free after model and Vision |
+| Prefix | Host tier 4 GiB by default; `--host-context-mib` may set more, with the startup guard | 8-12 GiB for ~100K-token agentic sessions, if ≥ 16 GiB stays free after model and Vision |
 | Prefix | Zero Device snapshot slots (needs the P1 index extension) | Qwen3.5-style C + 1: ~84 frames at C = 1, ≈ 0.35 % decode |
 | Prefix | Exactness as upstream: a resume equals the capturing request's own computation, may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold-run equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included, so echo turns lose endpoint reuse |
 | Prefix | P7 prefill CPU assist implemented, kept only if prefix M6 shows ≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged | No P7 (it changes shared offloaded-MoE Op code) |
@@ -3655,7 +3655,7 @@ documented as a reproducibility trade-off, not a quality one.
   therefore fits at any C, all lanes at once; the source pin drops after activation, leaving E.
 - **Device snapshot slots: 0.** `--device-snapshot-slots N` adds packed slots (115.7 MB = 41.8
   frames each; D2D capture under the existing slot policy); N ≥ 1 is required with
-  `--host-cache-mib 0`.
+  `--host-context-mib 0`.
 - **Host tier: one pinned slab pool, 4 GiB** (the §15.2 row; it replaced the earlier 2.0 GB
   checkpoint tier). Of 95.8 GiB the model pins 64.5 GiB, leaving ≈ 31 GiB; Vision adds 856 MiB of
   tower weights and ≥ 0.4 GB of pageable media buffers (§19.3.2). Resolved in the Program
@@ -3702,13 +3702,26 @@ today, `engine.cpp:181`) ranks choices and values snapshots, never decides feasi
 
 | Field | Value |
 |---|---|
-| `chunk_seconds` | 1.28 |
+| `chunk_seconds` | 0.1645 (was 1.28) |
 | `chunk_tokens` | `--prefill-chunk` |
-| `token_seconds` | 1.17e-3 |
+| `token_seconds` | 2.23e-5 (was 1.17e-3) |
 | `call_route_fraction` (ρ) | 10/512 = 0.0195 until M6 refits it |
-| `attention_pair_seconds` | 0 until M1 |
+| `attention_pair_seconds` | 1.06e-9 (was 0) |
 | `h2d_bytes_per_second` | 26e9 |
 | `transfer_batch_seconds` | 20e-6 |
+| `prefix_span_seconds` (Qwen4Exp `CallCost::span_seconds`) | 1.67 |
+
+Refitted 2026-10-05 on the Gold port (RTX 5090, INT8 KV, `ninfer_bench` pp, `fn/rigs/port/gate3.bat`).
+After the layer walk and expert streaming (§19.3.8 F2-F6), a prompt costs about 1.67 s per walk
+span to stream the experts, 0.16 s per further call, 22 us per token and 1.06 ns per attention pair.
+Measured against modelled: pp4096 in 4 and 8 calls 2.55 s and 3.03 s (model -4.8 % and +1.7 %),
+pp16384 2.70 s (+5.0 %), pp32768 4.36 s (-1.5 %), pp131072 19.0 s (0.0 %). Single-call prompts of
+512 to 4096 tokens took 2.1-2.5 s, which the model underestimates by 6-25 %. They pay the whole span
+at a width the fit does not cover. Because the walk ends its span at every cut, a cut followed by a
+GPU-staged call costs a span as well as a call. The planner therefore demotes automatic exact taps
+that are not free, and coalescing charges a new tap the same amount. The old constants overpriced
+tokens about 50-fold, so predicted coalescing waits exceeded the queue-timeout limit for shared
+prefixes beyond about 4K tokens.
 
 After P7, an EWMA of measured call seconds per width class feeds `index.set_cost` and the planner.
 
@@ -3762,7 +3775,7 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 | Flag | Qwen4Exp semantics |
 |---|---|
 | `--no-prefix-reuse` | Disables the cache: `allow_prefix_reuse = false` → `publish_continuation = false` (today hard-coded false, `program.cpp:389`) |
-| `--host-cache-mib N` | **Default 4096**, clamped as above; 0 = Device-only (requires `--device-snapshot-slots ≥ 1`) |
+| `--host-context-mib N` | **Default 4096**, clamped as above; 0 = Device-only (requires `--device-snapshot-slots ≥ 1`) |
 | `--device-snapshot-slots N` | **Default 0** (Qwen3.5: C + 1) |
 | `--cache-taps-per-request`, `--cache-tap-ladder`, `--cache-tap-min-gap` | Unchanged: 8 / max(4096, 2·chunk) / max(1024, chunk) |
 | `--prefix-cache-file PATH` | Unchanged; Qwen4Exp blocks persist `mtp_next`, snapshots their meta (after P6) |
@@ -3867,7 +3880,7 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   (`ForwardBatch::layer_waits[1]`). The tail page's planes of a layer are copied with that layer
   (`DeviceKVPagePool::copy_to_host_records` gained the plane-range form). An endpoint hands its
   partial page over as the snapshot's Device tail; a tap keeps it and the lane's later writes wait.
-  The Host tier is therefore required: `--host-cache-mib 0` or Device snapshot slots are refused
+  The Host tier is therefore required: `--host-context-mib 0` or Device snapshot slots are refused
   (decided default 0 slots; packed slots are a later option).
 - **Restores** are one batch per admission on the restore stream, in forward order: a decoder
   layer's group holds that layer's planes of every restored page (Host-only shared blocks into new
@@ -3986,7 +3999,7 @@ first K drafts, and for X3 the whole main state (GDN, PLE, tails, main KV).
 | X4 endpoint echo | Turn 2 = turn 1 + its 128 generated tokens + 64 new | Reuse = endpoint F; `mtp_continuation_mismatches == 0`; ids equal a Host-restored rerun (E1); +D1; agreement with cold reported, not asserted (E4) |
 | X5 chat no-echo | Two template turns without `reasoning_content` | Reuse ≥ the turn-1 opener; the opener adds one small call and no other |
 | X6 shared preamble | Three sessions sharing a ~6K system + tools block | Sessions 2-3 reuse ≥ the structural frontier; preamble pages counted once |
-| X7 eviction | `--host-cache-mib 512`, pool = max_context, three alternating conversations | Outputs equal cold runs with identical decomposition; `host_snapshot_evictions > 0`; fallbacks; debug `check_invariants` clean |
+| X7 eviction | `--host-context-mib 512`, pool = max_context, three alternating conversations | Outputs equal cold runs with identical decomposition; `host_snapshot_evictions > 0`; fallbacks; debug `check_invariants` clean |
 | X8 Host round trip | P2 GPU test on synthetic pools: lane state → slots → Host → another lane; page → slab → another page | Byte-exact |
 | X9 concurrency | C = 2 plain, two conversations resumed concurrently from the Host; C = 2 MTP robustness | C = 2 ids == C = 1 ids; no crash or hang; no Filling block mapped |
 | X10 cancel mid-prefill | Cancel after the first call; resend | Reuses the abort endpoint; ids equal an uncached run with the same boundary; +D1 |
@@ -4015,7 +4028,7 @@ identical-id workloads. Base command:
 build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer ^
   --ngram-volume G:\ninfer\qwen3_8_flash_next_nvfp4.ninfer.ngram --kv-dtype int8 --max-context 65536 ^
   --prefill-chunk 4096 --max-concurrency 1 --spec mtp --draft-tokens 4 --lm-head-draft ^
-  --host-cache-mib 4096 --request-log-jsonl profiles\bench\fn_prefix\<arm>\request_log.jsonl
+  --host-context-mib 4096 --request-log-jsonl profiles\bench\fn_prefix\<arm>\request_log.jsonl
 ```
 
 | ID | What | How | Report |
@@ -4083,7 +4096,7 @@ M6 gate.
 
 | Question | Decided (default, 2026-10-04) | Alternative |
 |---|---|---|
-| Host tier size | **4 GiB**, more by `--host-cache-mib` | 8-12 GiB for ~100K-token agentic sessions if ≥ 16 GiB stays free after model and Vision |
+| Host tier size | **4 GiB**, more by `--host-context-mib` | 8-12 GiB for ~100K-token agentic sessions if ≥ 16 GiB stays free after model and Vision |
 | Device snapshot slots | **0** (frame-free; needs P1) | `C + 1` as Qwen3.5 (~84 frames ≈ 0.35 % decode) |
 | Exactness contract | **As upstream** (E1-E6): a resume equals the capturing request's own computation and may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included (echo turns lose endpoint reuse) |
 | P7 prefill CPU assist (shared offloaded-MoE Op change) | **Implemented, kept only if M6 passes** (≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged): it is the main post-hit lever and also speeds short cold prompts | No P7 (it changes shared offloaded-MoE Op code) |
@@ -7629,6 +7642,86 @@ elastic pool does the same job with no kernel change:
 - **K5:** prefix-cache publish and restore.
 - **K6:** measurement — frames gained, decode at 4K/64K/128K/220K context against the device-only
   build, and the prefill rate.
+
+### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
+
+The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
+Gold-Star-Infer 5fbfc3dbe. That branch carries upstream's continuation/checkpoint Engine:
+resource-pressure preemption with Snapshot/Replay recovery, unit reservations, and a two-step
+admission. Only the final commit of the port builds; the replayed commits in between do not
+compile on their own, because the new contract changed the Program surface under them.
+
+**How Qwen4Exp maps onto the contract.**
+
+| Contract step | Qwen4Exp |
+|---|---|
+| `plan_request(PreparedPrompt&&)` | Keeps the prepared prompt on the plan; compiles a token constraint and checks readout tokens against the public token domain. |
+| `hybrid_sources` | Offers two sources: the prefix cache's affordable snapshot, chosen without a lane, then the root. Returns none while the request should wait for a prefilling sibling's snapshot (coalescing, below). |
+| `hybrid_prefetch` | Copies a blocked FIFO head's Host-only blocks into free and Host-backed Device pages while it waits. |
+| `start_binding` | Re-selects the source for the actual lane, crediting a lane-resident snapshot. A changed choice returns no reservation and no shortage, so the Engine falls back to the root. Otherwise it makes room and reserves the whole KV extent; a shortage is reported as `main_kv_pages`. Vision is reserved after the KV. |
+| Begin summary | `{prompt_tokens, reused_tokens, reuse_path}`. The reuse path is `HybridSnapshot`, `HybridEndpoint` or `Root`. |
+| `poll_context` | Runs Vision steps, then publishes the bound sequence. On cancellation it releases the binding. |
+| `reserve_units` | Always reserved: the binding already holds the whole extent. |
+| `start_pause` | Returns false: a Qwen4Exp request is never paused. |
+| Replay, checkpoints, capture | Stubs that are never reached (`advance_replay` throws). |
+
+The ops' new `DeviceExecutionView` parameter is passed as `execution_view().on_stream(s)`. The
+recurrent update and the replay record keep a bare stream. Gold's renames (`host_capacity_bytes`,
+`--host-context-mib`, `ContextCacheMode::Original`) are taken throughout. The Qwen3.5 tower's
+`parse_vision_config` moved to `models/qwen3_5/vision_config.h`, so `config.h` stays free of JSON
+as on Gold.
+
+**`/v1/decide` (prompt readouts and token constraints, `program/constraint.cpp`).**
+
+- A readout reads the prompt's next-token distribution from the first token's logits column
+  (rounded to BF16 like the sampler's input, before any mask), with `ops::target_logprobs` and
+  `ops::top_logprobs`. A request without readout tokens pays nothing.
+- A constrained round stages one descriptor per logits column and masks with
+  `ops::constrain_logits`: before the sampler (the prompt's first token and plain decode rounds)
+  and before the greedy targets and draft acceptance of a verification round (MTP and n-gram
+  chains; Qwen4Exp verifies no trees). Column j of a row samples output step (generated tokens) + j.
+  An unconstrained round skips the op entirely.
+- The probability records of a round's licensed tokens become ConstrainedDraws as their tokens
+  commit, so a rejected draft's draw is dropped with it.
+
+**Hybrid cache admission, as in the Qwen3.5 binding.**
+
+- *Prefetch* (hybrid-prefix-cache-spec §6.6): the Engine calls `hybrid_prefetch` for a FIFO head
+  that was evaluated but could not bind. Up to 256 Host-only blocks of its chosen path are restored
+  into free pages and pages evicted from Host-backed cached blocks. The pool never grows into the
+  expert frames for a prefetch. A selection whose path is still landing waits for that batch first.
+- *Drain before giving up a source:* when no snapshot candidate fits and Host writes are pending,
+  selection drains them and retries the candidates before the root.
+- *Coalescing* (§12.2): a fresh request sharing a prefix with a lane still prefilling (media
+  agreeing via `media_agreed_prefix`, now shared in `block_keys`) waits for that lane's snapshot at
+  the divergence. This happens when waiting saves more than a split costs and the predicted wait is
+  within half the queue timeout. The divergence is the block boundary below it, or the end of an
+  image both prompts carry. An exact tap is planned there; it splits the lane's pending call when
+  needed. A layer walk's enqueued span is never split. An in-flight capture inside the shared prefix
+  is waited for too.
+- *Boundary snapshots:* taps planned as boundaries (Explicit, Structural, coalescing) are published
+  as `SnapshotKind::Boundary`. A later conversation's continuation therefore does not supersede the
+  shared state a `/v1/decide` fan-out resumes from. Before, every tap was published as `Tap`.
+
+**Faults the port's verification found (2026-10-05).** Gold's Engine checks results that dev's
+ignored, which exposed these:
+
+- **MR3 flush (latent on dev).** `mtp_flush_cell` built its MTP call without the RoPE fields that
+  the M-RoPE change (§19.3.2) made mandatory, so the call threw. `finish` swallowed the exception, so
+  on dev an MTP request finishing with a pending cell silently skipped its endpoint capture and its
+  blocks' write-through. Gold's Engine fails such a request ("terminal native sequence could not
+  finish"), which crashed `/v1/decide` with MTP. The flush now stages the cell's RoPE position and
+  block start. `finish` and `abort` report a failure through the diagnostic channel.
+- **Engine admission without a cache.** Qwen4Exp always runs on the hybrid resource manager, which
+  refused to work with the context cache off. That broke the CLI and `ninfer_bench`.
+- **Prefill interleaving.** A second lane's prefill could be scheduled during another lane's layer
+  walk. `context_blocks` now reports such a lane, and the Engine's prefill turn skips blocked lanes.
+- **Options validated after the artifact is read.** The Qwen4Exp route skipped the Engine's common
+  option checks. They now run, architecture-aware, before the artifact is opened.
+
+**Not carried over:** preemption. Under resource pressure a Qwen4Exp request is not paused and
+replayed, because its whole KV extent is reserved at binding. It matters only at concurrency
+above 1 when the KV pool is short. A request that does not fit waits in the queue, as on dev.
 
 ---
 

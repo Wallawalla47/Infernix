@@ -167,14 +167,28 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
     Buffer<std::uint16_t> pooled_verify(std::vector<std::uint16_t>(pooled_count, 0)),
         pooled_commit(std::vector<std::uint16_t>(pooled_count, 0));
     Buffer<std::int32_t> dpos(positions), drows(table_rows), dtail(tail_slots), dtables(tables), dcommit(commit);
+    // Text RoPE: every M-RoPE axis is the token's position (axis-major [columns, 3]); a row's block
+    // start is the position of its first column's block.
+    const auto rope_of = [](const std::vector<std::int32_t>& columns) {
+        std::vector<std::int32_t> rope(3 * columns.size());
+        for (std::size_t a = 0; a < 3; ++a) {
+            std::copy(columns.begin(), columns.end(), rope.begin() + static_cast<std::ptrdiff_t>(a * columns.size()));
+        }
+        return rope;
+    };
+    std::vector<std::int32_t> starts(B);
+    for (std::int32_t b = 0; b < B; ++b) { starts[b] = positions[b * W] / R * R; }
+    Buffer<std::int32_t> drope(rope_of(positions)), dstarts(rope_of(starts));
     const auto batch_of = [&](bool update) {
-        return ninfer::ops::QsaBatch{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
-                                     .table_rows   = Tensor(drows.p, DType::I32, {B}),
-                                     .positions    = Tensor(dpos.p, DType::I32, {T}),
-                                     .tail_slots   = Tensor(dtail.p, DType::I32, {B}),
-                                     .batch        = B,
-                                     .width        = W,
-                                     .update_tails = update};
+        return ninfer::ops::QsaBatch{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
+                                     .table_rows       = Tensor(drows.p, DType::I32, {B}),
+                                     .positions        = Tensor(dpos.p, DType::I32, {T}),
+                                     .tail_slots       = Tensor(dtail.p, DType::I32, {B}),
+                                     .rope_positions   = Tensor(drope.p, DType::I32, {T, 3}),
+                                     .block_start_rope = Tensor(dstarts.p, DType::I32, {B, 3}),
+                                     .batch            = B,
+                                     .width            = W,
+                                     .update_tails     = update};
     };
     const auto layer_of = [&](Buffer<std::uint16_t>& pooled) {
         ninfer::ops::QsaKVLayer layer;
@@ -205,12 +219,16 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
             if (commit[b] == 0) { continue; }
             Tensor keys(draw.p, DType::BF16, {Di, T});
             Tensor tref(tails_ref.p + l * layer_tail, DType::BF16, {Di, R - 1, slots});
-            ninfer::ops::QsaBatch one{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
-                                      .table_rows   = Tensor(drows.p, DType::I32, {B}).slice(0, b, 1),
-                                      .positions    = Tensor(dpos.p, DType::I32, {T}).slice(0, b * W, commit[b]),
-                                      .tail_slots   = Tensor(dtail.p, DType::I32, {B}).slice(0, b, 1),
-                                      .batch        = 1,
-                                      .width        = commit[b]};
+            const std::vector<std::int32_t> row(positions.begin() + b * W, positions.begin() + b * W + commit[b]);
+            Buffer<std::int32_t> row_rope(rope_of(row)), row_start(rope_of({starts[b]}));
+            ninfer::ops::QsaBatch one{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
+                                      .table_rows       = Tensor(drows.p, DType::I32, {B}).slice(0, b, 1),
+                                      .positions        = Tensor(dpos.p, DType::I32, {T}).slice(0, b * W, commit[b]),
+                                      .tail_slots       = Tensor(dtail.p, DType::I32, {B}).slice(0, b, 1),
+                                      .rope_positions   = Tensor(row_rope.p, DType::I32, {commit[b], 3}),
+                                      .block_start_rope = Tensor(row_start.p, DType::I32, {1, 3}),
+                                      .batch            = 1,
+                                      .width            = commit[b]};
             Tensor row_keys(draw.p + (static_cast<std::size_t>(l) * T + b * W) * Di, DType::BF16, {Di, commit[b]});
             ninfer::ops::qsa_pool_keys(row_keys, Tensor(dnorm.p, DType::BF16, {Di}), tref, layer_of(pooled_ref), one,
                                        geometry, nullptr);

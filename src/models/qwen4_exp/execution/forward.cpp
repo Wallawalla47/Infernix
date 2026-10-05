@@ -406,7 +406,7 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const Tensor gates = z.view({DV, NV * T});
     ops::gated_rmsnorm(rows, p.norm, gates,
                        g.output_gate == GateActivation::Sigmoid ? ops::RmsGate::Sigmoid : ops::RmsGate::Silu,
-                       config_.rms_norm_eps, normed, s);
+                       config_.rms_norm_eps, normed, device_.execution_view().on_stream(s));
     Tensor y = work_.alloc(DType::BF16, {H, T});
     project(normed.view({VW, T}), p.output, y, work_, s);
     return y;
@@ -439,7 +439,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
         ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
     }
-    ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
+    ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn,
+              device_.execution_view().on_stream(s));
 
     // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
     const auto& layer = call.layer;

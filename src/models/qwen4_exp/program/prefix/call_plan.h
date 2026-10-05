@@ -20,6 +20,9 @@ struct CallCost {
     std::uint32_t served_columns = 8;            // calls this narrow are CPU-served (no staging)
     double served_call_seconds   = 0.035;        // their fixed cost (estimated, 25-40 ms)
     double split_budget          = 0.1;          // the most an automatic exact tap may add
+    // A cut followed by a GPU-staged call ends the layer walk's span there (a capture needs the
+    // boundary's state in every layer), so the next span streams the experts again.
+    double span_seconds = 0.0;
 
     [[nodiscard]] double call_seconds(std::uint32_t width) const noexcept;
 };

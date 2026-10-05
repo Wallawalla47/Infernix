@@ -54,7 +54,8 @@ struct PrefixCacheCounters {
     std::uint64_t host_image_writes           = 0;
     std::uint64_t host_block_writes           = 0;
     std::uint64_t host_image_restores         = 0;
-    std::uint64_t host_block_restores         = 0;
+    std::uint64_t host_block_restores         = 0; // prefetched blocks included
+    std::uint64_t prefetched_blocks           = 0;
     std::uint64_t host_tail_restores          = 0;
     std::uint64_t host_write_bytes            = 0;
     std::uint64_t host_restore_bytes          = 0;
@@ -198,6 +199,8 @@ public:
     [[nodiscard]] std::span<const cudaEvent_t> restore_events(RestoreTicket ticket) const noexcept;
     // Orders `consumer` after every copy of a landing batch.
     void order_after_restore(RestoreTicket ticket, cudaStream_t consumer) const;
+    // Waits on the host for a landing batch (and every batch before it) and retires what landed.
+    void await_restore(RestoreTicket ticket);
     void abort_restore() noexcept;
 
     // Releases every reference the cache holds; the index is rebuilt empty.

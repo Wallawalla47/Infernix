@@ -115,7 +115,7 @@ public:
 
     // A Program that resizes resources outside rounds (Qwen4Exp's expert cache, design §19.3.7)
     // asks for maintain() through a waker; the idle worker runs it under the execution lock.
-    static constexpr bool kProgramMaintains = requires(Program& program) {
+    static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
         program.maintain();
         program.set_maintenance_waker(std::function<void()>{});
     };
@@ -1897,10 +1897,19 @@ private:
                 recovering = lane;
             }
         }
+        // A lane whose context the Program blocks cannot take this cycle's prefill turn: offering
+        // it would idle the turn while the lane it waits for never runs.
+        auto prefill_view = slots_;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (prefill_view[lane] && prefill_view[lane]->sequence &&
+                instance_.program->context_blocks(*prefill_view[lane]->sequence)) {
+                prefill_view[lane].reset();
+            }
+        }
         const auto prefill = recovering && (slots_[*recovering]->is_prefilling() ||
                                             slots_[*recovering]->is_replaying())
                                  ? recovering
-                                 : scheduler_.next_prefill(slots_, max_concurrency_);
+                                 : scheduler_.next_prefill(prefill_view, max_concurrency_);
         std::vector<std::uint32_t> candidates;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
