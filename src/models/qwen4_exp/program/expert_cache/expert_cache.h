@@ -67,6 +67,8 @@ public:
     [[nodiscard]] std::uint32_t capacity() const { return capacity_; }
     [[nodiscard]] std::uint64_t now() const { return now_; }
     [[nodiscard]] double score(std::uint32_t key) const;
+    [[nodiscard]] std::uint32_t count(std::uint32_t key) const { return count_[key]; }
+    [[nodiscard]] std::uint32_t num_keys() const { return static_cast<std::uint32_t>(count_.size()); }
     [[nodiscard]] std::span<const std::uint32_t> residents() const { return residents_; }
 
     // Seeds residency and counts, for example from a saved state or a shipped profile.
@@ -94,6 +96,13 @@ private:
     std::vector<std::uint32_t> residents_; // dense list of resident keys
     std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
     std::vector<std::pair<double, std::uint32_t>> scratch_;
+};
+
+// What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
+// highest score first.
+struct SavedState {
+    std::vector<std::uint32_t> counts;
+    std::vector<std::uint32_t> ranked;
 };
 
 // ---------------------------------------------------------------------------- frames
@@ -189,6 +198,11 @@ public:
     std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
     // Returns the run: capacity grows back and queued experts load into it.
     void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // Warm start (design §19.3.5 S4b): sets every key's count from `counts` (empty: unchanged), then
+    // loads `keys`, best first, into free frames while the policy has capacity. Before the first
+    // round only. Returns the number of keys loaded.
+    std::uint32_t seed(std::span<const std::uint32_t> keys, std::span<const std::uint32_t> counts,
+                       std::vector<Command>& out);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
     // The key held in `frame`, or nothing.
     [[nodiscard]] std::optional<std::uint32_t> frame_key(std::uint32_t frame) const;

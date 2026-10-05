@@ -923,6 +923,15 @@ int main() {
     } catch (const std::invalid_argument&) { fast_flag_rejected = true; }
     failures += check(fast_flag_rejected, "the removed --fast-prefill-kernel was accepted");
 
+    // --expert-state: absent keeps the default (the artifact path + .expert-state), "off" disables.
+    failures += check(!parse({"ninfer-serve", "model.ninfer"}).expert_state.has_value(),
+                      "serve expert state must default to the artifact's file");
+    const auto state_off = parse({"ninfer-serve", "model.ninfer", "--expert-state", "off"});
+    failures += check(state_off.expert_state.has_value() && state_off.expert_state->empty(),
+                      "serve --expert-state off must disable the saved state");
+    const auto state_file = parse({"ninfer-serve", "model.ninfer", "--expert-state", "cache.state"});
+    failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
+                      "serve --expert-state FILE must name the file");
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

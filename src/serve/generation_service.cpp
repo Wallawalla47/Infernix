@@ -256,6 +256,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.ngram_volume_path        = options_.ngram_volume_path;
+    engine_options.expert_state_path        = options_.expert_state ? *options_.expert_state
+                                                                    : std::filesystem::path(options_.artifact_path +
+                                                                                            ".expert-state");
     engine_options.thinking_budget_message  = options_.thinking_budget_message;
     engine_options.device                   = options_.device;
     engine_options.max_context              = options_.max_context;

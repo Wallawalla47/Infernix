@@ -182,6 +182,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             startup; must match a template the target accepts\n"
            "  --ngram-volume FILE        Qwen3.8-Flash-Next n-gram embedding volume\n"
            "                             (default: the artifact path + .ngram)\n"
+           "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
+           "                             startup to fill the VRAM expert cache, written at\n"
+           "                             stop and every 10 minutes between requests\n"
+           "                             (default: the artifact path + .expert-state)\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
@@ -402,6 +406,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = require_value("--ngram-volume");
+        } else if (arg == "--expert-state") {
+            const std::string path = require_value("--expert-state");
+            options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
             if (options.chat_template_path.empty()) {

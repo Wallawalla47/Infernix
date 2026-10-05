@@ -319,6 +319,8 @@ int main(int argc, char** argv) {
         engine_options.artifact_path            = cli.artifact_path;
         engine_options.chat_template_path       = cli.chat_template_path;
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
+        engine_options.expert_state_path        = cli.expert_state ? *cli.expert_state
+                                                                   : std::filesystem::path(cli.artifact_path.string() + ".expert-state");
         engine_options.ram_headroom_bytes       = cli.ram_headroom_bytes;
         engine_options.device                   = cli.device;
         engine_options.max_context              = cli.max_context;

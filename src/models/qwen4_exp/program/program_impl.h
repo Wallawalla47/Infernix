@@ -21,6 +21,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
@@ -682,6 +683,7 @@ public:
         experts.route_log    = residency_->route_log();
         experts.route_stride = residency_->route_stride();
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = residency_->table(l); }
+        warm_start_experts();
         if (!options_.route_trace.empty()) {
             trace_ = std::make_unique<RouteTrace>(
                 options_.route_trace,
@@ -1309,7 +1311,9 @@ private:
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
     std::size_t decode_budget(std::uint32_t tokens) {
-        if (residency_->stats().promotions < residency_->frames()) { return kDecodePromotionsPerLayer * tokens; }
+        // The fill phase: until every frame was loaded once (promoted or seeded at a warm start).
+        const ExpertResidency::Stats& stats = residency_->stats();
+        if (stats.promotions + stats.seeded < residency_->frames()) { return kDecodePromotionsPerLayer * tokens; }
         budget_tokens_ += tokens;
         const std::uint64_t due = budget_tokens_ / kDecodePromotionInterval;
         budget_tokens_ %= kDecodePromotionInterval;
@@ -1396,6 +1400,60 @@ public:
         waker_ = std::move(waker);
     }
 
+    // ---- warm start (design §19.3.5 S4b) ----
+    // Fills the frames from the saved state, before the first request.
+    void warm_start_experts() {
+        if (options_.expert_state.empty() || !options_.expert_cache) { return; }
+        const auto keys = c_.num_hidden_layers * c_.moe.experts;
+        const expert_cache::ExpertStateLoad load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        if (!load.state) {
+            diagnostic("expert cache starts empty: " + load.message);
+            expert_state_saved_ = std::chrono::steady_clock::now();
+            return;
+        }
+        const auto start           = std::chrono::steady_clock::now();
+        const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, device_.stream);
+        device_.synchronize();
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        char line[256];
+        std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s (%.1f GiB in %.2f s)", loaded,
+                      residency_->frames(), options_.expert_state.string().c_str(),
+                      static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+                      seconds);
+        diagnostic(line);
+        expert_state_saved_  = std::chrono::steady_clock::now();
+        expert_state_routed_ = residency_->stats().routed;
+    }
+
+public:
+    // Writes the saved state (at stop, and from maintain_expert_state). Never throws.
+    void save_expert_state() noexcept {
+        if (options_.expert_state.empty() || !residency_ || residency_->frames() == 0) { return; }
+        try {
+            const std::string error =
+                expert_cache::save_expert_state(options_.expert_state, options_.expert_state_identity, residency_->saved_state());
+            if (!error.empty()) { diagnostic("expert state not saved: " + error, DiagnosticLevel::Warning); }
+            expert_state_saved_  = std::chrono::steady_clock::now();
+            expert_state_routed_ = residency_->stats().routed;
+        } catch (const std::exception& error) {
+            diagnostic(std::string("expert state not saved: ") + error.what(), DiagnosticLevel::Warning);
+        } catch (...) {}
+    }
+    // Between requests: saves when rounds ran since the last save and 10 minutes have passed.
+    void maintain_expert_state() noexcept {
+        if (options_.expert_state.empty() || !residency_ || residency_->stats().routed == expert_state_routed_) { return; }
+        if (std::chrono::steady_clock::now() - expert_state_saved_ < kExpertStateInterval) { return; }
+        save_expert_state();
+    }
+
+private:
+    // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
+    static constexpr std::uint32_t kSeedCountCap = 16;
+    static constexpr std::chrono::minutes kExpertStateInterval{10};
+    std::chrono::steady_clock::time_point expert_state_saved_{};
+    std::uint64_t expert_state_routed_ = 0;
+
+public:
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
     // cache to the control law's decision.
     void apply_vram_target(bool idle) {

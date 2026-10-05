@@ -267,6 +267,22 @@ void CacheController::load(std::uint32_t key, std::uint32_t frame, std::vector<C
     out.push_back({Command::Kind::kWriteEntry, key, frame, table_[key].encode()});
 }
 
+std::uint32_t CacheController::seed(std::span<const std::uint32_t> keys, std::span<const std::uint32_t> counts,
+                                    std::vector<Command>& out) {
+    policy_.seed({}, counts);
+    std::uint32_t loaded = 0;
+    for (const std::uint32_t key : keys) {
+        if (key >= table_.size() || policy_.resident(key) || policy_.resident_count() >= policy_.capacity()) { continue; }
+        const auto frame = frames_.acquire();
+        if (!frame) { break; }
+        const std::uint32_t one[] = {key};
+        policy_.seed(one, {});
+        load(key, *frame, out);
+        ++loaded;
+    }
+    return loaded;
+}
+
 bool CacheController::complete_load(std::uint32_t key, std::uint32_t frame, std::uint64_t serial) const {
     return table_[key].state == ResidencyState::kReady && table_[key].frame == frame && load_serial_[key] == serial;
 }
