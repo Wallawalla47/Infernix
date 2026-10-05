@@ -10,6 +10,10 @@ add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 
+# Asynchronous unbuffered reads for the SSD expert tier (CPU and disk only).
+ninfer_add_test(ninfer_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_read_queue.cpp"
+  LIBRARIES ninfer_core)
+
 # Unbuffered block reads through a ring (CPU and disk only).
 ninfer_add_test(ninfer_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
   LIBRARIES ninfer_core)
