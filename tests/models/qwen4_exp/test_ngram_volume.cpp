@@ -131,6 +131,18 @@ int main() {
         check(rows_match(many, read(volume, many)), "cached rows equal the oracle");
         check(volume.counters().reads == before.reads && volume.counters().hits - before.hits == many.size(),
               "a second call hits the cache");
+        check(volume.cached(many), "cached() reports rows already read");
+        std::vector<std::uint32_t> with_new = many;
+        std::uint32_t unread = 7;
+        const auto seen = [&](std::uint32_t r) {
+            return std::find(rows.begin(), rows.end(), r) != rows.end() ||
+                   std::find(shared.begin(), shared.end(), r) != shared.end() ||
+                   std::find(many.begin(), many.end(), r) != many.end();
+        };
+        while (seen(unread)) { unread += 9973; }
+        with_new.push_back(unread); // never read
+        check(!volume.cached(with_new), "cached() reports a row not yet read");
+        check(!volume.cached(std::vector<std::uint32_t>{static_cast<std::uint32_t>(kRows)}), "cached() rejects a row past the table");
 
         // Two rows of one cache slot (the slot is a hash of the row id; brute-force a collision).
         const auto slot_of = [](std::uint32_t row) { return (row * 2654435761U) >> 12U; };
