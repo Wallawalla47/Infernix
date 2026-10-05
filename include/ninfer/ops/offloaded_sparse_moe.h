@@ -79,15 +79,17 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// CPU-served misses (design section 10.3). When enabled for a call (max_jobs > 0 and the call
 /// has at most max_columns <= kMaxCpuCallColumns columns), up to max_jobs <= kMaxCpuJobs of its
 /// non-resident experts with at most max_job_columns columns, the fewest-column ones first, are
-/// published as a request in mapped host memory, with the x columns they read, and computed by
+/// published as a request in mapped host memory, with the x columns they read (compacted: the
+/// request's column k is x's k-th column read by a chosen job, in column order), and computed by
 /// the host's expert engine (offloaded_moe::CpuMissService) while the GPU computes the other jobs.
+/// Calls of at least wide_from columns (prefill; 0: none) take wide_jobs as their cap instead.
 /// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
 /// so where an expert is computed never changes a bit. A host that does not answer within 2 s
 /// traps the kernel.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
-    std::uint16_t* x                    = nullptr; // mapped BF16 [H, max_columns]
-    const std::uint16_t* y              = nullptr; // mapped BF16 [H, max_jobs * kMaxCpuColumns]
+    std::uint16_t* x                    = nullptr; // mapped BF16 [H, kMaxCpuXColumns]
+    const std::uint16_t* y              = nullptr; // mapped BF16 [H, max(max_jobs, wide_jobs) * kMaxCpuColumns]
     const std::uint32_t* done           = nullptr; // mapped; the host writes the answered sequence
     std::uint32_t* sequence             = nullptr; // device counter of published requests
     std::int32_t layer                  = 0;
@@ -97,6 +99,10 @@ struct MoeCpuChannel {
     // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
     std::int32_t pcie_divisor           = 3;
     std::int32_t max_job_columns        = offloaded_moe::kMaxCpuColumns; // 1..kMaxCpuColumns
+    // Prefill CPU assist (design §19.3.1 P7): calls of at least wide_from columns (0: none) take up
+    // to wide_jobs <= kMaxCpuJobs CPU-served misses.
+    std::int32_t wide_from              = 0;
+    std::int32_t wide_jobs              = 0;
 };
 
 /// Device memory a call warms into L2 while it waits for its CPU-served misses (design §19.3.3

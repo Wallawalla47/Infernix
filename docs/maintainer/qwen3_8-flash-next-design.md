@@ -3728,6 +3728,29 @@ assist on and off at 32, 256 and 2,048 columns, plus the W4A4 oracle) and M6. **
 speeds every cold prompt ≤ ~2K and the last chunk of long ones. **Risks:** DRAM contention with the
 GPU's staging reads; worker scheduling on P- and E-cores.
 
+*P7 as implemented* (branch `claude/fn-prefix-p7`, over concurrency S3, 2026-10-05):
+
+- **Op.** `kMaxCpuJobs` 32 → 256 and `kMaxCpuCallColumns` 256. The plan publishes the chosen jobs'
+  x columns compacted (the request names them by compact index, in column order), so the mapped x
+  holds at most `kMaxCpuXColumns` = 256 columns whatever the call's width. `MoeCpuChannel` /
+  `CpuMissService::Options` gain `wide_from` and `wide_jobs`: a call of at least `wide_from`
+  columns takes `wide_jobs` as its cap instead of `max_jobs`. Deviation from the plan above: the
+  split keeps the decode rule, want = min(cap, M − M / divisor) with divisor 3 (the CPU takes about
+  two thirds of the thinnest misses); the per-layer EMA split is not built, since this rule already
+  doubles short-prompt prefill (below). The CPU call bookkeeping grows to 1,280 bytes.
+- **Program.** `ProgramOptions::cpu_assist_jobs` (256; 0 disables): the service's `max_columns`
+  becomes 255 (`kAssistMaxColumns`) and `wide_from` the decode width + 1, so prefill calls of
+  9-255 columns are assisted; wider chunks route nearly every expert and stream or stage on the GPU
+  (F2).
+- **Tests.** Layer test: an assist service (cap 256 from 9 columns) with the count oracle by width.
+  `forward_real --cpu-columns` adds 24- and 100-column calls through a service configured as the
+  Program's: 2,980 and 5,495 experts CPU-served, logits bitwise equal to the GPU route.
+- **Measured** (2026-10-05, ABBA in one build with a temporary toggle, `ninfer_bench`, chunk 1024,
+  three repetitions): pp64 82.7 → 167.0 tok/s (+102 %), pp128 126.7 → 246.4 (+94 %), pp200 158.8 →
+  287.9 (+81 %); the code prompt at `--prefill-chunk 128` prefills 62.9 → 88.5 tok/s plain and
+  62.6 → 96.5 MTP with identical greedy ids; tg512 101.14 → 101.07 (noise). M6's suffix gate after
+  a prefix hit is not measured yet (it needs the P5 planner on the same branch).
+
 #### Flags, Engine wiring and Vision
 
 | Flag | Qwen4Exp semantics |

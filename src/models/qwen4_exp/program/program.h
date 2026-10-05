@@ -313,6 +313,10 @@ struct ProgramOptions {
     std::uint32_t cpu_expert_workers = 6;
     std::uint32_t cpu_expert_jobs    = 8;
     std::int32_t cpu_pcie_divisor    = 3;
+    // Prefill CPU assist (design §19.3.1 P7): prefill calls wider than a decode round and narrower
+    // than kAssistMaxColumns hand up to this many of each layer's thinnest misses to the CPU (same
+    // divisor). 0 disables.
+    std::uint32_t cpu_assist_jobs    = 256;
     // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
     // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
     bool prefix_cache                = false;

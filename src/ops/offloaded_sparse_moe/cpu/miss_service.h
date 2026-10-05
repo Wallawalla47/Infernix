@@ -33,6 +33,8 @@ public:
         int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
         int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
+        int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
+        int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
     };
 
@@ -51,8 +53,9 @@ private:
     std::vector<Layer> layers_;
     Options options_;
     MissRequest* request_ = nullptr; // mapped
-    std::uint16_t* x_     = nullptr; // mapped BF16 [H, max_columns]
-    std::uint16_t* y_     = nullptr; // mapped BF16 [H, max_jobs * kMaxCpuColumns]
+    std::uint16_t* x_     = nullptr; // mapped BF16 [H, kMaxCpuXColumns]
+    std::uint16_t* y_     = nullptr; // mapped BF16 [H, max(max_jobs, wide_jobs) * kMaxCpuColumns]
+    int jobs_             = 0;       // max(max_jobs, wide_jobs)
     std::uint32_t* done_  = nullptr; // mapped
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};

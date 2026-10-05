@@ -8,9 +8,10 @@
 
 namespace ninfer::ops::offloaded_moe {
 
-inline constexpr int kMaxCpuJobs        = 32;  // CPU-served experts per layer call
+inline constexpr int kMaxCpuJobs        = 256; // CPU-served experts per layer call (prefill assist: up to ~2/3 of a layer's misses)
 inline constexpr int kMaxCpuColumns     = 8;   // columns per CPU-served expert (the narrow route's n)
-inline constexpr int kMaxCpuCallColumns = 128; // columns of a CPU-served call (8 lanes x width 16)
+inline constexpr int kMaxCpuCallColumns = 256; // columns of a CPU-served call (decode: 8 lanes x width 16; prefill assist: < 256)
+inline constexpr int kMaxCpuXColumns    = 256; // x columns one request publishes (compacted: at most the call's columns)
 inline constexpr int kMaxLandingSlots   = 32;  // landing frames of one call (MoeExpertSource::landing)
 
 // Written by the device: every field, a system-scope fence, then `sequence`. The host answers by

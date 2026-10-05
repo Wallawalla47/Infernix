@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
@@ -49,7 +50,8 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     : layers_(std::move(layers)), options_(std::move(options)) {
     if (options_.workers < 1 || options_.max_jobs < 1 || options_.max_jobs > kMaxCpuJobs ||
         options_.max_columns < 1 || options_.max_columns > kMaxCpuCallColumns || options_.max_job_columns < 1 ||
-        options_.max_job_columns > kMaxCpuColumns) {
+        options_.max_job_columns > kMaxCpuColumns || options_.wide_from < 0 || options_.wide_jobs < 0 ||
+        options_.wide_jobs > kMaxCpuJobs || (options_.wide_from > 0) != (options_.wide_jobs > 0)) {
         throw std::invalid_argument("CPU miss service options are out of range");
     }
     for (const auto& layer : layers_) {
@@ -64,8 +66,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         return p;
     };
     request_ = static_cast<MissRequest*>(mapped(sizeof(MissRequest)));
-    x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * options_.max_columns));
-    y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * options_.max_jobs * kMaxCpuColumns));
+    jobs_    = std::max(options_.max_jobs, options_.wide_jobs);
+    x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * kMaxCpuXColumns));
+    y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * jobs_ * kMaxCpuColumns));
     done_    = static_cast<std::uint32_t*>(mapped(64));
     cuda_require(cudaMalloc(&sequence_, sizeof(std::uint32_t)), "cudaMalloc");
     cuda_require(cudaMemset(sequence_, 0, sizeof(std::uint32_t)), "cudaMemset");
@@ -94,14 +97,16 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.max_columns  = options_.max_columns;
     out.pcie_divisor = options_.pcie_divisor;
     out.max_job_columns = options_.max_job_columns;
+    out.wide_from       = options_.wide_from;
+    out.wide_jobs       = options_.wide_jobs;
     return out;
 }
 
 void CpuMissService::serve() {
     try {
         pin(options_.cpus.empty() ? -1 : options_.cpus[0]);
-        CpuExpertTeam team({.workers = options_.workers, .max_jobs = options_.max_jobs, .cpus = options_.cpus});
-        std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(options_.max_jobs));
+        CpuExpertTeam team({.workers = options_.workers, .max_jobs = jobs_, .cpus = options_.cpus});
+        std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request_->sequence);
         auto* volatile_done     = reinterpret_cast<volatile std::uint32_t*>(done_);
         std::uint32_t seen      = *volatile_sequence;
