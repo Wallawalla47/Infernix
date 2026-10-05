@@ -507,6 +507,27 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             source.landing_slots = experts_.landing_slots;
         }
     }
+    // While the host computes this call's misses, the CPU wait warms the next layer's first weights
+    // into L2: its attention-mixer down and up projections and the start of its input projection.
+    if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
+        const auto& next = parameters_.layers[layer + 1];
+        const Weight& input = config_.layer_types[layer + 1] == MixerKind::Gdn
+                                  ? std::get<GdnParameters>(next.mixer).projection.weight
+                                  : std::get<AttentionParameters>(next.mixer).projection.weight;
+        constexpr std::size_t kInputWarm = 16ULL << 20;
+        const std::pair<const Weight*, std::size_t> spans[] = {
+            {&next.attn_hc.down.weight, next.attn_hc.down.weight.payload_bytes},
+            {&next.attn_hc.up.weight, next.attn_hc.up.weight.payload_bytes},
+            {&input, std::min<std::size_t>(input.payload_bytes, kInputWarm)}};
+        int i = 0;
+        for (const auto& [w, bytes] : spans) {
+            if (w->payload != nullptr && reinterpret_cast<std::uintptr_t>(w->payload) % 16 == 0) {
+                source.l2_warm.ptr[i]   = w->payload;
+                source.l2_warm.bytes[i] = bytes;
+                ++i;
+            }
+        }
+    }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
     }

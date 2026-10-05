@@ -4857,6 +4857,25 @@ the same Ops. `hyper_connection_norm`, `_gates` and `_collapse` become private k
 | L2 class per weight | New Core `Weight` field `l2` ∈ {`Stream`, `Reuse`} set at Qwen4Exp binding: main-forward dense weights `Stream` (K1 adds an evict-first `createpolicy` hint), drafter dense weights `Reuse` (default policy). Narrows §8.3 rule 5. Drafter evict-last is a measured variant, kept only if M4 shows a gain | Protects the measured drafter L2 reuse |
 | Shared expert on its own branch (2026-10-04, Strata `cfd3b72`) | The shared expert depends only on the MLP mixer output, but runs on the main stream after the resident expert pass (`forward.cpp:458-477`), so it overlaps staging and CPU misses but not the routing chain (router, route, dispatch, `cpu_plan`; a 10.5 µs mean route → count gap) or the resident experts. Fork it at the mixer output onto a Program-owned stream (not the miss-staging fork stream, where it would queue behind `stage_kernel`), join before `moe_experts_cpu_wait`; two events per layer, graph-captured | −0.1 to −0.25 ms at T = 1 in GPU-bound layers (estimate); less in miss-heavy MTP rounds and after 1b's two-kernel shared chain (~8-9 µs). Kept only if M4 shows it beyond noise |
 
+*Phase 2 as implemented so far* (2026-10-05):
+
+- **L2 warming in the CPU wait** (branch `claude/fn-kernels-l2`, over concurrency S3): `MoeL2Warm`
+  (four spans) in `MoeExpertSource`; when a call published a CPU request, `cpu_wait_kernel` runs 8
+  more CTAs that issue `cp.async.bulk.prefetch.L2.global` in 16 KiB pieces over their share of the
+  spans, then exit. Forward warms the next layer's `attn_hc` down and up and the first 16 MiB of its
+  mixer input projection. Measured (ABBA in one build with a temporary toggle; outputs identical):
+  tg512 plain 100.65/100.98 → 102.52/102.54 tok/s (+1.7 %), tg512 MTP 152.93/153.02 → 153.80/153.87
+  (+0.6 %), cold CLI code plain 74.3/74.5 → 75.5/75.4 (+1.4 %), MTP 89.7/89.8 → 89.7/90.2 (+0.2 %).
+- **Shared expert on its own branch: rejected.** Built (Program-owned stream, fork at the MoE input,
+  join before the CPU wait, the shared ops on a sub-arena carved before the fork), ids identical,
+  but slower: tg512 MTP 135.5/134.6 → 132.2/132.8 tok/s (−2.0 %; the code and tg512-plain arms of
+  that run overlapped builds, a rerun is in the k2pdl rig). The shared chain competes with the
+  routing chain and the resident experts for SMs.
+- **PDL for K1** (branch `claude/fn-kernels-2`): weights first, `pdl::wait_for_dependencies`
+  before x or the output, `trigger_dependents` after the passes, `pdl::launch_with` (programmatic
+  only in captured graphs); a captured producer → K1 case in the Q8 linear test. Measurement pending.
+- Not built yet: the `Weight` L2 class.
+
 #### Phase 3: tensor-core K2 (conditional)
 
 `mma.m16n8k16` BF16 → FP32 per 32-code group with exact int8 → BF16 decode (`q8_bf16_pair_from_s8`),
