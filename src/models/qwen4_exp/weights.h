@@ -84,6 +84,26 @@ struct ProposalWeights {
     WeightId token_ids; // I32 [rows]: each row's token id
 };
 
+// The Vision tower (design §19.3.2): Qwen3.5's tower and parameter names, BF16, pinned host memory
+// with vision offload, device memory otherwise.
+struct VisionNormWeights {
+    WeightId weight, bias;
+};
+
+struct VisionBlockWeights {
+    VisionNormWeights norm1, norm2;
+    WeightId query, key, value, query_bias, key_bias, value_bias;
+    WeightId output, output_bias;
+    WeightId fc1, fc1_bias, fc2, fc2_bias;
+};
+
+struct VisionWeights {
+    WeightId patch_embedding, patch_embedding_bias, position_embedding;
+    std::vector<VisionBlockWeights> layers;
+    VisionNormWeights merger_norm;
+    WeightId merger_fc1, merger_fc1_bias, merger_fc2, merger_fc2_bias;
+};
+
 struct TextWeights {
     WeightId token_embedding; // BF16, pinned host memory
     WeightId output_head;
@@ -91,6 +111,7 @@ struct TextWeights {
     std::vector<BlockWeights> layers;
     std::optional<MtpWeights> mtp;
     std::optional<ProposalWeights> proposal;
+    std::optional<VisionWeights> vision;
 };
 
 } // namespace ninfer::models::qwen4_exp

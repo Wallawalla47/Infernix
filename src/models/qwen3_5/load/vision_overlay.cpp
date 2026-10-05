@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -70,55 +71,49 @@ VisionOverlayGroup build_group(const PinnedRangeIndex& index,
 
 } // namespace
 
+VisionOverlayLayout make_vision_overlay_layout(const artifact::MaterializationPlan& plan,
+                                               const std::vector<artifact::ObjectHandle>& prelude,
+                                               const std::vector<std::vector<artifact::ObjectHandle>>& layers,
+                                               const std::vector<artifact::ObjectHandle>& merger) {
+    const PinnedRangeIndex index(plan);
+    VisionOverlayLayout out;
+    out.prelude = build_group(index, prelude);
+    out.layers.reserve(layers.size());
+    for (const auto& handles : layers) {
+        VisionOverlayGroup group = build_group(index, handles);
+        out.slot_bytes           = std::max(out.slot_bytes, group.bytes);
+        out.layers.push_back(std::move(group));
+    }
+    out.merger        = build_group(index, merger);
+    out.staging_bytes = staging_align(out.prelude.bytes) + staging_align(out.merger.bytes) +
+                        2 * staging_align(out.slot_bytes);
+    return out;
+}
+
 VisionOverlayLayout compute_vision_overlay_layout(const ModelWeights& weights,
                                                   const std::vector<loading::PendingWeight>& pending,
                                                   const artifact::MaterializationPlan& plan) {
     if (!weights.vision) { throw std::logic_error("vision overlay layout requires vision weights"); }
     const VisionWeights& vision = *weights.vision;
-    const PinnedRangeIndex index(plan);
-    VisionOverlayLayout out;
-
-    {
-        std::vector<artifact::ObjectHandle> handles;
-        for (const WeightId id :
-             {vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}) {
+    const auto handles = [&](std::initializer_list<WeightId> ids) {
+        std::vector<artifact::ObjectHandle> out;
+        for (const WeightId id : ids) {
             auto part = objects_for(pending, id);
-            handles.insert(handles.end(), part.begin(), part.end());
+            out.insert(out.end(), part.begin(), part.end());
         }
-        out.prelude = build_group(index, handles);
+        return out;
+    };
+    std::vector<std::vector<artifact::ObjectHandle>> layers;
+    layers.reserve(vision.layers.size());
+    for (const VisionBlockWeights& s : vision.layers) {
+        layers.push_back(handles({s.norm1.weight, s.norm1.bias, s.norm2.weight, s.norm2.bias, s.query, s.key, s.value,
+                                  s.query_bias, s.key_bias, s.value_bias, s.output, s.output_bias, s.fc1, s.fc1_bias,
+                                  s.fc2, s.fc2_bias}));
     }
-
-    out.layers.reserve(vision.layers.size());
-    for (std::size_t layer = 0; layer < vision.layers.size(); ++layer) {
-        const VisionBlockWeights& source = vision.layers[layer];
-        std::vector<artifact::ObjectHandle> handles;
-        for (const WeightId id :
-             {source.norm1.weight, source.norm1.bias, source.norm2.weight, source.norm2.bias,
-              source.query, source.key, source.value, source.query_bias, source.key_bias,
-              source.value_bias, source.output, source.output_bias, source.fc1,
-              source.fc1_bias, source.fc2, source.fc2_bias}) {
-            auto part = objects_for(pending, id);
-            handles.insert(handles.end(), part.begin(), part.end());
-        }
-        VisionOverlayGroup group = build_group(index, handles);
-        out.slot_bytes           = std::max(out.slot_bytes, group.bytes);
-        out.layers.push_back(std::move(group));
-    }
-
-    {
-        std::vector<artifact::ObjectHandle> handles;
-        for (const WeightId id : {vision.merger_norm.weight, vision.merger_norm.bias,
-                                  vision.merger_fc1, vision.merger_fc1_bias,
-                                  vision.merger_fc2, vision.merger_fc2_bias}) {
-            auto part = objects_for(pending, id);
-            handles.insert(handles.end(), part.begin(), part.end());
-        }
-        out.merger = build_group(index, handles);
-    }
-
-    out.staging_bytes = staging_align(out.prelude.bytes) + staging_align(out.merger.bytes) +
-                        2 * staging_align(out.slot_bytes);
-    return out;
+    return make_vision_overlay_layout(
+        plan, handles({vision.patch_embedding, vision.patch_embedding_bias, vision.position_embedding}), layers,
+        handles({vision.merger_norm.weight, vision.merger_norm.bias, vision.merger_fc1, vision.merger_fc1_bias,
+                 vision.merger_fc2, vision.merger_fc2_bias}));
 }
 
 } // namespace ninfer::models::qwen3_5

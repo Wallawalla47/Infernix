@@ -37,7 +37,7 @@ struct Options {
     bool original_nvfp4_prefill_kernel = false;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
-    bool vision_offload                    = false;
+    VisionOffload vision_offload                    = VisionOffload::Auto;
     std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
 

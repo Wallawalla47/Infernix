@@ -1058,7 +1058,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it | Qwen guidance |
 | `--vision` | enable media input and load Vision GPU allocations | off |
-| `--vision-offload on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; requires `--vision` | `off` |
+| `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching; pause/replay resources stay available; rejected with the hybrid options below | prefix reuse on |

@@ -1,19 +1,13 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
+#include "models/qwen3_5/execution/vision_tower.h"
 
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/nvtx.h"
 #include "models/qwen3_5/program/vision_control.h"
-#include "ninfer/ops/add_bias.h"
-#include "ninfer/ops/gelu.h"
-#include "ninfer/ops/layer_norm.h"
 #include "ninfer/ops/linear.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
 #include <cmath>
@@ -57,11 +51,8 @@ struct VisionWorkspaceLayout {
     TensorRegion pos_weights;
     TensorRegion x;
     TensorRegion patch_bf16;
-    TensorRegion attended;
     TensorRegion qkv;
     TensorRegion attention_norm;
-    TensorRegion projected;
-    TensorRegion mlp_down;
     TensorRegion mlp_up;
     TensorRegion mlp_norm;
     TensorRegion normalized;
@@ -152,12 +143,8 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
             out.qkv = add(DType::BF16, {3 * dimension(config.hidden_size), patches}, "vision QKV");
             out.attention_norm     = add(DType::BF16, {dimension(config.hidden_size), patches},
                                          "vision attention norm/attended");
-            out.attended           = out.attention_norm;
             out.qkv_scratch        = scratch(qkv_bytes, "QKV scratch");
             out.projection_scratch = scratch(projection_bytes, "attention output scratch");
-            out.projected =
-                alias_tensor(out.qkv, DType::BF16, {dimension(config.hidden_size), patches},
-                             "attention projection output");
         }
         {
             auto mlp_scope = builder.scope();
@@ -165,7 +152,6 @@ VisionWorkspaceLayout build_workspace_layout(const VisionConfig& config,
                 add(DType::BF16, {dimension(config.intermediate_size), patches}, "vision MLP up");
             out.mlp_norm =
                 add(DType::BF16, {dimension(config.hidden_size), patches}, "vision MLP norm/down");
-            out.mlp_down     = out.mlp_norm;
             out.up_scratch   = scratch(up_bytes, "MLP up scratch");
             out.down_scratch = scratch(down_bytes, "MLP down scratch");
         }
@@ -215,11 +201,6 @@ std::size_t merger_hidden_bytes(const VisionConfig& config, std::size_t merged_t
     Tensor tensor(nullptr, DType::BF16,
                   {dimension(config.merger_width()), static_cast<std::int32_t>(merged_tokens)});
     return tensor.bytes();
-}
-
-void copy_host(const void* src, Tensor& dst, cudaStream_t stream) {
-    if (dst.bytes() == 0) { return; }
-    CUDA_CHECK(cudaMemcpyAsync(dst.data, src, dst.bytes(), cudaMemcpyHostToDevice, stream));
 }
 
 } // namespace
@@ -344,122 +325,38 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
     if (layout.bytes > plan.encode_peak_bytes || backing.bytes < plan.capacity_bytes) {
         throw std::invalid_argument("Vision workspace capacity is too small for request");
     }
-    const auto patches  = static_cast<std::int32_t>(patches64);
-    const auto tokens   = static_cast<std::int32_t>(tokens64);
     cudaStream_t stream = ctx_.stream;
-
-    const auto project = [&](const Tensor& x, const LinearParameters& p, Tensor& out,
-                             const LayoutRegion& region) {
-        WorkspaceArena scratch(region.bind(backing));
-        ops::linear(x, p.weight, out, p.policy, scratch, stream);
-    };
-    Tensor position_ids = layout.position_ids.bind(backing);
-    Tensor x            = layout.x.bind(backing);
-    Tensor patch_bf16   = layout.patch_bf16.bind(backing);
-    Tensor pos_indices  = layout.pos_indices.bind(backing);
-    Tensor pos_weights  = layout.pos_weights.bind(backing);
-    {
-        nvtx::ScopedRange patch_range(nvtx::Name::VisionPatchEmbedding, nvtx::Category::Vision,
-                                      static_cast<std::uint64_t>(patches64));
-        copy_host(control.position_ids.data(), position_ids, stream);
-        copy_host(item.patches.data(), patch_bf16, stream);
-        if (weight_stream != nullptr) { weight_stream->prelude_ready(stream); }
-        project(patch_bf16, parameters_.patch_embedding, x, layout.patch_scratch);
-        ops::add_bias(parameters_.patch_embedding_bias, x, stream);
-        // The artifact records the source table shape [rows,hidden], while Tensor's
-        // contiguous matrix convention is [inner,columns]. The payload is already
-        // row-major, so this is a zero-copy [hidden,rows] view, not a transpose.
-        copy_host(control.position_table_indices.data(), pos_indices, stream);
-        copy_host(control.position_table_weights.data(), pos_weights, stream);
-        Tensor position_table = parameters_.position_embedding.reshape(
-            {dimension(config_.hidden_size), dimension(config_.num_position_embeddings)});
-        ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
-    }
+    // The shared tower stages (vision_tower.h) over this plan's buffers.
+    Tensor x = layout.x.bind(backing);
+    const VisionEmbedBuffers embed{.position_ids  = layout.position_ids.bind(backing),
+                                   .patches       = layout.patch_bf16.bind(backing),
+                                   .pos_indices   = layout.pos_indices.bind(backing),
+                                   .pos_weights   = layout.pos_weights.bind(backing),
+                                   .patch_scratch = layout.patch_scratch.bind(backing)};
+    vision_embed(stream, config_, parameters_, control, item.patches, embed, x, weight_stream);
+    const VisionLayerBuffers buffers{.qkv                = layout.qkv.bind(backing),
+                                     .attention_norm     = layout.attention_norm.bind(backing),
+                                     .mlp_up             = layout.mlp_up.bind(backing),
+                                     .mlp_norm           = layout.mlp_norm.bind(backing),
+                                     .qkv_scratch        = layout.qkv_scratch.bind(backing),
+                                     .projection_scratch = layout.projection_scratch.bind(backing),
+                                     .up_scratch         = layout.up_scratch.bind(backing),
+                                     .down_scratch       = layout.down_scratch.bind(backing)};
     for (std::size_t layer = 0; layer < parameters_.layers.size(); ++layer) {
         nvtx::ScopedRange layer_range(nvtx::Name::VisionLayer, nvtx::Category::Vision,
                                       static_cast<std::uint64_t>(layer));
         if (weight_stream != nullptr) {
             weight_stream->arrive(static_cast<std::uint32_t>(layer), stream);
         }
-        const auto& block = parameters_.layers[layer];
-        {
-            nvtx::ScopedRange attention_range(nvtx::Name::VisionAttention,
-                                              nvtx::Category::Attention,
-                                              static_cast<std::uint64_t>(layer));
-            Tensor attended = layout.attended.bind(backing);
-            {
-                Tensor qkv = layout.qkv.bind(backing);
-                {
-                    Tensor h = layout.attention_norm.bind(backing);
-                    ops::layer_norm(x, block.norm1.weight, block.norm1.bias, 1.0e-6F, h, stream);
-                    project(h, block.qkv, qkv, layout.qkv_scratch);
-                }
-                ops::add_bias(block.qkv_bias, qkv, stream);
-                const std::int32_t plane      = dimension(config_.hidden_size);
-                const std::size_t plane_bytes = static_cast<std::size_t>(plane) * 2;
-                Tensor q(qkv.data, DType::BF16,
-                         {dimension(config_.hidden_size / config_.num_heads),
-                          dimension(config_.num_heads), patches});
-                Tensor k(static_cast<unsigned char*>(qkv.data) + plane_bytes, DType::BF16,
-                         {dimension(config_.hidden_size / config_.num_heads),
-                          dimension(config_.num_heads), patches});
-                Tensor v(static_cast<unsigned char*>(qkv.data) + 2 * plane_bytes, DType::BF16,
-                         {dimension(config_.hidden_size / config_.num_heads),
-                          dimension(config_.num_heads), patches});
-                q.nb[2] = qkv.nb[1];
-                k.nb[2] = qkv.nb[1];
-                v.nb[2] = qkv.nb[1];
-                ops::rope(position_ids, dimension(config_.hidden_size / config_.num_heads),
-                          10'000.0F, q, k, ctx_.execution_view().on_stream(stream));
-                Tensor attended_heads =
-                    attended.view({dimension(config_.hidden_size / config_.num_heads),
-                                   dimension(config_.num_heads), patches});
-                ops::packed_softmax_attention(
-                    q, k, v,
-                    {dimension(config_.hidden_size / config_.num_heads),
-                     dimension(config_.num_heads), dimension(config_.num_heads)},
-                    static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.hidden_size /
-                                                                           config_.num_heads))),
-                    control.segment_length, attended_heads, stream);
-            }
-            Tensor projected = layout.projected.bind(backing);
-            project(attended, block.output, projected, layout.projection_scratch);
-            ops::add_bias(block.output_bias, projected, stream);
-            ops::residual_add(projected, x, stream);
-        }
-        {
-            nvtx::ScopedRange mlp_range(nvtx::Name::VisionMlp, nvtx::Category::PostMixer,
-                                        static_cast<std::uint64_t>(layer));
-            Tensor down = layout.mlp_down.bind(backing);
-            Tensor up   = layout.mlp_up.bind(backing);
-            {
-                Tensor h = layout.mlp_norm.bind(backing);
-                ops::layer_norm(x, block.norm2.weight, block.norm2.bias, 1.0e-6F, h, stream);
-                project(h, block.fc1, up, layout.up_scratch);
-            }
-            ops::add_bias(block.fc1_bias, up, stream);
-            ops::gelu(up, ops::GeluMode::Tanh, stream);
-            project(up, block.fc2, down, layout.down_scratch);
-            ops::add_bias(block.fc2_bias, down, stream);
-            ops::residual_add(down, x, stream);
-        }
+        vision_layer(stream, config_, parameters_.layers[layer], embed.position_ids,
+                     control.segment_length, buffers, x);
     }
-
     if (weight_stream != nullptr) { weight_stream->merger_ready(stream); }
-    {
-        nvtx::ScopedRange merge_range(nvtx::Name::VisionMerge, nvtx::Category::Vision,
-                                      static_cast<std::uint64_t>(tokens64));
-        Tensor normalized = layout.normalized.bind(backing);
-        ops::layer_norm(x, parameters_.merger_norm.weight, parameters_.merger_norm.bias, 1.0e-6F,
-                        normalized, stream);
-        Tensor merged = normalized.view({dimension(config_.merger_width()), tokens});
-        Tensor hidden = layout.merger_hidden.bind(backing);
-        project(merged, parameters_.merger_fc1, hidden, layout.merger_first_scratch);
-        ops::add_bias(parameters_.merger_fc1_bias, hidden, stream);
-        ops::gelu(hidden, ops::GeluMode::Exact, stream);
-        project(hidden, parameters_.merger_fc2, output, layout.merger_second_scratch);
-        ops::add_bias(parameters_.merger_fc2_bias, output, stream);
-    }
+    const VisionMergerBuffers merger{.normalized     = layout.normalized.bind(backing),
+                                     .hidden         = layout.merger_hidden.bind(backing),
+                                     .first_scratch  = layout.merger_first_scratch.bind(backing),
+                                     .second_scratch = layout.merger_second_scratch.bind(backing)};
+    vision_merge(stream, config_, parameters_, x, merger, output);
 }
 
 VisionPrefillSession::VisionPrefillSession(

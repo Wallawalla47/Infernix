@@ -231,7 +231,6 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.purpose != EnginePurpose::CausalScoring) {
             throw ArtifactError("unknown loading purpose");
         }
-        if (options.vision) { throw ArtifactError("Vision is not implemented for Qwen4Exp"); }
         if (options.speculative != SpeculativeBackend::None && !options.mtp()) {
             throw ArtifactError("Qwen4Exp speculative decoding uses its MTP drafter (--spec mtp)");
         }
@@ -240,6 +239,20 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         Config out;
         out.text = text(directory.component("text").config);
+        if (options.vision) {
+            if (!directory.components.contains("vision")) { throw ArtifactError("the artifact has no vision component"); }
+            constexpr std::string_view types[] = {"qwen4_exp_vision"};
+            out.vision = qwen3_5::parse_vision_config(directory.component("vision").config, types);
+            if (out.vision->hidden_size / out.vision->num_heads != 72) {
+                throw ArtifactError("the Vision tower must have 72-wide heads");
+            }
+            // Image tokens rotate by three axes: the text RoPE must be interleaved M-RoPE.
+            for (std::size_t pair = 0; pair < out.text.rope.pair_axes.size(); ++pair) {
+                if (out.text.rope.pair_axes[pair] != pair % 3) {
+                    throw ArtifactError("Qwen4Exp vision needs interleaved M-RoPE (pair i on axis i % 3)");
+                }
+            }
+        }
         if (options.purpose == EnginePurpose::Generation && options.mtp()) {
             if (!directory.components.contains("mtp")) { throw ArtifactError("the artifact has no MTP component"); }
             out.mtp = true;

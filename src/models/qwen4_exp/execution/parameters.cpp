@@ -73,7 +73,63 @@ public:
         return out;
     }
 
+    // The Vision tower's parameters in the shared tower's types (qwen3_5/execution/vision_tower.h),
+    // prepared as Qwen3.5 prepares them: fused QKV over one input and its joined bias.
+    qwen3_5::execution::VisionParameters vision(const VisionWeights& w) const {
+        using qwen3_5::execution::NormParameters;
+        const auto norm = [&](const VisionNormWeights& n) { return NormParameters{tensor(n.weight), tensor(n.bias)}; };
+        qwen3_5::execution::VisionParameters out;
+        out.patch_embedding      = linear({w.patch_embedding});
+        out.patch_embedding_bias = tensor(w.patch_embedding_bias);
+        out.position_embedding   = tensor(w.position_embedding);
+        out.layers.reserve(w.layers.size());
+        for (std::size_t i = 0; i < w.layers.size(); ++i) {
+            out.layers.push_back(with_context("vision/layers/" + std::to_string(i), [&] {
+                const auto& layer = w.layers[i];
+                const std::array qkv{input(layer.query), input(layer.key), input(layer.value)};
+                return qwen3_5::execution::VisionBlockParameters{norm(layer.norm1),
+                                                                 norm(layer.norm2),
+                                                                 ops::prepare_linear_weight(qkv),
+                                                                 joined_bias({layer.query_bias, layer.key_bias, layer.value_bias}),
+                                                                 linear({layer.output}),
+                                                                 linear({layer.fc1}),
+                                                                 linear({layer.fc2}),
+                                                                 tensor(layer.output_bias),
+                                                                 tensor(layer.fc1_bias),
+                                                                 tensor(layer.fc2_bias)};
+            }));
+        }
+        out.merger_norm     = norm(w.merger_norm);
+        out.merger_fc1      = linear({w.merger_fc1});
+        out.merger_fc2      = linear({w.merger_fc2});
+        out.merger_fc1_bias = tensor(w.merger_fc1_bias);
+        out.merger_fc2_bias = tensor(w.merger_fc2_bias);
+        return out;
+    }
+
 private:
+    // One BF16 vector over three consecutive bias parameters (the converter stores them adjacent).
+    Tensor joined_bias(const std::array<WeightId, 3>& ids) const {
+        WeightView view;
+        std::uint64_t count = 0;
+        for (const auto id : ids) {
+            const auto& part_view = model_.weight(id).view;
+            count += weight_element_count(part_view.shape);
+            for (const auto& part : part_view.parts) {
+                if (!view.parts.empty() &&
+                    (view.parts.back().parent != part.parent || view.parts.back().end != part.begin)) {
+                    throw std::invalid_argument("Vision QKV bias: the three biases must be one contiguous bank");
+                }
+                view.parts.push_back(part);
+            }
+        }
+        if (count > std::uint64_t(std::numeric_limits<std::int32_t>::max())) {
+            throw std::invalid_argument("Vision bias exceeds Tensor extent");
+        }
+        view.shape = {count};
+        return weight_tensor(view, {static_cast<std::int32_t>(count)});
+    }
+
     const Model& model_;
 };
 
@@ -158,6 +214,12 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.proposal) {
         draft_head.rows      = prepare.linear({w.proposal->head});
         draft_head.token_ids = prepare.tensor(w.proposal->token_ids);
+    }
+    if (w.vision) {
+        vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
+        if (vision->merger_fc2.weight.n != static_cast<std::int32_t>(model.config().text.hidden_size)) {
+            throw std::invalid_argument("Qwen4Exp vision: the merger's output width differs from the text hidden size");
+        }
     }
 }
 

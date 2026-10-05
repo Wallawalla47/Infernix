@@ -275,10 +275,11 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "VISION (off by default)\n"
            "  --vision                   enable media and load the Vision GPU allocations\n"
-           "  --vision-offload on|off    keep the vision tower in pinned system RAM instead of\n"
-           "                             VRAM (default off); on adds no steady-state VRAM and\n"
-           "                             borrows device memory only while encoding an image;\n"
-           "                             requires --vision\n"
+           "  --vision-offload auto|on|off  keep the vision tower in pinned system RAM\n"
+           "                             instead of VRAM; on adds no steady-state VRAM and\n"
+           "                             borrows device memory only while encoding an image\n"
+           "                             (default auto: on for Qwen3.8-Flash-Next, off for\n"
+           "                             Qwen3.5); on requires --vision\n"
            "  --vision-max-merged N      bound merged vision tokens, 64-32768 (default 32768)\n"
            "  --media-cache-mib N        retained decoded-media cache\n"
            "                             (default 1024; 0 disables)\n"
@@ -620,12 +621,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--vision-offload") {
             const std::string_view value = require_value("--vision-offload");
-            if (value == "on") {
-                options.vision_offload = true;
+            if (value == "auto") {
+                options.vision_offload = VisionOffload::Auto;
+            } else if (value == "on") {
+                options.vision_offload = VisionOffload::On;
             } else if (value == "off") {
-                options.vision_offload = false;
+                options.vision_offload = VisionOffload::Off;
             } else {
-                throw std::invalid_argument("--vision-offload accepts on or off");
+                throw std::invalid_argument("--vision-offload accepts auto, on or off");
             }
         } else if (arg == "--vision-max-merged") {
             const std::uint32_t merged =
@@ -760,7 +763,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-split-workspace-mib must be in [0,16384]");
     }
     product::validate_speculative_cli_options(options.speculative);
-    if (options.vision_offload && !options.enable_vision) {
+    if (options.vision_offload == VisionOffload::On && !options.enable_vision) {
         throw std::invalid_argument("--vision-offload on requires --vision");
     }
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {

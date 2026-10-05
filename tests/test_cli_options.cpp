@@ -123,14 +123,21 @@ int run_tests() {
     const ninfer::cli::Options offload =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--vision-offload",
                "on", "--vision-max-merged", "512"});
-    failures += check(offload.enable_vision && offload.vision_offload,
+    failures += check(offload.enable_vision && offload.vision_offload == ninfer::VisionOffload::On,
                       "--vision-offload on did not reach CLI options");
     failures += check(offload.vision_max_merged_tokens == 512,
                       "--vision-max-merged did not preserve its value");
-    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
-                              "--vision-offload", "on", "--vision-offload", "off"})
-                           .vision_offload,
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision",
+                             "--vision-offload", "on", "--vision-offload", "off"})
+                              .vision_offload == ninfer::VisionOffload::Off,
                       "--vision-offload off did not reach CLI options");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello"}).vision_offload ==
+                          ninfer::VisionOffload::Auto,
+                      "--vision-offload does not default to auto");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision-offload", "off",
+                             "--vision-offload", "auto"})
+                              .vision_offload == ninfer::VisionOffload::Auto,
+                      "--vision-offload auto did not reach CLI options");
     failures +=
         check(ninfer::cli::usage_text("ninfer-cli").find("--vision-offload") != std::string::npos,
               "CLI help omits --vision-offload");

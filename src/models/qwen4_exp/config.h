@@ -6,6 +6,7 @@
 // (docs/maintainer/qwen3_8-flash-next-design.md §2, §12).
 
 #include "models/load_options.h"
+#include "models/qwen3_5/config.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 
 #include <array>
@@ -135,6 +136,9 @@ struct Config {
     TextConfig text;
     bool mtp = false;                // the MTP drafter is bound (--spec mtp)
     std::uint32_t proposal_rows = 0; // rows of the bound proposal head (--lm-head-draft), else 0
+    // The Vision tower (--vision): Qwen3.5's tower except its output width, which the merger's
+    // bound fc2 gives (design §19.3.2).
+    std::optional<qwen3_5::VisionConfig> vision;
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);

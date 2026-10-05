@@ -99,6 +99,9 @@ enum class ProposalHead : std::uint8_t {
     Optimized,
 };
 
+// Where the Vision tower's weights live between encodes (--vision-offload).
+enum class VisionOffload : std::uint8_t { Auto, On, Off };
+
 enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
@@ -357,8 +360,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     // Vision offload keeps the vision tower in pinned system RAM instead of device memory and
-    // streams it through borrowed evictable device staging per encode window.
-    bool vision_offload = false;
+    // streams it through borrowed device memory per encode window. Auto: on for
+    // Qwen3.8-Flash-Next (its expert cache lends the window's memory), off for Qwen3.5.
+    VisionOffload vision_offload = VisionOffload::Auto;
     // Upper bound on merged tokens per vision item; zero leaves the compiled limit.
     std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
