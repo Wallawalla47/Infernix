@@ -7,8 +7,8 @@
 // chat template, design §7).
 //
 // Admission reserves a request's whole KV extent (prompt plus its effective output ceiling) when
-// it is admitted, so an admitted request always completes; there is no prefix cache yet, so every
-// admission reuses nothing.
+// it is admitted, so an admitted request always completes. With the prefix cache, an admission
+// resumes from the deepest affordable snapshot and maps the cached blocks below it.
 
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/output_session.h"
@@ -20,6 +20,8 @@
 #include "runtime/contract/request.h"
 #include "runtime/contract/resources.h"
 #include "runtime/contract/timing.h"
+#include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include <array>
 #include <cstddef>
@@ -292,6 +294,12 @@ struct ProgramOptions {
     std::uint32_t cpu_expert_workers = 6;
     std::uint32_t cpu_expert_jobs    = 8;
     std::int32_t cpu_pcie_divisor    = 3;
+    // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
+    // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
+    bool prefix_cache                = false;
+    std::uint64_t prefix_host_bytes  = 0;
+    runtime::prefix_cache::TapPlannerConfig prefix_taps;
+    runtime::prefix_cache::CacheCostModel prefix_cost;
     DiagnosticObserver diagnostics;
     // Internal (A/B measurement and tests): the runtime VRAM monitor that shrinks and grows the
     // expert cache as other programs take and release device memory (design §19.3.7), and how long

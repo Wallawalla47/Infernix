@@ -96,6 +96,10 @@ struct ForwardBatch {
     const ForwardVerify* verify = nullptr; // set for a speculative verification call
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
     const MtpChunk* mtp_chunk = nullptr;   // when set: the chunk's MTP cells (one sequence)
+    // Prefix-cache copies of the call's lane in flight (a restore into it, a copy-out of it): each
+    // empty or one event per decoder layer, then one for the MTP block. Layer l waits for entry l
+    // before it reads or writes its state or KV planes; the MTP block waits for the last entry.
+    std::array<std::span<const cudaEvent_t>, 2> layer_waits{};
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c

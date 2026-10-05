@@ -13,6 +13,7 @@
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "models/registry.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
@@ -22,6 +23,8 @@
 namespace ninfer::runtime {
 namespace {
 
+// The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-cache-mib is not given.
+constexpr std::uint64_t kQwen4ExpDefaultHostCacheBytes = 4ULL << 30;
 // Planning allowance for the Program's pinned and mapped buffers (I/O staging, sampling, the CPU
 // expert service's mapped records); the measured total is well below it.
 constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
@@ -146,6 +149,23 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;
+    // The hybrid prefix cache (design §19.3.1). Host-born snapshots live in the pinned slab pool;
+    // the cost model ranks resume sources by the measured prefill coefficients.
+    const ContextCacheOptions& cache = options.context_cache;
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
+        const std::uint32_t chunk         = options.prefill_chunk;
+        program_options.prefix_cache      = true;
+        program_options.prefix_host_bytes = cache.host_cache_budget_bytes.value_or(kQwen4ExpDefaultHostCacheBytes);
+        program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value_or(8U);
+        program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value_or(std::max(4096U, 2U * chunk));
+        program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value_or(std::max(1024U, chunk));
+        program_options.prefix_cost.chunk_seconds          = 1.28;
+        program_options.prefix_cost.chunk_tokens           = chunk;
+        program_options.prefix_cost.token_seconds          = 1.17e-3;
+        program_options.prefix_cost.call_route_fraction    = 10.0 / 512.0;
+        program_options.prefix_cost.h2d_bytes_per_second   = 26.0e9;
+        program_options.prefix_cost.transfer_batch_seconds = 20.0e-6;
+    }
     program_options.route_trace   = models::qwen4_exp::testing::route_trace();
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;

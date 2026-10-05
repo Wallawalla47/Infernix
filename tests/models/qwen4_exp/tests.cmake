@@ -32,3 +32,16 @@ set_tests_properties(ninfer_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RE
 ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
   LIBRARIES ninfer_model_loading)
+
+# Prefix-cache state images and page records on synthetic Device pools (no model; skips without a GPU).
+ninfer_add_test(ninfer_qwen4_exp_prefix_state_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_state_image.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen4_exp_prefix_state_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# The prefix cache through the public Engine on the real artifact (NINFER_QWEN4_ARTIFACT): tap,
+# Host-block and endpoint resumes against cold and lane-resident runs, plain and MTP.
+ninfer_add_test(ninfer_qwen4_exp_prefix_cache_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_cache_real.cpp"
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)

@@ -869,10 +869,22 @@ void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> 
                                             std::span<const std::uint32_t> record_groups,
                                             const HostKVPageLayout& layout,
                                             cudaStream_t stream) const {
+    copy_to_host_records(source, records, record_groups, layout, 0, planes_.size(), stream);
+}
+
+void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                                            std::span<std::byte* const> records,
+                                            std::span<const std::uint32_t> record_groups,
+                                            const HostKVPageLayout& layout,
+                                            std::size_t plane_begin, std::size_t plane_end,
+                                            cudaStream_t stream) const {
     if (records.size() != source.size() || layout.geometry != geometry()) {
         throw std::invalid_argument("Paged KV D2H record geometry or extent is inconsistent");
     }
     validate_record_groups(record_groups, records.size(), "Paged KV D2H");
+    if (plane_begin > plane_end || plane_end > planes_.size()) {
+        throw std::invalid_argument("Paged KV D2H plane range is out of bounds");
+    }
     const std::size_t max_pitch = device_max_copy_pitch();
     for (std::size_t index = 0; index < source.size(); ++index) {
         (void)physical_index(source[index]);
@@ -887,8 +899,8 @@ void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> 
         std::size_t pitch     = 0;
         const std::size_t end = host_record_run_end(source, addresses, record_groups, begin,
                                                     layout.page_stride, max_pitch, pitch);
-        copy_host_run(cudaMemcpyDeviceToHost, 0, planes_.size(), source[begin].index_, end - begin,
-                      records[begin], pitch, layout, stream);
+        copy_host_run(cudaMemcpyDeviceToHost, plane_begin, plane_end, source[begin].index_,
+                      end - begin, records[begin], pitch, layout, stream);
         begin = end;
     }
 }

@@ -3797,6 +3797,76 @@ measurements):
   prefix, logits bitwise with the Program's CPU service and without), since the Program has no
   CPU on/off switch and a test-only one would sit in the shared `program_impl.h`.
 
+**P1 as built** (`a519a4a67`): `reserve_host_image` / `release_host_image` /
+`publish_host_snapshot` (a reservation's slabs are owned by nothing until published or released;
+reservations evict like `begin_snapshot_host_fill` but never past their claim and are never
+evicted while outstanding; `check_invariants` counts them), zero Device slots legal,
+`insert_block(…, attach)`, and `CacheCostModel::call_route_fraction` / `call_seconds` with
+`prefill_seconds` bit-identical to the per-chunk formula at ρ = 0. Tests U1 (Host-born publish with
+and without a tail, duplicates, refused publications, claims, reservations under eviction, the
+Device tail of a Host-born endpoint evicted and planned as a slab restore, `attach = false`, zero
+slots) and U4 (closed form, saturation, subadditivity, ρ = 0 identity) in
+`ninfer_prefix_cache_index_test`.
+
+**P2 as built**: `prefix/state_image.{h,cpp}`. The layout follows the forward pass: the header
+(256 B: magic, version, a fingerprint of every part, frontier, `mtp_written`, `mtp_next`,
+`lineage_echo`, `mtp_accept`), then per decoder layer its GDN recurrent and conv state or its QSA
+tail, the PLE history in the group of the layer it precedes, then the MTP group (saved residual,
+MTP tail); 115,673,088 bytes for the real geometry with MTP. `LaneStateImage` copies a lane to a
+segmented Host image (by group or whole), to and from a packed Device buffer, and restores by
+group. `kv_page_geometry` / `kv_layer_planes` are now the Program's single definition of the page
+group's plane order. Test X8 (`ninfer_qwen4_exp_prefix_state_test`, synthetic pools of the real
+geometry, no model): Host, packed and write-through round trips byte-exact without touching other
+lanes, header validation, and per-KV-layer page moves byte-exact (931,840-byte INT8 records).
+Packed Device slots are not allocated by the Program (Device snapshot slots stay 0, below).
+
+**P3 + P4 as built** (one step, pipelined from the start): `prefix/prefix_cache.{h,cpp}` (the
+binding) and `prefix/prefix_program.cpp` (the Program side).
+
+- **Snapshots are Host-born only.** A capture reserves Host slabs and copies the lane's image and
+  its partial page from the lane, one group (decoder layer, then MTP) at a time on the transfer
+  stream with an event after each; the next call of that lane waits per layer
+  (`ForwardBatch::layer_waits[1]`). The tail page's planes of a layer are copied with that layer
+  (`DeviceKVPagePool::copy_to_host_records` gained the plane-range form). An endpoint hands its
+  partial page over as the snapshot's Device tail; a tap keeps it and the lane's later writes wait.
+  The Host tier is therefore required: `--host-cache-mib 0` or Device snapshot slots are refused
+  (decided default 0 slots; packed slots are a later option).
+- **Restores** are one batch per admission on the restore stream, in forward order: a decoder
+  layer's group holds that layer's planes of every restored page (Host-only shared blocks into new
+  cache pages, a Host copy-on-write source into the lane's first private page) and its image parts;
+  the MTP group holds the MTP planes and image parts. One event per group; the first call waits
+  per layer (`layer_waits[0]`), by ticket, so a landed batch's recycled events are never waited on.
+- **Admission.** The quote chooses with the index (lane-resident candidates' restore bytes lowered
+  by the image) and checks fit as plan §7.1 (copy-on-write source per MR6). Reserve re-selects,
+  **pins the selection's path and snapshot before making room** (eviction could otherwise drop
+  the blocks it is about to map), evicts, reserves `need`, and activates: the table maps shared
+  pages, then private leases; a Device copy-on-write source is a `copy_page` on the compute stream;
+  `mtp_cells` follows MR6; taps are planned beyond the frontier.
+- **Waiting for an endpoint.** A prompt that continues an endpoint still being copied out (its
+  anchor on the matched path and its tail continuing the prompt) waits for that copy (≤ one image's
+  copy time) and is matched again; other prompts never wait.
+- **Publication** at every prefill call, plain and verified commit and finish, at the plan §7.4
+  frontier; MR5 decides adoption of a Host-only twin by `mtp_next`. Blocks past the prompt (the
+  generated output) chain their lookup hash from the previous block's
+  (`block_lookup_hash(previous, tokens, extra)`) and carry the prompt's trailing Vision key, as
+  Qwen3.5's `hybrid_publish_blocks` does; the lane's hash list grows with them. (Found by the real-artifact
+  test `ninfer_qwen4_exp_prefix_cache_real_test`: the first version published only the prompt's blocks, so a finish never had the
+  path an endpoint needs and turn 2 resumed from the last tap.) Taps are realized at prefill
+  call boundaries only (flexible): exact taps, and the opener, wait for P5's call planner.
+- **Finish / consistent abort.** The MR3 flush (one kv-only MTP cell from the saved residual), the
+  last blocks, the endpoint when F ≥ the lineage's deepest snapshot + 64 and every full block is
+  published, then write-through of the lane's Device-only path blocks after the endpoint (one
+  transfer stream). The lane records the endpoint capture: while nothing else is admitted into the
+  slot, a resume from that snapshot skips the image restore (lane-resident), only if the capture
+  created the snapshot and it is at the lane's frontier (`deepest == F`). When the endpoint is not
+  captured (within 64 tokens of the deepest snapshot, unfinished MTP blocks), the latest capture is
+  an earlier tap whose state the slot no longer holds; the first version recorded it anyway, and a
+  turn-2 resume from it skipped the restore and ran on the turn-1 end state (the real-artifact
+  test: outputs differed from the second token).
+- **Engine wiring (minimal; P6 completes it).** `ContextCacheMode::Hybrid` enables the cache with a
+  4 GiB default Host tier and the tap and cost defaults of plan §11; there are no stats or
+  persistence yet.
+
 #### Tests
 
 `ninfer_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)
