@@ -23,7 +23,14 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).
-- **Disk.** ~80 GB for the artifact, plus a 52 GB n-gram volume, ideally on its own NVMe drive.
+- **Disk.** ~80 GB for the artifact, plus a 52 GB n-gram volume on an NVMe drive.
+  - The volume is read in random 4 KiB blocks: about 1.1M reads in a 128K-token prompt, a few
+    per decode round.
+  - A fast consumer drive is enough. On an RTX 5090 machine, a Samsung 990 PRO and an Intel Optane
+    P5800X gave the same prefill (5,766 against 5,768 tok/s at 128K) and decode (111.3 tok/s).
+  - Per-read latency was ~200 µs on the 990 PRO against ~60 µs on the Optane, a few milliseconds
+    over a whole generation.
+  - A SATA SSD or a hard disk would be far slower.
 
 ## Convert
 
@@ -164,6 +171,26 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   least valuable experts at the next round boundary, or at once when idle, and logs it; it grows
   back 30 s after the memory is released. Decode is slower while the cache is smaller, and a
   warning is logged if it falls below a quarter of its startup size.
+- **The KV cache is elastic.**
+  - Startup backs only its first 32K tokens; the ledger shows `KV 482 (grows to 3360 from the
+    expert cache)`.
+  - A request that needs more KV takes the memory from the expert cache when it is admitted, and
+    gives it back when it ends.
+  - Cached prefix blocks that also have a host copy return their memory after 60 s with no request
+    running; a later match restores them from host RAM.
+  - A long `--max-context` therefore costs expert frames only while long contexts are in use. On
+    an RTX 5090 at `--max-context 262144`: 9,299 frames instead of 8,197, and plain decode 109.6
+    instead of 103.5 tok/s.
+- **`--vram-past-budget`** (Windows) also sizes the expert cache into VRAM that the Windows
+  per-process budget withholds.
+  - On an RTX 5090 the budget is 31,419 MiB against 32,187 MiB of physical memory less the driver's
+    reserve. A further 640 MiB allocates and runs at full VRAM speed: about 240 more expert frames.
+  - The engine measures this allowance at startup: physical memory less the reserve, less the
+    budget, less a 128 MiB margin. It reports it in the ledger (`… in use before loading (640 MiB
+    past the OS budget)`).
+  - If Windows lowers the budget later, the cache shrinks by the same amount.
+  - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
+    which slows decode until the cache shrinks. It is off by default.
 - On a system without CUDA virtual memory management the cache cannot resize: the headroom with a
   display is then 1 GiB, and a warning names the headroom to set when free VRAM runs short.
 - `--kv-capacity auto` means `--max-context` x `--max-concurrency`, the same as omitting it.
