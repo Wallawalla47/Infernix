@@ -1144,10 +1144,28 @@ public:
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
         round_width_ = 1;
         plain_round_ = true;
-        stage_decode(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
+        const std::span<const std::uint32_t> round_lanes(lanes.data(), static_cast<std::size_t>(batch));
+        const std::span<const std::int32_t> round_positions(positions.data(), static_cast<std::size_t>(batch));
+        // A replayed round reads its rows after the launch, while the GPU embeds and runs layer 0,
+        // and releases them to the gate before ple_embed (design §12.3, n-gram S4b); a round that
+        // warms or captures its graph reads them first.
+        // A round whose rows are all in the host cache reads nothing, so it stages them first.
+        const bool gated = graphs_[static_cast<std::size_t>(batch - 1)].executable.ready() &&
+                           !decode_rows_cached(round_lanes, round_positions);
+        stage_decode(round_lanes, round_positions);
+        const std::uint32_t word = next_gate_word();
+        if (!gated) {
+            stage_decode_rows(round_lanes, round_positions);
+            publish_pinned_word(gate_ready(), word);
+        }
         run_decode(batch);
+        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
-        sample(std::span<const std::uint32_t>(lanes.data(), batch), std::span<const std::int32_t>(positions.data(), batch));
+        sample(round_lanes, round_positions, [&] {
+            if (!gated) { return; }
+            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
+            release_gate.owner = nullptr;
+        });
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -1671,6 +1689,16 @@ private:
 
     std::uint32_t* gate_ready() const { return static_cast<std::uint32_t*>(gate_host_.data()); }
 
+    // The n-gram gate of a decode or verification graph: the pinned rows behind the round's word.
+    execution::NgramRowGate row_gate() const {
+        auto* io_device = static_cast<std::byte*>(io_device_.p);
+        return {.pinned_rows = host_io() + io_layout_.ngram,
+                .ready       = gate_ready(),
+                .expected    = reinterpret_cast<const std::uint32_t*>(io_device + io_layout_.gate),
+                .wait_stats  = static_cast<std::uint64_t*>(gate_stats_.p),
+                .wait_row    = reinterpret_cast<const std::int32_t*>(io_device + io_layout_.slots)};
+    }
+
     std::uint32_t lane_index(const Lane& lane) const noexcept {
         return static_cast<std::uint32_t>(&lane - lanes_.data());
     }
@@ -1870,7 +1898,55 @@ private:
             host_lanes_[b]   = static_cast<std::int32_t>(lanes[b]);
             stage_call_rope(lane, static_cast<std::uint32_t>(positions[b]), 1, static_cast<std::int32_t>(lanes.size()),
                             static_cast<std::int32_t>(b), static_cast<std::int32_t>(lanes.size()), static_cast<std::int32_t>(b));
+        }
+    }
+
+    // The n-gram rows of a plain decode round (column b: lane b's input token).
+    void stage_decode_rows(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
+        for (std::size_t b = 0; b < lanes.size(); ++b) {
+            Lane& lane = lanes_[lanes[b]];
             stage_ngram(lane, lane.history, positions[b], 1, b);
+        }
+    }
+
+    // Whether every n-gram row of a plain decode round is in the host row cache.
+    bool decode_rows_cached(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
+        const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
+        for (std::size_t b = 0; b < lanes.size(); ++b) {
+            const Lane& lane = lanes_[lanes[b]];
+            window_.clear();
+            for (std::int32_t p = positions[b] - context; p <= positions[b]; ++p) {
+                window_.push_back(p < 0 ? static_cast<std::int32_t>(c_.eos_token_id) : lane.history[static_cast<std::size_t>(p)]);
+            }
+            row_ids_.resize(hash_.heads());
+            hash_.row_ids(window_, 1, row_ids_.data());
+            if (!volume_.cached(row_ids_)) { return false; }
+        }
+        return true;
+    }
+
+    std::uint32_t next_gate_word() {
+        if (++gate_sequence_ == 0) { ++gate_sequence_; }
+        const std::uint32_t word = gate_sequence_;
+        *reinterpret_cast<std::uint32_t*>(host_io() + io_layout_.gate) = word;
+        return word;
+    }
+
+    // After a gated launch: submits the queued work, reads the rows (`read`), releases the gate and
+    // counts the reads toward `lane` (the round's first row).
+    void read_behind_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
+        device_.flush();
+        const NgramVolume::Counters before = volume_.counters();
+        read();
+        const NgramVolume::Counters& after = volume_.counters();
+        publish_pinned_word(gate_ready(), word);
+        ++lane.gate.rounds;
+        lane.gate.reads += after.reads - before.reads;
+        lane.gate.read_ns += after.read_ns - before.read_ns;
+        if (after.read_ns - before.read_ns > kSlowGatedReadNs) {
+            diagnostic("n-gram rows behind the gate took " + std::to_string((after.read_ns - before.read_ns) / 1000000) +
+                           " ms (the GPU waited at layer 1)",
+                       DiagnosticLevel::Warning);
         }
     }
 
@@ -1954,9 +2030,11 @@ private:
     // captured and later rounds replay it.
     void run_decode(std::int32_t batch) {
         const cudaStream_t s = device_.stream;
-        upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch), s);
+        upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         residency_->before_round(s, /*landing=*/true);
-        replay(graphs_[static_cast<std::size_t>(batch - 1)], [&] { forward_call(batch, 1, batch); });
+        const execution::NgramRowGate gate = row_gate();
+        replay(graphs_[static_cast<std::size_t>(batch - 1)],
+               [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate); });
         residency_->enqueue_route_download(s, batch);
     }
 
@@ -2119,9 +2197,7 @@ private:
                 stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
             }
         };
-        if (++gate_sequence_ == 0) { ++gate_sequence_; }
-        const std::uint32_t word = gate_sequence_;
-        *reinterpret_cast<std::uint32_t*>(host_io() + io_layout_.gate) = word;
+        const std::uint32_t word = next_gate_word();
         DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
         const bool gated   = graph.executable.ready();
         if (!gated) {
@@ -2131,13 +2207,7 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         residency_->before_round(s, /*landing=*/true);
-        auto* io_device = static_cast<std::byte*>(io_device_.p);
-        const execution::NgramRowGate gate{
-            .pinned_rows = host_io() + io_layout_.ngram,
-            .ready       = gate_ready(),
-            .expected    = reinterpret_cast<const std::uint32_t*>(io_device + io_layout_.gate),
-            .wait_stats  = static_cast<std::uint64_t*>(gate_stats_.p),
-            .wait_row    = reinterpret_cast<const std::int32_t*>(io_device + io_layout_.slots)};
+        const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
             forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate);
@@ -2173,21 +2243,8 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
         if (gated) {
-            device_.flush();
-            const NgramVolume::Counters before = volume_.counters();
-            read_rows();
-            const NgramVolume::Counters& after = volume_.counters();
-            publish_pinned_word(gate_ready(), word);
+            read_behind_gate(lanes_[lanes[0]], word, read_rows);
             release_gate.owner = nullptr;
-            Lane& first = lanes_[lanes[0]];
-            ++first.gate.rounds;
-            first.gate.reads += after.reads - before.reads;
-            first.gate.read_ns += after.read_ns - before.read_ns;
-            if (after.read_ns - before.read_ns > kSlowGatedReadNs) {
-                diagnostic("n-gram rows behind the gate took " + std::to_string((after.read_ns - before.read_ns) / 1000000) +
-                               " ms (the GPU waited at layer 1)",
-                           DiagnosticLevel::Warning);
-            }
         }
         device_.synchronize();
 
@@ -2573,7 +2630,9 @@ private:
     }
 
     // Samples the next token of each row from logits32_ (row b = column b) into pending_tokens_.
-    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
+    // `before_wait` runs on the host after the sampling work is queued, before its wait.
+    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
+                const std::function<void()>& before_wait = {}) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         Tensor wide(logits32_.p, DType::FP32, {vocab_, batch});
@@ -2597,6 +2656,7 @@ private:
                         ops::kSamplePurposeDecode, *work_, s);
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
+        if (before_wait) { before_wait(); }
         device_.synchronize();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }

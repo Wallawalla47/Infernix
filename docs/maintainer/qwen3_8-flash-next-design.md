@@ -1767,9 +1767,9 @@ and measurements: §19.3.4.
 bigram, 8-15 the trigram; EOS closes windows and pads the start; vision placeholders hash as tokens)
 and `NgramVolume::read_rows` probes a direct-mapped, pageable 2^20-row cache (~170 MB, alive with
 the Program), reading each distinct missing 4 KiB block once through a 64-deep polled ring (S1).
-Prefill, forced-token and plain decode calls read their rows before the launch and upload them
-with the io (`upload_pinned`; prefill: the whole layout). Verification rounds (S2) read them after
-the launch: the verify graph runs `upload_pinned_when` (Core) before `ple_embed`, which copies the
+Prefill and forced-token calls read their rows before the launch and upload them with the io
+(`upload_pinned`; prefill: the whole layout). Verification rounds (S2), and plain decode rounds
+with a row missing from the host cache (S4b), read them after the launch: the verify graph runs `upload_pinned_when` (Core) before `ple_embed`, which copies the
 rows from the pinned io once the pinned ready word equals the round's io `gate` word. The anchor
 column (committed tokens) and every column of an n-gram copy row are read while the drafter runs;
 the draft columns after the verify launch, while the GPU embeds and runs layer 0. A round that
@@ -5352,6 +5352,29 @@ unmeasured on G:) would hit a request's first gated round, and the slow-read war
   ~420 us, ~24 us each, which is close to serial latency, not the probe's ~4.5 us per read. Why the
   overlapped ring does not overlap here is open (next item); the cold code prompt reads few rows in
   decode (403 behind the gate), so it gains little.
+
+#### S4b as built: gated plain rounds (2026-10-05)
+
+The plain decode graph carries the same gate before `ple_embed`. A replayed plain round whose rows
+are all in the host cache (`NgramVolume::cached`, a probe of the hashed row ids) stages them before
+the launch as before; a round with a miss reads its rows after the launch, while the sampling work
+is queued, and publishes before its sync (`sample`'s `before_wait` hook). The first version gated
+every replayed round and lost 1.2 % on warm tg512 plain (110.26 -> 108.98 tok/s, sd 0.06; its cold
+story gain was +2.0 %); the cache probe removed that.
+
+Measured (one binary, temporary toggle; cold CLI, 400 tokens, 6 + 6 runs ABBA; tg512 2 + 2 files of
+3 reps): cold story plain 95.37 -> 97.47 tok/s (**+2.20 %**, ranges 95.3-95.6 / 97.2-97.8), cold
+code plain 83.15 -> 83.30 (+0.18 %, within noise: few decode reads), tg512 plain (n-gram warm)
+110.31 -> 110.36 (+0.04 %). Greedy ids identical, MTP equals plain, C = 2 serve identity 6/6 in
+both arms. Story: 391 gated rounds, 5,960 reads (167.8 ms) behind the gate, the GPU waited in 277
+rounds (mean 231 us): about 60 % of the read time is hidden; the rest waits on reads at ~28 us
+each.
+
+**Read cost (open).** Alone, one thread issues these overlapped unbuffered reads at 4.7-5.0 us each
+(batches of 17-64, no synchronous completions; 9.3 us on an E-core, 8.5 us with half the CPUs
+spinning, <= 5.8 us with 64 GiB pinned). Inside the engine they cost ~22-28 us each, and pinning
+the engine thread to a P-core or raising its priority changed nothing. Untested: contention with
+the GPU's zero-copy staging and the CPU expert team, and parallel issuers (S4c).
 
 #### S0 as built (branch `claude/fn-ngram`)
 

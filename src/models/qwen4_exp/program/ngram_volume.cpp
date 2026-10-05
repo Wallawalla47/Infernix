@@ -55,9 +55,6 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         throw std::invalid_argument("n-gram rows: output size differs from the row count");
     }
     const std::size_t row_bytes = table_.row_bytes;
-    const auto slot_of = [](std::uint32_t row) {
-        return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
-    };
     misses_.clear();
     for (std::size_t i = 0; i < rows.size(); ++i) {
         if (rows[i] >= table_.rows) { throw std::out_of_range("n-gram row id outside the table"); }
@@ -100,6 +97,13 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
     counters_.reads += offsets_.size();
     counters_.read_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+bool NgramVolume::cached(std::span<const std::uint32_t> rows) const noexcept {
+    for (const std::uint32_t row : rows) {
+        if (row >= table_.rows || tags_[slot_of(row)] != row) { return false; }
+    }
+    return true;
 }
 
 std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact) {

@@ -28,6 +28,9 @@ public:
     // Copies each row's codes to out[i * row_bytes, (i + 1) * row_bytes).
     void read_rows(std::span<const std::uint32_t> rows, std::span<std::byte> out) const;
 
+    // Whether every row is in the host cache, so read_rows would read nothing from the volume.
+    [[nodiscard]] bool cached(std::span<const std::uint32_t> rows) const noexcept;
+
     // Row traffic since the volume was opened: rows requested, rows served by the host cache, 4 KiB
     // blocks read from the volume, and the wall time of the calls' volume reads.
     struct Counters {
@@ -43,6 +46,11 @@ public:
 private:
     static constexpr unsigned kCacheBits  = 20; // 2^20 rows, ~170 MB with 160-byte rows
     static constexpr std::size_t kInFlight = 64; // blocks read at once
+
+    // The direct-mapped cache slot of a row.
+    static std::size_t slot_of(std::uint32_t row) noexcept {
+        return static_cast<std::size_t>((row * 2654435761U) >> (32U - kCacheBits));
+    }
 
     ReadOnlyFile file_;
     NgramTableConfig table_;
