@@ -1332,9 +1332,12 @@ private:
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
     std::size_t decode_budget(std::uint32_t tokens) {
-        // The fill phase: until every frame was loaded once (promoted, landed, or seeded at a warm start).
+        // The fill phase: until this session promoted or landed as many experts as there are frames.
+        // Seeded frames (a warm start) do not end it: promotions only follow misses, so a workload
+        // the saved state matches promotes little anyway, while one it does not match replaces the
+        // seeded experts at the fill rate instead of the steady-state rate.
         const ExpertResidency::Stats& stats = residency_->stats();
-        if (stats.promotions + stats.landed + stats.seeded < residency_->frames()) {
+        if (stats.promotions + stats.landed < residency_->frames()) {
             return kDecodePromotionsPerLayer * tokens;
         }
         budget_tokens_ += tokens;
@@ -1435,7 +1438,8 @@ public:
             return;
         }
         const auto start           = std::chrono::steady_clock::now();
-        const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, device_.stream);
+        const auto max_keys = static_cast<std::uint32_t>(kSeedShare * residency_->frames());
+        const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         char line[256];
@@ -1472,6 +1476,9 @@ public:
 private:
     // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
     static constexpr std::uint32_t kSeedCountCap = 16;
+    // The share of the frames a warm start fills (the best-ranked experts); the rest stay free for
+    // the fill phase's landing (S4), so a workload unlike the saved state still fills quickly.
+    static constexpr double kSeedShare = 0.5;
     static constexpr std::chrono::minutes kExpertStateInterval{10};
     std::chrono::steady_clock::time_point expert_state_saved_{};
     std::uint64_t expert_state_routed_ = 0;

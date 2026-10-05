@@ -94,9 +94,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - **Warm start.** The engine saves the expert cache's state (which experts it holds and how often each
   was used) to `<artifact>.expert-state` when it stops and every 10 minutes between requests. The
-  next start loads the highest-ranked experts into VRAM before the first request (about 1 s), so
-  the first few hundred tokens decode near the warm speed when the work resembles the last
-  session's. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
+  next start loads the highest-ranked experts into half of the expert cache before the first
+  request (under a second), so the first few hundred tokens decode faster when the work resembles
+  the last session's (measured +24 % plain and +30 % with MTP on a repeated coding prompt), and
+  about as fast as a cold start when it does not; the other half stays free to fill quickly. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
   as cold benchmarks need. Output is the same either way: where an expert is computed never
   changes a bit.
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the

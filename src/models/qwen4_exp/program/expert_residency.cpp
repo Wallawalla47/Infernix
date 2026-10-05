@@ -339,7 +339,8 @@ ExpertResidency::SavedState ExpertResidency::saved_state() const {
     return out;
 }
 
-std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t count_cap, cudaStream_t compute) {
+std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
+                                          cudaStream_t compute) {
     if (!controller_ || frames_ == 0) { return 0; }
     if (!state.counts.empty() && state.counts.size() != static_cast<std::size_t>(layers_) * experts_) {
         throw std::invalid_argument("expert residency: the saved state has another key count");
@@ -347,7 +348,8 @@ std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t
     std::vector<std::uint32_t> counts(state.counts);
     for (auto& count : counts) { count = std::min(count, count_cap); }
     commands_.clear();
-    const std::uint32_t loaded = controller_->seed(state.ranked, counts, commands_);
+    const std::span<const std::uint32_t> ranked(state.ranked.data(), std::min<std::size_t>(state.ranked.size(), max_keys));
+    const std::uint32_t loaded = controller_->seed(ranked, counts, commands_);
     issue_loads(compute);
     stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
     stats_.seeded += loaded;

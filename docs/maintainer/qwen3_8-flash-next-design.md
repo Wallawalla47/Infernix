@@ -5817,13 +5817,17 @@ shipped profile. It published no gain.
   in an old session ranks by recent use soon. Frame count is not part of the identity: a state
   ranks every resident, and a smaller cache loads its best prefix.
 - **Load.** In the Program constructor after the frames and tables exist:
-  `CacheController::seed(ranked, counts)` sets the counts, then loads ranked keys into free frames
-  while the policy has room (copy commands on the copy stream); the Program waits for them and
+  `CacheController::seed(ranked, counts)` sets the counts, then loads the best-ranked keys, up to
+  half the frames (`kSeedShare`), into free frames while the policy has room (copy commands on the copy stream); the Program waits for them and
   uploads the table, and logs `expert cache warm start: N of F frames from FILE (X GiB in Y s)` or
   why it started empty.
 - **Save.** `Program::shutdown_cleanup` (the Engine's orderly stop) and `Program::maintain` between
   requests (when rounds ran since the last save and 10 minutes passed); never during a round.
-- **Budget.** `decode_budget`'s fill test is `promotions + seeded < frames` (S4 adds `landed`).
+- **Budget.** As first built, `decode_budget`'s fill test was `promotions + seeded < frames`, as
+  planned above. Measured on a workload unrelated to the saved state it regressed (below), because
+  a seeded cache left the fill phase at once and replaced the irrelevant seeded experts only at the
+  steady-state rate. Since 2026-10-05 seeded frames do not end the fill phase (`promotions + landed <
+  frames`): promotions only follow misses, so a matching workload promotes little either way.
 - **Interface.** `EngineOptions::expert_state_path` (empty: off; `ninfer_bench` leaves it empty).
   CLI and serve: `--expert-state FILE|off`, default `<artifact>.expert-state`.
 - **Tests.** `test_expert_cache.cpp`: seed fills the policy's capacity, skips duplicates, residents
@@ -5839,7 +5843,18 @@ shipped profile. It published no gain.
     86.3-86.5 %;
   - the warm start loaded every frame (9,389 plain, 8,672 MTP; 24.2 / 22.3 GiB) in 0.96 / 0.88 s;
     the state file is 133-136 KB; greedy ids equal in all four runs of each mode.
-  - Not yet measured: a workload unrelated to the saved state, and the 10-minute save in a server.
+  - Unrelated workload (the story prompt warm-started from the code prompt's state, order off /
+    state / state / off) with the first fill rule: plain 72.9/72.6 → 62.7/62.9 tok/s (−13.7 %, hit
+    rate 73.7 → 60.7 %), MTP 74.8/74.9 → 62.3/62.7 (−16.5 %, 71.1 → 55.7 %); ids equal. The fill rule
+    was changed (Budget, above) and both workloads are re-measured.
+  - With the new fill rule (and S4's landing, which uses free frames) the regression on the
+    unrelated workload stayed for a full seed, because a full cache leaves landing no free frame.
+    Seed share sweep (one run per cell, from the code prompt's state, tok/s): code plain off 78.7,
+    share 1.0 105.8, 0.5 97.6, 0.25 90.8; code MTP 129.4 / 178.5 / 168.2 / 156.0; story plain 80.2 /
+    76.0 / 81.1 / 80.9; story MTP 95.9 / 77.8 / 92.3 / 96.0. **Decision:** a warm start fills half
+    the frames (`kSeedShare` = 0.5, the best-ranked experts): +24 % / +30 % on the matching workload,
+    within about 4 % of a cold start on the unrelated one.
+  - Not yet measured: the 10-minute save in a server.
 
 **S5. Fork at every width, compacted phase lists (1.5 days).** (1) `forked()` needs only a fork
 stream and `staging_slots > 0`. (2) S3's kernel becomes `plan_kernel`, run before every fork (also
