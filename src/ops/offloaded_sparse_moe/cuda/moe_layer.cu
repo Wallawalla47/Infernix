@@ -1046,10 +1046,13 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
-    const bool overlap  = source.overlap_stream != nullptr && half > 0 && max_jobs > half;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
     const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
+    // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
+    // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
+    const bool overlap  = source.overlap_stream != nullptr && half > 0 && max_jobs > half && !use_wide;
     std::optional<moe::wide::Call> wide;
     if (overlap) {
         // Double-buffered passes: stage pass p+1 on the side stream while pass p computes.
