@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -25,12 +26,16 @@ constexpr std::array kGeometries{
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
     Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
     Geometry{17408, 5120, 243U}, Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U},
-    // Qwen3.8-Flash-Next recipe B classes on the runtime-shape route: hyper-connection down
-    // (+inject) and up (K 320, padded to 384), GDN projection and output, QSA output, shared
-    // expert gate/up and down, PLE projection.
+    // Qwen3.8-Flash-Next's dense Q8 classes on the register-streamed route: hyper-connection
+    // down (+inject), final mixer down, hyper-connection up (K 320, padded to 384), GDN projection,
+    // GDN and QSA output, shared expert gate/up and down, PLE projection, the MTP attention group
+    // and the MTP embedding/hidden projections.
     Geometry{324, 10240, 301U},  Geometry{320, 10240, 307U},  Geometry{10240, 320, 311U},
-    Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{2560, 4096, 331U},
-    Geometry{1280, 2560, 337U},  Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}};
+    Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{1280, 2560, 337U},
+    Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}, Geometry{13952, 2560, 353U},
+    Geometry{2560, 2560, 359U},
+    // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
+    Geometry{2560, 4096, 331U}};
 
 int q8_a16_conformance() {
     int failures = 0;
@@ -80,14 +85,21 @@ int q8_a16_conformance() {
     return failures;
 }
 
-// Speculative verification relies on this for one row (design §11.3): on the runtime-shape SIMT
-// routes, an output column is bit-identical whether it is computed alone or beside up to seven
-// others. Covers the few-row route ([324, 10240]) and eight-row blocks with long and short K.
+// Speculative verification relies on this for one row (design §11.3): an output column is
+// bit-identical whether it is computed alone or beside other columns, up to 8 columns on every route
+// (the register-streamed and SIMT routes reduce a column identically, so a shape may mix them by
+// width), and as far as each Flash-Next shape keeps the register-streamed route beyond 8 (passes,
+// token slices and K-split warps): 64 for the hyper-connection and final-mixer downs, 48 for the
+// shared expert gate/up, 16 for its down.
 int q8_a16_column_invariance() {
-    constexpr int kColumns = 8;
-    int failures           = 0;
-    for (const auto& shape :
-         {Geometry{324, 10240, 401U}, Geometry{2560, 4096, 409U}, Geometry{10240, 320, 419U}}) {
+    int failures = 0;
+    for (const auto& [shape, kColumns] :
+         {std::pair{Geometry{324, 10240, 401U}, 64},  std::pair{Geometry{320, 10240, 403U}, 64},
+          std::pair{Geometry{10240, 320, 419U}, 8},   std::pair{Geometry{16384, 2560, 421U}, 8},
+          std::pair{Geometry{2560, 6144, 431U}, 8},   std::pair{Geometry{1280, 2560, 433U}, 48},
+          std::pair{Geometry{2560, 640, 439U}, 16},   std::pair{Geometry{12800, 2560, 443U}, 8},
+          std::pair{Geometry{13952, 2560, 449U}, 8},  std::pair{Geometry{2560, 2560, 457U}, 8},
+          std::pair{Geometry{2560, 4096, 409U}, 8}}) {
         const auto host = make_q8_g32_fp16_weight(shape.n, shape.k, shape.seed);
         std::vector<std::uint16_t> activation(static_cast<std::size_t>(shape.k) * kColumns);
         std::uint32_t state = shape.seed;

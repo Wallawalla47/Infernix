@@ -43,5 +43,16 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n17408_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n34816_k5120(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n248320_k5120(std::int32_t tokens);
+// Qwen3.8-Flash-Next's dense Q8 classes (register-streamed route up to 64 columns).
+[[nodiscard]] Q8Launch select_q8_n16384_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n12800_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n13952_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n1280_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k6144(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n324_k10240(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n320_k10240(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n10240_k320(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_n2560_k640(std::int32_t tokens);
 
 } // namespace ninfer::ops::detail

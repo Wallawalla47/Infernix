@@ -21,6 +21,31 @@ __device__ __forceinline__ V load_ldg(const T* ptr) {
     return __ldg(reinterpret_cast<const V*>(ptr));
 }
 
+// Read-only global load that does not allocate in L1: weights streamed once per call.
+template <class V, class T>
+__device__ __forceinline__ V ld_nc_na(const T* ptr) {
+    static_assert(sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 || sizeof(V) == 16);
+    if constexpr (sizeof(V) == 2) {
+        unsigned short value;
+        asm("ld.global.nc.L1::no_allocate.u16 %0, [%1];" : "=h"(value) : "l"(ptr));
+        return *reinterpret_cast<const V*>(&value);
+    } else if constexpr (sizeof(V) == 4) {
+        unsigned value;
+        asm("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(value) : "l"(ptr));
+        return *reinterpret_cast<const V*>(&value);
+    } else if constexpr (sizeof(V) == 8) {
+        uint2 value;
+        asm("ld.global.nc.L1::no_allocate.v2.u32 {%0, %1}, [%2];" : "=r"(value.x), "=r"(value.y) : "l"(ptr));
+        return *reinterpret_cast<const V*>(&value);
+    } else {
+        uint4 value;
+        asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+            : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+            : "l"(ptr));
+        return *reinterpret_cast<const V*>(&value);
+    }
+}
+
 template <class T, class V>
 __device__ __forceinline__ void store_vec(T* ptr, V value) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
