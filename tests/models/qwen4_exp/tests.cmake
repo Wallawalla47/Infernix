@@ -3,6 +3,11 @@ ninfer_add_test(ninfer_qwen4_exp_expert_cache_test
   LIBRARIES ninfer_qwen4_exp_expert_cache
   NEEDS_SOURCE_DIR)
 
+# The SSD tier's RAM-level controller (design §19.3.7 RT2), host only.
+ninfer_add_test(ninfer_qwen4_exp_host_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_tier.cpp"
+  LIBRARIES ninfer_qwen4_exp_expert_cache)
+
 ninfer_add_test(ninfer_qwen4_exp_ngram_hash_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ngram_hash.cpp"
   LIBRARIES ninfer_model_loading
