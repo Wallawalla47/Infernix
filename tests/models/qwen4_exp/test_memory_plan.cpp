@@ -92,6 +92,10 @@ void test_planned_terms() {
     const HostMemoryLedger more_pins = plan_host_memory(snapshot(50 * kGiB, 200 * kGiB), d);
     require(base.expert_ram - more_pins.expert_ram == kGiB + (kGiB * 25 + 9'999) / 10'000,
             "a later pin costs its bytes plus its lock overhead");
+    d = flash_next();
+    d.prefix_cache += kGiB;
+    const HostMemoryLedger prefix_tier = plan_host_memory(snapshot(50 * kGiB, 200 * kGiB), d);
+    require(prefix_tier.expert_ram == more_pins.expert_ram, "the prefix cache's Host tier is a pin like any other");
     d                   = flash_next();
     d.pageable += kGiB;
     const HostMemoryLedger more_cache = plan_host_memory(snapshot(50 * kGiB, 200 * kGiB), d);

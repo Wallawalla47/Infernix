@@ -134,7 +134,7 @@ std::size_t current_free_device_bytes() {
 
 } // namespace
 
-EngineOptions normalize_engine_options(EngineOptions options) {
+EngineOptions normalize_engine_options(EngineOptions options, models::Architecture architecture) {
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -168,6 +168,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
                                     "archive capacity");
     }
     const std::uint32_t concurrency = options.max_concurrency;
+    const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
+    if (qwen4_exp && cache.enabled && cache.mode == ContextCacheMode::Legacy) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next has no original (Legacy) prefix cache: use the hybrid prefix cache or "
+            "disable the context cache");
+    }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
         if (cache.device_state_slots) {
             throw std::invalid_argument(
@@ -175,16 +181,36 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_capacity_bytes =
-            cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
+        cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(
+            qwen4_exp ? kDefaultQwen4ExpHybridHostCacheBytes : kDefaultHybridHostCacheBytes);
         const bool host_tier             = *cache.host_capacity_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        if (qwen4_exp) {
+            // Qwen3.8-Flash-Next's snapshots are born in the Host tier (design §19.3.1): it needs
+            // the tier and has no Device snapshot slots.
+            if (!host_tier) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache keeps its snapshots in the Host tier: "
+                    "--host-cache-mib must be positive");
+            }
+            if (hybrid.device_snapshot_slots.value_or(0U) != 0) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache has no Device snapshot slots");
+            }
+            if (!hybrid.persistent_file.empty()) {
+                throw std::invalid_argument(
+                    "--prefix-cache-file is not available for Qwen3.8-Flash-Next");
+            }
+            hybrid.device_snapshot_slots = 0U;
+        }
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
         // storage, so one more is kept for shared prefixes.
-        hybrid.device_snapshot_slots =
-            hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+        if (!qwen4_exp) {
+            hybrid.device_snapshot_slots =
+                hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+        }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
@@ -194,7 +220,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
         hybrid.tap_min_gap_tokens =
             hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, chunk));
-        if (*hybrid.device_snapshot_slots == 0 || *hybrid.device_snapshot_slots > 64) {
+        if ((!qwen4_exp && *hybrid.device_snapshot_slots == 0) || *hybrid.device_snapshot_slots > 64) {
             throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
         }
         if (*hybrid.max_new_taps > 64) {

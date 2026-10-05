@@ -80,6 +80,8 @@ struct StateImageHeader {
     std::int32_t mtp_next = -1;
     // The capturing request resumed from an endpoint.
     bool lineage_echo = false;
+    // The snapshot is the generation-opener tap (an exact split before the assistant turn).
+    bool opener = false;
     std::array<double, 8> mtp_accept{};
 };
 

@@ -3876,6 +3876,58 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   4 GiB default Host tier and the tap and cost defaults of plan §11; there are no stats or
   persistence yet.
 
+**P5 as built** (branch `claude/fn-prefix-p5`, on the Vision head; 2026-10-05):
+`prefix/call_plan.{h,cpp}` (`plan_calls`, `CallCost`, `inside_exclusion`) and the Program wiring.
+
+- **One plan per admission.** Every selection (snapshot or root) carries a `CallPlan` from its
+  frontier: `plan_taps` with the prompt's hints, the matched frontiers and the Vision spans as
+  exclusions, then `plan_calls`. A lane without reuse (or with the cache off) gets the plain grid.
+  `advance_prefill` runs the lane's next planned call (`Lane::calls`) and throws if the plan does
+  not continue the lane's state. Quanta are the plan's call count + output − 1 + Vision steps (the
+  quote's resumed-request quanta previously omitted the Vision steps).
+- **Δ admission** as designed: boundary taps (Explicit, Structural) always cut; the opener and
+  Automatic taps, in position order, cut when they add ≤ `split_budget` = 0.1 s of fixed call
+  cost, else become flexible. A call of ≤ 8 columns costs `served_call_seconds` = 0.035 s (the
+  CPU-served estimate); wider calls `CacheCostModel::call_seconds`. A split that only shifts the
+  grid (same call count, saturated calls) has Δ ≈ 0 and is kept.
+- **Realization.** After a call ending at B: taps at or before B are due; a flexible tap is also
+  due at the start of the final call. A boundary strictly inside a Vision item realizes nothing
+  (its flexible taps wait for the next boundary). Calls of ≤ 8 columns promote at the decode rate
+  (`decode_budget`), wider calls 16 per layer.
+- **Opener kept** (no erasure after endpoint resumes, as decided). The image header gained bit 2
+  `opener` (a Tap at a GenerationOpener hint); an activation from a snapshot with `opener` and
+  `lineage_echo` counts `endpoint_mismatch_fallbacks`.
+- **Vision.** The quote drops candidates whose frontier lies strictly inside an item, then re-plans
+  the encode window from the frontier (`plan_vision(prompt, reused)`): items ending at or before F
+  are not encoded again (previously every item was re-encoded on a resume). The lendable-frames
+  check uses the re-planned window.
+- **Not built:** consecutive ≤ 8-column calls sharing one Engine step. Taps keep ≥ 64 tokens apart
+  (except Explicit), so two consecutive small calls do not arise in practice.
+- **Tests:** U2 `ninfer_qwen4_exp_call_plan_test` (grids, coverage, Δ admission and demotion against
+  an independent enumeration over 4,000 random plans, refused inputs, span membership). The real
+  test adds X5 (chat turn 2 without the reasoning block resumes at ≥ turn 1's opener), X6 (two
+  sessions sharing only the system block resume at the same structural frontier) and X3 in its
+  public-API form: a repeated chat prompt resumes at its own opener (an exact off-grid split of
+  the capturing run) and must generate the same ids. The D1/X3 Program oracle with
+  `force_call_boundaries` is not built.
+- **Found by the real test:** with user turns shorter than 64 tokens the opener lies within
+  `kMinimumTapSeparation` of the structural tap, and `plan_taps` keeps only the earlier tap of the
+  cluster (as designed), so such a turn resumes at the end of the system block. The test's turns
+  are longer than 64 tokens.
+
+**P6 as built** (same branch, 2026-10-05). Per-model resolution lives in
+`normalize_engine_options(options, Architecture)`; the Engine reads the artifact's architecture
+first (an unreadable artifact falls back to the Qwen3.5 rules and fails in construction). Qwen4Exp:
+Host tier default 4 GiB (`kDefaultQwen4ExpHybridHostCacheBytes`), 0 refused; no Device snapshot
+slots (refused if given); Legacy enabled refused (`ninfer` and `ninfer_bench` already disable the
+cache; the two real tests that used the default now disable it); `--prefix-cache-file` refused
+until persistence. The RAM ledger gained a `prefix cache` term: the Host tier is planned with the
+experts (with the default, ~73.3 GiB must be available for `ninfer-serve`). `hybrid_stats` and the
+materialization diagnostics (`cached_prefix_tokens`, `restored_host_bytes`) are filled. Docs: Hybrid
+spec §17 (the binding's contract), `docs/qwen3_8-flash-next.md` "Prefix cache", `docs/serving.md`
+flag rows, `ninfer-serve --help`. Qwen4Exp-only counters (`endpoint_mismatch_fallbacks`, MTP
+continuation and branch mismatches) are not in `RuntimeStats` yet.
+
 #### Tests
 
 `ninfer_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)

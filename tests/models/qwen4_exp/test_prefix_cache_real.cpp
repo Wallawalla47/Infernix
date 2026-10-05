@@ -10,6 +10,11 @@
 //   endpoint     (E1) A second turn resumes from the first turn's endpoint left in its lane; after
 //                pressure evicts everything Device-side, the same second turn resumes through a
 //                Host image restore and must generate the same tokens.
+//   X5           Chat turn 2 without turn 1's reasoning block resumes at least at turn 1's generation
+//                opener tap.
+//   X6           Sessions sharing only a system block resume at its structural tap (an exact split).
+//   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap) and
+//                generates what the capturing run generated.
 //
 //   ninfer_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
@@ -132,6 +137,74 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                                                        std::to_string(restored.reused) + ")");
     failures += check(restored.tokens == resident.tokens, "Host-restored endpoint equals the lane-resident resume (" +
                                                               first_difference(restored.tokens, resident.tokens) + ")");
+
+    // Chat prompts carry the structural (end of the system block) and generation-opener taps.
+    std::string rules;
+    for (int r = 1; r <= 110; ++r) {
+        rules += "Rule " + std::to_string(r) + ": items of colour " + std::to_string(r % 9) + " go to shelf " +
+                 std::to_string((r * 7) % 13) + ".\n";
+    }
+    const auto chat = [&](std::vector<ninfer::ChatMessage> messages, std::uint32_t outputs) {
+        ninfer::PromptInput input;
+        input.messages                = std::move(messages);
+        input.options.enable_thinking = false;
+        ninfer::RequestOptions request      = greedy(outputs, true);
+        request.stop.include_model_defaults = true;
+        return engine.generate(engine.prepare(std::move(input)), request);
+    };
+    const auto message = [](ninfer::ChatRole role, std::string text) {
+        ninfer::ChatMessage m;
+        m.role = role;
+        m.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
+        return m;
+    };
+    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules);
+    // User turns longer than kMinimumTapSeparation (64 tokens): an opener closer to the structural
+    // tap joins its cluster, and only the earlier tap is kept.
+    std::string context;
+    for (int i = 0; i < 4; ++i) {
+        context += "Today a delivery of mixed items arrived at the warehouse and I need to plan where each "
+                   "box goes before the afternoon shift starts. ";
+    }
+    const auto user = [&](const std::string& question) {
+        return message(ninfer::ChatRole::User, context + question);
+    };
+
+    // X5 chat no-echo: turn 2 re-renders turn 1's reply without its reasoning block; it resumes at
+    // least at turn 1's generation opener (a few tokens before turn 1's prompt end).
+    const ninfer::GenerationResult s1 =
+        chat({system, user("Which shelf takes colour 4?")}, 32);
+    const std::uint32_t n1 = s1.prompt.prompt_tokens;
+    const ninfer::GenerationResult x5 =
+        chat({system, user("Which shelf takes colour 4?"), message(ninfer::ChatRole::Assistant, s1.content),
+              message(ninfer::ChatRole::User, "And colour 5?")},
+             32);
+    std::printf("        X5: turn 1 prompt %u, turn 2 prompt %u reused %u\n", n1, x5.prompt.prompt_tokens,
+                x5.reused_prompt_tokens);
+    failures += check(x5.reused_prompt_tokens + 16U >= n1, "X5 turn 2 reuses at least turn 1's opener (reused " +
+                                                               std::to_string(x5.reused_prompt_tokens) + ", turn 1 prompt " +
+                                                               std::to_string(n1) + ")");
+
+    // X6 shared preamble: sessions 2 and 3 share only the system block; they resume at its
+    // structural tap, an exact split the first session made.
+    const ninfer::GenerationResult s2 =
+        chat({system, user("Summarise rule 12 in one sentence.")}, 32);
+    const ninfer::GenerationResult s3 = chat({system, user("How many rules send items to shelf 0?")}, 32);
+    std::printf("        X6: sessions 2 and 3 reused %u and %u of %u and %u\n", s2.reused_prompt_tokens,
+                s3.reused_prompt_tokens, s2.prompt.prompt_tokens, s3.prompt.prompt_tokens);
+    failures += check(s2.reused_prompt_tokens >= 1024 && s2.reused_prompt_tokens + 8U < s2.prompt.prompt_tokens &&
+                          s3.reused_prompt_tokens == s2.reused_prompt_tokens,
+                      "X6 sessions 2 and 3 resume at the shared structural frontier");
+
+    // X3 split equivalence at an exact off-grid tap: session 2 again resumes at its own generation
+    // opener; the run that captured it split its prefill there, so the resume repeats its computation.
+    const ninfer::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
+    failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
+                          again.reused_prompt_tokens < s2.prompt.prompt_tokens,
+                      "X3 the repeat resumes at the opener (reused " + std::to_string(again.reused_prompt_tokens) + ")");
+    failures += check(again.generated_token_ids == s2.generated_token_ids,
+                      "X3 the opener resume equals the capturing run (" +
+                          first_difference(again.generated_token_ids, s2.generated_token_ids) + ")");
     return failures;
 }
 

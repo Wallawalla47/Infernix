@@ -12,7 +12,8 @@ namespace ninfer::models::qwen4_exp::detail {
 
 namespace vx = qwen3_5::execution;
 
-std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::PreparedPromptData& prompt) const {
+std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::PreparedPromptData& prompt,
+                                                                std::uint32_t reused) const {
     if (!parameters_.vision || !parameters_.model.config().vision) {
         throw std::invalid_argument("Qwen4Exp: images and video need an engine started with --vision");
     }
@@ -28,12 +29,15 @@ std::shared_ptr<const VisionAdmission> ProgramImpl::plan_vision(const qwen3_5::P
                          .patches     = static_cast<std::uint32_t>(prompt.vision_items[i].patch_count),
                          .merged      = static_cast<std::uint32_t>(plan.merged_count)});
     }
+    // The pass encodes only the items ending past the reused prefix.
     std::vector<std::size_t> patches;
-    for (const auto& item : items) { patches.push_back(item.patches); }
-    const std::size_t pass_bytes = vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
+    for (const auto& item : items) {
+        if (item.token_end > reused) { patches.push_back(item.patches); }
+    }
+    const std::size_t pass_bytes = patches.empty() ? 0 : vx::plan_vision_pass(config, *parameters_.vision, patches).bytes;
     const auto& overlay          = parameters_.model.overlay_vision();
     const std::size_t staging    = overlay ? vx::vision_staging_align(overlay->layout.staging_bytes) : 0;
-    out->window = plan_vision_window(items, 0, pass_bytes, staging, work_capacity_, residency_->frame_stride(),
+    out->window = plan_vision_window(items, reused, pass_bytes, staging, work_capacity_, residency_->frame_stride(),
                                      static_cast<std::uint32_t>(parameters_.vision->merger_fc2.weight.n),
                                      config.hidden_size, config.depth);
     return out;

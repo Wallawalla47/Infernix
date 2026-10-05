@@ -108,6 +108,7 @@ int main() {
         Diagnostics diagnostics;
         ninfer::EngineOptions options;
         options.artifact_path = artifact;
+        options.context_cache.enabled = false; // no prefix cache (Qwen4Exp has no Legacy cache)
         if (ngram != nullptr) { options.ngram_volume_path = ngram; }
         options.max_context = 4096;
         options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(4096);

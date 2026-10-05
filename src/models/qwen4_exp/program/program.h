@@ -75,7 +75,7 @@ struct DeviceKVLeaseShortfall {
     std::uint32_t backend_pages = 0;
 };
 
-// The hybrid prefix cache's statistics; all zero while Qwen4Exp has no prefix cache.
+// The hybrid prefix cache's statistics; all zero without a prefix cache.
 struct HybridPrefixCacheStats {
     std::uint32_t nodes                   = 0;
     std::uint32_t snapshots               = 0;
@@ -351,7 +351,7 @@ public:
         return 0U;
     }
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept { return 0; }
-    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept { return {}; }
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     void skip_capture(CaptureOffer&&) noexcept {}
 
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing,

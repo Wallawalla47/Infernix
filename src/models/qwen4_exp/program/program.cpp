@@ -27,6 +27,8 @@ void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_ma
 
 void Program::maintain() { impl_->apply_vram_target(true); }
 
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
+
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
     return impl_->plan_request(prompt, options);
 }

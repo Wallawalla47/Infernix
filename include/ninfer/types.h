@@ -25,6 +25,9 @@ inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
+// The hybrid prefix cache's Host tier for Qwen3.8-Flash-Next when --host-context-mib is not
+// given: its expert cache needs the rest of the pinnable RAM.
+inline constexpr std::size_t kDefaultQwen4ExpHybridHostCacheBytes = 4ULL << 30;
 // Physical Host memory left free for the OS and other programs once every pinned allocation is
 // locked, when --ram-headroom-mib is not given.
 inline constexpr std::uint64_t kDefaultRamHeadroomBytes = 2ULL << 30;

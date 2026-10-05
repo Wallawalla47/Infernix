@@ -3,6 +3,7 @@
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
+#include "models/registry.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -10,7 +11,10 @@
 
 namespace ninfer::runtime {
 
-[[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
+// Validates the options and resolves every default; the hybrid prefix cache's Host tier, Device
+// snapshot slots and tap budget depend on the model architecture.
+[[nodiscard]] EngineOptions normalize_engine_options(
+    EngineOptions options, models::Architecture architecture = models::Architecture::Qwen3_5);
 
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;

@@ -38,6 +38,11 @@ ninfer_add_test(ninfer_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
   LIBRARIES ninfer_model_runtime)
 
+# The prefix cache's prefill call planner: coverage, grids, exact-tap admission (host only).
+ninfer_add_test(ninfer_qwen4_exp_call_plan_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_call_plan.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # RoPE staging of a lane: prompt M-RoPE, later tokens, block starts, MTP sub-chunks (host only).
 ninfer_add_test(ninfer_qwen4_exp_rope_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"

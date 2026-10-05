@@ -24,7 +24,6 @@ namespace ninfer::runtime {
 namespace {
 
 // The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-cache-mib is not given.
-constexpr std::uint64_t kQwen4ExpDefaultHostCacheBytes = 4ULL << 30;
 // Planning allowance for the Program's pinned and mapped buffers (I/O staging, sampling, the CPU
 // expert service's mapped records); the measured total is well below it.
 constexpr std::uint64_t kProgramPinnedAllowance = 256ULL << 20;
@@ -114,6 +113,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.expert_banks = plan.pinned_expert_bytes();
     demand.other_pinned = plan.pinned_other_bytes();
     demand.later_pinned = kProgramPinnedAllowance;
+    // The prefix cache pins its whole Host tier at startup, beside the experts.
+    if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid) {
+        demand.prefix_cache = options.context_cache.host_cache_budget_bytes.value();
+    }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
     demand.load_staging = kLoadStagingBytes;
     const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
@@ -155,10 +158,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
         const std::uint32_t chunk         = options.prefill_chunk;
         program_options.prefix_cache      = true;
-        program_options.prefix_host_bytes = cache.host_cache_budget_bytes.value_or(kQwen4ExpDefaultHostCacheBytes);
-        program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value_or(8U);
-        program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value_or(std::max(4096U, 2U * chunk));
-        program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value_or(std::max(1024U, chunk));
+        // normalize_engine_options resolved every value for this architecture.
+        program_options.prefix_host_bytes          = cache.host_cache_budget_bytes.value();
+        program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
+        program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
+        program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
         program_options.prefix_cost.chunk_seconds          = 1.28;
         program_options.prefix_cost.chunk_tokens           = chunk;
         program_options.prefix_cost.token_seconds          = 1.17e-3;
