@@ -254,6 +254,36 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     issue_loads(compute);
 }
 
+ExpertResidency::SavedState ExpertResidency::saved_state() const {
+    SavedState out;
+    if (!controller_) { return out; }
+    const auto& policy = controller_->policy();
+    out.counts.resize(policy.num_keys());
+    for (std::uint32_t key = 0; key < policy.num_keys(); ++key) { out.counts[key] = policy.count(key); }
+    out.ranked.assign(policy.residents().begin(), policy.residents().end());
+    std::stable_sort(out.ranked.begin(), out.ranked.end(),
+                     [&](std::uint32_t a, std::uint32_t b) { return policy.score(a) > policy.score(b); });
+    return out;
+}
+
+std::uint32_t ExpertResidency::warm_start(const SavedState& state, std::uint32_t count_cap, cudaStream_t compute) {
+    if (!controller_ || frames_ == 0) { return 0; }
+    if (!state.counts.empty() && state.counts.size() != static_cast<std::size_t>(layers_) * experts_) {
+        throw std::invalid_argument("expert residency: the saved state has another key count");
+    }
+    std::vector<std::uint32_t> counts(state.counts);
+    for (auto& count : counts) { count = std::min(count, count_cap); }
+    commands_.clear();
+    const std::uint32_t loaded = controller_->seed(state.ranked, counts, commands_);
+    issue_loads(compute);
+    stats_.promotions -= loaded; // issue_loads counted them; they are seeds, not promotions
+    stats_.seeded += loaded;
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    publish_landed();
+    if (table_dirty_) { upload_table(compute); }
+    return loaded;
+}
+
 std::uint32_t ExpertResidency::lendable() const noexcept {
     if (!controller_) { return 0; }
     const std::uint32_t lent = controller_->loaned_frames(), floor = frames_ / 4;

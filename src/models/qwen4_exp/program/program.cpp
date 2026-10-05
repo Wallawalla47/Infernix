@@ -25,7 +25,10 @@ const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_siz
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
-void Program::maintain() { impl_->apply_vram_target(true); }
+void Program::maintain() {
+    impl_->apply_vram_target(true);
+    impl_->maintain_expert_state();
+}
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
@@ -89,6 +92,7 @@ std::optional<PhysicalUsageSnapshot> Program::fail_all_cleanup() noexcept {
 
 std::optional<PhysicalUsageSnapshot> Program::shutdown_cleanup() noexcept {
     impl_->release_all();
+    impl_->save_expert_state();
     impl_->save_prefix_cache_for_shutdown();
     return std::nullopt;
 }

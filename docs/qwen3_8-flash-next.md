@@ -92,6 +92,13 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
   frames only while it encodes (`--vision-offload auto`).
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
+- **Warm start.** The engine saves the expert cache's state (which experts it holds and how often each
+  was used) to `<artifact>.expert-state` when it stops and every 10 minutes between requests. The
+  next start loads the highest-ranked experts into VRAM before the first request (about 1 s), so
+  the first few hundred tokens decode near the warm speed when the work resembles the last
+  session's. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
+  as cold benchmarks need. Output is the same either way: where an expert is computed never
+  changes a bit.
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the
   request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
   of reads`). The row cache outlives requests, so repeated text hits it, while new text reads most

@@ -1018,6 +1018,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with `--use-original-prefix-caching` or `--no-prefix-reuse` | `auto` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free. Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`; `auto` = 1024). Qwen3.8-Flash-Next: after the expert cache takes the rest, for the display and other programs (`auto` = 1024 with a display on the GPU, 256 without; [details](qwen3_8-flash-next.md#vram)) | `auto` |
+| `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. `off` starts with an empty cache and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |

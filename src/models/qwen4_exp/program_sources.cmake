@@ -28,6 +28,7 @@ target_sources(ninfer_model_runtime PRIVATE
 
 # The host expert cache (design §9) is a host-only library its conformance test links directly.
 add_library(ninfer_qwen4_exp_expert_cache STATIC
-  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_cache.cpp")
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_cache.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/expert_cache/expert_state.cpp")
 ninfer_internal_includes(ninfer_qwen4_exp_expert_cache)
 target_link_libraries(ninfer_model_runtime PUBLIC ninfer_qwen4_exp_expert_cache)

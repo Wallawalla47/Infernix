@@ -32,6 +32,8 @@ struct ServeOptions {
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
+    std::optional<std::filesystem::path> expert_state;
     std::string host = "127.0.0.1";
     int port         = 8080;
     std::string api_key;                          // empty => no auth

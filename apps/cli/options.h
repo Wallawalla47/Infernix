@@ -17,6 +17,8 @@ struct Options {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
+    // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
+    std::optional<std::filesystem::path> expert_state;
     std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
     std::string prompt;
     std::filesystem::path messages_path;

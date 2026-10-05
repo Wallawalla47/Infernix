@@ -307,6 +307,10 @@ struct EngineOptions {
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
+    // before the first request (warm start), written at stop and every 10 minutes between requests.
+    // Empty: no warm start (the cache starts empty and nothing is saved).
+    std::filesystem::path expert_state_path;
     // Message the model receives when it hits its thinking budget, before the canonical
     // </think> close the frontend appends when the message lacks it. Empty preserves the
     // model's built-in end-of-thinking control suffix.

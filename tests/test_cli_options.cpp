@@ -258,6 +258,15 @@ int run_tests() {
                   (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
+    // --expert-state: absent keeps the default (the artifact path + .expert-state), "off" disables.
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).expert_state.has_value(),
+                      "CLI expert state must default to the artifact's file");
+    const auto state_off = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-state", "off"});
+    failures += check(state_off.expert_state.has_value() && state_off.expert_state->empty(),
+                      "CLI --expert-state off must disable the saved state");
+    const auto state_file = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-state", "cache.state"});
+    failures += check(state_file.expert_state && *state_file.expert_state == "cache.state",
+                      "CLI --expert-state FILE must name the file");
     return failures == 0 ? 0 : 1;
 }
 

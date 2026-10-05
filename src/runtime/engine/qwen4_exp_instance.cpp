@@ -150,6 +150,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.mtp_draft_tokens   = options.speculative.backend == SpeculativeBackend::Mtp
                                              ? options.speculative.draft_tokens
                                              : 0U;
+    if (!options.expert_state_path.empty()) {
+        // The state belongs to the artifact: its experts and their records, not the build or KV format.
+        std::error_code error;
+        const auto size = std::filesystem::file_size(options.artifact_path, error);
+        const auto time = std::filesystem::last_write_time(options.artifact_path, error);
+        program_options.expert_state          = options.expert_state_path;
+        program_options.expert_state_identity = "artifact=" + std::filesystem::absolute(options.artifact_path).string() +
+                                                ";size=" + std::to_string(error ? 0U : size) +
+                                                ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+    }
     program_options.ngram_volume = options.ngram_volume_path.empty()
                                        ? models::qwen4_exp::default_ngram_volume(options.artifact_path)
                                        : options.ngram_volume_path;

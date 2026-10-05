@@ -5,8 +5,10 @@
 // top and never names a frame above it.
 
 #include "models/qwen4_exp/program/expert_cache/expert_cache.h"
+#include "models/qwen4_exp/program/expert_cache/expert_state.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <cstdio>
 #include <fstream>
 #include <optional>
@@ -428,6 +430,59 @@ void test_lending() {
     check(threw, "a frame is given back only while lent");
 }
 
+// Warm start (design §19.3.5 S4b): seed sets the counts, then loads the ranked keys best first into
+// free frames while the policy has capacity (frames - slack), skipping keys already resident or out
+// of range; each loaded key issues one copy into a distinct frame and publishes when that copy lands.
+void test_seed() {
+    constexpr std::uint32_t kKeys = 64, kFrames = 10, kSlack = 2;
+    CacheController cache(kKeys, kFrames, kSlack, 1);
+    std::vector<std::uint32_t> counts(kKeys, 0);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { counts[k] = k % 7; }
+    const std::vector<std::uint32_t> ranked{40, 3, 40, 99, 7, 12, 5, 6, 8, 9, 10, 11, 13};
+    std::vector<CacheController::Command> cmds;
+    const std::uint32_t loaded = cache.seed(ranked, counts, cmds);
+    check(loaded == kFrames - kSlack, "seed fills the policy's capacity (frames - slack)");
+    std::set<std::uint32_t> frames, keys;
+    for (const auto& c : cmds) {
+        if (c.kind == CacheController::Command::Kind::kCopy) {
+            frames.insert(c.frame);
+            keys.insert(c.key);
+            check(cache.complete_load(c.key, c.frame, c.serial), "a seeded copy publishes");
+        }
+    }
+    check(frames.size() == loaded && keys.size() == loaded, "each seeded key copies into its own frame");
+    check(keys.count(40) == 1 && keys.count(3) == 1 && keys.count(99) == 0, "duplicates and out-of-range keys are skipped");
+    check(keys.count(11) == 0 && keys.count(13) == 0, "keys past the capacity are not loaded");
+    check(cache.policy().resident(40) && cache.policy().count(40) == 40 % 7, "seeded keys are resident with their counts");
+    check(cache.policy().count(50) == 50 % 7, "counts are seeded for every key");
+    cmds.clear();
+    check(cache.seed(ranked, {}, cmds) == 0 && cmds.empty(), "a full cache seeds nothing more");
+}
+
+// The saved state file: a round trip keeps counts and ranking; another identity, key count, version
+// or a truncated file loads nothing (with a reason).
+void test_state_file() {
+    const auto dir  = std::filesystem::temp_directory_path();
+    const auto path = dir / "ninfer_expert_state_test.bin";
+    SavedState state;
+    state.counts = {5, 0, 9, 1};
+    state.ranked = {2, 0, 3};
+    check(save_expert_state(path, "artifact A", state).empty(), "the state saves");
+    const ExpertStateLoad same = load_expert_state(path, "artifact A", 4);
+    check(same.state && same.state->counts == state.counts && same.state->ranked == state.ranked, "a saved state round-trips");
+    check(!load_expert_state(path, "artifact B", 4).state, "another artifact's state is ignored");
+    check(!load_expert_state(path, "artifact A", 5).state, "a state with another key count is ignored");
+    check(!load_expert_state(dir / "ninfer_expert_state_missing.bin", "artifact A", 4).state, "a missing file loads nothing");
+    {
+        const auto size = std::filesystem::file_size(path);
+        std::filesystem::resize_file(path, size - 3);
+    }
+    const ExpertStateLoad cut = load_expert_state(path, "artifact A", 4);
+    check(!cut.state && !cut.message.empty(), "a truncated file is refused with a reason");
+    std::filesystem::remove(path);
+    check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
+}
+
 int main() {
     test_residency_entries();
     test_lfru_conformance();
@@ -438,6 +493,8 @@ int main() {
     test_controller_resize();
     test_load_serials();
     test_lending();
+    test_seed();
+    test_state_file();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;

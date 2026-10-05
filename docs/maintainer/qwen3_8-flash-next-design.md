@@ -5709,6 +5709,42 @@ shipped profile. It published no gain.
   - Bit-neutral: expert arithmetic is placement-invariant. Cold benchmarks state whether a seed
     was used.
 
+*S4b as implemented* (branch `claude/fn-conc-s4b`, 2026-10-05):
+
+- **State.** `expert_cache::SavedState` = every key's LFRU count and the resident keys by score,
+  highest first (`ExpertResidency::saved_state`). File `NINFQ4ES` v1 (`expert_cache/expert_state.{h,cpp}`):
+  magic, version, an identity string, key count, counts, ranking, footer; written through `.tmp` and
+  a rename; a load returns the state or the reason it was refused (missing, other identity or key
+  count, truncated). The identity is the artifact's absolute path, size and modification time: the
+  experts and records, not the build. Last-use times and the clock are not saved: the policy's clock
+  restarts at 0 and every seeded count is capped at 16 (`kSeedCountCap`), so an expert used heavily
+  in an old session ranks by recent use soon. Frame count is not part of the identity: a state
+  ranks every resident, and a smaller cache loads its best prefix.
+- **Load.** In the Program constructor after the frames and tables exist:
+  `CacheController::seed(ranked, counts)` sets the counts, then loads ranked keys into free frames
+  while the policy has room (copy commands on the copy stream); the Program waits for them and
+  uploads the table, and logs `expert cache warm start: N of F frames from FILE (X GiB in Y s)` or
+  why it started empty.
+- **Save.** `Program::shutdown_cleanup` (the Engine's orderly stop) and `Program::maintain` between
+  requests (when rounds ran since the last save and 10 minutes passed); never during a round.
+- **Budget.** `decode_budget`'s fill test is `promotions + seeded < frames` (S4 adds `landed`).
+- **Interface.** `EngineOptions::expert_state_path` (empty: off; `ninfer_bench` leaves it empty).
+  CLI and serve: `--expert-state FILE|off`, default `<artifact>.expert-state`.
+- **Tests.** `test_expert_cache.cpp`: seed fills the policy's capacity, skips duplicates, residents
+  and out-of-range keys, copies each key into its own frame; the state file round-trips and is
+  refused for another identity, key count, a missing or a truncated file, with no `.tmp` left.
+  Option parsing in the CLI and serve option tests. Model-level check (cold/warm/warm/cold, ids and
+  speed): rig `fn/rigs/conc/s4b.bat`.
+- **Measured** (2026-10-05, RTX 5090, recipe B dense8m, INT8 KV, cold CLI code prompt, 400 tokens,
+  a fresh process per run, order cold / warm / warm / `off`; the warm runs start from the state the
+  cold run of the same prompt saved, so this is the same-workload best case):
+  - plain 72.9 / 73.5 → 107.6 / 107.9 tok/s (+47 %), hit rate 69.2 % → 91.2-91.6 %;
+  - MTP max 4 `--lm-head-draft` 88.8 / 89.1 → 193.7 / 197.0 tok/s (+119 %), hit rate 61.8 % →
+    86.3-86.5 %;
+  - the warm start loaded every frame (9,389 plain, 8,672 MTP; 24.2 / 22.3 GiB) in 0.96 / 0.88 s;
+    the state file is 133-136 KB; greedy ids equal in all four runs of each mode.
+  - Not yet measured: a workload unrelated to the saved state, and the 10-minute save in a server.
+
 **S5. Fork at every width, compacted phase lists (1.5 days).** (1) `forked()` needs only a fork
 stream and `staging_slots > 0`. (2) S3's kernel becomes `plan_kernel`, run before every fork (also
 without CPU serving): in job order it writes `resident[]`, `staged[]` and counts after `CpuCall`

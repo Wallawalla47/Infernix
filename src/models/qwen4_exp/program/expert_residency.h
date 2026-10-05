@@ -43,7 +43,15 @@ public:
         std::uint64_t promotions = 0; // expert copies issued
         std::uint64_t lent_frames    = 0; // frames lent now
         std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
+        std::uint64_t seeded         = 0; // experts loaded by the warm start
     };
+
+    using SavedState = expert_cache::SavedState;
+    [[nodiscard]] SavedState saved_state() const;
+    // Before the first round: seeds the counts (each capped at `count_cap`, so a stale expert
+    // yields to new uses) and loads the ranked keys into free frames, waiting for the copies.
+    // Returns the number loaded.
+    std::uint32_t warm_start(const SavedState& state, std::uint32_t count_cap, cudaStream_t compute);
 
     // banks[l]: layer l's pinned host records (record_stride bytes apart). max_columns: the most
     // columns one round routes. The cache starts with no frames: resize() backs them.

@@ -93,7 +93,8 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--ngram-volume FILE] [--ram-headroom-mib N]\n"
+           "       [--chat-template FILE] [--ngram-volume FILE] [--expert-state FILE|off]\n"
+           "       [--ram-headroom-mib N]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
            "       [--vision] [--vision-offload auto|on|off] [--vision-max-merged N]\n"
@@ -227,6 +228,9 @@ Options parse_options(int argc, char** argv) {
             options.chat_template_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
+        } else if (arg == "--expert-state") {
+            const std::string path = value(arg);
+            options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
         } else if (arg == "--messages") {
             options.messages_path = value(arg);
         } else if (arg == "--max-new") {

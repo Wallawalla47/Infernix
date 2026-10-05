@@ -289,6 +289,11 @@ struct ProgramOptions {
     std::uint32_t kv_capacity_tokens = 0;
     KvCacheStorage kv_cache          = KvCacheStorage::Int8Group64;
     std::filesystem::path ngram_volume;
+    // The expert cache's saved state (design §19.3.5 S4b): read at startup to fill the frames, written
+    // at stop and every 10 minutes between requests. Empty: no warm start. The identity names the
+    // artifact the state belongs to.
+    std::filesystem::path expert_state;
+    std::string expert_state_identity;
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
