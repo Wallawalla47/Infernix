@@ -78,7 +78,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         frames[e] = resident++;
         frame_bytes.insert(frame_bytes.end(), bank[e].record.begin(), bank[e].record.end());
     }
+    // Free frames after the resident ones, for landing: slot 1 has none (-1), slot 3 is past the
+    // misses when there are few.
+    const std::vector<std::int32_t> landing{resident, -1, resident + 1, resident + 2};
+    frame_bytes.resize(frame_bytes.size() + 3 * stride, 0);
     auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_landing    = device_copy(landing);
+    auto* d_landed     = device_copy(std::vector<std::int32_t>(landing.size(), -1));
     auto* d_frames     = device_copy(frames);
     auto* d_scales     = device_copy(scales);
 
@@ -152,6 +158,27 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         int slots;
         const moe::CpuMissService* service;
         bool fork = false;
+        bool land = false;
+    };
+    // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
+    // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
+    const auto cpu_selection = [&](const moe::CpuMissService* service, const std::vector<std::int32_t>& jobs) {
+        std::vector<std::uint8_t> chosen(experts, 0);
+        if (service == nullptr || columns > service->channel(0).max_columns) { return chosen; }
+        const auto channel = service->channel(0);
+        int misses = 0;
+        for (const std::int32_t e : jobs) { misses += frames[e] < 0 ? 1 : 0; }
+        const int want = std::min(channel.max_jobs, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        int n = 0;
+        for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
+            for (const std::int32_t e : jobs) {
+                if (n < want && frames[e] < 0 && expert_columns[e] == width) {
+                    chosen[e] = 1;
+                    ++n;
+                }
+            }
+        }
+        return chosen;
     };
     // The fork stream and its events, for the one-pass decode/verification route.
     cudaStream_t fork_stream = nullptr;
@@ -162,7 +189,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
-                                Config{64, &service_narrow, true}}) {
+                                Config{64, &service_narrow, true}, Config{64, nullptr, true, true},
+                                Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -179,6 +207,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
             source.fork_events[1] = fork_events[1];
+        }
+        if (config.land) {
+            source.landing       = d_landing;
+            source.landed        = d_landed;
+            source.landing_slots = static_cast<std::int32_t>(landing.size());
+            cuda_check(cudaMemcpy(d_landed, std::vector<std::int32_t>(landing.size(), -1).data(),
+                                  landing.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice), "cudaMemcpy");
         }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
@@ -205,6 +240,40 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
                     mismatches, got.size());
         check(mismatches == 0, "layer route equals the CPU engine for every placement and staging pass");
+        if (config.land) {
+            // Oracle: the staged misses in job order (resident and CPU-served jobs excluded); landing slot n
+            // receives the n-th of them on the forked route, and nothing on the other routes.
+            std::int32_t job_count = 0;
+            cuda_check(cudaMemcpy(&job_count, dispatch.job_count, sizeof(job_count), cudaMemcpyDeviceToHost), "cudaMemcpy");
+            std::vector<std::int32_t> jobs(static_cast<std::size_t>(job_count));
+            cuda_check(cudaMemcpy(jobs.data(), dispatch.jobs, jobs.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+            const auto cpu = cpu_selection(config.service, jobs);
+            std::vector<std::int32_t> staged;
+            for (const std::int32_t e : jobs) {
+                if (frames[e] < 0 && cpu[e] == 0) { staged.push_back(e); }
+            }
+            const bool forked_route = config.fork && max_jobs <= std::min(slots, 512) && columns <= 8;
+            std::vector<std::int32_t> landed(landing.size());
+            cuda_check(cudaMemcpy(landed.data(), d_landed, landed.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+                       "cudaMemcpy");
+            bool ok = true;
+            for (std::size_t n = 0; n < landing.size(); ++n) {
+                const std::int32_t want = forked_route && landing[n] >= 0 && n < staged.size() ? staged[n] : -1;
+                ok = ok && landed[n] == want;
+                if (want >= 0) {
+                    std::vector<std::uint8_t> bytes(moe::kRecordBytes);
+                    cuda_check(cudaMemcpy(bytes.data(), d_frame_base + static_cast<std::size_t>(landing[n]) * stride,
+                                          bytes.size(), cudaMemcpyDeviceToHost), "cudaMemcpy");
+                    ok = ok && std::memcmp(bytes.data(), bank[want].record.data(), bytes.size()) == 0;
+                }
+            }
+            std::printf("  landing: %zu staged misses, landed %d %d %d %d\n", staged.size(), landed[0], landed[1],
+                        landed[2], landed[3]);
+            check(ok, "landing frames receive the first staged misses in job order (forked route only)");
+            // The next configuration starts from free landing frames again.
+            cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
+        }
     }
     for (auto event : fork_events) { cudaEventDestroy(event); }
     cudaStreamDestroy(fork_stream);
@@ -219,6 +288,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cudaFree(d_logits);
     cudaFree(d_scales);
     cudaFree(d_frames);
+    cudaFree(d_landed);
+    cudaFree(d_landing);
     cudaFree(d_frame_base);
     cudaFreeHost(host);
 }

@@ -283,6 +283,37 @@ std::uint32_t CacheController::seed(std::span<const std::uint32_t> keys, std::sp
     return loaded;
 }
 
+std::uint32_t CacheController::reserve_free(std::uint32_t count, std::vector<std::uint32_t>& out) {
+    const std::size_t residents = policy_.resident_count();
+    const std::size_t room      = policy_.capacity() > residents ? policy_.capacity() - residents : 0;
+    std::uint32_t reserved      = 0;
+    while (reserved < count && reserved < room) {
+        const auto frame = frames_.acquire();
+        if (!frame) { break; }
+        out.push_back(*frame);
+        ++reserved;
+    }
+    return reserved;
+}
+
+bool CacheController::adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
+                            std::uint64_t round_started, std::vector<Command>& out) {
+    if (key >= table_.size() || table_[key].state != ResidencyState::kAbsent) { return false; }
+    if (const auto victim = policy_.promote(key, protect)) {
+        if (table_[*victim].state != ResidencyState::kAbsent) { frames_.retire(make_absent(*victim, out), round_started); }
+    }
+    // A queued load of the key is dropped by drain_queue (the key is no longer absent); a copy of
+    // it still in flight never publishes (complete_load compares the serial).
+    table_[key] = table_[key].next(ResidencyState::kLoading, frame);
+    table_[key] = table_[key].next(ResidencyState::kReady, frame);
+    out.push_back({Command::Kind::kWriteEntry, key, frame, table_[key].encode()});
+    load_serial_[key] = ++next_serial_;
+    frame_key_[frame] = key;
+    return true;
+}
+
+void CacheController::release(std::uint32_t frame) { frames_.release_now(frame); }
+
 bool CacheController::complete_load(std::uint32_t key, std::uint32_t frame, std::uint64_t serial) const {
     return table_[key].state == ResidencyState::kReady && table_[key].frame == frame && load_serial_[key] == serial;
 }
@@ -290,7 +321,8 @@ bool CacheController::complete_load(std::uint32_t key, std::uint32_t frame, std:
 void CacheController::drain_queue(std::vector<Command>& out) {
     while (!queued_.empty()) {
         const std::uint32_t key = queued_.front();
-        if (!policy_.resident(key)) { // evicted before it could load
+        // Evicted before it could load, or landed by a round meanwhile (adopt).
+        if (!policy_.resident(key) || table_[key].state != ResidencyState::kAbsent) {
             queued_.pop_front();
             is_queued_[key] = 0;
             continue;

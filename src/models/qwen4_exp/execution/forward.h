@@ -61,6 +61,12 @@ struct ForwardExperts {
     // Prefill chunks stage their next pass of misses on this stream while one pass computes.
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};
+    // Landing frames of decode and verification calls (design §19.3.5 S4; see
+    // ops::MoeExpertSource::landing): layer l uses landing + l * landing_slots and landed + l *
+    // landing_slots. Null disables.
+    const std::int32_t* landing = nullptr;
+    std::int32_t* landed        = nullptr;
+    std::int32_t landing_slots  = 0;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It

@@ -132,36 +132,73 @@ constexpr int kStageChunk = 16384;
 constexpr int kMaxPassJobs = 512;
 
 // Resolves the record of every job in [job_base, job_base + pass_jobs) and copies the pass's
-// non-resident records to the staging slots (pass_jobs <= slots, so all fit). Chunk c of the
-// concatenated miss records is copied by CTA c % gridDim.x, keeping the CTAs' reads adjacent.
+// non-resident records that are not CPU-served (its misses) to their destinations: the n-th miss in
+// job order lands in frame landing[n] when n < landing_slots and landing[n] >= 0 (block 0 logs
+// landed[n] = its expert), else it takes the next staging slot (pass_jobs <= slots, so all fit).
+// Every CTA ranks the misses with warp ballots; chunk c of the concatenated miss records is copied
+// by CTA c % gridDim.x, keeping the CTAs' reads adjacent.
 __global__ void __launch_bounds__(kThreads)
     stage_kernel(MoeDispatch dispatch, MoeExpertSource source, int job_base, int pass_jobs,
                  const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records) {
     __shared__ int miss_jobs[kMaxPassJobs];
+    __shared__ std::uint8_t* miss_dst[kMaxPassJobs];
+    __shared__ int warp_misses[kWarps];
+    __shared__ int landed_before[offloaded_moe::kMaxLandingSlots + 1]; // landing frames among slots [0, n)
     __shared__ int misses;
     const int jobs = min(*dispatch.job_count - job_base, pass_jobs);
     if (jobs <= 0) { return; }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int landing_slots = source.landing != nullptr ? source.landing_slots : 0;
     if (threadIdx.x == 0) {
-        int n = 0;
-        for (int j = 0; j < jobs; ++j) {
-            if (cpu_flags != nullptr && cpu_flags[job_base + j] != 0) { continue; } // served by the CPU
-            const int expert = dispatch.jobs[job_base + j];
-            const int frame  = source.frames[expert];
-            const std::uint8_t* record;
+        misses           = 0;
+        landed_before[0] = 0;
+        for (int n = 0; n < landing_slots; ++n) { landed_before[n + 1] = landed_before[n] + (source.landing[n] >= 0 ? 1 : 0); }
+    }
+    __syncthreads();
+    for (int base = 0; base < jobs; base += blockDim.x) {
+        const int j = base + threadIdx.x;
+        bool miss = false, resolved = false;
+        int expert = 0;
+        const std::uint8_t* record = nullptr;
+        if (j < jobs && (cpu_flags == nullptr || cpu_flags[job_base + j] == 0)) { // else served by the CPU
+            resolved        = true;
+            expert          = dispatch.jobs[job_base + j];
+            const int frame = source.frames[expert];
             if (frame >= 0) {
                 record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
             } else if (source.staging_slots > 0) {
-                record       = source.staging_base + static_cast<std::uint64_t>(n) * source.record_stride;
-                miss_jobs[n] = job_base + j;
-                ++n;
+                miss = true;
             } else {
                 record = source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
             }
-            if (blockIdx.x == 0) { job_records[job_base + j] = record; }
         }
-        misses = n;
+        const unsigned ballot = __ballot_sync(0xFFFFFFFFU, miss);
+        if (lane == 0) { warp_misses[warp] = __popc(ballot); }
+        __syncthreads();
+        if (miss) {
+            int n = misses + __popc(ballot & ((1U << lane) - 1U));
+            for (int v = 0; v < warp; ++v) { n += warp_misses[v]; }
+            std::uint8_t* destination;
+            if (n < landing_slots && source.landing[n] >= 0) {
+                // The frames are the caller's writable pool; frame_base is const for the read routes.
+                destination = const_cast<std::uint8_t*>(source.frame_base) +
+                              static_cast<std::uint64_t>(source.landing[n]) * source.record_stride;
+                if (blockIdx.x == 0) { source.landed[n] = expert; }
+            } else {
+                const int slot = n - landed_before[min(n, landing_slots)];
+                destination    = source.staging_base + static_cast<std::uint64_t>(slot) * source.record_stride;
+            }
+            miss_jobs[n] = job_base + j;
+            miss_dst[n]  = destination;
+            record       = destination;
+        }
+        if (resolved && blockIdx.x == 0) { job_records[job_base + j] = record; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            for (int v = 0; v < kWarps; ++v) { misses += warp_misses[v]; }
+        }
+        __syncthreads();
     }
-    __syncthreads();
     constexpr int kChunks = (static_cast<int>(moe::kRecordBytes) + kStageChunk - 1) / kStageChunk;
     constexpr int kVec    = kStageChunk / 16;
     const int total       = misses * kChunks;
@@ -171,8 +208,7 @@ __global__ void __launch_bounds__(kThreads)
         const int expert = dispatch.jobs[miss_jobs[m]];
         const auto* src = reinterpret_cast<const uint4*>(
             source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride + offset);
-        auto* dst = reinterpret_cast<uint4*>(source.staging_base + static_cast<std::uint64_t>(m) * source.record_stride +
-                                             offset);
+        auto* dst = reinterpret_cast<uint4*>(miss_dst[m] + offset);
         const int vectors = bytes / 16;
         uint4 v[kVec / kThreads];
 #pragma unroll
@@ -920,6 +956,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
+    require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
+                (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
+            "experts landing is incomplete");
     const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1]);
     auto* h_blocks     = layout.h_blocks;
     auto** job_records = layout.job_records;
@@ -962,6 +1001,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             MoeExpertSource buffer = source;
             buffer.staging_base    = source.staging_base + static_cast<std::uint64_t>(b) * half * source.record_stride;
             buffer.staging_slots   = half;
+            buffer.landing         = nullptr; // landing is for forked calls only
+            buffer.landing_slots   = 0;
             if (pass >= 2) { CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[3 + b], 0)); }
             stage_kernel<<<kStageCtas, kThreads, 0, source.overlap_stream>>>(dispatch, buffer, base, jobs, flags,
                                                                             job_records);
@@ -1006,9 +1047,12 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         return;
     }
     if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
+    MoeExpertSource unlanded = source; // landing is for forked calls only
+    unlanded.landing         = nullptr;
+    unlanded.landing_slots   = 0;
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
-        stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
+        stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, unlanded, base, jobs,
                                                                                        flags, job_records);
         check_launch("stage");
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit

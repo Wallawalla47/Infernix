@@ -44,7 +44,12 @@ public:
         std::uint64_t lent_frames    = 0; // frames lent now
         std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
         std::uint64_t seeded         = 0; // experts loaded by the warm start
+        std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
     };
+    // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
+    // decode or verification round, the round's forked MoE calls copy their first staged misses
+    // into them instead of staging slots, and the round's settle adopts them as resident.
+    static constexpr std::uint32_t kLandingSlots = 16;
 
     using SavedState = expert_cache::SavedState;
     [[nodiscard]] SavedState saved_state() const;
@@ -117,15 +122,24 @@ public:
     }
     [[nodiscard]] std::uint32_t frames() const noexcept { return frames_; }
 
-    // Before a round: publishes the loads that completed since the last round.
-    void before_round(cudaStream_t compute);
-    // After the round's kernels are enqueued: downloads its route log with the round.
+    // Before a round: publishes the loads that completed since the last round, returns the
+    // reservations of a round that was never settled, and with `landing` (decode and verification
+    // rounds) reserves min(kLandingSlots, free frames / layers) landing frames per layer while the
+    // policy has room, uploading the landing table (frame or -1) and clearing the landed log.
+    void before_round(cudaStream_t compute, bool landing = false);
+    // The landing table and landed log, device I32 [layers][kLandingSlots] at fixed addresses.
+    [[nodiscard]] const std::int32_t* landing_table() const noexcept {
+        return static_cast<const std::int32_t*>(landing_device_.p);
+    }
+    [[nodiscard]] std::int32_t* landed_log() noexcept { return static_cast<std::int32_t*>(landed_device_.p); }
+    // After the round's kernels are enqueued: downloads its route log (and landed log) with the round.
     void enqueue_route_download(cudaStream_t compute, std::int32_t columns);
     // After the round completed (the compute stream was synchronized): runs the policy over the
     // round's routes and issues its evictions and promotions. `per_layer_budget` caps the
     // promotions one layer's routes may start. A non-empty `live` (one flag per column) credits
     // only the flagged columns' experts: a verification round's rejected draft columns neither
-    // count as uses nor start promotions (design section 11.3).
+    // count as uses nor start promotions (design section 11.3). A layer's landed experts are adopted
+    // first and use up its budget: max(0, per_layer_budget - landed) promotions remain.
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                      std::span<const std::uint8_t> live = {});
 
@@ -133,6 +147,8 @@ public:
 
 private:
     void upload_table(cudaStream_t compute);
+    // Returns every reserved landing frame to the pool.
+    void release_reservations();
     // Publishes the promotions whose copies have completed.
     void publish_landed();
     // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
@@ -153,6 +169,13 @@ private:
     DeviceBuffer route_device_;
     PinnedHostBuffer route_host_{1};
     bool table_dirty_ = true;
+    DeviceBuffer landing_device_;
+    PinnedHostBuffer landing_host_{1};
+    DeviceBuffer landed_device_;
+    PinnedHostBuffer landed_host_{1};
+    std::vector<std::uint32_t> reserved_; // [layer][landing_per_layer_] reserved frames
+    std::uint32_t landing_per_layer_ = 0;
+    bool landing_uploaded_           = false; // the device landing table holds frames
 
     std::unique_ptr<expert_cache::CacheController> controller_;
     std::vector<expert_cache::CacheController::Command> commands_;

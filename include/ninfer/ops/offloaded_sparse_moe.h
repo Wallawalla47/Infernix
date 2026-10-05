@@ -121,6 +121,16 @@ struct MoeExpertSource {
     // (fork, join) are caller-owned; the stream is otherwise idle.
     cudaStream_t fork_stream = nullptr;
     cudaEvent_t fork_events[2] = {};
+    // Optional landing for forked calls (design §19.3.5 S4; ignored by every other route): the n-th
+    // staged miss in job order (CPU-served misses excluded) is copied into frame landing[n]
+    // (frame_base + landing[n] * record_stride) instead of a staging slot when n < landing_slots
+    // and landing[n] >= 0, and stage block 0 writes landed[n] = its expert; other entries of
+    // `landed` are left as they are. Device arrays of landing_slots <= kMaxLandingSlots entries.
+    // The frames must be free (no expert, not read by this call); the caller adopts the landed
+    // experts afterwards. Results are unchanged: a landed record is read exactly as a staged one.
+    const std::int32_t* landing = nullptr;
+    std::int32_t* landed        = nullptr;
+    std::int32_t landing_slots  = 0;
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

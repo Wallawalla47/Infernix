@@ -5704,6 +5704,35 @@ CPU-served misses are still promoted within the budget.
   Bit-neutral (a landed frame holds the identical record). C = 1: the first ~100-200 decode tokens
   after start and every cold benchmark.
 
+*S4 as implemented* (branch `claude/fn-conc-s4`, over S4b and S3, 2026-10-05):
+
+- **Op.** `MoeExpertSource::landing` / `landed` / `landing_slots` (≤ `kMaxLandingSlots` = 32), honoured
+  only on the fork route (decode and verification); the pass and serial routes ignore them.
+  `stage_kernel` now ranks its misses with warp ballots in chunks of 256 jobs (no serial walk), the
+  n-th miss (CPU-served jobs excluded) lands in `landing[n]` when that is a frame (block 0 logs
+  `landed[n]`), others take the next staging slot; per-miss destinations sit in shared memory.
+- **Program.** `CacheController::reserve_free` (pops free frames while the policy has room),
+  `adopt` (READY in its frame, admitted with an LFRU victim outside the layer's group, a queued
+  load dropped by `drain_queue`, which now also skips keys that are no longer absent; an in-flight
+  copy of the key never publishes since adoption bumps its serial), `release`, `free_frames`.
+  `ExpertResidency::before_round(compute, landing)` (decode and verify only) returns any
+  unsettled reservations, reserves min(16, free / layers) frames per layer, uploads the
+  [48][16] table with `upload_pinned` and clears the landed log; the log returns with the route
+  download; `after_round` adopts each layer's landed experts before `on_route`, whose budget
+  becomes max(0, budget − landed). Reservations are also returned before a resize or a lend.
+  `decode_budget` counts `promotions + landed + seeded`; the per-request report adds "landed".
+- **Tests.** Layer test: an exact oracle of the landed experts (the first staged misses in job
+  order, CPU-selected misses excluded, a −1 slot skipped, nothing on non-fork routes) and their
+  frame bytes. Expert-cache test: reserve/adopt/release semantics.
+- **Measured** (2026-10-05, cold CLI code prompt, `--expert-state off`, ABBA in one build with a
+  temporary toggle): plain 74.6/74.7 → 81.3/80.8 tok/s (+8.6 %), MTP 89.8/89.2 → 133.1/133.1
+  (+48.7 %); ~5.7-6.3 K landed experts replace ~55-60 % of the promotions. The 7,448-token prompt's
+  MTP decode 60.6 → 91.0 tok/s (one run per arm). C = 4 plain fill through `ninfer-serve` 57.8 →
+  73.5 tok/s aggregate (one run per arm), outputs identical. Greedy ids of code and story, plain
+  and MTP, equal the pre-S4 build. **Open:** the long prompt's ids varied between runs in both
+  arms; the same variation appears without S4 and is traced to the wide prefill route (§19.3.8,
+  "F1 nondeterminism"), not to landing, which is decode-only.
+
 **S4b. Warm start (2026-10-04, from Strata; 1-1.5 days).** §9.3 item 4 plans seed and persistence,
 but `LfruPolicy::seed` has no caller, so every start begins with 0 resident experts. Strata fills
 VRAM at start from a ranking: the user's saved state if one exists (VRAM experts, then counted

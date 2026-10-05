@@ -203,11 +203,23 @@ public:
     // round only. Returns the number of keys loaded.
     std::uint32_t seed(std::span<const std::uint32_t> keys, std::span<const std::uint32_t> counts,
                        std::vector<Command>& out);
+    // Fill-phase landing (design §19.3.5 S4). reserve_free pops up to `count` free frames into
+    // `out` while the policy has room for that many more residents (the LFRU state is untouched)
+    // and returns how many it reserved. adopt makes `key`, copied into the reserved `frame` during
+    // a round, resident there: READY in the table, admitted by the policy (a victim outside
+    // `protect` is evicted as in on_route), a queued load of it dropped; false when the key is
+    // already loading or resident elsewhere (the caller then releases the frame). release returns
+    // a reserved frame that received no expert.
+    std::uint32_t reserve_free(std::uint32_t count, std::vector<std::uint32_t>& out);
+    bool adopt(std::uint32_t key, std::uint32_t frame, std::span<const std::uint32_t> protect,
+               std::uint64_t round_started, std::vector<Command>& out);
+    void release(std::uint32_t frame);
     [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
     // The key held in `frame`, or nothing.
     [[nodiscard]] std::optional<std::uint32_t> frame_key(std::uint32_t frame) const;
 
     [[nodiscard]] std::uint32_t frames() const { return frames_.backed(); }
+    [[nodiscard]] std::uint32_t free_frames() const { return static_cast<std::uint32_t>(frames_.free_count()); }
     [[nodiscard]] const ResidencyEntry& entry(std::uint32_t key) const { return table_[key]; }
     [[nodiscard]] const LfruPolicy& policy() const { return policy_; }
     [[nodiscard]] std::size_t queued_loads() const { return queued_.size(); }
