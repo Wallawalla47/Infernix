@@ -43,4 +43,35 @@ private:
     std::vector<CUmemGenericAllocationHandle> chunks_;
 };
 
+// A reserved virtual range whose chunks are mapped individually, anywhere in it (an elastic pool
+// whose planes each grow at their own end: design §19.3.11). Unmapped chunks must never be
+// accessed. Not thread-safe; the owner orders every unmap after the device work that reads it.
+class VmmRange {
+public:
+    VmmRange(int device, std::size_t reserve_bytes, std::size_t chunk_bytes);
+    ~VmmRange();
+    VmmRange(const VmmRange&)            = delete;
+    VmmRange& operator=(const VmmRange&) = delete;
+
+    [[nodiscard]] void* base() const noexcept { return reinterpret_cast<void*>(base_); }
+    [[nodiscard]] std::size_t chunk_bytes() const noexcept { return chunk_; }
+    [[nodiscard]] std::size_t reserved_bytes() const noexcept { return reserved_; }
+    [[nodiscard]] std::size_t chunk_count() const noexcept { return handles_.size(); }
+    [[nodiscard]] std::size_t mapped_bytes() const noexcept { return mapped_ * chunk_; }
+    [[nodiscard]] bool mapped(std::size_t chunk) const noexcept { return handles_[chunk] != 0; }
+
+    // Maps chunk `chunk`; false (nothing mapped) when the device has no memory for it.
+    [[nodiscard]] bool map(std::size_t chunk);
+    // Releases chunk `chunk`; the caller has finished every device access to it.
+    void unmap(std::size_t chunk);
+
+private:
+    int device_           = 0;
+    std::size_t chunk_    = 0;
+    std::size_t reserved_ = 0;
+    std::size_t mapped_   = 0;
+    CUdeviceptr base_     = 0;
+    std::vector<CUmemGenericAllocationHandle> handles_; // 0: unmapped
+};
+
 } // namespace ninfer
