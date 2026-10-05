@@ -31,7 +31,7 @@ struct ReadOnlyFile::Impl {
     const std::byte* data = nullptr;
     std::size_t size      = 0;
 
-    explicit Impl(const std::filesystem::path& path) {
+    explicit Impl(const std::filesystem::path& path, FileMapping map) {
         // A read-only consumer imposes the loosest sharing: POSIX open and unlink are always
         // permissive, so a mapped artifact must not block re-reading or replacement (for
         // example swapping in a new .ninfer while a server still has it mapped). Reads still
@@ -60,7 +60,9 @@ struct ReadOnlyFile::Impl {
         }
 
         size = static_cast<std::size_t>(file_size.QuadPart);
-        if (size != 0) {
+        if (map == FileMapping::None) {
+            close_handle(mapping_file); // no buffered handle either: nothing caches the file's data
+        } else if (size != 0) {
             mapping = ::CreateFileMappingW(mapping_file, nullptr, PAGE_READONLY, 0, 0, nullptr);
             if (mapping == nullptr) {
                 const auto error = ::GetLastError();
@@ -105,20 +107,22 @@ struct ReadOnlyFile::Impl {
     }
 };
 
-ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path)
-    : impl_(std::make_unique<Impl>(path)) {}
+ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path, FileMapping mapping)
+    : impl_(std::make_unique<Impl>(path, mapping)) {}
 
 ReadOnlyFile::~ReadOnlyFile()                                  = default;
 ReadOnlyFile::ReadOnlyFile(ReadOnlyFile&&) noexcept            = default;
 ReadOnlyFile& ReadOnlyFile::operator=(ReadOnlyFile&&) noexcept = default;
 
 std::span<const std::byte> ReadOnlyFile::mapped_bytes() const noexcept {
-    return {impl_->data, impl_->size};
+    return {impl_->data, impl_->data != nullptr ? impl_->size : 0}; // FileMapping::None: empty
 }
 
 std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
     LARGE_INTEGER size{};
-    if (!::GetFileSizeEx(impl_->mapping_file, &size) || size.QuadPart < 0) {
+    const bool buffered = impl_->mapping_file != nullptr && impl_->mapping_file != INVALID_HANDLE_VALUE;
+    const HANDLE file   = buffered ? impl_->mapping_file : impl_->direct_file; // FileMapping::None: no buffered handle
+    if (!::GetFileSizeEx(file, &size) || size.QuadPart < 0) {
         return impl_->size;
     }
     return static_cast<std::uint64_t>(size.QuadPart);

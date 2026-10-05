@@ -9,9 +9,18 @@
 
 namespace ninfer {
 
+// Whether a ReadOnlyFile maps the whole file. A file read only through read_direct* must not be
+// mapped: on Windows, every unbuffered read of a file with a mapped data section pays the cache
+// manager's coherency work, which cut random 4 KiB reads of the n-gram volume from ~220K/s to
+// ~56K/s (Optane P5800X, 2026-10-05).
+enum class FileMapping : std::uint8_t {
+    Whole, // mapped_bytes() is the whole file
+    None,  // nothing mapped: mapped_bytes() is empty; for read_direct* only
+};
+
 class ReadOnlyFile {
 public:
-    explicit ReadOnlyFile(const std::filesystem::path& path);
+    explicit ReadOnlyFile(const std::filesystem::path& path, FileMapping mapping = FileMapping::Whole);
     ~ReadOnlyFile();
 
     ReadOnlyFile(ReadOnlyFile&&) noexcept;
