@@ -15,7 +15,11 @@ Q8Launch select_q8_n10240_k320(std::int32_t tokens) {
     if (tokens <= 8) return launch_q8_a16_stream_linear<Stream<8, 8>>;
     if (tokens <= 64) return launch_q8_a16_mma_r32_t64;
     if (tokens <= 96) return launch_q8_a16_mma_r32_t96;
-    return launch_q8_a16_mma_r32_t128;
+    // Beyond 96 columns (prefill chunks): the MMA tile sweep of 2026-10-05 (fn/rigs/layer/q8tiles2.bat,
+    // RTX 5090). Every MMA tile accumulates each output over K in the same order, so their bits are
+    // identical (checked at every swept point); only speed differs.
+    if (tokens <= 192) return launch_q8_a16_mma_r48_t64;
+    return launch_q8_a16_mma_r64_t128;
 }
 
 } // namespace ninfer::ops::detail
