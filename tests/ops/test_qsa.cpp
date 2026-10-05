@@ -4,11 +4,15 @@
 // 2048 in blocks of 4):
 //
 //   - qsa_index_query: FP64 RMSNorm with the unit-offset weight, then the half-split RoPE of the
-//     first rotary_dim dimensions at each column's position.
+//     first rotary_dim dimensions at each column's three-axis RoPE position, pair i on axis i % 3
+//     (distinct random axes).
 //   - qsa_pool_keys: the pooled key of every block a call completes, read back from the paged
-//     plane, against FP64 RoPE(norm(bf16(mean))) (the BF16 mean is the contract's boundary); the
-//     slots of blocks no call completed stay untouched; pooled keys are bitwise the same however a
-//     sequence is split into calls.
+//     plane, against FP64 RoPE(norm(bf16(mean))) at the RoPE position of the block's first token
+//     (the BF16 mean is the contract's boundary). Every sequence holds an image span with real
+//     M-RoPE positions (text: three equal axes; image: (cur, cur + y, cur + x); text after it
+//     shifted by max(h, w)), so blocks rotate by distinct axes, also when their first token
+//     precedes the call (block starts). The slots of blocks no call completed stay untouched;
+//     pooled keys are bitwise the same however a sequence is split into calls.
 //   - The raw-key tails, exactly: after a call or commit ending at position `last`, slot q % R
 //     holds the raw key of every position q <= last of the latest block with q % R < R - 1, also
 //     when `last` completes that block. Rewriting position `last` of a completed block (the MTP
@@ -32,6 +36,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -173,12 +178,16 @@ std::vector<double> normalize(const std::vector<double>& x,
     return out;
 }
 
-// The half-split rotation of the first kRotary dimensions at `position`.
-void rotate(std::vector<double>& x, int position) {
+// A token's RoPE position: three axes (temporal, height, width).
+using Rope = std::array<int, 3>;
+
+// The half-split rotation of the first kRotary dimensions at RoPE position `rope`, pair i by
+// axis i % 3 (interleaved M-RoPE).
+void rotate(std::vector<double>& x, const Rope& rope) {
     constexpr int half = kRotary / 2;
     for (int i = 0; i < half; ++i) {
         const double inv   = std::pow(static_cast<double>(kGeometry.theta), -2.0 * i / kRotary);
-        const double angle = position * inv;
+        const double angle = rope[i % 3] * inv;
         const double c = std::cos(angle), s = std::sin(angle);
         const double a = x[i], b = x[i + half];
         x[i]        = a * c - b * s;
@@ -186,9 +195,35 @@ void rotate(std::vector<double>& x, int position) {
     }
 }
 
-// Pooled key of block b of a raw-key sequence ([positions][kDi] BF16).
+// An image span inside a sequence: grid rows x cols tokens from position `start` (rows = 0: none).
+struct Image {
+    int start = 0, rows = 0, cols = 0;
+};
+
+// RoPE positions of `n` tokens with one image, as the frontend assigns them: text tokens before the
+// image take their index on every axis, image token (y, x) takes (cur, cur + y, cur + x) with cur
+// its start, and text after it continues from cur + max(rows, cols).
+std::vector<Rope> rope_map(int n, const Image& image) {
+    std::vector<Rope> out(n);
+    const int end = image.start + image.rows * image.cols;
+    for (int q = 0; q < n; ++q) {
+        if (image.rows == 0 || q < image.start) {
+            out[q] = {q, q, q};
+        } else if (q < end) {
+            const int k = q - image.start;
+            out[q]      = {image.start, image.start + k / image.cols, image.start + k % image.cols};
+        } else {
+            const int v = image.start + std::max(image.rows, image.cols) + (q - end);
+            out[q]      = {v, v, v};
+        }
+    }
+    return out;
+}
+
+// Pooled key of block b of a raw-key sequence ([positions][kDi] BF16) with RoPE positions `rope`.
 std::vector<double> pooled_oracle(const std::vector<std::uint16_t>& raw,
-                                  const std::vector<std::uint16_t>& weight, int block) {
+                                  const std::vector<std::uint16_t>& weight,
+                                  const std::vector<Rope>& rope, int block) {
     std::vector<double> mean(kDi);
     for (int d = 0; d < kDi; ++d) {
         double sum = 0.0;
@@ -198,7 +233,7 @@ std::vector<double> pooled_oracle(const std::vector<std::uint16_t>& raw,
         mean[d] = from_bf16(to_bf16(sum / kR));
     }
     auto out = normalize(mean, weight);
-    rotate(out, kR * block);
+    rotate(out, rope[kR * block]);
     return out;
 }
 
@@ -208,12 +243,13 @@ void test_index_query(int columns, std::uint32_t seed) {
     std::mt19937 rng(seed);
     const auto q = random_bf16(rng, static_cast<std::size_t>(kDi) * kIndexHeads * columns, 2.0);
     const auto weight = random_bf16(rng, kDi, 0.3);
+    // Distinct axes per column (axis a of column c at word a * columns + c).
     std::uniform_int_distribution<int> position(0, 8191);
-    std::vector<std::int32_t> positions(columns);
-    for (auto& p : positions) { p = position(rng); }
-    DeviceBuffer dq = upload(q), dw = upload(weight), dp = upload(positions);
+    std::vector<std::int32_t> rope(3 * static_cast<std::size_t>(columns));
+    for (auto& p : rope) { p = position(rng); }
+    DeviceBuffer dq = upload(q), dw = upload(weight), dp = upload(rope);
     Tensor tq(dq.p, DType::BF16, {kDi, kIndexHeads, columns});
-    ops::qsa_index_query(tq, Tensor(dw.p, DType::BF16, {kDi}), Tensor(dp.p, DType::I32, {columns}),
+    ops::qsa_index_query(tq, Tensor(dw.p, DType::BF16, {kDi}), Tensor(dp.p, DType::I32, {columns, 3}),
                          kGeometry, nullptr);
     synchronize("index query");
     const auto got = t::from_device_bf16(dq, q.size());
@@ -226,7 +262,7 @@ void test_index_query(int columns, std::uint32_t seed) {
                 x[d] = from_bf16(q[(static_cast<std::size_t>(c) * kIndexHeads + h) * kDi + d]);
             }
             auto out = normalize(x, weight);
-            rotate(out, positions[c]);
+            rotate(out, {rope[c], rope[columns + c], rope[2 * static_cast<std::size_t>(columns) + c]});
             ref.insert(ref.end(), out.begin(), out.end());
         }
     }
@@ -250,6 +286,7 @@ struct PoolCase {
     const char* name;
     std::vector<int> first;
     std::vector<Step> steps;
+    std::vector<Image> images; // one per row
 };
 
 constexpr int kLayers = 2;
@@ -285,6 +322,9 @@ public:
             for (int r = 0; r < rows_; ++r) {
                 raw_[l].push_back(
                     random_bf16(rng, static_cast<std::size_t>(positions_) * kDi, 1.0));
+            }
+            if (l == 0) {
+                for (int r = 0; r < rows_; ++r) { rope_.push_back(rope_map(positions_, c.images.at(r))); }
             }
             pooled_[l] = upload(std::vector<std::uint16_t>(
                 static_cast<std::size_t>(kSlotWidth) * kPage * pages, kCanary));
@@ -344,13 +384,18 @@ private:
                       DeviceBuffer* positions_out = nullptr) {
         const int batch = static_cast<int>(table_rows.size());
         std::vector<std::uint16_t> keys(static_cast<std::size_t>(kDi) * width * batch * kLayers);
-        std::vector<std::int32_t> positions(static_cast<std::size_t>(width) * batch), rows(batch),
-            slots(batch);
+        const std::size_t columns = static_cast<std::size_t>(width) * batch;
+        std::vector<std::int32_t> positions(columns), rows(batch), slots(batch), rope(3 * columns),
+            block_rope(3 * static_cast<std::size_t>(batch));
         for (int b = 0; b < batch; ++b) {
             rows[b]  = table_rows[b];
             slots[b] = slot_of(table_rows[b]);
+            const Rope& block_start = rope_[sources[b]][starts[b] / kR * kR];
+            for (int a = 0; a < 3; ++a) { block_rope[static_cast<std::size_t>(a) * batch + b] = block_start[a]; }
             for (int j = 0; j < width; ++j) {
-                positions[static_cast<std::size_t>(b) * width + j] = starts[b] + j;
+                const std::size_t column = static_cast<std::size_t>(b) * width + j;
+                positions[column]        = starts[b] + j;
+                for (int a = 0; a < 3; ++a) { rope[a * columns + column] = rope_[sources[b]][starts[b] + j][a]; }
                 for (int l = 0; l < kLayers; ++l) {
                     std::memcpy(
                         &keys[((static_cast<std::size_t>(l) * batch + b) * width + j) * kDi],
@@ -360,15 +405,17 @@ private:
             }
         }
         DeviceBuffer dkeys = upload(keys), dpos = upload(positions), drows = upload(rows),
-                     dslots = upload(slots);
+                     dslots = upload(slots), drope = upload(rope), dblock = upload(block_rope);
         const ops::QsaBatch qsa_batch{
-            .block_tables = Tensor(tables_.p, DType::I32, {pages_per_row_, table_rows_}),
-            .table_rows   = Tensor(drows.p, DType::I32, {batch}),
-            .positions    = Tensor(dpos.p, DType::I32, {batch * width}),
-            .tail_slots   = Tensor(dslots.p, DType::I32, {batch}),
-            .batch        = batch,
-            .width        = width,
-            .update_tails = update_tails};
+            .block_tables     = Tensor(tables_.p, DType::I32, {pages_per_row_, table_rows_}),
+            .table_rows       = Tensor(drows.p, DType::I32, {batch}),
+            .positions        = Tensor(dpos.p, DType::I32, {batch * width}),
+            .tail_slots       = Tensor(dslots.p, DType::I32, {batch}),
+            .rope_positions   = Tensor(drope.p, DType::I32, {batch * width, 3}),
+            .block_start_rope = Tensor(dblock.p, DType::I32, {batch, 3}),
+            .batch            = batch,
+            .width            = width,
+            .update_tails     = update_tails};
         for (int l = 0; l < kLayers; ++l) {
             Tensor raw(static_cast<std::uint16_t*>(dkeys.p) +
                            static_cast<std::size_t>(l) * kDi * width * batch,
@@ -467,7 +514,7 @@ private:
                     const auto key = block_key(stored, r, b);
                     if (kR * b + kR - 1 >= case_.first[r] && kR * b + kR - 1 < written_[r]) {
                         for (const auto v : key) { got.push_back(from_bf16(v)); }
-                        const auto oracle = pooled_oracle(raw_[l][r], weight_[l], b);
+                        const auto oracle = pooled_oracle(raw_[l][r], weight_[l], rope_[r], b);
                         ref.insert(ref.end(), oracle.begin(), oracle.end());
                     } else {
                         untouched &= std::all_of(key.begin(), key.end(),
@@ -543,6 +590,7 @@ private:
     std::vector<std::uint16_t> weight_[kLayers];
     DeviceBuffer weights_[kLayers], pooled_[kLayers];
     std::vector<std::vector<std::uint16_t>> raw_[kLayers]; // [row][position * kDi + d]
+    std::vector<std::vector<Rope>> rope_;                  // [row][position]
     std::vector<int> frontier_, written_;
 };
 
@@ -565,7 +613,8 @@ void test_pool(std::uint32_t seed) {
                           {3, false, {}},
                           {5, true, {5, 1}},
                           {130, false, {}},
-                          {2, false, {}}}};
+                          {2, false, {}}},
+                         {{9, 6, 10}, {41, 5, 8}}};
     PoolHarness(mixed, seed).run();
     // One sequence, the MTP drafter's pattern: prompt chunks, then verification commits of one to
     // five cells (draft step 0 rewrites the last committed cell).
@@ -579,8 +628,23 @@ void test_pool(std::uint32_t seed) {
                             {6, true, {2}},
                             {6, true, {5}},
                             {1, false, {}},
-                            {6, true, {6}}}};
+                            {6, true, {6}}},
+                           {{100, 16, 16}}};
     PoolHarness(drafter, seed + 1).run();
+    // Vision (VT2): a 1,024-column prefill call through 32 x 24 image grids that begin inside it
+    // (row 1 at a position that is not a multiple of 4), then decode W = 1 and verification
+    // W = 5 / 8 at B = 2, so blocks whose first token precedes a call rotate by its block start.
+    const PoolCase image{"image",
+                         {0, 3},
+                         {{1024, false, {}},
+                          {1, false, {}},
+                          {2, false, {}},
+                          {5, true, {3, 5}},
+                          {8, true, {8, 2}},
+                          {1, false, {}},
+                          {8, true, {1, 7}}},
+                         {{200, 32, 24}, {777, 24, 32}}};
+    PoolHarness(image, seed + 2).run();
 }
 
 // --------------------------------------------------------------------------------- attention

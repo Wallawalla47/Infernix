@@ -16,6 +16,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/rows.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 
@@ -29,9 +30,6 @@ namespace ninfer::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
-
-// Columns of one MTP call inside a prefill chunk (bounds the drafter's share of the workspace).
-constexpr std::int32_t kMtpChunkColumns = 512;
 
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
@@ -100,6 +98,10 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
         logits.ne[0] != dim(config_.vocab_size)) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
+    if (batch.rope_positions.ne[0] != T || batch.rope_positions.ne[1] != 3 ||
+        batch.block_start_rope.ne[0] != batch.batch || batch.block_start_rope.ne[1] != 3) {
+        throw std::invalid_argument("Qwen4Exp forward: RoPE positions must be [T, 3] and block starts [batch, 3]");
+    }
     const cudaStream_t s = device_.stream;
     const std::int32_t H = dim(config_.hidden_size), W = dim(config_.residual_width());
     // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
@@ -107,6 +109,9 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     work_.reset();
     Tensor x0 = work_.alloc(DType::BF16, {H, T});
     ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+    if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
+        ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
+    }
     Tensor residual = work_.alloc(DType::BF16, {W, T});
     ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
 
@@ -141,9 +146,11 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
                                         ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
                                               .view({dim(config_.qsa.index_head_dim), T})
                                         : Tensor{},
-                    .update_tails = batch.verify == nullptr,
-                    .positions    = batch.positions,
-                    .slots        = batch.slots,
+                    .update_tails     = batch.verify == nullptr,
+                    .positions        = batch.positions,
+                    .rope_positions   = batch.rope_positions,
+                    .block_start_rope = batch.block_start_rope,
+                    .slots            = batch.slots,
                     .table_rows   = batch.table_rows,
                     .batch        = batch.batch,
                     .width        = batch.width};
@@ -186,7 +193,8 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
         const std::int32_t cells = (chunk.prepend ? 1 : 0) + chunk.columns;
         const std::size_t column = static_cast<std::size_t>(W) * 2;
         if (chunk.columns < 0 || chunk.columns > T || batch.batch != 1 ||
-            (cells > 0 && (chunk.ids.numel() != cells || chunk.positions.numel() != cells))) {
+            (cells > 0 && (chunk.ids.ne[0] != cells || chunk.positions.ne[0] != cells ||
+                           chunk.rope_positions == nullptr || chunk.block_start_rope == nullptr))) {
             throw std::invalid_argument("Qwen4Exp forward: MTP chunk does not match the call");
         }
         // Cell v is `saved` (v = 0 when prepending) or chunk column v - prepend; sub-chunks bound
@@ -208,14 +216,20 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
                 CUDA_CHECK(cudaMemcpyAsync(out, static_cast<const std::byte*>(residual.data) + column * from,
                                            column * rest, cudaMemcpyDeviceToDevice, s));
             }
-            MtpCall call{.residuals  = rows,
-                         .ids        = chunk.ids.slice(0, begin, n),
-                         .positions  = chunk.positions.slice(0, begin, n),
-                         .slots      = batch.slots,
-                         .table_rows = batch.table_rows,
-                         .batch      = 1,
-                         .width      = n,
-                         .kv_only    = true};
+            const std::int32_t k = begin / kMtpChunkColumns;
+            MtpCall call{.residuals        = rows,
+                         .ids              = chunk.ids.slice(0, begin, n),
+                         .positions        = chunk.positions.slice(0, begin, n),
+                         .rope_positions   = Tensor(chunk.rope_positions + 3 * static_cast<std::size_t>(begin),
+                                                    DType::I32, {n, 3}),
+                         .block_start_rope = Tensor(chunk.block_start_rope + 3 * static_cast<std::size_t>(k),
+                                                    DType::I32, {1, 3}),
+                         .slots            = batch.slots,
+                         .table_rows       = batch.table_rows,
+                         .batch            = 1,
+                         .width            = n,
+                         .kv_only          = true,
+                         .vision           = chunk.vision != nullptr ? &chunk.vision[k] : nullptr};
             mtp_block(call, rows);
         }
         CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1),
@@ -383,7 +397,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
         ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
     }
-    ops::rope(call.positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
+    ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn, s);
 
     // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
     const auto& layer = call.layer;
@@ -402,11 +416,18 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                    call.positions.view({call.width, call.batch}), call.table_rows, view, s);
     }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
-    const ops::QsaBatch qsa_batch{kv_.block_tables, call.table_rows, call.positions, call.slots, call.batch,
-                                  call.width, call.update_tails};
+    const ops::QsaBatch qsa_batch{.block_tables     = kv_.block_tables,
+                                  .table_rows       = call.table_rows,
+                                  .positions        = call.positions,
+                                  .tail_slots       = call.slots,
+                                  .rope_positions   = call.rope_positions,
+                                  .block_start_rope = call.block_start_rope,
+                                  .batch            = call.batch,
+                                  .width            = call.width,
+                                  .update_tails     = call.update_tails};
     ops::qsa_pool_keys(ik, p.index_key_norm, call.tails, layer, qsa_batch, geometry, s);
     if (call.kv_only) { return Tensor{}; }
-    ops::qsa_index_query(iq, p.index_query_norm, call.positions, geometry, s);
+    ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
 
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_);
@@ -500,7 +521,9 @@ void Forward::run_mtp(const MtpCall& call) {
         throw std::logic_error("Qwen4Exp forward: the MTP drafter is not loaded");
     }
     if (call.batch <= 0 || call.width <= 0 || call.ids.numel() != call.batch * call.width ||
-        call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1)) {
+        call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1) ||
+        call.rope_positions.ne[0] != call.batch * call.width || call.rope_positions.ne[1] != 3 ||
+        call.block_start_rope.ne[0] != call.batch || call.block_start_rope.ne[1] != 3) {
         throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");
     }
     eager_chunk_ = false;
@@ -521,6 +544,9 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         // Input fusion: R = fc_hidden(per stream of RMSNorm_{S*H}(rows)) + fc_embedding(RMSNorm_H(embed(id))).
         Tensor x0 = work_.alloc(DType::BF16, {H, T});
         ops::embedding(call.ids, parameters_.token_embedding, x0, s);
+        if (call.vision != nullptr && call.vision->columns.data != nullptr) {
+            ops::scatter(call.vision->embeddings, call.vision->columns, x0, s);
+        }
         Tensor e = work_.alloc(DType::BF16, {H, T});
         ops::rmsnorm(x0, p.embedding_norm, config_.rms_norm_eps, true, e, s);
         Tensor ep = work_.alloc(DType::BF16, {H, T});
@@ -540,9 +566,11 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
                                            .tails        = state_.mtp_tails,
                                            .key_records  = call.key_records,
                                            .update_tails = call.kv_only && call.key_records.data == nullptr,
-                                           .kv_only      = call.kv_only,
-                                           .positions    = call.positions,
-                                           .slots        = call.slots,
+                                           .kv_only          = call.kv_only,
+                                           .positions        = call.positions,
+                                           .rope_positions   = call.rope_positions,
+                                           .block_start_rope = call.block_start_rope,
+                                           .slots            = call.slots,
                                            .table_rows   = call.table_rows,
                                            .batch        = call.batch,
                                            .width        = call.width};

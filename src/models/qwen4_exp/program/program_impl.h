@@ -23,6 +23,11 @@
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
+#include "models/qwen4_exp/program/rope_positions.h"
+#include "models/qwen4_exp/program/vision_window.h"
+#include "models/qwen3_5/execution/vision_tower.h"
+#include "models/qwen3_5/execution/vision_weight_stream.h"
+#include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -50,11 +55,18 @@
 namespace ninfer::models::qwen4_exp {
 namespace detail {
 
+// A prompt with media: its items' control plan and the encode window it needs (design §19.3.2).
+struct VisionAdmission {
+    qwen3_5::VisionControlPlan control;
+    VisionWindowPlan window;
+};
+
 struct BasePlanImpl {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
     std::uint32_t pages = 0; // KV page groups the request needs
     bool reuse          = false; // the prefix cache may resume and publish this request
+    std::shared_ptr<const VisionAdmission> vision;
 };
 
 // The copy-on-write source of a resume (design §19.3.1, rule MR6): the snapshot's tail page (the
@@ -99,6 +111,24 @@ struct QuoteImpl {
     std::uint32_t pages = 0;
     std::uint32_t lane  = 0;
     std::optional<PrefixSelection> prefix;
+    std::shared_ptr<const VisionAdmission> vision;
+};
+
+// A media prompt's encode window and handoff (design §19.3.2): filled at reserve, encoded over
+// admission steps, released once the prompt's last call is enqueued or the lane is released.
+struct LaneVision {
+    std::shared_ptr<const VisionAdmission> admission;
+    qwen3_5::VisionControl control;            // the encoded items' controls
+    std::vector<std::shared_ptr<const qwen3_5::PreparedMediaPayload>> payloads; // per encoded item
+    std::vector<std::uint32_t> visual;         // the encoded visual tokens' positions, ascending
+    ExpertResidency::FrameLease lease;         // the handoff (W), or handoff and window (L)
+    Tensor handoff;                            // BF16 [out, V_encoded]
+    std::unique_ptr<qwen3_5::execution::VisionWeightStream> stream;
+    std::optional<qwen3_5::execution::VisionParameters> weights; // the stream's rebased view
+    std::unique_ptr<qwen3_5::execution::VisionPassLayout> layout;
+    std::unique_ptr<qwen3_5::execution::VisionTowerPass> pass;
+    std::optional<CudaEventTimer> timer;
+    bool encoded = false;
 };
 
 struct ContractAccess {
@@ -147,10 +177,15 @@ using Clock = std::chrono::steady_clock;
 
 inline std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 
-// Per-call inputs staged through pinned memory, one device copy.
+// Per-call inputs staged through pinned memory, one device copy. Decode and verification rounds
+// upload only the prefix before `ngram` plus their rows (io_prefix), so every array they read,
+// the RoPE positions and pooled-block starts included, precedes `ngram`. `rope` holds a call's
+// [columns, 3] axis-major RoPE positions, `block_rope` its [batch, 3] block starts; `mtp_rope` and
+// `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk).
 struct IoLayout {
-    std::size_t ids = 0, positions = 0, slots = 0, rows = 0, columns = 0, ngram = 0, mtp_ids = 0, mtp_cells = 0,
-                bytes = 0;
+    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, ngram = 0,
+                mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0, vision_columns = 0,
+                mtp_vision_columns = 0, bytes = 0;
 };
 
 // Device I32 arrays of a verification round, each with room for every lane and width.
@@ -159,10 +194,12 @@ struct SpecLayout {
                 accepted = 0, commit = 0, words = 0;
 };
 
-// I32 MTP drafter io: chain ids [B], cells [K, B], drafts [K, B], catch-up ids [W, B], gather
-// columns [B], catch-up cells [W, B].
+// I32 MTP drafter io: chain ids [B], cells [K, B], per draft step the cells' RoPE positions and
+// pooled-block starts [K][3][B] (axis-major per step), drafts [K, B], catch-up ids [W, B], gather
+// columns [B], catch-up cells [W, B]. Everything before `drafts` is uploaded per draft round.
 struct MtpIo {
-    std::size_t ids = 0, cells = 0, drafts = 0, up_ids = 0, gather = 0, up_cells = 0, words = 0;
+    std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, drafts = 0, up_ids = 0, gather = 0,
+                up_cells = 0, words = 0;
 };
 
 // Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
@@ -219,6 +256,9 @@ public:
         std::vector<std::int32_t> history; // prompt, then committed output
         std::uint32_t prompt_tokens = 0;
         std::uint32_t state_tokens  = 0; // positions already in the model state
+        LaneRope rope;                    // RoPE positions of the lane's tokens (design §19.3.2)
+        std::unique_ptr<LaneVision> vision; // the encode window and handoff of a media prompt
+        double vision_seconds = 0;          // the tower's GPU time
         ops::SamplingConfig sampling;
         std::optional<DeviceKVPageReservation> reservation;
         std::vector<DeviceKVPageLease> pages;
@@ -310,15 +350,25 @@ public:
         const std::size_t heads     = NgramHash(c.ple.ngram, 0).heads();
         const std::size_t row_bytes = c.ple.table.row_bytes;
         const std::size_t columns   = static_cast<std::size_t>(d.columns);
-        d.io.ids       = 0;
-        d.io.positions = align(d.io.ids + 4ULL * columns);
-        d.io.slots     = align(d.io.positions + 4ULL * columns);
-        d.io.rows      = align(d.io.slots + 4ULL * lanes);
-        d.io.columns   = align(d.io.rows + 4ULL * lanes);
-        d.io.ngram     = align(d.io.columns + 4ULL * columns);
-        d.io.mtp_ids   = align(d.io.ngram + row_bytes * heads * columns);
-        d.io.mtp_cells = align(d.io.mtp_ids + 4ULL * (columns + 1));
-        d.io.bytes     = align(d.io.mtp_cells + 4ULL * (columns + 1));
+        const std::size_t mtp_subchunks = (columns + 1 + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
+        d.io.ids            = 0;
+        d.io.positions      = align(d.io.ids + 4ULL * columns);
+        d.io.rope           = align(d.io.positions + 4ULL * columns);
+        d.io.block_rope     = align(d.io.rope + 12ULL * columns);
+        d.io.slots          = align(d.io.block_rope + 12ULL * lanes);
+        d.io.rows           = align(d.io.slots + 4ULL * lanes);
+        d.io.columns        = align(d.io.rows + 4ULL * lanes);
+        d.io.ngram          = align(d.io.columns + 4ULL * columns);
+        d.io.mtp_ids        = align(d.io.ngram + row_bytes * heads * columns);
+        d.io.mtp_cells      = align(d.io.mtp_ids + 4ULL * (columns + 1));
+        d.io.mtp_rope       = align(d.io.mtp_cells + 4ULL * (columns + 1));
+        d.io.mtp_block_rope = align(d.io.mtp_rope + 12ULL * (columns + 1));
+        d.io.vision_columns     = align(d.io.mtp_block_rope + 12ULL * mtp_subchunks);
+        d.io.mtp_vision_columns = align(d.io.vision_columns + 4ULL * columns);
+        d.io.bytes              = align(d.io.mtp_vision_columns + 4ULL * (columns + 1));
+        if (d.io.block_rope + 12ULL * lanes > d.io.ngram || d.io.columns + 4ULL * columns > d.io.ngram) {
+            throw std::logic_error("Qwen4Exp: decode io must precede the n-gram rows");
+        }
         d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
         d.logits16     = 2ULL * c.vocab_size * lanes * W;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
@@ -366,9 +416,11 @@ public:
             d.mtp_column_bytes = 2ULL * width;
             d.mtp_ones         = sizeof(float) * c.hc.streams * static_cast<std::size_t>(d.mtp_columns);
             const auto k       = static_cast<std::size_t>(d.mtp_k);
-            d.mtp_io.ids       = 0;
-            d.mtp_io.cells     = d.mtp_io.ids + lanes;
-            d.mtp_io.drafts    = d.mtp_io.cells + lanes * k;
+            d.mtp_io.ids              = 0;
+            d.mtp_io.cells            = d.mtp_io.ids + lanes;
+            d.mtp_io.rope_cells       = d.mtp_io.cells + lanes * k;
+            d.mtp_io.block_rope_cells = d.mtp_io.rope_cells + 3 * lanes * k;
+            d.mtp_io.drafts           = d.mtp_io.block_rope_cells + 3 * lanes * k;
             d.mtp_io.up_ids    = d.mtp_io.drafts + lanes * k;
             d.mtp_io.gather    = d.mtp_io.up_ids + static_cast<std::size_t>(lanes) * W;
             d.mtp_io.up_cells  = d.mtp_io.gather + lanes;
@@ -644,7 +696,8 @@ public:
     // ---------------------------------------------------------------- admission
     RequestBasePlan plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
         const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
-        if (data.has_media()) { throw std::invalid_argument("Qwen4Exp does not serve images or video yet"); }
+        std::shared_ptr<const VisionAdmission> vision;
+        if (data.has_media()) { vision = plan_vision(data); }
         const auto n = static_cast<std::uint32_t>(data.token_ids.size());
         if (n == 0 || n > options_.max_context) {
             throw std::invalid_argument("Qwen4Exp: the prompt is empty or exceeds max_context");
@@ -663,6 +716,8 @@ public:
         const std::uint64_t chunks = 1ULL + (n - 1ULL) / static_cast<std::uint64_t>(chunk_);
         base->summary.service_work_quanta =
             chunks + (base->summary.effective_output_tokens == 0 ? 0ULL : base->summary.effective_output_tokens - 1ULL);
+        if (vision) { base->summary.service_work_quanta += vision->window.steps; }
+        base->vision   = std::move(vision);
         base->sampling = translate(options.sampling);
         const std::uint32_t positions = std::min(options_.max_context, n + base->summary.effective_output_tokens);
         base->pages = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
@@ -670,7 +725,10 @@ public:
     }
 
     bool feasible(const RequestBasePlan& base) const noexcept {
-        return base.impl_ != nullptr && base.impl_->pages <= pool_->capacity_pages() &&
+        // A window lends at most what serving never gives up (a quarter of the frames stays).
+        const bool frames = !base.impl_ || !base.impl_->vision ||
+                            base.impl_->vision->window.frames <= residency_->frames() - residency_->frames() / 4;
+        return base.impl_ != nullptr && frames && base.impl_->pages <= pool_->capacity_pages() &&
                base.impl_->pages <= static_cast<std::uint32_t>(pages_per_row_);
     }
 
@@ -679,7 +737,8 @@ public:
         out.destination = destination;
         out.summary     = base.summary();
         if (destination.value >= options_.max_concurrency || lanes_[destination.value].phase != Phase::Free ||
-            transaction_lane_) {
+            transaction_lane_ ||
+            (base.impl_->vision && residency_->lendable() < base.impl_->vision->window.frames)) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
@@ -688,6 +747,7 @@ public:
         impl->sampling = base.impl_->sampling;
         impl->pages    = base.impl_->pages;
         impl->lane     = destination.value;
+        impl->vision   = base.impl_->vision;
         if (prefix_) {
             const auto& data = qwen3_5::PreparedPromptAccess::view(prompt);
             impl->prefix     = prefix_select(data, *base.impl_, destination.value);
@@ -744,7 +804,17 @@ public:
         lane.history.assign(data.token_ids.begin(), data.token_ids.end());
         lane.history.reserve(lane.history.size() + q.summary.effective_output_tokens + 1);
         lane.prompt_tokens  = static_cast<std::uint32_t>(lane.history.size());
+        // A prompt with media keeps its M-RoPE positions; every other token is its index + delta.
+        lane.rope.prompt_tokens = lane.prompt_tokens;
+        lane.rope.delta         = data.rope_delta;
+        if (data.has_media()) {
+            lane.rope.prompt.assign(data.positions.begin(), data.positions.end());
+        } else {
+            lane.rope.prompt.clear();
+        }
+        if (q.vision) { vision_reserve(lane, q.vision, data); }
         lane.state_tokens   = 0;
+        lane.vision_seconds = 0;
         lane.speculative    = {};
         lane.mtp_cells   = 0;
         lane.mtp_live    = mtp_;
@@ -809,8 +879,25 @@ public:
         return runtime::ContextTransactionReserveStatus::Reserved;
     }
 
-    ContextTransactionProgress progress(runtime::CancellationFlagView) {
+    ContextTransactionProgress progress(runtime::CancellationFlagView cancellation) {
         if (!transaction_lane_ || published_) { throw std::logic_error("Qwen4Exp: no admission to progress"); }
+        Lane& admitted = lanes_[*transaction_lane_];
+        if (admitted.vision && !vision_encoded(admitted)) {
+            // The encode window, one step per call (design §19.3.2); other lanes run between steps.
+            if (cancellation.requested()) {
+                release(*transaction_lane_);
+                MaterializationResult aborted;
+                aborted.status = runtime::ContextTransactionStatus::Aborted;
+                return aborted;
+            }
+            try {
+                vision_step(admitted);
+            } catch (...) {
+                release(*transaction_lane_);
+                throw;
+            }
+            if (!vision_encoded(admitted)) { return runtime::ContextTransactionInProgress{}; }
+        }
         published_ = true;
         MaterializationResult out;
         out.status    = runtime::ContextTransactionStatus::Published;
@@ -840,9 +927,11 @@ public:
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
         // a copy-out of this lane's state still in flight (design §19.3.1).
         next_waits_ = prefix_waits(lane);
-        run(1, width, 1, chunk ? &*chunk : nullptr);
+        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width));
         lane.state_tokens += static_cast<std::uint32_t>(width);
         prefix_after_prefill_call(lane, index, last);
+        // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
+        if (last && lane.vision) { vision_release(lane); }
         if (!last) {
             device_.synchronize();
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
@@ -1422,6 +1511,7 @@ private:
         out.prefill_seconds      = static_cast<double>(lane.prefill_ns) * 1e-9;
         out.decode_seconds       = static_cast<double>(lane.decode_ns) * 1e-9;
         out.decode_share_seconds = static_cast<double>(lane.decode_share_ns) * 1e-9;
+        out.vision_seconds       = lane.vision_seconds;
         return out;
     }
 
@@ -1433,6 +1523,8 @@ private:
         lane.row = KVExecutionRowLease{};
         lane.history.clear();
         lane.history.shrink_to_fit();
+        lane.rope = {};
+        if (lane.vision) { vision_release(lane); }
         lane.proposer.reset();
         lane.phase        = Phase::Free;
         lane.state_tokens = 0;
@@ -1461,6 +1553,21 @@ private:
     }
 
     std::byte* host_io() const { return static_cast<std::byte*>(io_host_.data()); }
+
+    // `count` I32 words of the pinned io at byte offset `offset`.
+    std::span<std::int32_t> io_words(std::size_t offset, std::size_t count) const {
+        return {reinterpret_cast<std::int32_t*>(host_io() + offset), count};
+    }
+
+    // RoPE positions of `count` consecutive tokens of `lane` from `first`, as columns column ..
+    // column + count - 1 of a call of `columns` columns over `batch` sequences, and the pooled-block
+    // start of the lane's sequence b.
+    void stage_call_rope(const Lane& lane, std::uint32_t first, std::int32_t count, std::int32_t columns,
+                         std::int32_t column, std::int32_t batch, std::int32_t b) const {
+        stage_rope(lane.rope, first, count, io_words(io_layout_.rope, 3ULL * columns), columns, column);
+        stage_rope_value(block_start_rope(lane.rope, first, static_cast<std::uint32_t>(r_)),
+                         io_words(io_layout_.block_rope, 3ULL * batch), batch, b);
+    }
 
     // The n-gram rows of `count` positions starting at `begin`, from the tokens before them; the
     // traffic counts toward `lane`'s request.
@@ -1495,6 +1602,7 @@ private:
             positions[i] = begin + i;
         }
         columns[0] = width - 1;
+        stage_call_rope(lanes_[lane], static_cast<std::uint32_t>(begin), width, width, 0, 1, 0);
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots)[0] = static_cast<std::int32_t>(lane);
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows)[0]  = static_cast<std::int32_t>(lane);
         stage_ngram(lanes_[lane], history, begin, width, 0);
@@ -1515,6 +1623,8 @@ private:
             slots[b]         = static_cast<std::int32_t>(lanes[b]);
             rows[b]          = static_cast<std::int32_t>(lanes[b]);
             host_lanes_[b]   = static_cast<std::int32_t>(lanes[b]);
+            stage_call_rope(lane, static_cast<std::uint32_t>(positions[b]), 1, static_cast<std::int32_t>(lanes.size()),
+                            static_cast<std::int32_t>(b), static_cast<std::int32_t>(lanes.size()), static_cast<std::int32_t>(b));
             stage_ngram(lane, lane.history, positions[b], 1, b);
         }
     }
@@ -1522,11 +1632,11 @@ private:
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
     // `logit_columns` columns land in logits32_.
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
-             const execution::MtpChunk* chunk = nullptr) {
+             const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr) {
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
-        forward_call(batch, width, logit_columns, nullptr, chunk);
+        forward_call(batch, width, logit_columns, nullptr, chunk, vision);
         residency_->enqueue_route_download(s, batch * width);
     }
 
@@ -1593,12 +1703,15 @@ private:
     }
 
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
-                      const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr) {
+                      const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
+                      const execution::VisionInput* vision = nullptr) {
         const std::int32_t cols = batch * width;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch fb;
         fb.ids           = Tensor(base + io_layout_.ids, DType::I32, {cols});
         fb.positions     = Tensor(base + io_layout_.positions, DType::I32, {cols});
+        fb.rope_positions   = Tensor(base + io_layout_.rope, DType::I32, {cols, 3});
+        fb.block_start_rope = Tensor(base + io_layout_.block_rope, DType::I32, {batch, 3});
         fb.slots         = Tensor(base + io_layout_.slots, DType::I32, {batch});
         fb.table_rows    = Tensor(base + io_layout_.rows, DType::I32, {batch});
         fb.logit_columns = Tensor(base + io_layout_.columns, DType::I32, {logit_columns});
@@ -1612,6 +1725,7 @@ private:
         fb.mtp_chunk       = chunk;
         fb.layer_waits     = next_waits_;
         next_waits_        = {};
+        fb.vision          = vision;
         // Decode and verification rounds export their final residuals for the MTP catch-up.
         if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
@@ -1685,6 +1799,7 @@ private:
             slots[b]       = static_cast<std::int32_t>(lanes[b]);
             rows[b]        = static_cast<std::int32_t>(lanes[b]);
             host_lanes_[b] = static_cast<std::int32_t>(lanes[b]);
+            stage_call_rope(lane, static_cast<std::uint32_t>(positions[b]), W, batch * W, b * W, batch, b);
             stage_ngram(lane, sequence_, positions[b], W, static_cast<std::size_t>(b * W));
             spec_host(spec_layout_.extents)[b] = n;
             spec_host(spec_layout_.lengths)[b] = positions[b];
@@ -1909,6 +2024,11 @@ private:
             cells_host[i] = first + i;
             ids[i]        = lane.history[static_cast<std::size_t>(first + i + 1)];
         }
+        // Cell c takes the target's RoPE position of c (design §19.3.2), per sub-chunk.
+        const std::int32_t subchunks = (cells + execution::kMtpChunkColumns - 1) / execution::kMtpChunkColumns;
+        stage_mtp_chunk_rope(lane.rope, static_cast<std::uint32_t>(first), cells, execution::kMtpChunkColumns,
+                             static_cast<std::uint32_t>(r_), io_words(io_layout_.mtp_rope, 3ULL * cells),
+                             io_words(io_layout_.mtp_block_rope, 3ULL * subchunks));
         lane.mtp_cells = static_cast<std::uint32_t>(begin + columns);
         lane.mtp_live  = true;
         auto* base = static_cast<std::byte*>(io_device_.p);
@@ -1918,8 +2038,11 @@ private:
         chunk.columns   = columns;
         // A one-token prompt has no cell yet (its only position is the pending cell).
         if (cells > 0) {
-            chunk.ids       = Tensor(base + io_layout_.mtp_ids, DType::I32, {cells});
-            chunk.positions = Tensor(base + io_layout_.mtp_cells, DType::I32, {cells});
+            chunk.ids              = Tensor(base + io_layout_.mtp_ids, DType::I32, {cells});
+            chunk.positions        = Tensor(base + io_layout_.mtp_cells, DType::I32, {cells});
+            chunk.rope_positions   = reinterpret_cast<std::int32_t*>(base + io_layout_.mtp_rope);
+            chunk.block_start_rope = reinterpret_cast<std::int32_t*>(base + io_layout_.mtp_block_rope);
+            chunk.vision           = stage_mtp_vision(lane, static_cast<std::uint32_t>(first), cells, subchunks);
         }
         return chunk;
     }
@@ -1968,7 +2091,13 @@ private:
             const std::int32_t limit = static_cast<std::int32_t>(lane.pages.size()) * kPagedKVPageSize - 1;
             mtp_host(mtp_io_.ids)[b] = lane.history.back();
             for (std::int32_t j = 0; j < mtp_k_; ++j) {
-                mtp_host(mtp_io_.cells)[j * batch + b] = std::min(cell + j, limit);
+                const std::int32_t at = std::min(cell + j, limit);
+                mtp_host(mtp_io_.cells)[j * batch + b] = at;
+                const std::size_t step = 3ULL * static_cast<std::size_t>(batch) * j;
+                stage_rope_value(rope_of(lane.rope, static_cast<std::uint32_t>(at)),
+                                 std::span<std::int32_t>(mtp_host(mtp_io_.rope_cells + step), 3ULL * batch), batch, b);
+                stage_rope_value(block_start_rope(lane.rope, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(r_)),
+                                 std::span<std::int32_t>(mtp_host(mtp_io_.block_rope_cells + step), 3ULL * batch), batch, b);
             }
             slots[b] = static_cast<std::int32_t>(lanes[b]);
             rows[b]  = static_cast<std::int32_t>(lanes[b]);
@@ -1985,14 +2114,16 @@ private:
         Tensor anchors(mtp_device(mtp_io_.ids), DType::I32, {batch});
         if (unwritten) {
             // The pending cells' K/V (rewriting a written cell is idempotent).
-            forward_->run_mtp({.residuals  = chain,
-                               .ids        = anchors,
-                               .positions  = Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}),
-                               .slots      = slot_tensor,
-                               .table_rows = row_tensor,
-                               .batch      = batch,
-                               .width      = 1,
-                               .kv_only    = true});
+            forward_->run_mtp({.residuals        = chain,
+                               .ids              = anchors,
+                               .positions        = Tensor(mtp_device(mtp_io_.cells), DType::I32, {batch}),
+                               .rope_positions   = Tensor(mtp_device(mtp_io_.rope_cells), DType::I32, {batch, 3}),
+                               .block_start_rope = Tensor(mtp_device(mtp_io_.block_rope_cells), DType::I32, {batch, 3}),
+                               .slots            = slot_tensor,
+                               .table_rows       = row_tensor,
+                               .batch            = batch,
+                               .width            = 1,
+                               .kv_only          = true});
         }
         if (steps == 0) {
             for (std::int32_t b = 0; b < batch; ++b) {
@@ -2004,12 +2135,15 @@ private:
         replay(mtp_draft_graphs_[static_cast<std::size_t>(batch - 1) * mtp_k_ + (steps - 1)], [&] {
         for (std::int32_t j = 0; j < steps; ++j) {
             Tensor drafts(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j) * batch), DType::I32, {batch});
+            const std::size_t step = 3ULL * static_cast<std::size_t>(batch) * j;
             forward_->run_mtp({.residuals    = chain,
                                .ids          = j == 0 ? anchors
                                                       : Tensor(mtp_device(mtp_io_.drafts + static_cast<std::size_t>(j - 1) * batch),
                                                                DType::I32, {batch}),
                                .positions    = Tensor(mtp_device(mtp_io_.cells + static_cast<std::size_t>(j) * batch),
                                                       DType::I32, {batch}),
+                               .rope_positions   = Tensor(mtp_device(mtp_io_.rope_cells + step), DType::I32, {batch, 3}),
+                               .block_start_rope = Tensor(mtp_device(mtp_io_.block_rope_cells + step), DType::I32, {batch, 3}),
                                .slots        = slot_tensor,
                                .table_rows   = row_tensor,
                                .batch        = batch,
@@ -2048,11 +2182,15 @@ private:
         }
         upload_pinned(mtp_device(mtp_io_.up_ids), mtp_host(mtp_io_.up_ids), 4ULL * batch * W, s);
         const Tensor positions(io + io_layout_.positions, DType::I32, {W * batch});
+        const Tensor rope(io + io_layout_.rope, DType::I32, {W * batch, 3});
+        const Tensor block_rope(io + io_layout_.block_rope, DType::I32, {batch, 3});
         const Tensor slots(io + io_layout_.slots, DType::I32, {batch});
         replay(mtp_catch_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
         forward_->run_mtp({.residuals   = Tensor(mtp_residuals_.p, DType::BF16, {width_, W * batch}),
                            .ids         = Tensor(mtp_device(mtp_io_.up_ids), DType::I32, {W * batch}),
                            .positions   = positions,
+                           .rope_positions   = rope,
+                           .block_start_rope = block_rope,
                            .slots       = slots,
                            .table_rows  = Tensor(io + io_layout_.rows, DType::I32, {batch}),
                            .batch       = batch,
@@ -2224,6 +2362,21 @@ private:
     std::uint64_t next_transaction_    = 0;
     std::uint64_t pending_transaction_ = 0;
     std::uint64_t revision_            = 1;
+    // ---------------------------------------------------------------- vision (vision_program.cpp)
+    [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen3_5::PreparedPromptData& prompt) const;
+    void vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
+                        const qwen3_5::PreparedPromptData& prompt);
+    [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }
+    void vision_step(Lane& lane);
+    void vision_release(Lane& lane) noexcept;
+    // The image columns of a prefill call [begin, begin + width), staged into the io; null without any.
+    const execution::VisionInput* stage_vision(Lane& lane, std::uint32_t begin, std::int32_t width);
+    // Per MTP sub-chunk: the cells whose next token is an image token; null without media.
+    const execution::VisionInput* stage_mtp_vision(Lane& lane, std::uint32_t first, std::int32_t cells,
+                                                   std::int32_t subchunks);
+    // The call inputs that point into the io.
+    execution::VisionInput vision_input_;
+    std::vector<execution::VisionInput> mtp_vision_inputs_;
 
     // The prefix cache, declared last so it is destroyed first: it returns its page leases to pool_
     // and its lane image reads gdn_ and the lane buffers.

@@ -4328,6 +4328,44 @@ other rates are estimates.
   t` in the per-item equal-length attention, per-frame grids in `get_rope_index`): no extra
   mechanism, one 4-frame smoke test, and a documented token cost (2 fps, up to 768 frames).
 
+#### V1-V6 as built (2026-10-05)
+
+- **V1.** `qsa_index_query(q, norm_weight, rope_positions)` and `QsaBatch::{rope_positions,
+  block_start_rope}` (read by `qsa_pool_keys` only): pair i rotates by axis i % 3. VT2 adds distinct
+  random axes to the index-query cases and real M-RoPE image spans to every pooling case, plus an
+  image case (a 1,024-column prefill through two images, decode W = 1, verification W = 5 / 8 at
+  B = 2, a row starting at position 3). Passes.
+- **V2.** `program/rope_positions.{h,cpp}` (`LaneRope`, `rope_of`, `block_start_rope`, `stage_rope`,
+  `stage_mtp_chunk_rope`); io gains `rope` and `block_rope` before `ngram` (a constructor check),
+  `mtp_rope` and `mtp_block_rope` after the MTP cells; `mtp_io_` gains the draft steps' RoPE words
+  before `drafts`. `kMtpChunkColumns` lives in `forward.h`. VT3 (`ninfer_qwen4_exp_rope_positions_test`,
+  host, against an independent port of the frontend's position rule) passes. **Text gate:** greedy
+  ids of code / story / long, plain and MTP, are identical to the base build (6 of 6).
+- **V3.** `CacheController::complete_load(key, frame, serial)`; `Command::serial` on copies; the
+  residency publishes a landed batch's load only when it is the key's newest copy in that frame.
+  VT4's ABA case without lending passes.
+- **V4.** `FramePool::lend/give_back` (state `kLoaned`), `CacheController::choose_run/lend/give_back/
+  frame_key` (per-frame keys kept on load, eviction and relocation), `ExpertResidency::lend/
+  give_back/lendable` with the lease waits; `resize` (memory R2) leaves the pool unchanged while
+  frames are lent, so the next boundary after the return resizes. VT4's lending cases pass.
+- **V5.** Deviation from the design: Qwen3.5 keeps its workspace plan and handoff placement and calls
+  the shared stages (`qwen3_5/execution/vision_tower.{h,cpp}`: `vision_embed`, `vision_layer`,
+  `vision_merge`); only Qwen4Exp runs the layer-major `VisionTowerPass` over its own layout. Both
+  models use one op sequence, and Qwen3.5's output is bit-identical by construction without
+  re-planning its memory. `VisionWeightStream` moved to `vision_weight_stream.{h,cpp}` (Program-free)
+  with the fence, the prelude → layers → merger order, `finish()` and the failure-path sync.
+  `make_vision_overlay_layout` and `parse_vision_config` are shared; Qwen4Exp binds the tower under
+  Qwen3.5's parameter names and keeps `VisionOverlayAssets{pool = nullptr}`.
+  `--vision-offload auto|on|off` (`auto`: on for Qwen4Exp, off for Qwen3.5) with option tests.
+- **V6.** `program/vision_window.{h,cpp}` (pure planning: placement W/L, frames, steps,
+  `visual_slice`; host test `ninfer_qwen4_exp_vision_window_test`) and `program/vision_program.cpp`
+  (plan, reserve, stepped encode, release, staging). `ForwardBatch::vision` and `MtpCall::vision`
+  scatter visual embeddings after the token embedding. First GPU smoke (Flash-Next, dense8m, INT8
+  KV): the chart answer equals Quasar's ("NIFER VISION 731；3；左侧"), the natural image answers
+  correctly; ids identical with offload on and off and between plain and MTP. **Open:** the encode
+  window takes 1.4 s for either image with offload on or off, against ~10-40 ms estimated; being
+  diagnosed (eager module loading and an nsys trace).
+
 #### Steps
 
 Each step builds and tests on its own. V0, V1, V3 and V5 can run in parallel; V2 needs V1, V4 needs
