@@ -318,7 +318,7 @@ alternatives that were tried and reverted.
   first one's snapshot where the prompts diverge. Four requests with a new 13.9K-token system
   prompt: mean time to first token 1.48 s instead of 3.52 s. A shared prefix may hold images:
   requests that carry the same image (by content) behind the same text wait for the first one's
-  snapshot past it, so the image is encoded once.
+  snapshot past it, so the image is encoded once. Commit: [`704d923`][c-vision-coalesce].
 - **Host eviction keeps what the next turns reuse**, and **a request waiting for a lane prefetches
   its host-only blocks**: at the 52 GB production host tier, 9.2 % fewer prompt tokens prefilled
   and a 7.8 % shorter agentic workload.
@@ -670,6 +670,7 @@ when upstream replaced it in `abb7f14f`.
   Questions over one state reuse its cached prefix, images included. On ignis's authored
   144-question set: balanced accuracy 0.958 (ignis published 0.934), median answer mass 0.998,
   about 53 ms per question. See [Decisions](docs/serving.md#decisions).
+  Commit: [`de8deca`][c-decide].
 - **llama.cpp-style model details on `/v1/models`** (upstream PR #162 by
   [Hector Ramon Jimenez (hecrj)](https://github.com/hecrj)) and **`ignore_eos` on chat
   completions** (upstream PR #197 by [Thireus](https://github.com/Thireus)).
@@ -932,6 +933,8 @@ well, and for the work this branch builds on.
 [c-nvfp4-mse]: https://github.com/Wallawalla47/ninfer-custom/commit/8cc75d8c7918acb2b40f460bcbc970a1e5a0e01e
 [c-thinking-omitted]: https://github.com/Wallawalla47/ninfer-custom/commit/9a655cac1ed2efba3e5c2539a1009aa005ee3042
 [c-tolerant-recovered]: https://github.com/Wallawalla47/ninfer-custom/commit/a404af27efd7b828b3943ac8f534bdb18a029ab2
+[c-vision-coalesce]: https://github.com/Wallawalla47/ninfer-custom/commit/704d923e60ac59fa786dc858c2b59e1f0e6cb7ec
+[c-decide]: https://github.com/Wallawalla47/ninfer-custom/commit/de8decac7af36edbe21c1baedf50d8db66d8afd8
 
 ---
 
