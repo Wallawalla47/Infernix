@@ -1783,12 +1783,29 @@ private:
             // while its DMA was in flight. Evaluate that event in a fresh bounded pass.
             if (admission_check_pending_.load(std::memory_order_acquire)) { return true; }
             if (resident_empty()) {
-                throw std::logic_error("isolated request cannot reserve its first legal unit after "
-                                       "context reclamation: state=" +
-                                       std::to_string(shortage.state_slots) +
-                                       ", main_kv=" + std::to_string(shortage.main_kv_pages) +
-                                       ", backend_kv=" + std::to_string(shortage.backend_kv_pages) +
-                                       ", host_bytes=" + std::to_string(shortage.host_bytes));
+                // Nothing running can free resources for this request, so it would wait forever.
+                // Fail it alone: as a worker error it would fail the whole Engine. It is a
+                // capacity condition, so the client sees it as unavailable, not as an internal
+                // server error.
+                if (restoring) {
+                    std::erase(paused_, request);
+                } else {
+                    std::lock_guard lock(queue_mutex_);
+                    std::erase(pending_, request);
+                }
+                complete_error(
+                    request,
+                    std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Unavailable,
+                        "the Engine cannot admit this request: its first unit needs state=" +
+                            std::to_string(shortage.state_slots) +
+                            ", main_kv=" + std::to_string(shortage.main_kv_pages) +
+                            ", backend_kv=" + std::to_string(shortage.backend_kv_pages) +
+                            ", host_bytes=" + std::to_string(shortage.host_bytes) +
+                            " more than an idle Engine has")));
+                request_admission_check();
+                publish_runtime_stats();
+                return true;
             }
             if (restoring) {
                 scheduler_.restoration_blocked();
