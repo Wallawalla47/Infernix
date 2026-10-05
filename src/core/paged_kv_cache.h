@@ -275,6 +275,13 @@ public:
                               std::span<std::byte* const> records,
                               std::span<const std::uint32_t> record_groups,
                               const HostKVPageLayout& layout, cudaStream_t stream = nullptr) const;
+    // The same restricted to planes [plane_begin, plane_end), so a capture can copy a model
+    // layer's planes as soon as the layer's last writer has run.
+    void copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                              std::span<std::byte* const> records,
+                              std::span<const std::uint32_t> record_groups,
+                              const HostKVPageLayout& layout, std::size_t plane_begin,
+                              std::size_t plane_end, cudaStream_t stream) const;
     void copy_from_host_records(std::span<const std::byte* const> records,
                                 std::span<const std::uint32_t> record_groups,
                                 std::span<const DeviceKVPageHandle> destination,

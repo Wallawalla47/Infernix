@@ -110,8 +110,19 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     Tensor residual = work_.alloc(DType::BF16, {W, T});
     ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
 
+    const auto wait_layer = [&](std::size_t entry) {
+        for (const auto& events : batch.layer_waits) {
+            if (!events.empty()) { CUDA_CHECK(cudaStreamWaitEvent(s, events[entry], 0)); }
+        }
+    };
+    for (const auto& events : batch.layer_waits) {
+        if (!events.empty() && events.size() != config_.num_hidden_layers + 1U) {
+            throw std::invalid_argument("Qwen4Exp forward: layer waits do not match the layers");
+        }
+    }
     for (std::uint32_t layer = 0; layer < config_.num_hidden_layers; ++layer) {
         const auto& block = parameters_.layers[layer];
+        wait_layer(layer);
         try {
             auto scope = work_.scope();
             if (block.ple) { ple(*block.ple, residual, batch); }
@@ -168,6 +179,7 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
     if (batch.residual_out.data != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
     }
+    wait_layer(config_.num_hidden_layers);
     if (batch.mtp_chunk != nullptr) {
         // The chunk's MTP cells from its live residuals, then its last residual becomes pending.
         const MtpChunk& chunk = *batch.mtp_chunk;

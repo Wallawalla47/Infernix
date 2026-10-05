@@ -33,9 +33,9 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt, const runtim
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept { return impl_->feasible(base); }
 
-HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt&, const RequestBasePlan& base,
+HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt, const RequestBasePlan& base,
                                            runtime::LaneId destination) {
-    return impl_->quote(base, destination);
+    return impl_->quote(prompt, base, destination);
 }
 
 runtime::ContextTransactionReserveStatus Program::hybrid_reserve_materialization(

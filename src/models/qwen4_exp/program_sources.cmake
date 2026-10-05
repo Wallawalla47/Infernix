@@ -16,6 +16,9 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vram_monitor.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/state_image.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/prefix_cache.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix/prefix_program.cpp"
 )
 
 # The host expert cache (design §9) is a host-only library its conformance test links directly.
