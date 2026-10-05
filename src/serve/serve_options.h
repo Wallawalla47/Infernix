@@ -44,6 +44,7 @@ struct ServeOptions {
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
+    bool vram_past_budget = false;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

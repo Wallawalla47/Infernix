@@ -122,6 +122,10 @@ std::string usage_text(const char* argv0) {
            "                           (default = --max-context; auto sizes to free\n"
            "                           VRAM less --vram-headroom-mib; Qwen3.8-Flash-Next:\n"
            "                           auto = --max-context)\n"
+           "  --vram-past-budget       Qwen3.8-Flash-Next on Windows: also use the VRAM the\n"
+           "                           OS budget withholds (~0.6 GiB more expert cache on\n"
+           "                           an RTX 5090; may move to system memory if another\n"
+           "                           program needs VRAM)\n"
            "  --vram-headroom-mib N|auto\n"
            "                           VRAM in MiB startup sizing leaves free: Qwen3.5,\n"
            "                           after --kv-capacity auto (auto " +
@@ -242,6 +246,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--vram-past-budget") {
+            options.vram_past_budget = true;
         } else if (arg == "--vram-headroom-mib") {
             const char* text = value(arg);
             if (std::string_view(text) == "auto") {

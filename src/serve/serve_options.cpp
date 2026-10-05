@@ -210,6 +210,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             Next, after the expert cache, for the display and\n"
            "                             other programs (auto: 1024 with a display on the\n"
            "                             GPU, else 256)\n"
+           "  --vram-past-budget         Qwen3.8-Flash-Next on Windows: also use the VRAM\n"
+           "                             the OS budget withholds (~0.6 GiB more expert\n"
+           "                             cache on an RTX 5090; may move to system memory\n"
+           "                             if another program needs VRAM)\n"
            "  --kv-dtype T               KV storage: bf16 (default) | int8 | fp8 | nvfp4 | k8v4 |\n"
            "                             vq2 | k4v2\n"
            "  --host-context-mib N       pinned Host budget in decimal MiB that resolve to\n"
@@ -217,7 +221,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             state snapshots share (default 8192; 0 = GPU only).\n"
            "                             Original system: the shared budget for StateImages,\n"
            "                             KV and pause snapshots (default 8192 MiB + eight\n"
-           "                             native StateImages; 0 disables Host context backing)\n"
+           "                             native StateImages; 0 disables Host context backing).\n"
+           "                             Qwen3.8-Flash-Next: default 4096, must be positive\n"
            "  --no-prefix-reuse          disable prefix caching in either system below;\n"
            "                             request pause/replay resources remain available;\n"
            "                             cannot be combined with any prefix-cache option\n"
@@ -426,6 +431,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--vram-headroom-mib") {
             options.vram_headroom_bytes =
                 parse_vram_headroom(require_value("--vram-headroom-mib"));
+        } else if (arg == "--vram-past-budget") {
+            options.vram_past_budget = true;
         } else if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));

@@ -26,6 +26,9 @@ struct VramSnapshot {
     std::uint64_t local_usage  = 0;
     DisplayState display       = DisplayState::Unknown;
     int outputs                = -1; // DXGI outputs of the adapter; -1 unknown
+    // A source opened past the budget: the bytes added to the OS budget (already included in
+    // local_budget and device_free); 0 otherwise.
+    std::uint64_t budget_allowance = 0;
 };
 
 // One device's source. query() may be called from any thread on which the device is current.
@@ -40,7 +43,17 @@ public:
 
 // The source for `device`: DXGI and NVML where present (both loaded or created lazily; their
 // absence never fails, it only leaves fields unknown), else CUDA alone.
-[[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device);
+//
+// `past_budget` (--vram-past-budget): WDDM's per-process budget withholds part of the physical
+// VRAM that is allocatable at device speed (RTX 5090: budget 31,419 MiB against 32,187 MiB of
+// physical memory less the driver's reserve; 640 MiB more allocated, design §19.3.8 VRAM item 2).
+// The source then measures once, at open, allowance = NVML physical (total - reserved) - the
+// budget - kPastBudgetMargin, and reports budget + allowance as the budget and free memory derived
+// from it, as cudaMemGetInfo derives it (budget - usage). A later budget cut by the OS lowers the
+// effective budget by the same amount. Memory past the budget may be demoted to system memory
+// when another program needs VRAM. Without DXGI or NVML the allowance is 0.
+inline constexpr std::uint64_t kPastBudgetMargin = 128ULL << 20;
+[[nodiscard]] std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget = false);
 
 // A device allocation step that the driver placed partly in system memory (the Windows WDDM sysmem
 // fallback) lowers device free memory by less than it allocated. The bytes of a step of `bytes`

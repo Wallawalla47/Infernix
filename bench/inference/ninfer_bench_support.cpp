@@ -308,6 +308,7 @@ std::string usage_text(std::string_view program) {
         << (ninfer::kDefaultRamHeadroomBytes >> 20) << ")\n"
         << "  --vram-headroom-mib <N|auto> Qwen3.8-Flash-Next: VRAM the expert cache leaves free for the\n"
         << "                              display and other programs (default auto: 1024 with a display, else 256)\n"
+        << "  --vram-past-budget          Qwen3.8-Flash-Next on Windows: also use the VRAM the OS budget withholds\n"
         << "  -p, --n-prompt <list>       pp lengths, for example 512,2048\n"
         << "  -n, --n-gen <list>          tg lengths, for example 128\n"
         << "  -pg, --prompt-gen <P,G;..>  combined pp+tg tests\n"
@@ -391,6 +392,8 @@ BenchOptions parse_args(int argc, char** argv) {
                 throw std::invalid_argument("--ram-headroom-mib must be a MiB count");
             }
             options.ram_headroom_bytes = static_cast<std::uint64_t>(mib) << 20;
+        } else if (arg == "--vram-past-budget") {
+            options.vram_past_budget = true;
         } else if (arg == "--vram-headroom-mib") {
             const std::string text = value("--vram-headroom-mib");
             if (text == "auto") {
