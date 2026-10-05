@@ -30,8 +30,9 @@ public:
     struct Options {
         int workers     = 8;     // including the service thread
         int max_jobs    = 4;     // CPU-served experts per layer call, at most kMaxCpuJobs
-        int max_columns = 64;    // calls with more columns stay on the GPU
+        int max_columns = 64;    // calls with more columns stay on the GPU, at most kMaxCpuCallColumns
         int pcie_divisor = 3;    // misses / pcie_divisor stay on the GPU stage (0: none)
+        int max_job_columns = kMaxCpuColumns; // misses with more columns stay on the GPU
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
     };
 
@@ -51,7 +52,7 @@ private:
     Options options_;
     MissRequest* request_ = nullptr; // mapped
     std::uint16_t* x_     = nullptr; // mapped BF16 [H, max_columns]
-    std::uint16_t* y_     = nullptr; // mapped BF16 [H, kMaxCpuJobs * kMaxCpuColumns]
+    std::uint16_t* y_     = nullptr; // mapped BF16 [H, max_jobs * kMaxCpuColumns]
     std::uint32_t* done_  = nullptr; // mapped
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
