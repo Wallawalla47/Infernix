@@ -112,6 +112,12 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    // Begins the orderly stop without waiting for it: new work is refused, and queued and active
+    // generation requests end with an Unavailable error within one unit of work. A Generation
+    // Engine then saves its prefix cache file, when configured. Destruction waits for the stop.
+    // Idempotent and callable from any thread.
+    void stop() noexcept;
+
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;

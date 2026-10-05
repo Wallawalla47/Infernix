@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
+#include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
@@ -139,6 +140,24 @@ std::vector<SpeculativeRoundShape> speculative_round_shapes(const EngineOptions&
 std::uint32_t page_count(std::uint32_t capacity) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+// The Main KV pages a plan may hold. The original cache retains context in continuations whose
+// pages fit the C active lanes' windows, so C * L pages bound it. The hybrid cache keeps every
+// Device page no active lease holds as cached blocks, so only the token capacity representation
+// (pages * page size in int32) bounds it and automatic sizing spends the free VRAM on cache.
+std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t logical_pages,
+                                       const ContextCacheOptions& cache) {
+    std::uint64_t maximum = static_cast<std::uint64_t>(concurrency) * logical_pages;
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
+        maximum = std::max<std::uint64_t>(
+            maximum, static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) /
+                         static_cast<std::uint64_t>(kPagedKVPageSize));
+    }
+    if (maximum > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("maximum Main KV page count exceeds uint32");
+    }
+    return maximum;
 }
 
 // Device memory the driver takes for CUDA Graph decode executables. Every topology class of a
@@ -890,10 +909,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(options.max_concurrency) * logical_pages;
-    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("maximum Main KV page count exceeds uint32");
-    }
+        maximum_main_page_groups(options.max_concurrency, logical_pages, options.context_cache);
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
         if (options.kv_capacity.explicit_tokens < options.max_context) {
@@ -1009,7 +1025,27 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache        = inputs.context_cache;
     impl->kv_storage           = inputs.kv_storage;
     impl->persistent           = persistent_layout(*impl);
-    if (!impl->context_cache.host_capacity_bytes) {
+    if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
+        // The whole Host budget is the hybrid slab pool that KV blocks and state snapshots share
+        // (docs/maintainer/hybrid-prefix-cache-spec.md §5.4); the Program's Host context arena
+        // stays empty, so a paused request recovers by Replay. A budget too small for one
+        // snapshot is rejected here, before anything is allocated. The backend pool is the MTP KV
+        // pool, or the DFlash draft's paged full-attention pool.
+        const KVPageGeometry* backend = nullptr;
+        if (impl->speculative_backend == SpeculativeBackend::Mtp &&
+            impl->persistent.decoder.mtp_kv) {
+            backend = &impl->persistent.decoder.mtp_kv->pages.spec.geometry;
+        } else if (impl->persistent.dflash && impl->persistent.dflash->full) {
+            backend = &impl->persistent.dflash->full->pages.spec.geometry;
+        }
+        const HybridHostLayout host =
+            plan_hybrid_host_layout(impl->persistent.decoder.text_kv.pages.spec.geometry, backend,
+                                    impl->persistent.state_images.host.image_bytes);
+        if (!impl->context_cache.host_capacity_bytes) {
+            impl->context_cache.host_capacity_bytes = kDefaultHybridHostCacheBytes;
+        }
+        (void)hybrid_host_slabs(host, *impl->context_cache.host_capacity_bytes);
+    } else if (!impl->context_cache.host_capacity_bytes) {
         // Default Host capacity covers 8 GiB of KV bytes plus eight complete StateImages.
         impl->context_cache.host_capacity_bytes =
             checked_add(8ULL * 1024 * 1024 * 1024,
@@ -1165,12 +1201,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const std::uint64_t maximum_pages64 =
-        static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
-    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("maximum Main KV page count exceeds uint32");
-    }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    const auto maximum_pages          = static_cast<std::uint32_t>(
+        maximum_main_page_groups(inputs.max_concurrency, logical_pages, inputs.context_cache));
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;

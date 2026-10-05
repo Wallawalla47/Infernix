@@ -15,11 +15,9 @@ Sequence:
   3. optional alt arm: AB_ALT_EXE (default the treatment build) with the treatment's flags plus
      AB_ALT_EXTRA_FLAGS (default the original prefix cache), so one run compares two fork
      configurations, or two fork builds, with the control;
-  4. control arm: the same flags minus those the control's --help does not advertise; the
-     fork's single --host-cache-mib ceiling is translated into the control's explicit
-     --host-state-slots / --host-kv-mib / catalog limits using the split the fork's original
-     prefix cache resolves at startup (one model load per run), so the arms get the same
-     pinned host RAM and catalog sizes;
+  4. control arm: the same flags minus those the control's --help does not advertise; both
+     builds size their pinned Host tier with --host-context-mib, so the arms get the same
+     pinned host RAM;
   5. analyze.py writes report.md / summary.json into the run directory. With several --seeds,
      each seed runs every arm into <out>/seed-<n> in turn, and analyze.py adds a combined
      report over the seeds in <out>.
@@ -139,17 +137,6 @@ def without(flags, names):
 def flag_str(flags):
     return " ".join(n + ("" if v is None else " " + (('"%s"' % v) if " " in v else v))
                     for n, v in flags)
-
-
-def host_translation(server_start):
-    """The control's explicit host-cache flags equal to an original-cache fork's resolved split."""
-    cc = server_start["engine"]["context_cache"]
-    mem = server_start["memory"]
-    return [("--host-state-slots", str(cc["host_state_slots"])),
-            ("--host-kv-mib", str(mem["host_kv_capacity_bytes"] // (1 << 20))),
-            ("--max-private-continuations", str(cc["max_private_continuations"])),
-            ("--max-long-anchors-per-continuation", str(cc["max_long_anchors_per_continuation"])),
-            ("--max-shared-prefixes", str(cc["max_shared_prefixes"]))]
 
 
 # ---------------------------------------------------------------------------------------
@@ -649,24 +636,6 @@ def calibrate_ctx(model, ctrl_flags, bat_ctx, run_dir):
     raise SystemExit("control failed to start at every candidate context")
 
 
-def original_cache_split(model, treat_flags, ctx, run_dir):
-    """server_start of the treatment build with the original prefix cache, whose --host-cache-mib
-    budget resolves into the explicit Host state/KV split and catalog sizes the control takes."""
-    flags = set_flag(treat_flags, "--max-context", str(ctx))
-    if ORIGINAL_CACHE_FLAG not in dict(flags):
-        flags.append((ORIGINAL_CACHE_FLAG, None))
-    log("host-cache split: treatment build with %s" % ORIGINAL_CACHE_FLAG)
-    probe = Serve(TREATMENT_EXE, model, flags, os.path.join(run_dir, "original_cache_split.jsonl"),
-                  os.path.join(run_dir, "original_cache_split_serve.log")).start()
-    try:
-        start = read_server_start(probe.request_log)
-    finally:
-        probe.stop()
-    if start is None:
-        raise SystemExit("the original-cache startup wrote no server_start record")
-    return start
-
-
 def run_arm(name, exe, model, flags, plan, run_dir, ctx):
     arm_dir = os.path.join(run_dir, name)
     os.makedirs(arm_dir, exist_ok=True)
@@ -691,7 +660,7 @@ def run_arm(name, exe, model, flags, plan, run_dir, ctx):
     return start, (client.failures if client else [("arm", "did not run")])
 
 
-def run_seed(seed, plan, run_dir, arms, model, flags, control_host, config, ctx):
+def run_seed(seed, plan, run_dir, arms, model, flags, config, ctx):
     """Every selected arm on one workload seed, then that seed's report."""
     with open(os.path.join(run_dir, "plan.json"), "w", encoding="utf-8") as f:
         json.dump(plan, f)
@@ -712,8 +681,6 @@ def run_seed(seed, plan, run_dir, arms, model, flags, control_host, config, ctx)
         failures += f
     if "control" in arms:
         ctrl = set_flag(flags["control"], "--max-context", str(ctx))
-        for n, v in control_host:
-            ctrl = set_flag(ctrl, n, v)
         config["control_flags"] = ctrl
         starts["control"], f = run_arm("control", CONTROL_EXE, model, ctrl, plan, run_dir, ctx)
         failures += f
@@ -791,12 +758,6 @@ def main():
     t0 = time.time()
     ctx = args.ctx or (calibrate_ctx(model, without(ctrl_flags, {"--max-context"}), bat_ctx, out_dir)
                        if "control" in arms else bat_ctx)
-    control_host = []
-    if "control" in arms and "--host-cache-mib" in dict(treat_flags) and \
-            "--host-cache-mib" not in ctrl_supported:
-        control_host = host_translation(original_cache_split(model, treat_flags, ctx, out_dir))
-        log("control host cache = original-cache --host-cache-mib split: %s"
-            % flag_str(control_host))
     config = {"launch_bat": LAUNCH_BAT, "model": model, "treatment_exe": TREATMENT_EXE,
               "control_exe": CONTROL_EXE, "treatment_flags": treat_flags,
               "alt_extra_flags": ALT_EXTRA_FLAGS if "alt" in arms else None,
@@ -811,7 +772,7 @@ def main():
     for seed in seeds:
         run_dir = out_dir if len(seeds) == 1 else os.path.join(out_dir, "seed-%d" % seed)
         os.makedirs(run_dir, exist_ok=True)
-        failures += run_seed(seed, plans[seed], run_dir, arms, model, flags, control_host,
+        failures += run_seed(seed, plans[seed], run_dir, arms, model, flags,
                              config, ctx)
         run_dirs.append(run_dir)
     log("all seeds finished in %.1f min" % ((time.time() - t0) / 60))

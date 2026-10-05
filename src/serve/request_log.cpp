@@ -161,6 +161,10 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "root";
     case ninfer::PrefixReusePath::Checkpoint:
         return "checkpoint";
+    case ninfer::PrefixReusePath::HybridEndpoint:
+        return "hybrid_endpoint";
+    case ninfer::PrefixReusePath::HybridSnapshot:
+        return "hybrid_snapshot";
     }
     return "unknown";
 }
@@ -864,6 +868,38 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
               {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    // Hybrid prefix cache (the serving default): absolute occupancy, per-interval events.
+    if (current.hybrid_snapshots != 0 || current.hybrid_tree_blocks != 0 ||
+        current.hybrid_blocks_inserted != 0) {
+        const auto delta = [&](std::uint64_t RuntimeStats::* field) {
+            return monotonic_delta(previous.*field, current.*field);
+        };
+        record["context_cache"]["hybrid"] =
+            Json{{"device_blocks", current.hybrid_cached_blocks},
+                 {"evictable_blocks", current.hybrid_evictable_blocks},
+                 {"tree_blocks", current.hybrid_tree_blocks},
+                 {"snapshots", current.hybrid_snapshots},
+                 {"host_capacity_bytes", current.hybrid_host_capacity_bytes},
+                 {"host_used_bytes", current.hybrid_host_used_bytes},
+                 {"snapshot_hits", delta(&RuntimeStats::hybrid_snapshot_hits)},
+                 {"reused_tokens", delta(&RuntimeStats::hybrid_reused_tokens)},
+                 {"blocks_inserted", delta(&RuntimeStats::hybrid_blocks_inserted)},
+                 {"blocks_reattached", delta(&RuntimeStats::hybrid_blocks_reattached)},
+                 {"blocks_duplicate", delta(&RuntimeStats::hybrid_blocks_duplicate)},
+                 {"taps_created", delta(&RuntimeStats::hybrid_taps_created)},
+                 {"taps_skipped", delta(&RuntimeStats::hybrid_taps_skipped)},
+                 {"endpoints_created", delta(&RuntimeStats::hybrid_endpoints_created)},
+                 {"host_image_writes", delta(&RuntimeStats::hybrid_host_image_writes)},
+                 {"host_block_writes", delta(&RuntimeStats::hybrid_host_block_writes)},
+                 {"host_image_restores", delta(&RuntimeStats::hybrid_host_image_restores)},
+                 {"host_block_restores", delta(&RuntimeStats::hybrid_host_block_restores)},
+                 {"host_write_bytes", delta(&RuntimeStats::hybrid_host_write_bytes)},
+                 {"host_restore_bytes", delta(&RuntimeStats::hybrid_host_restore_bytes)},
+                 {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
+                 {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
+                 {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
+                 {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+    }
     return record.dump();
 }
 

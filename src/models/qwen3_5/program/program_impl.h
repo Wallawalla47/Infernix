@@ -22,15 +22,21 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
 #include "models/qwen3_5/program/ngram_proposer.h"
+#include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "runtime/prefix_cache/cost.h"
+#include "runtime/prefix_cache/prefix_index.h"
+#include "runtime/prefix_cache/tap_planner.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -266,6 +272,62 @@ struct ResumeStateImpl {
     ~ResumeStateImpl();
 };
 
+// Hybrid prefix cache admission decision (docs/maintainer/hybrid-prefix-cache-spec.md §6): the
+// snapshot to resume from (invalid: a root start) and the facts the binding logs.
+struct HybridQuoteImpl {
+    runtime::prefix_cache::SnapshotRef snapshot;
+    std::uint32_t reuse_frontier = 0;
+    // Longest prompt prefix held as cached full blocks, reusable or not.
+    std::uint32_t cached_prefix_tokens = 0;
+};
+
+// A prefill tap whose StateImage is captured but whose snapshot waits for the blocks it anchors
+// on: a frontier inside a block needs that block complete, and an MTP backend trails the text
+// frontier by one token, so even a page-aligned frontier waits for its last block's backend page.
+struct HybridPendingTap {
+    std::uint32_t frontier = 0;
+    StateImageHandle image;
+    std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
+};
+
+// Per-lane hybrid bookkeeping for the active sequence.
+struct HybridLaneState {
+    bool active  = false;
+    bool publish = false;
+    // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
+    // frontier are appended as the sequence commits them.
+    std::vector<runtime::prefix_cache::NodeRef> path;
+    std::uint64_t path_hash = runtime::prefix_cache::kRootLookupHash;
+    // Extra key of every full prompt block (Vision identity), empty for text-only prompts.
+    std::vector<std::uint64_t> prompt_extras;
+    // Extra key of blocks after the last full prompt block: every Vision item precedes them.
+    std::uint64_t trailing_extra = 0;
+    std::vector<runtime::prefix_cache::PlannedTap> taps;
+    std::size_t next_tap = 0;
+    std::vector<runtime::prefix_cache::TapExclusion> exclusions;
+    std::vector<HybridPendingTap> pending;
+    // Most recent snapshot frontier this sequence reused or captured.
+    std::uint32_t last_capture = 0;
+    // Deepest snapshot frontier known on this path (reused or created by this sequence).
+    std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
+    // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
+    // queues behind the restore's per-layer events; releasing the lane queues behind the whole
+    // restore if it may still be landing.
+    std::uint64_t restore_ticket = 0;
+    bool restore_layers_pending  = false;
+};
+
 class ProgramImpl {
 public:
     ProgramImpl(const execution::Parameters&, const SequencePlanImpl&, DeviceContext&,
@@ -342,7 +404,28 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
     void fail_all_cleanup() noexcept;
+    void shutdown_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
+                                                              std::uint32_t maximum_frontier);
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+    void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
+
+    void set_hybrid_coalesce_wait_limit(double seconds) noexcept {
+        hybrid_coalesce_wait_seconds_ = seconds > 0.0 ? seconds : 0.0;
+    }
+
+    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
+
+    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
+        return hybrid_shutdown_save_;
+    }
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -502,6 +585,23 @@ public:
         bool borrow_backend        = false;
         bool borrow_state          = false;
         bool source_tail_hidden    = false;
+
+        // A binding from a hybrid prefix cache source: the pinned tree path and snapshot, the
+        // forks that share its pages, and the Host restore the source needs.
+        struct HybridBinding {
+            std::shared_ptr<const HybridQuoteImpl> quote;
+            std::vector<runtime::prefix_cache::NodeRef> path;
+            std::vector<std::uint64_t> extras;
+            bool snapshot_pinned = false;
+            bool state_restored  = false;
+            // This binding opened the cache's staged restore batch.
+            bool restore_staged = false;
+            std::optional<KVPagePrefixForkReservation> text_fork;
+            std::optional<KVPagePrefixForkReservation> backend_fork;
+            std::uint64_t restore_bytes = 0;
+        };
+
+        std::optional<HybridBinding> hybrid;
     };
 
     std::optional<ContextTransaction> context_transaction_;
@@ -529,6 +629,8 @@ public:
                            DeviceKVPageHandle destination, runtime::ContextResourceClass);
     void publish_context_transfers(ContextTransaction&);
     [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
+    void plan_binding_units(ContextTransaction&, const RequestBasePlan&, ResumeState*,
+                            ExecutionUnitKind, std::uint32_t);
     void install_binding(ContextTransaction&);
     void prepare_binding(ContextTransaction&);
     void complete_binding(ContextTransaction&, ContextProgress&);
@@ -629,5 +731,67 @@ public:
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing);
+
+    // ---- hybrid prefix cache (null unless ContextCacheMode::Hybrid) ----------------------------
+    std::unique_ptr<HybridPrefixCache> hybrid_;
+    std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
+    runtime::prefix_cache::CacheCostModel hybrid_cost_;
+    double hybrid_coalesce_wait_seconds_ = 0.0;
+    std::filesystem::path hybrid_file_;
+    std::string hybrid_fingerprint_;
+    std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+
+    void create_hybrid_prefix_cache(const StartupObserver& observer);
+    // Stages a binding from a hybrid source: pins the quoted path and snapshot, makes room by
+    // evicting unpinned cached blocks, submits the Host restores the source needs and reserves
+    // the forks. Returns the remaining shortage when room cannot be made from the cache.
+    [[nodiscard]] runtime::ResourceReservation
+    start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
+                         const SourceCandidate& candidate, ResumeState* resume,
+                         ExecutionUnitKind resume_kind, std::uint32_t resume_tokens);
+    // Activates the staged binding: the lane's KV shares the tree's pages, its state is the
+    // snapshot image (or a reset), and the lane starts publishing its own blocks and taps.
+    void complete_hybrid_binding(ContextTransaction& tx, ContextProgress& out);
+    // Returns everything a staged hybrid binding holds. Safe on a partially staged binding.
+    void abort_hybrid_binding(ContextTransaction& tx) noexcept;
+    // The per-layer events the lane's first prefill pass waits on, consumed by this call; empty
+    // once the batch has landed. The view is valid only until the cache's next poll(), which every
+    // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
+    [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
+    // True when a sibling lane still prefilling a prompt that shares more with this one than the
+    // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
+    // snapshot as an exact tap of the sibling when none is planned near the divergence.
+    [[nodiscard]] bool hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse);
+    // Writes the Host tier to the attached file once every Host write has landed. Called by the
+    // shutdown cleanup after the lanes wrote their blocks through.
+    void save_hybrid_cache_for_shutdown() noexcept;
+    [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
+    // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
+    [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
+    // Inserts every newly committed full block of the lane's sequence into the tree, then
+    // publishes the pending taps those blocks complete.
+    void hybrid_publish_blocks(SequenceState& sequence);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
+    // Realizes the planned taps a completed prefill chunk reached.
+    void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
+                                    std::uint32_t prompt_tokens);
+    // Publishes pending taps whose blocks are committed; a finishing lane hands its own last
+    // pages to the remaining ones or drops them.
+    void hybrid_publish_pending(SequenceState& sequence, bool finishing);
+    // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
+                                                                std::uint32_t columns);
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot whose image
+    // moves out of the lane; the snapshot the lane resumed from is superseded once a deeper one
+    // exists. The caller then clears the lane.
+    void hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept;
+    // Drops the lane's index pins and pending taps. Safe on any lane state.
+    void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 };
 } // namespace ninfer::models::qwen3_5::detail

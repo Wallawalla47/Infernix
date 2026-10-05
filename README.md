@@ -5,7 +5,7 @@
 > testing). It is likely to be neither complete nor entirely accurate. This is hobby development.
 
 This is a personal fork of [Neroued/ninfer](https://github.com/Neroued/ninfer). It follows upstream
-closely and adds changes on top: the history is upstream `master` (`d44ab584`), the Windows port,
+closely and adds changes on top: the history is upstream `master` (`abb7f14f`), the Windows port,
 then one commit per fork change. The sections below explain what is different, grouped by topic,
 with credit given as best my AI agents can where a change came from someone else. The upstream
 README follows, copied unchanged, under the "Upstream README" heading. A huge thank you to Neroued
@@ -15,14 +15,13 @@ for creating NInfer!
 
 1. builds and runs natively on Windows (and still on Linux)
 2. uses a new prefix caching system, designed and implemented by Claude Opus 5.5, as the default.
-   You set how much system RAM it may use with `--host-cache-mib N`; `--prefix-cache-file PATH`
+   You set how much system RAM it may use with `--host-context-mib N`; `--prefix-cache-file PATH`
    keeps the cache across restarts. On the agentic benchmark below it serves far more of each
    prompt from cache than upstream's system. Stop the server with Ctrl+C (twice) rather than by
    closing the window, because Windows does not always leave enough time after a window closes to
    save a large cache
-3. keeps upstream's original prefix caching, with a raft of fixes, behind
-   `--use-original-prefix-caching` (I worked on it before switching to a new design; I found the
-   original too complex and fragile)
+3. keeps upstream's own prefix caching (its continuation/checkpoint cache with request preemption
+   and replay) behind `--use-original-prefix-caching`
 4. prefills INT8, NVFP4, FP8 and K8V4 KV with faster prompt-attention kernels by default (a third
    to two thirds less prompt-attention time on long INT8 and NVFP4 prompts than upstream's kernels,
    a sixth to a half less for FP8 and K8V4); `--use-original-int8-prefill-kernel` and
@@ -75,7 +74,7 @@ copied next to it. The launch I use on a single 32 GB RTX 5090 (stop any other r
 first):
 
 ```bat
-ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-cache-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
+ninfer-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens 7 --lm-head-draft --ngram-draft-tokens 15 --ngram-min-match 12 --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --pending-timeout-ms 900000 --prefill-chunk 4096 --kv-capacity auto --vram-headroom-mib 0 --log-colours on --ngram-archive-mib 2048 --ngram-session-mib 256 --ngram-native-sessions --request-log-jsonl log.json --default-thinking-budget 16384 --thinking-budget-message "Considering the limited time available to the user, I must stop thinking now. Time to act:" --tolerant-tool-calls
 ```
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts. Stop the server by
@@ -264,7 +263,7 @@ did.
 
 **Picking individual changes.** This fork's
 [history](https://github.com/Wallawalla47/ninfer-custom/commits/master) is upstream `master`
-(`d44ab584`), then the Windows port, then one commit per fork change in dependency order, each
+(`abb7f14f`), then the Windows port, then one commit per fork change in dependency order, each
 a whole feature with its fixes folded in. Each item below links to its commit, and each commit
 message lists the earlier fork commits it builds on, so a change can be cherry-picked into another
 fork together with those prerequisites.
@@ -289,7 +288,7 @@ alternatives that were tried and reverted.
   each answer, and a few points spread back through long history. Most cost no extra prefill work
   because they fall on prefill chunk boundaries.
 - **Three tiers.** Free VRAM after the model becomes GPU block cache (`--kv-capacity` defaults to
-  `auto`); `--host-cache-mib` (default 8192, `0` = GPU only) is one pinned host RAM pool that
+  `auto`); `--host-context-mib` (default 8192, `0` = GPU only) is one pinned host RAM pool that
   blocks and snapshots share, split by how much prefill time each entry saves; and
   `--prefix-cache-file PATH` saves the host tier on shutdown and reloads it at startup (a smaller
   host tier keeps the most valuable entries). A file from a different model, KV format or
@@ -303,48 +302,27 @@ alternatives that were tried and reverted.
 - **Host eviction keeps what the next turns reuse**, and **a request waiting for a lane prefetches
   its host-only blocks**: at the 52 GB production host tier, 9.2 % fewer prompt tokens prefilled
   and a 7.8 % shorter agentic workload.
-- Everything except `--host-cache-mib` is derived from `--max-concurrency` and `--prefill-chunk`;
+- Everything except `--host-context-mib` is derived from `--max-concurrency` and `--prefill-chunk`;
   `--device-snapshot-slots`, `--cache-taps-per-request`, `--cache-tap-ladder` and
   `--cache-tap-min-gap` are optional overrides.
+- **It runs on upstream's execution engine.** A cached path is one more binding source for
+  upstream's lane binding, so requests grow their KV unit by unit, cached blocks are evicted first
+  when growth runs short, and only then is a younger request paused and later replayed.
 - **Ctrl+C stops cleanly and saves the cache**: the first press asks for confirmation, the second
   answers running and queued requests with 503 and saves; one more press exits without saving.
   Commit: [`b14f8d6`][c-ctrl-c-stop].
 
 ### Original prefix cache: `--use-original-prefix-caching`
 
-Upstream's checkpoint catalog (a saved state plus the KV at that exact point), kept with this
-fork's fixes. It is configured with `--host-cache-mib` or upstream's separate capacity flags,
-which require `--use-original-prefix-caching`. Details:
-[resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md).
+Upstream's own context cache: private continuations and shared checkpoints with incremental KV
+reservation, resource-pressure preemption and snapshot or replay recovery. `--device-state-slots`
+requires `--use-original-prefix-caching`, and `--host-context-mib` sizes its shared Host budget.
+Details: [resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md).
 
-- **GPU KV grows with the answer instead of being reserved up front**: a request reserves its
-  prompt plus a 4,096-token window and extends it as the answer grows, freeing just enough idle
-  cache when the pool is full. Commit: [`3614562`][c-kv-lease].
-- **Eviction takes the oldest entries first, only as many as needed, and moves them to host RAM
-  before deleting them.** Commit: [`b3c6442`][c-eviction].
-- **A checkpoint loses its value only when its own conversation has moved past it.** Builds on
-  upstream PR #300 by [pkochubey](https://github.com/pkochubey) (upstream issue
-  [#178](https://github.com/Neroued/ninfer/issues/178)). Commit: [`dbb1964`][c-lineage-value].
-- **One host RAM setting, `--host-cache-mib`**, sizes the saved-state pool, the long anchors and
-  host KV. Commit: [`a5c4039`][c-host-budget].
-- **Long anchors are placed automatically** at message boundaries, spaced further apart further
-  back (`--long-anchor-spacing`). Commits: [`b83ac4b`][c-anchors],
-  [`99e0552`][c-anchor-spacing].
-- **Aborted requests keep their prefilled prefix**, so a retry carries on from there.
-  Commit: [`1dac1a2`][c-salvage].
-- **More time to find a cache plan** (5 ms to 250 ms with the request's cost; upstream issue
-  [#229](https://github.com/Neroued/ninfer/issues/229), approach suggested by Gene0Liu), and **the
-  shared-prefix list no longer fills up for good** (upstream issue
-  [#251](https://github.com/Neroued/ninfer/issues/251), approach suggested by albertov).
-  Commits: [`16fced4`][c-planning-budget], [`65b168e`][c-shared-catalog].
-- **The default shared-prefix catalog is sized for a request's full candidate set** (upstream PR
-  #274 by [giveen](https://github.com/giveen)); **cache planning cannot race with itself** (by
-  [Gideon Zenz (gzenz)](https://github.com/gzenz)); **no resource-underflow HTTP 500s** when a
-  release leaves shared pages exclusive.
-  Commits: [`34f7d18`][c-pr274], [`831326f`][c-seal-window],
-  [`3f43c97`][c-entitlement].
-- **Real-model prefix-reuse scenarios and a smoke runner** cover these fixes.
-  Commit: [`ea722fa`][c-prefix-tests].
+The fixes this fork carried for upstream's previous checkpoint-catalog cache (answer-sized KV
+leases, recency eviction, lineage value, a single host budget, automatic long anchors, prefix
+salvage on abort, a longer planning budget and shared-catalog reclaim) were retired with that cache
+when upstream replaced it in `abb7f14f`.
 
 ### Prefill speed
 
@@ -785,10 +763,18 @@ which require `--use-original-prefix-caching`. Details:
 
 ### Kept in sync with upstream
 
-This fork is rebased onto upstream `master` whenever upstream moves; the latest is `d44ab584`
-(September 2026). Where upstream rewrote code this fork had changed, the rebase starts from
+This fork is rebased onto upstream `master` whenever upstream moves; the latest is `abb7f14f`
+(October 2026). Where upstream rewrote code this fork had changed, the rebase starts from
 upstream's version and carries the fork's change onto it only where an A/B test on the RTX 5090
 shows the fork's version is faster. Once upstream adopts a change, it leaves this list.
+
+Dropped in the rebase onto `abb7f14f`, because upstream now does the same thing:
+
+- **Fork fixes to upstream's previous prefix cache** (see above) and **worker recovery from out of
+  memory**: upstream replaced that cache and its admission with incremental reservation and
+  preemption, which reports a shortage instead of failing an allocation.
+- **Round-robin prefill (`--prefill-round-robin`)**: upstream now rotates prefill between lanes by
+  default. The narrow prefill steps beside other requests were not carried over.
 
 Dropped in the rebase onto `d44ab584`, with the measurement that decided each:
 
@@ -861,19 +847,6 @@ well, and for the work this branch builds on.
 [c-ab-rig]: https://github.com/Wallawalla47/ninfer-custom/commit/9189a7e114393be93e35391d68462117ab3b993d
 [c-hybrid]: https://github.com/Wallawalla47/ninfer-custom/commit/a4665be499db14b44e6e6efd99b3bf913c00884d
 [c-ctrl-c-stop]: https://github.com/Wallawalla47/ninfer-custom/commit/b14f8d6bd05a04f7f69e5127d1520b22c2af06fc
-[c-kv-lease]: https://github.com/Wallawalla47/ninfer-custom/commit/3614562450a737ffacc623254ffd81c823ce55fc
-[c-eviction]: https://github.com/Wallawalla47/ninfer-custom/commit/b3c64426a0a3d8186fe5a675932cc0c925591eea
-[c-lineage-value]: https://github.com/Wallawalla47/ninfer-custom/commit/dbb1964968b91794f50516b8b8b50990f0553944
-[c-host-budget]: https://github.com/Wallawalla47/ninfer-custom/commit/a5c4039418b5e88165e985a74bc707ed100c8940
-[c-anchors]: https://github.com/Wallawalla47/ninfer-custom/commit/b83ac4bb361e10cd1f3857b56f4d8a28e9f34cd9
-[c-anchor-spacing]: https://github.com/Wallawalla47/ninfer-custom/commit/99e05522716fcdf9e19e43bdde4f1734f49ebead
-[c-salvage]: https://github.com/Wallawalla47/ninfer-custom/commit/1dac1a236b948aa01ba49728f33a3f0689a08a87
-[c-planning-budget]: https://github.com/Wallawalla47/ninfer-custom/commit/16fced46fc28f453c1aec429dbfe7791ae380a4e
-[c-shared-catalog]: https://github.com/Wallawalla47/ninfer-custom/commit/65b168ec12f6afb78a319223e3d3d57ccaa576dc
-[c-pr274]: https://github.com/Wallawalla47/ninfer-custom/commit/34f7d188f5f2dfb75d1b02f04b84ffe2f646a6fb
-[c-seal-window]: https://github.com/Wallawalla47/ninfer-custom/commit/831326fbb68d37ce6898d00c3a3d7ea1ec23e4c8
-[c-entitlement]: https://github.com/Wallawalla47/ninfer-custom/commit/3f43c97852baaa75bfd13ffef2121b98b65d5278
-[c-prefix-tests]: https://github.com/Wallawalla47/ninfer-custom/commit/ea722fa330c541fb8f3d61d9ef85e634d857fe8d
 [c-fast-int8]: https://github.com/Wallawalla47/ninfer-custom/commit/4c9a949eee73b3cfbdcaf79ae87121af46dea177
 [c-nvfp4-kv]: https://github.com/Wallawalla47/ninfer-custom/commit/8dcd89a1029a568e48e2387ec37208e0432b9fb8
 [c-concurrent-prefill]: https://github.com/Wallawalla47/ninfer-custom/commit/25e52f915a9184ed1c76ec2a77848e6fa87c8b71
@@ -953,7 +926,7 @@ well, and for the work this branch builds on.
 
 Everything below is a copy of the upstream
 [NInfer README](https://github.com/Neroued/ninfer/blob/master/README.md) as of the upstream
-commit this fork is rebased on (`d44ab584`), unchanged except for one added link to
+commit this fork is rebased on (`abb7f14f`), unchanged except for one added link to
 the fork's [ngram copy proposals](docs/ngram.md) guide.
 
 # NInfer

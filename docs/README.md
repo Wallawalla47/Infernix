@@ -54,6 +54,7 @@ other references own narrower contracts:
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [DFlash2 tree verification](maintainer/tree-verification.md) | per-round lattice draft trees, tree acceptance and its exactness, automatic and per-batch-size tree widths, accepted-path compaction |
 | [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for continuation, retention, incremental resources, preemption and recovery |
+| [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | `ninfer-serve`'s default prefix-cache mode: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |

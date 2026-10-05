@@ -204,6 +204,10 @@ void ProgramImpl::abort_context() noexcept {
         // itself so every submitted reader has retired before releasing its source/destination.
         // CUDA failure is already fatal to the Engine; it must not prevent CPU ownership cleanup.
         (void)cudaStreamSynchronize(device.transfer_stream);
+        if (tx.hybrid) {
+            abort_hybrid_binding(tx);
+            if (tx.adopted) { hybrid_release_lane(tx.lane); }
+        }
         if (tx.state_transfer) {
             state_store->abort_transfer(std::move(*tx.state_transfer));
             tx.state_transfer.reset();

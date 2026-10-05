@@ -38,7 +38,10 @@
 
 namespace ninfer::runtime {
 
-template <class Instance>
+// `Manager` selects the prefix-cache implementation: ResourceManager (the original
+// continuation/checkpoint cache) or HybridResourceManager
+// (docs/maintainer/hybrid-prefix-cache-spec.md). Both expose the same surface to the core.
+template <class Instance, class Manager = ResourceManager<typename Instance::ModelContract>>
 class EngineCore {
 
 public:
@@ -55,7 +58,7 @@ public:
     using Scheduling         = Scheduler<Request>;
     using RoundMembership    = typename Scheduling::RoundMembership;
     using ControlMembership  = typename Scheduling::ControlMembership;
-    using ResourceManagement = ResourceManager<ModelContract>;
+    using ResourceManagement = Manager;
     using Clock              = std::chrono::steady_clock;
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options,
@@ -98,12 +101,18 @@ public:
     }
 
     ~EngineCore() noexcept {
+        stop();
+        if (worker_.joinable()) { worker_.join(); }
+    }
+
+    // Refuses new submissions. At its next unit boundary the worker ends every queued and active
+    // request with an Unavailable error and runs the Program's orderly Shutdown cleanup.
+    void stop() noexcept {
         {
             std::lock_guard lock(queue_mutex_);
             stopping_ = true;
         }
         queue_cv_.notify_all();
-        if (worker_.joinable()) { worker_.join(); }
     }
 
     EngineCore(const EngineCore&)            = delete;
@@ -698,14 +707,34 @@ private:
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
+        bool answered = false;
         {
             std::lock_guard lock(request->mutex);
-            if (request->response_done) { return; }
-            request->error         = std::move(error);
-            request->response_done = true;
+            if (!request->response_done) {
+                request->error         = std::move(error);
+                request->response_done = true;
+                answered               = true;
+            }
         }
+        // A request answered early (an orderly stop) still returns its capacity here.
         if (mark_completed(request)) { release_reserved_capacity(); }
-        request->cv.notify_one();
+        if (answered) { request->cv.notify_one(); }
+    }
+
+    // Ends the consumer's wait with `error` while the worker still owns the request. The worker
+    // completes the request later with complete_error, which keeps this answer.
+    void answer_error(const std::shared_ptr<Request>& request,
+                      const std::exception_ptr& error) noexcept {
+        try {
+            std::lock_guard lock(request->mutex);
+            if (!request->response_done) {
+                request->error         = error;
+                request->response_done = true;
+            }
+        } catch (...) {}
+        try {
+            request->cv.notify_one();
+        } catch (...) {}
     }
 
     void complete_success(const std::shared_ptr<Request>& request, FinishReason reason) {
@@ -1609,10 +1638,26 @@ private:
         return true;
     }
 
+    // Hybrid prefix cache: copies the waiting FIFO head's Host-only blocks into spare Device cache
+    // (hybrid-prefix-cache-spec §6.6).
+    void prefetch_blocked_head() {
+        if constexpr (!std::is_same_v<Manager, ResourceManager<ModelContract>>) {
+            std::shared_ptr<Request> head;
+            {
+                std::lock_guard lock(queue_mutex_);
+                if (!pending_.empty()) { head = pending_.front(); }
+            }
+            if (!head || !head->base_plan) { return; }
+            resources_.prefetch_blocked_head(*instance_.program, *head->base_plan,
+                                             head->publication_order);
+        }
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
         if (!lane) {
+            if (!restoring) { prefetch_blocked_head(); }
             if (restoring && !paused_.empty()) {
                 const auto ticket = paused_.front()->id;
                 if (!has_older_resident(ticket)) {
@@ -1708,7 +1753,7 @@ private:
                     .prompt_tokens        = request->base_plan->summary().prompt_tokens,
                     .reused_prompt_tokens = source.reused_tokens,
                     .prefix_reuse_path =
-                        source.reused_tokens ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
+                        source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
                 if (restoring) {
                     std::erase(paused_, request);
                     observe_scheduling(request, GenerationSchedulingTransition::RestoreStarted,
@@ -1750,6 +1795,7 @@ private:
                 return false;
             }
         }
+        if (!restoring) { prefetch_blocked_head(); }
         return false;
     }
 
@@ -2008,7 +2054,7 @@ private:
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
-    void fail_all_locked(std::exception_ptr error) noexcept {
+    void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
         {
             std::lock_guard lock(queue_mutex_);
@@ -2018,8 +2064,23 @@ private:
         scheduler_ = Scheduling{};
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
+        // An orderly stop saves the prefix cache during the Program cleanup, which takes seconds
+        // for a large Host tier: answer every request first rather than after the save.
+        if (shutdown) {
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) { answer_error(slots_[lane], error); }
+            }
+            if (materializing_request != nullptr) { answer_error(materializing_request, error); }
+            for (const auto& request : pending) { complete_error(request, error); }
+            pending.clear();
+        }
         // Native retires all transfer readers before any external checkpoint owner is destroyed.
-        instance_.program->fail_all_cleanup();
+        // An orderly stop also saves an attached hybrid prefix cache file.
+        if (shutdown) {
+            instance_.program->shutdown_cleanup();
+        } else {
+            instance_.program->fail_all_cleanup();
+        }
         materializing_.reset();
         admission_decision_.reset();
         context_is_admission_reclaim_ = false;
@@ -2053,8 +2114,10 @@ private:
                 if (stopping_) {
                     lock.unlock();
                     std::scoped_lock execution_lock(execution_mutex_);
-                    fail_all_locked(std::make_exception_ptr(RequestError(
-                        RequestErrorKind::Unavailable, "inference engine is shutting down")));
+                    fail_all_locked(
+                        std::make_exception_ptr(RequestError(RequestErrorKind::Unavailable,
+                                                             "inference engine is shutting down")),
+                        true);
                     return;
                 }
             }

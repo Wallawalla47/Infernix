@@ -12,23 +12,28 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_C
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
-  --kv-capacity 240000 \
   --max-concurrency 2 \
   --kv-dtype fp8 \
-  --device-state-slots 2 \
+  --host-context-mib 8192 \
   --spec mtp --draft-tokens 3 \
   --lm-head-draft \
   --preserve-thinking
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
-240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
-when running alone. Requests acquire KV pages as execution advances; if concurrent growth exhausts
-the pool, the scheduler can pause a request and restore it later.
+The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. The default
+hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)) sizes the shared Main Text KV
+pool to the Device memory the model and runtime leave free (`--kv-capacity` defaults to `auto`).
+Requests acquire KV pages as execution advances, and pages no active request holds are the Device
+block cache: content-addressed 64-token KV blocks shared across requests. If concurrent growth
+exhausts the pool, cached blocks are evicted first, then the scheduler can pause a request and
+restore it later. `--host-context-mib 8192` is the one pinned Host pool that blocks and sparse state
+snapshots share; every other cache capacity is derived from `--max-concurrency` and
+`--prefill-chunk`.
 
-With `C=2` and two extra Device slots, the process owns four Device StateImages. The default shared
-pinned Host budget is 8 GiB plus eight model StateImages. It holds retained state, KV and pause
-snapshots, including in-flight destinations; `--host-context-mib` sets an explicit total instead.
+With `--use-original-prefix-caching`, the original continuation/checkpoint cache is used instead:
+`--kv-capacity` then follows `--max-context`, `--device-state-slots N` adds Device StateImages beyond
+the active lanes, and the default shared pinned Host budget is 8 GiB plus eight model StateImages,
+holding retained state, KV and pause snapshots, including in-flight destinations.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
@@ -50,6 +55,24 @@ with `--vision`; each accelerates generated-text decode after multimodal prefill
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
+
+### Stop the server
+
+Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom
+line, beneath the statistics panel: `Press Ctrl+C again within 5 s to save the prefix cache and
+close` (`… to close` without `--prefix-cache-file`). Without an interactive console, the prompt is
+logged as a warning. A second press within those 5 seconds stops the server; otherwise the prompt
+disappears and serving continues. Ctrl+Break, closing the console window and `SIGTERM` stop at once.
+
+Stopping refuses new connections, and every running and queued request ends with an HTTP 503
+`service_unavailable` error, or an error event on a stream that has already started. The Engine
+then saves the prefix cache when `--prefix-cache-file` is set, while the bottom line shows
+`Closing: saving the prefix cache | Press Ctrl+C again to exit without saving`. The process exits
+after logging `server stopped` and the save result. One more Ctrl+C during the stop exits at once
+without saving: an unfinished save stops, its temporary file is deleted, and the previous file is
+kept. Ctrl+C with console text selected only copies the text. Windows ends the
+process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
+tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 
 ## Endpoints
 
@@ -891,7 +914,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with `--use-original-prefix-caching` or `--no-prefix-reuse` | `auto` |
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
@@ -935,9 +958,15 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-offload on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; requires `--vision` | `off` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
-| `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
+| `--no-prefix-reuse` | disable compatible-prefix caching; pause/replay resources stay available; rejected with the hybrid options below | prefix reuse on |
+| `--host-context-mib N` | pinned Host budget in decimal MiB that resolve to whole bytes. Hybrid cache: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected; a paused request then recovers by replay. Original cache: the shared budget for StateImages, KV and pause snapshots, including in-flight destinations; `0` disables Host context backing | hybrid `8192 MiB`; original `8192 MiB + 8 native StateImages` |
+| `--use-original-prefix-caching` | select the original continuation/checkpoint prefix cache ([resource scheduling](maintainer/resource-scheduling-and-context-cache.md)) instead of the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), whose content-addressed 64-token KV blocks are shared across requests alongside sparse state snapshots. The hybrid cache configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-context-mib` sizes its one pinned Host pool. The hybrid options below are rejected with this flag, and `--device-state-slots` requires it. | hybrid cache |
+| `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`) | `max-concurrency + 1`; `+ 2` without a Host tier |
+| `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
+| `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
+| `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
+| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
+| `--device-state-slots N` | original: extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
@@ -966,11 +995,13 @@ non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty
 Frequency penalty is `0` for all registered presets. Process flags override registered values,
 request fields override process flags, and `--greedy` finally forces temperature `0`.
 
-For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
-Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
-limit on total process RAM. `--host-context-mib 0` disables Host context backing.
-`--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
-available, and the capacity flags may still be specified.
+For `C=--max-concurrency`, total Device StateImage capacity is `C+H`, where `H` is
+`--device-snapshot-slots` with the hybrid cache and `--device-state-slots` with the original one.
+The Host budget is startup-fixed context storage, not a limit on total process RAM. With the
+original cache, Host state and Main/Backend KV share it and `--host-context-mib 0` disables Host
+context backing. `--no-prefix-reuse` disables cross-request history reads and writes and runs the
+original cache's manager disabled; pause/replay recovery remains available, and
+`--device-state-slots` and `--host-context-mib` may still be specified.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
@@ -1148,22 +1179,11 @@ bound session's retained source count and bytes, `total_bytes` as the whole arch
 `sampling_seed` as the effective seed after request-domain separation for a request that named a
 session, otherwise `null`.
 
-`request_done.materialization.cached_prefix_tokens` and `restored_host_bytes` describe a hybrid
-prefix-cache admission and are `0` with `--use-original-prefix-caching`.
-`cached_prefix_tokens` is the longest prompt prefix held as cached KV blocks, whether or not it was
-reusable: reuse also needs a state snapshot inside it, so a gap to `prefix_cache_hit_tokens` is
-prefix lost to snapshot placement. `restored_host_bytes` is what the admission copied back from the
-Host tier; those copies overlap the request's first prefill pass, so their time is part of its
-prefill.
-
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
 When Vision is enabled, `vision_workspace` reports the aggregate prompt and maximum-item token
 bounds plus encode peak and handoff layout/usage within that same allocation; these bytes must not
 be added to `workspace.capacity_bytes`. The field is `null` when Vision is disabled.
-`host_state_image_bytes` is the Host size of one StateImage, the cost of one retained state
-checkpoint whatever prefix depth it resumes; `host_kv_page_group_bytes` is the Host KV size of one
-page group; and `host_cache_budget_bytes` is the `--host-cache-mib` budget those two are traded
-under, `0` when that budget is not in use. `cuda_graph_allowance_bytes` is the CUDA Graph memory
+`cuda_graph_allowance_bytes` is the CUDA Graph memory
 the KV sizing reserved, and `cuda_graph_measured_bytes` the Device memory graph preparation
 actually took at startup (`0` without CUDA Graphs); the startup log warns when the second exceeds
 the first.
@@ -1230,6 +1250,22 @@ transfers, tail-page COW and pressure spills as interval deltas; `occupancy` and
 end-of-interval gauges. The separate `scheduling` object reports preemptions, restores and replayed
 tokens. Occupancy includes Host reservations while transfers are in flight.
 
+With the hybrid prefix cache (the default), `context_cache.hybrid` is present once
+the cache has inserted a block or holds a snapshot. `device_blocks` (Device-resident 64-token KV blocks),
+`evictable_blocks` (those Device eviction may drop now), `tree_blocks` (blocks on the Device or
+Host), `snapshots`, `host_capacity_bytes`, and `host_used_bytes` are end-of-interval gauges; the rest
+are interval deltas. `snapshot_hits` counts admissions that resumed from a snapshot and
+`reused_tokens` the prompt tokens they reused. `blocks_inserted` counts new tree blocks,
+`blocks_reattached` blocks whose existing tree entry took a request's Device pages, and
+`blocks_duplicate` committed blocks the tree already held on the Device, whose pages were released.
+`taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
+`endpoints_created` end-of-answer snapshots. `host_image_writes`, `host_block_writes`,
+`host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
+Host-tier write-through and restores. `evicted_blocks` counts Device block evictions,
+`host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
+reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
+with no Host copy, which remove them and the blocks after them from the cache.
+
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
 mutually exclusive Host phases and their `total`; `device_wait_seconds` is separate.
@@ -1282,7 +1318,9 @@ answer quality; validate the workload before deployment.
 
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
-and leaves 1 GiB of sizing headroom (`--vram-headroom-mib`); omitting the option makes it follow `--max-context`. The
+and leaves 1 GiB of sizing headroom (`--vram-headroom-mib`); omitting the option selects `auto`
+with the hybrid prefix cache and follows `--max-context` with `--use-original-prefix-caching` or
+`--no-prefix-reuse`. The
 CUDA Graph driver-state allowance reserved against that budget is 64 MiB plus 4 MiB for every
 decode-graph executable the engine instantiates: one per topology class of each captured family,
 for every batch size up to `--max-concurrency` (DFlash and DFlash2 capture a second family when
@@ -1300,8 +1338,10 @@ progress for the oldest resident request. A paused request does not block fresh 
 the remaining capacity. Restoration follows original request order and reserves enough space to
 rebuild the saved frontier and complete one new execution unit.
 
-A paused request keeps its committed output and protocol state. With sufficient Host backing, it
-can restore a snapshot; otherwise it rebuilds model state from retained input and committed tokens.
+A paused request keeps its committed output and protocol state. With the original cache and
+sufficient Host backing, it can restore a snapshot; otherwise (always with the hybrid cache, whose
+Host pool holds cached blocks and snapshots, not pause snapshots) it rebuilds model state from the
+deepest cached prefix plus retained input and committed tokens.
 Replay does not resample or republish those tokens, but it consumes compute and can increase gaps in
 the output stream. The policy and ownership rules are defined in
 [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md).
@@ -1311,8 +1351,14 @@ Compatible prefixes are reused for both text and multimodal histories unless the
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
 skips Vision execution, while new suffix media is encoded normally. The pretty completion record
 shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
-`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root` or `checkpoint`). Reuse requires
+`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root`, `checkpoint`, or with the hybrid
+cache `hybrid_endpoint` or `hybrid_snapshot`). Reuse requires
 matching KV, recurrent state, hidden state, selected-backend state and exact prefix identity.
+
+The hybrid prefix cache retains content-addressed KV blocks and sparse state snapshots; its
+admission, tap placement, Host tier and eviction are defined in the
+[hybrid prefix cache spec](maintainer/hybrid-prefix-cache-spec.md). The rest of this section
+describes the original cache (`--use-original-prefix-caching`).
 
 Completed conversation endpoints serve direct continuations. A separate input checkpoint preserves
 the stable boundary before a response that a later prompt may normalize or replace. With

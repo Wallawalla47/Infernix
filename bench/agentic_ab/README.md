@@ -91,9 +91,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
   (`AB_LAUNCH_BAT`, default the official-artifact launcher) plus `AB_TREATMENT_EXTRA_FLAGS`
   (default none). The control runs the same flags minus the ones its `--help` does not
   advertise.
-- **Same host RAM.** Upstream has no `--host-cache-mib`. The runner reads the split the fork
-  resolved at startup (host state slots, host KV bytes, private continuations, long anchors,
-  shared prefixes) and passes the control those exact values as explicit flags.
+- **Same host RAM.** Both builds size their pinned Host tier with `--host-context-mib`, so the
+  control gets the treatment's value unchanged.
 - **Same context.** Upstream keeps a fixed 1 GiB of VRAM spare under `--kv-capacity auto`, so it
   may not start at the bat's context. The runner tries the bat's value first, then 200000,
   180000, 170000, 160000, and runs every arm at the first one the control starts with. The
@@ -123,9 +122,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
    ```
 
    `--arms treatment,alt,control` adds the original-prefix-cache arm (about 50 minutes; the arms
-   always run in that order). The control's host cache is translated from the split the fork's
-   original cache resolves for the same `--host-cache-mib`, read from one extra startup of the
-   fork before the first seed. `--seeds 42,43,44` runs every arm once per workload seed, seed by seed, into
+   always run in that order). `--seeds 42,43,44` runs every arm once per workload seed, seed by seed, into
    `<out>/seed-<n>`, and writes a combined report to `<out>/report.md`; each seed replays
    different observations. `--ctx N` skips calibration, `--scale F` stretches or shrinks the
    session loops (0.3 is a quick smoke run), `--dry-run` prints the plans and flags.

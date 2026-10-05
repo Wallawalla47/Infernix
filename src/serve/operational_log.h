@@ -65,10 +65,10 @@ public:
                       bool auth_enabled) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
-
-private:
+    // Writes a record rendered elsewhere, such as the stop policy's (serve/stop_control.h).
     void write(OperationalRecord record) const;
 
+private:
     std::shared_ptr<spdlog::logger> logger_;
 };
 

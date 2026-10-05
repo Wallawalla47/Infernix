@@ -158,6 +158,15 @@ ninfer::EngineOptions options_for(const char* artifact, const std::string& backe
     options.speculative.draft_tokens       = backend == "mtp" ? 3 : 5;
     options.speculative.ngram_draft_tokens = width;
     options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+    // NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid runs the same checks on the hybrid prefix cache.
+    if (const char* cache = std::getenv("NINFER_NGRAM_TEST_CONTEXT_CACHE");
+        cache != nullptr && std::string_view(cache) == "hybrid") {
+        options.kv_capacity =
+            ninfer::KvCapacityPolicy::explicit_capacity(max_context * concurrency);
+        options.context_cache.mode                = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.host_capacity_bytes = 1ULL << 30;
+        return options;
+    }
     options.context_cache.device_state_slots  = 2;
     options.context_cache.host_capacity_bytes = 1ULL << 30;
     return options;

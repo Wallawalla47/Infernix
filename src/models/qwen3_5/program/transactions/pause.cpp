@@ -173,6 +173,7 @@ bool ProgramImpl::start_pause(SequenceHandle handle, bool save_snapshot,
     }
     if (save_snapshot && saved->frontier) { saved->snapshot = detach_checkpoint(state); }
     if (!saved->snapshot) {
+        hybrid_release_lane(state.lane);
         release_sequence_kv(state);
         release_sequence_state(state);
     }

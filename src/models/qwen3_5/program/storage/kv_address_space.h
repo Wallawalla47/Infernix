@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -109,6 +110,41 @@ private:
     KVAddressSpaceHandle destination_;
     std::uint32_t frontier_     = 0;
     std::uint32_t full_pages_   = 0;
+    std::uint32_t tail_columns_ = 0;
+    std::uint32_t growth_pages_ = 0;
+    DeviceKVPageReservation page_reservation_;
+    std::optional<KVExecutionRowLease> row_;
+    std::optional<LogicalKVPageHandle> tail_destination_;
+
+    friend class KVAddressSpaceStore;
+};
+
+// Hybrid prefix cache activation of an empty address space from cached pages owned by the prefix
+// index (docs/maintainer/hybrid-prefix-cache-spec.md §6.4). Full pages are shared by reference; a
+// partial tail is copied by the caller into a private destination page before commit.
+class KVPagePrefixForkReservation {
+public:
+    KVPagePrefixForkReservation() noexcept = default;
+    ~KVPagePrefixForkReservation();
+
+    KVPagePrefixForkReservation(KVPagePrefixForkReservation&& other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)), destination_(other.destination_),
+          full_pages_(std::move(other.full_pages_)), tail_source_(other.tail_source_),
+          tail_columns_(other.tail_columns_), growth_pages_(other.growth_pages_),
+          page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)),
+          tail_destination_(std::exchange(other.tail_destination_, std::nullopt)) {}
+
+    KVPagePrefixForkReservation& operator=(KVPagePrefixForkReservation&&)      = delete;
+    KVPagePrefixForkReservation(const KVPagePrefixForkReservation&)            = delete;
+    KVPagePrefixForkReservation& operator=(const KVPagePrefixForkReservation&) = delete;
+
+    [[nodiscard]] bool needs_tail_copy() const noexcept { return tail_columns_ != 0; }
+
+private:
+    KVAddressSpaceStore* owner_ = nullptr;
+    KVAddressSpaceHandle destination_;
+    std::vector<LogicalKVPageHandle> full_pages_;
+    std::optional<LogicalKVPageHandle> tail_source_;
     std::uint32_t tail_columns_ = 0;
     std::uint32_t growth_pages_ = 0;
     DeviceKVPageReservation page_reservation_;
@@ -473,6 +509,150 @@ public:
                     pages_->unpin_source(logical);
                 }
             }
+        }
+        if (fork.tail_destination_) {
+            pages_->abort_transfer_destination(*fork.tail_destination_, fork.page_reservation_);
+            fork.tail_destination_.reset();
+        }
+        fork.page_reservation_.release();
+        fork.row_.reset();
+        fork.owner_ = nullptr;
+    }
+
+    // `growth_pages` are reserved beyond the cached prefix (its full pages plus the private tail).
+    [[nodiscard]] KVPagePrefixForkReservation prepare_page_prefix_fork(
+        KVAddressSpaceHandle destination_handle, std::span<const LogicalKVPageHandle> full_pages,
+        std::optional<LogicalKVPageHandle> tail_source, std::uint32_t tail_columns,
+        std::uint32_t growth_pages, std::int32_t execution_row) {
+        Address& destination = require(destination_handle);
+        if (destination.active || destination.row || destination.reservation.valid() ||
+            destination.page_count != 0 || destination.committed_frontier != 0) {
+            throw std::logic_error("KV cached-prefix destination is not empty");
+        }
+        const auto page_size = static_cast<std::uint32_t>(kPagedKVPageSize);
+        if (tail_columns >= page_size || tail_source.has_value() != (tail_columns != 0)) {
+            throw std::invalid_argument("KV cached-prefix tail is inconsistent");
+        }
+        const auto full                    = static_cast<std::uint32_t>(full_pages.size());
+        const std::uint32_t required_pages = full + (tail_columns != 0 ? 1U : 0U);
+        if (required_pages == 0 || required_pages > page_capacity_ ||
+            growth_pages > page_capacity_ - required_pages) {
+            throw std::invalid_argument("KV cached-prefix geometry is invalid");
+        }
+        for (const LogicalKVPageHandle logical : full_pages) {
+            if (!pages_->device_resident(logical) ||
+                pages_->committed_columns(logical) != page_size ||
+                !pages_->can_pin_source(logical) || !pages_->can_retain_reference(logical, false)) {
+                throw std::logic_error("KV cached-prefix page is not stable");
+            }
+        }
+        if (tail_source && (!pages_->device_resident(*tail_source) ||
+                            pages_->committed_columns(*tail_source) < tail_columns ||
+                            !pages_->can_pin_source(*tail_source))) {
+            throw std::logic_error("KV cached-prefix tail source is not stable");
+        }
+        KVPagePrefixForkReservation fork;
+        fork.page_reservation_ = pages_->physical_pool().make_empty_reservation();
+        pages_->physical_pool().resize_reservation(fork.page_reservation_,
+                                                   growth_pages + (tail_columns != 0 ? 1U : 0U));
+        fork.row_.emplace(tables_->acquire(execution_row));
+        if (tail_columns != 0) {
+            fork.tail_destination_ =
+                pages_->materialize_transfer_destination(fork.page_reservation_, tail_columns);
+        }
+        fork.full_pages_.assign(full_pages.begin(), full_pages.end());
+        fork.tail_source_  = tail_source;
+        fork.tail_columns_ = tail_columns;
+        fork.growth_pages_ = growth_pages;
+        fork.destination_  = destination_handle;
+        for (const LogicalKVPageHandle logical : full_pages) { pages_->pin_source(logical); }
+        if (tail_source) { pages_->pin_source(*tail_source); }
+        fork.owner_ = this;
+        return fork;
+    }
+
+    [[nodiscard]] DeviceKVPageHandle
+    page_prefix_fork_tail_source(const KVPagePrefixForkReservation& fork) const {
+        require_page_prefix_fork(fork);
+        if (!fork.tail_source_) { throw std::logic_error("KV cached-prefix fork has no tail"); }
+        return pages_->physical(*fork.tail_source_);
+    }
+
+    [[nodiscard]] DeviceKVPageHandle
+    page_prefix_fork_tail_destination(const KVPagePrefixForkReservation& fork) const {
+        require_page_prefix_fork(fork);
+        if (!fork.tail_destination_) {
+            throw std::logic_error("KV cached-prefix fork has no tail destination");
+        }
+        return pages_->physical(*fork.tail_destination_);
+    }
+
+    void commit_page_prefix_fork(KVPagePrefixForkReservation&& fork, cudaStream_t stream) {
+        require_page_prefix_fork(fork);
+        Address& destination               = require(fork.destination_);
+        const auto full                    = static_cast<std::uint32_t>(fork.full_pages_.size());
+        const std::uint32_t required_pages = full + (fork.tail_columns_ != 0 ? 1U : 0U);
+        if (!fork.row_ || destination.active || destination.row ||
+            destination.reservation.valid() || destination.page_count != 0 ||
+            fork.page_reservation_.pages() != fork.growth_pages_ ||
+            (fork.tail_columns_ != 0 &&
+             (!fork.tail_destination_ || !pages_->valid(*fork.tail_destination_)))) {
+            throw std::logic_error("KV cached-prefix fork changed before publication");
+        }
+        publish_scratch_.clear();
+        for (const LogicalKVPageHandle logical : fork.full_pages_) {
+            if (pages_->source_pins(logical) == 0 || !pages_->device_resident(logical)) {
+                throw std::logic_error("KV cached-prefix page changed before publication");
+            }
+            publish_scratch_.push_back(pages_->physical(logical));
+        }
+        if (fork.tail_destination_) {
+            publish_scratch_.push_back(pages_->physical(*fork.tail_destination_));
+        }
+        // The whole directory is built before any physical ownership moves.
+        Directory directory;
+        for (std::uint32_t page = 0; page < full; ++page) {
+            directory_slot(directory, page) = fork.full_pages_[page];
+        }
+        if (fork.tail_destination_) { directory_slot(directory, full) = *fork.tail_destination_; }
+        tables_->publish(fork.row_->handle(), 0, publish_scratch_, stream);
+
+        for (const LogicalKVPageHandle logical : fork.full_pages_) {
+            pages_->retain_reference(logical, false);
+            pages_->protect_coverage(logical, static_cast<std::uint32_t>(kPagedKVPageSize));
+        }
+        if (fork.tail_destination_) {
+            pages_->publish_transfer_destination(*fork.tail_destination_, true);
+            fork.tail_destination_.reset();
+        }
+        destination.directory  = std::move(directory);
+        destination.page_count = required_pages;
+        destination.committed_frontier =
+            full * static_cast<std::uint32_t>(kPagedKVPageSize) + fork.tail_columns_;
+        destination.reservation = std::move(fork.page_reservation_);
+        destination.row.emplace(std::move(*fork.row_));
+        fork.row_.reset();
+        destination.active = true;
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
+            pages_->retain_active_reference(membership(destination, page));
+        }
+        for (const LogicalKVPageHandle logical : fork.full_pages_) {
+            pages_->unpin_source(logical);
+        }
+        if (fork.tail_source_) { pages_->unpin_source(*fork.tail_source_); }
+        fork.owner_ = nullptr;
+    }
+
+    void abort_page_prefix_fork(KVPagePrefixForkReservation& fork) noexcept {
+        if (fork.owner_ != this) { return; }
+        for (const LogicalKVPageHandle logical : fork.full_pages_) {
+            if (pages_->valid(logical) && pages_->source_pins(logical) != 0) {
+                pages_->unpin_source(logical);
+            }
+        }
+        if (fork.tail_source_ && pages_->valid(*fork.tail_source_) &&
+            pages_->source_pins(*fork.tail_source_) != 0) {
+            pages_->unpin_source(*fork.tail_source_);
         }
         if (fork.tail_destination_) {
             pages_->abort_transfer_destination(*fork.tail_destination_, fork.page_reservation_);
@@ -1042,6 +1222,12 @@ private:
         return addresses_[handle.index_];
     }
 
+    void require_page_prefix_fork(const KVPagePrefixForkReservation& fork) const {
+        if (fork.owner_ != this || !valid(fork.destination_)) {
+            throw std::logic_error("KV cached-prefix fork reservation is stale");
+        }
+    }
+
     void require_prefix_fork(const KVPrefixForkReservation& fork) const {
         if (fork.owner_ != this || !valid(fork.source_) || !valid(fork.destination_)) {
             throw std::logic_error("KV prefix-fork reservation is stale");
@@ -1167,6 +1353,10 @@ private:
 
 inline KVPrefixForkReservation::~KVPrefixForkReservation() {
     if (owner_ != nullptr) { owner_->abort_prefix_fork(*this); }
+}
+
+inline KVPagePrefixForkReservation::~KVPagePrefixForkReservation() {
+    if (owner_ != nullptr) { owner_->abort_page_prefix_fork(*this); }
 }
 
 inline KVActivePrefixViewReservation::~KVActivePrefixViewReservation() {

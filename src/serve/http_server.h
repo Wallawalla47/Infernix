@@ -55,6 +55,9 @@ public:
     bool bind();
     void attach(GenerationService& service);
     bool listen();
+    // Closes the listening socket and stops the attached service's Engine, whose queued and
+    // running requests then fail, so listen() returns within about one unit of Engine work.
+    // Does not block; callable from any thread.
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }

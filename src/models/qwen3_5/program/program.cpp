@@ -298,6 +298,47 @@ AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); 
 
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
+void Program::shutdown_cleanup() noexcept { impl_->shutdown_cleanup(); }
+
+bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_ != nullptr; }
+
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
+                                                     std::uint32_t maximum_frontier) {
+    return impl_->hybrid_sources(base, maximum_frontier);
+}
+
+bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) {
+    return impl_->hybrid_reclaim(shortage);
+}
+
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) {
+    return impl_->hybrid_prefetch(base);
+}
+
+std::uint32_t Program::hybrid_prefetch_room() const noexcept {
+    return impl_->hybrid_prefetch_room();
+}
+
+HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
+
+void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {
+    impl_->set_hybrid_cost(cost);
+}
+
+void Program::set_hybrid_coalesce_wait_limit(double seconds) {
+    impl_->set_hybrid_coalesce_wait_limit(seconds);
+}
+
+HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                         std::string fingerprint,
+                                                         const StartupObserver& observer) {
+    return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
+}
+
+std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
+    return impl_->hybrid_shutdown_save();
+}
+
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->physical_usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }

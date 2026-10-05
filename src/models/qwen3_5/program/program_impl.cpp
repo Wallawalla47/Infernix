@@ -120,7 +120,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    const auto host_bytes = plan.context_cache.host_capacity_bytes.value();
+    // The hybrid prefix cache owns the whole Host budget as its slab pool (hybrid_program.cpp).
+    const auto host_bytes =
+        plan.context_cache.enabled && plan.context_cache.mode == ContextCacheMode::Hybrid
+            ? std::size_t{0}
+            : plan.context_cache.host_capacity_bytes.value();
     std::vector<HostKVPageLayout> layouts{
         plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry())};
     text_host_kv_page_stride = layouts.front().page_stride;
@@ -261,6 +265,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     work.reset();
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
+    create_hybrid_prefix_cache(startup_observer);
 }
 
 ProgramImpl::~ProgramImpl() noexcept {

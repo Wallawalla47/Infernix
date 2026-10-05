@@ -512,7 +512,12 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
     out.speculative = std::move(request.speculative_stats);
     try {
         device.synchronize();
-        if (request.publish_continuation) { out.checkpoint = detach_checkpoint(sequences[lane]); }
+        if (hybrid_) {
+            // Hybrid mode retains context in the prefix index, never as a checkpoint.
+            hybrid_finish_lane(sequences[lane], true);
+        } else if (request.publish_continuation) {
+            out.checkpoint = detach_checkpoint(sequences[lane]);
+        }
         clear_lane(sequences[lane], request);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (...) { clear_lane(sequences[lane], request); }
@@ -532,6 +537,17 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
         context_transaction_->lane == lane) {
         abort_context();
     }
+    if (hybrid_ && requests[lane].lifecycle != Lifecycle::Empty) {
+        // The committed state is publishable as an endpoint when no model unit is in flight.
+        const auto& request  = requests[lane];
+        const auto& sequence = sequences[lane];
+        const bool consistent =
+            (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
+             (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
+              sequence.text_kv_valid == request.prefill->cursor)) &&
+            !sequence.state.fork_pending;
+        hybrid_finish_lane(sequences[lane], consistent);
+    }
     clear_lane(sequences[lane], requests[lane]);
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
@@ -548,7 +564,32 @@ void ProgramImpl::fail_all_cleanup() noexcept {
             clear_lane(sequences[lane], requests[lane]);
         }
     }
+    if (hybrid_) {
+        if (device.transfer_stream != nullptr) {
+            (void)cudaStreamSynchronize(device.transfer_stream);
+        }
+        hybrid_->clear();
+    }
     // Published checkpoints belong to Runtime or ResumeState. After readers settle, their
     // owners release them; clearing this directory here would invalidate those live owners.
+}
+
+void ProgramImpl::shutdown_cleanup() noexcept {
+    if (hybrid_) {
+        try {
+            device.synchronize();
+        } catch (...) {}
+        abort_context();
+        pending_transaction_.reset();
+        // Every lane writes its blocks through to the Host tier as it is released, so the save
+        // below sees the whole tree.
+        for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+            if (requests[lane].lifecycle != Lifecycle::Empty) {
+                clear_lane(sequences[lane], requests[lane]);
+            }
+        }
+        save_hybrid_cache_for_shutdown();
+    }
+    fail_all_cleanup();
 }
 } // namespace ninfer::models::qwen3_5::detail
