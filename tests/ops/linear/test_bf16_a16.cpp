@@ -7,6 +7,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -24,13 +25,19 @@ using namespace ninfer::test::direct_bf16_weight;
 
 constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 
+// The activation pattern of one column does not depend on the call's T, so an oracle computed for
+// the first tokens of a long call serves every shorter call too.
+std::uint16_t activation_bit(std::int32_t column, std::int32_t token) {
+    const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
+    return f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+}
+
 std::vector<std::uint16_t> make_activation_bits(std::int32_t hidden, std::int32_t tokens) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(hidden) * tokens);
     for (std::int32_t token = 0; token < tokens; ++token) {
         for (std::int32_t column = 0; column < hidden; ++column) {
-            const int centered = ((column * 29 + token * 71 + 17) & 0xff) - 128;
             result[static_cast<std::size_t>(token) * hidden + column] =
-                f32_to_bf16(static_cast<float>(centered) * (1.0F / 512.0F));
+                activation_bit(column, token);
         }
     }
     return result;
@@ -257,10 +264,172 @@ int run_selector_linear() {
     return failures;
 }
 
+// FP64 oracle for the listed tokens of the fixed activation pattern, result[i * n + row] for
+// tokens[i]: every complete dot product accumulated naively in FP64. Rows are taken eight at a time
+// so one token's activation stays in cache while it meets eight weight rows.
+std::vector<double> oracle_tokens(const HostWeight& weight, std::span<const std::int32_t> tokens) {
+    const std::int32_t n = weight.n, k = weight.k;
+    const auto columns   = static_cast<std::size_t>(k);
+    std::vector<double> w(weight.bits.size());
+    for (std::size_t index = 0; index < w.size(); ++index) {
+        w[index] = bf16_to_f32(weight.bits[index]);
+    }
+    std::vector<double> x(tokens.size() * columns);
+    for (std::size_t token = 0; token < tokens.size(); ++token) {
+        for (std::int32_t column = 0; column < k; ++column) {
+            x[token * columns + column] = bf16_to_f32(activation_bit(column, tokens[token]));
+        }
+    }
+    std::vector<double> result(tokens.size() * static_cast<std::size_t>(n));
+    constexpr std::int32_t kRows = 8;
+    const std::int32_t blocks    = (n + kRows - 1) / kRows;
+    std::atomic<std::int32_t> next{0};
+    const auto work = [&] {
+        for (std::int32_t block = next++; block < blocks; block = next++) {
+            const std::int32_t first = block * kRows, count = std::min(kRows, n - first);
+            const double* rows       = w.data() + static_cast<std::size_t>(first) * columns;
+            for (std::size_t token = 0; token < tokens.size(); ++token) {
+                const double* activation = x.data() + token * columns;
+                double sums[kRows]       = {};
+                for (std::int32_t column = 0; column < k; ++column) {
+                    for (std::int32_t row = 0; row < count; ++row) {
+                        sums[row] += rows[row * columns + column] * activation[column];
+                    }
+                }
+                for (std::int32_t row = 0; row < count; ++row) {
+                    result[token * static_cast<std::size_t>(n) + first + row] = sums[row];
+                }
+            }
+        }
+    };
+    std::vector<std::thread> workers;
+    const unsigned threads = std::max(1U, std::thread::hardware_concurrency());
+    for (unsigned thread = 0; thread < threads; ++thread) workers.emplace_back(work);
+    for (std::thread& worker : workers) worker.join();
+    return result;
+}
+
+// One call at T tokens compared against the oracle at `checked` tokens (oracle[i * n + row] for
+// checked[i]). A replay captures the call in a graph, negates the activation and launches again.
+int run_vision_case(const DeviceWeight& weight, std::int32_t tokens,
+                    std::span<const std::int32_t> checked, std::span<const double> oracle,
+                    bool replay, cudaStream_t stream) {
+    const std::int32_t rows = weight.host.n, hidden = weight.host.k;
+    auto activation_bits    = make_activation_bits(hidden, tokens);
+    DeviceBuffer device_activation = to_device(activation_bits);
+    const std::size_t outputs      = static_cast<std::size_t>(rows) * tokens;
+    GuardedDeviceBuffer guarded_output(outputs * sizeof(std::uint16_t));
+    guarded_output.fill(0xff);
+    Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
+    Tensor output(guarded_output.data(), DType::BF16, {rows, tokens});
+    DeviceArena workspace(256);
+    const auto launch = [&] {
+        ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, stream);
+    };
+    double sign = 1.0;
+    if (replay) {
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        definition.capture(stream, launch);
+        graph.instantiate(definition);
+        graph.launch(stream);
+        cuda_synchronize(stream);
+        for (auto& bits : activation_bits) bits ^= 0x8000;
+        device_activation.copy_from_host(activation_bits.data(), device_activation.bytes);
+        guarded_output.fill(0xff);
+        graph.launch(stream);
+        sign = -1.0;
+    } else {
+        launch();
+    }
+    cuda_synchronize(stream);
+
+    const std::string label = "BF16_A16 vision Linear [" + std::to_string(rows) + "," +
+                              std::to_string(hidden) + "] T=" + std::to_string(tokens) +
+                              (replay ? " graph" : " eager");
+    int failures = guarded_output.verify_guards(label);
+    const auto output_bits = from_device<std::uint16_t>(guarded_output.data(), outputs);
+    for (std::size_t index = 0; index < outputs; ++index) {
+        if (!std::isfinite(bf16_to_f32(output_bits[index]))) {
+            std::cerr << label << ": element " << index << " is not finite\n";
+            ++failures;
+            break;
+        }
+    }
+    std::vector<double> actual, expected;
+    actual.reserve(checked.size() * rows);
+    expected.reserve(checked.size() * rows);
+    for (std::size_t index = 0; index < checked.size(); ++index) {
+        for (std::int32_t row = 0; row < rows; ++row) {
+            const std::size_t at = static_cast<std::size_t>(checked[index]) * rows + row;
+            actual.push_back(bf16_to_f32(output_bits[at]));
+            expected.push_back(sign * oracle[index * rows + row]);
+        }
+    }
+    failures += verify_reduction(label, actual, expected, kA16Tolerance);
+    if (from_device<std::uint16_t>(device_activation, activation_bits.size()) != activation_bits) {
+        std::cerr << label << ": modified its activation\n";
+        ++failures;
+    }
+    failures += weight.verify_preserved(label + " weight");
+    return failures;
+}
+
+// The BF16 vision tower projections of Qwen3.8-Flash-Next and Qwen3.5 (and Quasar's merger
+// [5120,4608]) are registered problems. Calls up to T = 4100 compare every output with the FP64
+// oracle; T = 16384 and 65536 compare complete columns at tile seams and both ends. [4304,1152]
+// and [1152,4304] exercise the N and K tails of the tail-capable TMA route.
+int run_vision_bf16_linear() {
+    constexpr std::int32_t kFullTokens = 4100;
+    const std::vector<std::pair<int, int>> shapes = {
+        {1152, 1536}, // patch embedding
+        {3456, 1152}, // fused QKV
+        {1152, 1152}, // attention output
+        {4304, 1152}, // MLP fc1: N tail
+        {1152, 4304}, // MLP fc2: K tail
+        {4608, 4608}, // merger fc1
+        {2560, 4608}, // merger fc2 (Flash-Next)
+        {5120, 4608}, // merger fc2 (Quasar)
+    };
+    std::vector<std::int32_t> first_tokens(kFullTokens);
+    for (std::int32_t token = 0; token < kFullTokens; ++token) first_tokens[token] = token;
+    const auto first = [&](std::int32_t tokens) {
+        return std::span<const std::int32_t>(first_tokens).first(static_cast<std::size_t>(tokens));
+    };
+    DeviceContext context;
+    int failures = 0;
+    for (const auto& [n, k] : shapes) {
+        const DeviceWeight weight(make_patterned(n, k, 424U));
+        const std::vector<double> oracle = oracle_tokens(weight.host, first_tokens);
+        for (const std::int32_t tokens :
+             {1,   2,    3,    8,    9,    15,   16,   17,   31,   32,   33,   63,   64,
+              65,  127,  128,  129,  255,  256,  257,  383,  384,  385,  511,  512,  513,
+              767, 768,  769,  1023, 1024, 1025, 1151, 1152, 1153, 2047, 2048, 2049, 2303,
+              2304, 2305, 4095, 4096, 4100}) {
+            failures +=
+                run_vision_case(weight, tokens, first(tokens), oracle, false, context.stream);
+        }
+        for (const std::int32_t tokens : {1, 9, 65, 1025, 4100}) {
+            failures += run_vision_case(weight, tokens, first(tokens), oracle, true, context.stream);
+        }
+        for (const std::int32_t tokens : {16384, 65536}) {
+            std::vector<std::int32_t> checked{0,    1,          127,          128,
+                                              4095, 4096,       4097,         tokens / 2,
+                                              tokens - 257,     tokens - 256, tokens - 2,
+                                              tokens - 1};
+            std::sort(checked.begin(), checked.end());
+            checked.erase(std::unique(checked.begin(), checked.end()), checked.end());
+            failures += run_vision_case(weight, tokens, checked, oracle_tokens(weight.host, checked),
+                                        false, context.stream);
+        }
+    }
+    return failures;
+}
+
 int run_general_bf16_linear() {
-    // Shapes outside the specialised table (14336/5120, 5120/6144, 256/5120) route to the general
-    // runtime-shape GEMM fallback. Cover the minimal tile, non-tile-aligned extents (the row/column
-    // boundary guards), multi-tile grids, and the QAT full-precision vocab head's real shape.
+    // Shapes outside the specialised table route to the general runtime-shape GEMM fallback. Cover
+    // the minimal tile, non-tile-aligned extents (the row/column boundary guards), multi-tile
+    // grids, and the QAT full-precision vocab head's real shape.
     int failures = 0;
     const std::vector<std::pair<int, int>> shapes = {
         {32, 32},   // exactly one 32x32 tile
@@ -272,24 +441,6 @@ int run_general_bf16_linear() {
     for (const auto& [n, k] : shapes) {
         DeviceWeight weight(make_patterned(n, k, 421U));
         for (int tokens : {1, 2, 32, 33, 128}) {
-            failures += run_bf16_linear_case(weight, tokens);
-        }
-    }
-    // The quasar vision tower is stored BF16, so every vision projection routes here. Cover its
-    // real shapes (patch_embedding, fused qkv/attention output, mlp fc1/fc2, merger fc1/fc2) at the
-    // image patch counts (T up to a huge image), which the generic cases above never reach.
-    const std::vector<std::pair<int, int>> vision_shapes = {
-        {1152, 1536}, // patch_embedding  [hidden, 3*t*p*p]
-        {1152, 1152}, // attention query/key/value and output
-        {3456, 1152}, // fused qkv
-        {4304, 1152}, // mlp fc1
-        {1152, 4304}, // mlp fc2
-        {4608, 4608}, // merger fc1
-        {5120, 4608}, // merger fc2
-    };
-    for (const auto& [n, k] : vision_shapes) {
-        DeviceWeight weight(make_patterned(n, k, 422U));
-        for (int tokens : {1, 2, 32, 33, 256, 1024, 1025, 4096}) {
             failures += run_bf16_linear_case(weight, tokens);
         }
     }
@@ -329,6 +480,7 @@ int run_bf16_linear() {
         }
     }
     failures += run_selector_linear();
+    failures += run_vision_bf16_linear();
     failures += run_general_bf16_linear();
     return failures;
 }

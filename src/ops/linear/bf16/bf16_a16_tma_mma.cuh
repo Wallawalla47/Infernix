@@ -26,6 +26,15 @@ inline TmaDescriptorStaging<Bf16TmaDescriptors>& bf16_tma_descriptor_staging() {
 }
 #endif
 
+inline void check_bf16_tma_map(CUresult status) {
+    if (status != CUDA_SUCCESS) {
+        const char* name = nullptr;
+        (void)cuGetErrorName(status, &name);
+        throw std::runtime_error(std::string("BF16 TMA descriptor: ") +
+                                 (name ? name : "CUDA error"));
+    }
+}
+
 inline CUtensorMap bf16_tma_map(const __nv_bfloat16* pointer, int rows, int k, int block_rows,
                                 int block_k) {
     // Factor K into 64-element sectors. The contiguous 128-byte dimension matches the
@@ -37,26 +46,51 @@ inline CUtensorMap bf16_tma_map(const __nv_bfloat16* pointer, int rows, int k, i
     const std::uint32_t box[]{64, static_cast<std::uint32_t>(block_k / 64),
                               static_cast<std::uint32_t>(block_rows)};
     const std::uint32_t steps[]{1, 1, 1};
-    const auto status = cuTensorMapEncodeTiled(
+    check_bf16_tma_map(cuTensorMapEncodeTiled(
         &result, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<__nv_bfloat16*>(pointer),
         dimensions, strides, box, steps, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-    if (status != CUDA_SUCCESS) {
-        const char* name = nullptr;
-        (void)cuGetErrorName(status, &name);
-        throw std::runtime_error(std::string("BF16 TMA descriptor: ") +
-                                 (name ? name : "CUDA error"));
-    }
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
+    return result;
+}
+
+// Row-major [rows, k] read in [block_rows, 64] boxes. Box elements past k or rows are zero-filled
+// (FLOAT_OOB_FILL_NONE), so the K and row tails of tail-capable schedules read as zeros. The row
+// stride k * 2 bytes must be a multiple of 16, which validate_bf16_operands guarantees (k % 8 == 0).
+inline CUtensorMap bf16_tma_map_2d(const __nv_bfloat16* pointer, int rows, int k, int block_rows) {
+    CUtensorMap result{};
+    const std::uint64_t dimensions[]{static_cast<std::uint64_t>(k),
+                                     static_cast<std::uint64_t>(rows)};
+    const std::uint64_t strides[]{static_cast<std::uint64_t>(k) * 2};
+    const std::uint32_t box[]{64, static_cast<std::uint32_t>(block_rows)};
+    const std::uint32_t steps[]{1, 1};
+    check_bf16_tma_map(cuTensorMapEncodeTiled(
+        &result, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<__nv_bfloat16*>(pointer),
+        dimensions, strides, box, steps, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE));
     return result;
 }
 
 template <class Schedule>
+inline constexpr bool bf16_tma_tail = [] {
+    if constexpr (requires { Schedule::kTail; })
+        return Schedule::kTail;
+    else
+        return false;
+}();
+
+template <class Schedule>
 Bf16TmaDescriptors make_bf16_tma_descriptors(const Bf16A16Operands& p) {
     validate_bf16_operands<Schedule>(p);
-    if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
-        throw std::invalid_argument("BF16 TMA requires complete row/K tiles");
-    return {bf16_tma_map(p.weight, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK),
-            bf16_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK)};
+    if constexpr (bf16_tma_tail<Schedule>) {
+        static_assert(Schedule::kBlockK == 64, "tail TMA reads one 64-element K box per stage");
+        return {bf16_tma_map_2d(p.weight, p.rows, p.k, Schedule::kBlockRows),
+                bf16_tma_map_2d(p.x, p.tokens, p.k, Schedule::kBlockTokens)};
+    } else {
+        if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
+            throw std::invalid_argument("BF16 TMA requires complete row/K tiles");
+        return {bf16_tma_map(p.weight, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK),
+                bf16_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK)};
+    }
 }
 
 __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorMap* map,
@@ -65,6 +99,17 @@ __device__ __forceinline__ void bf16_tma_load(void* destination, const CUtensorM
                  "[%0], [%1, {%2, %3, %4}], [%5];"
                  :
                  : "r"(smem_addr(destination)), "l"(map), "r"(0), "r"(k_sector), "r"(row),
+                   "r"(smem_addr(barrier))
+                 : "memory");
+}
+
+// The complete box is written (out-of-bounds elements as zeros) and counted by complete_tx.
+__device__ __forceinline__ void bf16_tma_load_2d(void* destination, const CUtensorMap* map,
+                                                 int k, int row, std::uint64_t* barrier) {
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3}], [%4];"
+                 :
+                 : "r"(smem_addr(destination)), "l"(map), "r"(k), "r"(row),
                    "r"(smem_addr(barrier))
                  : "memory");
 }
@@ -91,9 +136,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     const Bf16TmaDescriptors& descriptors = *descriptors_pointer;
 #endif
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
-    constexpr int S   = Schedule::kStages;
-    const int K       = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    const int tiles_r = rows / BR, tiles_t = (count + BT - 1) / BT;
+    constexpr int S     = Schedule::kStages;
+    constexpr bool Tail = bf16_tma_tail<Schedule>;
+    const int K         = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
+    const int tiles_r = Tail ? div_up(rows, BR) : rows / BR, tiles_t = (count + BT - 1) / BT;
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<Schedule>(blockIdx.x, tiles_r, tiles_t, tile_r, tile_t);
     const int row_begin = tile_r * BR, token_begin = token_offset + tile_t * BT;
@@ -112,7 +158,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         cta_mbarrier_fence_init();
     }
     __syncthreads();
-    const int tiles_k = K / BK;
+    const int tiles_k = Tail ? div_up(K, BK) : K / BK;
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
 #ifdef _WIN32
@@ -124,10 +170,17 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
                 cta_mbarrier_arrive_expect_tx(full + stage, (BR + BT) * BK * 2);
-                bf16_tma_load(a + stage * BR * BK, &descriptors.weight, kt * (BK / 64), row_begin,
-                              full + stage);
-                bf16_tma_load(b + stage * BT * BK, &descriptors.activation, kt * (BK / 64),
-                              token_begin, full + stage);
+                if constexpr (Tail) {
+                    bf16_tma_load_2d(a + stage * BR * BK, &descriptors.weight, kt * BK, row_begin,
+                                     full + stage);
+                    bf16_tma_load_2d(b + stage * BT * BK, &descriptors.activation, kt * BK,
+                                     token_begin, full + stage);
+                } else {
+                    bf16_tma_load(a + stage * BR * BK, &descriptors.weight, kt * (BK / 64),
+                                  row_begin, full + stage);
+                    bf16_tma_load(b + stage * BT * BK, &descriptors.activation, kt * (BK / 64),
+                                  token_begin, full + stage);
+                }
             }
         }
         return;
@@ -144,8 +197,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }
-    bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
-                                               token_begin, rows, token_offset + count, warp, lane);
+    bf16_finish_mma_tile<Schedule, FullTokens, !Tail>(output, epilogue, storage, accum, row_begin,
+                                                      token_begin, rows, token_offset + count, warp,
+                                                      lane);
 }
 
 template <class Schedule, class Output, class Epilogue>
@@ -157,9 +211,11 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
     // Staged once: every token-slice launch below reads the same copy, in stream order.
     const Bf16TmaDescriptors* staged = bf16_tma_descriptor_staging().stage(descriptors, stream);
 #endif
+    const int row_tiles = bf16_tma_tail<Schedule> ? div_up(p.rows, Schedule::kBlockRows)
+                                                  : p.rows / Schedule::kBlockRows;
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const auto blocks = static_cast<std::int64_t>(p.rows / Schedule::kBlockRows) *
-                            div_up(count, Schedule::kBlockTokens);
+        const auto blocks =
+            static_cast<std::int64_t>(row_tiles) * div_up(count, Schedule::kBlockTokens);
         if (blocks > 2147483647LL)
             throw std::invalid_argument("BF16 TMA grid exceeds CUDA grid.x capacity");
         const auto launch = [&]<bool Full>() {

@@ -4129,6 +4129,32 @@ host's publication test does not use it.
   `run_general_bf16_linear` for registered cases. Bench `ninfer_linear_bench --qtype bf16 --policy
   a16`; curves in `docs/maintainer/linear-tuning.md`. Expected 100-150 TFLOP/s (estimated).
   Flash-Next's text BF16 shapes are untouched, so text stays bit-identical.
+- **Implementation decisions (V0, 2026-10-04).** No new kernel: every route is an instance of an
+  existing BF16 template.
+  - The 4304 tail lives inside the existing TMA MMA template, selected by a schedule trait
+    (`Bf16A16TmaTailMmaSchedule`, `kTail`): 2-D tensor maps read 64-element K boxes with hardware
+    zero fill, the grid and K loop round up, and the store predicates rows ≥ N
+    (`bf16_finish_fragment<FullTokens, FullRows>`). Non-tail instantiations compile to the
+    previous code. Collective and fragment epilogues reject the tail form at compile time, so the
+    fused BF16 Ops that share the template cannot select it by accident.
+  - T ≤ 8 returns the fallback's skinny GEMV (`select_bf16_general_launch`), so those outputs stay
+    bit-identical; only the merger of tiny inputs reaches it, too rarely to tune. (The registered
+    GEMV/SIMT schedules need K to be a multiple of 128 or more, which fc2's 4304 is not.)
+  - Large-T routes rasterize row-fast (`Bf16A16TmaR64T128K64S2Rows` and its tail form): the
+    activation (up to 564 MB, fc2's input at P = 65,536) is read about once from DRAM while the ≤ 47 MB weight
+    stays in L2; the token-fast order would re-read it once per row tile (18-80 times).
+  - Per-T selection from a temporary private-launcher sweep (cold-L2 CUDA graphs, existing TMA,
+    cp.async MMA and sliced-K schedules, row-fast and grouped rasters; deleted after use): each
+    interval takes the fastest candidate within 2 % at each measured T, seams at the last measured
+    T. The sweep's winners were up to 1.6× faster than the first default (the largest 64 × {32, 64,
+    128} tile that still launched about two waves).
+  - Measured (VM1, 2026-10-05, RTX 5090, graph execution): registered against the fallback
+    9.6-22.6× over all 8 shapes and T ∈ {64 … 65,536}, 12.4-18.3× at T ≥ 1,024 (acceptance ≥ 5×);
+    e.g. fc1 [4304, 1152] 15.5× at T = 4,096, the merger [5120, 4608] 247 TFLOP/s at T = 65,536.
+    The BF16 Linear, LinearAdd and attention-input op tests pass at the final selectors; the
+    Quasar real-model regression (identical text) ran before the sweep's selectors were pasted.
+  - On Windows the eager TMA routes share one descriptor staging buffer, which requires them to run
+    on the compute stream; V6's window runs the tower GEMMs there.
 
 #### M-RoPE through the text path
 

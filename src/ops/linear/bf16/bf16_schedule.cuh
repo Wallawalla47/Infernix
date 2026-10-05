@@ -208,6 +208,19 @@ struct Bf16A16TmaMmaSchedule
     static_assert(BlockRows <= 256 && BlockTokens <= 256 && BlockK <= 16384);
 };
 
+// Tail-capable TMA form for problems whose N or K is not a tile multiple (the vision MLP's 4304).
+// Both operands are read through 2-D tensor maps in one 64-element K box per stage; out-of-bounds
+// box elements zero-fill, so a partial K tile adds nothing and a partial row tile computes rows
+// that the store discards.
+template <int BlockRows, int BlockTokens, int WarpRows, int WarpTokens, int Stages,
+          int MinBlocksPerSm = 1, Bf16MmaRaster Raster = Bf16MmaRaster::TokenFast,
+          int RasterGroupRows = 1>
+struct Bf16A16TmaTailMmaSchedule
+    : Bf16A16TmaMmaSchedule<BlockRows, BlockTokens, 64, WarpRows, WarpTokens, Stages,
+                            MinBlocksPerSm, Raster, RasterGroupRows> {
+    static constexpr bool kTail = true;
+};
+
 // Static K and optional whole-call token specialization do not restrict the generic template.
 template <class Schedule, int K, int Capacity = 0, bool ExactTokens = false>
 struct Bf16ScheduleInstance : Schedule {
