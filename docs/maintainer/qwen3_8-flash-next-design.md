@@ -7072,6 +7072,564 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   producer's tensor-map acquires (read). Under test: the prefill staging overlap (pass p+1 staged
   on the side stream while pass p computes).
 
+#### Long prompts: attribution and plan (2026-10-05)
+
+- **The bound.** A 4,096-token call routes nearly every expert, so F2 streams every non-resident
+  expert of every layer for every call: ~384 per layer × 2.76 MB × 48 layers ≈ 51 GB, ~1.8 s at
+  the x8 link's 27.6 GB/s. The call's other work is ~1.0 s (16K prompt, dev 9ec2580a5, nsys,
+  `fn/prof/prefill_kernels.py`). So chunk-major prefill is link-bound: pp16384 ≈ 2,000 tok/s,
+  about 65 s for a 128K prompt (an extrapolation; not measured end to end).
+  - This is also why the BF16 text routes (aa6a85985) moved pp4096 by only +0.3 %: the call
+    waits on the link, not on the GEMMs.
+- **The call's other work per 4,096 tokens** (same trace, before the BF16 routes; ms):
+
+  | Kernel | ms |
+  |---|---:|
+  | `bf16_general_gemm` | 270 |
+  | QSA `attention_kernel` (FP32 SIMT; flat beyond 2K context, since the budget caps attended tokens) | 245 |
+  | `q8_a16_mma` | 176 |
+  | Expert GEMMs | ~160 |
+  | `split_kernel` | 105 |
+  | Router projection | 36 |
+  | QSA selection (~85 ms per call at 128K, from Q2's per-token cost) | 10-14 |
+
+- **Plan** (F4, then the compute items F5 and F6; a 128K nsys on current code confirms the split
+  first):
+  1. F4: link once per span instead of once per call.
+  2. F5, F6: then cut the compute that becomes the bound.
+
+- **128K measured** (2026-10-05, dev aa6a85985 + pipelined decode (decode only), `ninfer_bench
+  -pg 131072,32`, chunk 4096, INT8 KV, docs corpus, nsys `fn/prof/pf128k`):
+  - Prefill took 81.9 s (1,600 tok/s; 82.5 s under nsys).
+  - Each 4,096-token call takes 2.3-2.5 s of wall time, of which the GPU is busy ~0.83 s; the
+    rest waits on the expert link.
+  - The n-gram rows cost **21.7 s** of host reads over the prompt: 2.1M rows, 31 % host-cache
+    hits, 1.27M 4 KiB reads at ~17 µs each, before each call while the GPU idles.
+  - Kernel time of the late calls (100K+ of context) per call:
+
+    | Kernel | ms |
+    |---|---:|
+    | QSA attention | 248 |
+    | `q8_a16_mma` | 175 |
+    | `split_kernel` | 98 |
+    | QSA scoring | 73 |
+    | Wide expert GEMM | 55 |
+    | Narrow expert kernels launched per staging pass (nearly every expert takes the wide route) | 47 |
+    | Router projection | 36 |
+    | BF16 TMA | 16 |
+
+#### F7: n-gram rows read on several threads (re-applied after F9)
+
+**Status.** Re-applied 2026-10-05 after F9, with 8 threads at depth 16 each (`kParallelInFlight`).
+The first measurement below was confounded by the mapped volume (F9).
+
+**Probe** (`fn/probes/ioring_bench.cpp`, unmapped volume, random 4 KiB reads):
+
+| Threads × depth | Reads/s |
+|---|---:|
+| 1 × 64 | ~220K |
+| 4 × 64 | 391K |
+| 8 × 64 | 663K |
+| 8 × 16 | 878K |
+
+The probe ran beside a build, so these are lower bounds.
+
+**Engine** (`fn/rigs/layer/vf.bat`, 128K prompt, `--vram-past-budget`, one run, against
+`diag2.bat`'s single-thread F9 build):
+
+| | Single thread (F9) | F7 re-applied |
+|---|---:|---:|
+| 1.27M NVMe reads | 5.9 s | 1.29 s (~980K reads/s) |
+| Host staging per 64K span | 3.0 s | 0.70 s |
+| 128K prefill (tok/s) | 5,331 | 6,576 (+23 %) |
+
+pp16384 at `--max-ctx 20480` was 6,051 tok/s; the 40K CLI prompt prefilled at 5.60k tok/s.
+
+**History** (kept): the version first measured below was rejected and reverted.
+
+The volume is an Optane P5800X, about 5 µs per 4 KiB read and over 1M reads/s. The hypothesis was
+that one thread submitting overlapped `ReadFile` calls is bound by the call itself (~15-20 µs on
+Windows), about 60K reads/s.
+
+**What was tried.** A `read_rows` call with at least 512 distinct missing blocks was split over
+8 threads, each with its own 64-block ring. The rows went straight to the output, and the host cache
+was filled afterwards on the calling thread. The rows were exact, and `test_ngram_volume.cpp`
+passed.
+
+**Result.** In the engine, the 128K prompt's n-gram read time rose from 3.16 s (dev aa6a85985) to
+4.09 s.
+
+**Disposition.** The likely causes are contention with the prefill's CPU workers, and a queue
+depth (8 × 64) far past what the drive needs. Neither was isolated. The change is reverted, and its
+patch is kept at `fn/rigs/layer/f7_parallel_reads.patch`. Read time stays the 128K prompt's
+largest host cost (§19.3.8), so a contention-aware design (a persistent reader thread, depth near
+the drive's knee) remains open.
+
+#### F4: the layer walk
+
+- **Order.** A span of consecutive calls of one prompt runs layer-major: decoder layer l over
+  every chunk of the span, then layer l + 1. Each layer's non-resident experts are streamed once
+  per span (F2's ring, two layers ahead; a layer's half is released after the span's last chunk).
+- **Same results.** The call grid, and with it every output bit, is the chunk-major one. Chunk c at
+  layer l reads exactly what call c reads at layer l: its own residual columns, and the layer's KV,
+  GDN, PLE and QSA state after chunks 0..c−1. Only expert placement differs, and the MoE
+  arithmetic is placement-invariant.
+  - `Forward::run` is now `begin_call`, `embed`, `layer` × 48 and `finish`; the walk calls the
+    same steps per (layer, chunk).
+- **Spans.** Consecutive calls of at least 256 columns, up to `kWalkMaxTokens` = 65,536 tokens.
+  - A span ends at a call whose end realizes a prefix tap: the capture needs the boundary's state
+    in every layer. `prefix_tap_due` mirrors `prefix_after_prefill_call`.
+  - A single call keeps the chunk-major path.
+- **Memory.** The span's residual stream (BF16 [S·H, tokens], 20 KB per token: 1.3 GB at 64K)
+  and every chunk's staged io image live in the stream lease after the ring.
+  - At the prompt's first walk the lease is lent with that area, and the ring's halves are widened
+    by the experts the larger lease evicts.
+  - Without enough lendable frames the prompt runs chunk-major.
+  - Link time per layer (~38 ms) is below a span's compute per layer from about two chunks on, so
+    64K spans are compute-bound.
+- **Steps.** Staging reads every chunk's n-gram rows and io into pinned memory and uploads them
+  once; each chunk's embedding and layer 0 are enqueued as soon as its io is uploaded.
+  - Each later `advance_prefill` enqueues ⌈48 / chunks⌉ layers of every chunk (about one call's
+    work), synchronizes, and returns zero processed tokens as a service unit.
+  - Other lanes, cancellation and decode rounds interleave as between calls.
+  - The last step returns the span's tokens and runs the call-end work once: the route download
+    (the span's last chunk), `prefix_after_prefill_call`, and `after_round` with 16 promotions per
+    layer per chunk.
+- **Interactions.**
+  - An abort inside a span leaves no endpoint: the layers are at different positions.
+  - Another lane's prefill calls run without the ring while a walk holds it.
+  - A Vision window cannot take the lease back from a walk.
+  - The LFRU state is credited once per span (from the last chunk's routes) instead of once per
+    call; every chunk routes nearly every expert, so the credited set is about the same.
+- **Toggle.** A temporary environment variable (`NINFER_TMP_WALK_OFF`) gave the A/B in one
+  binary; it was removed before the commit.
+
+#### F5: QSA prompt attention on Tensor Cores
+
+- **Route.** Exactly the calls the FP32 kernel would run unsplit (`ops/qsa/qsa_prompt.{h,cu}`,
+  inside `qsa_attention` after the selection): columns × KV heads above 170, i.e. 86+ columns.
+  Decode, verification and short suffixes keep the FP32 kernel.
+  - **Why this rule and not a width.** Within that class a column's FP32 result never depended on
+    its call's width (the kernel's only width dependence is its split count). The prefix cache
+    relies on that: a resumed prompt can compute a position in a call of another width than the run
+    that captured the state.
+  - The prompt kernel is width-independent too, so the class keeps the property.
+  - **Measured failure that set this rule.** A first version used a 256-column threshold inside the
+    class. `ninfer_qwen4_exp_prefix_cache_real_test` X12 (a restored Host-tier resume against the
+    capturing Engine's turn) then failed deterministically: the first token difference came at 30,
+    in 2 of 2 runs with the route on and 0 of 2 with it off.
+  - `test_qsa.cpp` now also checks that a 100-column call reproduces the same columns of a wider
+    call bit for bit.
+- **Kernel.** One CTA per (column, KV head):
+  - The KV head's 12 query heads are padded to 16 MMA rows.
+  - Each warp sweeps its own 16-token tiles of the column's attended list, in the decode kernel's
+    order, gathered by `cp.async` into double-buffered swizzled stages.
+  - Each warp keeps its own online softmax; the CTA merges the warps' (max, sum, rows) at the end.
+  - INT8: 4 warps. BF16 storage: 2 warps, for shared memory.
+- **Arithmetic.**
+  - Scores: FP32-accumulated m16n8k16. INT8 multiplies the Hadamard-rotated query rows (rounded
+    to FP16 once, in the k order that one `ldmatrix` lane of a code row supplies) by the codes
+    widened exactly, with the group scales applied per 64-dimension FP32 partial. BF16 storage
+    uses BF16 MMA on the stored keys.
+  - P × V: FP16 probabilities times FP16 values (INT8: codes times their represented group scale,
+    via `ldmatrix.trans`; BF16 storage: the stored FP16 values), FP32 accumulation.
+  - A tile whose largest V scale exceeds 256 decodes with the scales divided by 2^s and multiplies
+    the probabilities by 2^s (both exact).
+- **Qualification.** `test_qsa.cpp`'s FP64 oracle at the same criterion (relative L2 2.8e-3).
+  Prompt-route cases: a dense call, the dense/selected boundary inside a call, selected blocks
+  over several pages in two rows, and a list length off the tile grid.
+- **Expected** (estimate): the 245 ms per call of FP32 SIMT attention falls to ~30-60 ms (MMA work
+  ~1.4 ms per layer at peak; the gathers are L2-served up to ~32K of context).
+
+#### F6: vectorized `split_rows`
+
+`split_kernel` copied one BF16 element per thread: ~0.8 ms per prefill split, ~285 GB/s. Where
+every boundary, the row count and every pointer are 8-element aligned (all of Qwen4Exp's splits),
+a thread now copies 16 bytes. The copy is exact; `test_rows.cpp` checks both routes.
+
+#### F4-F6 speed (2026-10-05, RTX 5090, Windows, INT8 KV, `fn/rigs/layer/speed.bat`)
+
+**Arms and workload.**
+- **Arms:**
+  - OLD = dev aa6a85985.
+  - OFF = the new binary with the walk and the F5 route toggled off (F6 and F7 stay on).
+  - ON = the new binary.
+- **Workload:** `ninfer_bench` over the long-docs corpus, one process per arm and pass, passes in
+  ABC CBA order.
+- **Configurations:**
+  - "long": `--max-ctx 132096`, chunk 4096.
+  - "short": `--max-ctx 20480`, chunk 4096.
+  - "c1024": `--max-ctx 20480`, chunk 1024.
+
+**Results** (prefill tok/s, mean of 2):
+
+| Case | OLD | OFF | ON | ON / OLD |
+|---|---:|---:|---:|---:|
+| long pp131072 | 1,828 | 1,706 | 3,373 | 1.85× |
+| long pp65536 | 1,727 | 1,614 | 3,238 | 1.88× |
+| long pp16384 | 1,123 | 1,093 | 1,994 | 1.78× |
+| short pp16384 | 2,207 | 2,189 | 5,680 | 2.57× |
+| short pp4096 (one chunk: no walk) | 1,551 | 1,636 | 1,637 | 1.06× |
+| c1024 pp16384 | 521 | 512 | 2,420 | 4.64× |
+| tg512 | 110.0 | — | 110.1 | 1.00× |
+
+**Reading the results.**
+- **Spread.** The two passes of long pp131072 ON differ by 8 % (3,235 and 3,511). The other rows
+  are within 4 %.
+- **OFF is slower than OLD in the long case** (−5 to −7 %).
+  - Cause one: F7's slower n-gram reads (F7 is reverted since).
+  - Cause two: the OLD binary lends a smaller ring. That cap was raised (769 → 1,025 lent frames)
+    between the builds.
+  - The split between the two causes is not measured. The post-build rig re-measures without F7.
+- **What remains after the walk.** At 128K, the profile's late chunks were link-bound: ~2.4 s of
+  wall time against 0.8 s of GPU busy time. With the walk, that busy time is the bound. Its largest
+  parts per 4K chunk are QSA attention (248 ms, which F5 targets), q8 GEMMs (176 ms), elementwise
+  work (107 ms, mostly split, which F6 targets), experts (111 ms) and QSA selection (up to 86 ms).
+
+#### F9: the n-gram volume is no longer mapped (2026-10-05)
+
+**Finding.**
+- **Profile.** In the 128K profile of the layer walk, each 64K span began with ~11 s of host
+  staging while the GPU was idle. Temporary timers split it: 99.8 % was n-gram NVMe reads, 1.27M
+  reads at ~17 µs each (~60K reads/s). The chunk-major build showed the same per-read cost; there
+  the reads hid behind compute.
+- **Probe.** `fn/probes/ioring_bench.cpp` does random 4 KiB unbuffered reads of the real volume
+  from one thread at depth 64:
+
+  | Path | Reads/s |
+  |---|---:|
+  | Overlapped `ReadFile` | 213-228K |
+  | IoRing | 223-234K |
+  | Either, with 40 GiB pinned | −4 % |
+  | Either, with the file also mapped | 49-61K |
+
+- **Cause.** `ReadOnlyFile` always mapped the whole 52 GB file. NgramVolume never reads the
+  mapping, but on Windows every unbuffered read of a file with a mapped data section pays cache
+  coherency work.
+
+**Change.**
+- `ReadOnlyFile` takes a `FileMapping` mode; `None` maps nothing and opens no buffered handle.
+  POSIX honours it too.
+- NgramVolume opens its volume with `None`.
+- `test_read_only_file.cpp` checks `None`: nothing mapped, the live size, and the same bytes
+  through both read paths.
+
+**Result** (`fn/rigs/layer/diag2.bat`, 128K prompt, chunk 4096, one run each, against the same
+binary before the change):
+
+| | Before | After |
+|---|---:|---:|
+| Prefill (tok/s) | 3,255 | 5,331 (+64 %) |
+| n-gram read time | 21.6 s | 5.9 s (~213K reads/s, the probe's rate) |
+| Staging per span | 10.4-11.2 s | 3.0 s |
+| Reads behind the decode gate (169) | 8.2 ms | 2.1 ms |
+
+- The new binary also has F8, worth ≤ 0.6 s of the 15 s saved.
+- IoRing was not adopted: it adds only ~5 % over overlapped `ReadFile`.
+
+**Remaining.** About 6 s of reads per 128K prompt was still exposed under the walk (3 s per span).
+F7, re-applied, cut that to 1.3 s. Overlapping a span's reads with the previous span's compute
+would hide part of the rest, but it is worth under 3 % now.
+
+**Optane against a consumer NVMe drive** (`fn/rigs/layer/ssd.bat`, 2026-10-05):
+- **Setup.** The same binary with F7 and `--vram-past-budget`, and the volume copied to a
+  Samsung 990 PRO 2 TB (D:). ABBA order: Optane, 990 PRO, 990 PRO, Optane.
+- **Results:**
+
+  | | Optane P5800X | 990 PRO |
+  |---|---:|---:|
+  | Probe: 1 thread at depth 64 | ~220K reads/s | ~205K reads/s |
+  | Probe: 8 threads at depth 16 | 1.17M reads/s | 1.11M reads/s |
+  | pp131072 (tok/s) | 5,767 / 5,770 | 5,766 / 5,768 |
+  | pp16384, cold (tok/s) | 3,680 / 3,713 | 3,719 / 3,723 |
+  | 128K n-gram read time | 1.13 s | 1.17-1.18 s |
+  | tg512 (tok/s) | 111.4 / 111.3 | 111.3 / 111.3 |
+  | Load time | 25.1-25.4 s | 25.1-25.4 s |
+
+- **Decode gate.**
+  - Per-read latency behind the gate: ~60 µs on the Optane, ~200 µs on the 990 PRO.
+  - The GPU waited in 20 of 295 cold rounds on the Optane (mean 28-33 µs) and in 34-44 on the
+    990 PRO (54-68 µs): milliseconds per generation.
+- **Conclusion.** With F9 and F7 the volume's drive no longer matters on a fast NVMe SSD. The user
+  guide now says so.
+
+**The artifact loader as well.**
+- **Change.** `InputFile` opens its parts with `FileMapping::None`. `read_exact` (metadata and
+  host objects) now reads unbuffered: straight into an aligned destination, else through an 8 MiB
+  aligned bounce buffer per thread. The bulk reads were already unbuffered. The artifact reader and
+  materialization tests pass.
+- **Probe** (`fn/probes/bigread_bench.cpp`, 8 MiB sequential reads, two in flight): a mapped file
+  cut the rate 12 % (6.04 against 6.9 GB/s).
+- **Load time: no measurable change.** `load_seconds` is bimodal across today's runs with either
+  loader: ~21 s or ~25 s, by run time, with the old dev binary too. The four runs of the new loader
+  were 25.2-25.8 s. Loading is bound by something other than the reads.
+
+#### F10: q8 MMA tile selection for prefill widths (2026-10-05)
+
+**Problem.** In the 128K profile the q8 GEMMs were 5.65 s, 31 % of GPU time. Every Flash-Next
+shape used `r32_t128` above 96 columns:
+
+| Shape | Projection | Rate |
+|---|---|---:|
+| 324 × 10240 | hyper-connection down | 96 TFLOP/s |
+| 10240 × 320 | hyper-connection up | 110 TFLOP/s |
+| 16384 × 2560 | GDN query | 169 TFLOP/s |
+
+The 324-row shape had 352 CTAs, against 340 resident.
+
+**Probe.** `tests/ops/linear/tmp_q8_tiles.cpp` (temporary; `fn/rigs/layer/q8tiles2.bat`) ran
+every MMA tile launcher on the seven prefill shapes at 128-4096 columns.
+- **Bits.** Every tile's output is bit-identical to `r32_t128` at every point. An MMA tile
+  accumulates each output over K in the same order, so the selection is speed-only.
+- **Best tiles** (change against `r32_t128`):
+
+  | Shape | 128 columns | 4096 columns |
+  |---|---|---|
+  | 16384 × 2560 | r64_t128, −17 % | r64_t128, −18 % (1,623 against 1,979 µs) |
+  | 12800 × 2560 | r48_t64, −20 % | r64_t128, −19 % |
+  | 1280 × 2560 | r32_t64 to 512 columns | r64_t128, −16 % |
+  | 2560 × 6144 | r32_t64 to 256 columns | r64_t128, −16 % |
+  | 2560 × 640 | r32_t64 to 256 columns | r64_t128, −14 % |
+  | 10240 × 320 | r48_t64 to 192 columns | r64_t128, −17 % |
+  | 324 × 10240 | r32_t64 to 1024 columns, −7 to −30 % | r48_t64, −30 % |
+
+**Change.** The shapes' selectors (`src/ops/linear/q8/shapes/*.cu`) use these tiles above 96
+columns. Widths of 96 and below, where decode and verification run, are unchanged.
+`ninfer_linear_q8_a16_test` passes.
+
+**Expected.** ~30 ms per 4096-token chunk, ~1 s per 128K prompt.
+
+**Result** (`fn/rigs/layer/tiles_ab.bat`; A = F7+F8+F9, B = A + F10; ABBA, `--vram-past-budget`):
+
+| | A | B | Change |
+|---|---|---|---:|
+| pp131072 (tok/s) | 6,594 / 6,589 | 6,891 / 6,920 | +4.8 % |
+| pp16384 (tok/s) | 6,087 / 6,071 | 6,076 / 6,083 | 0.0 % |
+
+- The ~40K prompt's greedy ids are identical in both arms.
+- At 16K the walk's four chunks are bound by something other than these GEMMs; not attributed.
+
+#### F8: the router projection for prefill-wide calls
+
+**Problem.** `projection_fp32` (router logits, FP32 SIMT, a bit-invariance contract) took 755 µs
+per 4096-token call: 513 rows, K = 2560, 36 ms per chunk over 48 layers. Its narrow mapping
+re-reads a CTA's weight rows for every 8 columns.
+
+**Design.** Calls of at least 64 columns use a tiled kernel.
+- **Tiling.**
+  - Each CTA (512 threads) owns a 32-row × 16-column output tile.
+  - K is walked in slices of 256 elements, staged with double-buffered `cp.async`.
+  - A slice is exactly one 8-element chunk per lane, so lane l's partial is the narrow kernels'
+    lane-l partial, in the same order.
+  - A warp owns a 4 × 8 sub-tile and reduces it by the same butterfly.
+- **Bits.** An output's summation is unchanged, so its bits are unchanged by construction.
+
+**Rejected versions.**
+- Weights staged once per CTA with x read from global: 918 µs, measured beside another GPU job.
+- A 1,024-thread CTA: 1,615 µs. Its 64-register cap made the 4 × 8 tile spill.
+
+**Test.** `test_projection_fp32.cpp` checks every column of the wide calls bit-for-bit against the
+narrow mapping. Shapes:
+- 513 × 2560 at T = 64 and T = 4096;
+- four segments at K = 3072, T = 301;
+- 129 × 1024 at T = 135.
+
+It also checks the FP64 bound on edge columns.
+
+**Result.** 370 µs per 4096-token call, measured with CUDA events on an idle GPU, against 755 µs
+in the nsys profile. That is 2.0× faster, saving ~18 ms per chunk (~0.6 s per 128K prompt). The
+end-to-end effect is not measured yet.
+
+#### VRAM item 1: the prefill workspace lent from frames
+
+**Design.**
+- The static workspace covers only `max(lanes × W, min(chunk, 512))` columns.
+- A wider call swaps in a wide arena, taken from the first of these that is available:
+  - the stream lease (after the ring);
+  - a frame lease of its own;
+  - a `DeviceBuffer` fallback.
+- A temporary toggle (`NINFER_TMP_WIDE_WORK_OFF`, removed before the commit) restored the static
+  arena for the A/B.
+
+**Results** (`post.bat`, `--max-context 49152`, chunk 4096):
+
+| | Static arena (toggle off) | Wide arena (two runs) |
+|---|---:|---:|
+| Workspace (MiB) | 1,774 | 284 |
+| Expert frames | 8,734 | 9,299 (+565, +1.5 GiB) |
+| tg512 (tok/s) | 110.1 | 110.5 / 110.7 |
+| pp16384 (tok/s) | 5,602 | 5,674 / 5,707 |
+
+- The ~40K prompt's ids are identical in all three runs.
+- The tg512 and pp16384 differences are within one run's spread at this short context, so they
+  are not claimed as gains.
+
+#### VRAM item 2: the ~1.6 GB "in use before loading" (2026-10-05)
+
+**Probes.** `fn/probes/vram_probe.cu` and `vram_alloc_probe.cu`, plus a temporary ledger line,
+gave these readings:
+
+| Situation | Reading |
+|---|---|
+| nvidia-smi, idle GPU | 0 MiB used, 420 MiB driver reserve |
+| A bare CUDA 13.4 context held | 432 MiB used (nvidia-smi); 1,588 MiB used (`cudaMemGetInfo`), exactly the engine's figure |
+| Pinning host memory (16 GiB) | no change |
+| `CUDA_MODULE_LOADING`: lazy (the default) or `LAZY` | 1,588 MiB |
+| `CUDA_MODULE_LOADING=EAGER` | 1,814 MiB |
+
+**The cost is not NInfer's.** It is the WDDM context (~432 MiB), the driver's reserve (420 MiB),
+and ~736 MiB that `cudaMemGetInfo` reports as unavailable.
+
+**The unavailable part is usable.**
+- `cudaMalloc` handed out 31,616 MiB in 64 MiB pieces, against 30,991 MiB reported free.
+- Every piece was written at VRAM speed (≤ 0.10 ms per piece), so no sysmem fallback occurred.
+- That leaves ~625 MiB (~236 expert frames) unused. The engine sizes frames from the reported free
+  memory, minus headroom and reserve.
+
+**Now an opt-in: `--vram-past-budget`** (the user's decision, 2026-10-05).
+- **Finding.** `cudaMemGetInfo`'s free memory is exactly DXGI's budget minus usage: a budget of
+  31,419 MiB, against 32,187 MiB of NVML total less the driver reserve.
+- **Allowance.** The VRAM source measures one allowance at open: NVML usable − budget − 128 MiB,
+  640 MiB here. It reports budget + allowance as the budget, and free memory derived from it.
+  Sizing, the control law and the spill guard are unchanged. An OS budget cut still lowers the
+  effective budget by the same amount.
+- **Results** (`vf.bat`):
+
+  | | Off | On |
+  |---|---:|---:|
+  | Expert frames | 9,299 | 9,542 (+243) |
+  | "In use before loading" | 1,588 MiB | 948 MiB |
+  | tg512 (tok/s, one process per arm, within noise) | 110.3 | 111.7 |
+
+  - The ~40K prompt's greedy ids are identical off and on, and identical to `post.bat`.
+- **Off by default**, since that memory may be moved to system memory when another program needs
+  VRAM.
+
+---
+
+### 19.3.11 Long-context KV in host RAM (§9.6 as built; VRAM item 3, 2026-10-05)
+
+**Why.** The deployed configurations run `--max-context` 220K-500K at concurrency 2-4. At 220K × 2
+lanes, INT8 KV is ~6 GB of VRAM, about 2,300 expert frames. QSA attends to at most 2,051 selected
+tokens per query, so most of that KV is cold at any moment.
+
+**Model: exclusive page placement in page spaces.**
+- A 64-token KV page lives in exactly one space:
+  - **space 0**, the device pool (`DeviceKVPagePool`, as today);
+  - **space 1**, a pinned, GPU-mapped host pool with the same plane layout;
+  - **space 2**, a device pool lent from expert frames during a long prefill.
+- A block-table entry carries the space in its top bits (`page >> 28`); the low 28 bits index the
+  space's planes.
+- The pooled index-key plane is device memory in every space: space 1's pooled plane is a device
+  array, since selection scans every pooled key.
+- **Writers are unchanged.** KV append and pooled keys only ever write the frontier's pages, which
+  are space 0 by rule.
+- **Readers translate.** The page spaces are QSA-owned, so only QSA's kernels change:
+  - the decode attention kernel (`KVReader`);
+  - the prompt kernel (its `cp.async` gathers; space-1 pages are read zero-copy);
+  - the selection kernels and `pool_kernel` (pooled-plane offsets).
+- **Space-1 pages are read zero-copy**, as §9.6 planned. A selected 4-token block of one layer is
+  ~4.2 KB in INT8.
+
+**Placement and migration** (Program; between calls and rounds, never inside a captured graph):
+- **Admission.** A lane's pages are reserved in space 0 up to its device budget; the rest are
+  reserved in space 1. The frontier page and the most recent pages are always space 0.
+- **Long prefill.**
+  - Each chunk (or walk span) writes space-0 pages.
+  - After it, completed pages beyond the lane's device budget move to space 2 (D2D), so the prompt
+    kernel's dense gathers stay on the GPU.
+  - When the prompt ends, space-2 pages move to space 1 (D2H), except those the last chunks
+    selected most, which take space-0 pages. The lent frames go back.
+- **Decode: CLOCK over pages.**
+  - A small kernel after each decode call's selection sets one reference bit per page whose blocks
+    the call selected.
+  - Between rounds the host promotes referenced space-1 pages into space 0 (H2D on the copy
+    engine, a bounded number per round) and demotes unreferenced space-0 pages to space 1.
+  - The block tables are updated, so the next replay reads the new placement.
+
+**Interactions.**
+- **Prefix cache.** Cached blocks are space-0 leases, as today. A lane's space-1 pages are copied
+  to the prefix Host tier's slabs when published (they are already host bytes), never shared
+  zero-copy. Restores write space-0 pages.
+- **RAM ledger.** The host pool is pinned and counted. The tier turns on only when
+  `max_context × concurrency` KV exceeds the device budget.
+
+**Gate K0, measured before migration code.** Decode selections at 64K and 128K context
+(a temporary trace, `NINFER_TMP_QSA_TRACE`, kept as a patch on branch
+`backup/fn-layer-prefill-wip-20261005`; traces in `G:\ninfer\qsa_trace_*.bin`; `fn/rigs/layer/k0_sim.py`) give LRU hit rates for 4-token blocks against
+64-token pages at 16K/32K/64K tokens of device cache per lane. Pages are the unit if they reach ≥ 90 %
+at a 32K budget. Otherwise a block cache inside space-1 pages is added (designed then).
+
+**First: an elastic device pool (steps E1-E2, before K2).** The host tier pays only when the
+admitted contexts' KV exceeds the device. The deployed configurations rarely fill their
+`--max-context`, yet a fixed pool takes its whole maximum from the expert frames at startup. The
+elastic pool does the same job with no kernel change:
+- **E1, the pool.** `DeviceKVPagePool` gets a backed-page limit.
+  - Pages `[0, backed)` can be handed out; the rest of the capacity has no memory behind it.
+  - Allocation is already first-fit over ascending pages, so a pool keeps its pages low and its
+    top frees up.
+  - The limit rises freely. It falls only over free pages (`can_back`).
+- **E2, the Program.**
+  - **Backing.** The KV backing is a `VmmRange`: the address space for the whole plan is reserved,
+    and 2 MiB chunks are mapped individually. The planes are page-major, so pages `[0, n)` are a
+    prefix of every plane.
+  - **Base.** Startup maps the block tables and 512 base pages (32K tokens). The plan counts only
+    those, so the frames are sized with the rest free.
+  - **Growth.**
+    - When an admission's reservation is short after cache eviction, the pool grows in 64-page
+      units.
+    - Growth first uses memory the control law would give the frames anyway. The rest it takes from
+      the frames (`ExpertResidency::resize`, one 64 MiB frame chunk over so that much is
+      unmapped), at most a quarter of them per growth.
+    - Growth is refused while frames are lent. The quote and the prefix selection count what one
+      growth could add.
+  - **Shrink.**
+    - A release lowers the limit to the free top and gives whole frames back at once.
+    - After 60 s with every lane free, the maintenance pass releases the cache's idle,
+      host-backed device blocks (a later match restores them from the Host tier; nothing is lost),
+      then shrinks. The delay spares a follow-up turn a restore plus an expert reload.
+  - **The control law.** `VramControl::account_fixed` moves its sizing baseline by each grow or
+    shrink, so the KV is never read as the reserve's use.
+  - **Toggle.** A temporary `NINFER_TMP_KV_ELASTIC_OFF` restored the fixed pool for the A/B; it
+    was removed before the commit.
+- **Known costs.**
+  - A growth synchronizes the device and evicts experts at admission: a few ms plus refills.
+  - The idle eviction releases host-backed blocks in the index's value order, not by page
+    position, so it can release more than the top needs.
+  - A long conversation that pauses for more than 60 s restores its prefix from the Host tier
+    (~90 ms for 128K INT8) and reloads the evicted experts.
+- **Gate.**
+  - `ninfer_kv_cache_test` covers the backed limit and the `VmmRange`.
+  - The ~40K prompt at `--max-context 262144` must give the same ids elastic and fixed, and the
+    same ids as at 49152.
+  - tg512 at `--max-ctx 262144`: elastic against fixed, frames and tok/s.
+- **Results** (2026-10-05, `fn/rigs/layer/post.bat`, INT8 KV, one run each):
+  - `ninfer_kv_cache_test` passes.
+  - The ~40K prompt gives identical greedy ids in every arm: 49152 and 262144, elastic and fixed.
+  - At `--max-context 262144`:
+
+    | | Fixed | Elastic | Change |
+    |---|---:|---:|---:|
+    | Startup KV (MiB) | 3,360 | 458 | |
+    | Expert frames | 8,197 | 9,299 | +1,102 (+2.8 GiB) |
+    | tg512 (tok/s) | 103.5 | 109.6 | +5.9 % |
+    | 40K-prompt prefill (tok/s) | 2.83k | 2.91k | |
+
+  - The 40K request grew the pool to 704 pages (626 MiB), taking 88 frames.
+  - The release shrank it back to 512 pages and returned 63 frames at once.
+  - The remaining 25 frames (the chunk taken over the need) wait for the control law's grow delay.
+
+**Steps.**
+- **K1:** page spaces in the QSA ops plus their op tests (spaces 0/1/2, every reader, oracle =
+  the same KV in space 0).
+- **K2:** host pool, admission placement, and exact outputs with the tier forced on: every
+  non-frontier page in space 1, greedy ids equal to the device-only run.
+- **K3:** long-prefill space 2 and the end-of-prompt migration.
+- **K4:** decode CLOCK.
+- **K5:** prefix-cache publish and restore.
+- **K6:** measurement — frames gained, decode at 4K/64K/128K/220K context against the device-only
+  build, and the prefill rate.
+
 ---
 
 ## 20. Documentation and authority changes
