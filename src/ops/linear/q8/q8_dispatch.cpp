@@ -30,20 +30,28 @@ constexpr std::array kShapes{
     shape<Q8N9216K2048>(select_q8_n9216_k2048),     shape<Q8N12288K2048>(select_q8_n12288_k2048),
     shape<Q8N14336K5120>(select_q8_n14336_k5120),   shape<Q8N17408K5120>(select_q8_n17408_k5120),
     shape<Q8N34816K5120>(select_q8_n34816_k5120),   shape<Q8N248320K5120>(select_q8_n248320_k5120),
+    // Qwen3.8-Flash-Next (N 324 and 320 are not 16-row multiples, so they bypass the geometry type).
+    ShapeEntry{16384, 2560, select_q8_n16384_k2560},
+    ShapeEntry{12800, 2560, select_q8_n12800_k2560},
+    ShapeEntry{13952, 2560, select_q8_n13952_k2560},
+    ShapeEntry{2560, 2560, select_q8_n2560_k2560},
+    ShapeEntry{1280, 2560, select_q8_n1280_k2560},
+    ShapeEntry{2560, 6144, select_q8_n2560_k6144},
+    ShapeEntry{324, 10240, select_q8_n324_k10240},
+    ShapeEntry{320, 10240, select_q8_n320_k10240},
+    ShapeEntry{10240, 320, select_q8_n10240_k320},
+    ShapeEntry{2560, 640, select_q8_n2560_k640},
 };
 
-// Shapes without a tuned entry (Qwen3.8-Flash-Next's dense classes) use the runtime-shape
-// templates: predicated SIMT for decode and verification widths, MMA tiles beyond, each covering
-// any row count and any K padded to 128. A long, few-row shape (the hyper-connection down
-// projections, N 320-324 and K 10240: 41 eight-row blocks for 170 SMs) gives each row a CTA whose
-// eight warps split K: 7.5 -> 4.7 us at T = 1 and 12.1 -> 8.5 us at T = 5. With 128 blocks
-// ([1024, 4096]) or K 2560 it is slower than eight rows per CTA. Both SIMT widths of a schedule
-// pair reduce a column identically, so a column's output does not depend on how many columns
-// (up to 8) share the call.
+// Shapes without a tuned entry use the runtime-shape templates: predicated SIMT for decode and
+// verification widths, MMA tiles beyond, each covering any row count and any K padded to 128.
+// Both SIMT widths of a schedule pair reduce a column identically, so a column's output does not
+// depend on how many columns (up to 8) share the call.
 Q8Launch select_q8_generic(std::int32_t n, std::int32_t k, std::int32_t t) {
-    const bool few_rows = (n + 7) / 8 < 64 && k >= 4096;
-    if (t <= 4) return few_rows ? launch_q8_a16_simt_r1_t4_w8 : launch_q8_a16_simt_r8_t4;
-    if (t <= 8) return few_rows ? launch_q8_a16_simt_r1_t8_w8 : launch_q8_a16_simt_r8_t8;
+    (void)n;
+    (void)k;
+    if (t <= 4) return launch_q8_a16_simt_r8_t4;
+    if (t <= 8) return launch_q8_a16_simt_r8_t8;
     if (t <= 64) return launch_q8_a16_mma_r32_t64;
     if (t <= 96) return launch_q8_a16_mma_r32_t96;
     return launch_q8_a16_mma_r32_t128;

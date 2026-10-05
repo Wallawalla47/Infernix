@@ -54,6 +54,44 @@ struct Q8A16GemvSchedule {
     static_assert(kThreads <= 1024);
 };
 
+// x of the register-streamed route: staged once per CTA and pass into shared memory, or read by
+// each warp through L1 (long K split over a CTA's warps, where a whole-K tile would not fit).
+enum class Q8StreamX : std::uint8_t { Shared, Global };
+
+// Register-streamed decode schedule (q8_a16_stream.cuh). A warp holds RowsPerWarp rows and
+// KSplit warps share each row group, splitting K into contiguous scale-pair ranges; a CTA covers up
+// to MaxCols columns in passes of ColsPerPass over the register-resident weights.
+template <int K, int RowsPerWarp, int KSplit, int Warps, int MaxCols, int ColsPerPass, Q8StreamX XStage,
+          int MinBlocksPerSm>
+struct Q8A16StreamSchedule {
+    static_assert(K > 0 && K % 64 == 0);
+    static_assert(KSplit == 1 || KSplit == 2 || KSplit == 4 || KSplit == 8);
+    static_assert(K % (64 * KSplit) == 0, "every K warp owns the same whole scale pairs");
+    static_assert(RowsPerWarp > 0 && Warps > 0 && Warps % KSplit == 0);
+    static_assert(ColsPerPass > 0 && ColsPerPass <= 8 && MaxCols % ColsPerPass == 0 && MaxCols <= 16);
+    static_assert(MinBlocksPerSm > 0);
+    static constexpr int kK              = K;
+    static constexpr int kRowsPerWarp    = RowsPerWarp;
+    static constexpr int kKSplit         = KSplit;
+    static constexpr int kWarps          = Warps;
+    static constexpr int kThreads        = Warps * 32;
+    static constexpr int kRowGroups      = Warps / KSplit;
+    static constexpr int kBlockRows      = kRowGroups * RowsPerWarp;
+    static constexpr int kMaxCols        = MaxCols;
+    static constexpr int kColsPerPass    = ColsPerPass;
+    static constexpr int kPasses         = MaxCols / ColsPerPass;
+    static constexpr Q8StreamX kXStage   = XStage;
+    static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
+    static constexpr int kWarpK          = K / KSplit;
+    static constexpr int kChunks         = (kWarpK + 255) / 256;
+    static constexpr int kXTileBytes     = XStage == Q8StreamX::Shared ? ColsPerPass * K * 2 : 0;
+    static constexpr int kPartialBytes   = KSplit > 1 ? kRowGroups * KSplit * RowsPerWarp * ColsPerPass * 4 : 0;
+    static constexpr int kSharedBytes    = (kXTileBytes + kPartialBytes + 15) / 16 * 16 > 0
+                                               ? (kXTileBytes + kPartialBytes + 15) / 16 * 16
+                                               : 16;
+    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+};
+
 enum class Q8MmaFragmentPipeline { Serial, PingPong };
 
 // Quant codes are prefetched while MMA consumes the decoded BF16 weight tile.

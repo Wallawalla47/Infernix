@@ -4570,6 +4570,35 @@ and without the cliff above 8. At implementation, grep the recipe A and `dense8h
 for any other N < 505, K ≥ 4096 Q8 matrix; `select_q8_generic` stays for unregistered geometries.
 §19.2's idea of running 9-16-column blocks as two ≤ 8-column launches is superseded too.
 
+**K1 as built and measured (M1 sweep, 2026-10-04).** `q8_a16_stream_kernel`
+(`ops/linear/q8/q8_a16_stream.cuh`, schedules in `q8_schedule.cuh`) is bit-identical to the SIMT
+routes for T = 1..8 on all ten shapes (0 differing outputs; the [324, 10240] and [320, 10240] K
+split reproduces the few-row W8 route's warp-order sum). The sweep (a graph of 200 calls cycling
+≥ 256 MiB of weight copies, two runs agreeing within 0.5 %) gave K1 / previous route:
+
+| Shape | T = 1-8 | T = 9-64 (K1 MaxCols 16 against the MMA tile) |
+|---|---|---|
+| [16384, 2560], [12800, 2560], [13952, 2560] | 0.72-0.96 (faster) | 4.1-19.9 (much slower) |
+| [10240, 320] | 0.76-0.92 | 1.7-5.5 (slower) |
+| [2560, 2560] | 0.91-0.98, but 1.03 at T = 4 | 1.5-6.9 (slower) |
+| [1280, 2560] | 0.84-0.95, but 1.03 at T = 4 | 0.39-0.93 to T = 48, 1.02 at 64 |
+| [2560, 640] | 0.88-0.96 to T = 7, 1.00 at 8 | 0.83-0.99 to T = 16, slower beyond |
+| [324, 10240], [320, 10240] | 0.83-0.92 at T ≤ 2, 1.0 at 3, 1.04-1.16 at 4-8 | 0.15-0.46 (much faster) |
+| [2560, 6144] | 1.16-1.29 (slower everywhere) | 1.7-8.7 (slower) |
+
+Two expectations above did not hold: K1 MaxCols 16 is far slower than the MMA tiles at T = 9-16 on
+the large shapes (the estimate of −11 to −17 ms per forward there was wrong), and the few-row route
+is still the fastest for the HC downs at T = 4-8, so it is kept, not deleted. Each shape therefore
+routes to its measured winner: K1 at T ≤ 8 except [2560, 6144] (SIMT) and T = 4 of [2560, 2560] and
+[1280, 2560] (SIMT), the few-row route at T = 4-8 of the HC downs; K1 slices beyond 8 only for the
+HC downs (to 64), the shared expert gate/up (to 48) and down (to 16); the MMA tiles elsewhere.
+K1 and the SIMT routes reduce a column identically, so mixing them by width changes no bits;
+column invariance now holds to 8 on every shape and to 64 / 48 / 16 where K1 runs beyond 8.
+With the final routes no shape and width is more than 2 % slower than its previous route (second
+sweep, two runs within 1.3 %). End to end (ninfer_bench tg512 ABBA, frozen binaries, K0 against
+K0 + K1, 2026-10-05): plain 97.29 → 99.80 tok/s (+2.6 %), MTP 149.62 → 151.44 (+1.2 %); generated
+ids identical in both modes.
+
 #### Phase 1b: fused Ops (rounding changes, more precise)
 
 Op development §6.1 forbids a fused route from keeping intermediate BF16 roundings for parity, so
