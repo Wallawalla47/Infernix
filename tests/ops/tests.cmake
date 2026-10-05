@@ -207,6 +207,12 @@ ninfer_add_op_test(ninfer_qsa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
   LIBRARIES ninfer_ops)
 
+# QSA block selection against the kernel it replaced (bit for bit), the exact top-k of its own
+# scores and an FP64 oracle, also under CUDA Graph replay.
+ninfer_add_op_test(ninfer_qsa_select_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_select.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops)

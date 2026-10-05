@@ -98,6 +98,16 @@ rewriting the last position of a block completed inside a call or a verification
 MTP drafter does), chunking invariance, block selection (exact, on a value grid where FP32 scores
 are exact), and attention over decoded `bf16` and `int8` K/V across the dense/selected boundary.
 
+`ninfer_qsa_select_test` qualifies QSA block selection (`ops::detail::qsa_select`) against three
+oracles: the one-CTA-per-column kernel it replaced, kept verbatim in the test (counts and selected
+ids bitwise equal, FP32 scores bitwise equal where both keep them); the exact top-k of the
+production kernel's own scores (equal scores to the lower block id, ids ascending); and an FP64
+score oracle (FP32 scores within an accumulation bound, no unselected block above a selected one
+beyond the bounds). Cases span 0.5K-131K blocks per column, both sides of the 512-block budget, 1-9
+rows and widths up to 1,024 columns (groups of 128), index heads 1-4, ratios 4-128, exact,
+zero-score and near ties, bins beyond the candidate buffer, and CUDA Graph replays with new
+positions over garbage scratch.
+
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash

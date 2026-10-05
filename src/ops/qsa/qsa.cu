@@ -6,6 +6,7 @@
 
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
+#include "ops/qsa/qsa_select.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -24,8 +25,6 @@ constexpr int kHeadDim      = 256;
 constexpr int kIndexDim     = 128;
 constexpr int kMaxGroup     = 16; // query heads per KV head
 constexpr int kTokenTile    = 64;
-constexpr int kSelectThreads = 512;
-constexpr int kSelectGroup  = 32; // columns whose scores share one scratch pass
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa: ") + message); }
@@ -178,127 +177,7 @@ __global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int3
 }
 
 // ----------------------------------------------------------------------------------- selection
-
-__device__ __forceinline__ std::uint32_t sortable(float x) {
-    const std::uint32_t u = __float_as_uint(x);
-    return (u & 0x80000000U) ? ~u : (u | 0x80000000U);
-}
-
-// One CTA per column of a group: block scores into scratch, then the exact top-k by radix select,
-// written in ascending block order. Columns that select every block write count = -1 (dense).
-__global__ void __launch_bounds__(kSelectThreads)
-    select_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
-                  const std::int32_t* __restrict__ tables, int table_stride,
-                  const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
-                  int width, int ratio, int top_blocks, int column_begin, float* __restrict__ scores,
-                  int score_stride, std::int32_t* __restrict__ selected,
-                  std::int32_t* __restrict__ counts) {
-    const int t = column_begin + blockIdx.x;
-    const int p = positions[t];
-    const int blocks = (p + 1) / ratio;
-    if (blocks <= top_blocks) {
-        if (threadIdx.x == 0) { counts[t] = -1; }
-        return;
-    }
-    __shared__ float q[4 * kIndexDim];
-    __shared__ unsigned histogram[256];
-    __shared__ std::uint32_t prefix_shared, mask_shared;
-    __shared__ int remaining_shared, scan[kSelectThreads];
-    for (int i = threadIdx.x; i < index_heads * kIndexDim; i += blockDim.x) {
-        q[i] = __bfloat162float(index_q[static_cast<std::size_t>(t) * index_heads * kIndexDim + i]);
-    }
-    __syncthreads();
-    const int sequence        = t / width;
-    const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[sequence]) * table_stride;
-    const int slot_width      = kIndexDim / ratio;
-    float* column_scores      = scores + static_cast<std::size_t>(blockIdx.x) * score_stride;
-    const float scale         = rsqrtf(static_cast<float>(kIndexDim));
-    // Scores: one warp per block.
-    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32, warps = blockDim.x / 32;
-    for (int b = warp; b < blocks; b += warps) {
-        float key[4];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int d = lane + 32 * j;
-            key[j] = __bfloat162float(pooled[pooled_offset(table, ratio * b + d / slot_width, slot_width,
-                                                           d % slot_width)]);
-        }
-        float score = 0.0F;
-        for (int h = 0; h < index_heads; ++h) {
-            float dot = 0.0F;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) { dot += q[h * kIndexDim + lane + 32 * j] * key[j]; }
-            score += fmaxf(warp_sum(dot), 0.0F);
-        }
-        if (lane == 0) { column_scores[b] = score * scale; }
-    }
-    __syncthreads();
-    // Radix select of the top_blocks-th largest key, eight bits at a time.
-    if (threadIdx.x == 0) {
-        prefix_shared    = 0;
-        mask_shared      = 0;
-        remaining_shared = top_blocks;
-    }
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) { histogram[i] = 0; }
-        __syncthreads();
-        const std::uint32_t prefix = prefix_shared, mask = mask_shared;
-        for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
-            const std::uint32_t key = sortable(column_scores[b]);
-            if ((key & mask) == prefix) { atomicAdd(&histogram[(key >> shift) & 255U], 1U); }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            int remaining = remaining_shared;
-            for (int digit = 255; digit >= 0; --digit) {
-                const int count = static_cast<int>(histogram[digit]);
-                if (count >= remaining) {
-                    prefix_shared = prefix | (static_cast<std::uint32_t>(digit) << shift);
-                    mask_shared   = mask | (255U << shift);
-                    break;
-                }
-                remaining -= count;
-            }
-            remaining_shared = remaining; // how many of the threshold value to take
-        }
-        __syncthreads();
-    }
-    const std::uint32_t threshold = prefix_shared;
-    const int take_equal          = remaining_shared;
-    // Ascending block order: everything above the threshold, and the first take_equal ties.
-    int out = 0, equal_seen = 0;
-    for (int begin = 0; begin < blocks; begin += blockDim.x) {
-        const int b = begin + threadIdx.x;
-        const std::uint32_t key = b < blocks ? sortable(column_scores[b]) : 0;
-        const int equal = b < blocks && key == threshold ? 1 : 0;
-        scan[threadIdx.x] = equal;
-        __syncthreads();
-        for (int step = 1; step < blockDim.x; step <<= 1) {
-            const int v = threadIdx.x >= step ? scan[threadIdx.x - step] : 0;
-            __syncthreads();
-            scan[threadIdx.x] += v;
-            __syncthreads();
-        }
-        const int equal_rank = equal_seen + scan[threadIdx.x] - equal;
-        const int total_eq   = scan[blockDim.x - 1];
-        __syncthreads();
-        const int take = b < blocks && (key > threshold || (equal && equal_rank < take_equal)) ? 1 : 0;
-        scan[threadIdx.x] = take;
-        __syncthreads();
-        for (int step = 1; step < blockDim.x; step <<= 1) {
-            const int v = threadIdx.x >= step ? scan[threadIdx.x - step] : 0;
-            __syncthreads();
-            scan[threadIdx.x] += v;
-            __syncthreads();
-        }
-        if (take) { selected[static_cast<std::size_t>(t) * top_blocks + out + scan[threadIdx.x] - 1] = b; }
-        const int taken = scan[blockDim.x - 1];
-        __syncthreads();
-        out += taken;
-        equal_seen += total_eq;
-    }
-    if (threadIdx.x == 0) { counts[t] = out; }
-}
+// Block selection (scores, top-k, ascending ids) is qsa_select (qsa_select.cu).
 
 // ----------------------------------------------------------------------------------- attention
 
@@ -585,7 +464,8 @@ int attention_splits(int columns, int kv_heads) {
 struct Workspace {
     std::int32_t* selected;
     std::int32_t* counts;
-    float* scores;
+    void* select;             // qsa_select scratch
+    std::size_t select_bytes;
     float* partial;
 };
 
@@ -594,19 +474,20 @@ Workspace carve(void* base, const QsaGeometry& g, int columns, int max_context, 
     const int top_blocks = g.budget / g.ratio;
     const std::size_t selected = align(sizeof(std::int32_t) * top_blocks * static_cast<std::size_t>(columns));
     const std::size_t counts   = align(sizeof(std::int32_t) * static_cast<std::size_t>(columns));
-    const std::size_t scores   = align(sizeof(float) * kSelectGroup * static_cast<std::size_t>(max_context / g.ratio + 1));
+    const std::size_t select   = align(detail::qsa_select_scratch_bytes(g, columns, max_context));
     const int splits           = attention_splits(columns, g.kv_heads);
     const std::size_t partial  = splits > 1 ? align(sizeof(float) * static_cast<std::size_t>(columns) * splits *
                                                     g.heads * (kHeadDim + 2))
                                             : 0;
-    bytes = selected + counts + scores + partial;
+    bytes = selected + counts + select + partial;
     auto* p = static_cast<unsigned char*>(base);
     Workspace out{};
     if (p != nullptr) {
-        out.selected = reinterpret_cast<std::int32_t*>(p);
-        out.counts   = reinterpret_cast<std::int32_t*>(p + selected);
-        out.scores   = reinterpret_cast<float*>(p + selected + counts);
-        out.partial  = partial ? reinterpret_cast<float*>(p + selected + counts + scores) : nullptr;
+        out.selected     = reinterpret_cast<std::int32_t*>(p);
+        out.counts       = reinterpret_cast<std::int32_t*>(p + selected);
+        out.select       = p + selected + counts;
+        out.select_bytes = select;
+        out.partial      = partial ? reinterpret_cast<float*>(p + selected + counts + select) : nullptr;
     }
     return out;
 }
@@ -719,14 +600,8 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     const int stride     = batch.block_tables.ne[0];
     const auto* rows     = static_cast<const std::int32_t*>(batch.table_rows.data);
     const auto* pos      = static_cast<const std::int32_t*>(batch.positions.data);
-    for (int begin = 0; begin < columns; begin += kSelectGroup) {
-        const int n = std::min(kSelectGroup, columns - begin);
-        select_kernel<<<n, kSelectThreads, 0, stream>>>(
-            static_cast<const bf16*>(index_q.data), geometry.index_heads,
-            static_cast<const bf16*>(layer.pooled_pages.data), tables, stride, rows, pos, batch.width,
-            geometry.ratio, top_blocks, begin, ws.scores, max_context / geometry.ratio + 1, ws.selected, ws.counts);
-        check_launch("select");
-    }
+    detail::qsa_select(index_q, layer.pooled_pages, batch, geometry, max_context, ws.select, ws.select_bytes,
+                       {ws.selected, ws.counts}, stream);
     const int splits = attention_splits(columns, geometry.kv_heads);
     const dim3 grid(splits, geometry.kv_heads, columns);
     const auto launch = [&](auto kernel) {

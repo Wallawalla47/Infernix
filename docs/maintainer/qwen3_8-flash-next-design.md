@@ -5781,6 +5781,56 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
        (2-3 days). Ids stay bit-exact.
    - Estimate: plain decode +8 % at 8K, +27 % at 32K, 2× at 128K. It lands after prefix P0 and
      extends P0's QSA oracle test.
+   - **Q1 + Q2 design (2026-10-04, one step; built, measurements pending).** One selection path,
+     `ops::detail::qsa_select` (`src/ops/qsa/qsa_select.{h,cu}`), serves prompt chunks, decode,
+     drafts and verify rounds. `select_kernel` is gone from `qsa.cu`; it lives on verbatim as the
+     reference in `tests/ops/test_qsa_select.cu` (the prefix branch's P0 test is not on this branch;
+     the two QSA tests merge at rebase).
+     - Groups of 128 columns share one score scratch (128 × (max_context / R + 1) FP32: 33.6 MB at
+       262K, 16.9 MB at 132K), plus 1 MB of global-histogram state. A prompt chunk of 4,096 runs 32
+       groups. This replaces the plan's "≥ 170 columns, one CTA per column": the multi-CTA kernels
+       fill the SMs at any column count, so the group size only bounds scratch and launches.
+     - Scoring, `qsa_score_kernel`: a tile is up to 16 consecutive columns of one row; its CTAs
+       split the row's blocks, a warp reads 8 pooled keys once and scores them for every column of
+       the tile. Per column the 32 lane partials (8 blocks × 4 head slots, each lane's 4-product
+       chain in j order from 0) are reduce-scattered: at each xor offset a lane keeps half its
+       values and adds the partner's copy (own + partner). That is exactly the set of additions
+       `warp_sum`'s butterfly makes at that lane, so every dot is bitwise the old one, at 31
+       shuffles per 32 sums instead of 160. ReLUs join in head order from 0, times `rsqrtf(Di)`.
+       Scores, ids and counts are bitwise today's.
+     - Selection, exact over the 64-bit order key of `score_id_order.cuh` (ties to the lower id,
+       so the 512th key is unique and any split gives the same set): a 2,048-bin histogram of the
+       scores' ordered bits [30:20] (exponent and 3 mantissa bits; scores are ≥ +0) finds the bin
+       of the top-th score; scores above it are selected, the bin's scores are candidates (up to
+       4,096 keys in shared memory, with their AND/OR). An 8-bit radix select over the candidates
+       starts at the highest bit in which they differ and stops once a digit's keys are all taken.
+       A bin beyond 4,096 keys (heavy ties, e.g. zero scores at the threshold) runs the same radix
+       select over the column's scores instead. Ids are written in ascending block order.
+     - Selection kernel (linear_topk's split-and-merge): up to 8 CTAs per column add their slice
+       histograms into a global one; the last to arrive finds the bin, filters the column into a
+       bitmap and the candidate buffer, selects and compacts. The score kernel zeroes the
+       histograms and arrival counters each call, so stale arena bytes and graph replays are safe.
+     - Q2 decision (2026-10-05): a second variant, one 8-CTA thread-block cluster per column
+       (histograms reduced through distributed shared memory, candidates gathered in rank 0, no
+       global state), was built and measured against this one behind a temporary toggle, then
+       deleted. nsys, per layer call (8K / 32K / 128K, plain): decode select 12.3 / 13.8 / 23.7 µs
+       global against 16.1 / 17.2 / 23.8 µs cluster; prompt select 0.20 / 0.45 / 1.74 against
+       0.54 / 0.82 / 2.15 µs per prompt token. ninfer_bench decode (pg N,256, int8 KV, two runs
+       each): 4K 90.23 / 89.86 tok/s, 8K 90.87 / 90.29, 32K 80.64 / 80.48. Greedy ids of both
+       equal the Q0 kernel's (8K and 32K, plain and MTP, 256 tokens). Against Q0 the decode rate
+       rises 4.9 / 10.6 / 34.6 % at 4K / 8K / 32K and prefill 0.5 / 1.2 / 3.9 %; 32K decode is
+       89 % of 4K decode (M8 ≥ 85 %; Q0 70 %). 128K was not benchmarked end to end.
+     - Launches: the score kernel is a programmatic dependent (streaming: it triggers after its
+       loop), the select kernel enters with `pdl::enter()`; 2 launches per layer call and group.
+     - Expected (estimates, before measurement), per layer call at W = 1: pooled keys
+       N × 256 B (0.5 / 2.1 / 8.4 / 16.8 MB at 8K / 32K / 128K / 262K, floor 0.3 / 1.3 / 4.9 /
+       9.9 µs at 1.7 TB/s); score kernel ~2.5 / 3 / 6.5 / 11 µs, select ~5 / 5 / 6 / 8 µs (latency
+       of barriers and the candidate radix), plus ~1-2 µs of launch gap: ~8 / 9 / 13 / 20 µs
+       against 107 / 393 / 1,559 µs measured in Q0, ~0.1 / 0.11 / 0.16 ms per plain token. Verify
+       widths up to 4 cost about the same (keys are read once). Prompt chunk of 4,096: compute-bound
+       scoring (~2.2× the FP32 FMA floor of 512 FMAs per block and column), ~0.35 ms per layer at
+       8K and ~3 ms at 128K (Q0 at chunk 1024: 2.75 / 40.8 ms per 1,024 columns); a 128K prompt's
+       selection ~0.6 s instead of 31.6 s.
 3. **Warm start** (§19.3.5 S4b).
    - Save the LFRU state; at load, seed it and bulk-fill the frames (26.1 GB, ~0.95 s).
      `LfruPolicy::seed` has no caller today.
