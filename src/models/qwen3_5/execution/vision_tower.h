@@ -58,7 +58,7 @@ void vision_embed(cudaStream_t stream, const VisionConfig& config, const VisionP
 // One encoder layer in place on x: LN, fused QKV + bias, 2-D RoPE, non-causal attention per
 // segment (equal-length form), output projection + bias + residual, LN, fc1 + bias, tanh-GELU,
 // fc2 + bias + residual.
-void vision_layer(cudaStream_t stream, const VisionConfig& config, const VisionBlockParameters& block,
+void vision_layer(DeviceExecutionView execution, const VisionConfig& config, const VisionBlockParameters& block,
                   const Tensor& position_ids, std::int32_t segment_length, const VisionLayerBuffers& buffers,
                   Tensor& x);
 

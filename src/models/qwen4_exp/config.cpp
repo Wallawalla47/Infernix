@@ -1,6 +1,7 @@
 #include "models/qwen4_exp/config.h"
 
 #include "artifact/schema.h"
+#include "models/qwen3_5/vision_config.h"
 #include "models/registry.h"
 
 #include <cmath>

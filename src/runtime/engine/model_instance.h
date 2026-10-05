@@ -43,6 +43,11 @@ struct ConstructedModel {
     ContextMachineCostModel context_cost;
 };
 
+// The option checks that need no artifact (shared by every architecture, and the Qwen3.5-only
+// pairing of --vram-headroom-mib with automatic KV capacity); the Engine runs them before it opens
+// the artifact.
+void validate_engine_options(const EngineOptions& options, models::Architecture architecture);
+
 [[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
 
 } // namespace ninfer::runtime

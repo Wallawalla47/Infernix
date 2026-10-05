@@ -32,32 +32,39 @@ void Program::maintain() {
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
-RequestBasePlan Program::plan_request(const PreparedPrompt& prompt, const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(prompt, options);
+RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
+    return impl_->plan_request(std::move(prompt), options);
 }
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept { return impl_->feasible(base); }
 
-HybridAdmissionQuote Program::hybrid_quote(const PreparedPrompt& prompt, const RequestBasePlan& base,
-                                           runtime::LaneId destination) {
-    return impl_->quote(prompt, base, destination);
+std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
+    return impl_->hybrid_sources(base, maximum_frontier);
 }
 
-runtime::ContextTransactionReserveStatus Program::hybrid_reserve_materialization(
-    HybridAdmissionQuote&& quote, PreparedPrompt&& prompt, runtime::CancellationFlagView cancellation) {
-    return impl_->reserve(std::move(quote), std::move(prompt), cancellation);
+runtime::ResourceReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                                    const SourceCandidate& source, ResumeState* resume,
+                                                    ExecutionUnitKind, std::uint32_t) {
+    return impl_->start_binding(base, lane, source, resume);
 }
 
-ContextTransactionProgress Program::progress_context_transaction(runtime::CancellationFlagView cancellation) {
-    return impl_->progress(cancellation);
+ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation) {
+    return impl_->poll_context(cancellation);
 }
-
-void Program::finalize_context_transaction() noexcept { impl_->finalize(); }
 
 bool Program::has_context_transaction() const noexcept { return impl_->in_transaction(); }
 
-PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*,
-                                         runtime::PrefillStepWidth) {
+bool Program::context_blocks(SequenceHandle sequence) const noexcept { return impl_->context_blocks(sequence); }
+
+bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) { return impl_->hybrid_reclaim(shortage); }
+std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) { return impl_->hybrid_prefetch(base); }
+std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
+
+ReplayProgress Program::advance_replay(SequenceHandle, runtime::ExecutionTiming*) {
+    throw std::logic_error("Qwen4Exp never pauses a request, so none replays");
+}
+
+PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*) {
     return impl_->advance_prefill(sequence);
 }
 
@@ -85,16 +92,12 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->f
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
 
-std::optional<PhysicalUsageSnapshot> Program::fail_all_cleanup() noexcept {
-    impl_->release_all();
-    return std::nullopt;
-}
+void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 
-std::optional<PhysicalUsageSnapshot> Program::shutdown_cleanup() noexcept {
+void Program::shutdown_cleanup() noexcept {
     impl_->release_all();
     impl_->save_expert_state();
     impl_->save_prefix_cache_for_shutdown();
-    return std::nullopt;
 }
 
 PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
@@ -103,10 +106,6 @@ PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::
 }
 
 std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
-
-runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
-    return runtime::ProgramResourceRevision{impl_->revision()};
-}
 
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
 

@@ -74,9 +74,10 @@ void vision_embed(cudaStream_t stream, const VisionConfig& config, const VisionP
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
 }
 
-void vision_layer(cudaStream_t stream, const VisionConfig& config, const VisionBlockParameters& block,
+void vision_layer(DeviceExecutionView execution, const VisionConfig& config, const VisionBlockParameters& block,
                   const Tensor& position_ids, std::int32_t segment_length, const VisionLayerBuffers& buffers,
                   Tensor& x) {
+    const cudaStream_t stream  = execution.stream;
     const std::int32_t patches = x.ne[1];
     const std::int32_t H = dim(config.hidden_size), heads = dim(config.num_heads), D = H / heads;
     {
@@ -97,7 +98,7 @@ void vision_layer(cudaStream_t stream, const VisionConfig& config, const VisionB
             q.nb[2] = qkv.nb[1];
             k.nb[2] = qkv.nb[1];
             v.nb[2] = qkv.nb[1];
-            ops::rope(position_ids, D, 10'000.0F, q, k, stream);
+            ops::rope(position_ids, D, 10'000.0F, q, k, execution);
             Tensor attended_heads = attended.view({D, heads, patches});
             ops::packed_softmax_attention(q, k, v, {D, heads, heads},
                                           static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))),
@@ -261,7 +262,8 @@ void VisionTowerPass::advance(std::uint32_t end_stage) {
                                                  .projection_scratch = layout_.projection_scratch.bind(arena_),
                                                  .up_scratch         = layout_.up_scratch.bind(arena_),
                                                  .down_scratch       = layout_.down_scratch.bind(arena_)};
-                vision_layer(s, config_, parameters_.layers[layer], layout_.items[i].position_ids.bind(arena_),
+                vision_layer(device_.execution_view().on_stream(s), config_, parameters_.layers[layer],
+                             layout_.items[i].position_ids.bind(arena_),
                              item.control->segment_length, buffers, x);
             }
         } else {

@@ -46,11 +46,11 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
     }
     if (host_.slabs == 0) {
         // Host-born snapshots are the only snapshot source: without a Host tier there is no cache.
-        throw std::invalid_argument("Qwen4Exp prefix cache needs a Host tier (--host-cache-mib)");
+        throw std::invalid_argument("Qwen4Exp prefix cache needs a Host tier (--host-context-mib)");
     }
     if (host_.slabs < host_.image_slabs + 2U) {
         const std::uint64_t mib = (static_cast<std::uint64_t>(host_.image_slabs + 2U) * host_.slab_bytes + (1U << 20U) - 1U) >> 20U;
-        throw std::invalid_argument("--host-cache-mib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
+        throw std::invalid_argument("--host-context-mib is too small for the Qwen4Exp prefix cache: one snapshot needs " +
                                     std::to_string(mib) + " MiB");
     }
     pc::PrefixIndexConfig index = config.index;
@@ -75,7 +75,7 @@ PrefixCache::PrefixCache(const PrefixCacheConfig& config, DeviceKVPagePool& pool
         } catch (const std::exception& error) {
             throw std::runtime_error("pinning the Qwen4Exp prefix cache Host tier failed after " +
                                      std::to_string(pinned >> 20U) + " of " + std::to_string(total >> 20U) + " MiB (" +
-                                     error.what() + "); lower --host-cache-mib");
+                                     error.what() + "); lower --host-context-mib");
         }
         pinned += bytes;
     }
@@ -490,6 +490,13 @@ std::span<const cudaEvent_t> PrefixCache::restore_events(RestoreTicket ticket) c
 void PrefixCache::order_after_restore(RestoreTicket ticket, cudaStream_t consumer) const {
     const auto events = restore_events(ticket);
     if (!events.empty()) { CUDA_CHECK(cudaStreamWaitEvent(consumer, events.back(), 0)); }
+}
+
+void PrefixCache::await_restore(RestoreTicket ticket) {
+    // One restore stream completes batches in submission order.
+    const auto events = restore_events(ticket);
+    if (!events.empty()) { CUDA_CHECK(cudaEventSynchronize(events.back())); }
+    poll();
 }
 
 void PrefixCache::finish_restore(RestoreBatch& batch) noexcept {

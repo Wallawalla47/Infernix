@@ -217,6 +217,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_block_writes          = 0;
     std::uint64_t host_image_restores        = 0;
     std::uint64_t host_block_restores        = 0;
+    std::uint64_t prefetched_blocks          = 0;
     std::uint64_t host_tail_restores         = 0;
     std::uint64_t host_write_bytes           = 0;
     std::uint64_t host_restore_bytes         = 0;

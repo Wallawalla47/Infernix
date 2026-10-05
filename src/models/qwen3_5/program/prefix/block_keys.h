@@ -30,4 +30,11 @@ struct VisionTokenRange {
 void prompt_block_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
                        std::vector<std::uint64_t>& extras);
 
+// How much of `shared` equal leading tokens `waiting` really shares with `sibling`: Vision
+// placeholders are equal tokens for every image, so the agreement ends where the first media item
+// the two prompts do not carry identically (content, grid, timing, placement) begins.
+[[nodiscard]] std::uint32_t media_agreed_prefix(const PreparedPromptData& waiting,
+                                                const PreparedPromptData& sibling,
+                                                std::uint32_t shared) noexcept;
+
 } // namespace ninfer::models::qwen3_5::detail

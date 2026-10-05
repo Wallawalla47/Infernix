@@ -216,7 +216,7 @@ public:
         : options(normalize(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
-        if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
+        if (architecture == models::Architecture::Qwen4Exp) {
             auto constructed  = runtime::construct_qwen4_exp(options, device);
             options           = std::move(constructed.options);
             qwen4             = std::move(constructed.instance);
@@ -256,15 +256,16 @@ public:
         finalize_phase.complete();
     }
 
-    // Defaults that depend on the model (the hybrid prefix cache's) need the artifact's architecture.
-    static EngineOptions normalize(EngineOptions engine_options) {
-        // An unreadable artifact is reported by the model's construction, after option validation.
-        models::Architecture architecture = models::Architecture::Qwen3_5;
+    // Options are checked before the artifact is opened; defaults that depend on the model (the
+    // hybrid prefix cache's) need the artifact's architecture, read once here. An unreadable
+    // artifact is reported by the (Qwen3.5) model construction, after option validation.
+    EngineOptions normalize(EngineOptions engine_options) {
         try {
             if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
                 architecture = models::Architecture::Qwen4Exp;
             }
         } catch (const std::exception&) {}
+        runtime::validate_engine_options(engine_options, architecture);
         return runtime::normalize_engine_options(std::move(engine_options), architecture);
     }
 
@@ -343,6 +344,7 @@ public:
 
     [[nodiscard]] std::uint32_t capacity() const { return qwen4 != nullptr ? qwen4->capacity : active->capacity; }
 
+    models::Architecture architecture = models::Architecture::Qwen3_5; // set by normalize
     EngineOptions options;
     DeviceContext device;
     std::unique_ptr<runtime::ModelInstance> active;

@@ -348,7 +348,7 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output, DeviceSpa
         if (weight_stream != nullptr) {
             weight_stream->arrive(static_cast<std::uint32_t>(layer), stream);
         }
-        vision_layer(stream, config_, parameters_.layers[layer], embed.position_ids,
+        vision_layer(ctx_.execution_view().on_stream(stream), config_, parameters_.layers[layer], embed.position_ids,
                      control.segment_length, buffers, x);
     }
     if (weight_stream != nullptr) { weight_stream->merger_ready(stream); }

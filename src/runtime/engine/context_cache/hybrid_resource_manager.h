@@ -32,14 +32,16 @@ public:
     using ReclaimCursor = typename Original::ReclaimCursor;
     using SourceChoice  = typename Original::SourceChoice;
 
-    HybridResourceManager(bool enabled, ContextMachineCostModel /*costs*/) : enabled_(enabled) {}
+    // The manager serves every admission of its core, whether or not a prefix cache exists: Qwen3.5
+    // builds its hybrid core only with the hybrid cache on, while Qwen3.8-Flash-Next always runs on
+    // it and its Program offers the root alone when the cache is off.
+    HybridResourceManager(bool /*enabled*/, ContextMachineCostModel /*costs*/) {}
 
     // The tree's quotes in preference order (its chosen path, then a root start). Empty while a
     // prefilling sibling is about to publish the snapshot this request should resume from.
     [[nodiscard]] std::vector<SourceChoice> candidates(Program& program, const Base& base,
                                                        std::uint32_t maximum_frontier = UINT32_MAX,
                                                        std::optional<OwnerToken> = std::nullopt) {
-        if (!enabled_) { throw std::logic_error("hybrid resource manager is disabled"); }
         std::vector<SourceChoice> out;
         for (auto& source : program.hybrid_sources(base, maximum_frontier)) {
             out.push_back(SourceChoice{.source = std::move(source)});
@@ -147,6 +149,7 @@ public:
         out.hybrid_host_block_writes       = hybrid.host_block_writes;
         out.hybrid_host_image_restores     = hybrid.host_image_restores;
         out.hybrid_host_block_restores     = hybrid.host_block_restores;
+        out.hybrid_prefetched_blocks       = hybrid.prefetched_blocks;
         out.hybrid_host_write_bytes        = hybrid.host_write_bytes;
         out.hybrid_host_restore_bytes      = hybrid.host_restore_bytes;
         out.hybrid_evicted_blocks          = hybrid.evicted_blocks;
@@ -156,7 +159,6 @@ public:
     }
 
 private:
-    bool enabled_ = false;
     // The last prefetch attempt: the head it served, whether to try again and the room it left.
     std::uint64_t prefetch_order_ = 0;
     bool prefetch_retry_          = false;

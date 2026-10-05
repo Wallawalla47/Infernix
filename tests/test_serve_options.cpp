@@ -494,30 +494,12 @@ int main() {
                           ("Host context MiB did not preserve exact bytes: " + mib).c_str());
     }
 
-    // --vram-headroom-mib sets the headroom automatic KV sizing leaves, and only with auto (the
-    // hybrid cache's default; explicit with the original cache or an explicit capacity).
-    failures += check(parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "512"})
-                              .kv_capacity.automatic_headroom_bytes == (512ULL << 20),
-                      "--vram-headroom-mib did not apply to the hybrid default auto capacity");
-    const ServeOptions headroom = parse(
-        {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
-    failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          headroom.kv_capacity.automatic_headroom_bytes == (2048ULL << 20),
-                      "--vram-headroom-mib did not reach the automatic KV capacity policy");
-    const ServeOptions no_headroom = parse(
-        {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "0"});
-    failures += check(no_headroom.kv_capacity.automatic_headroom_bytes == 0,
+    // --vram-headroom-mib N|auto sets the headroom startup sizing leaves (Qwen3.5: after automatic
+    // KV capacity, its Engine refusing it beside an explicit capacity; Qwen3.8-Flash-Next: after the
+    // expert cache). 0 leaves none.
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "0"}).vram_headroom_bytes ==
+                          std::optional<std::size_t>(0),
                       "--vram-headroom-mib 0 must leave no sizing headroom");
-    for (const std::vector<std::string>& rejected :
-         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--use-original-prefix-caching",
-                                   "--vram-headroom-mib", "512"},
-          std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-capacity", "16384",
-                                   "--vram-headroom-mib", "512"}}) {
-        try {
-            (void)parse(rejected);
-            failures += check(false, "--vram-headroom-mib without --kv-capacity auto was accepted");
-        } catch (const std::invalid_argument&) {}
-    }
 
     constexpr std::size_t bytes_per_mib  = 1ULL << 20;
     constexpr std::size_t max_host_bytes = std::numeric_limits<std::size_t>::max();
@@ -594,8 +576,7 @@ int main() {
     // block cache) and every hybrid tuning value is left for the Engine to derive.
     const ServeOptions hybrid_minimal = parse({"ninfer-serve", "model.ninfer"});
     failures += check(hybrid_minimal.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
-                          hybrid_minimal.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes &&
+                          !hybrid_minimal.vram_headroom_bytes &&
                           !hybrid_minimal.context_cache.host_capacity_bytes &&
                           !hybrid_minimal.context_cache.hybrid.device_snapshot_slots &&
                           !hybrid_minimal.context_cache.hybrid.max_new_taps &&

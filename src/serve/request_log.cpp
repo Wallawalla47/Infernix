@@ -893,6 +893,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_block_writes", delta(&RuntimeStats::hybrid_host_block_writes)},
                  {"host_image_restores", delta(&RuntimeStats::hybrid_host_image_restores)},
                  {"host_block_restores", delta(&RuntimeStats::hybrid_host_block_restores)},
+                 {"prefetched_blocks", delta(&RuntimeStats::hybrid_prefetched_blocks)},
                  {"host_write_bytes", delta(&RuntimeStats::hybrid_host_write_bytes)},
                  {"host_restore_bytes", delta(&RuntimeStats::hybrid_host_restore_bytes)},
                  {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},

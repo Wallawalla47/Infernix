@@ -30,11 +30,16 @@ std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n,
     return ends;
 }
 
-double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, const CallCost& cost) {
+double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, std::span<const std::uint32_t> cuts,
+                  const CallCost& cost) {
     double total        = 0.0;
     std::uint32_t begin = frontier;
     for (const std::uint32_t end : ends) {
-        total += cost.call_seconds(end - begin);
+        const std::uint32_t width = end - begin;
+        total += cost.call_seconds(width);
+        if (width > cost.served_columns && std::binary_search(cuts.begin(), cuts.end(), begin)) {
+            total += cost.span_seconds;
+        }
         begin = end;
     }
     return total;
@@ -59,12 +64,12 @@ CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::ui
     for (const pc::PlannedTap& tap : out.taps) {
         if (tap.placement == pc::TapPlacement::Exact && tap.boundary) { cuts.push_back(tap.position); }
     }
-    double current = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, cuts), cost);
+    double current = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, cuts), cuts, cost);
     for (pc::PlannedTap& tap : out.taps) {
         if (tap.placement != pc::TapPlacement::Exact || tap.boundary) { continue; }
         std::vector<std::uint32_t> with = cuts;
         with.insert(std::upper_bound(with.begin(), with.end(), tap.position), tap.position);
-        const double seconds = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, with), cost);
+        const double seconds = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, with), with, cost);
         if (seconds - current <= cost.split_budget) {
             cuts    = std::move(with);
             current = seconds;

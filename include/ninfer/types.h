@@ -1346,6 +1346,8 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_block_writes       = 0;
     std::uint64_t hybrid_host_image_restores     = 0;
     std::uint64_t hybrid_host_block_restores     = 0;
+    // Of those, blocks copied for a waiting FIFO head before its admission.
+    std::uint64_t hybrid_prefetched_blocks       = 0;
     std::uint64_t hybrid_host_write_bytes        = 0;
     std::uint64_t hybrid_host_restore_bytes      = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;

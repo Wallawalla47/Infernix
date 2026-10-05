@@ -163,8 +163,12 @@ int test_cli_contract() {
             }
         }
     }
+    // Copy proposals without a neural drafter parse: which drafter combinations a model verifies is
+    // its Program's decision (Qwen3.5 refuses them at startup; Qwen3.8-Flash-Next accepts them).
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--ngram-draft-tokens", "15"})
+                               .speculative.ngram_draft_tokens == 15,
+                       "ngram drafts without a neural drafter parse");
     for (const auto arguments : std::vector<std::vector<std::string>>{
-             {"--ngram-draft-tokens", "1"},
              {"--spec", "mtp", "--ngram-draft-tokens", "64"},
              {"--spec", "mtp", "--ngram-draft-tokens", "-1"},
              {"--spec", "mtp", "--ngram-draft-tokens", "1.5"},
