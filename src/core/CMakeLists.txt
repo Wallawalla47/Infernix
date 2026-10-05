@@ -10,6 +10,7 @@ add_library(ninfer_core STATIC
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
+  direct_read_queue.cpp
   dtype.cpp
   host_memory.cpp
   host_worker_pool.cpp
