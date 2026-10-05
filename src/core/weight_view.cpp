@@ -332,13 +332,21 @@ Weight native_weight(const WeightView& view, float input_divisor) {
 }
 
 ExpertBankPlanes expert_bank_planes(const WeightParent& parent) {
-    const auto& g = parent.geometry;
-    if (g.layout != QuantLayout::ExpertRg16 || !parent.data) {
+    if (!parent.data) {
         throw std::invalid_argument("expert bank planes require a resident nvfp4_expert_rg16_v1 parent");
     }
+    ExpertBankPlanes out = expert_bank_layout(parent.geometry, reinterpret_cast<const float*>(parent.data +
+                                                                                            parent.geometry.scale_offset));
+    out.records = parent.data;
+    return out;
+}
+
+ExpertBankPlanes expert_bank_layout(const WeightGeometry& g, const float* multipliers) {
+    if (g.layout != QuantLayout::ExpertRg16) {
+        throw std::invalid_argument("expert bank layout requires an nvfp4_expert_rg16_v1 parent");
+    }
     ExpertBankPlanes out;
-    out.records       = parent.data;
-    out.multipliers   = reinterpret_cast<const float*>(parent.data + g.scale_offset);
+    out.multipliers   = multipliers;
     out.record_bytes  = g.record_bytes;
     out.record_stride = g.record_stride;
     out.experts       = static_cast<std::uint32_t>(dimension(g.shape[0]));

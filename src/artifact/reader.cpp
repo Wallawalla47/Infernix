@@ -119,6 +119,12 @@ void Reader::validate_object(ObjectHandle handle) const {
     }
 }
 
+std::filesystem::path Reader::file_path(std::size_t file_index) const {
+    (void)impl_->file(file_index); // opens and validates a part's header once
+    if (file_index == 0) { return impl_->entry; }
+    return impl_->entry.parent_path() / *impl_->directory.files[file_index].path;
+}
+
 std::vector<ReadSegment> Reader::segments(std::uint64_t offset, std::uint64_t bytes) const {
     const auto& data = directory();
     if (offset > data.payload_bytes || bytes > data.payload_bytes - offset) {

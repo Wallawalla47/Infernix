@@ -17,6 +17,9 @@ struct LoadOptions {
     float rope_yarn_factor                 = 1.0F;
     // Every Use binds A16Only, whatever activation precision the artifact permits.
     bool a16_activations = false;
+    // Qwen4Exp: the routed expert banks stay in the artifact and are read in place by the SSD
+    // expert tier (design §19.3.7) instead of being pinned in host memory.
+    bool stream_experts = false;
 
     bool operator==(const LoadOptions&) const = default;
 

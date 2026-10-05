@@ -58,6 +58,8 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::HostPinned) {
             require_pinned(part.object);
+        } else if (residency == Residency::Streamed) {
+            require_streamed(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
         }
@@ -104,6 +106,11 @@ void Binder::require_pinned(ObjectHandle object, std::uint64_t alignment) {
     auto& demand     = demands_.at(object.index);
     demand.pinned    = true;
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
+}
+
+void Binder::require_streamed(ObjectHandle object) {
+    reader_.validate_object(object);
+    demands_.at(object.index).streamed = true;
 }
 
 std::span<const std::byte> Binder::host_object(ObjectHandle object) {
@@ -196,6 +203,12 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         }
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
+        }
+        if (demand.streamed) {
+            if (demand.device || demand.pinned) {
+                throw ArtifactError("an object is both streamed and materialized");
+            }
+            plan.streamed_objects.push_back(ObjectHandle{i});
         }
         if (demand.pinned) {
             const ObjectHandle handle{i};

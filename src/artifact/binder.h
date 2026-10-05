@@ -10,7 +10,9 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values, HostPinned };
+// Streamed: located but never materialized; the runtime reads the object in place from the
+// artifact's files (MaterializedArtifact::stream_source, design §19.3.7 SSD tier).
+enum class Residency { Device, Host, Values, HostPinned, Streamed };
 
 struct ParameterReference {
     std::string name;
@@ -50,6 +52,7 @@ public:
     // arena end and are evicted first. Requires the object to be a device demand.
     void mark_device_evictable(ObjectHandle object, std::uint32_t evict_rank);
     void require_pinned(ObjectHandle object, std::uint64_t alignment = 256);
+    void require_streamed(ObjectHandle object);
     [[nodiscard]] std::span<const std::byte> host_object(ObjectHandle object);
     [[nodiscard]] ObjectHandle resource(std::string_view component, std::string_view role);
     [[nodiscard]] HostValues values(const Binding& binding, std::optional<QType> format = {});
@@ -62,6 +65,7 @@ private:
         bool device             = false;
         bool host               = false;
         bool pinned             = false;
+        bool streamed           = false;
         std::uint64_t alignment = 256;
         std::uint32_t evict_rank = 0;
         std::vector<std::byte> host_data;

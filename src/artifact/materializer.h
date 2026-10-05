@@ -7,7 +7,9 @@
 #include "core/weight_view.h"
 #include "ninfer/types.h"
 
+#include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -44,6 +46,8 @@ struct MaterializationPlan {
     std::vector<HostPlacement> host_objects;
     std::uint64_t pinned_capacity_bytes = 0;
     std::vector<PinnedPlacement> pinned_objects;
+    // Objects read in place at run time; located, never read here.
+    std::vector<ObjectHandle> streamed_objects;
     // Physical Host memory the pinned block must leave free, after the caller's later pins
     // (`later_pinned_bytes`, allocated once the model is loaded) are counted against it too.
     std::uint64_t host_reserve_bytes = kDefaultRamHeadroomBytes;
@@ -68,6 +72,39 @@ struct MaterializationStats {
     double upload_seconds               = 0;
 };
 
+class MaterializedArtifact;
+
+// One contiguous piece of a byte range in one artifact file.
+struct FileSegment {
+    std::uint32_t file   = 0; // index into StreamSource::files()
+    std::uint64_t offset = 0; // byte offset in that file
+    std::uint64_t at     = 0; // byte offset inside the requested range
+    std::uint64_t bytes  = 0;
+};
+
+// Where Streamed objects live in the artifact's files, for reading them in place (design §19.3.7):
+// the file paths (the entry and its parts) and each object's segments, kept after the Reader is
+// gone. It opens no file; the reader of the bytes opens its own handles.
+class StreamSource {
+public:
+    [[nodiscard]] std::span<const std::filesystem::path> files() const noexcept { return files_; }
+    [[nodiscard]] bool contains(ObjectHandle object) const noexcept;
+    [[nodiscard]] std::uint64_t object_bytes(ObjectHandle object) const;
+    // The file segments of [offset, offset + bytes) of a streamed object.
+    [[nodiscard]] std::vector<FileSegment> segments(ObjectHandle object, std::uint64_t offset,
+                                                    std::uint64_t bytes) const;
+
+private:
+    friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
+                                            const StartupObserver*, std::unique_ptr<EvictableWeightPool>);
+    struct Object {
+        std::uint64_t bytes = 0;
+        std::vector<FileSegment> segments; // the whole object, `at` from its start
+    };
+    std::vector<std::filesystem::path> files_;
+    std::vector<std::optional<Object>> objects_;
+};
+
 class MaterializedArtifact {
 public:
     MaterializedArtifact()                                           = default;
@@ -80,6 +117,9 @@ public:
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] const WeightParent& pinned_parent(ObjectHandle handle) const;
+    // A Streamed object's geometry with no resident data (data == nullptr).
+    [[nodiscard]] const WeightParent& streamed_parent(ObjectHandle handle) const;
+    [[nodiscard]] const StreamSource& stream_source() const noexcept { return stream_source_; }
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
 
@@ -106,6 +146,7 @@ private:
         std::optional<WeightParent> device;
         std::optional<WeightParent> host;
         std::optional<WeightParent> pinned;
+        std::optional<WeightParent> streamed;
         std::vector<std::byte> host_data;
     };
 
@@ -113,6 +154,7 @@ private:
     std::unique_ptr<PinnedHostBuffer> pinned_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
     std::vector<ObjectStorage> objects_;
+    StreamSource stream_source_;
     MaterializationStats stats_;
 };
 

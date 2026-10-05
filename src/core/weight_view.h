@@ -113,6 +113,9 @@ struct ExpertBankPlanes {
     std::uint32_t intermediate   = 0;
 };
 [[nodiscard]] ExpertBankPlanes expert_bank_planes(const WeightParent& parent);
+// The layout of a bank whose records are not resident (read in place by the SSD tier): records is
+// null and the multipliers are the caller's copy of the bank's scale tail.
+[[nodiscard]] ExpertBankPlanes expert_bank_layout(const WeightGeometry& geometry, const float* multipliers);
 
 // Block-scaled FP8 matrices in block128_scale_v1, leading axes flattened into a batch.
 struct Block128Planes {

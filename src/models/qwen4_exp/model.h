@@ -5,6 +5,7 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -51,6 +52,9 @@ public:
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
     [[nodiscard]] std::span<const ExpertBank> expert_banks() const noexcept { return banks_; }
+    // With LoadOptions::stream_experts: where each record lies in the artifact (the banks then
+    // hold no records, only their layout and multipliers).
+    [[nodiscard]] const std::optional<ExpertStore>& expert_store() const noexcept { return expert_store_; }
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
@@ -67,10 +71,12 @@ private:
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing);
+          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
+          std::optional<ExpertStore> expert_store);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
+    std::optional<ExpertStore> expert_store_; // the streamed banks' multipliers back banks_
     Config config_;
     LoadOptions options_;
     TextWeights weights_;
