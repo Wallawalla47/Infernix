@@ -327,6 +327,10 @@ struct EngineOptions {
     // Qwen3.8-Flash-Next: what the expert cache leaves for the display and other programs once
     // every fixed allocation is made (automatic: 1 GiB with a display attached, 256 MiB headless).
     std::optional<std::size_t> vram_headroom_bytes;
+    // Qwen3.8-Flash-Next on Windows: also size the expert cache into the physical VRAM the OS
+    // budget withholds (~0.6 GiB on an RTX 5090), measured at startup (--vram-past-budget). That
+    // memory may be moved to system memory when another program needs VRAM.
+    bool vram_past_budget = false;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

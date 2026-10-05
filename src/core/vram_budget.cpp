@@ -48,6 +48,7 @@ public:
         shutdown_     = reinterpret_cast<int (*)()>(symbol("nvmlShutdown"));
         by_pci_       = reinterpret_cast<int (*)(const char*, void**)>(symbol("nvmlDeviceGetHandleByPciBusId_v2"));
         display_      = reinterpret_cast<int (*)(void*, int*)>(symbol("nvmlDeviceGetDisplayActive"));
+        memory_       = reinterpret_cast<int (*)(void*, MemoryV2*)>(symbol("nvmlDeviceGetMemoryInfo_v2"));
         if (init_ == nullptr || shutdown_ == nullptr || by_pci_ == nullptr || display_ == nullptr ||
             init_() != 0) {
             release();
@@ -64,6 +65,15 @@ public:
     Nvml(const Nvml&)            = delete;
     Nvml& operator=(const Nvml&) = delete;
 
+    // Physical device memory less the driver's reserve (nvmlDeviceGetMemoryInfo_v2); 0 unknown.
+    [[nodiscard]] std::uint64_t usable_bytes() const {
+        if (device_ == nullptr || memory_ == nullptr) { return 0; }
+        MemoryV2 memory{};
+        memory.version = static_cast<unsigned>(sizeof(MemoryV2)) | (2U << 24U);
+        if (memory_(device_, &memory) != 0 || memory.reserved > memory.total) { return 0; }
+        return memory.total - memory.reserved;
+    }
+
     // 1 active, 0 inactive, -1 unknown.
     [[nodiscard]] int display_active() const {
         if (device_ == nullptr) { return -1; }
@@ -72,6 +82,11 @@ public:
     }
 
 private:
+    struct MemoryV2 { // nvmlMemory_v2_t
+        unsigned version;
+        unsigned long long total, reserved, free, used;
+    };
+
     void release() noexcept {
         if (initialized_) { (void)shutdown_(); }
         initialized_ = false;
@@ -94,13 +109,14 @@ private:
     int (*shutdown_)()                     = nullptr;
     int (*by_pci_)(const char*, void**)    = nullptr;
     int (*display_)(void*, int*)           = nullptr;
+    int (*memory_)(void*, MemoryV2*)       = nullptr;
     void* device_                          = nullptr;
     bool initialized_                      = false;
 };
 
 class DeviceSource final : public VramBudgetSource {
 public:
-    explicit DeviceSource(int device) : device_(device) {
+    DeviceSource(int device, bool past_budget) : device_(device) {
         if (cudaGetDeviceProperties(&props_, device) != cudaSuccess) {
             throw std::runtime_error("VRAM budget: cannot read the device's properties");
         }
@@ -108,6 +124,15 @@ public:
 #ifdef _WIN32
         budget_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
         open_adapter();
+        if (past_budget) {
+            const VramSnapshot now     = query();
+            const std::uint64_t usable = nvml_->usable_bytes();
+            if (now.has_budget && usable > now.local_budget + kPastBudgetMargin) {
+                allowance_ = usable - now.local_budget - kPastBudgetMargin;
+            }
+        }
+#else
+        (void)past_budget;
 #endif
     }
 
@@ -147,6 +172,13 @@ public:
                 out.has_budget   = true;
                 out.local_budget = info.Budget;
                 out.local_usage  = info.CurrentUsage;
+                if (allowance_ != 0) { // free memory as cudaMemGetInfo derives it, from the wider budget
+                    out.budget_allowance = allowance_;
+                    out.local_budget += allowance_;
+                    out.device_free = out.local_budget > out.local_usage
+                                          ? static_cast<std::size_t>(out.local_budget - out.local_usage)
+                                          : 0;
+                }
             }
             out.outputs = outputs_;
         }
@@ -212,6 +244,7 @@ private:
     DWORD budget_cookie_    = 0;
 #endif
     int device_ = 0;
+    std::uint64_t allowance_ = 0; // past the budget (measured at open); 0: the OS budget as reported
     cudaDeviceProp props_{};
     std::unique_ptr<Nvml> nvml_;
     std::mutex mutex_;
@@ -240,12 +273,12 @@ std::uint64_t SpillGuard::end(std::uint64_t bytes) {
     return spill_shortfall(before_, source_.query().device_free, bytes);
 }
 
-std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device) {
+std::unique_ptr<VramBudgetSource> open_vram_budget_source(int device, bool past_budget) {
     {
         const std::lock_guard<std::mutex> lock(fake_mutex());
         if (fake_source()) { return std::make_unique<FakeSource>(fake_source()); }
     }
-    return std::make_unique<DeviceSource>(device);
+    return std::make_unique<DeviceSource>(device, past_budget);
 }
 
 namespace testing {

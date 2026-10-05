@@ -265,6 +265,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.rope_yarn_factor          = options_.rope_yarn_factor;
     engine_options.kv_capacity              = options_.kv_capacity;
     engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
+    engine_options.vram_past_budget         = options_.vram_past_budget;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;

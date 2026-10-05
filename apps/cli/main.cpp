@@ -327,6 +327,7 @@ int main(int argc, char** argv) {
         engine_options.rope_yarn_factor         = cli.rope_yarn_factor;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
+        engine_options.vram_past_budget         = cli.vram_past_budget;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
