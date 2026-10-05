@@ -296,37 +296,45 @@ public:
     }
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
-        return std::holds_alternative<std::unique_ptr<HybridGenerationCore>>(core) &&
+        return (std::holds_alternative<std::unique_ptr<HybridGenerationCore>>(core) ||
+                std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) &&
+               options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid &&
                !options.context_cache.hybrid.persistent_file.empty();
     }
 
     void report_prefix_cache_save() const noexcept {
         try {
-            const std::optional<models::qwen3_5::HybridCachePersistence> result =
-                active->program->hybrid_shutdown_save();
-            if (!result) {
-                runtime::publish_diagnostic(
-                    options.diagnostic_observer, DiagnosticLevel::Warning,
-                    "prefix cache not saved: the Engine did not stop cleanly");
-                return;
-            }
-            const models::qwen3_5::HybridCachePersistence& saved = *result;
-            if (saved.ok) {
-                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                                            "prefix cache saved: %llu blocks, %llu snapshots, "
-                                            "%.1f MiB in %.1f s",
-                                            static_cast<unsigned long long>(saved.blocks),
-                                            static_cast<unsigned long long>(saved.snapshots),
-                                            static_cast<double>(saved.bytes) / 1048576.0,
-                                            saved.seconds);
+            if (qwen4) {
+                report_prefix_cache_save(qwen4->program->prefix_shutdown_save());
             } else {
-                runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
-                                            "prefix cache not saved: %s", saved.message.c_str());
+                report_prefix_cache_save(active->program->hybrid_shutdown_save());
             }
         } catch (const std::exception& error) {
             runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                         "prefix cache not saved: %s", error.what());
         } catch (...) {}
+    }
+
+    // Either model's shutdown-save result (the same fields).
+    template <class Result>
+    void report_prefix_cache_save(const std::optional<Result>& result) const {
+        if (!result) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "prefix cache not saved: the Engine did not stop cleanly");
+            return;
+        }
+        const Result& saved = *result;
+        if (saved.ok) {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                        "prefix cache saved: %llu blocks, %llu snapshots, "
+                                        "%.1f MiB in %.1f s",
+                                        static_cast<unsigned long long>(saved.blocks),
+                                        static_cast<unsigned long long>(saved.snapshots),
+                                        static_cast<double>(saved.bytes) / 1048576.0, saved.seconds);
+        } else {
+            runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                                        "prefix cache not saved: %s", saved.message.c_str());
+        }
     }
 
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {

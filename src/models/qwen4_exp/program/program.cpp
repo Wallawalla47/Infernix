@@ -87,6 +87,19 @@ std::optional<PhysicalUsageSnapshot> Program::fail_all_cleanup() noexcept {
     return std::nullopt;
 }
 
+std::optional<PhysicalUsageSnapshot> Program::shutdown_cleanup() noexcept {
+    impl_->release_all();
+    impl_->save_prefix_cache_for_shutdown();
+    return std::nullopt;
+}
+
+PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+                                                         const StartupObserver& observer) {
+    return impl_->attach_prefix_cache_file(path, std::move(fingerprint), observer);
+}
+
+std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
+
 runtime::ProgramResourceRevision Program::resource_revision() const noexcept {
     return runtime::ProgramResourceRevision{impl_->revision()};
 }

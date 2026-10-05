@@ -3928,6 +3928,16 @@ spec §17 (the binding's contract), `docs/qwen3_8-flash-next.md` "Prefix cache",
 flag rows, `ninfer-serve --help`. Qwen4Exp-only counters (`endpoint_mismatch_fallbacks`, MTP
 continuation and branch mismatches) are not in `RuntimeStats` yet.
 
+**Persistence as built** (same branch, 2026-10-05): `prefix/persist.cpp` mirrors Qwen3.5's file
+(tables first, then slabs, footer) with its own magic and version; blocks carry `mtp_next`, and a
+snapshot's meta is read back from its image's header slab (a header that fails the layout
+fingerprint or disagrees with the saved frontier fails the load, which then restores nothing). The
+Program saves in `shutdown_cleanup` after releasing every lane (Device work synchronized, transfers
+drained, the product's `PrefixCacheSaveControl` honoured); the instance attaches the file after the
+Program starts, with `hybrid_cache_fingerprint(options, "qwen4_exp")`; the Engine reports the save
+for either core. X12 in the real test: Engine 1 serves two chat turns and stops; Engine 2 restores
+the file and resumes turn 2 at its opener with Engine 1's ids.
+
 #### Tests
 
 `ninfer_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)

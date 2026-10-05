@@ -267,6 +267,20 @@ struct ProgramDevicePlan {
     }
 };
 
+// The prefix cache's Host tier saved at shutdown or loaded at startup (--prefix-cache-file).
+struct PrefixCachePersistence {
+    bool ok = false;
+    std::string message;
+    std::uint64_t blocks    = 0;
+    std::uint64_t snapshots = 0;
+    std::uint64_t bytes     = 0;
+    double seconds          = 0.0;
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
+};
+
 struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
@@ -300,6 +314,8 @@ struct ProgramOptions {
     std::uint64_t prefix_host_bytes  = 0;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
+    // The product's control over the shutdown save of a persistent prefix cache.
+    PrefixCacheSaveControl prefix_save;
     DiagnosticObserver diagnostics;
     // Internal (A/B measurement and tests): the runtime VRAM monitor that shrinks and grows the
     // expert cache as other programs take and release device memory (design §19.3.7), and how long
@@ -382,7 +398,15 @@ public:
     [[nodiscard]] bool resume_device_kv_lease(SequenceHandle) noexcept { return true; }
 
     [[nodiscard]] std::optional<PhysicalUsageSnapshot> fail_all_cleanup() noexcept;
-    [[nodiscard]] std::optional<PhysicalUsageSnapshot> shutdown_cleanup() noexcept { return fail_all_cleanup(); }
+    // Releases every lane, then saves the prefix cache's Host tier to its file when one is attached.
+    [[nodiscard]] std::optional<PhysicalUsageSnapshot> shutdown_cleanup() noexcept;
+    // Loads the Host tier from `path` into the empty prefix cache and keeps `path` for the shutdown
+    // save. `fingerprint` names everything the saved bytes depend on besides their geometry.
+    [[nodiscard]] PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path,
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
+    // The shutdown save's result; absent before shutdown or without a file.
+    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;

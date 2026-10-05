@@ -13,6 +13,10 @@ namespace ninfer::runtime {
 
 // Validates the options and resolves every default; the hybrid prefix cache's Host tier, Device
 // snapshot slots and tap budget depend on the model architecture.
+// Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
+// file records itself); a different value makes a saved file meaningless.
+[[nodiscard]] std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature);
+
 [[nodiscard]] EngineOptions normalize_engine_options(
     EngineOptions options, models::Architecture architecture = models::Architecture::Qwen3_5);
 

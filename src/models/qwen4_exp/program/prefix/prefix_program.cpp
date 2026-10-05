@@ -16,6 +16,19 @@ namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
 
+PrefixCachePersistence public_result(const prefix::PersistResult& result) {
+    return PrefixCachePersistence{.ok                  = result.ok,
+                                  .message             = result.message,
+                                  .blocks              = result.blocks,
+                                  .snapshots           = result.snapshots,
+                                  .bytes               = result.bytes,
+                                  .seconds             = result.seconds,
+                                  .saved_blocks        = result.saved_blocks,
+                                  .saved_snapshots     = result.saved_snapshots,
+                                  .required_host_bytes = result.required_host_bytes,
+                                  .host_bytes          = result.host_bytes};
+}
+
 } // namespace
 
 // ---- construction ------------------------------------------------------------------------------------
@@ -43,6 +56,42 @@ void ProgramImpl::create_prefix_cache() {
         flush_device_ = DeviceBuffer(4 * sizeof(std::int32_t));
         CUDA_CHECK(cudaEventCreateWithFlags(&flush_uploaded_, cudaEventDisableTiming));
     }
+}
+
+PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+                                                             const StartupObserver& observer) {
+    if (!prefix_) { return {.message = "the prefix cache is not enabled"}; }
+    if (path.empty()) { throw std::invalid_argument("prefix cache file path is empty"); }
+    PrefixCachePersistence loaded = public_result(prefix_->load(path, fingerprint, observer));
+    prefix_file_                  = path;
+    prefix_fingerprint_           = std::move(fingerprint);
+    return loaded;
+}
+
+// After every lane is released: Host writes and copy-outs land, then the save reads the slabs.
+void ProgramImpl::save_prefix_cache_for_shutdown() noexcept {
+    if (!prefix_ || prefix_file_.empty()) { return; }
+    try {
+        device_.synchronize();
+        prefix_->drain();
+        // The product may abandon the save (a Ctrl+C during the stop). It counts as running only
+        // from here, so an exit never waits for the Device work above.
+        const PrefixCacheSaveControl& control = options_.prefix_save;
+        if (!control.begin()) {
+            prefix_shutdown_save_ = PrefixCachePersistence{.message = "abandoned before it began"};
+            return;
+        }
+        struct Ended {
+            const PrefixCacheSaveControl& control;
+            bool saved = false;
+            ~Ended() { control.end(saved); }
+        } ended{control};
+        prefix_shutdown_save_ = public_result(
+            prefix_->save(prefix_file_, prefix_fingerprint_, CancellationView([&control] { return control.abandoned(); })));
+        ended.saved = prefix_shutdown_save_->ok;
+    } catch (const std::exception& error) {
+        prefix_shutdown_save_ = PrefixCachePersistence{.message = error.what()};
+    } catch (...) { prefix_shutdown_save_ = PrefixCachePersistence{.message = "unknown error"}; }
 }
 
 void ProgramImpl::pc_make_room(std::uint32_t pages) {

@@ -2341,6 +2341,18 @@ private:
     void mtp_flush_cell(Lane& lane, std::uint32_t index);
 
 public:
+    // Persistence of the Host tier (--prefix-cache-file).
+    PrefixCachePersistence attach_prefix_cache_file(const std::filesystem::path& path, std::string fingerprint,
+                                                    const StartupObserver& observer);
+    void save_prefix_cache_for_shutdown() noexcept;
+    [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const { return prefix_shutdown_save_; }
+
+private:
+    std::filesystem::path prefix_file_;
+    std::string prefix_fingerprint_;
+    std::optional<PrefixCachePersistence> prefix_shutdown_save_;
+
+public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
 
 private:

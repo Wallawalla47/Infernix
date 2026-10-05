@@ -15,6 +15,8 @@
 //   X6           Sessions sharing only a system block resume at its structural tap (an exact split).
 //   X3           A repeat of a chat prompt resumes at its generation opener (an exact off-grid tap) and
 //                generates what the capturing run generated.
+//   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
+//                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //
 //   ninfer_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
@@ -27,6 +29,7 @@
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -75,8 +78,7 @@ std::string first_difference(const std::vector<ninfer::TokenId>& a, const std::v
     return a.size() == b.size() ? "identical" : "lengths differ";
 }
 
-int run_mode(const char* artifact, const char* ngram, bool mtp) {
-    std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
+ninfer::EngineOptions base_options(const char* artifact, const char* ngram) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
@@ -87,12 +89,55 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     options.kv_cache             = ninfer::KvCacheStorage::Int8Group64;
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
+    options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;
+    options.context_cache.host_cache_budget_bytes = 2ULL << 30;
+    return options;
+}
+
+std::string rules_text() {
+    std::string rules;
+    for (int r = 1; r <= 110; ++r) {
+        rules += "Rule " + std::to_string(r) + ": items of colour " + std::to_string(r % 9) + " go to shelf " +
+                 std::to_string((r * 7) % 13) + ".\n";
+    }
+    return rules;
+}
+
+// User turns longer than kMinimumTapSeparation (64 tokens): an opener closer to the structural tap
+// joins its cluster, and only the earlier tap is kept.
+std::string user_context() {
+    std::string context;
+    for (int i = 0; i < 4; ++i) {
+        context += "Today a delivery of mixed items arrived at the warehouse and I need to plan where each "
+                   "box goes before the afternoon shift starts. ";
+    }
+    return context;
+}
+
+ninfer::ChatMessage message(ninfer::ChatRole role, std::string text) {
+    ninfer::ChatMessage m;
+    m.role = role;
+    m.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
+    return m;
+}
+
+ninfer::GenerationResult chat_on(ninfer::Engine& engine, std::vector<ninfer::ChatMessage> messages,
+                                 std::uint32_t outputs) {
+    ninfer::PromptInput input;
+    input.messages                = std::move(messages);
+    input.options.enable_thinking = false;
+    ninfer::RequestOptions request      = greedy(outputs, true);
+    request.stop.include_model_defaults = true;
+    return engine.generate(engine.prepare(std::move(input)), request);
+}
+
+int run_mode(const char* artifact, const char* ngram, bool mtp) {
+    std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
+    ninfer::EngineOptions options = base_options(artifact, ngram);
     if (mtp) {
         options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
     }
-    options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;
-    options.context_cache.host_cache_budget_bytes = 2ULL << 30;
     ninfer::Engine engine(std::move(options));
     int failures = 0;
 
@@ -139,33 +184,11 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                                                               first_difference(restored.tokens, resident.tokens) + ")");
 
     // Chat prompts carry the structural (end of the system block) and generation-opener taps.
-    std::string rules;
-    for (int r = 1; r <= 110; ++r) {
-        rules += "Rule " + std::to_string(r) + ": items of colour " + std::to_string(r % 9) + " go to shelf " +
-                 std::to_string((r * 7) % 13) + ".\n";
-    }
     const auto chat = [&](std::vector<ninfer::ChatMessage> messages, std::uint32_t outputs) {
-        ninfer::PromptInput input;
-        input.messages                = std::move(messages);
-        input.options.enable_thinking = false;
-        ninfer::RequestOptions request      = greedy(outputs, true);
-        request.stop.include_model_defaults = true;
-        return engine.generate(engine.prepare(std::move(input)), request);
+        return chat_on(engine, std::move(messages), outputs);
     };
-    const auto message = [](ninfer::ChatRole role, std::string text) {
-        ninfer::ChatMessage m;
-        m.role = role;
-        m.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
-        return m;
-    };
-    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules);
-    // User turns longer than kMinimumTapSeparation (64 tokens): an opener closer to the structural
-    // tap joins its cluster, and only the earlier tap is kept.
-    std::string context;
-    for (int i = 0; i < 4; ++i) {
-        context += "Today a delivery of mixed items arrived at the warehouse and I need to plan where each "
-                   "box goes before the afternoon shift starts. ";
-    }
+    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules_text());
+    const std::string context        = user_context();
     const auto user = [&](const std::string& question) {
         return message(ninfer::ChatRole::User, context + question);
     };
@@ -208,6 +231,58 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     return failures;
 }
 
+// X12: the Host tier saved at an Engine's stop and loaded by the next Engine.
+int run_persistence(const char* artifact, const char* ngram) {
+    std::printf("== persistence (X12)\n");
+    const std::filesystem::path file = std::filesystem::temp_directory_path() / "ninfer_qwen4_exp_x12.cache";
+    std::error_code ignored;
+    std::filesystem::remove(file, ignored);
+    const auto options = [&] {
+        ninfer::EngineOptions o                       = base_options(artifact, ngram);
+        o.context_cache.hybrid.persistent_file     = file;
+        o.context_cache.hybrid.persistent_identity = "x12";
+        return o;
+    };
+    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules_text());
+    const std::string context        = user_context();
+    const std::vector<ninfer::ChatMessage> turn1{system, message(ninfer::ChatRole::User, context + "Which shelf takes colour 2?")};
+    int failures = 0;
+    std::vector<ninfer::ChatMessage> turn2 = turn1;
+    ninfer::GenerationResult before;
+    {
+        ninfer::Engine engine(options());
+        failures += check(!engine.load_summary().prefix_cache.restored, "Engine 1 starts without a saved file");
+        const ninfer::GenerationResult r1 = chat_on(engine, turn1, 32);
+        turn2.push_back(message(ninfer::ChatRole::Assistant, r1.content));
+        turn2.push_back(message(ninfer::ChatRole::User, context + "And colour 3?"));
+        before = chat_on(engine, turn2, 32);
+    } // the stop saves the Host tier
+    std::error_code size_error;
+    const std::uintmax_t saved_bytes = std::filesystem::file_size(file, size_error);
+    failures += check(!size_error && saved_bytes > 0, "the stop saved the Host tier (" +
+                                                          std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
+    {
+        ninfer::Engine engine(options());
+        const ninfer::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
+        std::printf("        restored %llu blocks and %llu snapshots (%s)\n",
+                    static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
+                    restore.message.c_str());
+        failures += check(restore.restored && restore.snapshots > 0, "Engine 2 restores the saved snapshots");
+        // Turn 2 again: Engine 1 left a snapshot at its own generation opener, so the restarted
+        // Engine resumes there and repeats Engine 1's computation of turn 2.
+        const ninfer::GenerationResult after = chat_on(engine, turn2, 32);
+        failures += check(after.reused_prompt_tokens + 16U >= before.prompt.prompt_tokens,
+                          "after the restart turn 2 resumes at its opener (reused " +
+                              std::to_string(after.reused_prompt_tokens) + " of " +
+                              std::to_string(after.prompt.prompt_tokens) + ")");
+        failures += check(after.generated_token_ids == before.generated_token_ids,
+                          "the restored resume equals Engine 1's turn 2 (" +
+                              first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
+    }
+    std::filesystem::remove(file, ignored);
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -228,6 +303,7 @@ int main(int argc, char** argv) {
         int failures = 0;
         if (plain) { failures += run_mode(artifact, ngram, false); }
         if (mtp) { failures += run_mode(artifact, ngram, true); }
+        if (plain) { failures += run_persistence(artifact, ngram); }
         std::printf(failures == 0 ? "qwen4_exp prefix cache checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
