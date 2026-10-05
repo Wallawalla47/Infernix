@@ -1,7 +1,7 @@
 // ReadOnlyFile::read_direct_blocks (n-gram step S1, design §19.3.4): unbuffered 4 KiB block reads
 // through a ring of 1, 4 or 64 blocks, offsets in random order with repeats; every index is
 // consumed exactly once with its own block's bytes, and a read past the end throws after the reads
-// in flight have drained.
+// in flight have drained. FileMapping::None maps nothing and reads the same bytes.
 
 #include "core/read_only_file.h"
 
@@ -90,6 +90,18 @@ int main() {
         // The file stays usable afterwards.
         std::mt19937 again(7);
         run(file, 65, 64, again);
+        check(file.mapped_bytes().size() == kBlocks * kBlock, "FileMapping::Whole maps the whole file");
+
+        // FileMapping::None (the n-gram volume): nothing mapped, the same direct reads and live size.
+        const ninfer::ReadOnlyFile direct(path, ninfer::FileMapping::None);
+        check(direct.mapped_bytes().empty(), "FileMapping::None maps nothing");
+        check(direct.current_bytes() == kBlocks * kBlock, "FileMapping::None reports the file's size");
+        std::mt19937 unmapped(11);
+        for (const std::size_t count : {1U, 65U, 1000U}) { run(direct, count, 64, unmapped); }
+        std::vector<std::byte> one_storage;
+        const auto one = aligned_ring(one_storage, 1);
+        check(direct.read_direct(5 * kBlock, one) == kBlock && one[0] == pattern(5, 0) && one[4095] == pattern(5, 4095),
+              "FileMapping::None read_direct returns the block's bytes");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

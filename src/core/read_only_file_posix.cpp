@@ -17,7 +17,7 @@ struct ReadOnlyFile::Impl {
     const std::byte* data = nullptr;
     std::size_t size      = 0;
 
-    explicit Impl(const std::filesystem::path& path) {
+    explicit Impl(const std::filesystem::path& path, FileMapping map) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
@@ -38,7 +38,7 @@ struct ReadOnlyFile::Impl {
         }
 
         size = static_cast<std::size_t>(status.st_size);
-        if (size != 0) {
+        if (map == FileMapping::Whole && size != 0) {
             void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
             if (mapping == MAP_FAILED) {
                 const int error = errno;
@@ -56,15 +56,15 @@ struct ReadOnlyFile::Impl {
     }
 };
 
-ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path)
-    : impl_(std::make_unique<Impl>(path)) {}
+ReadOnlyFile::ReadOnlyFile(const std::filesystem::path& path, FileMapping mapping)
+    : impl_(std::make_unique<Impl>(path, mapping)) {}
 
 ReadOnlyFile::~ReadOnlyFile()                                  = default;
 ReadOnlyFile::ReadOnlyFile(ReadOnlyFile&&) noexcept            = default;
 ReadOnlyFile& ReadOnlyFile::operator=(ReadOnlyFile&&) noexcept = default;
 
 std::span<const std::byte> ReadOnlyFile::mapped_bytes() const noexcept {
-    return {impl_->data, impl_->size};
+    return {impl_->data, impl_->data != nullptr ? impl_->size : 0}; // FileMapping::None: empty
 }
 
 std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
