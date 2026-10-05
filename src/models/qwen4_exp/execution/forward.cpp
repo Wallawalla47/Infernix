@@ -501,6 +501,11 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         source.fork_stream    = experts_.overlap_stream;
         source.fork_events[0] = experts_.overlap_events[0];
         source.fork_events[1] = experts_.overlap_events[1];
+        if (experts_.landing != nullptr) {
+            source.landing       = experts_.landing + static_cast<std::size_t>(layer) * experts_.landing_slots;
+            source.landed        = experts_.landed + static_cast<std::size_t>(layer) * experts_.landing_slots;
+            source.landing_slots = experts_.landing_slots;
+        }
     }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");

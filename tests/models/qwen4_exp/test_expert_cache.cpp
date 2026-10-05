@@ -483,6 +483,37 @@ void test_state_file() {
     check(!std::filesystem::exists(path.string() + ".tmp"), "no temporary file is left behind");
 }
 
+// Fill-phase landing (design §19.3.5 S4): reserve_free pops free frames only while the policy has
+// room; adopt makes a landed key READY and resident in its frame, drops its queued load (no second
+// copy), refuses a key loading elsewhere, and release returns unused frames.
+void test_landing() {
+    constexpr std::uint32_t kKeys = 32, kFrames = 6;
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> reserved;
+    check(cache.reserve_free(4, reserved) == 4 && cache.free_frames() == kFrames - 4, "reserve_free pops free frames");
+    // Key 3 lands in reserved[0]; key 5 is loading elsewhere when it lands: refused.
+    const std::uint32_t group[] = {3, 5};
+    check(cache.adopt(3, reserved[0], group, 1, cmds), "a landed key is adopted");
+    check(cache.entry(3).state == ResidencyState::kReady && cache.entry(3).frame == reserved[0] &&
+              cache.policy().resident(3) && cache.frame_key(reserved[0]) == 3U,
+          "an adopted key is READY and resident in its frame");
+    check(!cache.adopt(3, reserved[1], group, 1, cmds), "a resident key is not adopted twice");
+    cache.release(reserved[1]);
+    cmds.clear();
+    const std::uint32_t five[] = {5};
+    cache.on_route(five, 1, cmds); // admitted and loaded into a free frame
+    check(cache.entry(5).state != ResidencyState::kAbsent, "key 5 loads through on_route");
+    check(!cache.adopt(5, reserved[2], group, 1, cmds), "a key loading elsewhere is refused");
+    cache.release(reserved[2]);
+    cache.release(reserved[3]);
+    check(cache.free_frames() == kFrames - 2, "released frames return to the pool");
+    // Room: the policy holds 2 of 6; reserve_free never reserves past capacity - residents.
+    reserved.clear();
+    check(cache.reserve_free(10, reserved) == 4, "reserve_free stops at the policy's room");
+    for (const auto f : reserved) { cache.release(f); }
+}
+
 int main() {
     test_residency_entries();
     test_lfru_conformance();
@@ -494,6 +525,7 @@ int main() {
     test_load_serials();
     test_lending();
     test_seed();
+    test_landing();
     test_state_file();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);

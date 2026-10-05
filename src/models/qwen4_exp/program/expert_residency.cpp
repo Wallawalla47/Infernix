@@ -23,7 +23,8 @@ std::uint64_t ExpertResidency::table_bytes(const TextConfig& config, std::int32_
     const std::uint64_t keys = static_cast<std::uint64_t>(config.num_hidden_layers) * config.moe.experts;
     const std::uint64_t route =
         static_cast<std::uint64_t>(config.moe.top_k) * static_cast<std::uint64_t>(max_columns) * config.num_hidden_layers;
-    return (keys + route) * sizeof(std::int32_t);
+    const std::uint64_t landing = 2ULL * config.num_hidden_layers * kLandingSlots; // table + landed log
+    return (keys + route + landing) * sizeof(std::int32_t);
 }
 
 std::uint32_t ExpertResidency::max_frames(const TextConfig& config) noexcept {
@@ -55,6 +56,15 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
     route_stride_ = static_cast<std::size_t>(top_k_) * static_cast<std::size_t>(max_columns);
     route_device_ = DeviceBuffer(route_stride_ * layers_ * sizeof(std::int32_t));
     route_host_   = PinnedHostBuffer(route_stride_ * layers_ * sizeof(std::int32_t));
+    const std::size_t landing_bytes = static_cast<std::size_t>(layers_) * kLandingSlots * sizeof(std::int32_t);
+    landing_host_   = PinnedHostBuffer(landing_bytes);
+    landed_host_    = PinnedHostBuffer(landing_bytes);
+    std::memset(landing_host_.data(), 0xFF, landing_bytes);
+    std::memset(landed_host_.data(), 0xFF, landing_bytes);
+    landing_device_ = DeviceBuffer(landing_bytes);
+    landed_device_  = DeviceBuffer(landing_bytes);
+    landing_device_.copy_from_host(landing_host_.data(), landing_bytes);
+    landed_device_.copy_from_host(landed_host_.data(), landing_bytes);
     seen_.assign(experts_, 0);
     group_.reserve(experts_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
@@ -87,6 +97,7 @@ ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream
     frames = std::min(frames, limit_);
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
+    release_reservations();
     commands_.clear();
     SpillGuard guard(vram);
     if (!arena_) {
@@ -176,9 +187,42 @@ void ExpertResidency::upload_table(cudaStream_t compute) {
     table_dirty_ = false;
 }
 
-void ExpertResidency::before_round(cudaStream_t compute) {
+void ExpertResidency::before_round(cudaStream_t compute, bool landing) {
     publish_landed();
+    release_reservations(); // a discarded round's
+    std::uint32_t per_layer = 0;
+    if (landing && controller_ && frames_ > 0) {
+        const std::uint32_t want = std::min<std::uint32_t>(kLandingSlots, controller_->free_frames() / layers_);
+        if (want > 0) {
+            const std::uint32_t got = controller_->reserve_free(want * layers_, reserved_);
+            per_layer               = got / layers_;
+            for (std::size_t i = static_cast<std::size_t>(per_layer) * layers_; i < reserved_.size(); ++i) {
+                controller_->release(reserved_[i]);
+            }
+            reserved_.resize(static_cast<std::size_t>(per_layer) * layers_);
+        }
+    }
+    const std::size_t landing_bytes = static_cast<std::size_t>(layers_) * kLandingSlots * sizeof(std::int32_t);
+    if (per_layer > 0 || landing_uploaded_) {
+        auto* table = static_cast<std::int32_t*>(landing_host_.data());
+        std::fill_n(table, static_cast<std::size_t>(layers_) * kLandingSlots, -1);
+        for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+            for (std::uint32_t n = 0; n < per_layer; ++n) {
+                table[layer * kLandingSlots + n] = static_cast<std::int32_t>(reserved_[layer * per_layer + n]);
+            }
+        }
+        upload_pinned(landing_device_.p, landing_host_.data(), landing_bytes, compute);
+        landing_uploaded_ = per_layer > 0;
+    }
+    if (per_layer > 0) { CUDA_CHECK(cudaMemsetAsync(landed_device_.p, 0xFF, landing_bytes, compute)); }
+    landing_per_layer_ = per_layer;
     if (table_dirty_) { upload_table(compute); }
+}
+
+void ExpertResidency::release_reservations() {
+    for (const std::uint32_t frame : reserved_) { controller_->release(frame); }
+    reserved_.clear();
+    landing_per_layer_ = 0;
 }
 
 void ExpertResidency::publish_landed() {
@@ -210,6 +254,11 @@ void ExpertResidency::enqueue_route_download(cudaStream_t compute, std::int32_t 
     const std::size_t pitch = route_stride_ * sizeof(std::int32_t);
     CUDA_CHECK(cudaMemcpy2DAsync(route_host_.data(), pitch, route_device_.p, pitch, used * sizeof(std::int32_t),
                                  layers_, cudaMemcpyDeviceToHost, compute));
+    if (landing_per_layer_ > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(landed_host_.data(), landed_device_.p,
+                                   static_cast<std::size_t>(layers_) * kLandingSlots * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, compute));
+    }
 }
 
 void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
@@ -234,8 +283,32 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
             ++stats_.routed;
             if (table[key] >= 0) { ++stats_.hits; }
         }
-        if (controller_) { controller_->on_route(group_, round_, commands_, per_layer_budget); }
+        // The layer's landed experts become resident in their frames; the rest of its reserved
+        // frames return to the pool.
+        std::size_t budget = per_layer_budget;
+        if (landing_per_layer_ > 0) {
+            const auto* landed = static_cast<const std::int32_t*>(landed_host_.data()) + layer * kLandingSlots;
+            std::size_t adopted = 0;
+            for (std::uint32_t n = 0; n < landing_per_layer_; ++n) {
+                const std::uint32_t frame = reserved_[layer * landing_per_layer_ + n];
+                const std::int32_t expert = landed[n];
+                const std::uint32_t key   = layer * experts_ + static_cast<std::uint32_t>(expert);
+                if (expert >= 0 && static_cast<std::uint32_t>(expert) < experts_ &&
+                    controller_->adopt(key, frame, group_, round_, commands_)) {
+                    table[key]   = static_cast<std::int32_t>(frame);
+                    table_dirty_ = true;
+                    ++adopted;
+                } else {
+                    controller_->release(frame);
+                }
+            }
+            stats_.landed += adopted;
+            budget = budget > adopted ? budget - adopted : 0;
+        }
+        if (controller_) { controller_->on_route(group_, round_, commands_, budget); }
     }
+    reserved_.clear();
+    landing_per_layer_ = 0;
     if (frames_ == 0) { return; }
     controller_->on_quiescent(commands_);
 
@@ -294,6 +367,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
                                                   std::span<const cudaStream_t> writers) {
     if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
     publish_landed();
+    release_reservations();
     std::vector<std::uint8_t> busy(frames_, 0);
     for (const auto& batch : in_flight_) {
         for (const auto& load : batch.loads) {

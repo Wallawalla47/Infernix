@@ -683,6 +683,9 @@ public:
         experts.route_log    = residency_->route_log();
         experts.route_stride = residency_->route_stride();
         for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) { experts.frames[l] = residency_->table(l); }
+        experts.landing       = residency_->landing_table();
+        experts.landed        = residency_->landed_log();
+        experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
         warm_start_experts();
         if (!options_.route_trace.empty()) {
             trace_ = std::make_unique<RouteTrace>(
@@ -1311,9 +1314,11 @@ private:
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
     std::size_t decode_budget(std::uint32_t tokens) {
-        // The fill phase: until every frame was loaded once (promoted or seeded at a warm start).
+        // The fill phase: until every frame was loaded once (promoted, landed, or seeded at a warm start).
         const ExpertResidency::Stats& stats = residency_->stats();
-        if (stats.promotions + stats.seeded < residency_->frames()) { return kDecodePromotionsPerLayer * tokens; }
+        if (stats.promotions + stats.landed + stats.seeded < residency_->frames()) {
+            return kDecodePromotionsPerLayer * tokens;
+        }
         budget_tokens_ += tokens;
         const std::uint64_t due = budget_tokens_ / kDecodePromotionInterval;
         budget_tokens_ %= kDecodePromotionInterval;
@@ -1508,15 +1513,17 @@ private:
             const auto routed   = s.routed - at_admission.routed;
             const auto hits     = s.hits - at_admission.hits;
             const auto promoted = s.promotions - at_admission.promotions;
+            const auto landed   = s.landed - at_admission.landed;
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
             std::size_t free_vram = 0, total_vram = 0;
             if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
             char text[384];
             std::snprintf(text, sizeof(text),
                           "expert cache: %u frames; request %.1f%% of %llu routed experts hit, %llu promotions, "
-                          "%llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
+                          "%llu landed, %llu misses CPU-served; since start %.1f%%; VRAM free %zu MiB",
                           residency_->frames(), routed ? 100.0 * static_cast<double>(hits) / static_cast<double>(routed) : 0.0,
                           static_cast<unsigned long long>(routed), static_cast<unsigned long long>(promoted),
+                          static_cast<unsigned long long>(landed),
                           static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
@@ -1754,7 +1761,7 @@ private:
     void run_decode(std::int32_t batch) {
         const cudaStream_t s = device_.stream;
         upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch), s);
-        residency_->before_round(s);
+        residency_->before_round(s, /*landing=*/true);
         replay(graphs_[static_cast<std::size_t>(batch - 1)], [&] { forward_call(batch, 1, batch); });
         residency_->enqueue_route_download(s, batch);
     }
@@ -1914,7 +1921,7 @@ private:
         }
         upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch * W), s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
-        residency_->before_round(s);
+        residency_->before_round(s, /*landing=*/true);
         replay(verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
             forward_call(batch, W, batch * W, &view);
