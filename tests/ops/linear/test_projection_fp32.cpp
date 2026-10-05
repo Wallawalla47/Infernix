@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -216,6 +217,82 @@ void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint3
     for (auto* p : devices) { cudaFree(p); }
 }
 
+// Prefill widths take the wide mapping (64 columns and more): every column's bits must equal the
+// narrow mapping's for the same column (calls of at most 63 columns), and sampled columns meet the
+// FP64 bound. Widths straddle the 128-column CTA range and the 16-column pass.
+void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::int32_t t, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    std::vector<float> wv;
+    std::vector<std::uint16_t*> devices;
+    std::vector<Tensor> tensors;
+    std::int32_t n = 0;
+    for (const std::int32_t segment : rows) {
+        std::vector<std::uint16_t> part(static_cast<std::size_t>(segment) * k);
+        for (auto& v : part) { v = bf16_bits(d(rng)); }
+        for (auto v : part) { wv.push_back(bf16_value(v)); }
+        devices.push_back(device(part));
+        tensors.push_back(Tensor(devices.back(), DType::BF16, {k, segment}));
+        n += segment;
+    }
+    std::vector<const Tensor*> weights;
+    for (const auto& w : tensors) { weights.push_back(&w); }
+    std::vector<std::uint16_t> bits;
+    std::vector<float> values;
+    random_activations(k, t, seed + 3, bits, values);
+    auto* dx    = device(bits);
+    float* dout = nullptr;
+    cudaMalloc(&dout, sizeof(float) * n * t);
+    const auto run = [&](std::int32_t first, std::int32_t width) {
+        Tensor x(dx + static_cast<std::size_t>(first) * k, DType::BF16, {k, width});
+        Tensor out(dout + static_cast<std::size_t>(first) * n, DType::FP32, {n, width});
+        ninfer::ops::projection_fp32(x, weights, out, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 wide failed"); }
+        std::vector<float> host(static_cast<std::size_t>(n) * width);
+        cudaMemcpy(host.data(), out.data, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        return host;
+    };
+    const std::vector<float> wide = run(0, t);
+    if (t >= 4096) { // informational: the prefill router's kernel time (not a check)
+        Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
+        cudaEvent_t begin, end;
+        cudaEventCreate(&begin);
+        cudaEventCreate(&end);
+        cudaEventRecord(begin);
+        for (int i = 0; i < 20; ++i) { ninfer::ops::projection_fp32(x, weights, out, nullptr); }
+        cudaEventRecord(end);
+        cudaEventSynchronize(end);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, begin, end);
+        std::cout << "wide N=" << n << " K=" << k << " T=" << t << ": " << ms / 20 * 1000 << " us per call\n";
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+    }
+    long differing = 0;
+    for (std::int32_t first = 0; first < t; first += 63) {
+        const std::int32_t width   = std::min(63, t - first);
+        const std::vector<float> narrow = run(first, width);
+        for (std::int32_t c = 0; c < width; ++c) {
+            if (std::memcmp(narrow.data() + static_cast<std::size_t>(c) * n,
+                            wide.data() + static_cast<std::size_t>(first + c) * n, sizeof(float) * n) != 0) {
+                ++differing;
+            }
+        }
+    }
+    const std::string label = "bf16 wide N=" + std::to_string(n) + " K=" + std::to_string(k) + " T=" + std::to_string(t);
+    std::cout << label << ": " << differing << " columns differ from the narrow mapping\n";
+    check(differing == 0, label + " bitwise equal to the narrow mapping");
+    // FP64 bound on the first and last three columns.
+    const WeightAt w = [&](std::int32_t r, std::int32_t i) { return static_cast<double>(wv[static_cast<std::size_t>(r) * k + i]); };
+    verify(label + " (first columns)", wide, w, values, n, k, 3, {});
+    const std::vector<float> tail(wide.end() - static_cast<std::ptrdiff_t>(n) * 3, wide.end());
+    const std::vector<float> tail_x(values.end() - static_cast<std::ptrdiff_t>(k) * 3, values.end());
+    verify(label + " (last columns)", tail, w, tail_x, n, k, 3, {});
+    cudaFree(dx);
+    cudaFree(dout);
+    for (auto* p : devices) { cudaFree(p); }
+}
+
 } // namespace
 
 int main() {
@@ -228,6 +305,10 @@ int main() {
         bf16_case({1000, 37}, 2560, 13);
         bf16_case({129}, 2560, 14);           // one segment
         bf16_case({7, 300, 1, 64}, 1024, 15); // four segments, one of a single row
+        bf16_wide_case({512, 1}, 2560, 64, 31);    // the narrowest wide call
+        bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
+        bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
+        bf16_wide_case({129}, 1024, 135, 43);
         quantized_case(ninfer::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(ninfer::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
         quantized_case(ninfer::QType::Q4_G64_FP16, 1000, 2560, 23, false);
