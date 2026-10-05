@@ -8,6 +8,7 @@
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/argmax.h"
@@ -33,6 +34,27 @@ std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
 
 void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceArena& work, cudaStream_t s) {
     ops::linear(x, p.weight, out, p.policy, work, s);
+}
+
+// The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
+// weights (recipe A) project, split and multiply.
+void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
+                   cudaStream_t s) {
+    if (gate_up.weight.qtype == QType::Q8_G32_FP16) {
+        ops::linear_swiglu(x, gate_up.weight, out, gate_up.policy, work, s);
+        return;
+    }
+    auto scope = work.scope();
+    const std::int32_t I = out.ne[0], T = out.ne[1];
+    Tensor projected = work.alloc(DType::BF16, {2 * I, T});
+    project(x, gate_up, projected, work, s);
+    Tensor gate = work.alloc(DType::BF16, {I, T});
+    Tensor up   = work.alloc(DType::BF16, {I, T});
+    {
+        Tensor* parts[] = {&gate, &up};
+        ops::split_rows(projected, parts, s);
+    }
+    ops::silu_mul(gate, up, out, s);
 }
 
 } // namespace
@@ -248,18 +270,11 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
     const cudaStream_t s = device_.stream;
-    const std::int32_t T = residual.ne[1], W = residual.ne[0], H = dim(config_.hidden_size);
+    const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
-    Tensor normalized = work_.alloc(DType::BF16, {W, T});
-    ops::hyper_connection_norm(residual, p.norm, S, config_.rms_norm_eps, normalized, s);
-    Tensor z = work_.alloc(DType::BF16, {p.down.weight.n, T});
-    project(normalized, p.down, z, work_, s);
-    Tensor m = work_.alloc(DType::BF16, {rank, T});
-    ops::hyper_connection_gates(z, rank, S, m, p.combine ? inject : nullptr, s);
-    Tensor u = work_.alloc(DType::BF16, {W, T});
-    project(m, p.up, u, work_, s);
     Tensor x = work_.alloc(DType::BF16, {H, T});
-    ops::hyper_connection_collapse(u, normalized, S, x, s);
+    ops::hyper_connection_mix(residual, p.norm, p.down.weight, p.up.weight, p.down.policy, S, rank, config_.rms_norm_eps,
+                              x, p.combine ? inject : nullptr, work_, s);
     return x;
 }
 
@@ -497,16 +512,8 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
 
     const std::int32_t I = dim(m.shared_intermediate);
-    Tensor gate_up = work_.alloc(DType::BF16, {2 * I, T});
-    project(x, p.shared_gate_up, gate_up, work_, s);
-    Tensor gate = work_.alloc(DType::BF16, {I, T});
-    Tensor up   = work_.alloc(DType::BF16, {I, T});
-    {
-        Tensor* parts[] = {&gate, &up};
-        ops::split_rows(gate_up, parts, s);
-    }
     Tensor product = work_.alloc(DType::BF16, {I, T});
-    ops::silu_mul(gate, up, product, s);
+    shared_swiglu(x, p.shared_gate_up, product, work_, s);
     Tensor shared = work_.alloc(DType::BF16, {H, T});
     project(product, p.shared_down, shared, work_, s);
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
@@ -593,16 +600,8 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         ops::resident_moe_experts(xm, routing.ids, p.experts_gate_up, p.experts_down, E, I, expert_ws.data,
                                   expert_ws.bytes, outputs, s);
         const std::int32_t SI = dim(m.shared_intermediate);
-        Tensor gate_up = work_.alloc(DType::BF16, {2 * SI, T});
-        project(xm, p.shared_gate_up, gate_up, work_, s);
-        Tensor gate = work_.alloc(DType::BF16, {SI, T});
-        Tensor up   = work_.alloc(DType::BF16, {SI, T});
-        {
-            Tensor* parts[] = {&gate, &up};
-            ops::split_rows(gate_up, parts, s);
-        }
         Tensor product = work_.alloc(DType::BF16, {SI, T});
-        ops::silu_mul(gate, up, product, s);
+        shared_swiglu(xm, p.shared_gate_up, product, work_, s);
         Tensor shared = work_.alloc(DType::BF16, {H, T});
         project(product, p.shared_down, shared, work_, s);
         Tensor ym = work_.alloc(DType::BF16, {H, T});

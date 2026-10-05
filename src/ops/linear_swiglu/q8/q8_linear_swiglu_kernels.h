@@ -7,6 +7,8 @@
 
 namespace ninfer::ops::detail {
 
+// Register-streamed small-T route of the Qwen3.8-Flash-Next shared-expert profile (K = 2560).
+void q8_linear_swiglu_stream_pair_launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void q8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, Tensor& out,
                                              cudaStream_t stream);
 void q8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,

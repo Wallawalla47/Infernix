@@ -28,6 +28,7 @@ enum class Q8LinearSwiGluScheduleId {
     DFlash2MmaR64C80K128,
     DFlash2MmaR64C96K128,
     DFlash2MmaR64C128,
+    StreamPair, // Qwen3.8-Flash-Next shared expert, T <= 16
 };
 
 struct Q8LinearSwiGluProblem {

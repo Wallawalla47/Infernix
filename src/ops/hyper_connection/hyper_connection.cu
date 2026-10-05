@@ -1,7 +1,10 @@
 #include "ninfer/ops/hyper_connection.h"
 
+#include "ops/hyper_connection/hyper_connection_mix_q8.h"
+
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -131,8 +134,7 @@ __global__ void expand_kernel(const bf16* __restrict__ x, int hidden, int stream
     }
 }
 
-} // namespace
-
+// The composed route's steps (private since hyper_connection_mix).
 void hyper_connection_norm(const Tensor& residual, const Tensor& weight, std::int32_t streams,
                            float eps, Tensor& out, cudaStream_t stream) {
     require(streams > 0 && contiguous_2d(residual, DType::BF16) && contiguous_2d(out, DType::BF16) &&
@@ -182,6 +184,67 @@ void hyper_connection_collapse(const Tensor& mix_logits, const Tensor& normalize
         static_cast<const bf16*>(mix_logits.data), static_cast<const bf16*>(normalized.data), hidden,
         streams, columns, static_cast<bf16*>(out.data));
     check_launch("collapse");
+}
+
+std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
+
+// The composed route's intermediates: Rn, z, m and u in BF16, then the projections' own workspace.
+std::size_t composed_bytes(const Weight& down, const Weight& up, LinearPolicy policy, std::int32_t streams,
+                           std::int32_t rank, std::int32_t max_tokens) {
+    const auto width = static_cast<std::size_t>(up.n);
+    const auto T     = static_cast<std::size_t>(max_tokens);
+    (void)streams;
+    return align256(width * T * 2) + align256(static_cast<std::size_t>(down.n) * T * 2) +
+           align256(static_cast<std::size_t>(rank) * T * 2) + align256(width * T * 2) +
+           std::max(linear_workspace_capacity_bytes(down.qtype, down.n, down.k, policy, 1, max_tokens),
+                    linear_workspace_capacity_bytes(up.qtype, up.n, up.k, policy, 1, max_tokens));
+}
+
+} // namespace
+
+void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, const Weight& down,
+                          const Weight& up, LinearPolicy policy, std::int32_t streams,
+                          std::int32_t rank, float eps, Tensor& x, Tensor* inject,
+                          WorkspaceArena& workspace, cudaStream_t stream) {
+    require(contiguous_2d(residual, DType::BF16) && contiguous_2d(x, DType::BF16) &&
+                contiguous_2d(norm_weight, DType::BF16) && streams > 0 && rank > 0,
+            "mix requires contiguous BF16 tensors");
+    const std::int32_t T = residual.ne[1], hidden = x.ne[0];
+    require(T > 0 && x.ne[1] == T && residual.ne[0] == streams * hidden && norm_weight.ne[0] == residual.ne[0] &&
+                down.k == residual.ne[0] && up.n == residual.ne[0] && up.k == rank &&
+                down.n == rank + (inject != nullptr ? streams : 0),
+            "mix shapes disagree");
+    if (inject != nullptr) {
+        require(contiguous_2d(*inject, DType::FP32) && inject->ne[0] == streams && inject->ne[1] == T,
+                "mix inject output must be FP32 [S, T]");
+    }
+    require(eps > 0, "mix epsilon must be positive");
+    auto scope = workspace.scope();
+    if (detail::hc_mix_q8_supported(down, up, hidden, streams, rank, T)) {
+        const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_q8_workspace_bytes(down.n, streams, T));
+        detail::hc_mix_q8(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
+        return;
+    }
+    Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
+    hyper_connection_norm(residual, norm_weight, streams, eps, normalized, stream);
+    Tensor z = workspace.alloc(DType::BF16, {down.n, T});
+    linear(normalized, down, z, policy, workspace, stream);
+    Tensor m = workspace.alloc(DType::BF16, {rank, T});
+    hyper_connection_gates(z, rank, streams, m, inject, stream);
+    Tensor u = workspace.alloc(DType::BF16, {up.n, T});
+    linear(m, up, u, policy, workspace, stream);
+    hyper_connection_collapse(u, normalized, streams, x, stream);
+}
+
+std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, const Weight& up, LinearPolicy policy,
+                                                          std::int32_t streams, std::int32_t rank,
+                                                          std::int32_t max_tokens) {
+    require(max_tokens > 0 && streams > 0 && rank > 0, "mix workspace needs positive T, streams and rank");
+    std::size_t bytes = composed_bytes(down, up, policy, streams, rank, max_tokens);
+    for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
+        bytes = std::max(bytes, detail::hc_mix_q8_workspace_bytes(down.n, streams, T) + 256);
+    }
+    return bytes;
 }
 
 void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& residual,

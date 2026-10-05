@@ -50,6 +50,14 @@ constexpr std::array<RouteSpec, 6> kDFlash2Routes{{
     {97, kAnyCols, Q8LinearSwiGluScheduleId::DFlash2MmaR64C128},
 }};
 
+// Qwen3.8-Flash-Next's shared expert, gate/up [1280, 2560] -> [640]: the register-streamed pair
+// route while the weights dominate, then the paired-row MMA tiles.
+constexpr std::array<RouteSpec, 3> kFlashNextSharedRoutes{{
+    {1, 16, Q8LinearSwiGluScheduleId::StreamPair},
+    {17, 64, Q8LinearSwiGluScheduleId::MmaR32C64},
+    {65, kAnyCols, Q8LinearSwiGluScheduleId::MmaR64C128},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) {
     std::int64_t expected = 1;
@@ -64,6 +72,8 @@ static_assert(catalog_is_closed(kCompanionRoutes),
               "Q8 companion LinearSwiGLU routes must be exact and closed");
 static_assert(catalog_is_closed(kDFlash2Routes),
               "Q8 DFlash2 LinearSwiGLU routes must be exact and closed");
+static_assert(catalog_is_closed(kFlashNextSharedRoutes),
+              "Q8 Flash-Next shared-expert LinearSwiGLU routes must be exact and closed");
 
 bool is_companion_shape(const Q8LinearSwiGluProblem& problem) noexcept {
     return problem.gate_up_rows == 12288 && problem.output_rows == 6144 && problem.k == 2048 &&
@@ -75,8 +85,13 @@ bool is_dflash2_shape(const Q8LinearSwiGluProblem& problem) noexcept {
            problem.padded_k == 5120;
 }
 
+bool is_flash_next_shared_shape(const Q8LinearSwiGluProblem& problem) noexcept {
+    return problem.gate_up_rows == 1280 && problem.output_rows == 640 && problem.k == 2560 &&
+           problem.padded_k == 2560;
+}
+
 bool supported_shape(const Q8LinearSwiGluProblem& problem) noexcept {
-    return is_companion_shape(problem) || is_dflash2_shape(problem);
+    return is_companion_shape(problem) || is_dflash2_shape(problem) || is_flash_next_shared_shape(problem);
 }
 
 } // namespace
@@ -117,12 +132,14 @@ const char* q8_linear_swiglu_schedule_name(Q8LinearSwiGluScheduleId schedule) no
         return "linear_swiglu.q8.dflash2.mma.r64.c96.k128";
     case Q8LinearSwiGluScheduleId::DFlash2MmaR64C128:
         return "linear_swiglu.q8.dflash2.mma.pair.r32.c128";
+    case Q8LinearSwiGluScheduleId::StreamPair:
+        return "linear_swiglu.q8.stream.pair";
     }
     return "linear_swiglu.q8.unknown";
 }
 
 bool q8_linear_swiglu_schedule_uses_mma(Q8LinearSwiGluScheduleId schedule) noexcept {
-    return schedule != Q8LinearSwiGluScheduleId::DecodePairR16;
+    return schedule != Q8LinearSwiGluScheduleId::DecodePairR16 && schedule != Q8LinearSwiGluScheduleId::StreamPair;
 }
 
 bool q8_linear_swiglu_admits(const Q8LinearSwiGluProblem& problem) noexcept {
@@ -143,6 +160,7 @@ Q8LinearSwiGluPlan q8_linear_swiglu_resolve_plan(const Q8LinearSwiGluProblem& pr
         throw std::logic_error("Q8 LinearSwiGLU: admitted problem has no route");
     };
     if (is_dflash2_shape(problem)) { return resolve_from(kDFlash2Routes); }
+    if (is_flash_next_shared_shape(problem)) { return resolve_from(kFlashNextSharedRoutes); }
     return resolve_from(kCompanionRoutes);
 }
 
@@ -204,6 +222,9 @@ void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor&
         return;
     case Q8LinearSwiGluScheduleId::DFlash2MmaR64C128:
         q8_linear_swiglu_mma_r64_c128_launch(x, w, out, stream);
+        return;
+    case Q8LinearSwiGluScheduleId::StreamPair:
+        q8_linear_swiglu_stream_pair_launch(x, w, out, stream);
         return;
     }
     throw std::logic_error("Q8 LinearSwiGLU: unknown schedule");
