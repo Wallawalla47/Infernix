@@ -117,7 +117,13 @@ struct MoeL2Warm {
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
+    // A non-resident expert's host record: host_table[e] when host_table is set (device [E] of
+    // host pointers, the SSD tier's RAM slots, design §19.3.7; a null entry is an expert that is
+    // in no host slot and must not reach this call's staging or CPU jobs), else host_records + e *
+    // record_stride. A record is read from a frame, a host pointer or a landing; its bits are
+    // identical in each.
     const std::uint8_t* host_records = nullptr;
+    const std::uint8_t* const* host_table = nullptr;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
     std::uint8_t* staging_base  = nullptr;
