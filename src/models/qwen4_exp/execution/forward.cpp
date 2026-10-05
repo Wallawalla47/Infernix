@@ -283,6 +283,11 @@ void Forward::ple(const PleParameters& p, Tensor& residual, const ForwardBatch& 
     const std::int32_t T = residual.ne[1], W = residual.ne[0], H = dim(config_.hidden_size);
     auto scope = work_.scope();
     Tensor e = work_.alloc(DType::BF16, {dim(config_.ple.embed_dim), T});
+    if (const NgramRowGate* gate = batch.ngram_gate) {
+        // ple_embed is a plain launch (no PDL), so stream order holds it behind the copy.
+        upload_pinned_when(batch.ngram_rows.data, gate->pinned_rows, batch.ngram_rows.bytes(), gate->ready,
+                           gate->expected, gate->wait_stats, gate->wait_row, s);
+    }
     ops::ple_embed(batch.ngram_rows, p.ngram_scale, e, s);
     Tensor kv = work_.alloc(DType::BF16, {W + H, T});
     project(e, p.projection, kv, work_, s);
