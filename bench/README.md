@@ -37,8 +37,8 @@ the same fixture, seed, cache policy, and timing mode.
 
 ## Build
 
-`CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `context_cost/`
-and `models/qwen3_5/`. All executables remain under `build/bench/`; the Op registration helper
+`CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
+`context_cost/` and `models/qwen3_5/`. All executables remain under `build/bench/`; the Op registration helper
 lives in `cmake/NinferBenchmarks.cmake`.
 
 ```bash
@@ -134,6 +134,39 @@ A one-token `tg` seed is not a file-copy benchmark. Use a suitable repeated-toke
 corpus with `-pg`, verify the output separately, and require positive ngram
 acceptance before attributing a speed change to copying. The standard matrix
 remains neural-only unless its cases explicitly request ngram.
+
+## Decode quality
+
+`ninfer_decode_quality_gen` and `ninfer_decode_quality_judge` measure what a build's decode path
+does to output quality, end to end. Perplexity scoring runs prefill only, so this is the check for
+decode kernels, speculative verification and n-gram drafting. The method and the recorded results
+are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
+
+- The generator cuts `segments` evenly spaced `prompt_tokens`-token segments from a UTF-8 corpus
+  and continues each greedily for `new_tokens` tokens through the production decode path:
+  DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
+  off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12). It writes one
+  line per segment: the corpus token offset, the prompt length and the generated token ids.
+- The judge scores any number of generator outputs with one reference: a CausalScoring Engine with
+  16-bit activations in every linear (`EngineOptions::a16_activations`), BF16 KV, each sequence in
+  one pass. For each build it reports how often the generated token is the reference's most
+  probable token given that build's own prefix, the mean reference log-probability and the mean
+  regret (top log-probability minus the generated token's); for each pair, the generated prefix
+  they share exactly.
+
+```bat
+ninfer_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
+ninfer_decode_quality_gen model.ninfer corpus.txt base-ngram.txt 32 1536 384 ngram
+ninfer_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt other.txt
+```
+
+Use the same artifact and corpus for every build. The generator uses only Engine API that upstream
+NInfer also has, so for a fork-versus-upstream comparison copy `decode_quality_gen.cpp` into an
+upstream checkout and build it there with `NINFER_DECODE_QUALITY_UPSTREAM` defined (it removes the
+n-gram option), linked to `ninfer_engine` like any benchmark. Rounding noise makes builds diverge
+after a few dozen tokens, which is why each build is judged on its own prefixes. Treat agreement
+differences of a few tenths of a percent over about 12,000 tokens as unresolved unless they repeat
+on other segments.
 
 ## Context-cost calibration
 
