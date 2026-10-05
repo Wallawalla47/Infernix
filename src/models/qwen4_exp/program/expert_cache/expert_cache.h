@@ -75,6 +75,8 @@ public:
     // Changes the capacity (the frame pool grew or shrank). Shrinking evicts the lowest-score
     // residents, wherever their frames are, into `victims`; uses keep their counts.
     void set_capacity(std::uint32_t capacity, std::vector<std::uint32_t>& victims);
+    // Makes a resident key non-resident (its frame is lent); its count is kept.
+    void evict(std::uint32_t key);
 
 private:
     static constexpr std::uint32_t kNone = 0xFFFFFFFFU;
@@ -115,17 +117,24 @@ public:
     // Backs frames [0, frames). Growing frees the new frames; shrinking needs every frame at or
     // above `frames` free (the controller relocates their experts first).
     void resize(std::uint32_t frames);
+    // Lends the free frames [first, first + count) to another user of the memory (design
+    // §19.3.2, "Frame lending"); they are neither acquired nor resized until given back.
+    void lend(std::uint32_t first, std::uint32_t count);
+    void give_back(std::uint32_t first, std::uint32_t count);
 
     [[nodiscard]] std::size_t free_count() const { return free_.size(); }
     [[nodiscard]] std::size_t pending_count() const { return pending_.size(); }
     [[nodiscard]] bool is_free(std::uint32_t frame) const { return state_[frame] == kFree; }
+    [[nodiscard]] bool is_loaned(std::uint32_t frame) const { return state_[frame] == kLoaned; }
+    [[nodiscard]] std::uint32_t loaned_count() const { return loaned_; }
     [[nodiscard]] std::uint32_t backed() const { return backed_; }
     [[nodiscard]] std::uint32_t max_frames() const { return static_cast<std::uint32_t>(state_.size()); }
 
 private:
-    enum : std::uint8_t { kFree, kHeld, kPending, kUnbacked };
+    enum : std::uint8_t { kFree, kHeld, kPending, kUnbacked, kLoaned };
     std::uint32_t rounds_in_flight_;
     std::uint32_t backed_ = 0;
+    std::uint32_t loaned_ = 0;
     std::vector<std::uint32_t> free_;
     std::deque<std::pair<std::uint64_t, std::uint32_t>> pending_; // (reusable at round_done >=, frame)
     std::vector<std::uint8_t> state_;
@@ -150,6 +159,7 @@ public:
         std::uint32_t frame;
         std::uint32_t word;
         std::uint32_t source = 0;
+        std::uint64_t serial = 0; // kCopy: this load's serial (complete_load)
     };
 
     // `frames` backed now, up to `max_frames` (0: no growth).
@@ -161,20 +171,44 @@ public:
                   std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1));
     void on_round_done(std::uint64_t round_done, std::vector<Command>& out);
     void on_quiescent(std::vector<Command>& out);
-    // Resizes the pool to `frames` while no round is in flight and every issued load has landed.
-    // Shrinking evicts the lowest-score residents (ABSENT writes) and relocates the experts still
-    // above the new top into free frames below it (relocations precede no other command); growing
-    // admits queued experts into the new frames.
+    // Resizes the pool to `frames` while no round is in flight, every issued load has landed and no
+    // frame is lent. Shrinking evicts the lowest-score residents (ABSENT writes) and relocates the
+    // experts still above the new top into free frames below it (relocations precede no other
+    // command); growing admits queued experts into the new frames.
     void resize(std::uint32_t frames, std::vector<Command>& out);
+
+    // Frame lending (design §19.3.2): a contiguous run of frames serves another use of the memory
+    // (the Vision window) and comes back later. choose_run picks the run of `count` frames whose
+    // held experts have the minimum summed LFRU score (free frames score 0); lent frames are
+    // ineligible, and runs over `busy` frames (targets of loads still in flight) are avoided while a
+    // run without them exists. Nothing when no run fits.
+    [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const;
+    // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
+    // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
+    // evicted elsewhere). Returns the number of evicted experts.
+    std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    // Returns the run: capacity grows back and queued experts load into it.
+    void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
+    [[nodiscard]] std::uint32_t loaned_frames() const { return frames_.loaned_count(); }
+    // The key held in `frame`, or nothing.
+    [[nodiscard]] std::optional<std::uint32_t> frame_key(std::uint32_t frame) const;
 
     [[nodiscard]] std::uint32_t frames() const { return frames_.backed(); }
     [[nodiscard]] const ResidencyEntry& entry(std::uint32_t key) const { return table_[key]; }
     [[nodiscard]] const LfruPolicy& policy() const { return policy_; }
     [[nodiscard]] std::size_t queued_loads() const { return queued_.size(); }
+    // Whether the copy issued as (key, frame, serial) may be published: the key is still READY in
+    // that frame from that very load. A key can be evicted and re-admitted into the same frame
+    // while an earlier copy is in flight (the ABA case); only the newest copy's data is current.
+    [[nodiscard]] bool complete_load(std::uint32_t key, std::uint32_t frame, std::uint64_t serial) const;
 
 private:
     void load(std::uint32_t key, std::uint32_t frame, std::vector<Command>& out);
     void drain_queue(std::vector<Command>& out);
+    // ABSENT write for a resident key; its frame no longer holds it.
+    std::uint32_t make_absent(std::uint32_t key, std::vector<Command>& out);
+
+    static constexpr std::uint32_t kNoKey = 0xFFFFFFFFU;
 
     LfruPolicy policy_;
     std::uint32_t slack_;
@@ -182,6 +216,9 @@ private:
     std::vector<ResidencyEntry> table_;
     std::deque<std::uint32_t> queued_;
     std::vector<std::uint8_t> is_queued_;
+    std::vector<std::uint64_t> load_serial_; // per key: the serial of its latest issued copy
+    std::vector<std::uint32_t> frame_key_;   // per frame: the key it holds, or kNoKey
+    std::uint64_t next_serial_ = 0;
     LfruPolicy::Step step_;
 };
 

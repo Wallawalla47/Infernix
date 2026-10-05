@@ -80,6 +80,10 @@ std::uint64_t ExpertResidency::pool_bytes() const noexcept {
 
 ExpertResidency::Resize ExpertResidency::resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram) {
     Resize out;
+    if (controller_ && controller_->loaned_frames() != 0) {
+        out.frames = frames_; // a lease holds frames: the next boundary after its return resizes
+        return out;
+    }
     frames = std::min(frames, limit_);
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
     publish_landed();
@@ -186,12 +190,12 @@ void ExpertResidency::publish_landed() {
             continue;
         }
         CUDA_CHECK(status);
-        for (const auto& [key, frame] : it->loads) {
-            // Publish only loads the policy still wants in that frame.
-            const ResidencyEntry& entry = controller_->entry(key);
-            if (entry.state == ResidencyState::kReady && entry.frame == frame) {
-                table[key]   = static_cast<std::int32_t>(frame);
-                table_dirty_ = true;
+        for (const auto& load : it->loads) {
+            // Publish only the load the policy still wants: the same key, frame and serial (a key
+            // evicted and re-admitted into this frame meanwhile has a newer copy in flight).
+            if (controller_->complete_load(load.key, load.frame, load.serial)) {
+                table[load.key] = static_cast<std::int32_t>(load.frame);
+                table_dirty_    = true;
             }
         }
         spare_events_.push_back(it->done);
@@ -250,19 +254,73 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
     issue_loads(compute);
 }
 
+std::uint32_t ExpertResidency::lendable() const noexcept {
+    if (!controller_) { return 0; }
+    const std::uint32_t lent = controller_->loaned_frames(), floor = frames_ / 4;
+    return frames_ > lent + floor ? frames_ - lent - floor : 0;
+}
+
+ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
+                                                  std::span<const cudaStream_t> writers) {
+    if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
+    publish_landed();
+    std::vector<std::uint8_t> busy(frames_, 0);
+    for (const auto& batch : in_flight_) {
+        for (const auto& load : batch.loads) {
+            if (load.frame < frames_) { busy[load.frame] = 1; }
+        }
+    }
+    const auto first = controller_->choose_run(count, busy);
+    if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
+    commands_.clear();
+    stats_.lend_evictions += controller_->lend(*first, count, commands_);
+    auto* table = static_cast<std::int32_t*>(table_host_.data());
+    for (const auto& command : commands_) {
+        if (command.kind == CacheController::Command::Kind::kWriteEntry &&
+            ResidencyEntry::decode(command.word).state != ResidencyState::kReady && table[command.key] >= 0) {
+            table[command.key] = -1;
+            table_dirty_       = true;
+        }
+    }
+    if (table_dirty_) { upload_table(compute); }
+    // Promotions still landing in the run must finish before its new user writes it.
+    for (const auto& batch : in_flight_) {
+        const bool targets = std::any_of(batch.loads.begin(), batch.loads.end(), [&](const Batch::Load& load) {
+            return load.frame >= *first && load.frame < *first + count;
+        });
+        if (!targets) { continue; }
+        CUDA_CHECK(cudaStreamWaitEvent(compute, batch.done, 0));
+        for (const cudaStream_t writer : writers) { CUDA_CHECK(cudaStreamWaitEvent(writer, batch.done, 0)); }
+    }
+    stats_.lent_frames += count;
+    auto* base = const_cast<std::uint8_t*>(frame_base());
+    return {*first, count, DeviceSpan{base + static_cast<std::size_t>(*first) * stride_, static_cast<std::size_t>(count) * stride_}};
+}
+
+void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
+    if (!lease.valid()) { return; }
+    commands_.clear();
+    controller_->give_back(lease.first, lease.count, commands_);
+    stats_.lent_frames -= lease.count;
+    lease = {};
+    issue_loads(compute); // queued experts load into the run once `compute` reaches here
+}
+
 void ExpertResidency::issue_loads(cudaStream_t compute) {
     Batch batch;
     for (const auto& command : commands_) {
-        if (command.kind == CacheController::Command::Kind::kCopy) { batch.loads.emplace_back(command.key, command.frame); }
+        if (command.kind == CacheController::Command::Kind::kCopy) {
+            batch.loads.push_back({command.key, command.frame, command.serial});
+        }
     }
     if (batch.loads.empty()) { return; }
     CUDA_CHECK(cudaEventRecord(table_ready_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, table_ready_, 0));
     auto* base = const_cast<std::uint8_t*>(frame_base());
-    for (const auto& [key, frame] : batch.loads) {
-        const std::uint32_t layer  = key / experts_;
-        const std::uint32_t expert = key % experts_;
-        CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::size_t>(frame) * stride_,
+    for (const auto& load : batch.loads) {
+        const std::uint32_t layer  = load.key / experts_;
+        const std::uint32_t expert = load.key % experts_;
+        CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::size_t>(load.frame) * stride_,
                                    banks_[layer] + static_cast<std::size_t>(expert) * stride_, stride_,
                                    cudaMemcpyHostToDevice, copy_stream_));
     }

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -275,6 +276,158 @@ void test_agent_simulation() {
 
 } // namespace
 
+// The ABA case of load publication (design §19.3.2, "Frame lending and the two expert-cache fixes"):
+// K loads into the only frame (serial s1); K2 evicts it and loads into the same frame; K re-enters it
+// (serial s2) while s1's copy could still be in flight. Only the newest copy of a key in its frame
+// may be published: complete_load(K, f, s1) is false, (K, f, s2) true, and K2's copy is stale too.
+void test_load_serials() {
+    constexpr std::uint32_t kKeys = 8, K = 3, K2 = 5;
+    CacheController cache(kKeys, 1, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    struct Copy {
+        std::uint32_t key, frame;
+        std::uint64_t serial;
+    };
+    std::vector<Copy> copies;
+    std::uint64_t round = 0;
+    // Routes `key` until its copy is issued; returns that copy.
+    const auto admit = [&](std::uint32_t key) -> std::optional<Copy> {
+        for (int i = 0; i < 64; ++i) {
+            const std::uint32_t group[] = {key};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+            std::optional<Copy> issued;
+            for (const auto& c : cmds) {
+                if (c.kind == CacheController::Command::Kind::kCopy && c.key == key) { issued = Copy{c.key, c.frame, c.serial}; }
+            }
+            cmds.clear();
+            if (issued) { return issued; }
+        }
+        return std::nullopt;
+    };
+    const auto first = admit(K);
+    check(first.has_value(), "K loads into the empty cache");
+    if (!first) { return; }
+    check(cache.complete_load(K, first->frame, first->serial), "K's only copy publishes");
+    const auto other = admit(K2);
+    check(other.has_value() && other->frame == first->frame, "K2 evicts K and loads into the same frame");
+    if (!other) { return; }
+    check(!cache.complete_load(K, first->frame, first->serial), "an evicted key's copy does not publish");
+    const auto again = admit(K);
+    check(again.has_value() && again->frame == first->frame, "K re-enters the same frame");
+    if (!again) { return; }
+    check(again->serial != first->serial, "each copy has its own serial");
+    check(!cache.complete_load(K, first->frame, first->serial), "K's first copy (ABA) does not publish");
+    check(cache.complete_load(K, again->frame, again->serial), "K's newest copy publishes");
+    check(!cache.complete_load(K2, other->frame, other->serial), "the evicted K2's copy does not publish");
+}
+
+// Frame lending (design §19.3.2, VT4): choose_run picks the run of held experts with the minimum
+// summed LFRU score, never a lent frame, and avoids busy frames while a run without them exists;
+// lend evicts every expert in the run (ABSENT, no frame maps to it) and shrinks the capacity by
+// the run; give_back restores the capacity and loads queued experts into it. With lending, the ABA
+// case: K in frame f (serial s1), f lent and given back, K re-admitted into f (s2): s1 does not
+// publish, s2 does. Every frame is back after the last give_back.
+void test_lending() {
+    constexpr std::uint32_t kKeys = 64, kFrames = 8;
+    CacheController cache(kKeys, kFrames, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    std::vector<std::uint32_t> frame_of(kKeys, ~0U);
+    std::vector<std::uint64_t> serial_of(kKeys, 0);
+    const auto apply = [&] {
+        for (const auto& c : cmds) {
+            if (c.kind == CacheController::Command::Kind::kCopy) {
+                frame_of[c.key]  = c.frame;
+                serial_of[c.key] = c.serial;
+            }
+            if (c.kind == CacheController::Command::Kind::kWriteEntry &&
+                ResidencyEntry::decode(c.word).state == ResidencyState::kAbsent) {
+                frame_of[c.key] = ~0U;
+            }
+        }
+        cmds.clear();
+    };
+    std::uint64_t round = 0;
+    // Keys 0..7 fill the frames; key k is routed k + 1 times (key 7 scores highest).
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        for (std::uint32_t use = 0; use <= k; ++use) {
+            const std::uint32_t group[] = {k};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+            apply();
+        }
+    }
+    bool all = true;
+    for (std::uint32_t k = 0; k < kFrames; ++k) { all &= frame_of[k] != ~0U; }
+    check(all, "eight keys fill the eight frames");
+
+    // The lowest summed score over 3 contiguous frames, by brute force.
+    const auto brute = [&](std::uint32_t count, const std::vector<std::uint8_t>& busy, bool avoid) {
+        std::optional<std::uint32_t> best;
+        double best_score = 0.0;
+        for (std::uint32_t first = 0; first + count <= kFrames; ++first) {
+            double sum = 0.0;
+            bool ok    = true;
+            for (std::uint32_t f = first; f < first + count; ++f) {
+                ok &= !(avoid && busy[f]);
+                const auto key = cache.frame_key(f);
+                sum += key ? cache.policy().score(*key) : 0.0;
+            }
+            if (ok && (!best || sum < best_score)) {
+                best       = first;
+                best_score = sum;
+            }
+        }
+        return best;
+    };
+    const std::vector<std::uint8_t> none(kFrames, 0);
+    check(cache.choose_run(3, none) == brute(3, none, false), "choose_run picks the minimum-score run");
+    std::vector<std::uint8_t> busy(kFrames, 0);
+    if (const auto run = cache.choose_run(3, none)) { busy[*run] = 1; }
+    const auto avoided = cache.choose_run(3, busy);
+    check(avoided.has_value() && avoided == brute(3, busy, true), "choose_run avoids busy frames while it can");
+    check(cache.choose_run(kFrames, std::vector<std::uint8_t>(kFrames, 1)) == std::optional<std::uint32_t>(0),
+          "choose_run takes busy frames when no run avoids them");
+
+    // K = the key in the first frame of the run; lend the run.
+    const std::uint32_t first = *cache.choose_run(3, none);
+    const std::uint32_t K     = *cache.frame_key(first);
+    const std::uint64_t s1    = serial_of[K];
+    const std::uint32_t capacity = cache.policy().capacity();
+    const std::uint32_t evicted  = cache.lend(first, 3, cmds);
+    apply();
+    check(evicted == 3, "lend evicts the three experts in the run");
+    check(cache.loaned_frames() == 3 && cache.policy().capacity() == capacity - 3, "lend shrinks the capacity by the run");
+    bool clear = true;
+    for (std::uint32_t f = first; f < first + 3; ++f) { clear &= !cache.frame_key(f).has_value(); }
+    for (std::uint32_t k = 0; k < kKeys; ++k) { clear &= frame_of[k] == ~0U || frame_of[k] < first || frame_of[k] >= first + 3; }
+    check(clear, "no expert maps to a lent frame");
+    check(cache.entry(K).state == ResidencyState::kAbsent, "the run's experts are ABSENT");
+    check(!cache.choose_run(kFrames, none).has_value(), "lent frames are never chosen");
+
+    // Routes K until it is resident again (queued while the frames are lent, then loaded).
+    const auto route_k = [&] {
+        for (int i = 0; i < 64 && frame_of[K] == ~0U; ++i) {
+            const std::uint32_t group[] = {K};
+            cache.on_route(group, ++round, cmds);
+            cache.on_quiescent(cmds);
+            apply();
+        }
+    };
+    cache.give_back(first, 3, cmds);
+    apply();
+    check(cache.loaned_frames() == 0 && cache.policy().capacity() == capacity, "give_back restores the capacity");
+    route_k();
+    check(frame_of[K] != ~0U, "K is resident again after the give-back");
+    check(!cache.complete_load(K, first, s1), "K's copy from before the loan (ABA) does not publish");
+    check(cache.complete_load(K, frame_of[K], serial_of[K]) && serial_of[K] != s1, "K's newest copy publishes");
+    bool threw = false;
+    try {
+        cache.give_back(first, 1, cmds);
+    } catch (const std::logic_error&) { threw = true; }
+    check(threw, "a frame is given back only while lent");
+}
+
 int main() {
     test_residency_entries();
     test_lfru_conformance();
@@ -283,6 +436,8 @@ int main() {
     test_agent_simulation();
     test_pool_resize();
     test_controller_resize();
+    test_load_serials();
+    test_lending();
     if (g_failures) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
