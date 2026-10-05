@@ -14,6 +14,8 @@ struct LoadOptions {
     SpeculativeBackend speculative         = SpeculativeBackend::None;
     ProposalHead proposal_head             = ProposalHead::Full;
     float rope_yarn_factor                 = 1.0F;
+    // Every Use binds A16Only, whatever activation precision the artifact permits.
+    bool a16_activations = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -66,7 +68,8 @@ struct LoadOptions {
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .speculative              = options.speculative.backend,
             .proposal_head            = options.speculative.proposal_head,
-            .rope_yarn_factor         = options.rope_yarn_factor};
+            .rope_yarn_factor         = options.rope_yarn_factor,
+            .a16_activations          = options.a16_activations};
 }
 
 } // namespace ninfer::models

@@ -61,6 +61,7 @@ struct Options {
     bool original_int8_prefill_kernel   = false;
     ninfer::PrefillPv8 prefill_8bit_pv          = ninfer::PrefillPv8::Auto;
     bool original_nvfp4_prefill_kernel  = false;
+    bool a16_activations                = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -76,6 +77,8 @@ std::string usage_text() {
            "       [--prefill-8bit-pv | --no-prefill-8bit-pv] (8-bit P*V for INT8 and K4V2;\n"
            "        FP16 for NVFP4, K8V4 and VQ2, which default to 8-bit; see ninfer-serve)\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
+           "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
+           "        measuring activation quantization; about 3x slower on NVFP4 artifacts)\n"
            "       [--output <directory>]\n"
            "       [--save-top-tokens <file>] (record each position's 32 most probable tokens)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
@@ -136,6 +139,8 @@ Options parse_options(int argc, char** argv) {
             out.prefill_8bit_pv = ninfer::PrefillPv8::Off;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
+        } else if (option == "--a16-activations") {
+            out.a16_activations = true;
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -271,6 +276,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.prefill_8bit_pv              = options.prefill_8bit_pv;
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
+    engine_options.a16_activations               = options.a16_activations;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));
@@ -529,6 +535,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
           {"prefill_8bit_pv", ninfer::prefill_pv8_name(options.prefill_8bit_pv)},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
+          {"a16_activations", options.a16_activations},
           {"stride_tokens", options.stride},
           {"prefill_chunk_tokens", engine.options().prefill_chunk},
           {"score_tile_tokens", 1024},

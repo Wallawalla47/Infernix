@@ -42,6 +42,7 @@ WeightId Bindings::parameter(std::string name, artifact::Shape shape,
             result.policy = ops::LinearPolicy::AllowA4;
             break;
         }
+        if (a16_activations) { result.policy = ops::LinearPolicy::A16Only; }
         for (const auto& [role, binding] : use.auxiliaries) {
             if (role != "activation_input_divisor") {
                 throw artifact::ArtifactError(name + "@" + input + ": unknown auxiliary " + role);
