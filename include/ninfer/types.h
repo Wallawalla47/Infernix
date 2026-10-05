@@ -423,11 +423,44 @@ struct ThinkingControlOptions {
     std::optional<std::uint32_t> budget;
 };
 
+// Most tokens one prompt readout may name.
+inline constexpr std::uint32_t kMaximumReadoutTokens = 256;
+
+// Constrained generation limits: output steps, tokens one step may permit, and distinct
+// multi-token sets one request may use (a one-token step forces that token and needs no set).
+inline constexpr std::uint32_t kMaximumConstraintSteps   = 64;
+inline constexpr std::uint32_t kMaximumConstraintChoices = 16;
+inline constexpr std::uint32_t kMaximumConstraintSets    = 4;
+
+// Output step i may only produce a token of steps[i]; a one-token step forces it. Generation
+// stops after the last step at the latest, so requested_output_tokens must not exceed the step
+// count. Sampling still chooses among the permitted tokens (greedy picks the most probable).
+struct TokenConstraint {
+    std::vector<std::vector<TokenId>> steps;
+
+    [[nodiscard]] bool empty() const noexcept { return steps.empty(); }
+};
+
+// One constrained output token and the model's distribution over its step's permitted tokens.
+struct ConstrainedDraw {
+    TokenId token = 0;
+    // Renormalized over the step's permitted tokens, in the step's order (temperature 1, before
+    // penalties).
+    std::vector<float> probabilities;
+    // The permitted tokens' share of the whole next-token distribution.
+    float mass = 0.0F;
+};
+
 struct ExecutionOptions {
     SamplingOverrides sampling;
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
+    // Distinct public tokens whose log-probabilities at the prompt's next position the request
+    // reports as GenerationResult::readout, at most kMaximumReadoutTokens. Empty requests none.
+    std::vector<TokenId> readout_tokens;
+    // Restricts each output token to its step's permitted set. Empty constrains nothing.
+    TokenConstraint constraint;
 };
 
 struct OutputOptions {
@@ -707,10 +740,20 @@ private:
     RequestErrorKind kind_;
 };
 
+// A submitted image's or video's display size in pixels, before any Vision resizing.
+struct MediaGeometry {
+    std::int32_t width  = 0;
+    std::int32_t height = 0;
+
+    [[nodiscard]] friend bool operator==(MediaGeometry, MediaGeometry) noexcept = default;
+};
+
 struct PromptSummary {
     bool starts_in_reasoning    = false;
     std::uint32_t prompt_tokens = 0;
     bool has_media              = false;
+    // One entry per media item, in prompt order.
+    std::vector<MediaGeometry> media;
 };
 
 struct PromptPreparationStats {
@@ -1021,6 +1064,15 @@ struct NgramArchiveStats {
     std::optional<std::uint64_t> sampling_seed;
 };
 
+// The next-token distribution after the whole prompt, read before the first output token.
+struct PromptReadout {
+    // log p(readout_tokens[i] | prompt) over the model's public tokens, in request order.
+    std::vector<float> logprobs;
+    // The unrestricted most probable next token and its log-probability.
+    TokenId top_token = 0;
+    float top_logprob = 0.0F;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1044,6 +1096,10 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
+    // Present exactly when the request named readout tokens and its prompt completed.
+    std::optional<PromptReadout> readout;
+    // One entry per generated token of a constrained request, in output order.
+    std::vector<ConstrainedDraw> constrained_draws;
 };
 
 struct ArenaMemorySummary {

@@ -25,6 +25,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sigmoid_gate_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/silu_and_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/token_constraint.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/top_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
@@ -52,6 +53,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/sigmoid_mul.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/token_constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/top_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )

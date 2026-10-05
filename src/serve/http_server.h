@@ -1,6 +1,7 @@
 #pragma once
 
 #include "serve/console_stats.h"
+#include "serve/decide.h"
 #include "serve/generation_service.h"
 #include "serve/metrics.h"
 #include "serve/operational_log.h"
@@ -93,6 +94,7 @@ private:
     void handle_chat_completions(const httplib::Request& req, httplib::Response& res);
     void handle_messages(const httplib::Request& req, httplib::Response& res);
     void handle_count_tokens(const httplib::Request& req, httplib::Response& res);
+    void handle_decide(const httplib::Request& req, httplib::Response& res);
     void handle_responses(const httplib::Request& req, httplib::Response& res);
     void handle_response_input_tokens(const httplib::Request& req, httplib::Response& res);
     void handle_response_get(const httplib::Request& req, httplib::Response& res);
@@ -119,6 +121,8 @@ private:
     ServeOptions options_;
     std::string public_model_id_;
     ninfer::ModelMetadata model_metadata_;
+    // /v1/decide answer labels, computed from the loaded tokenizer when the service attaches.
+    std::vector<DecideLabel> decide_labels_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
     JsonlRequestLog request_jsonl_;

@@ -90,6 +90,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
 `http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
@@ -888,6 +889,107 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Decisions
+
+`POST /v1/decide` answers typed questions about one piece of evidence by reading the model's
+next-token distribution where the answer would start: each option is named by a single-token label
+(`A`-`Z`, `a`-`z`, `0`-`9`, then the uppercase bigrams the tokenizer encodes as one token), and the
+answer is those labels' probabilities. Nothing is generated for these answers (`noul`, `choice`,
+`score`), so such a question costs one prefill; `number`, `scalar`, `point` and `box` generate a
+constrained digit chain (below). The wire shape is TypeSafe Jev's `POST /v1/systemone` (also served at that path), as served
+by [ignis](https://github.com/gpillon/ignis); the prompt is the one ignis measured its accuracy with
+(0.934 balanced accuracy over 144 authored decisions on the 27B, the declared labels holding a median
+99.8 % of the distribution), byte for byte.
+
+```bash
+curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
+  "state": "Help! My payouts have been failing for 3 days.",
+  "questions": {
+    "queue": {"type": "choice", "instructions": "Which queue should this ticket land in?",
+              "criteria": {"payouts": "Money leaving the account",
+                           "billing": "Money coming in",
+                           "fraud": "Suspected fraud or account takeover"}},
+    "urgent": {"type": "noul", "instructions": "Is the customer blocked right now?"},
+    "mood": {"type": "score", "instructions": "How upset is the customer?",
+             "criteria": ["calm", "annoyed", "angry", "furious"]}}}'
+```
+
+```json
+{"model": "qwen3.6-27b",
+ "answers": {
+   "queue": {"type": "choice", "choice": "payouts", "confidence": 0.98,
+             "probabilities": {"payouts": 0.98, "billing": 0.01, "fraud": 0.01},
+             "answer_mass": 0.999},
+   "urgent": {"type": "noul", "noul": 0.93, "answer_mass": 0.998},
+   "mood": {"type": "score", "score": 1.62, "confidence": 0.71,
+            "legend": {"0": "calm", "1": "annoyed", "2": "angry", "3": "furious"},
+            "probabilities": {"0": 0.01, "1": 0.36, "2": 0.6, "3": 0.03},
+            "answer_mass": 0.997}},
+ "usage": {"input_tokens": 393, "output_tokens": 0, "cached_input_tokens": 220,
+           "computed_prefill_tokens": 173}}
+```
+
+(Values illustrative.)
+
+- **`state`** is a string, JSON object or array, or OpenAI content parts (an array whose every
+  element is an object with a string `type`), so the evidence may include images. Object key order
+  is kept: the model reads the evidence in the order it was written.
+- **`questions`** maps ids of your choosing to questions, answered under the same ids in the same
+  order. A question has `type`, `instructions` (alias `question`: a string, object or array) and
+  `criteria` (alias `options`):
+  - `noul`: optional `{"true": description, "false": description}` (defaults `Yes`, `No`); answers
+    `noul`, the true option's probability.
+  - `choice`: an object of option name to description, `null` meaning the name describes itself;
+    answers `choice`, the per-option `probabilities` and `confidence`, the top probability.
+  - `score`: an ordered array of at least two level descriptions; answers `score`, the expected level
+    index (it can land between levels), a `legend`, the `probabilities` and `confidence`,
+    `1 - standard deviation / half the level range` (an even split between adjacent levels is
+    confident; one between the extremes is not).
+- **Generated primitives** write their answer under a token constraint: every output step may only
+  produce the tokens the schedule permits (a digit, or the one token of a forced literal such as
+  `{"x":`), so the run cannot leave the answer's shape. They cost a prefill plus one output token per
+  step, verified speculatively like any other generation. Each takes `instructions` and an optional
+  `digits`, and answers with the per-digit trace (`digits`: each digit and its probability among the
+  ten) and an `uncertainty` in units of the value, `sum((1 - p) * 10^place)` — the model's own
+  statement of its resolution, not a bound:
+  - `number`: a whole number in a field of `digits` digits (1-6, default 3), right-aligned and padded
+    with zeros, which carry no uncertainty; answers `number`.
+  - `scalar`: a number of at most `digits` digits (1-15, default 8) that may be negative or have a
+    decimal part, closed by the model with `}`; answers `value`, the `text` the model wrote, and the
+    errors `malformed_scalar`, `too_many_digits` or `run_cut_short` instead of a guess. Unlike ignis,
+    the colon after `{"value` is a choice between `":` and `":-`, the single token the tokenizer
+    writes for a colon followed by a minus sign: ignis forces `":` and offers a separate `-`, a
+    sequence the model almost never writes, which left a negative answer about 1 % of the mass.
+  - `point` and `box`: a position (`x`, `y`) or bounding box (`x0`, `y0`, `x1`, `y1`) on a
+    0-`10^digits - 1` scale over the state's one image (`digits` 1-6, default 3), answered in that
+    image's own `pixels` (each axis rescaled by its own side) beside the `normalized` reading, with
+    `method: "chain"`. A state without exactly one image is refused (`spatial_needs_one_image`).
+  Their prompts are ignis's texts (`point` at three digits is the one its pointing measurements
+  used); `answer_mass` is the lowest share of the distribution any chosen step's tokens held.
+- **Option order is part of the prompt**: each option is shown under the label at its position, so
+  reordering options asks a different question.
+- **`answer_mass`** is the declared labels' share of the whole next-token distribution. Near 1 the
+  model answered inside the declared set; a low mass means the probabilities are renormalized noise,
+  however plausible the winner looks. `confidence` is not calibrated beyond what ignis measured on
+  its authored set (every answer above 0.9 correct).
+- **Validation is all-or-nothing** before any prefill: a malformed question, more than 256 options
+  (the width ignis measured without decay) or more than the tokenizer can label, an empty
+  instruction, an unknown question field, `digits` on a readout or `criteria` on a generated type,
+  digits out of range, or a type not listed here (`question_type_unsupported`; ignis's
+  attention-read `locate` and head-based `point`/`box` are not served) refuses the whole request with
+  HTTP 400. Thinking is refused (`thinking_unsupported`): the answer
+  is read where the prompt ends, where a thinking prompt opens a reasoning block.
+- **Evidence placement and reuse.** JSON evidence follows the instruction in the system message, and
+  content parts lead the user turn and end at an explicit prefix-cache boundary. The first question
+  runs alone; the rest run in waves of `--max-concurrency` and resume from the cached evidence, so
+  N questions over one state (an image included) prefill and encode it once.
+  `usage.cached_input_tokens` and `usage.computed_prefill_tokens` show the split.
+- **Failures after validation are per question**: a question that fails during execution answers
+  `{"type": "error", "code", "message"}` beside its siblings' answers. A request whose every
+  question failed returns the first question's error status instead.
+- Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
+  readout with one staged output token that is never returned, a generated primitive with its run.
 
 ## Authentication and CORS
 

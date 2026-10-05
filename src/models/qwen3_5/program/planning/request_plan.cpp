@@ -92,6 +92,36 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     validate_sampling(options.sampling);
+    for (const TokenId id : options.readout_tokens) {
+        if (id < 0 || id >= execution::dimension(parameters.model.resources().public_token_count)) {
+            throw std::invalid_argument("readout token is outside the public token domain");
+        }
+    }
+    RequestConstraintPlan constraint;
+    for (const std::vector<TokenId>& step : options.constraint.steps) {
+        if (step.empty() || step.size() > kMaximumConstraintChoices) {
+            throw std::invalid_argument("constraint step has an invalid token count");
+        }
+        for (const TokenId id : step) {
+            if (id < 0 ||
+                id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                throw std::invalid_argument("constraint token is outside the public token domain");
+            }
+        }
+        if (step.size() == 1) {
+            constraint.step_descriptors.push_back(-2 - step.front());
+            continue;
+        }
+        auto set = std::find(constraint.sets.begin(), constraint.sets.end(), step);
+        if (set == constraint.sets.end()) {
+            if (constraint.sets.size() == kMaximumConstraintSets) {
+                throw std::invalid_argument("constraint uses too many distinct token sets");
+            }
+            set = constraint.sets.insert(constraint.sets.end(), step);
+        }
+        constraint.step_descriptors.push_back(
+            static_cast<std::int32_t>(set - constraint.sets.begin()));
+    }
     if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
         rewrite &&
         (rewrite->recovery_frontier == 0 || rewrite->recovery_frontier > rewrite->frontier ||
@@ -111,6 +141,9 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
                                                ? FinishReason::OutputLimit
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
+    base->readout_tokens                 = options.readout_tokens;
+    if (!constraint.empty()) { constraint.serial = next_constraint_serial_++; }
+    base->constraint = std::move(constraint);
     base->allow_prefix_reuse             = options.allow_prefix_reuse && prompt.identity.reusable;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;

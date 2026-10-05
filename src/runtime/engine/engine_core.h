@@ -792,6 +792,8 @@ private:
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
+        result.readout                 = std::move(request->readout);
+        result.constrained_draws       = std::move(request->constrained_draws);
         if (request->ngram_archive) {
             result.ngram_archive.bound = true;
             if (reason != FinishReason::Cancelled &&
@@ -908,6 +910,7 @@ private:
             request->continuation_owner = 0;
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
+            request->constrained_draws  = std::move(finished.constrained_draws);
             request->terminal_reason.reset();
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -1332,6 +1335,7 @@ private:
         }
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
+        request->readout         = std::move(progress.readout);
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);

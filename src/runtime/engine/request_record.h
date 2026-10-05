@@ -213,6 +213,8 @@ struct RequestRecord {
     std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
+    std::optional<PromptReadout> readout;
+    std::vector<ConstrainedDraw> constrained_draws;
 
     std::mutex mutex;
     std::condition_variable cv;

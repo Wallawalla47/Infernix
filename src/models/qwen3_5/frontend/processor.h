@@ -49,9 +49,16 @@ struct TokenSpan {
     std::size_t count = 0;
 };
 
+// The submitted media's display size, before Vision resizing.
+struct VisionSource {
+    int width  = 0;
+    int height = 0;
+};
+
 struct VisionItem {
     Modality modality = Modality::Image;
     VisionGrid grid;
+    VisionSource source;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
     std::array<std::uint8_t, 32> content_digest{};

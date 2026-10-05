@@ -946,6 +946,10 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 
 } // namespace
 
+void parse_openai_message_content(const Json& content, ChatTurn& turn, std::size_t index) {
+    parse_content_parts(content, turn, index);
+}
+
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);

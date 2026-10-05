@@ -31,6 +31,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.state_destination_slots, envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
+    // Constrained rows (chain rows only) restrict their columns before any acceptance reads the
+    // logits or the precomputed greedy argmax.
+    qwen3_5::constrain_round_logits(
+        execution.io, frame.target_logits, &frame.target_tokens,
+        dimension(execution.parameters.model.resources().public_token_count),
+        execution.device.stream);
     if (tree) {
         card.set_verification_tree(nullptr, nullptr);
         const cudaStream_t stream = execution.device.stream;

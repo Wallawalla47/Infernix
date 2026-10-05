@@ -199,6 +199,13 @@ struct GenerationRequest {
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
+    // Tokens whose log-probabilities at the prompt's next position the outcome reports
+    // (/v1/decide). Empty for every ordinary generation.
+    std::vector<ninfer::TokenId> readout_tokens;
+    // Restricts each output token to its step's set (/v1/decide's generated primitives).
+    ninfer::TokenConstraint constraint;
+    // Tokens that end generation once committed (a scalar's closing brace).
+    std::vector<ninfer::TokenId> stop_token_ids;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

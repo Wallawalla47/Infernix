@@ -32,6 +32,10 @@ struct OpenAIChatRequest {
 OpenAIChatRequest parse_chat_completion_request(const RequestJson& body,
                                                 const RequestLimits& limits);
 
+// Appends a Chat Completions message content value (a string or content parts) to `turn`, whose
+// role decides which media parts are accepted; `index` names the message in errors.
+void parse_openai_message_content(const RequestJson& content, ChatTurn& turn, std::size_t index);
+
 struct OpenAIChatResponseIdentity {
     std::string id;
     std::string model;

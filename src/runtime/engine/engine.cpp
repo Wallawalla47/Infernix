@@ -37,13 +37,60 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
         throw std::invalid_argument("thinking budget must be positive");
     }
+    const std::vector<TokenId>& readout = options.execution.readout_tokens;
+    if (readout.size() > kMaximumReadoutTokens) {
+        throw std::invalid_argument("readout names more than kMaximumReadoutTokens tokens");
+    }
+    if (!readout.empty() && options.execution.requested_output_tokens == 0) {
+        // The readout is taken where the first output token is chosen.
+        throw std::invalid_argument("readout requires at least one requested output token");
+    }
+    std::vector<TokenId> distinct = readout;
+    std::ranges::sort(distinct);
+    if (std::ranges::adjacent_find(distinct) != distinct.end()) {
+        throw std::invalid_argument("readout tokens must be distinct");
+    }
+    const TokenConstraint& constraint = options.execution.constraint;
+    if (!constraint.empty()) {
+        if (constraint.steps.size() > kMaximumConstraintSteps) {
+            throw std::invalid_argument("constraint has more than kMaximumConstraintSteps steps");
+        }
+        if (options.execution.thinking.budget) {
+            // The budget's injected close would occupy steps the constraint owns.
+            throw std::invalid_argument("constraint cannot be combined with a thinking budget");
+        }
+        if (options.execution.requested_output_tokens > constraint.steps.size()) {
+            throw std::invalid_argument("constraint has fewer steps than requested output tokens");
+        }
+        std::vector<std::vector<TokenId>> sets;
+        for (const std::vector<TokenId>& step : constraint.steps) {
+            if (step.empty() || step.size() > kMaximumConstraintChoices) {
+                throw std::invalid_argument(
+                    "constraint step must permit 1 to kMaximumConstraintChoices tokens");
+            }
+            std::vector<TokenId> sorted = step;
+            std::ranges::sort(sorted);
+            if (std::ranges::adjacent_find(sorted) != sorted.end()) {
+                throw std::invalid_argument("constraint step tokens must be distinct");
+            }
+            if (step.size() > 1 && std::ranges::find(sets, step) == sets.end()) {
+                sets.push_back(step);
+            }
+        }
+        if (sets.size() > kMaximumConstraintSets) {
+            throw std::invalid_argument(
+                "constraint uses more than kMaximumConstraintSets distinct multi-token steps");
+        }
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
-    resolved.stop                              = std::move(options.stop);
+    resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
+    resolved.execution.constraint              = std::move(options.execution.constraint);
+    resolved.stop                            = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.ngram_session                     = std::move(options.ngram_session);
     return resolved;
@@ -387,6 +434,19 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
     runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
         impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
     const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
+    const auto in_domain = [&](TokenId id) {
+        return id >= 0 && static_cast<std::uint64_t>(id) < impl_->model_metadata.vocab_size;
+    };
+    for (const TokenId id : resolved_options.execution.readout_tokens) {
+        if (!in_domain(id)) {
+            throw std::invalid_argument("readout token is outside the tokenizer domain");
+        }
+    }
+    for (const auto& step : resolved_options.execution.constraint.steps) {
+        if (!std::ranges::all_of(step, in_domain)) {
+            throw std::invalid_argument("constraint token is outside the tokenizer domain");
+        }
+    }
 
     const PromptSummary prompt_summary = prompt.impl_->summary;
     if (prompt_summary.prompt_tokens > impl_->options.max_context) {

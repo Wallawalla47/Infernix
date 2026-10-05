@@ -4,8 +4,10 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/token_constraint.h"
 #include "ninfer/types.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -188,8 +190,22 @@ struct DFlashDecodeStateLayout {
     std::optional<TensorRegion> tree_masks;
 };
 
+// Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
+// descriptors of the round being executed and the probability records it produces.
+struct TokenConstraintStateLayout {
+    TensorRegion choices;
+    TensorRegion counts;
+    TensorRegion descriptors;
+    TensorRegion records;
+};
+
+// Most logits columns one round constrains: every row at the widest verification.
+inline constexpr std::int32_t kTokenConstraintColumns = static_cast<std::int32_t>(
+    kMaximumConcurrency * std::max(kDFlashVerifyMaximumWidth, kMtpVerifyMaximumWidth));
+
 struct RoundStateLayout {
     RoundStateSpec spec;
+    std::optional<TokenConstraintStateLayout> constraint;
     std::optional<OrdinaryDecodeStateLayout> ordinary;
     TensorRegion token;
     TensorRegion pos;
@@ -344,8 +360,28 @@ struct DFlashDecodeState {
     [[nodiscard]] DFlashDecodeState narrowed(std::uint32_t k) const;
 };
 
+struct TokenConstraintState {
+    // I32 [kTokenConstraintChoices, lanes * kMaximumConstraintSets]: set s of lane l is column
+    // l * kMaximumConstraintSets + s; counts is I32 [lanes * kMaximumConstraintSets].
+    Tensor choices;
+    Tensor counts;
+    // I32 [kTokenConstraintColumns], -1 where unconstrained (ops::constrain_logits encoding).
+    Tensor descriptors;
+    // FP32 [kTokenConstraintRecord, kTokenConstraintColumns].
+    Tensor records;
+
+    // The first `columns` descriptors and records, for a logits view of that many columns.
+    [[nodiscard]] Tensor descriptor_view(std::int32_t columns) const {
+        return descriptors.slice(0, 0, columns);
+    }
+    [[nodiscard]] Tensor record_view(std::int32_t columns) const {
+        return records.slice(1, 0, columns);
+    }
+};
+
 struct RoundState {
     std::optional<OrdinaryDecodeState> ordinary;
+    std::optional<TokenConstraintState> constraint;
     Tensor token;
     Tensor pos;
     Tensor rope_pos;
@@ -361,5 +397,11 @@ struct RoundState {
     RoundState() = default;
     RoundState(DeviceSpan backing, const RoundStateLayout& layout);
 };
+
+// Applies the staged constraint descriptors to `logits` ([rows,C], or [rows,K+1,B] viewed as
+// C = (K+1)*B columns) before a sampler or acceptance reads it; `argmax` (I32, C elements, or
+// null) is a precomputed greedy choice to keep consistent. No-op without constraint controls.
+void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,
+                            std::int32_t token_domain, cudaStream_t stream);
 
 } // namespace ninfer::models::qwen3_5

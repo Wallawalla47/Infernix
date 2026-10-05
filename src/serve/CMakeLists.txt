@@ -4,6 +4,8 @@ add_library(ninfer_serve STATIC
   openai_chat_request.cpp
   openai_chat_response.cpp
   openai_chat_http.cpp
+  decide.cpp
+  decide_http.cpp
   openai_common.cpp
   openai_responses_request.cpp
   openai_responses_state.cpp

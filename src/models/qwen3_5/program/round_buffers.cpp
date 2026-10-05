@@ -83,6 +83,18 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     if (!spec.causal_scoring) {
         layout.backend_kv_table_row =
             add_tensor(builder, DType::I32, {1}, "step backend KV table row");
+        constexpr auto sets =
+            static_cast<std::int32_t>(kMaximumConcurrency * kMaximumConstraintSets);
+        TokenConstraintStateLayout& constraint = layout.constraint.emplace();
+        constraint.choices     = add_tensor(builder, DType::I32,
+                                            {ops::kTokenConstraintChoices, sets},
+                                            "constraint choices");
+        constraint.counts      = add_tensor(builder, DType::I32, {sets}, "constraint counts");
+        constraint.descriptors = add_tensor(builder, DType::I32, {kTokenConstraintColumns},
+                                            "constraint descriptors");
+        constraint.records     = add_tensor(builder, DType::FP32,
+                                            {ops::kTokenConstraintRecord, kTokenConstraintColumns},
+                                            "constraint records");
     }
     return layout;
 }
@@ -468,6 +480,29 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
 }
 
+void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,
+                            std::int32_t token_domain, cudaStream_t stream) {
+    if (!io.constraint) { return; }
+    const std::int32_t rows    = logits.ne[0];
+    const std::int64_t columns = static_cast<std::int64_t>(logits.ne[1]) * logits.ne[2] *
+                                 logits.ne[3];
+    if (columns <= 0 || columns > kTokenConstraintColumns) {
+        throw std::logic_error("constrained logits are wider than the descriptor table");
+    }
+    const auto count = static_cast<std::int32_t>(columns);
+    Tensor matrix(logits.data, DType::BF16, {rows, count});
+    Tensor descriptors = io.constraint->descriptor_view(count);
+    Tensor records     = io.constraint->record_view(count);
+    if (argmax != nullptr) {
+        Tensor flat(argmax->data, DType::I32, {count});
+        ops::constrain_logits(matrix, &flat, descriptors, io.constraint->choices,
+                              io.constraint->counts, token_domain, records, stream);
+    } else {
+        ops::constrain_logits(matrix, nullptr, descriptors, io.constraint->choices,
+                              io.constraint->counts, token_domain, records, stream);
+    }
+}
+
 RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     if (!layout.complete) { throw std::invalid_argument("RoundState layout is incomplete"); }
     if (layout.ordinary) {
@@ -481,6 +516,14 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         rope_pos             = layout.rope_pos.bind(backing);
         logits               = layout.logits.bind(backing);
         backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
+    }
+    if (layout.constraint) {
+        constraint.emplace(TokenConstraintState{
+            .choices     = layout.constraint->choices.bind(backing),
+            .counts      = layout.constraint->counts.bind(backing),
+            .descriptors = layout.constraint->descriptors.bind(backing),
+            .records     = layout.constraint->records.bind(backing),
+        });
     }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }
