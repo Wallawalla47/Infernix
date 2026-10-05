@@ -3,6 +3,8 @@
 
 #include "ops/qsa/qsa_select.h"
 
+#include "ops/qsa/page_spaces.cuh"
+
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/pdl.cuh"
@@ -61,10 +63,12 @@ static_assert(kQsaSelectGroupColumns <= 256, "ScoreTiles stores group-relative c
 
 // Same addressing as qsa.cu's pool and attention kernels: the pooled key of block b fills the R
 // token slots of its block, slot_width = Di / R elements each.
-__device__ __forceinline__ std::int64_t pooled_offset(const std::int32_t* table, int token, int slot_width,
-                                                      int slot) {
-    const int page = table[token >> kPagedKVPageShift];
-    return static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
+// A page id's space is resolved (design §19.3.11): the pool's pooled plane or the spaces' array.
+__device__ __forceinline__ const bf16* pooled_element(const bf16* pool, const QsaPageSpaces& spaces,
+                                                      const std::int32_t* table, int token, int slot_width, int slot) {
+    int page;
+    const bf16* plane = qsa_pooled_plane(spaces, pool, table[token >> kPagedKVPageShift], page);
+    return plane + static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * page +
            static_cast<std::int64_t>(slot_width) * (token & kPagedKVPageMask) + slot;
 }
 
@@ -105,7 +109,7 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
                      const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
                      int width, int ratio, int top_blocks, int group_begin, const ScoreTiles tiles,
                      float* __restrict__ scores, int score_stride, std::uint32_t* __restrict__ clear,
-                     int clear_words) {
+                     int clear_words, QsaPageSpaces spaces) {
     pdl::enter_streaming();
     if (clear != nullptr) {
         const std::int64_t ctas = static_cast<std::int64_t>(gridDim.x) * gridDim.y;
@@ -161,19 +165,20 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
 #pragma unroll
                 for (int j = 0; j < kLanePartials; ++j) { key[bb][j] = 0.0F; }
             } else if (block_in_page) {
-                const std::int64_t page =
-                    static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * table[(ratio * b) >> kPagedKVPageShift];
+                int local;
+                const bf16* plane = qsa_pooled_plane(spaces, pooled, table[(ratio * b) >> kPagedKVPageShift], local);
+                const std::int64_t page = static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * local;
 #pragma unroll
                 for (int j = 0; j < kLanePartials; ++j) {
                     const int token = ratio * b + token_offset[j];
-                    key[bb][j] = __bfloat162float(pooled[page + static_cast<std::int64_t>(slot_width) *
-                                                                    (token & kPagedKVPageMask) + slot[j]]);
+                    key[bb][j] = __bfloat162float(plane[page + static_cast<std::int64_t>(slot_width) *
+                                                                   (token & kPagedKVPageMask) + slot[j]]);
                 }
             } else {
 #pragma unroll
                 for (int j = 0; j < kLanePartials; ++j) {
                     key[bb][j] = __bfloat162float(
-                        pooled[pooled_offset(table, ratio * b + token_offset[j], slot_width, slot[j])]);
+                        *pooled_element(pooled, spaces, table, ratio * b + token_offset[j], slot_width, slot[j]));
                 }
             }
         }
@@ -633,7 +638,8 @@ QsaSelectScores qsa_select_scores(const void* scratch, const QsaGeometry& geomet
 
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
-                std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream) {
+                std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
+                const QsaPageSpaces& spaces) {
     const std::int32_t columns = batch.batch * batch.width;
     require(geometry.index_head_dim == kIndexDim && geometry.index_heads >= 1 &&
                 geometry.index_heads <= kScoreHeadSlots && geometry.ratio > 1 && kIndexDim % geometry.ratio == 0 &&
@@ -678,7 +684,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
                                          dim3(kScoreThreads), 0, stream},
                                         qsa_score_kernel, index, geometry.index_heads, pooled, tables, table_stride,
                                         rows, positions, batch.width, geometry.ratio, top_blocks, begin, tiles,
-                                        scores, l.stride, state, l.group * (kScoreBins + 1)));
+                                        scores, l.stride, state, l.group * (kScoreBins + 1), spaces));
         const int slices = std::clamp(std::min(ceil_div(max_blocks, kSliceBlocks), ceil_div(std::int64_t{4} * sms, n)),
                                       1, kMaxSlices);
         CUDA_CHECK(pdl::launch_consumer({dim3(static_cast<unsigned>(slices), static_cast<unsigned>(n)),

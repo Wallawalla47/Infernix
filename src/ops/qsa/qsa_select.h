@@ -54,10 +54,12 @@ struct QsaSelectOutput {
 };
 
 /// index_q: BF16 [Di, index_heads, T] from qsa_index_query; pooled_pages: the layer's BF16 pooled
-/// plane holding every block the columns see.
+/// plane holding every block the columns see; `spaces`: the layer's pages outside the pool, whose
+/// pooled keys live in spaces.pooled (design §19.3.11; none by default).
 void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatch& batch,
                 const QsaGeometry& geometry, std::int32_t max_context, void* scratch,
-                std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream);
+                std::size_t scratch_bytes, const QsaSelectOutput& output, cudaStream_t stream,
+                const QsaPageSpaces& spaces = {});
 
 /// After qsa_select, the FP32 scores of its last group: column c of the group (c counted from
 /// the group's first column) holds block b at scores[c * stride + b] for b < its block count.
