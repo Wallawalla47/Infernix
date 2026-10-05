@@ -41,6 +41,8 @@ public:
         std::uint64_t routed     = 0; // routed (layer, expert) uses, summed over rounds' groups
         std::uint64_t hits       = 0; // of those, resident in a frame at the round's start
         std::uint64_t promotions = 0; // expert copies issued
+        std::uint64_t lent_frames    = 0; // frames lent now
+        std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
     };
 
     // banks[l]: layer l's pinned host records (record_stride bytes apart). max_columns: the most
@@ -63,13 +65,33 @@ public:
         std::uint64_t spilled = 0;     // bytes of a chunk the driver placed in system memory (given back)
         bool refused          = false; // the device had no memory for the next chunk
     };
-    // Backs `frames` frames (clamped to frame_limit()). Call only between rounds, with nothing in
-    // flight on the compute stream: promotion copies are waited for, then a shrink evicts the
+    // Backs `frames` frames (clamped to frame_limit()); unchanged while frames are lent. Call only
+    // between rounds, with nothing in flight on the compute stream: promotion copies are waited for,
+    // then a shrink evicts the
     // lowest-score experts, moves the survivors above the new top below it on `compute` and
     // releases the top chunks; a grow maps chunks one at a time, stops at the first the driver
     // refuses or places in system memory (`vram` tells), and fills the new frames from the queue.
     // Without VMM only the first call allocates.
     Resize resize(std::uint32_t frames, cudaStream_t compute, VramBudgetSource& vram);
+    // Frame lending (design §19.3.2, "Frame lending"): a contiguous run of frames serves another use
+    // of device memory (the Vision window) and comes back. Lent frames hold no expert and are never
+    // resized; decode graphs reach frames through the tables, so lending invalidates none.
+    struct FrameLease {
+        std::uint32_t first = 0, count = 0;
+        DeviceSpan memory; // the run's bytes
+        [[nodiscard]] bool valid() const noexcept { return count != 0; }
+    };
+    // Frames that may be lent now: backed, not lent, above the quarter serving always keeps.
+    [[nodiscard]] std::uint32_t lendable() const noexcept;
+    // Between rounds (no round in flight): evicts the experts of the cheapest run of `count` frames
+    // (avoiding frames that in-flight promotions target while it can), uploads the table on
+    // `compute`, and makes `compute` and every `writers` stream wait for each in-flight promotion
+    // batch that targets the run.
+    FrameLease lend(std::uint32_t count, cudaStream_t compute, std::span<const cudaStream_t> writers);
+    // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
+    // its frames start after `compute` reaches this point.
+    void give_back(FrameLease& lease, cudaStream_t compute);
+
     // Whether the pool can resize after its first size (VMM).
     [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
     [[nodiscard]] std::uint32_t frame_limit() const noexcept { return limit_; }
@@ -134,7 +156,11 @@ private:
     cudaEvent_t table_ready_  = nullptr;
     struct Batch {
         cudaEvent_t done = nullptr;
-        std::vector<std::pair<std::uint32_t, std::uint32_t>> loads; // (key, frame)
+        struct Load {
+            std::uint32_t key, frame;
+            std::uint64_t serial;
+        };
+        std::vector<Load> loads;
     };
     std::vector<Batch> in_flight_;
     std::vector<cudaEvent_t> spare_events_;
