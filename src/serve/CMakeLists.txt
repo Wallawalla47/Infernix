@@ -22,6 +22,7 @@ add_library(ninfer_serve STATIC
   http_server.cpp
   openai_responses_http.cpp
   serve_options.cpp
+  stop_control.cpp
 )
 ninfer_internal_includes(ninfer_serve)
 target_link_libraries(ninfer_serve

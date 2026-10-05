@@ -6,6 +6,9 @@
 #include "models/qwen3_5/measurement.h"
 
 #include <algorithm>
+#include <system_error>
+#include <string>
+#include <filesystem>
 #include <chrono>
 #include <map>
 #include <set>
@@ -73,6 +76,54 @@ void validate_options(const EngineOptions& options) {
     }
 }
 
+// The hybrid index ranks admission sources and values snapshots with the same calibrated
+// prefill and Host-to-Device coefficients as the original cache's ResourceManager.
+// Uncalibrated (zero) terms keep the index's generic defaults.
+prefix_cache::CacheCostModel hybrid_cache_cost(const ContextMachineCostModel& model) {
+    constexpr double kSecondsPerNs = 1.0e-9;
+    constexpr double kQ32          = 4294967296.0;
+    prefix_cache::CacheCostModel cost;
+    if (model.prefill.chunk_ns != 0) {
+        cost.chunk_seconds = static_cast<double>(model.prefill.chunk_ns) * kSecondsPerNs;
+    }
+    if (model.prefill.token_ns_q32 != 0) {
+        cost.token_seconds = static_cast<double>(model.prefill.token_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    if (model.prefill.attention_pair_ns_q32 != 0) {
+        cost.attention_pair_seconds =
+            static_cast<double>(model.prefill.attention_pair_ns_q32) / kQ32 * kSecondsPerNs;
+    }
+    const ContextTransferCost& h2d =
+        model.transfer[static_cast<std::size_t>(ContextTransferDirection::HostToDevice)];
+    if (h2d.ns_per_byte_q32 != 0) {
+        cost.h2d_bytes_per_second =
+            1.0 / (static_cast<double>(h2d.ns_per_byte_q32) / kQ32 * kSecondsPerNs);
+    }
+    if (h2d.batch_ns != 0) {
+        cost.transfer_batch_seconds = static_cast<double>(h2d.batch_ns) * kSecondsPerNs;
+    }
+    return cost;
+}
+
+// Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
+// file records itself): the exact artifact, its execution signature, the KV and speculative
+// formats, RoPE scaling and the product binary's build identity. Any difference makes the saved
+// state meaningless, so the file is ignored.
+std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature) {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(options.artifact_path, error);
+    const auto time = std::filesystem::last_write_time(options.artifact_path, error);
+    std::string out = "artifact=" + std::filesystem::absolute(options.artifact_path).string();
+    out += ";size=" + std::to_string(error ? 0U : size);
+    out += ";mtime=" + std::to_string(error ? 0 : time.time_since_epoch().count());
+    out += ";signature=" + signature;
+    out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
+    out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
+    out += ";yarn=" + std::to_string(options.rope_yarn_factor);
+    out += ";build=" + options.context_cache.hybrid.persistent_identity;
+    return out;
+}
+
 std::size_t current_free_device_bytes() {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
@@ -117,7 +168,49 @@ EngineOptions normalize_engine_options(EngineOptions options) {
                                     "archive capacity");
     }
     const std::uint32_t concurrency = options.max_concurrency;
-    cache.device_state_slots        = cache.device_state_slots.value_or(concurrency);
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
+        if (cache.device_state_slots) {
+            throw std::invalid_argument(
+                "the hybrid prefix cache sizes its Device state slots with device_snapshot_slots");
+        }
+        // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
+        // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
+        cache.host_capacity_bytes =
+            cache.host_capacity_bytes.value_or(kDefaultHybridHostCacheBytes);
+        const bool host_tier             = *cache.host_capacity_bytes != 0;
+        HybridPrefixCacheOptions& hybrid = cache.hybrid;
+        // One resident snapshot per request lane keeps every live conversation's latest
+        // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
+        // their Host copies are written. Without a Host tier these slots are the only snapshot
+        // storage, so one more is kept for shared prefixes.
+        hybrid.device_snapshot_slots =
+            hybrid.device_snapshot_slots.value_or(concurrency + (host_tier ? 1U : 2U));
+        // Taps without a Host tier would evict other conversations' resident snapshots.
+        hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
+        // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
+        // the chunk: coarser ladders only waste snapshots on taps that share one boundary.
+        const std::uint32_t chunk = std::max<std::uint32_t>(options.prefill_chunk, 64U);
+        hybrid.tap_ladder_tokens =
+            hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * chunk));
+        hybrid.tap_min_gap_tokens =
+            hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, chunk));
+        if (*hybrid.device_snapshot_slots == 0 || *hybrid.device_snapshot_slots > 64) {
+            throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
+        }
+        if (*hybrid.max_new_taps > 64) {
+            throw std::invalid_argument("hybrid taps per request must be at most 64");
+        }
+        if (*hybrid.tap_ladder_tokens < 64 || *hybrid.tap_min_gap_tokens < 64) {
+            throw std::invalid_argument(
+                "hybrid tap ladder and minimum gap must be at least 64 tokens");
+        }
+        // Every lane holds one active sequence; retained context lives in the Program's prefix
+        // index, whose snapshots take the extra Device StateImage slots.
+        cache.device_state_slots = hybrid.device_snapshot_slots;
+    } else {
+        if (cache.mode == ContextCacheMode::Hybrid) { cache.mode = ContextCacheMode::Original; }
+        cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
+    }
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
     if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
@@ -183,6 +276,33 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
                                                         device, options.startup_observer);
+    LoadSummary::PrefixCacheRestore restore;
+    if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid) {
+        instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
+        // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
+        // is kept well inside its queue timeout.
+        instance->program->set_hybrid_coalesce_wait_limit(
+            static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
+        const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        if (!file.empty()) {
+            const models::qwen3_5::HybridCachePersistence loaded =
+                instance->program->attach_hybrid_cache_file(
+                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
+            restore = LoadSummary::PrefixCacheRestore{
+                .attempted           = true,
+                .restored            = loaded.ok,
+                .message             = loaded.message,
+                .blocks              = loaded.blocks,
+                .snapshots           = loaded.snapshots,
+                .bytes               = loaded.bytes,
+                .seconds             = loaded.seconds,
+                .saved_blocks        = loaded.saved_blocks,
+                .saved_snapshots     = loaded.saved_snapshots,
+                .required_host_bytes = loaded.required_host_bytes,
+                .host_bytes          = loaded.host_bytes,
+            };
+        }
+    }
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
@@ -206,6 +326,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.context_cost         = std::move(context_cost.summary);
+    summary.prefix_cache         = std::move(restore);
 
     // Model metadata for /v1/models. The architecture owns the dimension facts; the Engine adds the
     // registered identity and the artifact-measured element and payload totals. The effective

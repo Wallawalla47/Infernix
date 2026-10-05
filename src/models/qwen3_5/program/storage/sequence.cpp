@@ -105,6 +105,7 @@ void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
 void ProgramImpl::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     // The caller settles real GPU readers before reaching this destruction boundary.
     const auto lane = sequence.lane;
+    hybrid_release_lane(lane);
     request.prefill.reset();
     release_sequence_kv(sequence);
     release_sequence_state(sequence);
@@ -147,6 +148,7 @@ void ProgramImpl::commit_sequence_kv(SequenceState& state, std::uint32_t main,
                                      std::uint32_t backend) {
     text_kv_addresses->commit_frontier(state.kv->text, main);
     if (state.kv->backend) { backend_kv_addresses->commit_frontier(*state.kv->backend, backend); }
+    if (hybrid_) { hybrid_publish_blocks(state); }
 }
 
 void ProgramImpl::trim_sequence_kv(SequenceState& state, std::uint32_t main,

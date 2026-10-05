@@ -99,6 +99,10 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
         return "root";
     case ninfer::PrefixReusePath::Checkpoint:
         return "checkpoint";
+    case ninfer::PrefixReusePath::HybridEndpoint:
+        return "hybrid_endpoint";
+    case ninfer::PrefixReusePath::HybridSnapshot:
+        return "hybrid_snapshot";
     }
     return "unknown";
 }

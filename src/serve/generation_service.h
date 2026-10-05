@@ -165,6 +165,9 @@ public:
 
     void warmup();
 
+    // Begins the Engine's orderly stop: running and queued generations fail as Unavailable.
+    void stop() noexcept { engine_->stop(); }
+
 private:
     enum class CacheParticipation : std::uint8_t {
         Disabled,

@@ -74,8 +74,9 @@ BAT_MAX_CONTEXT = "220000"
 # --prefill-chunk 2048 / --ngram-min-match 12; edit here to benchmark your own
 # configuration. The treatment uses all of them; the control uses the subset its
 # --help supports (fork-only flags are dropped automatically). --request-log-jsonl
-# is appended by build_args(). The published run used the fork's original prefix cache,
-# which the fork now selects with --use-original-prefix-caching.
+# is appended by build_args(). The published run used the fork's original prefix cache with
+# explicit Host state/KV and catalog capacities; that cache is now upstream's context cache, which
+# --use-original-prefix-caching selects and --host-context-mib sizes.
 BAT_FLAGS = [
     ("--host", HOST), ("--port", str(PORT)),
     ("--use-original-prefix-caching", None),
@@ -85,15 +86,11 @@ BAT_FLAGS = [
     ("--ngram-draft-tokens", "15"), ("--ngram-min-match", "12"),
     ("--kv-dtype", "int8"),
     ("--preserve-thinking", None),
-    ("--host-kv-mib", "24000"),
+    ("--host-context-mib", "24000"),
     ("--pending-timeout-ms", "900000"),
     ("--prefill-chunk", "2048"),
     ("--kv-capacity", "auto"), ("--vram-headroom-mib", "0"),
     ("--log-colours", "on"),
-    ("--host-state-slots", "64"),
-    ("--max-private-continuations", "32"),
-    ("--max-long-anchors-per-continuation", "8"),
-    ("--max-shared-prefixes", "32"),
     ("--ngram-archive-mib", "2048"),
     ("--ngram-session-mib", "256"),
     ("--ngram-native-sessions", None),

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace ninfer::models::qwen3_5 {
@@ -150,12 +151,6 @@ struct StateImageDeviceSlotView {
     std::optional<CyclicKVCacheSlotView> dflash_local;
 };
 
-/**
- * Caller-backed fixed storage for Qwen3.6 continuation state.
- *
- * Every absolute slot contains common GDN/hidden state and, for a DFlash Program, its local cyclic
- * K/V state. The pool owns neither slot roles nor logical checkpoint identity.
- */
 // One independently transferable part of a StateImage's Host form: one linear-attention layer's
 // conv and recurrent state, or everything else (continuation hidden, DFlash local KV, KV window).
 struct StateImagePart {
@@ -168,6 +163,12 @@ struct StateImagePart {
     std::uint32_t layer = 0;
 };
 
+/**
+ * Caller-backed fixed storage for Qwen3.6 continuation state.
+ *
+ * Every absolute slot contains common GDN/hidden state and, for a DFlash Program, its local cyclic
+ * K/V state. The pool owns neither slot roles nor logical checkpoint identity.
+ */
 class StateImageDevicePool {
 public:
     StateImageDevicePool(DeviceSpan backing, const StateImageDeviceLayout& layout);
@@ -220,6 +221,18 @@ public:
                       cudaStream_t stream = nullptr) const;
     void copy_from_host(HostStateImageConstView source, std::int32_t destination,
                         cudaStream_t stream = nullptr);
+    // Segmented host images: the packed host image byte o lives at
+    // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
+    void copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
+                               std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
+    void copy_from_host_segments(std::span<const std::byte* const> segments,
+                                 std::size_t segment_bytes, std::int32_t destination,
+                                 cudaStream_t stream = nullptr);
+    // One part of the image, so a restore can land the state a forward pass reads first ahead of
+    // the rest.
+    void copy_from_host_segments(std::span<const std::byte* const> segments,
+                                 std::size_t segment_bytes, std::int32_t destination,
+                                 StateImagePart part, cudaStream_t stream);
 
 private:
     void validate_host_layout(const StateImageHostLayout* layout, const std::byte* data) const;

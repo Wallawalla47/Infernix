@@ -2,6 +2,9 @@
 # include root. It proves that the public product headers stand alone.
 add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+# It links the public Engine, as a consumer does, for the out-of-line definitions the options
+# own (PrefixCacheSaveControl); ninfer::engine exports only the include/ root.
+target_link_libraries(ninfer_public_api_test PRIVATE ninfer::engine)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"

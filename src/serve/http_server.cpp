@@ -580,6 +580,9 @@ bool HttpServer::listen() {
     }
 }
 
-void HttpServer::stop() { server_.stop(); }
+void HttpServer::stop() {
+    server_.stop();
+    if (service_ != nullptr) { service_->stop(); }
+}
 
 } // namespace ninfer::serve

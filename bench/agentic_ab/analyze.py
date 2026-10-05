@@ -799,8 +799,7 @@ def main(argv):
     L.append("## Launch parameters\n")
     for a in arms:
         if a == "control":
-            L.append("%s (fork-only flags dropped: %s; the fork's `--host-cache-mib` is replaced "
-                     "by the explicit host-cache flags it resolved to):\n\n```text\n%s\n```\n"
+            L.append("%s (fork-only flags dropped: %s):\n\n```text\n%s\n```\n"
                      % (LABEL[a], ", ".join("`%s`" % d for d in cfg.get("dropped_for_control", [])),
                         flag_str(cfg.get("control_flags", []))))
         else:

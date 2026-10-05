@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -620,6 +621,82 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
         CUDA_CHECK(cudaMemcpyAsync(device, byte_offset(source.data, offset), bytes,
                                    cudaMemcpyHostToDevice, stream));
     });
+}
+
+namespace {
+
+// Visits the pieces of the host byte range [offset, offset + bytes) that fall in each fixed-size
+// segment of a segmented host image.
+template <class Visit>
+void split_segments(std::size_t offset, std::size_t bytes, std::size_t segment_bytes,
+                    Visit&& visit) {
+    std::size_t done = 0;
+    while (done < bytes) {
+        const std::size_t position = offset + done;
+        const std::size_t segment  = position / segment_bytes;
+        const std::size_t within   = position % segment_bytes;
+        const std::size_t count    = std::min(bytes - done, segment_bytes - within);
+        visit(segment, within, done, count);
+        done += count;
+    }
+}
+
+void validate_segments(std::size_t segment_count, std::size_t segment_bytes,
+                       std::size_t image_bytes) {
+    if (segment_bytes == 0 || segment_count == 0 ||
+        segment_count < 1U + (image_bytes - 1U) / segment_bytes) {
+        throw std::invalid_argument("segmented StateImage host copy does not cover the image");
+    }
+}
+
+} // namespace
+
+void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
+                                                 std::span<std::byte* const> segments,
+                                                 std::size_t segment_bytes,
+                                                 cudaStream_t stream) const {
+    validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
+    validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
+    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
+        split_segments(
+            offset, bytes, segment_bytes,
+            [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
+                CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within,
+                                           static_cast<const std::byte*>(device) + done, count,
+                                           cudaMemcpyDeviceToHost, stream));
+            });
+    });
+}
+
+void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                   std::size_t segment_bytes,
+                                                   std::int32_t destination, cudaStream_t stream) {
+    for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
+        copy_from_host_segments(
+            segments, segment_bytes, destination,
+            StateImagePart{.kind = StateImagePart::Kind::LinearLayer, .layer = layer}, stream);
+    }
+    copy_from_host_segments(segments, segment_bytes, destination,
+                            StateImagePart{.kind = StateImagePart::Kind::Rest}, stream);
+}
+
+void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
+                                                   std::size_t segment_bytes,
+                                                   std::int32_t destination, StateImagePart part,
+                                                   cudaStream_t stream) {
+    validate_slot(destination, slot_count(),
+                  "StateImage segmented H2D destination is out of range");
+    validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
+    for_each_host_component(
+        destination, part, [&](void* device, std::size_t offset, std::size_t bytes) {
+            split_segments(
+                offset, bytes, segment_bytes,
+                [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(device) + done,
+                                               segments[segment] + within, count,
+                                               cudaMemcpyHostToDevice, stream));
+                });
+        });
 }
 
 } // namespace ninfer::models::qwen3_5

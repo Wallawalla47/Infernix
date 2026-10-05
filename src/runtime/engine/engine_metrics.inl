@@ -2,8 +2,8 @@
 
 namespace ninfer::runtime {
 
-template <class Instance>
-nvtx::Name EngineCore<Instance>::phase_range_name(EngineHostPhase phase) noexcept {
+template <class Instance, class Manager>
+nvtx::Name EngineCore<Instance, Manager>::phase_range_name(EngineHostPhase phase) noexcept {
     switch (phase) {
     case EngineHostPhase::Boundary:
         return nvtx::Name::EngineBoundary;
@@ -15,16 +15,17 @@ nvtx::Name EngineCore<Instance>::phase_range_name(EngineHostPhase phase) noexcep
     return nvtx::Name::EngineBoundary;
 }
 
-template <class Instance>
-std::uint64_t EngineCore<Instance>::elapsed_ns(Clock::time_point started,
-                                               Clock::time_point finished) noexcept {
+template <class Instance, class Manager>
+std::uint64_t EngineCore<Instance, Manager>::elapsed_ns(Clock::time_point started,
+                                                        Clock::time_point finished) noexcept {
     const auto count =
         std::chrono::duration_cast<std::chrono::nanoseconds>(finished - started).count();
     return count > 0 ? static_cast<std::uint64_t>(count) : 0;
 }
 
-template <class Instance>
-typename EngineCore<Instance>::ActiveExposureSet EngineCore<Instance>::active_exposure_set() const {
+template <class Instance, class Manager>
+typename EngineCore<Instance, Manager>::ActiveExposureSet
+EngineCore<Instance, Manager>::active_exposure_set() const {
     ActiveExposureSet result;
     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
         if (slots_[lane] == nullptr) { continue; }
@@ -33,8 +34,9 @@ typename EngineCore<Instance>::ActiveExposureSet EngineCore<Instance>::active_ex
     return result;
 }
 
-template <class Instance>
-typename EngineCore<Instance>::HostPhaseMeasurement EngineCore<Instance>::begin_host_phase() const {
+template <class Instance, class Manager>
+typename EngineCore<Instance, Manager>::HostPhaseMeasurement
+EngineCore<Instance, Manager>::begin_host_phase() const {
     return HostPhaseMeasurement{
         .started          = Clock::now(),
         .accounted_before = worker_accounted_elapsed_ns_,
@@ -42,8 +44,8 @@ typename EngineCore<Instance>::HostPhaseMeasurement EngineCore<Instance>::begin_
     };
 }
 
-template <class Instance>
-void EngineCore<Instance>::set_host_work_class(
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::set_host_work_class(
     HostWorkClass work_class, std::span<const std::uint32_t> decode_lanes) noexcept {
     current_host_work_class_   = work_class;
     current_decode_lane_count_ = decode_lanes.size();
@@ -52,8 +54,8 @@ void EngineCore<Instance>::set_host_work_class(
     }
 }
 
-template <class Instance>
-bool EngineCore<Instance>::current_decode_contains(std::uint32_t lane) const noexcept {
+template <class Instance, class Manager>
+bool EngineCore<Instance, Manager>::current_decode_contains(std::uint32_t lane) const noexcept {
     return std::find(current_decode_lanes_.begin(),
                      current_decode_lanes_.begin() +
                          static_cast<std::ptrdiff_t>(current_decode_lane_count_),
@@ -61,9 +63,9 @@ bool EngineCore<Instance>::current_decode_contains(std::uint32_t lane) const noe
            current_decode_lanes_.begin() + static_cast<std::ptrdiff_t>(current_decode_lane_count_);
 }
 
-template <class Instance>
-void EngineCore<Instance>::add_class_host_time(std::uint64_t host_ns,
-                                               std::uint64_t device_wait_ns) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::add_class_host_time(std::uint64_t host_ns,
+                                                        std::uint64_t device_wait_ns) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
     switch (current_host_work_class_) {
     case HostWorkClass::Decode:
@@ -81,10 +83,10 @@ void EngineCore<Instance>::add_class_host_time(std::uint64_t host_ns,
     }
 }
 
-template <class Instance>
-void EngineCore<Instance>::expose_engine_phase(const ActiveExposureSet& exposed,
-                                               EngineHostPhase phase,
-                                               std::uint64_t elapsed) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::expose_engine_phase(const ActiveExposureSet& exposed,
+                                                        EngineHostPhase phase,
+                                                        std::uint64_t elapsed) noexcept {
     for (std::size_t i = 0; i < exposed.size; ++i) {
         const ActiveExposure& exposure = exposed.entries[i];
         RequestHostTiming& timing      = exposure.request->host_timing;
@@ -94,9 +96,9 @@ void EngineCore<Instance>::expose_engine_phase(const ActiveExposureSet& exposed,
     }
 }
 
-template <class Instance>
-void EngineCore<Instance>::finish_engine_phase(const HostPhaseMeasurement& measurement,
-                                               EngineHostPhase phase) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::finish_engine_phase(const HostPhaseMeasurement& measurement,
+                                                        EngineHostPhase phase) noexcept {
     const std::uint64_t wall    = elapsed_ns(measurement.started, Clock::now());
     const std::uint64_t nested  = worker_accounted_elapsed_ns_ - measurement.accounted_before;
     const std::uint64_t own     = wall > nested ? wall - nested : 0;
@@ -117,9 +119,9 @@ void EngineCore<Instance>::finish_engine_phase(const HostPhaseMeasurement& measu
     worker_accounted_elapsed_ns_ += own;
 }
 
-template <class Instance>
-void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing,
-                                                 const ActiveExposureSet& exposed) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::record_program_timing(
+    runtime::ExecutionTiming timing, const ActiveExposureSet& exposed) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
     stats.program_submit_ns += timing.submit_host_ns;
     stats.program_post_ns += timing.post_host_ns;
@@ -134,9 +136,9 @@ void EngineCore<Instance>::record_program_timing(runtime::ExecutionTiming timing
     worker_accounted_elapsed_ns_ += timing.elapsed_ns();
 }
 
-template <class Instance>
-void EngineCore<Instance>::finish_program_call(const HostPhaseMeasurement& measurement,
-                                               runtime::ExecutionTiming timing) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::finish_program_call(const HostPhaseMeasurement& measurement,
+                                                        runtime::ExecutionTiming timing) noexcept {
     const std::uint64_t wall     = elapsed_ns(measurement.started, Clock::now());
     const std::uint64_t nested   = worker_accounted_elapsed_ns_ - measurement.accounted_before;
     const std::uint64_t observed = timing.elapsed_ns() + nested;
@@ -144,17 +146,17 @@ void EngineCore<Instance>::finish_program_call(const HostPhaseMeasurement& measu
     record_program_timing(timing, measurement.exposed);
 }
 
-template <class Instance>
-void EngineCore<Instance>::record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                                         std::uint64_t RuntimeHostWorkStats::*invocation_member,
-                                         Clock::time_point started) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::record_detail(
+    std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+    std::uint64_t RuntimeHostWorkStats::* invocation_member, Clock::time_point started) noexcept {
     RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
     stats.*elapsed_member += elapsed_ns(started, Clock::now());
     ++(stats.*invocation_member);
 }
 
-template <class Instance>
-void EngineCore<Instance>::publish_runtime_stats() {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::publish_runtime_stats() {
     HostPhaseMeasurement measurement = begin_host_phase();
     std::optional<nvtx::ScopedRange> phase_range;
     phase_range.emplace(nvtx::Name::EngineMaintenance, nvtx::Category::Runtime);
@@ -166,6 +168,9 @@ void EngineCore<Instance>::publish_runtime_stats() {
     snapshot.device_state_occupied_slots      = physical.occupied.state_slots;
     snapshot.device_main_kv_occupied_pages    = physical.occupied.main_kv_pages;
     snapshot.device_backend_kv_occupied_pages = physical.occupied.backend_kv_pages;
+    if constexpr (requires { resources_.populate_runtime_stats(*instance_.program, snapshot); }) {
+        resources_.populate_runtime_stats(*instance_.program, snapshot);
+    }
 
     {
         std::lock_guard lock(queue_mutex_);
@@ -199,8 +204,8 @@ void EngineCore<Instance>::publish_runtime_stats() {
     published_stats_ = snapshot;
 }
 
-template <class Instance>
-void EngineCore<Instance>::record_context_work(
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::record_context_work(
     const typename ModelContract::ContextProgress& progress,
     const std::shared_ptr<Request>& owner) {
     const auto& op = progress.operations;
@@ -269,8 +274,8 @@ void EngineCore<Instance>::record_context_work(
     }
 }
 
-template <class Instance>
-void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& request) {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::record_first_output(const std::shared_ptr<Request>& request) {
     const auto now                   = Clock::now();
     auto& snapshot                   = request->first_output_timing.emplace();
     snapshot.elapsed_seconds         = elapsed_ns(request->submitted, now) * 1.0e-9;
@@ -292,9 +297,9 @@ void EngineCore<Instance>::record_first_output(const std::shared_ptr<Request>& r
     snapshot.context_transfers       = request->context_transfers;
 }
 
-template <class Instance>
-void EngineCore<Instance>::record_execution_work(GenerationWorkTiming& work,
-                                                 ExecutionTiming timing) noexcept {
+template <class Instance, class Manager>
+void EngineCore<Instance, Manager>::record_execution_work(GenerationWorkTiming& work,
+                                                          ExecutionTiming timing) noexcept {
     work.submit_seconds += timing.submit_host_ns * 1.0e-9;
     work.wait_seconds += timing.device_wait_ns * 1.0e-9;
     work.post_seconds += timing.post_host_ns * 1.0e-9;

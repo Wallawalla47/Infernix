@@ -36,7 +36,9 @@ int main() {
     for (const auto* factor : {"1", "2.5", "4"}) {
         const auto yarn = parse({"ninfer-serve", "model.ninfer", "--rope-yarn-factor", factor});
         failures += check(yarn.rope_yarn_factor == std::stof(factor) && yarn.max_context == 8192 &&
-                              yarn.kv_capacity.explicit_tokens == 8192,
+                              yarn.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                              yarn.kv_capacity.automatic_headroom_bytes ==
+                                  ninfer::kDefaultKvCapacityHeadroomBytes,
                           "YaRN must not grow serving context or KV defaults");
     }
     for (const auto* factor : {"0", "0.99", "4.01", "-1", "nan", "inf", "-inf", "1e999", "2x", ""}) {
@@ -230,9 +232,13 @@ int main() {
                           defaults.media_live_bytes == ninfer::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
-                          defaults.kv_capacity.explicit_tokens == defaults.max_context,
-                      "default KV capacity does not follow max context");
+    failures += check(defaults.context_cache.enabled &&
+                          defaults.context_cache.mode == ninfer::ContextCacheMode::Hybrid,
+                      "the hybrid prefix cache is not the default");
+    failures += check(defaults.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          defaults.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                      "default KV capacity is not sized to free VRAM for the hybrid cache");
     failures += check(!defaults.context_cache.host_capacity_bytes.has_value(),
                       "default Host context capacity was resolved before Engine startup");
     failures += check(defaults.speculative.backend == ninfer::SpeculativeBackend::None,
@@ -447,9 +453,19 @@ int main() {
     failures += check(logging.log_level == ninfer::product::LogLevel::Debug,
                       "log level did not reach serving options");
 
-    const ServeOptions context_cache = parse(
-        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-context-mib", "64"});
+    // The original prefix cache and its capacities.
+    const ServeOptions original = parse({"ninfer-serve", "model.ninfer", "--max-context", "16384",
+                                         "--use-original-prefix-caching"});
+    failures += check(original.context_cache.enabled &&
+                          original.context_cache.mode == ninfer::ContextCacheMode::Original &&
+                          original.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          original.kv_capacity.explicit_tokens == 16384,
+                      "the original prefix cache must keep the explicit max-context KV capacity");
+    const ServeOptions context_cache =
+        parse({"ninfer-serve", "model.ninfer", "--use-original-prefix-caching",
+               "--device-state-slots", "3", "--host-context-mib", "64"});
     failures += check(context_cache.context_cache.enabled &&
+                          context_cache.context_cache.mode == ninfer::ContextCacheMode::Original &&
                           context_cache.context_cache.device_state_slots == 3 &&
                           context_cache.context_cache.host_capacity_bytes == (64ULL << 20),
                       "context-cache capacities did not reach serving options");
@@ -476,7 +492,11 @@ int main() {
                           ("Host context MiB did not preserve exact bytes: " + mib).c_str());
     }
 
-    // --vram-headroom-mib sets the headroom automatic KV sizing leaves, and only with auto.
+    // --vram-headroom-mib sets the headroom automatic KV sizing leaves, and only with auto (the
+    // hybrid cache's default; explicit with the original cache or an explicit capacity).
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "512"})
+                              .kv_capacity.automatic_headroom_bytes == (512ULL << 20),
+                      "--vram-headroom-mib did not apply to the hybrid default auto capacity");
     const ServeOptions headroom = parse(
         {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
     failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
@@ -487,7 +507,8 @@ int main() {
     failures += check(no_headroom.kv_capacity.automatic_headroom_bytes == 0,
                       "--vram-headroom-mib 0 must leave no sizing headroom");
     for (const std::vector<std::string>& rejected :
-         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "512"},
+         {std::vector<std::string>{"ninfer-serve", "model.ninfer", "--use-original-prefix-caching",
+                                   "--vram-headroom-mib", "512"},
           std::vector<std::string>{"ninfer-serve", "model.ninfer", "--kv-capacity", "16384",
                                    "--vram-headroom-mib", "512"}}) {
         try {
@@ -553,6 +574,113 @@ int main() {
                       disabled_cache.context_cache.host_capacity_bytes == (64ULL << 20),
                   "--no-prefix-reuse did not preserve independently configured capacities");
     }
+
+    // Hybrid prefix cache capacities.
+    const ServeOptions hybrid =
+        parse({"ninfer-serve", "model.ninfer", "--host-context-mib", "4096",
+               "--device-snapshot-slots", "3", "--cache-taps-per-request", "5",
+               "--cache-tap-ladder", "8192", "--cache-tap-min-gap", "512"});
+    failures += check(hybrid.context_cache.enabled &&
+                          hybrid.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          hybrid.context_cache.host_capacity_bytes == (4096ULL << 20) &&
+                          hybrid.context_cache.hybrid.device_snapshot_slots == 3 &&
+                          hybrid.context_cache.hybrid.max_new_taps == 5 &&
+                          hybrid.context_cache.hybrid.tap_ladder_tokens == 8192 &&
+                          hybrid.context_cache.hybrid.tap_min_gap_tokens == 512,
+                      "hybrid prefix-cache options did not reach serving options");
+    // The default is a complete configuration: the KV pool defaults to free VRAM (the Device
+    // block cache) and every hybrid tuning value is left for the Engine to derive.
+    const ServeOptions hybrid_minimal = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(hybrid_minimal.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          hybrid_minimal.kv_capacity.automatic_headroom_bytes ==
+                              ninfer::kDefaultKvCapacityHeadroomBytes &&
+                          !hybrid_minimal.context_cache.host_capacity_bytes &&
+                          !hybrid_minimal.context_cache.hybrid.device_snapshot_slots &&
+                          !hybrid_minimal.context_cache.hybrid.max_new_taps &&
+                          !hybrid_minimal.context_cache.hybrid.tap_ladder_tokens &&
+                          !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens,
+                      "the hybrid default must size KV automatically and leave tuning derived");
+    const ServeOptions hybrid_explicit_kv =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "8192", "--kv-capacity", "16384",
+               "--host-context-mib", "0"});
+    failures += check(hybrid_explicit_kv.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          hybrid_explicit_kv.kv_capacity.explicit_tokens == 16384 &&
+                          hybrid_explicit_kv.context_cache.host_capacity_bytes == 0U,
+                      "hybrid mode must keep an explicit KV capacity and a zero Host budget");
+    for (const std::vector<std::string>& legacy_flag :
+         std::vector<std::vector<std::string>>{{"--device-state-slots", "2"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), legacy_flag.begin(), legacy_flag.end());
+        bool rejected = false;
+        try {
+            (void)parse(std::move(arguments));
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "an original prefix-cache flag was accepted without the mode");
+    }
+    // The cache file resolves to an absolute path at launch, so the shutdown save writes where
+    // startup read. A path with backslashes and a drive, as a Windows shell passes a quoted
+    // argument, names the same file.
+    const auto cache_file = [&](std::vector<std::string> extra) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), extra.begin(), extra.end());
+        return parse(std::move(arguments)).context_cache.hybrid.persistent_file;
+    };
+    failures +=
+        check(cache_file({"--prefix-cache-file", "file.cache"}) ==
+                  (std::filesystem::current_path() / "file.cache").lexically_normal(),
+              "a relative --prefix-cache-file did not resolve against the launch directory");
+    const std::filesystem::path absolute =
+        (std::filesystem::temp_directory_path() / "ninfer-serve-options.cache").lexically_normal();
+    failures += check(cache_file({"--prefix-cache-file", absolute.string()}) == absolute,
+                      "an absolute --prefix-cache-file was not kept as given");
+    const auto rejected_cache_file = [&](std::vector<std::string> extra) {
+        try {
+            (void)cache_file(std::move(extra));
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejected_cache_file({"--prefix-cache-file",
+                                           (std::filesystem::temp_directory_path() /
+                                            "ninfer-missing-directory-for-test" / "file.cache")
+                                               .string()}),
+                      "--prefix-cache-file accepted a file in a directory that does not exist");
+    failures += check(rejected_cache_file(
+                          {"--prefix-cache-file", std::filesystem::temp_directory_path().string()}),
+                      "--prefix-cache-file accepted a directory");
+    failures +=
+        check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--host-context-mib", "0"}),
+              "--prefix-cache-file was accepted without a Host tier to save");
+    for (const std::vector<std::string>& hybrid_flag :
+         std::vector<std::vector<std::string>>{{"--prefix-cache-file", "file.cache"},
+                                               {"--device-snapshot-slots", "2"},
+                                               {"--cache-taps-per-request", "2"},
+                                               {"--cache-tap-ladder", "2048"},
+                                               {"--cache-tap-min-gap", "64"}}) {
+        for (const char* disabling : {"--use-original-prefix-caching", "--no-prefix-reuse"}) {
+            std::vector<std::string> arguments{"ninfer-serve", "model.ninfer", disabling};
+            arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());
+            bool rejected = false;
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "a hybrid prefix-cache flag was accepted without the mode");
+        }
+    }
+    // --no-prefix-reuse disables whichever cache is selected by default and keeps the KV pool at
+    // --max-context; naming the original cache alongside it is contradictory.
+    const ServeOptions without_reuse =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384", "--no-prefix-reuse"});
+    failures += check(!without_reuse.context_cache.enabled &&
+                          without_reuse.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
+                          without_reuse.kv_capacity.explicit_tokens == 16384,
+                      "--no-prefix-reuse did not disable the default prefix cache");
+    bool original_without_reuse_rejected = false;
+    try {
+        (void)parse(
+            {"ninfer-serve", "model.ninfer", "--use-original-prefix-caching", "--no-prefix-reuse"});
+    } catch (const std::invalid_argument&) { original_without_reuse_rejected = true; }
+    failures += check(original_without_reuse_rejected,
+                      "original prefix cache was accepted together with --no-prefix-reuse");
 
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -632,6 +760,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--host-context-mib") != std::string::npos,
               "serve help omits context-cache capacities");
+    failures += check(serve_usage_text("ninfer-serve").find("--use-original-prefix-caching") !=
+                          std::string::npos,
+                      "serve help does not name the original prefix-cache selection");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
@@ -667,8 +798,8 @@ int main() {
     failures += check(serve_usage_text("ninfer-serve").find("metadata.name") != std::string::npos,
                       "serve help omits the artifact-derived model id default");
 
-    const ServeOptions inherited =
-        parse({"ninfer-serve", "model.ninfer", "--max-context", "16384"});
+    const ServeOptions inherited = parse({"ninfer-serve", "model.ninfer", "--max-context", "16384",
+                                          "--use-original-prefix-caching"});
     failures += check(inherited.kv_capacity.mode == ninfer::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
                       "omitted --kv-capacity did not follow --max-context");

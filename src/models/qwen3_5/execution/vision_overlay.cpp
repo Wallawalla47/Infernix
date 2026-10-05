@@ -295,4 +295,25 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
     return results;
 }
 
+void encode_overlay_suffix(DeviceContext& device, const Parameters& parameters,
+                           const qwen3_5::PreparedPromptData& prompt,
+                           const detail::VisionPrefillPlan& plan, std::uint32_t reused,
+                           VisionPrefillSession& session) {
+    const std::size_t item_end = plan.control->prepared_item_begin + plan.control->items.size();
+    std::size_t first_needed   = item_end;
+    for (const detail::VisionUseSpan& use : plan.uses) {
+        if (use.end > reused && use.prepared_item_index < first_needed) {
+            first_needed = use.prepared_item_index;
+        }
+    }
+    VisionOverlayWindowStats stats;
+    std::vector<PinnedVisionResult> results;
+    if (first_needed < item_end) {
+        results = encode_items_overlay(device, parameters, prompt, plan, first_needed, &stats);
+    } else {
+        results.resize(item_end);
+    }
+    session.set_preencoded(std::move(results), stats);
+}
+
 } // namespace ninfer::models::qwen3_5::execution

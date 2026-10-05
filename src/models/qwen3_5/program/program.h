@@ -3,12 +3,15 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "runtime/prefix_cache/cost.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -32,6 +35,7 @@ struct ReclaimPlan;
 struct DemotionBatch;
 class ProgramImpl;
 struct ContractAccess;
+struct HybridQuoteImpl;
 } // namespace detail
 class SequencePlanner;
 class Program;
@@ -169,6 +173,57 @@ struct SourceCandidate {
     bool split_state     = false;
     bool backup_state    = false;
     std::vector<CheckpointHandle> private_points;
+    // Hybrid prefix cache source (docs/maintainer/hybrid-prefix-cache-spec.md §6): a quote of
+    // the block-tree path and snapshot to resume from, or of a root start. A binding started from
+    // it activates the lane from cached blocks instead of a checkpoint.
+    std::shared_ptr<const detail::HybridQuoteImpl> hybrid;
+    PrefixReusePath reuse_path = PrefixReusePath::Checkpoint;
+};
+
+// Outcome of saving or restoring the hybrid prefix cache's Host tier.
+struct HybridCachePersistence {
+    bool ok = false;
+    std::string message;
+    std::uint64_t blocks    = 0;
+    std::uint64_t snapshots = 0;
+    std::uint64_t bytes     = 0;
+    double seconds          = 0.0;
+    // Load only: what the file holds and needs, against this Host tier.
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
+};
+
+struct HybridPrefixCacheStats {
+    std::uint32_t nodes                      = 0;
+    std::uint32_t snapshots                  = 0;
+    std::uint32_t device_resident_blocks     = 0;
+    std::uint32_t device_evictable_blocks    = 0;
+    std::uint32_t host_slabs                 = 0;
+    std::uint32_t host_free_slabs            = 0;
+    std::uint64_t host_slab_bytes            = 0;
+    std::uint32_t free_device_snapshot_slots = 0;
+    std::uint64_t admissions                 = 0;
+    std::uint64_t snapshot_hits              = 0;
+    std::uint64_t reused_tokens              = 0;
+    std::uint64_t blocks_inserted            = 0;
+    std::uint64_t blocks_reattached          = 0;
+    std::uint64_t blocks_duplicate           = 0;
+    std::uint64_t taps_created               = 0;
+    std::uint64_t taps_skipped               = 0;
+    std::uint64_t endpoints_created          = 0;
+    std::uint64_t host_image_writes          = 0;
+    std::uint64_t host_block_writes          = 0;
+    std::uint64_t host_image_restores        = 0;
+    std::uint64_t host_block_restores        = 0;
+    std::uint64_t host_tail_restores         = 0;
+    std::uint64_t host_write_bytes           = 0;
+    std::uint64_t host_restore_bytes         = 0;
+    std::uint64_t evicted_blocks             = 0;
+    std::uint64_t host_snapshot_evictions    = 0;
+    std::uint64_t host_dead_reclaims         = 0;
+    std::uint64_t unbacked_node_losses       = 0;
 };
 
 struct ContextDemotion {
@@ -465,7 +520,43 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     void fail_all_cleanup() noexcept;
+    // fail_all_cleanup for the Engine's orderly stop. With a hybrid cache file attached, the Host
+    // tier is saved once every lane has written its blocks through and before the cleanup drops
+    // it; hybrid_shutdown_save() reports the result.
+    void shutdown_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
+
+    // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission binds a lane through the
+    // same context transaction as a checkpoint source: hybrid_sources() quotes, start_binding()
+    // stages and poll_context() activates.
+    [[nodiscard]] bool hybrid_prefix_cache() const noexcept;
+    // The quoted sources for a request in preference order: the chosen cached path, if any, then
+    // a root start. A resumed request's source never passes `maximum_frontier`. Empty while a
+    // prefilling sibling is about to publish the snapshot this request should resume from.
+    [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
+                                                              std::uint32_t maximum_frontier);
+    // Evicts unpinned cached Device blocks, and the Device copies of cached snapshot images, until
+    // the shortage is covered or nothing evictable remains. Returns whether anything was freed.
+    [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
+    // Copies Host-only blocks a waiting request resumes from into Device pages the pools can
+    // spare as cache (hybrid-prefix-cache-spec §6.6), so its admission restores less. Returns the
+    // blocks whose copy started; absent while a prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
+    // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
+    void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
+    // Longest predicted wait for a prefilling sibling's snapshot that admission may choose over
+    // prefilling the shared prefix again. Zero disables coalescing.
+    void set_hybrid_coalesce_wait_limit(double seconds);
+    // Restores a saved Host tier before the first request and attaches the file, so
+    // shutdown_cleanup saves the tier back to it. `fingerprint` names everything the saved bytes
+    // depend on; `observer` receives the file read as StartupPhase::PrefixCacheLoad.
+    [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
+    [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 private:

@@ -88,4 +88,15 @@ encode_items_overlay(DeviceContext& device, const Parameters& parameters,
                      const qwen3_5::PreparedPromptData& prompt, const detail::VisionPrefillPlan& plan,
                      std::size_t first_item, VisionOverlayWindowStats* stats);
 
+class VisionPrefillSession;
+
+// Encode, in one overlay window, the prepared items a prefill consumes past its `reused` prompt
+// tokens and install them on `session`. Items wholly inside the reused prefix are not encoded:
+// their embeddings already live in the reused context. Item indices are absolute prepared-item
+// indices, which start at the plan's prepared_item_begin for a prompt extending a prefix.
+void encode_overlay_suffix(DeviceContext& device, const Parameters& parameters,
+                           const qwen3_5::PreparedPromptData& prompt,
+                           const detail::VisionPrefillPlan& plan, std::uint32_t reused,
+                           VisionPrefillSession& session);
+
 } // namespace ninfer::models::qwen3_5::execution

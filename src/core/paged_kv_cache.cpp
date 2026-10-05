@@ -669,6 +669,41 @@ TransferWork DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPage
     return device_copy_work(1);
 }
 
+void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begin,
+                                     std::size_t plane_end, std::int32_t first, std::size_t count,
+                                     std::byte* host_base, std::size_t host_pitch,
+                                     const HostKVPageLayout& host, cudaStream_t stream) const {
+    const bool to_host = kind == cudaMemcpyDeviceToHost;
+    for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
+        const Tensor& plane                 = planes_[plane_index];
+        const HostKVPlaneLayout& host_plane = host.planes[plane_index];
+        std::byte* host_plane_base          = host_base + host_plane.offset;
+        auto* device_base                   = static_cast<unsigned char*>(plane.data);
+        const auto copy                     = [&](std::byte* host_ptr, unsigned char* device_ptr,
+                                                  std::size_t device_pitch, std::size_t width) {
+            if (to_host) {
+                CUDA_CHECK(cudaMemcpy2DAsync(host_ptr, host_pitch, device_ptr, device_pitch, width,
+                                             count, cudaMemcpyDeviceToHost, stream));
+            } else {
+                CUDA_CHECK(cudaMemcpy2DAsync(device_ptr, device_pitch, host_ptr, host_pitch, width,
+                                             count, cudaMemcpyHostToDevice, stream));
+            }
+        };
+        if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+            copy(host_plane_base, device_base + static_cast<std::int64_t>(first) * plane.nb[3],
+                 plane.nb[3], host_plane.page_payload_bytes);
+        } else {
+            for (std::int32_t head = 0; head < plane.ne[3]; ++head) {
+                copy(host_plane_base +
+                         static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
+                     device_base + static_cast<std::int64_t>(head) * plane.nb[3] +
+                         static_cast<std::int64_t>(first) * plane.nb[2],
+                     plane.nb[2], host_plane.head_payload_bytes);
+            }
+        }
+    }
+}
+
 template <bool ToHost>
 TransferWork
 DeviceKVPagePool::copy_host_pages(std::span<const DeviceKVPageHandle> pages,
@@ -780,6 +815,120 @@ TransferWork DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
     }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
     return copy_host_pages<false>(destination, source.data(), stream);
+}
+
+std::size_t DeviceKVPagePool::host_record_run_end(std::span<const DeviceKVPageHandle> pages,
+                                                  std::span<const std::byte* const> records,
+                                                  std::span<const std::uint32_t> groups,
+                                                  std::size_t begin, std::size_t page_stride,
+                                                  std::size_t max_pitch,
+                                                  std::size_t& pitch) noexcept {
+    // Pages [begin, end) form one strided transfer when their physical indices are consecutive
+    // and their host records, all in one pinned allocation, advance by one constant pitch of at
+    // least one packed page record and at most the device's maximum copy pitch.
+    const auto joins = [&](std::size_t next) {
+        return pages[next].index_ == pages[next - 1].index_ + 1 &&
+               records[next] > records[next - 1] &&
+               (groups.empty() || groups[next] == groups[next - 1]);
+    };
+    pitch           = page_stride;
+    std::size_t end = begin + 1;
+    if (end >= pages.size() || !joins(end)) { return end; }
+    const auto step = static_cast<std::size_t>(records[end] - records[begin]);
+    if (step < page_stride || step > max_pitch) { return end; }
+    pitch = step;
+    while (end < pages.size() && joins(end) &&
+           static_cast<std::size_t>(records[end] - records[end - 1]) == step) {
+        ++end;
+    }
+    return end;
+}
+
+namespace {
+
+// Largest source or destination pitch cudaMemcpy2DAsync accepts on the current device.
+std::size_t device_max_copy_pitch() {
+    int device = 0;
+    int pitch  = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&pitch, cudaDevAttrMaxPitch, device));
+    return static_cast<std::size_t>(pitch);
+}
+
+void validate_record_groups(std::span<const std::uint32_t> groups, std::size_t records,
+                            const char* op) {
+    if (!groups.empty() && groups.size() != records) {
+        throw std::invalid_argument(std::string(op) + " record groups do not match the records");
+    }
+}
+
+} // namespace
+
+void DeviceKVPagePool::copy_to_host_records(std::span<const DeviceKVPageHandle> source,
+                                            std::span<std::byte* const> records,
+                                            std::span<const std::uint32_t> record_groups,
+                                            const HostKVPageLayout& layout,
+                                            cudaStream_t stream) const {
+    if (records.size() != source.size() || layout.geometry != geometry()) {
+        throw std::invalid_argument("Paged KV D2H record geometry or extent is inconsistent");
+    }
+    validate_record_groups(record_groups, records.size(), "Paged KV D2H");
+    const std::size_t max_pitch = device_max_copy_pitch();
+    for (std::size_t index = 0; index < source.size(); ++index) {
+        (void)physical_index(source[index]);
+        if (records[index] == nullptr) {
+            throw std::invalid_argument("Paged KV D2H record is null");
+        }
+    }
+    const std::span<const std::byte* const> addresses(
+        reinterpret_cast<const std::byte* const*>(records.data()), records.size());
+    std::size_t begin = 0;
+    while (begin < source.size()) {
+        std::size_t pitch     = 0;
+        const std::size_t end = host_record_run_end(source, addresses, record_groups, begin,
+                                                    layout.page_stride, max_pitch, pitch);
+        copy_host_run(cudaMemcpyDeviceToHost, 0, planes_.size(), source[begin].index_, end - begin,
+                      records[begin], pitch, layout, stream);
+        begin = end;
+    }
+}
+
+void DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
+                                              std::span<const std::uint32_t> record_groups,
+                                              std::span<const DeviceKVPageHandle> destination,
+                                              const HostKVPageLayout& layout,
+                                              cudaStream_t stream) const {
+    copy_from_host_records(records, record_groups, destination, layout, 0, planes_.size(), stream);
+}
+
+void DeviceKVPagePool::copy_from_host_records(std::span<const std::byte* const> records,
+                                              std::span<const std::uint32_t> record_groups,
+                                              std::span<const DeviceKVPageHandle> destination,
+                                              const HostKVPageLayout& layout,
+                                              std::size_t plane_begin, std::size_t plane_end,
+                                              cudaStream_t stream) const {
+    if (records.size() != destination.size() || layout.geometry != geometry()) {
+        throw std::invalid_argument("Paged KV H2D record geometry or extent is inconsistent");
+    }
+    validate_record_groups(record_groups, records.size(), "Paged KV H2D");
+    if (plane_begin > plane_end || plane_end > planes_.size()) {
+        throw std::invalid_argument("Paged KV H2D plane range is out of bounds");
+    }
+    validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
+    for (const std::byte* record : records) {
+        if (record == nullptr) { throw std::invalid_argument("Paged KV H2D record is null"); }
+    }
+    const std::size_t max_pitch = device_max_copy_pitch();
+    std::size_t begin           = 0;
+    while (begin < destination.size()) {
+        std::size_t pitch     = 0;
+        const std::size_t end = host_record_run_end(destination, records, record_groups, begin,
+                                                    layout.page_stride, max_pitch, pitch);
+        // The H2D direction only reads the host run.
+        copy_host_run(cudaMemcpyHostToDevice, plane_begin, plane_end, destination[begin].index_,
+                      end - begin, const_cast<std::byte*>(records[begin]), pitch, layout, stream);
+        begin = end;
+    }
 }
 
 std::vector<DeviceKVPageReservation>

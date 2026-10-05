@@ -10,6 +10,14 @@ ninfer_add_test(ninfer_resource_manager_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_prefix_cache_index_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefix_cache_index.cpp"
+  LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_hybrid_cache_defaults_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_hybrid_cache_defaults.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_kv_capacity_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_kv_capacity.cpp"
   LIBRARIES ninfer_runtime_support)

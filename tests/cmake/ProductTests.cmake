@@ -60,6 +60,10 @@ ninfer_add_test(ninfer_console_stats_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_console_stats.cpp"
   LIBRARIES ninfer_serve ninfer_product_logging)
 
+ninfer_add_test(ninfer_stop_control_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_stop_control.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_http_error_handler_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_http_error_handler.cpp"
   LIBRARIES ninfer_serve)

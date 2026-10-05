@@ -28,6 +28,8 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
+// Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given.
+inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -147,6 +149,7 @@ enum class StartupPhase : std::uint8_t {
     ProgramInitialize,
     HostContextPin,
     CudaGraphPrepare,
+    PrefixCacheLoad,
     EngineFinalize,
 };
 
@@ -196,14 +199,88 @@ struct DiagnosticObserver {
     // are ignored so a logging failure cannot disturb execution.
     std::function<void(const Diagnostic& diagnostic)> callback;
 };
+
+// Prefix-cache implementation selected at Engine construction. Original is the
+// continuation/checkpoint ResourceManager
+// (docs/maintainer/resource-scheduling-and-context-cache.md). Hybrid is the content-addressed block
+// tree with sparse state snapshots (docs/maintainer/hybrid-prefix-cache-spec.md). ninfer-serve
+// selects Hybrid unless
+// --use-original-prefix-caching selects Original; the Engine option itself defaults to Original.
+enum class ContextCacheMode : std::uint8_t {
+    Original,
+    Hybrid,
+};
+
+// Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
+// from any thread, also while the Engine is being destroyed. Copies share one state: the product
+// keeps a copy from the options it passes, beyond the Engine's lifetime.
+class PrefixCacheSaveControl {
+public:
+    enum class Abandon : std::uint8_t {
+        // Nothing replaced the previous file; a save in progress deleted its unfinished file.
+        Unsaved,
+        // The save had already completed.
+        Saved,
+        // The save did not stop within the timeout; its unfinished file may remain.
+        StillWriting,
+    };
+
+    PrefixCacheSaveControl();
+
+    // Stops a save in progress, or one not begun yet, from replacing the previous file. Waits at
+    // most `timeout` for a save in progress to stop and delete its unfinished file.
+    Abandon abandon(std::chrono::milliseconds timeout) const noexcept;
+
+    // The Engine's side. A save writes only after begin() returns true, polls abandoned() while
+    // it writes, and then calls end() with whether it replaced the file.
+    [[nodiscard]] bool begin() const noexcept;
+    [[nodiscard]] bool abandoned() const noexcept;
+    void end(bool saved) const noexcept;
+
+private:
+    struct State;
+    std::shared_ptr<State> state_;
+};
+
+// Hybrid-mode tuning. Every field is optional: Engine construction derives the unset ones from
+// max_concurrency, prefill_chunk and whether a Host tier exists (host_capacity_bytes, default
+// kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
+// values.
+struct HybridPrefixCacheOptions {
+    // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
+    // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
+    // lane plus one staging slot with a Host tier, plus two without one (Device slots are then
+    // the only snapshot storage).
+    std::optional<std::uint32_t> device_snapshot_slots;
+    // New prefill state snapshots one request may create. Default 8 with a Host tier, 2 without.
+    std::optional<std::uint32_t> max_new_taps;
+    // Geometric ladder base G: ladder taps target prompt_tokens - G * 2^k. Default
+    // max(4096, 2 * prefill_chunk): ladder taps land on prefill chunk boundaries.
+    std::optional<std::uint32_t> tap_ladder_tokens;
+    // Ladder taps closer than this to another snapshot on the same path are skipped. Default
+    // max(1024, prefill_chunk).
+    std::optional<std::uint32_t> tap_min_gap_tokens;
+    // Opt-in persistence of the Host tier: saved to this file when the Engine shuts down cleanly
+    // and restored from it at startup, but only when it was written for the same artifact, KV and
+    // state formats and `persistent_identity` (the product binary's build). Empty disables it.
+    std::filesystem::path persistent_file;
+    std::string persistent_identity;
+    // Lets the product abandon the save at shutdown (ninfer-serve: Ctrl+C during the stop).
+    PrefixCacheSaveControl persistent_save;
+};
+
 struct ContextCacheOptions {
     // Controls cross-request history reads and writes. Request pause/replay resources remain
     // available when history is disabled.
     bool enabled = true;
+    ContextCacheMode mode = ContextCacheMode::Original;
+    HybridPrefixCacheOptions hybrid;
     // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
     std::optional<std::uint32_t> device_state_slots;
-    // Shared Host quota for StateImages, KV, pause snapshots and in-flight destinations. Native
-    // startup defaults to 8 GiB plus eight Host StateImages using the model's actual layout.
+    // Original mode: shared Host quota for StateImages, KV, pause snapshots and in-flight
+    // destinations; native startup defaults to 8 GiB plus eight Host StateImages using the
+    // model's actual layout. Hybrid mode: the pinned Host slab pool that cached KV blocks and
+    // state snapshots share (default kDefaultHybridHostCacheBytes, 0 disables the Host tier).
     // This does not bound total process RAM.
     // Engine::options() returns both resolved capacities after construction.
     std::optional<std::size_t> host_capacity_bytes;
@@ -927,6 +1004,9 @@ struct ThinkingBudgetStats {
 enum class PrefixReusePath : std::uint8_t {
     Root,
     Checkpoint,
+    // Hybrid prefix cache: a previous generation's endpoint snapshot, or a prefill snapshot.
+    HybridEndpoint,
+    HybridSnapshot,
 };
 
 struct NgramArchiveStats {
@@ -1156,6 +1236,33 @@ struct RuntimeStats {
     // Allocator lifetime high-water mark, including reserved transfer destinations.
     std::size_t host_context_peak_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
+
+    // Hybrid prefix cache (ContextCacheMode::Hybrid); zero in Original mode. Block and snapshot
+    // gauges are absolute; the rest are cumulative event counters.
+    std::uint32_t hybrid_cached_blocks           = 0; // Device-resident tree blocks
+    std::uint32_t hybrid_evictable_blocks        = 0;
+    std::uint32_t hybrid_tree_blocks             = 0; // Device or Host
+    std::uint32_t hybrid_snapshots               = 0;
+    std::uint64_t hybrid_host_capacity_bytes     = 0;
+    std::uint64_t hybrid_host_used_bytes         = 0;
+    std::uint64_t hybrid_snapshot_hits           = 0;
+    std::uint64_t hybrid_reused_tokens           = 0;
+    std::uint64_t hybrid_blocks_inserted         = 0;
+    std::uint64_t hybrid_blocks_reattached       = 0;
+    std::uint64_t hybrid_blocks_duplicate        = 0;
+    std::uint64_t hybrid_taps_created            = 0;
+    std::uint64_t hybrid_taps_skipped            = 0;
+    std::uint64_t hybrid_endpoints_created       = 0;
+    std::uint64_t hybrid_host_image_writes       = 0;
+    std::uint64_t hybrid_host_block_writes       = 0;
+    std::uint64_t hybrid_host_image_restores     = 0;
+    std::uint64_t hybrid_host_block_restores     = 0;
+    std::uint64_t hybrid_host_write_bytes        = 0;
+    std::uint64_t hybrid_host_restore_bytes      = 0;
+    std::uint64_t hybrid_evicted_blocks          = 0;
+    std::uint64_t hybrid_host_snapshot_evictions = 0;
+    std::uint64_t hybrid_host_dead_reclaims      = 0;
+    std::uint64_t hybrid_unbacked_node_losses    = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1215,6 +1322,24 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+
+    // Hybrid prefix cache restored from its persistent file at startup.
+    struct PrefixCacheRestore {
+        bool attempted = false;
+        bool restored  = false;
+        // Why nothing was restored (no file yet, incompatible file, I/O error).
+        std::string message;
+        std::uint64_t blocks    = 0;
+        std::uint64_t snapshots = 0;
+        std::uint64_t bytes     = 0;
+        double seconds          = 0.0;
+        // What the file holds and the Host tier bytes all of it takes, against this Engine's
+        // tier. When the tier is smaller, only the snapshots it values most were restored.
+        std::uint64_t saved_blocks        = 0;
+        std::uint64_t saved_snapshots     = 0;
+        std::uint64_t required_host_bytes = 0;
+        std::uint64_t host_bytes          = 0;
+    } prefix_cache;
 };
 
 } // namespace ninfer

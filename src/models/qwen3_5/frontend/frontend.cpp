@@ -10,6 +10,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
+#include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 
 #include <nlohmann/json.hpp>
@@ -530,6 +531,55 @@ prepare_context_cache(ContextCacheHints hints, std::size_t message_count,
     return out;
 }
 
+// Boundary facts for hybrid prefix-cache taps. The Program floors each frontier to a page
+// boundary and applies its own priority, spacing and budget rules; this only reports where the
+// rendered prompt has reusable structure.
+PreparedTapHints prepare_tap_hints(const ContextCacheHints& hints,
+                                   std::span<const std::optional<std::uint32_t>> message_boundaries,
+                                   std::span<const std::optional<std::uint32_t>> cache_boundaries,
+                                   std::optional<std::size_t> engine_tool_marker_index,
+                                   std::optional<std::uint32_t> leading_boundary,
+                                   const std::optional<RewriteCheckpointSpec>& rewrite_checkpoint) {
+    using runtime::prefix_cache::TapHint;
+    using runtime::prefix_cache::TapHintKind;
+    // Protocol write-policy hints (OpenAI explicit mode, Anthropic cache_control) govern the
+    // original shared-prefix publication. Hybrid taps are cheap and content-deduplicated, so
+    // explicit markers only add taps; automatic placement is never suppressed.
+    PreparedTapHints out;
+    out.hints.reserve(message_boundaries.size() + hints.markers.size() + 3U);
+    const auto add = [&](std::optional<std::uint32_t> frontier, TapHintKind kind) {
+        if (frontier && *frontier != 0) { out.hints.push_back(TapHint{*frontier, kind}); }
+    };
+    for (std::size_t index = 0; index < hints.markers.size(); ++index) {
+        const PromptCacheMarker& marker = hints.markers[index];
+        // Only a client-named breakpoint is honored unconditionally; protocol-automatic markers
+        // (OpenAI default caching, Anthropic automatic cache_control) compete with the Engine's
+        // structural boundaries and mark the conversation's latest turn.
+        const TapHintKind kind = has_shared_candidate_evidence(
+                                     marker.evidence, SharedCandidateEvidence::ExplicitBoundary)
+                                     ? TapHintKind::Explicit
+                                     : TapHintKind::Automatic;
+        if (marker.location == PromptCacheMarkerLocation::MessageBoundary) {
+            if (marker.after_message_count < message_boundaries.size()) {
+                add(message_boundaries[marker.after_message_count], kind);
+            }
+        } else if (index < cache_boundaries.size()) {
+            add(cache_boundaries[index], kind);
+        }
+    }
+    if (engine_tool_marker_index && *engine_tool_marker_index < cache_boundaries.size()) {
+        add(cache_boundaries[*engine_tool_marker_index], TapHintKind::Structural);
+    }
+    if (leading_boundary && *leading_boundary < message_boundaries.size()) {
+        add(message_boundaries[*leading_boundary], TapHintKind::Structural);
+    }
+    if (rewrite_checkpoint) { add(rewrite_checkpoint->frontier, TapHintKind::GenerationOpener); }
+    for (const std::optional<std::uint32_t> boundary : message_boundaries) {
+        add(boundary, TapHintKind::MessageBoundary);
+    }
+    return out;
+}
+
 } // namespace
 
 ModelSamplingDefaults default_sampling(Architecture architecture) {
@@ -933,9 +983,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         }
     }
     result.identity.reusable = true;
+    result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
+                                                 engine_tool_marker_index, leading_boundary,
+                                                 result.identity.rewrite_checkpoint);
     result.context_cache     = prepare_context_cache(
         std::move(cache_hints), message_count, message_boundaries, rendered_markers,
         cache_boundaries, result.vision_items, engine_tool_marker_index, leading_boundary);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     if (impl_->ngram_sources_enabled) {
         fi::check_preparation_control(control, "ngram index");
         build_ngram_index(result);
@@ -1016,6 +1070,7 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }
     assign_text_positions(result);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.update_session_index = false;
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();

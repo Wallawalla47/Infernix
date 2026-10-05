@@ -174,6 +174,20 @@ public:
         object.role          = StateImageRole::ActiveMutable;
     }
 
+    // A reserved destination filled by a stream-ordered copy (hybrid prefix cache admission and
+    // tap capture) becomes the lane's active image or an immutable cached snapshot.
+    void activate_copied(StateImageHandle handle) {
+        Object& object       = require_copied_destination(handle);
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::ActiveMutable;
+    }
+
+    void publish_copied_checkpoint(StateImageHandle handle) {
+        Object& object       = require_copied_destination(handle);
+        object.content_epoch = next_epoch();
+        object.role          = StateImageRole::CheckpointImmutable;
+    }
+
     [[nodiscard]] bool valid(StateImageHandle handle) const noexcept {
         return handle.owner_ == this && handle.index_ < objects_.size() &&
                objects_[handle.index_].role != StateImageRole::Free &&
@@ -710,6 +724,16 @@ private:
     [[nodiscard]] std::uint64_t next_transfer() noexcept {
         if (++next_transfer_id_ == 0) { ++next_transfer_id_; }
         return next_transfer_id_;
+    }
+
+    [[nodiscard]] Object& require_copied_destination(StateImageHandle handle) {
+        Object& object = require(handle);
+        if (object.role != StateImageRole::ReservedDestination || !object.device_slot ||
+            object.host_slot || object.source_pins != 0 || object.destination_pinned ||
+            object.checkpoint_references != 0 || has_pending_replica(object)) {
+            throw std::logic_error("StateImage copied destination is not publishable");
+        }
+        return object;
     }
 
     [[nodiscard]] Object& require(StateImageHandle handle) {

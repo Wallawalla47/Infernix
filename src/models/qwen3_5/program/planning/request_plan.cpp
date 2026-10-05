@@ -180,7 +180,9 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             PreparedNgramIndex{.index = std::move(prompt.ngram_index.index)});
     }
     base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
-    if (base->summary.publish_continuation) {
+    // The hybrid prefix cache publishes its own blocks and snapshots as the lane commits them;
+    // it never captures checkpoints.
+    if (base->summary.publish_continuation && !hybrid_) {
         const auto& prepared = *base->prompt;
         auto backing         = std::make_shared<PreparedCaptureBacking>();
         backing->digests     = base->prefix_digests;
@@ -246,12 +248,30 @@ UnitDemand ProgramImpl::next_unit(const SequenceState& sequence, const RequestCo
             throw std::logic_error("decode demand requires an active token and output budget");
         }
         const auto available    = std::min(tokens - 1U, capacity - frontier - 1U);
-        const auto extent       = speculative_backend == SpeculativeBackend::None
+        auto extent             = speculative_backend == SpeculativeBackend::None
                                       ? 0U
                                       : std::min({available, draft_window,
-                                            speculative_backend == SpeculativeBackend::Mtp
-                                                      ? sequence.mtp_draft_count
-                                                      : draft_window});
+                                            // An MTP row may verify an n-gram copy instead of its
+                                            // own drafts (decode.cpp), up to the copy window.
+                                            speculative_backend == SpeculativeBackend::Mtp &&
+                                                    ngram_draft_window == 0
+                                                ? sequence.mtp_draft_count
+                                                : draft_window});
+        // A DFlash2 tree row verifies its whole tree whatever output budget it has left: a round
+        // widens a row whose neural extent is full to the tree's width (decode.cpp row_extent),
+        // so the unit covers the widest tree that fits before the capacity.
+        if (is_masked_draft_backend(speculative_backend) && available >= neural_draft_window) {
+            std::uint32_t tree_columns = 0;
+            for (const std::uint32_t columns : tree_widths.automatic) {
+                tree_columns = std::max(tree_columns, columns);
+            }
+            for (const std::uint32_t columns : tree_widths.fixed) {
+                tree_columns = std::max(tree_columns, columns);
+            }
+            if (tree_columns > extent + 1U && capacity - frontier - 1U >= tree_columns - 1U) {
+                extent = tree_columns - 1U;
+            }
+        }
         demand.main_frontier    = frontier + extent + 1U;
         demand.backend_frontier = speculative_backend == SpeculativeBackend::Mtp
                                       ? std::min(capacity, frontier + extent + draft_window)
