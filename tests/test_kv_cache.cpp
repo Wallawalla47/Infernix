@@ -1,6 +1,7 @@
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "core/vmm_arena.h"
 
 #include <cuda_runtime.h>
 
@@ -227,6 +228,99 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
     } catch (const std::bad_alloc&) { bundle_failed = true; }
     failures += expect(bundle_failed, "impossible multi-pool reservation succeeded");
     failures += expect_size(pool.reserved_pages(), before, "failed bundle changed the first pool");
+    return failures;
+}
+
+// An elastic pool (design §19.3.11): only pages below the backed limit are handed out, first fit keeps
+// them low, the limit rises freely and falls only over free pages.
+int exercise_backed_limit(ninfer::DeviceContext& context) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    };
+    PlannedCache plan = plan_cache(8, 8, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    failures += expect_size(pool.backed_pages(), 8, "a new pool backs its capacity");
+
+    pool.set_backed_pages(3);
+    failures += expect_size(pool.available_pages(), 3, "available under the limit");
+    failures += expect(!pool.reserve(4).has_value(), "reservation past the backed limit succeeded");
+    std::optional<ninfer::DeviceKVPageReservation> first = pool.reserve(3);
+    failures += expect(first.has_value(), "reservation within the limit failed");
+    std::vector<ninfer::DeviceKVPageLease> low;
+    low.reserve(3);
+    pool.materialize(*first, 3, low); // pages 0..2
+    failures += expect(pool.can_back(3) && !pool.can_back(2), "can_back ignored pages in use");
+    bool refused = false;
+    try {
+        pool.set_backed_pages(2);
+    } catch (const std::logic_error&) { refused = true; }
+    failures += expect(refused, "the limit fell over a page in use");
+
+    pool.set_backed_pages(8);
+    failures += expect_size(pool.available_pages(), 5, "available after growth");
+    std::optional<ninfer::DeviceKVPageReservation> second = pool.reserve(5);
+    failures += expect(second.has_value(), "reservation of the grown pages failed");
+    std::vector<ninfer::DeviceKVPageLease> high;
+    high.reserve(5);
+    pool.materialize(*second, 5, high); // pages 3..7
+
+    ninfer::KVExecutionRowLease row = tables.acquire(0);
+    tables.publish(row.handle(), 0, std::span<const ninfer::DeviceKVPageLease>(low), context.stream);
+    tables.publish(row.handle(), 3, std::span<const ninfer::DeviceKVPageLease>(high), context.stream);
+    context.synchronize();
+    failures += expect(read_mapping(tables.row(row.handle()), 8) == std::vector<std::int32_t>({0, 1, 2, 3, 4, 5, 6, 7}),
+                       "pages were not handed out lowest first across growth");
+    row.release();
+
+    // Free the top five: the limit may fall back to three, not below.
+    high.clear();
+    failures += expect(pool.can_back(3) && !pool.can_back(2), "can_back after freeing the top");
+    pool.set_backed_pages(3);
+    failures += expect_size(pool.available_pages(), 0, "available after shrinking to the pages in use");
+    failures += expect(!pool.reserve(1).has_value(), "reservation past the lowered limit succeeded");
+
+    // A free page below a used one does not let the limit fall past the used one.
+    pool.set_backed_pages(8);
+    low.pop_back(); // frees page 2
+    std::optional<ninfer::DeviceKVPageReservation> third = pool.reserve(2);
+    std::vector<ninfer::DeviceKVPageLease> mid;
+    mid.reserve(2);
+    pool.materialize(*third, 2, mid); // pages 2 and 3
+    low.clear();                      // frees 0 and 1
+    failures += expect(pool.can_back(4) && !pool.can_back(3), "a low hole let the limit fall past a used page");
+    mid.clear();
+    pool.set_backed_pages(0);
+    failures += expect_size(pool.available_pages(), 0, "an empty pool shrank to nothing");
+    pool.set_backed_pages(8);
+    failures += expect_size(pool.available_pages(), 8, "an empty pool grew back to its capacity");
+    return failures;
+}
+
+// Chunks map and unmap individually anywhere in the reserved range and keep their addresses.
+int exercise_vmm_range() {
+    if (!ninfer::VmmArena::supported(0)) { return 0; }
+    int failures            = 0;
+    const std::size_t chunk = 2ULL << 20;
+    ninfer::VmmRange range(0, 4 * chunk, chunk);
+    failures += expect_size(range.chunk_count(), 4, "VMM range chunk count");
+    failures += expect_size(range.mapped_bytes(), 0, "a new VMM range maps nothing");
+    auto* base = static_cast<std::byte*>(range.base());
+    failures += expect(range.map(2) && range.map(0), "mapping VMM range chunks failed");
+    failures += expect(range.mapped(0) && !range.mapped(1) && range.mapped(2), "VMM range mapped state");
+    failures += expect_size(range.mapped_bytes(), 2 * chunk, "VMM range mapped bytes");
+    std::vector<std::uint8_t> host(chunk, 0x5A), back(chunk, 0);
+    if (cudaMemcpy(base + 2 * chunk, host.data(), chunk, cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(back.data(), base + 2 * chunk, chunk, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        return failures + expect(false, "VMM range chunk copy failed");
+    }
+    failures += expect(back == host, "VMM range chunk did not hold its bytes");
+    range.unmap(2);
+    failures += expect(!range.mapped(2), "VMM range unmap");
+    failures += expect(range.map(2), "remapping a VMM range chunk failed");
+    failures += expect(range.base() == base, "the VMM range moved");
     return failures;
 }
 
@@ -679,6 +773,8 @@ int main() {
     try {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
+        failures += exercise_backed_limit(context);
+        failures += exercise_vmm_range();
         failures += exercise_republish_while_copy_queued(context);
         failures += exercise_layout_and_transfer(
             context,

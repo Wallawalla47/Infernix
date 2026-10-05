@@ -223,6 +223,15 @@ public:
     [[nodiscard]] const KVPageGeometry& geometry() const noexcept { return spec_.geometry; }
 
     [[nodiscard]] std::uint32_t capacity_pages() const noexcept;
+    // Pages [0, backed_pages) can be handed out; the rest of the capacity has no memory behind it
+    // (an elastic pool over reserved virtual memory). The whole capacity by default.
+    [[nodiscard]] std::uint32_t backed_pages() const noexcept { return backed_pages_; }
+    // Whether every page in [pages, backed_pages) is free, so the limit may fall to `pages`.
+    [[nodiscard]] bool can_back(std::uint32_t pages) const noexcept;
+    // Raises or lowers the limit (lowering needs can_back; the caller unmaps the memory afterwards,
+    // raising maps it before). Allocation is first-fit over ascending pages, so a pool keeps its
+    // pages low and its top frees up.
+    void set_backed_pages(std::uint32_t pages);
     [[nodiscard]] std::uint32_t allocated_pages() const noexcept;
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
@@ -368,6 +377,7 @@ private:
     mutable std::vector<std::uint32_t> validation_marks_;
     mutable std::uint32_t validation_stamp_ = 0;
     std::uint32_t allocated_pages_          = 0;
+    std::uint32_t backed_pages_    = 0;
     std::uint32_t reserved_pages_           = 0;
 };
 
