@@ -10,7 +10,8 @@
 // routing: they take the layer's non-resident experts in ascending id, up to one half of the ring.
 // Layer l uses half l % 2. Its copies wait until layer l - 2's experts finished reading that half,
 // and layer l's MoE waits for them (one event per layer each way). Experts beyond the half's
-// capacity, and any the chunk does not route, stay with the MoE (staged as before, or unused).
+// capacity, and any the chunk does not route, stay with the MoE (staged as before, or unused). With
+// the SSD tier an expert without a host copy is not streamed (the MoE's fetch channel serves it).
 // Results are unchanged: a streamed record is read exactly as a resident or staged one
 // (ops::MoeExpertSource::prefetched).
 //
@@ -28,14 +29,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <functional>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp::execution {
 
 class ExpertStream {
 public:
-    // banks[l]: layer l's pinned host records, record_stride bytes apart.
-    ExpertStream(std::uint32_t experts, std::uint64_t record_stride, std::vector<const std::uint8_t*> banks);
+    // A non-resident expert's pinned host record, or null when it has none (SSD-only). Stable for
+    // the chunk: begin() is called after the round's boundary.
+    using RecordOf = std::function<const std::uint8_t*(std::uint32_t layer, std::uint32_t expert)>;
+
+    // `one_allocation`: a layer's records are one pinned allocation (the banks), so adjacent
+    // records copy as one run; otherwise (the SSD tier's slots, pinned in chunks) one copy each.
+    ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
+                 bool one_allocation);
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -81,7 +89,8 @@ private:
 
     std::uint32_t experts_ = 0, layers_ = 0;
     std::uint64_t stride_  = 0;
-    std::vector<const std::uint8_t*> banks_;
+    RecordOf record_of_;
+    bool one_allocation_ = true;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;
     cudaEvent_t uploaded_ = nullptr;

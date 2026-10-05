@@ -532,6 +532,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
                                 .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};
+    if (!experts_.host_tables.empty()) {
+        source.host_records = nullptr; // the banks hold no records in tier mode
+        source.host_table   = experts_.host_tables.at(layer);
+        if (!experts_.fetch.empty()) { source.fetch = experts_.fetch.at(layer); }
+    }
+    source.error = experts_.error;
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
     if (eager_chunk_ && experts_.overlap_stream != nullptr) {
         source.overlap_stream = experts_.overlap_stream;

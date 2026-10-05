@@ -14,10 +14,11 @@ std::size_t align_up(std::size_t bytes) { return (bytes + kAlign - 1) / kAlign *
 
 } // namespace
 
-ExpertStream::ExpertStream(std::uint32_t experts, std::uint64_t record_stride, std::vector<const std::uint8_t*> banks)
-    : experts_(experts), layers_(static_cast<std::uint32_t>(banks.size())), stride_(record_stride),
-      banks_(std::move(banks)) {
-    if (experts_ == 0 || layers_ == 0 || stride_ == 0 || stride_ % 16 != 0) {
+ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
+                           bool one_allocation)
+    : experts_(experts), layers_(layers), stride_(record_stride), record_of_(std::move(record_of)),
+      one_allocation_(one_allocation) {
+    if (experts_ == 0 || layers_ == 0 || stride_ == 0 || stride_ % 16 != 0 || !record_of_) {
         throw std::invalid_argument("expert stream: empty geometry or unaligned records");
     }
     tables_host_ = PinnedHostBuffer(static_cast<std::size_t>(layers_) * experts_ * sizeof(std::int32_t));
@@ -76,7 +77,8 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         const std::int32_t* frames = residency + static_cast<std::size_t>(l) * experts_;
         std::uint32_t taken = 0;
         for (std::uint32_t e = 0; e < experts_; ++e) {
-            row[e] = frames[e] < 0 && taken < half_ ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
+            const bool stream = frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
+            row[e]            = stream ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
         }
         streams_[l] = taken > 0 ? 1 : 0;
     }
@@ -121,18 +123,22 @@ const std::int32_t* ExpertStream::slots(std::uint32_t layer) const noexcept {
 void ExpertStream::enqueue(std::uint32_t layer) {
     if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
-    // Runs of consecutive experts land in consecutive slots: one copy per run.
+    // Runs of consecutive experts in consecutive slots and adjacent records of one allocation: one
+    // copy per run (a copy may not span two pinned allocations, even adjacent ones).
     for (std::uint32_t e = 0; e < experts_;) {
         if (row[e] < 0) {
             ++e;
             continue;
         }
+        const std::uint8_t* source = record_of_(layer, e);
         std::uint32_t end = e + 1;
-        while (end < experts_ && row[end] == row[end - 1] + 1) { ++end; }
+        while (one_allocation_ && end < experts_ && row[end] == row[end - 1] + 1 &&
+               record_of_(layer, end) == source + static_cast<std::size_t>(end - e) * stride_) {
+            ++end;
+        }
         const std::size_t bytes = static_cast<std::size_t>(end - e) * stride_;
-        CUDA_CHECK(cudaMemcpyAsync(records_ + static_cast<std::size_t>(row[e]) * stride_,
-                                   banks_[layer] + static_cast<std::size_t>(e) * stride_, bytes, cudaMemcpyHostToDevice,
-                                   stream_));
+        CUDA_CHECK(cudaMemcpyAsync(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes,
+                                   cudaMemcpyHostToDevice, stream_));
         stats_.streamed += end - e;
         ++stats_.copies;
         e = end;

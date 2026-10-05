@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
         engine_options.artifact_path     = options.artifact_path;
         engine_options.ngram_volume_path = options.ngram_volume_path;
         engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
+        engine_options.expert_ram_bytes   = options.expert_ram_bytes;
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.device            = options.device;

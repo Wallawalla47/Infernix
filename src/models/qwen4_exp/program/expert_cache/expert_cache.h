@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -41,6 +42,10 @@ struct ResidencyEntry {
 // what tools/expert_cache_replay's LFRU does, decision for decision.
 class LfruPolicy {
 public:
+    // Which missing keys may be admitted (the SSD tier: only keys with a host copy can be loaded).
+    // Every routed key counts as used either way.
+    using Admissible = std::function<bool(std::uint32_t)>;
+
     // halving_period > 0 halves every count each that many ticks (design §9.3, untested default).
     LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0);
 
@@ -54,9 +59,13 @@ public:
     // One routed layer call: `group` holds its distinct keys (the union over the round's columns).
     // `admission_budget` limits how many misses become resident (the DRAM/PCIe token bucket);
     // the highest-score misses are admitted first, and only if they outrank the victim they
-    // replace. An unlimited budget reproduces the replay tool's on-demand LFRU exactly.
+    // replace. An unlimited budget reproduces the replay tool's on-demand LFRU exactly. With
+    // `admissible`, misses it rejects stay non-resident (out.misses still lists them). With
+    // `evictable` (the SSD tier's eviction gate) admission is always the budgeted one-victim loop,
+    // and it stops at the first victim the gate refuses.
     void step(std::span<const std::uint32_t> group, Step& out,
-              std::size_t admission_budget = static_cast<std::size_t>(-1));
+              std::size_t admission_budget = static_cast<std::size_t>(-1), const Admissible* admissible = nullptr,
+              const Admissible* evictable = nullptr);
 
     // Promote a non-resident key (for example a staged prefetch whose frame changes role).
     // Returns the victim, or nothing when the pool still has room.
@@ -102,6 +111,7 @@ private:
     std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
     std::vector<std::pair<double, std::uint32_t>> scratch_;
     std::vector<double> scores_;           // scratch: residents' scores, in residents_ order
+    std::vector<std::uint32_t> candidates_;
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
@@ -136,6 +146,10 @@ public:
     // §19.3.2, "Frame lending"); they are neither acquired nor resized until given back.
     void lend(std::uint32_t first, std::uint32_t count);
     void give_back(std::uint32_t first, std::uint32_t count);
+    // A retired frame whose expert is being copied out (the SSD tier's demotion) is held: neither
+    // freed by on_quiescent nor acquired until release_held.
+    void hold(std::uint32_t frame);
+    void release_held(std::uint32_t frame);
 
     [[nodiscard]] std::size_t free_count() const { return free_.size(); }
     [[nodiscard]] std::size_t pending_count() const { return pending_.size(); }
@@ -146,7 +160,7 @@ public:
     [[nodiscard]] std::uint32_t max_frames() const { return static_cast<std::uint32_t>(state_.size()); }
 
 private:
-    enum : std::uint8_t { kFree, kHeld, kPending, kUnbacked, kLoaned };
+    enum : std::uint8_t { kFree, kHeld, kPending, kUnbacked, kLoaned, kDemoting };
     std::uint32_t rounds_in_flight_;
     std::uint32_t backed_ = 0;
     std::uint32_t loaned_ = 0;
@@ -183,7 +197,13 @@ public:
 
     // The route log of one layer call. `round_started` is the agent's latest sample.
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
-                  std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1));
+                  std::vector<Command>& out, std::size_t admission_budget = static_cast<std::size_t>(-1),
+                  const LfruPolicy::Admissible* admissible = nullptr, const LfruPolicy::Admissible* evictable = nullptr);
+    // The SSD tier's demotion (design §19.3.7 T4/T7): after on_route evicted an expert and before
+    // on_quiescent, its retired frame is held while its record is copied to RAM; release_held frees
+    // it once the copy completed and loads queued experts into free frames.
+    void hold(std::uint32_t frame) { frames_.hold(frame); }
+    void release_held(std::uint32_t frame, std::vector<Command>& out);
     void on_round_done(std::uint64_t round_done, std::vector<Command>& out);
     void on_quiescent(std::vector<Command>& out);
     // Resizes the pool to `frames` while no round is in flight, every issued load has landed and no
@@ -229,6 +249,8 @@ public:
     [[nodiscard]] const ResidencyEntry& entry(std::uint32_t key) const { return table_[key]; }
     [[nodiscard]] const LfruPolicy& policy() const { return policy_; }
     [[nodiscard]] std::size_t queued_loads() const { return queued_.size(); }
+    // Keys admitted and waiting for a free frame (their load is not issued yet).
+    [[nodiscard]] const std::deque<std::uint32_t>& queued_keys() const { return queued_; }
     // Whether the copy issued as (key, frame, serial) may be published: the key is still READY in
     // that frame from that very load. A key can be evicted and re-admitted into the same frame
     // while an earlier copy is in flight (the ABA case); only the newest copy's data is current.

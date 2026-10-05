@@ -70,6 +70,14 @@ struct ForwardExperts {
     std::int32_t staging_slots  = 0;
     // Per layer: the channel to the host expert engine for CPU-served misses (empty disables).
     std::vector<ops::MoeCpuChannel> cpu;
+    // SSD tier (design §19.3.7; empty in full mode): per layer, the device table of host record
+    // pointers (null: SSD-only; replaces the pinned bank) and the fetch channel its SSD-only
+    // experts without a CPU job are read through.
+    std::vector<const std::uint8_t* const*> host_tables;
+    std::vector<ops::MoeFetchChannel> fetch;
+    // Mapped word a call that could not serve an expert writes (ops::MoeExpertSource::error); the
+    // Program checks it after each synchronization. Null: none.
+    std::uint32_t* error = nullptr;
     // Prefill chunks stage their next pass of misses on this stream while one pass computes.
     cudaStream_t overlap_stream = nullptr;
     std::array<cudaEvent_t, 5> overlap_events{};

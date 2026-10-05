@@ -131,13 +131,21 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
     demand.load_staging = kLoadStagingBytes;
+    demand.expert_cap   = options.expert_ram_bytes;
     const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
     report(options, DiagnosticLevel::Info, ledger.describe());
-    if (ledger.placement != models::qwen4_exp::ExpertPlacement::Full) {
-        throw std::runtime_error(
-            "Qwen3.8-Flash-Next keeps every expert in Host RAM and this machine has too little free now (" +
-            ledger.describe() + "). Free Host memory, or lower --ram-headroom-mib (now " +
-            std::to_string(options.ram_headroom_bytes >> 20) + " MiB)");
+    if (ledger.cap_too_large) {
+        throw std::runtime_error("--expert-ram-mib " + std::to_string(*options.expert_ram_bytes >> 20) +
+                                 " asks for more Host RAM than is free now (" + ledger.describe() +
+                                 "); lower it, use auto, or free Host memory");
+    }
+    // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
+    // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
+    const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    if (tier) {
+        auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
+        streamed.stream_experts = true;
+        plan                    = models::qwen4_exp::plan_load(reader, streamed);
     }
     // A small reserve trims other programs' working sets; keep NInfer's own pageable memory
     // resident so its heap and driver pages never hard-fault from the page file.
@@ -206,6 +214,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;
+    if (tier) {
+        program_options.expert_ram_bytes =
+            static_cast<std::uint64_t>(static_cast<double>(ledger.expert_ram) / (1.0 + demand.lock_overhead));
+    }
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom

@@ -122,7 +122,27 @@ void test_starved_and_describe() {
     require(line.find("RAM ledger: available 78.00 GiB") == 0 && line.find("reserve 2.00") != std::string::npos &&
                 line.find("full mode") != std::string::npos,
             "the ledger line names the inputs and the outcome: " + line);
-    require(empty.describe().find("too little RAM") != std::string::npos, "a short ledger says so");
+    require(empty.describe().find("SSD tier") != std::string::npos, "a short ledger names the SSD tier");
+}
+
+// --expert-ram-mib: a cap below what the ledger leaves selects the SSD tier with exactly the cap; a
+// cap at or above the full need changes nothing; a cap the ledger cannot give is flagged.
+void test_expert_cap() {
+    HostMemoryDemand d       = flash_next();
+    const std::uint64_t need = need_for_full(d);
+    d.expert_cap             = 32 * kGiB;
+    const HostMemoryLedger capped = plan_host_memory(snapshot(need + kGiB, 200 * kGiB), d);
+    require(capped.placement == ExpertPlacement::Tier && capped.expert_ram == 32 * kGiB && capped.capped &&
+                !capped.cap_too_large && capped.describe().find("capped by --expert-ram-mib") != std::string::npos,
+            "a 32 GiB cap on a full-mode machine gives the SSD tier with 32 GiB");
+    d.expert_cap = 100 * kGiB;
+    const HostMemoryLedger above = plan_host_memory(snapshot(need + kGiB, 200 * kGiB), d);
+    require(above.placement == ExpertPlacement::Full && !above.capped && !above.cap_too_large,
+            "a cap above the full need leaves full mode");
+    d.expert_cap = 40 * kGiB;
+    const HostMemoryLedger short_room = plan_host_memory(snapshot(30 * kGiB, 200 * kGiB), d);
+    require(short_room.cap_too_large && short_room.placement == ExpertPlacement::Tier,
+            "a cap larger than the ledger leaves is flagged");
 }
 
 // ---------------------------------------------------------------- RT7
@@ -364,6 +384,7 @@ int main() {
         test_planned_terms();
         test_commit_limit();
         test_starved_and_describe();
+        test_expert_cap();
         test_graph_bound();
         test_display_headroom();
         test_internal_reserve();

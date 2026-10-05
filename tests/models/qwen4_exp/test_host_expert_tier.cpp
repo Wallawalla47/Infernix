@@ -4,12 +4,19 @@
 // service's role) including a straddling record, a resident key served without a read, duplicate
 // demands sharing a ticket, admission of hot landings at the next boundary (the victims lose their
 // host copy, the dirty set names both), ring exhaustion reusing finished slots, a failed read, and
-// destruction with reads in flight. CPU and disk only.
+// destruction with reads in flight. CPU and disk only, except with --fetch: the tier as the responder
+// of a fetch channel (mapped words, so a CUDA context), this thread playing the device's half of the
+// protocol (ops/offloaded_sparse_moe/cpu/fetch_request.h): records landed from RAM and read from disk,
+// more records than ring slots (slots reused as the "device" consumes them), the heartbeat, a request
+// failing on an unreadable record, and admission of fetched landings at the next boundary.
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
+#include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -18,6 +25,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -132,9 +140,107 @@ std::vector<const std::uint8_t*> serve(HostExpertTier& tier, const std::vector<s
     return out;
 }
 
+// The device's half of the fetch protocol, played on the channel's mapped words.
+struct DeviceSide {
+    ninfer::ops::MoeFetchChannel channel;
+    std::uint32_t sequence = 0;
+
+    void publish(std::uint32_t layer, const std::vector<std::int32_t>& experts) {
+        for (std::size_t i = 0; i < experts.size(); ++i) { channel.request->expert[i] = experts[i]; }
+        channel.request->layer = static_cast<std::int32_t>(layer);
+        channel.request->count = static_cast<std::int32_t>(experts.size());
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *reinterpret_cast<volatile std::uint32_t*>(&channel.request->sequence) = ++sequence;
+    }
+    [[nodiscard]] std::uint32_t beat() const { return *reinterpret_cast<const volatile std::uint32_t*>(channel.heartbeat); }
+    // Waits (up to 5 s) until record i of the current request has landed: its address, or null once
+    // the request failed (`status`) or the wait timed out.
+    const std::uint8_t* wait(std::uint32_t i, std::uint32_t& status) const {
+        const auto* response = reinterpret_cast<const volatile ninfer::ops::offloaded_moe::FetchResponse*>(channel.response);
+        const auto until     = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::chrono::steady_clock::now() < until) {
+            if (response->sequence == sequence) {
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                status = response->status;
+                if (status != 0) { return nullptr; }
+                if (response->landed > i) {
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    return reinterpret_cast<const std::uint8_t*>(response->record[i]);
+                }
+            }
+            std::this_thread::yield();
+        }
+        status = ETIMEDOUT;
+        return nullptr;
+    }
+    void consume(std::uint32_t records) {
+        *reinterpret_cast<volatile std::uint64_t*>(channel.consumed) = static_cast<std::uint64_t>(sequence) << 32U | records;
+    }
+};
+
+void test_fetch(const ExpertStore& store) {
+    ninfer::ops::offloaded_moe::FetchChannel channel;
+    auto o  = options();
+    o.fetch = &channel;
+    HostExpertTier tier(store, o);
+    std::vector<std::uint32_t> ranked(kKeys);
+    for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
+    check(tier.prefill(ranked) == 50, "fetch: pre-fill fills the resident slots");
+    DeviceSide device{channel.channel(0)};
+    tier.begin_round(32);
+
+    // Layer 1, experts 0..19 = keys 40..59: 40..49 are in RAM, 50..59 read from disk through the
+    // 8-slot ring, consumed one record at a time.
+    std::vector<std::int32_t> experts;
+    for (std::int32_t e = 0; e < 20; ++e) { experts.push_back(e); }
+    const std::uint32_t beat_before = device.beat();
+    device.publish(1, experts);
+    bool all = true, from_ram = true;
+    for (std::uint32_t i = 0; i < experts.size(); ++i) {
+        std::uint32_t status = 0;
+        const std::uint8_t* record = device.wait(i, status);
+        all = all && status == 0 && matches(record, kExperts + i);
+        if (i < 10) { from_ram = from_ram && record == tier.record(kExperts + i); }
+        device.consume(i + 1);
+    }
+    check(all, "fetch: 20 records (10 from RAM, 10 through an 8-slot ring) land in job order with their bytes");
+    check(from_ram, "fetch: a key in RAM lands at its RAM slot without a read");
+    check(device.beat() != beat_before, "fetch: the heartbeat advances while a round is open");
+
+    // Layer 2, experts 30..39 = keys 110..119: key 119 cannot be read, so the request fails.
+    experts.clear();
+    for (std::int32_t e = 30; e < 40; ++e) { experts.push_back(e); }
+    device.publish(2, experts);
+    std::uint32_t status = 0, wrong = 0;
+    for (std::uint32_t i = 0; i < experts.size(); ++i) {
+        const std::uint8_t* record = device.wait(i, status);
+        if (record == nullptr) { break; }
+        wrong += matches(record, 2 * kExperts + 30 + i) ? 0U : 1U;
+        device.consume(i + 1);
+    }
+    check(status == EIO, "fetch: a request with an unreadable record fails with EIO");
+    check(wrong == 0, "fetch: every record landed before the failure holds its bytes");
+    tier.end_round();
+
+    // The hot fetched keys are admitted at the next boundary (records still in their ring slots).
+    std::vector<std::uint32_t> hot;
+    for (std::uint32_t k = 2 * kExperts + 30; k < 2 * kExperts + 39; ++k) { hot.push_back(k); }
+    tier.record_uses(1, hot, 50.0);
+    tier.begin_round(32);
+    std::uint32_t admitted = 0;
+    for (const auto k : hot) { admitted += matches(tier.record(k), k) ? 1U : 0U; }
+    std::cout << "fetch: " << tier.stats().fetch_requests << " requests, " << tier.stats().fetch_records
+              << " records (" << tier.stats().fetch_from_ram << " from RAM), " << tier.stats().demand_reads
+              << " reads, " << admitted << " of 9 hot landings admitted\n";
+    check(tier.stats().fetch_requests == 2 && tier.stats().fetch_from_ram == 10, "fetch: request statistics");
+    check(admitted > 0, "fetch: hot fetched landings are admitted into RAM");
+    tier.controller().check();
+    tier.end_round();
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
         const Files files = make_files();
         std::vector<std::vector<float>> multipliers(kLayers, std::vector<float>(3 * kExperts, 1.0F));
@@ -201,6 +307,7 @@ int main() {
                       << tier.stats().demand_failures << " failed, " << tier.stats().admitted << " admitted\n";
             tier.begin_round(32);
         }
+        if (argc > 1 && std::string_view(argv[1]) == "--fetch") { test_fetch(store); }
         {
             // Destruction with reads in flight.
             HostExpertTier tier(store, options());

@@ -15,11 +15,11 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 - **GPU.** An RTX 5090 (sm_120a). A **PCIe x16** link matters: expert misses cross PCIe, and an
   x8 link halves their bandwidth. Check with
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
-- **RAM.** About 96 GB. A run pins ~64.5 GiB. At startup a RAM ledger plans every allocation and
-  keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults about 69.3 GiB
-  must be available, and 73.3 GiB for `ninfer-serve` with its prefix cache (see
-  [Prefix cache](#prefix-cache)). When the experts do not fit, startup stops with the ledger line, which names
-  every term.
+- **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
+  allocation and keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults
+  about 69.3 GiB must be available, and 73.3 GiB for `ninfer-serve` with its prefix cache (see
+  [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
+  experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
   programs (see [VRAM](#vram)).
@@ -138,6 +138,18 @@ tokens; KV blocks are shared across requests. `ninfer` (one request) runs withou
   start, as for Qwen3.5 ([serving](serving.md)); a file from another artifact, KV format, drafter
   or `ninfer-serve` build is ignored and replaced.
 - Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`.
+
+## SSD expert tier
+
+When the routed experts do not all fit in RAM, or `--expert-ram-mib N` caps them below the ~64.5 GiB
+they need, the experts stay in the artifact: startup pins N MiB (or what the ledger leaves) of
+expert slots and fills them with the saved ranking of `--expert-state`, then the rest in file order.
+A round that routes an expert in neither VRAM nor RAM reads it from the artifact while the layer's
+other experts compute: decode and verification hand it to the CPU expert engine, prefill copies it
+from the read as soon as it lands. Read experts that rank above the coldest RAM expert replace it.
+Outputs are the same bits as with every expert in RAM; only speed changes, with the share of routed
+experts read from disk. The tier needs at least 2.6 GiB (1,024 slots). A read that fails fails the
+requests of that round with an error and the server keeps serving.
 
 ## VRAM
 

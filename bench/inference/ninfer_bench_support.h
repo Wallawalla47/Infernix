@@ -55,6 +55,7 @@ struct BenchOptions {
     std::string artifact_path;
     std::string ngram_volume_path;
     std::uint64_t ram_headroom_bytes = ninfer::kDefaultRamHeadroomBytes;
+    std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::string corpus_path{kDefaultCorpusPath};

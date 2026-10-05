@@ -39,11 +39,14 @@ struct HostMemoryDemand {
     double lock_overhead = 0.0025;
     // Full mode needs this much beyond the banks, so the system is not run at the reserve's edge.
     std::uint64_t full_margin = kLedgerGiB;
+    // --expert-ram-mib: at most this much RAM for the experts (less than full mode needs selects the
+    // SSD tier even when more is free). Empty: what the ledger leaves.
+    std::optional<std::uint64_t> expert_cap;
 };
 
 enum class ExpertPlacement : std::uint8_t {
-    Full, // every expert bank pinned in RAM (today's load path)
-    Tier, // RAM holds part of the experts; the rest is read from the artifact
+    Full, // every expert bank pinned in RAM
+    Tier, // the SSD tier: RAM holds part of the experts; the rest is read from the artifact
 };
 
 struct HostMemoryLedger {
@@ -59,6 +62,9 @@ struct HostMemoryLedger {
     std::uint64_t full_need = 0;
     // The commit limit, not physical memory, bounded expert_ram (a small page file).
     bool commit_limited = false;
+    // expert_cap bounded expert_ram; the cap asked for more than the ledger leaves (an error).
+    bool capped        = false;
+    bool cap_too_large = false;
     ExpertPlacement placement = ExpertPlacement::Tier;
 
     // One log line: the inputs and the outcome.
