@@ -10,6 +10,10 @@ add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
   LIBRARIES ninfer_core)
 
+# Unbuffered block reads through a ring (CPU and disk only).
+ninfer_add_test(ninfer_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
+  LIBRARIES ninfer_core)
+
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)

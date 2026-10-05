@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 
@@ -24,14 +25,14 @@ public:
     [[nodiscard]] std::uint64_t current_bytes() const noexcept;
     std::size_t read_direct(std::uint64_t offset, std::span<std::byte> destination) const;
 
-    // Unbuffered reads issued together and awaited together (overlapped on Windows, so their
-    // device latency overlaps). Offsets, sizes and destinations follow read_direct's alignment
-    // rules; every read must complete in full or the call throws.
-    struct DirectRead {
-        std::uint64_t offset = 0;
-        std::span<std::byte> destination;
-    };
-    void read_direct_batch(std::span<const DirectRead> reads) const;
+    // Unbuffered reads of `block_bytes` at each offset (read_direct's alignment rules), at most
+    // ring.size() / block_bytes in flight, each into a free block of `ring` (block-aligned), so
+    // their device latency overlaps on Windows. consume(i, bytes) runs on the calling thread as read
+    // i completes, in completion order; its ring block is reused once consume returns. Returns when
+    // every read has completed; a failed or short read stops issuing, waits for the reads in flight
+    // and throws.
+    void read_direct_blocks(std::span<const std::uint64_t> offsets, std::size_t block_bytes, std::span<std::byte> ring,
+                            const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const;
 
 private:
     struct Impl;

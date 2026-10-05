@@ -75,11 +75,19 @@ std::uint64_t ReadOnlyFile::current_bytes() const noexcept {
     return static_cast<std::uint64_t>(status.st_size);
 }
 
-void ReadOnlyFile::read_direct_batch(std::span<const DirectRead> reads) const {
-    for (const DirectRead& read : reads) {
-        if (read_direct(read.offset, read.destination) != read.destination.size()) {
-            throw std::runtime_error("direct batch read: a read did not complete in full");
+void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, std::size_t block_bytes,
+                                      std::span<std::byte> ring,
+                                      const std::function<void(std::size_t, std::span<const std::byte>)>& consume) const {
+    if (block_bytes == 0 || ring.size() < block_bytes) {
+        throw std::invalid_argument("direct block reads need a ring of at least one block");
+    }
+    // Serial reads into the first ring block (the WSL build).
+    const std::span<std::byte> block = ring.first(block_bytes);
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+        if (read_direct(offsets[i], block) != block_bytes) {
+            throw std::runtime_error("direct block read: a read did not complete in full");
         }
+        consume(i, block);
     }
 }
 
