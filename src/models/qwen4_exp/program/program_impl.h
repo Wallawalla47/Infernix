@@ -8,6 +8,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
+#include "core/nvtx.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
@@ -922,7 +923,14 @@ public:
         const std::int32_t width =
             std::min<std::int32_t>(chunk_, static_cast<std::int32_t>(lane.prompt_tokens) - begin);
         const bool last = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
-        stage_sequence(index, begin, width, lane.history);
+        // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
+        const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
+                                            static_cast<std::uint64_t>(width));
+        {
+            const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                               static_cast<std::uint64_t>(width));
+            stage_sequence(index, begin, width, lane.history);
+        }
         const auto chunk = stage_mtp_chunk(lane, index, begin, width);
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
         // a copy-out of this lane's state still in flight (design §19.3.1).
@@ -933,7 +941,12 @@ public:
         // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
         if (last && lane.vision) { vision_release(lane); }
         if (!last) {
-            device_.synchronize();
+            {
+                const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
+                device_.synchronize();
+            }
+            const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
+                                                    static_cast<std::uint64_t>(width));
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
                         kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
@@ -954,10 +967,14 @@ public:
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
             sample(lanes, positions);
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
-                        kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
-            residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
-            apply_vram_target(false);
+            {
+                const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
+                                                        static_cast<std::uint64_t>(width));
+                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
+                            kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
+                residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
+                apply_vram_target(false);
+            }
             const SequenceHandle rows[] = {sequence};
             out.timing.submit_host_ns = elapsed_ns(start);
             lane.prefill_ns += out.timing.submit_host_ns;

@@ -216,3 +216,9 @@ ninfer_add_op_test(ninfer_qsa_select_test
 ninfer_add_op_test(ninfer_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
   LIBRARIES ninfer_ops)
+
+# The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
+ninfer_add_op_test(ninfer_offloaded_moe_wide_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)

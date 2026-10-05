@@ -6588,6 +6588,138 @@ ledger and `--vram-headroom-mib N|auto`; RT7 and the engine smoke pass.
 R2 and R3 implemented on `claude/fn-memory`: the VMM frame pool with resize, the monitor, the law
 and the idle hook; RT8 (host), RT9 and RT13 (engine, fake source) are the tests.
 
+### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
+
+Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");
+this section records the design decisions of F0 and F1. Results are recorded by the merging session.
+
+#### F0: attribution of a multi-chunk prefill
+
+- **Instrumentation.** Qwen4Exp's prefill had no NVTX ranges, so a timeline could not say what the
+  host did while the GPU idled. `advance_prefill` now opens permanent ranges in the ninfer domain
+  (`core/nvtx.h`, as Qwen3.5 does): `prefill.chunk` (payload: width), `prefill.ple_rows`
+  (`stage_sequence`: n-gram hashing and row reads), `device.wait` (the sync after a non-last
+  chunk) and `prefill.residency` (`after_round`: host LFRU policy and promotion issue). They are
+  chunk-granular, cost nothing without a tool attached, and stay outside the files other tracks own
+  (`ngram_volume.cpp`, `expert_residency.cpp`). An earlier ad-hoc patch with formatted range names in
+  those files was replaced.
+- **Rig.** nsys (`--trace=cuda,nvtx`) of `ninfer_bench -p 16384 --prefill-chunk 4096 -r 2
+  --warmup 0`: four cold chunks in a fresh process (empty expert cache, cold n-gram rows), then the
+  same prompt warm; once per arm of the F1 toggle, plus profiler-free runs of the same workload.
+- **Attribution.** `f0_attribution.py` reads the SQLite export. Per chunk window (from a chunk's
+  range start to the next one's) it reports GPU busy time (union over all streams), the narrow and
+  wide expert kernels, `stage_kernel` and its exposed part (running while no other kernel runs),
+  other kernels, the io upload and its queue delay behind promotions (GPU start minus API return,
+  and the promotions that finished in between), promotions (count, bytes, span), and idle GPU time
+  split by the host range active at the time (`prefill.ple_rows`, `prefill.residency`,
+  `device.wait`, other).
+
+#### F1: the wide route
+
+- **Route.** An expert takes the wide route when it has more than eight columns in the call and its
+  gate and up input scales are equal; otherwise the narrow route, at any width. Both conditions are
+  properties of the call's routing and the stored scales, never of placement, so outputs stay
+  placement-invariant. Unequal gate/up scales would need two A operands inside one MMA tile (gate and
+  up rows interleave in the record); the narrow route computes such experts exactly instead.
+  Measured on 2026-10-04: all 24,576 experts of `Qwen3.8-Flash-Next-NVFP4` share the scale, so the
+  rule only covers recipes that do not exist today. The narrow kernels skip wide jobs; the fork
+  route (one pass, graph-captured decode) is limited to calls of at most eight columns, where no
+  expert can be wide.
+- **Reuse.** The GEMM is the warp-specialized TMA pipeline of the dense W4A4 route
+  (`nvfp4_a4_tma_kernel`) made grouped and persistent (`cuda/wide_expert.cuh`): one producer warp
+  issues the stage loads on full/empty mbarriers, eight consumer warps run
+  `mma…kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64` (`mma_nvfp4_e4m3`). Reused unchanged: the
+  tensor-map construction (`nvfp4_make_tma_2d`), `nvfp4_tma_load_2d`, the Windows descriptor staging
+  (`TmaDescriptorStaging`, one staging per layer call), the mbarrier helpers, the 64-byte-swizzled
+  activation tiles with the dense kernel's `ldmatrix` A fragments and scale lanes,
+  `nvfp4_prepare_shared`, and the canonical arithmetic of `canonical_math.h`. From Qwen3.5's
+  `sparse_moe/prefill`: the device-built list of (expert, column tile) jobs and the grid-stride walk
+  over jobs times row blocks, and packed rows grouped by expert instead of a gathered activation copy.
+- **Not reused, and why.**
+  - `nvfp4_a4_tma_kernel` itself: its B operand is a dense, tensor-mapped weight with persistent
+    128-row scale tiles, one matrix per launch. Expert records (`nvfp4_expert_rg16_v1`) sit at
+    per-job addresses in frames, staging slots or the host bank, and their row-group units cannot be
+    described by a tensor map in the MMA's operand order. Its token tiles are 128 or 256 (tied to the
+    tiled activation-scale layout), against ~20 columns per expert at chunk 1024 and ~80 at 4096.
+    Parameterizing it would also requalify five dense routes.
+  - `nvfp4_a4_mma_kernel` (cp.async): the same weight-layout constraint.
+  - `quantize_nvfp4_k16` and `launch_nvfp4_a4_quantize`: their divisor formulation is not the
+    canonical A4 rule of §16.2, and they quantize a whole matrix with one scale, not each expert's
+    rows with its own.
+  - The token-major SwiGLU epilogue: it fuses SiLU on FP32 accumulators, without the BF16 y
+    boundary, `swiglu_bf16` or A4(h).
+  - `sparse_moe/prefill`'s kernels: BF16-activation Q4/Q8 codecs on BF16 MMA; its router and
+    selection duplicate `moe_route`/`moe_dispatch`.
+- **Operands.** Activations are the A operand (M = 16 columns), weights B (N = 8 rows), as in the
+  dense route.
+  - A: one plane row per routed entry in dispatch order (expert-grouped), filled once per call by
+    `quantize_kernel` with the canonical rule (`canon::quantize_a4_codes`, the code-returning form of
+    `quantize_a4_block`, equal by test). x rows: 1,280 code bytes + 160 scale bytes (59 MB of
+    workspace at chunk 4096, ~21 frames). The A4(h) rows (320 + 40 bytes) live in the entry's unused
+    narrow h-block row (stride 1,120 bytes), so h costs no workspace. Both planes are read through
+    tensor maps; a tile's rows past its expert read the next expert's rows, and the epilogue discards
+    them (MMA rows are independent).
+  - B: each K tile's eight 144-byte units of a row group are one contiguous 1,152-byte run, moved by
+    one `cp.async.bulk` into shared memory unchanged. A thread forms its fragments in registers:
+    the record's word at 32q + 4i holds four k of row i (low nibbles) and of row i + 8 (high nibbles),
+    so `(w0 & 0x0F0F0F0F) | (w1 & 0x0F0F0F0F) << 4` is a complete B register for rows 0-7 and the
+    high-nibble form for rows 8-15. Its eight K slots hold k, k + 4 of each half block in that order,
+    and the activation plane stores its codes in the same order (byte i of a block:
+    code[8(i/4) + i%4] | code[8(i/4) + 4 + i%4] << 4). Within each 64-wide K step the MMA's four
+    16-slot blocks take record blocks 0, 2, 1, 3 (`plane_block`, applied to the activation plane
+    too), which puts the four lanes of a group on disjoint banks of the 144-byte-stride units. Weight
+    scales are four byte loads per row and K step, assembled with `prmt`.
+- **Tiles and pipeline.** 64 columns × 128 rows × 128-wide K tiles, three stages (43 KB, two CTAs
+  per SM), eight consumer warps as 2 (columns) × 4 (rows). A warp's 32 rows are one 16-intermediate
+  block of h, and gate row 2i and up row 2i + 1 land in the same thread, so the gate/up epilogue is
+  registers and shuffles: y = bf16(acc ⊗ α), h = `swiglu_bf16`, the block maximum by two shuffles,
+  the canonical scale and codes, the eight code bytes by two OR-shuffles. The down epilogue writes
+  y = bf16(acc ⊗ α_down) to the entry's output column. The grid is persistent (two CTAs per SM)
+  over the pass's (tile, row block) items; the epilogue uses no shared memory, so the producer
+  fills the next item's stages meanwhile.
+- **Passes.** The work list is planned once per layer call for the pass size moe_experts stages
+  (half the slots with the overlap stream, all of them otherwise), and the wide GEMMs of pass p run
+  after the narrow kernels of pass p, before its slots are released. Staging and the pass loop are
+  unchanged (F2 replaces them).
+- **Numerics.** Up to the accumulator the arithmetic is §16.2's; only the sum is the tensor core's
+  FP32 accumulation of exact block products instead of one exact int64 sum. Qualification
+  (`test_offloaded_moe_wide.cu`): the code quantizer against the block quantizer (exact); both GEMMs'
+  accumulators, read through a probe epilogue, against the exact sums within an FP32 accumulation
+  bound; the down epilogue bitwise; end to end against the FP64 chain with the canonical narrow
+  arithmetic as the rounding-order control; narrow-route experts bitwise against the CPU engine;
+  and bit-identical outputs across placements and pass layouts.
+- **Measurement.** A temporary environment toggle, never committed (`f1-toggle-temporary.patch`),
+  puts every expert back on the narrow route in the same binary, for ABBA prefill timing, the
+  teacher-forced A15 check (8K text at chunk 4096 against a chunk-2048 rounding-order control) and
+  re-recorded greedy baselines. The x-plane workspace is the one cost the toggle cannot show; it is
+  read from the startup frame count against the base build.
+
+#### F1 results (2026-10-05, RTX 5090, Windows, INT8 KV, toggle build, ABBA)
+
+- **A VRAM defect found and fixed first.** The first measurement had the wide route 76 % slower
+  end to end (146 against 613 tok/s) while its kernels were faster: the first wide launch took
+  3,336 MiB of device memory. Its record-unit loads used `cp.async.bulk` with a `shared::cluster`
+  destination; ptxas guards each such copy with a call to a driver routine (the remote-CTA path),
+  and the driver raised the per-thread stack limit from 1 KiB to 14,416 B at that launch
+  (× 170 SMs × 1,536 threads). With the expert frames filling VRAM, allocations fell back to WDDM
+  system memory and every kernel slowed. The kernel runs without clusters, so the `shared::cta`
+  destination is the same copy with no guard (a PTX probe shows one `UBLKCP` and no call); after
+  it the stack limit and free memory are unchanged across the first launch. Other `CALL.ABS`
+  sites in the binary (e.g. the INT8 and VQ prompt-attention kernels) are float-division slow
+  paths and do not raise the stack.
+- **Op** (`ninfer_offloaded_moe_wide_bench`, frames placement, per layer call): T = 4096 79.2 →
+  1.86 ms, T = 1024 20.5 → 3.27 ms, T = 256 6.32 → 4.68 ms, T = 64 2.87 → 2.89 ms (equal).
+- **End to end** (`ninfer_bench`, two runs per arm, means): pp4096 at chunk 4096 674.1 → 982.6
+  tok/s (+45.8 %), pp16384 at chunk 4096 646.8 → 1081.9 (+67.3 %), pp4096 at chunk 1024 420.8 →
+  474.7 (+12.8 %); tg512 decode 88.14 → 87.91 tok/s (−0.26 %, within the arms' spread: A 88.06 and
+  88.22, B 88.03 and 87.79; decode does not use the wide route). VRAM free after a request
+  375-379 MiB in both arms, the same expert frame count.
+- **Quality:** teacher-forced logits of the narrow and wide routes were bit-identical on code, doc
+  and chat texts at chunk 1024 and an 8K text at chunk 4096 (the artifact's experts all have equal
+  gate and up input scales); the op test's FP64 checks pass (C1-C6).
+- **Merged without** the temporary toggle; the NVTX ranges of F0 were ported onto the current
+  `advance_prefill`.
+
 ---
 
 ## 20. Documentation and authority changes
