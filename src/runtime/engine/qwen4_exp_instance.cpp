@@ -75,6 +75,11 @@ void validate(const EngineOptions& options) {
     if (options.kv_cache != KvCacheStorage::BFloat16 && options.kv_cache != KvCacheStorage::Int8Group64) {
         throw std::invalid_argument("Qwen3.8-Flash-Next supports --kv-dtype bf16 or int8");
     }
+    // Its loader binds the stored activation permissions as recorded (canonical W4A4 experts); a
+    // 16-bit-activation reference route is not built, so the option is refused, not ignored.
+    if (options.a16_activations) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next has no 16-bit-activation reference route (a16_activations)");
+    }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
