@@ -1766,9 +1766,15 @@ and measurements: §19.3.4.
 **As built.** The engine worker hashes 16 rows per column (`NgramHash::row_ids`: heads 0-7 the
 bigram, 8-15 the trigram; EOS closes windows and pads the start; vision placeholders hash as tokens)
 and `NgramVolume::read_rows` probes a direct-mapped, pageable 2^20-row cache (~170 MB, alive with
-the Program), reading each missing occurrence unbuffered in overlapped groups of 64. The rows go to
-the host io buffer and up with the io prefix (`upload_pinned`; prefill: the whole layout).
-`ple_embed`, a plain launch at the top of layer 1, is the only reader.
+the Program), reading each distinct missing 4 KiB block once through a 64-deep polled ring (S1).
+Prefill, forced-token and plain decode calls read their rows before the launch and upload them
+with the io (`upload_pinned`; prefill: the whole layout). Verification rounds (S2) read them after
+the launch: the verify graph runs `upload_pinned_when` (Core) before `ple_embed`, which copies the
+rows from the pinned io once the pinned ready word equals the round's io `gate` word. The anchor
+column (committed tokens) and every column of an n-gram copy row are read while the drafter runs;
+the draft columns after the verify launch, while the GPU embeds and runs layer 0. A round that
+warms or captures its graph reads everything first. `ple_embed`, a plain launch at the top of
+layer 1, is the only reader.
 
 **Planned.**
 
@@ -5309,6 +5315,43 @@ idle (`miss_service.cpp:111-116`) sleeps ≥ 1 ms, up to 15.6 ms, on Windows (in
 cheap to probe. Drafting on the device right after acceptance, as Qwen3.5 does, would remove the
 commit-to-draft gap; a larger design. NVMe power-state exits (50-150 ms on some drives, §12.4;
 unmeasured on G:) would hit a request's first gated round, and the slow-read warning will show them.
+
+#### S2 as built (branch `claude/fn-ngram-s2`, 2026-10-05)
+
+- **Core.** `upload_pinned_when(dst, pinned_src, bytes, pinned_ready, device_expected, wait_stats,
+  wait_row, stream)` and `publish_pinned_word` (`core/device`), as designed: ≤ 16 CTAs of 256
+  threads, 32 KiB each; every CTA's thread 0 polls with `__nanosleep(200)`, then
+  `__threadfence_system()`, then `__ldcv` loads in batches of eight 16-byte vectors; a wait records
+  its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s. Test cases in
+  `ninfer_device_test`: 2,560 / 12,800 / 327,680 B with a 2 ms producer delay over poison, a
+  pre-published word (no wait), three graph replays with the old word left published, and a
+  misaligned size. The 3-5 s producer-delay TDR probe was not run.
+- **Program.** `IoLayout::gate` (a U32 before the rows); `gate_host_` (pinned ready word),
+  `gate_sequence_` (strictly increasing, skips 0), `gate_stats_` (per-lane device wait counters,
+  zeroed at admission). `decode()` fixes each row's draft count and source before drafting
+  (a pure reorder), so `mtp_draft` reads the anchor and copy-row columns while it waits; the
+  `sequence_` history copy is gone (`verify_token` builds each window). `verify()` uploads the io
+  only up to the rows, launches, enqueues the tail, flushes, reads the rest, publishes, then
+  synchronizes; `GateRelease` publishes over zeroed rows if anything throws in between.
+  `report_ngram` adds "G gated rounds: R NVMe reads (T ms) behind the gate, the GPU waited in W
+  (mean X us)"; a gated round's reads above 100 ms warn.
+- **Measured** (one binary, `TEMP-S2` toggle: A reads every row before the launch, B gated; cold
+  CLI = new process each, n-gram and expert cold; RTX 5090, CUDA 13.4):
+
+| Workload | A (rows before launch) | B (gated) | B - A |
+  |---|---:|---:|---:|
+  | Cold CLI story, MTP, 400 tokens, 6 + 6 runs ABBA | 115.50 tok/s (115.3-115.7) | 119.73 (119.3-120.2) | **+3.67 %** (2 x pooled SE 0.31 tok/s) |
+  | Cold CLI code, MTP, 400 tokens, 6 + 6 runs ABBA | 131.88 (131.3-132.5) | 132.37 (131.9-132.9) | +0.37 % (+0.48 tok/s against 2 x SE 0.47: at the noise edge) |
+  | tg512 MTP (n-gram warm), 2 + 2 files of 3 reps | 139.33 | 139.42 | +0.06 % (within noise) |
+
+  Greedy ids are identical in every run, MTP equals plain at C = 1, the C = 2 serve identity is 6/6
+  in both arms, and `prefix_real` passes all 27 checks. The story request's line: 229 gated
+  rounds, 4,016 reads (95.9 ms) behind the gate, the GPU waited in 151 rounds for 223 us on
+  average, so about two thirds of the read time is hidden. **The acceptance's "mean gate wait <=
+  10 us" is not met** (story ~147 us, code ~27 us per gated round): a decode round's ~17 reads take
+  ~420 us, ~24 us each, which is close to serial latency, not the probe's ~4.5 us per read. Why the
+  overlapped ring does not overlap here is open (next item); the cold code prompt reads few rows in
+  decode (403 behind the gate), so it gains little.
 
 #### S0 as built (branch `claude/fn-ngram`)
 

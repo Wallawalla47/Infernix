@@ -2,7 +2,13 @@
 
 #include <cuda_runtime.h>
 
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <functional>
 #include <iostream>
+#include <thread>
+#include <vector>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,6 +51,123 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
         std::cerr << label << " total_vram is zero\n";
         ++failures;
     }
+    return failures;
+}
+
+// upload_pinned_when: the copy waits for the published word, reads the data written after the
+// launch (not the poison before it), counts its waits, and a graph replay with a new expected
+// word rejects the word an earlier round left in place.
+int check_pinned_gate(const ninfer::DeviceContext& ctx) {
+    int failures = 0;
+    constexpr std::size_t kMaxBytes = 327680;
+    std::byte* src             = nullptr;
+    std::uint32_t* ready       = nullptr;
+    std::uint32_t* expected_h  = nullptr;
+    void* dst                  = nullptr;
+    std::uint32_t* expected    = nullptr;
+    std::uint64_t* stats       = nullptr;
+    CUDA_CHECK(cudaMallocHost(&src, kMaxBytes));
+    CUDA_CHECK(cudaMallocHost(&ready, 64));
+    CUDA_CHECK(cudaMallocHost(&expected_h, 64));
+    CUDA_CHECK(cudaMalloc(&dst, kMaxBytes));
+    CUDA_CHECK(cudaMalloc(&expected, sizeof(std::uint32_t)));
+    CUDA_CHECK(cudaMalloc(&stats, 2 * sizeof(std::uint64_t)));
+    std::uint32_t word = 0;
+    ninfer::publish_pinned_word(ready, 0);
+    std::vector<std::byte> host(kMaxBytes);
+    const auto fill = [&](std::size_t bytes, std::uint32_t round) {
+        for (std::size_t i = 0; i < bytes; ++i) { host[i] = static_cast<std::byte>((i * 131 + round * 7 + 3) & 0xff); }
+    };
+    // Poison, launch, wait, write the data, publish; returns whether the copy holds the data.
+    const auto produce = [&](std::size_t bytes, std::uint32_t round, const std::function<void()>& launch) {
+        std::memset(src, 0xa5, bytes);
+        *expected_h = ++word;
+        CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
+        launch();
+        ctx.flush();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        fill(bytes, round);
+        std::memcpy(src, host.data(), bytes);
+        ninfer::publish_pinned_word(ready, word);
+        ctx.synchronize();
+        std::vector<std::byte> out(bytes);
+        CUDA_CHECK(cudaMemcpy(out.data(), dst, bytes, cudaMemcpyDeviceToHost));
+        return std::memcmp(out.data(), host.data(), bytes) == 0;
+    };
+    const auto read_stats = [&](std::uint64_t (&out)[2]) {
+        CUDA_CHECK(cudaMemcpy(out, stats, sizeof(out), cudaMemcpyDeviceToHost));
+    };
+    std::uint32_t round = 0;
+    for (const std::size_t bytes : {std::size_t{2560}, std::size_t{12800}, kMaxBytes}) {
+        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        if (!produce(bytes, ++round, [&] {
+                ninfer::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+            })) {
+            ++failures;
+            std::cerr << "gated copy of " << bytes << " bytes does not hold the published data\n";
+        }
+        std::uint64_t waited[2] = {};
+        read_stats(waited);
+        if (waited[1] != 1 || waited[0] < 1000000) {
+            ++failures;
+            std::cerr << "gated copy of " << bytes << " bytes recorded " << waited[1] << " waits, " << waited[0]
+                      << " ns (expected 1 wait of at least 1 ms)\n";
+        }
+    }
+    // A published word passes at once and records no wait.
+    {
+        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        *expected_h = ++word;
+        CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
+        fill(2560, ++round);
+        std::memcpy(src, host.data(), 2560);
+        ninfer::publish_pinned_word(ready, word);
+        ninfer::upload_pinned_when(dst, src, 2560, ready, expected, stats, nullptr, ctx.stream);
+        ctx.synchronize();
+        std::uint64_t waited[2] = {};
+        read_stats(waited);
+        if (waited[1] != 0) {
+            ++failures;
+            std::cerr << "a gate whose word was published before the launch recorded a wait\n";
+        }
+    }
+    // Graph replays: each round stages a new expected word; the old word stays published until
+    // the host writes the round's data, so a gate that accepted a stale word would copy poison.
+    {
+        constexpr std::size_t bytes = 12800;
+        cudaGraph_t graph       = nullptr;
+        cudaGraphExec_t exec    = nullptr;
+        CUDA_CHECK(cudaStreamBeginCapture(ctx.stream, cudaStreamCaptureModeThreadLocal));
+        ninfer::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+        CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
+        CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
+        for (int replay = 0; replay < 3; ++replay) {
+            if (!produce(bytes, ++round, [&] { CUDA_CHECK(cudaGraphLaunch(exec, ctx.stream)); })) {
+                ++failures;
+                std::cerr << "graph replay " << replay << " copied a stale or partial round\n";
+            }
+        }
+        std::uint64_t waited[2] = {};
+        read_stats(waited);
+        if (waited[1] != 3) {
+            ++failures;
+            std::cerr << "graph replays recorded " << waited[1] << " waits (expected 3)\n";
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(exec));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+    }
+    try {
+        ninfer::upload_pinned_when(dst, src, 2561, ready, expected, nullptr, nullptr, ctx.stream);
+        ++failures;
+        std::cerr << "a gated copy of a size that is not a 16-byte multiple did not throw\n";
+    } catch (const std::invalid_argument&) {}
+    CUDA_CHECK(cudaFree(stats));
+    CUDA_CHECK(cudaFree(expected));
+    CUDA_CHECK(cudaFree(dst));
+    CUDA_CHECK(cudaFreeHost(expected_h));
+    CUDA_CHECK(cudaFreeHost(ready));
+    CUDA_CHECK(cudaFreeHost(src));
     return failures;
 }
 
@@ -91,6 +214,7 @@ int main(int argc, char** argv) {
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';
     }
     failures += check_context(ctx, "ctx");
+    failures += check_pinned_gate(ctx);
     int* device_value = nullptr;
     int* host_value   = nullptr;
     CUDA_CHECK(cudaMalloc(&device_value, sizeof(int)));

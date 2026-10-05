@@ -191,12 +191,21 @@ inline std::size_t align(std::size_t v) { return (v + 255) / 256 * 256; }
 // upload only the prefix before `ngram` plus their rows (io_prefix), so every array they read,
 // the RoPE positions and pooled-block starts included, precedes `ngram`. `rope` holds a call's
 // [columns, 3] axis-major RoPE positions, `block_rope` its [batch, 3] block starts; `mtp_rope` and
-// `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk).
+// `mtp_block_rope` the MTP chunk's per sub-chunk (execution::MtpChunk). `gate` is the U32 a gated
+// verification round's rows wait for (design §12.3): it precedes `ngram`, so the round uploads it
+// with the prefix and its rows go through the gate instead.
 struct IoLayout {
-    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, ngram = 0,
+    std::size_t ids = 0, positions = 0, rope = 0, block_rope = 0, slots = 0, rows = 0, columns = 0, gate = 0, ngram = 0,
                 mtp_ids = 0, mtp_cells = 0, mtp_rope = 0, mtp_block_rope = 0, vision_columns = 0,
                 mtp_vision_columns = 0, bytes = 0;
 };
+
+// A request's verification rounds whose rows were read behind the n-gram gate, and those reads.
+struct GateTraffic {
+    std::uint64_t rounds = 0, reads = 0, read_ns = 0;
+};
+inline constexpr std::size_t kGateStatsBytes     = 16;          // per lane: U64 wait ns, U64 waits
+inline constexpr std::uint64_t kSlowGatedReadNs  = 100000000;   // a gated round's reads warn past 100 ms
 
 // Device I32 arrays of a verification round, each with room for every lane and width.
 struct SpecLayout {
@@ -282,6 +291,7 @@ public:
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
         NgramVolume::Counters ngram; // this request's n-gram row traffic
+        GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
         SpeculativeStats speculative;
         // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
@@ -371,7 +381,8 @@ public:
         d.io.slots          = align(d.io.block_rope + 12ULL * lanes);
         d.io.rows           = align(d.io.slots + 4ULL * lanes);
         d.io.columns        = align(d.io.rows + 4ULL * lanes);
-        d.io.ngram          = align(d.io.columns + 4ULL * columns);
+        d.io.gate           = align(d.io.columns + 4ULL * columns);
+        d.io.ngram          = align(d.io.gate + 4);
         d.io.mtp_ids        = align(d.io.ngram + row_bytes * heads * columns);
         d.io.mtp_cells      = align(d.io.mtp_ids + 4ULL * (columns + 1));
         d.io.mtp_rope       = align(d.io.mtp_cells + 4ULL * (columns + 1));
@@ -454,7 +465,7 @@ public:
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
-               4ULL * d.mtp_io.words;
+               4ULL * d.mtp_io.words + kGateStatsBytes * lanes;
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
@@ -553,6 +564,9 @@ public:
         token_counts_.fill(0);
         host_sampled_ = PinnedHostBuffer(4ULL * lanes);
         host_configs_ = PinnedHostBuffer(sizeof(ops::SamplingConfig) * lanes);
+        allocate(gate_stats_, kGateStatsBytes * lanes, allocated);
+        gate_stats_.fill(0);
+        publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
 
         execution::ForwardState state;
         state.gdn      = gdn_.get();
@@ -916,6 +930,9 @@ public:
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
         lane.ngram                   = {};
+        lane.gate                    = {};
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * q.lane, 0, kGateStatsBytes,
+                                   device_.stream));
         transaction_lane_ = q.lane;
         published_        = false;
         ++revision_;
@@ -1068,15 +1085,18 @@ public:
         // each drafter current, and a row's draft-length policy advances only in its one-row rounds.
         const bool speculate = batch == 1;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
+        std::int32_t steps = 0;
         if (mtp_) {
-            std::int32_t steps = 0;
             for (std::int32_t b = 0; b < batch; ++b) {
                 Lane& lane = lanes_[lanes[b]];
                 wanted[b]  = speculate && lane.mtp_live ? choose_draft_length(lane) : 0;
                 steps      = std::max(steps, wanted[b]);
             }
-            mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps);
         }
+        // Each row's draft count and source are fixed before the drafter runs (an MTP row's count
+        // is its draft length; a longer n-gram copy proposal replaces its drafts), so the round's
+        // width, and with it every row's n-gram landing columns, is known while it drafts.
+        std::array<std::int32_t, kMaximumConcurrency> extents{};
         std::int32_t width = 1;
         for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
             Lane& lane = lanes_[lanes[b]];
@@ -1087,21 +1107,39 @@ public:
             if (remaining < 2) { continue; }
             const auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
             if (mtp_ && lane.mtp_live && wanted[b] > 0) {
-                const auto n = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b]));
-                drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + n);
+                extents[b] = static_cast<std::int32_t>(std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b])));
             }
             if (speculate && lane.proposer) {
                 auto copy = lane.proposer->propose(lane.history, limit, options_.ngram_min_match).tokens;
-                if (copy.size() > drafts_[b].size()) {
+                if (copy.size() > static_cast<std::size_t>(extents[b])) {
                     drafts_[b]     = std::move(copy);
                     from_ngram_[b] = true;
+                    extents[b]     = static_cast<std::int32_t>(drafts_[b].size());
                 }
             }
-            width = std::max(width, 1 + static_cast<std::int32_t>(drafts_[b].size()));
+            width = std::max(width, 1 + extents[b]);
+        }
+        // Columns of each verification row whose n-gram rows are already staged: the drafter's
+        // wait reads every committed-token column (the anchor's) and all of a copy row's.
+        std::array<std::int32_t, kMaximumConcurrency> staged{};
+        if (mtp_) {
+            mtp_draft(std::span<const std::uint32_t>(lanes.data(), batch), steps, [&] {
+                if (width == 1) { return; }
+                for (std::int32_t b = 0; b < batch; ++b) {
+                    staged[b] = from_ngram_[b] ? width : 1;
+                    stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], width, 0, staged[b]);
+                }
+            });
+            for (std::int32_t b = 0; b < batch && max_width_ > 1; ++b) {
+                if (!from_ngram_[b] && extents[b] > 0) {
+                    drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
+                }
+            }
         }
         if (width > 1) {
             return verify(sequences, std::span<const std::uint32_t>(lanes.data(), batch),
-                          std::span<const std::int32_t>(positions.data(), batch), width, start);
+                          std::span<const std::int32_t>(positions.data(), batch), width,
+                          std::span<const std::int32_t>(staged.data(), batch), start);
         }
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].speculative.fallback_steps; }
         round_width_ = 1;
@@ -1613,9 +1651,45 @@ private:
                           static_cast<unsigned long long>(n.rows),
                           n.rows ? 100.0 * static_cast<double>(n.hits) / static_cast<double>(n.rows) : 0.0,
                           static_cast<unsigned long long>(n.reads), static_cast<double>(n.read_ns) * 1e-6);
-            diagnostic(text);
+            std::string line = text;
+            if (const auto& g = lane.gate; g.rounds > 0) {
+                std::uint64_t waits[2] = {};
+                CUDA_CHECK(cudaMemcpyAsync(waits, static_cast<const std::byte*>(gate_stats_.p) + kGateStatsBytes * lane_index(lane),
+                                           sizeof(waits), cudaMemcpyDeviceToHost, device_.stream));
+                device_.synchronize();
+                std::snprintf(text, sizeof(text),
+                              "; %llu gated rounds: %llu NVMe reads (%.1f ms) behind the gate, the GPU waited in %llu "
+                              "(mean %.1f us)",
+                              static_cast<unsigned long long>(g.rounds), static_cast<unsigned long long>(g.reads),
+                              static_cast<double>(g.read_ns) * 1e-6, static_cast<unsigned long long>(waits[1]),
+                              waits[1] ? static_cast<double>(waits[0]) * 1e-3 / static_cast<double>(waits[1]) : 0.0);
+                line += text;
+            }
+            diagnostic(line);
         } catch (...) {}
     }
+
+    std::uint32_t* gate_ready() const { return static_cast<std::uint32_t*>(gate_host_.data()); }
+
+    std::uint32_t lane_index(const Lane& lane) const noexcept {
+        return static_cast<std::uint32_t>(&lane - lanes_.data());
+    }
+
+    // Publishes a gated round's word if the round ends before its rows are read: the rows are
+    // zeroed (the round's results are discarded with the error), so the enqueued gate passes.
+    struct GateRelease {
+        ProgramImpl* owner = nullptr;
+        std::uint32_t word = 0;
+        std::size_t bytes  = 0;
+        GateRelease(ProgramImpl* o, std::uint32_t w, std::size_t b) : owner(o), word(w), bytes(b) {}
+        GateRelease(const GateRelease&)            = delete;
+        GateRelease& operator=(const GateRelease&) = delete;
+        ~GateRelease() {
+            if (owner == nullptr) { return; }
+            std::memset(owner->host_io() + owner->io_layout_.ngram, 0, bytes);
+            publish_pinned_word(owner->gate_ready(), word);
+        }
+    };
 
     // A diagnostic (Info unless stated) for the Engine's observer, or stderr without one.
     void diagnostic(const std::string& text, DiagnosticLevel level = DiagnosticLevel::Info) const noexcept {
@@ -1724,6 +1798,31 @@ private:
         for (std::int32_t p = begin - context; p < begin + count; ++p) {
             window_.push_back(p < 0 ? static_cast<std::int32_t>(c_.eos_token_id) : history[static_cast<std::size_t>(p)]);
         }
+        read_ngram(lane, count, column);
+    }
+
+    // Verification row b's token at position q: its history up to the anchor (position p), then its
+    // drafts, padded past their extent with the last draft (the anchor without drafts).
+    std::int32_t verify_token(const Lane& lane, std::size_t b, std::int32_t p, std::int32_t q) const {
+        if (q < 0) { return static_cast<std::int32_t>(c_.eos_token_id); }
+        if (q <= p) { return lane.history[static_cast<std::size_t>(q)]; }
+        const auto& d = drafts_[b];
+        const auto j  = static_cast<std::size_t>(q - p - 1);
+        return j < d.size() ? d[j] : (d.empty() ? lane.history.back() : d.back());
+    }
+
+    // The n-gram rows of verification row b's columns [from, to) (W columns from position p).
+    void stage_verify_ngram(Lane& lane, std::size_t b, std::int32_t p, std::int32_t W, std::int32_t from, std::int32_t to) {
+        if (from >= to) { return; }
+        const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
+        window_.clear();
+        for (std::int32_t q = p + from - context; q < p + to; ++q) { window_.push_back(verify_token(lane, b, p, q)); }
+        read_ngram(lane, to - from, b * static_cast<std::size_t>(W) + static_cast<std::size_t>(from));
+    }
+
+    // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
+    // io columns from `column`.
+    void read_ngram(Lane& lane, std::int32_t count, std::size_t column) {
         const std::size_t heads = hash_.heads();
         row_ids_.resize(static_cast<std::size_t>(count) * heads);
         hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
@@ -1913,7 +2012,7 @@ private:
 
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
-                      const execution::VisionInput* vision = nullptr) {
+                      const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr) {
         const std::int32_t cols = batch * width;
         auto* base = static_cast<std::byte*>(io_device_.p);
         execution::ForwardBatch fb;
@@ -1926,6 +2025,7 @@ private:
         fb.logit_columns = Tensor(base + io_layout_.columns, DType::I32, {logit_columns});
         fb.ngram_rows    = Tensor(base + io_layout_.ngram, DType::U8,
                                   {dim(c_.ple.table.row_bytes), dim(hash_.heads()), cols});
+        fb.ngram_gate    = gate;
         fb.host_slots      = std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(batch));
         fb.host_table_rows = fb.host_slots;
         fb.batch           = batch;
@@ -1979,8 +2079,15 @@ private:
     // filler drafts past their extent), one forward over batch x width columns that leaves all
     // recurrent state in place, then on-device acceptance. The pending batch licenses each row's
     // accepted drafts and its correction or bonus token; commit folds the accepted prefix in.
+    //
+    // The n-gram rows not yet staged (`staged[b]` columns of row b are) are read on the host after
+    // the launch, while the GPU embeds and runs layer 0, and released to the round's gate before
+    // ple_embed (design §12.3, n-gram S2). A round that captures or warms its graph reads them
+    // first and releases the gate before the launch. Every call that writes the landing area
+    // ends in a stream sync before the next round stages, so a gate never reads it across calls.
     PendingBatch verify(std::span<const SequenceHandle> sequences, std::span<const std::uint32_t> lanes,
-                        std::span<const std::int32_t> positions, std::int32_t width, Clock::time_point start) {
+                        std::span<const std::int32_t> positions, std::int32_t width,
+                        std::span<const std::int32_t> staged, Clock::time_point start) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::int32_t W = width, K = width - 1;
@@ -1990,37 +2097,54 @@ private:
         auto* slots   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots);
         auto* rows    = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows);
         for (std::int32_t b = 0; b < batch; ++b) {
-            Lane& lane                = lanes_[lanes[b]];
-            const auto& d             = drafts_[b];
-            const auto n              = static_cast<std::int32_t>(d.size());
-            const std::int32_t anchor = lane.history.back();
-            sequence_.assign(lane.history.begin(), lane.history.end());
-            for (std::int32_t j = 0; j < K; ++j) {
-                const std::int32_t token = j < n ? d[static_cast<std::size_t>(j)] : (n > 0 ? d.back() : anchor);
-                sequence_.push_back(token);
-                spec_host(spec_layout_.drafts)[b * K + j] = token;
-            }
+            Lane& lane = lanes_[lanes[b]];
+            const auto n = static_cast<std::int32_t>(drafts_[b].size());
+            const std::int32_t p = positions[b];
             for (std::int32_t j = 0; j < W; ++j) {
-                ids[b * W + j]     = sequence_[static_cast<std::size_t>(positions[b] + j)];
-                pos[b * W + j]     = positions[b] + j;
+                ids[b * W + j]     = verify_token(lane, static_cast<std::size_t>(b), p, p + j);
+                pos[b * W + j]     = p + j;
                 columns[b * W + j] = b * W + j;
             }
+            for (std::int32_t j = 0; j < K; ++j) { spec_host(spec_layout_.drafts)[b * K + j] = ids[b * W + j + 1]; }
             slots[b]       = static_cast<std::int32_t>(lanes[b]);
             rows[b]        = static_cast<std::int32_t>(lanes[b]);
             host_lanes_[b] = static_cast<std::int32_t>(lanes[b]);
-            stage_call_rope(lane, static_cast<std::uint32_t>(positions[b]), W, batch * W, b * W, batch, b);
-            stage_ngram(lane, sequence_, positions[b], W, static_cast<std::size_t>(b * W));
+            stage_call_rope(lane, static_cast<std::uint32_t>(p), W, batch * W, b * W, batch, b);
             spec_host(spec_layout_.extents)[b] = n;
-            spec_host(spec_layout_.lengths)[b] = positions[b];
-            spec_host(spec_layout_.anchors)[b] = anchor;
+            spec_host(spec_layout_.lengths)[b] = p;
+            spec_host(spec_layout_.anchors)[b] = lane.history.back();
         }
-        upload_pinned(io_device_.p, io_host_.data(), io_prefix(batch * W), s);
+        const auto read_rows = [&] {
+            for (std::int32_t b = 0; b < batch; ++b) {
+                stage_verify_ngram(lanes_[lanes[b]], static_cast<std::size_t>(b), positions[b], W, staged[b], W);
+            }
+        };
+        if (++gate_sequence_ == 0) { ++gate_sequence_; }
+        const std::uint32_t word = gate_sequence_;
+        *reinterpret_cast<std::uint32_t*>(host_io() + io_layout_.gate) = word;
+        DecodeGraph& graph = verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)];
+        const bool gated   = graph.executable.ready();
+        if (!gated) {
+            read_rows();
+            publish_pinned_word(gate_ready(), word);
+        }
+        upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         residency_->before_round(s, /*landing=*/true);
-        replay(verify_graphs_[static_cast<std::size_t>(batch - 1) * max_width_ + (W - 1)], [&] {
+        auto* io_device = static_cast<std::byte*>(io_device_.p);
+        const execution::NgramRowGate gate{
+            .pinned_rows = host_io() + io_layout_.ngram,
+            .ready       = gate_ready(),
+            .expected    = reinterpret_cast<const std::uint32_t*>(io_device + io_layout_.gate),
+            .wait_stats  = static_cast<std::uint64_t*>(gate_stats_.p),
+            .wait_row    = reinterpret_cast<const std::int32_t*>(io_device + io_layout_.slots)};
+        replay(graph, [&] {
             const execution::ForwardVerify view = verify_view(batch, W);
-            forward_call(batch, W, batch * W, &view);
+            forward_call(batch, W, batch * W, &view, nullptr, nullptr, &gate);
         });
+        // From here an enqueued gate waits for `word`: an error before it is published still
+        // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
+        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
         residency_->enqueue_route_download(s, batch * W);
 
         // Acceptance on the device, from BF16-rounded logits as in plain decode (design 16.5).
@@ -2048,6 +2172,23 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
+        if (gated) {
+            device_.flush();
+            const NgramVolume::Counters before = volume_.counters();
+            read_rows();
+            const NgramVolume::Counters& after = volume_.counters();
+            publish_pinned_word(gate_ready(), word);
+            release_gate.owner = nullptr;
+            Lane& first = lanes_[lanes[0]];
+            ++first.gate.rounds;
+            first.gate.reads += after.reads - before.reads;
+            first.gate.read_ns += after.read_ns - before.read_ns;
+            if (after.read_ns - before.read_ns > kSlowGatedReadNs) {
+                diagnostic("n-gram rows behind the gate took " + std::to_string((after.read_ns - before.read_ns) / 1000000) +
+                               " ms (the GPU waited at layer 1)",
+                           DiagnosticLevel::Warning);
+            }
+        }
         device_.synchronize();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
@@ -2281,7 +2422,10 @@ private:
         return best;
     }
 
-    void mtp_draft(std::span<const std::uint32_t> lanes, std::int32_t steps) {
+    // `while_drafting` runs on the host after the draft steps are submitted, before their wait
+    // (only when draft steps run).
+    void mtp_draft(std::span<const std::uint32_t> lanes, std::int32_t steps,
+                   const std::function<void()>& while_drafting = {}) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         const std::size_t column = 2ULL * width_;
@@ -2364,6 +2508,10 @@ private:
         });
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
+        if (while_drafting) {
+            device_.flush();
+            while_drafting();
+        }
         device_.synchronize();
         for (std::int32_t b = 0; b < batch; ++b) {
             Lane& lane = lanes_[lanes[b]];
@@ -2592,7 +2740,11 @@ private:
     GdnReplayRecords records_;
     std::vector<std::optional<ops::GdnReplayFoldPlan>> folds_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> drafts_;
-    std::vector<std::int32_t> sequence_;
+    // The n-gram gate of verification rounds (design §12.3): the pinned ready word, its last
+    // published value (strictly increasing, never 0) and per-lane device wait statistics.
+    PinnedHostBuffer gate_host_{64};
+    std::uint32_t gate_sequence_ = 0;
+    DeviceBuffer gate_stats_;
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

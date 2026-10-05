@@ -102,8 +102,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
   changes a bit.
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the
   request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
-  of reads`). The row cache outlives requests, so repeated text hits it, while new text reads most
-  of its rows from the volume.
+  of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
+  waited in W (mean X us)`). The row cache outlives requests, so repeated text hits it, while new
+  text reads most of its rows from the volume. With speculation, the rows of draft tokens are
+  read while the GPU starts the verification round, so most of that read time is hidden.
 
 ## Prefix cache
 

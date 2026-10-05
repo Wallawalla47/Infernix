@@ -1,6 +1,11 @@
 #include "core/device.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdint>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -323,7 +328,78 @@ __global__ void upload_pinned_kernel(void* __restrict__ dst, const void* __restr
     }
 }
 
+constexpr std::size_t kGateCtaBytes = 32 * 1024;
+constexpr int kGateMaxCtas         = 16;
+constexpr int kGateThreads         = 256;
+
+// Each CTA's thread 0 polls the host word, so no CTA depends on another being resident. .cv loads:
+// the source is rewritten for every round, so no cache line of an earlier round may be used.
+__global__ void __launch_bounds__(kGateThreads)
+    upload_pinned_when_kernel(uint4* __restrict__ dst, const uint4* __restrict__ src, std::size_t vectors,
+                              const std::uint32_t* ready, const std::uint32_t* expected, std::uint64_t* stats,
+                              const std::int32_t* row) {
+    if (threadIdx.x == 0) {
+        const std::uint32_t want = *expected;
+        const auto* word         = reinterpret_cast<const volatile std::uint32_t*>(ready);
+        if (*word != want) {
+            std::uint64_t start, now;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+            do {
+                __nanosleep(200);
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+                if (now - start > kPinnedGateTimeoutNs) { asm volatile("trap;"); }
+            } while (*word != want);
+            if (stats != nullptr && blockIdx.x == 0) {
+                std::uint64_t* at = stats + 2 * (row != nullptr ? *row : 0);
+                atomicAdd(reinterpret_cast<unsigned long long*>(at), static_cast<unsigned long long>(now - start));
+                atomicAdd(reinterpret_cast<unsigned long long*>(at + 1), 1ULL);
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    constexpr int kBatch     = 8;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t base = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; base < vectors;
+         base += kBatch * stride) {
+        uint4 loaded[kBatch];
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const std::size_t i = base + b * stride;
+            if (i < vectors) { loaded[b] = __ldcv(src + i); }
+        }
+#pragma unroll
+        for (int b = 0; b < kBatch; ++b) {
+            const std::size_t i = base + b * stride;
+            if (i < vectors) { dst[i] = loaded[b]; }
+        }
+    }
+}
+
 } // namespace
+
+void upload_pinned_when(void* device_dst, const void* pinned_src, std::size_t bytes, const std::uint32_t* pinned_ready,
+                        const std::uint32_t* device_expected, std::uint64_t* wait_stats, const std::int32_t* wait_row,
+                        cudaStream_t stream) {
+    if (bytes == 0) { return; }
+    if (bytes % 16 != 0 || (reinterpret_cast<std::uintptr_t>(device_dst) | reinterpret_cast<std::uintptr_t>(pinned_src)) % 16 != 0) {
+        throw std::invalid_argument("upload_pinned_when: bytes and buffers must be 16-byte multiples");
+    }
+    const auto ctas = static_cast<unsigned int>(
+        std::min<std::size_t>((bytes + kGateCtaBytes - 1) / kGateCtaBytes, kGateMaxCtas));
+    upload_pinned_when_kernel<<<ctas, kGateThreads, 0, stream>>>(static_cast<uint4*>(device_dst),
+                                                                 static_cast<const uint4*>(pinned_src), bytes / 16,
+                                                                 pinned_ready, device_expected, wait_stats, wait_row);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void publish_pinned_word(std::uint32_t* pinned_ready, std::uint32_t value) noexcept {
+#if defined(_M_X64) || defined(__x86_64__)
+    _mm_sfence();
+#endif
+    std::atomic_thread_fence(std::memory_order_release);
+    *static_cast<volatile std::uint32_t*>(pinned_ready) = value;
+}
 
 void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, cudaStream_t stream) {
     if (bytes == 0) { return; }

@@ -110,6 +110,17 @@ struct MtpChunk {
     const VisionInput* vision = nullptr;
 };
 
+// A call whose n-gram rows the host writes after the launch (design §12.3, n-gram S2): before
+// ple_embed, the rows are copied from `pinned_rows` into ForwardBatch::ngram_rows once the pinned
+// `ready` word equals the device word `expected` (core upload_pinned_when).
+struct NgramRowGate {
+    const void* pinned_rows        = nullptr;
+    const std::uint32_t* ready     = nullptr; // pinned
+    const std::uint32_t* expected  = nullptr; // device
+    std::uint64_t* wait_stats      = nullptr; // device U64 [rows, 2]: wait ns and waits, per row
+    const std::int32_t* wait_row   = nullptr; // device: the row to add to
+};
+
 struct ForwardBatch {
     Tensor ids;        // I32 [T]
     Tensor positions;  // I32 [T]: KV position of each column
@@ -117,6 +128,7 @@ struct ForwardBatch {
     Tensor block_start_rope; // I32 [batch, 3] axis-major: RoPE position of each sequence's first
                              // pooled-block token (ops::QsaBatch::block_start_rope)
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's FP8 n-gram rows
+    const NgramRowGate* ngram_gate = nullptr; // when set: ngram_rows are written by the gate
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
     Tensor logit_columns; // I32 [n]: the columns whose logits are produced (each sequence's last
