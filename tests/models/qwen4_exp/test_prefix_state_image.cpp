@@ -206,6 +206,7 @@ void test_round_trips(const TextConfig& c) {
     header.mtp_written  = true;
     header.mtp_next     = 151643;
     header.lineage_echo = true;
+    header.opener       = true;
     header.mtp_accept   = {0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2};
     write_state_image_header(layout, header, a.segments[0]);
     for (std::uint32_t g = layout.groups(); g-- > 0;) { image.copy_group_from_host(g, a.const_image(), 1, stream); }
@@ -214,7 +215,7 @@ void test_round_trips(const TextConfig& c) {
     require(lane_bytes(image, 2) == lane2, "a restore touches no other lane");
     const auto read = read_state_image_header(layout, a.segments[0]);
     require(read && read->frontier == header.frontier && read->mtp_written && read->mtp_next == header.mtp_next &&
-                read->lineage_echo && read->mtp_accept == header.mtp_accept,
+                read->lineage_echo && read->opener && read->mtp_accept == header.mtp_accept,
             "the header round-trips");
 
     // Lane 0 to a packed Device slot, written through to a second Host image, restored into lane 2.

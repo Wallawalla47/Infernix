@@ -213,7 +213,7 @@ public:
                               std::unique_ptr<Qwen4ExpCore>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
+        : options(normalize(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::artifact_is_qwen4_exp(options.artifact_path)) {
@@ -254,6 +254,18 @@ public:
                                                     std::move(constructed.context_cost));
         }
         finalize_phase.complete();
+    }
+
+    // Defaults that depend on the model (the hybrid prefix cache's) need the artifact's architecture.
+    static EngineOptions normalize(EngineOptions engine_options) {
+        // An unreadable artifact is reported by the model's construction, after option validation.
+        models::Architecture architecture = models::Architecture::Qwen3_5;
+        try {
+            if (runtime::artifact_is_qwen4_exp(engine_options.artifact_path)) {
+                architecture = models::Architecture::Qwen4Exp;
+            }
+        } catch (const std::exception&) {}
+        return runtime::normalize_engine_options(std::move(engine_options), architecture);
     }
 
     ~Impl() noexcept {

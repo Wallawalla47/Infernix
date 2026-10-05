@@ -6,9 +6,10 @@ CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an
 design, measurements and open work are in the
 [design document](maintainer/qwen3_8-flash-next-design.md) (§16.5, §19.2).
 
-Text generation works through `ninfer`, `ninfer-serve` and `ninfer_bench`, with the model's MTP
-drafter (`--spec mtp`) and n-gram copy proposals. Not yet supported: vision, CausalScoring
-(perplexity), the prefix cache.
+Generation works through `ninfer`, `ninfer-serve` and `ninfer_bench`, with the model's MTP
+drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
+`ninfer-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity), prefix-cache
+persistence (`--prefix-cache-file`).
 
 ## Requirements
 
@@ -17,7 +18,8 @@ drafter (`--spec mtp`) and n-gram copy proposals. Not yet supported: vision, Cau
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB. A run pins ~64.5 GiB. At startup a RAM ledger plans every allocation and
   keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults about 69.3 GiB
-  must be available. When the experts do not fit, startup stops with the ledger line, which names
+  must be available, and 73.3 GiB for `ninfer-serve` with its prefix cache (see
+  [Prefix cache](#prefix-cache)). When the experts do not fit, startup stops with the ledger line, which names
   every term.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
   workspaces and a reserve for CUDA graphs leave, less a headroom for the display and other
@@ -88,11 +90,35 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - The engine starts six CPU worker threads for missed experts (up to eight per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
+- `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
+  frames only while it encodes (`--vision-offload auto`).
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the
   request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
   of reads`). The row cache outlives requests, so repeated text hits it, while new text reads most
   of its rows from the volume.
+
+## Prefix cache
+
+`ninfer-serve` reuses prompt prefixes with the hybrid prefix cache (its default;
+[spec](maintainer/hybrid-prefix-cache-spec.md#17-qwen4exp-binding-qwen38-flash-next)). A
+conversation's next turn resumes from a snapshot of the model state and prefills only the new
+tokens; KV blocks are shared across requests. `ninfer` (one request) runs without it.
+
+- **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
+  `--host-cache-mib` (default 4096, must be positive). It is pinned at startup and counted in the
+  RAM ledger (`prefix cache` in the ledger line). `--no-prefix-reuse` turns the cache off and frees
+  that RAM for the experts.
+- **Snapshots.** Each turn leaves one at the generation opener (the assistant turn's start) and one
+  at its end; shared prefixes (the system and tools block, client breakpoints) get one where they
+  end. Copying a snapshot to the Host overlaps the next call. The opener costs one small extra
+  call per turn (estimated 25-40 ms); a system-block or breakpoint snapshot inside a prefill chunk
+  costs one extra chunk call (estimated ~1.3 s), once per distinct prefix.
+- **Exactness.** A resumed request computes what the request that left the snapshot computed; it
+  may differ from an uncached run where two tokens are near ties. `--no-prefix-reuse` gives
+  uncached runs.
+- Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`,
+  `--prefix-cache-file`.
 
 ## VRAM
 

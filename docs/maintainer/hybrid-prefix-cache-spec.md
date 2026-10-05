@@ -19,7 +19,8 @@ Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-p
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, K4V2,
 VQ2),
-and every speculative backend (none, MTP, DFlash, DFlash2).
+and every speculative backend (none, MTP, DFlash, DFlash2). `Qwen4ExpForCausalLM`
+(Qwen3.8-Flash-Next) has its own binding of the same index and frontend keys (§17).
 
 Coexistence rules:
 
@@ -40,8 +41,8 @@ Coexistence rules:
 ## Status
 
 Hybrid mode configures itself: the only capacity a deployment chooses is `--host-context-mib`
-(default 8192, 0 = Device only); every other value is derived from the rest of the configuration
-(§14.2).
+(default 8192, 0 = Device only; Qwen3.8-Flash-Next: default 4096, must be positive, §17); every
+other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
@@ -1505,3 +1506,26 @@ superseded storage:
   catalogs, long anchors) were removed with it. `--host-context-mib` replaces `--host-cache-mib`.
 - The per-request `materialization` admission diagnostics were dropped with the old transaction;
   the `throughput` record keeps the hybrid gauges and counters.
+
+---
+
+## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
+
+`Qwen4ExpForCausalLM` keeps every routed expert in pinned Host RAM and streams them into a Device
+expert cache, so VRAM and pinned RAM are budgeted against the experts. Its prefix cache reuses this
+design's index (`runtime/prefix_cache`: tree, snapshots, GDSF, superseding, `plan_taps`) and the
+frontend's keys and hints (`block_hashes`, `block_extras`, `tap_hints`) unchanged; the physical
+binding and its orchestration are its own (`src/models/qwen4_exp/program/prefix/`). The model-level
+rules, measurements and the build record are in the
+[Flash-Next design](qwen3_8-flash-next-design.md) §19.3.1; this section states the contract.
+
+| area | Qwen4Exp |
+|---|---|
+| Configuration | Hybrid only: `normalize_engine_options` resolves the Host tier per architecture (default 4 GiB, `kDefaultQwen4ExpHybridHostCacheBytes`; 0 is refused), no Device snapshot slots (`--device-snapshot-slots` is refused), the common tap budget (8, ladder max(4096, 2 x chunk), gap max(1024, chunk)). The original prefix cache (`ContextCacheMode::Legacy` enabled) is refused: a Qwen4Exp Engine runs with the hybrid cache or with the context cache disabled. `--prefix-cache-file` is refused until persistence is built |
+| Snapshots | Host-born only: a capture reserves Host slabs and copies the lane's state image (GDN recurrent and conv state, PLE state, QSA tails, the MTP drafter's saved residual) and its partial page, one decoder layer at a time on the transfer stream; the next call of the lane waits per layer. Restores are one batch per admission on the restore stream, waited on per layer by the first call |
+| MTP drafter | Cells and anchors follow rules MR1-MR6 (design §19.3.1): blocks record `mtp_next`, snapshots `mtp_written`/`mtp_next`; a resume whose continuation differs rewrites the anchor's last cell in a private copy |
+| Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks` |
+| Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate |
+| Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
+| Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
+| Not built | Device snapshot slots, prefetch of a blocked head (§6.6), in-flight coalescing (§12.2), Device KV reclaim, persistence (§5.5), prefill CPU assist and C > 1 extras (design P7, P8) |

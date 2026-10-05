@@ -99,6 +99,7 @@ ninfer::EngineOptions engine_options(const char* artifact, const char* ngram_vol
                                      std::size_t prompts) {
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
+    options.context_cache.enabled = false; // no prefix cache (Qwen4Exp has no Legacy cache)
     if (ngram_volume != nullptr) { options.ngram_volume_path = ngram_volume; }
     options.max_context     = config.max_context;
     options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(config.max_context);

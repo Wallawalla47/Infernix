@@ -22,6 +22,7 @@
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/prefix/call_plan.h"
 #include "models/qwen4_exp/program/prefix/prefix_cache.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/rope_positions.h"
@@ -85,6 +86,8 @@ struct PrefixSelection {
     std::uint32_t need     = 0; // pages the admission newly takes (private + restored)
     bool image_restore     = false;
     std::vector<std::uint32_t> existing; // frontiers of every matched snapshot (tap spacing)
+    std::uint32_t cached_tokens = 0;     // the prompt prefix held as cached blocks (diagnostics)
+    prefix::CallPlan plan;               // the suffix's prefill calls and taps from `frontier`
 };
 
 // One lane's prefix-cache state.
@@ -100,10 +103,15 @@ struct LanePrefix {
     std::uint64_t resident_capture = 0;               // the endpoint the slot still holds
     std::vector<runtime::prefix_cache::PlannedTap> taps;
     std::vector<runtime::prefix_cache::TapHint> hints;
+    std::vector<runtime::prefix_cache::TapExclusion> exclusions; // Vision spans: no snapshot inside
     // Block lookup hashes: the prompt's, extended by publication over the generated blocks; the
     // prompt's cumulative Vision keys, and the key every block after the prompt carries.
     std::vector<std::uint64_t> hashes, extras;
     std::uint64_t trailing_extra = 0;
+    // The admission's diagnostics: the prompt prefix held as cached blocks, and the bytes its
+    // restore copied back from the Host tier.
+    std::uint32_t cached_tokens  = 0;
+    std::uint64_t restored_bytes = 0;
 };
 
 struct QuoteImpl {
@@ -257,6 +265,9 @@ public:
         std::vector<std::int32_t> history; // prompt, then committed output
         std::uint32_t prompt_tokens = 0;
         std::uint32_t state_tokens  = 0; // positions already in the model state
+        // The prompt's planned prefill calls (design §19.3.1): exclusive ends, the last prompt_tokens.
+        std::vector<std::uint32_t> calls;
+        std::size_t next_call = 0;
         LaneRope rope;                    // RoPE positions of the lane's tokens (design §19.3.2)
         std::unique_ptr<LaneVision> vision; // the encode window and handoff of a media prompt
         double vision_seconds = 0;          // the tower's GPU time
@@ -714,10 +725,9 @@ public:
         base->summary.prefix_reuse_path       = PrefixReusePath::Root;
         base->reuse                           = prefix_ != nullptr && options.allow_prefix_reuse && data.identity.reusable;
         base->summary.publish_continuation    = base->reuse;
-        const std::uint64_t chunks = 1ULL + (n - 1ULL) / static_cast<std::uint64_t>(chunk_);
         base->summary.service_work_quanta =
-            chunks + (base->summary.effective_output_tokens == 0 ? 0ULL : base->summary.effective_output_tokens - 1ULL);
-        if (vision) { base->summary.service_work_quanta += vision->window.steps; }
+            service_quanta(plan_prefill(data, 0, {}, base->reuse).ends.size(), base->summary.effective_output_tokens,
+                           vision.get());
         base->vision   = std::move(vision);
         base->sampling = translate(options.sampling);
         const std::uint32_t positions = std::min(options_.max_context, n + base->summary.effective_output_tokens);
@@ -738,8 +748,7 @@ public:
         out.destination = destination;
         out.summary     = base.summary();
         if (destination.value >= options_.max_concurrency || lanes_[destination.value].phase != Phase::Free ||
-            transaction_lane_ ||
-            (base.impl_->vision && residency_->lendable() < base.impl_->vision->window.frames)) {
+            transaction_lane_) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
@@ -760,12 +769,17 @@ public:
             if (s.snapshot) {
                 impl->summary.reusable_prompt_tokens = s.frontier;
                 impl->summary.prefix_reuse_path      = reuse_path_for(prefix_->index().snapshot(*s.snapshot).kind);
-                const std::uint32_t suffix           = impl->summary.prompt_tokens - s.frontier;
-                impl->summary.service_work_quanta =
-                    1ULL + (suffix - 1ULL) / static_cast<std::uint64_t>(chunk_) +
-                    (impl->summary.effective_output_tokens == 0 ? 0ULL : impl->summary.effective_output_tokens - 1ULL);
+                // Items inside the reused prefix are not encoded again (design §19.3.2).
+                if (impl->vision && s.frontier > 0) { impl->vision = plan_vision(data, s.frontier); }
             }
+            impl->summary.service_work_quanta =
+                service_quanta(s.plan.ends.size(), impl->summary.effective_output_tokens, impl->vision.get());
         } else if (pool_->available_pages() < base.impl_->pages) {
+            out.readiness = runtime::Readiness::TemporarilyBlocked;
+            return out;
+        }
+        // A window lends frames other lanes' handoffs may hold now.
+        if (impl->vision && residency_->lendable() < impl->vision->window.frames) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
@@ -826,6 +840,7 @@ public:
             lane.prefix.extras = data.block_extras;
             lane.prefix.trailing_extra = prefix_trailing_extra(data);
             lane.prefix.hints  = data.tap_hints.hints;
+            lane.prefix.exclusions = prefix_exclusions(data);
             // Make room before reserving: the quote counted evictable cache pages as available.
             pc_make_room(selection->need);
             auto reservation = pool_->reserve(selection->need);
@@ -834,9 +849,13 @@ public:
                 lane.row = KVExecutionRowLease{};
                 return runtime::ContextTransactionReserveStatus::Aborted;
             }
+            const std::uint64_t restored = prefix_->counters().host_restore_bytes;
             prefix_activate(lane, q.lane, *selection, *reservation, q.pages);
+            lane.prefix.cached_tokens  = selection->cached_tokens;
+            lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
             lane.reservation    = std::move(*reservation);
             lane.prefix.reused  = selection->frontier;
+            lane.calls          = selection->plan.ends;
         } else {
             auto reservation = pool_->reserve(q.pages);
             if (!reservation) {
@@ -849,7 +868,9 @@ public:
             lane.reservation = std::move(*reservation);
             tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages), device_.stream);
             reset_slot(q.lane);
+            lane.calls = plan_prefill(data, 0, {}, false).ends;
         }
+        lane.next_call = 0;
         lane.mtp_accept.fill(kAcceptancePrior);
         lane.mtp_policy_rounds = 0;
         if (max_width_ > 1) {
@@ -903,6 +924,8 @@ public:
         MaterializationResult out;
         out.status    = runtime::ContextTransactionStatus::Published;
         out.published = StartResult{handle(*transaction_lane_)};
+        out.diagnostics.cached_prefix_tokens = admitted.prefix.cached_tokens;
+        out.diagnostics.restored_host_bytes  = admitted.prefix.restored_bytes;
         return out;
     }
 
@@ -920,9 +943,16 @@ public:
         Lane& lane        = lanes_[index];
         if (lane.phase != Phase::Prefill) { throw std::logic_error("Qwen4Exp: prefill on a lane that is not prefilling"); }
         const std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens);
-        const std::int32_t width =
-            std::min<std::int32_t>(chunk_, static_cast<std::int32_t>(lane.prompt_tokens) - begin);
-        const bool last = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
+        if (lane.next_call >= lane.calls.size() || lane.calls[lane.next_call] <= lane.state_tokens) {
+            throw std::logic_error("Qwen4Exp: the lane's prefill plan does not continue its state");
+        }
+        const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
+        const bool last          = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
+        // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate, so it
+        // does not churn the expert cache (design §19.3.1).
+        const std::size_t promotions = width <= kServedCallColumns
+                                           ? decode_budget(static_cast<std::uint32_t>(width))
+                                           : kPrefillPromotionsPerLayer;
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
         const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                             static_cast<std::uint64_t>(width));
@@ -947,9 +977,9 @@ public:
             }
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
-            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
-                        kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
-            residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+                        static_cast<std::uint32_t>(begin));
+            residency_->after_round(device_.stream, width, promotions);
             apply_vram_target(false);
         }
 
@@ -970,9 +1000,9 @@ public:
             {
                 const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                         static_cast<std::uint64_t>(width));
-                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width),
-                            kPrefillPromotionsPerLayer, static_cast<std::uint32_t>(begin));
-                residency_->after_round(device_.stream, width, kPrefillPromotionsPerLayer);
+                trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+                            static_cast<std::uint32_t>(begin));
+                residency_->after_round(device_.stream, width, promotions);
                 apply_vram_target(false);
             }
             const SequenceHandle rows[] = {sequence};
@@ -1393,6 +1423,8 @@ public:
 
 private:
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
+    // Calls this narrow are CPU-served (design §16.2, prefix P0 step 3).
+    static constexpr std::int32_t kServedCallColumns = 8;
 
     // Appends the round whose routes after_round is about to apply to the internal route trace
     // (ProgramOptions::route_trace); rows' lanes are host_lanes_ as staged for the round.
@@ -2301,9 +2333,25 @@ private:
     void prefix_release(Lane& lane) noexcept;
     // The cumulative Vision key of every item of the prompt: the key of each block after it.
     [[nodiscard]] static std::uint64_t prefix_trailing_extra(const qwen3_5::PreparedPromptData& prompt);
+    // Every Vision item's token span: no tap and no resume lies strictly inside one.
+    [[nodiscard]] static std::vector<runtime::prefix_cache::TapExclusion>
+    prefix_exclusions(const qwen3_5::PreparedPromptData& prompt);
     [[nodiscard]] std::optional<runtime::prefix_cache::SnapshotRef> prefix_resident(const Lane& lane) const;
     [[nodiscard]] std::array<std::span<const cudaEvent_t>, 2> prefix_waits(const Lane& lane) const noexcept;
     void mtp_flush_cell(Lane& lane, std::uint32_t index);
+
+public:
+    [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;
+
+private:
+    // The prompt's prefill calls from `frontier`, and with `taps` the prefix taps they realize.
+    [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
+                                                std::span<const std::uint32_t> existing, bool taps) const;
+    // Engine work quanta of a request: its prefill calls, decode rounds and Vision steps.
+    [[nodiscard]] static std::uint64_t service_quanta(std::size_t calls, std::uint32_t output,
+                                                      const VisionAdmission* vision) noexcept {
+        return calls + (output == 0 ? 0ULL : output - 1ULL) + (vision ? vision->window.steps : 0ULL);
+    }
 
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
@@ -2380,7 +2428,9 @@ private:
     std::uint64_t pending_transaction_ = 0;
     std::uint64_t revision_            = 1;
     // ---------------------------------------------------------------- vision (vision_program.cpp)
-    [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen3_5::PreparedPromptData& prompt) const;
+    // The encode window of the items ending past the reused prefix [0, reused).
+    [[nodiscard]] std::shared_ptr<const VisionAdmission> plan_vision(const qwen3_5::PreparedPromptData& prompt,
+                                                                     std::uint32_t reused = 0) const;
     void vision_reserve(Lane& lane, std::shared_ptr<const VisionAdmission> admission,
                         const qwen3_5::PreparedPromptData& prompt);
     [[nodiscard]] static bool vision_encoded(const Lane& lane) noexcept { return !lane.vision || lane.vision->encoded; }

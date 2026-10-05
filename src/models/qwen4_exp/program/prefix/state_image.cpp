@@ -17,7 +17,7 @@ constexpr std::uint32_t kHeaderVersion = 1;
 struct PackedHeader {
     std::uint64_t magic       = 0;
     std::uint32_t version     = 0;
-    std::uint32_t flags       = 0; // bit 0 mtp_written, bit 1 lineage_echo
+    std::uint32_t flags       = 0; // bit 0 mtp_written, bit 1 lineage_echo, bit 2 opener
     std::uint64_t fingerprint = 0;
     std::uint64_t image_bytes = 0;
     std::uint32_t frontier    = 0;
@@ -120,7 +120,7 @@ void write_state_image_header(const StateImageLayout& layout, const StateImageHe
     PackedHeader packed;
     packed.magic       = kHeaderMagic;
     packed.version     = kHeaderVersion;
-    packed.flags       = (header.mtp_written ? 1U : 0U) | (header.lineage_echo ? 2U : 0U);
+    packed.flags       = (header.mtp_written ? 1U : 0U) | (header.lineage_echo ? 2U : 0U) | (header.opener ? 4U : 0U);
     packed.fingerprint = layout.fingerprint;
     packed.image_bytes = layout.image_bytes;
     packed.frontier    = header.frontier;
@@ -136,13 +136,14 @@ std::optional<StateImageHeader> read_state_image_header(const StateImageLayout& 
     std::memcpy(&packed, image_begin, sizeof(packed));
     if (packed.magic != kHeaderMagic || packed.version != kHeaderVersion ||
         packed.fingerprint != layout.fingerprint || packed.image_bytes != layout.image_bytes ||
-        (packed.flags & ~3U) != 0) {
+        (packed.flags & ~7U) != 0) {
         return std::nullopt;
     }
     StateImageHeader header;
     header.frontier     = packed.frontier;
     header.mtp_written  = (packed.flags & 1U) != 0;
     header.lineage_echo = (packed.flags & 2U) != 0;
+    header.opener       = (packed.flags & 4U) != 0;
     header.mtp_next     = packed.mtp_next;
     header.mtp_accept   = packed.mtp_accept;
     return header;

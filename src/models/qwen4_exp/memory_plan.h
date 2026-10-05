@@ -27,6 +27,8 @@ struct HostMemoryDemand {
     std::uint64_t other_pinned = 0;
     // Pinned and mapped allocations made after the model loads (the Program's buffers).
     std::uint64_t later_pinned = 0;
+    // The prefix cache's pinned Host tier (--host-cache-mib), pinned when the Program starts.
+    std::uint64_t prefix_cache = 0;
     // Large pageable allocations made after planning (the n-gram row cache).
     std::uint64_t pageable = 0;
     // Transient load staging (bounce and upload slots), freed when the load ends.

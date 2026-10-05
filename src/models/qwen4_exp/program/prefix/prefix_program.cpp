@@ -105,6 +105,12 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
         const std::uint64_t room   = static_cast<std::uint64_t>(pool_->available_pages()) + index.device_evictable_blocks();
         return static_cast<std::uint64_t>(s.need) + evictable_on_path <= room;
     };
+    std::uint32_t cached_tokens = 0; // the prompt prefix held as cached blocks
+    const auto planned = [&](PrefixSelection s) {
+        s.plan          = plan_prefill(prompt, s.frontier, s.existing, base.reuse);
+        s.cached_tokens = cached_tokens;
+        return s;
+    };
     PrefixSelection root;
     root.need = E;
     if (base.reuse && n > 1) {
@@ -114,7 +120,12 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             // The endpoint this prompt continues has just been published.
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
-        std::erase_if(match.candidates, [](const pc::MatchCandidate& c) { return c.filling_blocks != 0; });
+        cached_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
+        // A frontier strictly inside a Vision item would resume half an image (design §19.3.1).
+        const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+        std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
+            return c.filling_blocks != 0 || prefix::inside_exclusion(c.frontier, spans);
+        });
         // A lane-resident snapshot needs no image restore: its state is still in the lane.
         const std::optional<pc::SnapshotRef> resident = prefix_resident(lanes_[lane]);
         for (pc::MatchCandidate& c : match.candidates) {
@@ -148,14 +159,14 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             }
             s.image_restore = !(resident && *resident == c.snapshot);
             s.existing      = frontiers;
-            if (fits(s)) { return s; }
+            if (fits(s)) { return planned(std::move(s)); }
         }
     }
-    if (fits(root)) { return root; }
+    if (fits(root)) { return planned(std::move(root)); }
     if (prefix_->transfers_pending()) {
         // Blocks pinned only by in-flight copies become evictable once those land.
         prefix_->drain();
-        if (fits(root)) { return root; }
+        if (fits(root)) { return planned(std::move(root)); }
     }
     return std::nullopt;
 }
@@ -252,6 +263,9 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     if (s.snapshot) {
         // MR6: whether the drafter's cell F - 1 holds this prompt's continuation.
         const prefix::StateImageHeader& meta = prefix_->meta(*s.snapshot);
+        // The opener of an echo lineage serves only when the endpoint after it did not: the client
+        // did not echo the generated turn exactly (design §19.3.1, "Generation opener").
+        if (meta.opener && meta.lineage_echo) { ++prefix_->counters().endpoint_mismatch_fallbacks; }
         const bool continues = static_cast<std::size_t>(s.frontier) < lane.history.size() &&
                                meta.mtp_next == lane.history[s.frontier];
         if (s.cow == PrefixCow::Tail) {
@@ -267,10 +281,62 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + index * static_cast<std::size_t>(token_domain_),
                                    0, 4ULL * token_domain_, stream));
     }
-    // Taps for this prompt beyond the resume frontier, realized at prefill call boundaries.
-    lane.prefix.taps.clear();
-    const auto planned = pc::plan_taps(lane.prompt_tokens, s.frontier, lane.prefix.hints, s.existing, {}, prefix_->taps());
-    for (const pc::PlannedTap& tap : planned) { lane.prefix.taps.push_back(tap); }
+    // Taps for this prompt beyond the resume frontier, realized at the plan's call boundaries.
+    lane.prefix.taps = s.plan.taps;
+}
+
+// The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
+// prefix taps beyond the frontier (no tap inside a Vision item), exact ones admitted by their cost.
+prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
+                                           std::span<const std::uint32_t> existing, bool taps) const {
+    const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
+    std::vector<pc::PlannedTap> planned;
+    if (taps && prefix_) {
+        const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+        planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
+    }
+    return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned,
+                              prefix::CallCost{.model = options_.prefix_cost});
+}
+
+HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
+    HybridPrefixCacheStats out;
+    if (!prefix_) { return out; }
+    const pc::PrefixIndexStats index         = prefix_->index().stats();
+    const prefix::PrefixCacheCounters& count = prefix_->counters();
+    out.nodes                   = index.nodes;
+    out.snapshots               = index.snapshots;
+    out.device_resident_blocks  = index.device_resident_blocks;
+    out.device_evictable_blocks = index.device_evictable_blocks;
+    out.host_slabs              = prefix_->host_layout().slabs;
+    out.host_free_slabs         = index.host_free_slabs;
+    out.host_slab_bytes         = prefix_->host_layout().slab_bytes;
+    out.snapshot_hits           = index.snapshot_hits;
+    out.reused_tokens           = count.reused_tokens;
+    out.blocks_inserted         = count.blocks_inserted;
+    out.blocks_reattached       = count.blocks_reattached;
+    out.blocks_duplicate        = count.blocks_duplicate;
+    out.taps_created            = count.taps_created;
+    out.taps_skipped            = count.taps_skipped;
+    out.endpoints_created       = count.endpoints_created;
+    out.host_image_writes       = count.host_image_writes;
+    out.host_block_writes       = count.host_block_writes;
+    out.host_image_restores     = count.host_image_restores;
+    out.host_block_restores     = count.host_block_restores;
+    out.host_write_bytes        = count.host_write_bytes;
+    out.host_restore_bytes      = count.host_restore_bytes;
+    out.evicted_blocks          = index.device_block_evictions;
+    out.host_snapshot_evictions = index.host_snapshot_evictions;
+    out.host_dead_reclaims      = index.host_dead_reclaims;
+    out.unbacked_node_losses    = index.unbacked_node_losses;
+    return out;
+}
+
+std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen3_5::PreparedPromptData& prompt) {
+    std::vector<pc::TapExclusion> out;
+    if (prompt.vision_items.empty()) { return out; }
+    for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) { out.push_back({range.begin, range.end}); }
+    return out;
 }
 
 // ---- publication -------------------------------------------------------------------------------------
@@ -337,6 +403,10 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     c.meta.mtp_next    = lane.history.size() > F ? lane.history[F] : -1;
     c.meta.lineage_echo = lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume) &&
                           prefix_->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
+    c.meta.opener = kind == pc::SnapshotKind::Tap &&
+                    std::any_of(lane.prefix.hints.begin(), lane.prefix.hints.end(), [&](const pc::TapHint& hint) {
+                        return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
+                    });
     c.meta.mtp_accept = lane.mtp_accept;
     // The lineage's previous snapshot serves only requests diverging before this one.
     if (const auto previous = prefix_->capture_result(lane.prefix.capture); previous && previous->snapshot.valid()) {
@@ -358,11 +428,15 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     if (!prefix_ || !lane.prefix.reuse) { return; }
     prefix_publish(lane, prefix_frontier(lane, false));
     if (last || lane.prefix.taps.empty()) { return; }
-    const std::uint32_t B    = lane.state_tokens;
-    const std::uint32_t next = std::min<std::uint32_t>(B + static_cast<std::uint32_t>(chunk_), lane.prompt_tokens);
-    bool due                 = false;
+    const std::uint32_t B = lane.state_tokens;
+    // A boundary inside a Vision item cannot be resumed from: its flexible taps wait for the next.
+    if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return; }
+    // An exact tap ends a call; a flexible one is realized at the first boundary at or past it, or
+    // at the start of the prompt's final call.
+    const bool final_next = lane.next_call + 1U == lane.calls.size();
+    bool due              = false;
     std::erase_if(lane.prefix.taps, [&](const pc::PlannedTap& tap) {
-        const bool now = tap.position <= B || (next == lane.prompt_tokens && tap.position < lane.prompt_tokens);
+        const bool now = tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
         due            = due || now;
         return now;
     });
@@ -420,6 +494,7 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     } catch (...) {}
     lane.prefix.path.clear();
     lane.prefix.taps.clear();
+    lane.prefix.exclusions.clear();
     lane.prefix.restore.reset();
     lane.prefix.resume.reset();
     lane.prefix.page_base = 0;
