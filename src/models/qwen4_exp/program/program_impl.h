@@ -632,7 +632,12 @@ public:
         // stay on the GPU.
         const std::uint32_t cpu_workers = options_.cpu_expert_workers;
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
+        const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
+            // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
+            // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
+            const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
+            const bool assist        = assist_jobs > 0 && decode_columns < kAssistMaxColumns;
             std::vector<ops::offloaded_moe::CpuMissService::Layer> service_layers;
             for (const auto& layer : parameters_.layers) {
                 service_layers.push_back({.records       = reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records),
@@ -644,8 +649,10 @@ public:
                 ops::offloaded_moe::CpuMissService::Options{
                     .workers     = static_cast<int>(cpu_workers),
                     .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
-                    .max_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_),
+                    .max_columns = assist ? kAssistMaxColumns : decode_columns,
                     .pcie_divisor = options_.cpu_pcie_divisor,
+                    .wide_from   = assist ? decode_columns + 1 : 0,
+                    .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
                     .cpus        = {}});
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
@@ -1459,6 +1466,10 @@ private:
     std::uint64_t expert_state_routed_ = 0;
 
 public:
+    // Prefill calls up to this width are CPU-assisted (design §19.3.1 P7); wider chunks route nearly
+    // every expert, and their misses stream or stage on the GPU.
+    static constexpr int kAssistMaxColumns = 255;
+
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
     // cache to the control law's decision.
     void apply_vram_target(bool idle) {

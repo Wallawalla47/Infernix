@@ -139,6 +139,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                              .pcie_divisor = 0, .cpus = {}});
     moe::CpuMissService service_narrow(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
                                                 .max_job_columns = 2, .cpus = {}});
+    // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
+    moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
+                                                .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
     // with at most max_job_columns columns, so the number served is min(want, eligible misses).
     std::vector<int> expert_columns(experts, 0);
@@ -151,7 +154,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             ++misses;
             eligible += expert_columns[e] <= channel.max_job_columns ? 1 : 0;
         }
-        const int want = std::min(channel.max_jobs, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
+        const int want = std::min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
         return std::min(want, eligible);
     };
     struct Config {
@@ -190,7 +194,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
                                 Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
                                 Config{64, &service_narrow, true}, Config{64, nullptr, true, true},
-                                Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true}}) {
+                                Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
+                                Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
+                                Config{64, &service_assist, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");

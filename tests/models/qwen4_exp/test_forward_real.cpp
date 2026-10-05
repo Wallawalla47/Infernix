@@ -8,8 +8,9 @@
 //       [TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]]...
 //   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv bf16|int8]
 //
-// With --cpu-columns the test checks that calls of at most 8 columns, which the Program serves
-// with the CPU expert service, give the GPU route's logits bit for bit (check_cpu_columns).
+// With --cpu-columns the test checks that calls the Program serves with the CPU expert service
+// (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
+// bit for bit (check_cpu_columns).
 // TOKENS is a comma-separated id list, or @FILE holding ids separated by commas or whitespace; the
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
@@ -334,22 +335,24 @@ std::vector<int> top(const std::vector<float>& v, std::size_t offset, std::size_
     return index;
 }
 
-// The Program CPU-serves every call of at most kMaxCpuColumns columns (short prompts, chunk
-// remainders, forced tokens). Each expert of such a call has at most that many columns, so its
-// output is the same bits on the CPU and the GPU (design §16.2), and so are the call's logits. Two
-// sequences run the same prefix, then the last tokens as calls of 1, 2, 5 and 8 columns, through
-// the Program's MoE configuration (64 staging slots, the prefill overlap stream; no resident
-// experts here), one of them with the Program's CPU expert service as well.
+// The Program CPU-serves the misses of every call of at most kMaxCpuColumns columns (short prompts,
+// chunk remainders, forced tokens) and, with the prefill assist (design §19.3.1 P7), the thinnest
+// misses of prefill calls up to 255 columns. A CPU-served expert has at most kMaxCpuColumns columns,
+// so its output is the same bits on the CPU and the GPU (design §16.2), and so are the call's
+// logits. Two sequences run the same prefix, then the last tokens as calls of 1, 2, 5, 8, 24 and 100
+// columns, through the Program's MoE configuration (64 staging slots, the prefill overlap stream;
+// no resident experts here), one of them with a CPU expert service configured as the Program's
+// (decode cap 32, assist cap 256 from 9 columns) as well.
 bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContext& device,
                        const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
                        std::int32_t context, KvCacheStorage kv) {
     namespace moe               = ninfer::ops::offloaded_moe;
     const auto& c               = parameters.model.config().text;
     const auto n                = static_cast<std::int32_t>(tokens.size());
-    const std::int32_t widths[] = {1, 2, 5, moe::kMaxCpuColumns};
-    const std::int32_t tail     = 1 + 2 + 5 + moe::kMaxCpuColumns;
+    const std::int32_t widths[] = {1, 2, 5, moe::kMaxCpuColumns, 24, 100};
+    const std::int32_t tail     = 1 + 2 + 5 + moe::kMaxCpuColumns + 24 + 100;
     if (n <= tail + moe::kMaxCpuColumns) {
-        throw std::invalid_argument("--cpu-columns needs more than 24 tokens");
+        throw std::invalid_argument("--cpu-columns needs more than 148 tokens");
     }
     const std::int32_t prefix = n - tail;
     Harness harness(parameters, device, context, prefix, 2, kv);
@@ -372,10 +375,13 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     }
     bool ok = true;
     {
+        constexpr std::int32_t kAssistColumns = 255;
         moe::CpuMissService service(layers, {.workers      = 6,
-                                             .max_jobs     = moe::kMaxCpuJobs,
-                                             .max_columns  = moe::kMaxCpuColumns,
+                                             .max_jobs     = 32,
+                                             .max_columns  = kAssistColumns,
                                              .pcie_divisor = 3,
+                                             .wide_from    = moe::kMaxCpuColumns + 1,
+                                             .wide_jobs    = moe::kMaxCpuJobs,
                                              .cpus         = {}});
         auto sources           = harness.experts_view;
         sources.staging_base   = static_cast<std::uint8_t*>(staging.p);
@@ -400,7 +406,7 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
         };
         (void)run(*gpu, 0, 0, prefix);
         (void)run(*cpu, 1, 0, prefix);
-        if (service.served_experts() != 0) {
+        if (prefix > kAssistColumns && service.served_experts() != 0) {
             std::printf("FAIL: a %d-column call reached the CPU service\n", prefix);
             ok = false;
         }
@@ -421,8 +427,8 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
     }
     for (auto event : events) { cudaEventDestroy(event); }
     cudaStreamDestroy(overlap);
-    std::printf(ok ? "CPU-served small calls equal the GPU route bit for bit\n"
-                   : "FAIL: CPU-served small calls differ from the GPU route\n");
+    std::printf(ok ? "CPU-served calls equal the GPU route bit for bit\n"
+                   : "FAIL: CPU-served calls differ from the GPU route\n");
     return ok;
 }
 

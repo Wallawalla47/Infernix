@@ -153,7 +153,7 @@ std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries) {
 std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
     const auto e = static_cast<std::size_t>(entries), j = static_cast<std::size_t>(max_jobs);
     return round256(e * kHBlocks * sizeof(canon::A4Block)) + round256(j * sizeof(void*)) +
-           round256(j * sizeof(std::int32_t)) + 256 + round256(e * kXRowBytes) +
+           round256(j * sizeof(std::int32_t)) + kCpuCallBytes + round256(e * kXRowBytes) +
            round256(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t)) +
            round256((j + 2) * sizeof(std::int32_t));
 }
@@ -169,7 +169,7 @@ ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std:
     w.cpu_flags = reinterpret_cast<std::int32_t*>(p);
     p += round256(j * sizeof(std::int32_t));
     w.cpu_call = p;
-    p += 256;
+    p += kCpuCallBytes;
     w.x_plane = reinterpret_cast<std::uint8_t*>(p);
     p += round256(e * kXRowBytes);
     w.tiles = reinterpret_cast<std::int32_t*>(p);

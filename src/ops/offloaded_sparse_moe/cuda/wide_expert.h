@@ -70,11 +70,14 @@ struct ExpertsWorkspace {
     canon::A4Block* h_blocks;     // [entries][kHBlocks]; wide entries hold their A4(h) row here
     const std::uint8_t** job_records; // [max_jobs]
     std::int32_t* cpu_flags;      // [max_jobs]
-    void* cpu_call;               // 256 bytes
+    void* cpu_call;               // kCpuCallBytes
     std::uint8_t* x_plane;        // [entries][kXRowBytes]
     std::int32_t* tiles;          // [max_tiles][2]: (job, first column)
     std::int32_t* pass_tiles;     // [max_jobs + 2]
 };
+
+// Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).
+inline constexpr std::size_t kCpuCallBytes = 1280;
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
 [[nodiscard]] std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);
