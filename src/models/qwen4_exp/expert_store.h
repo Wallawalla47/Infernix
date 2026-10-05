@@ -30,6 +30,11 @@ public:
     // ([experts][3] FP32 words). Throws ArtifactError on a record that is not 4 KiB-aligned.
     ExpertStore(const artifact::StreamSource& source, std::span<const artifact::ObjectHandle> banks,
                 std::uint64_t record_stride, std::uint32_t experts, std::vector<std::vector<float>> multipliers);
+    // From explicit locations (tests and tools): records[layer * experts + e] lists a record's
+    // segments; the same alignment rules apply.
+    ExpertStore(std::vector<std::filesystem::path> files, std::uint64_t record_stride, std::uint32_t layers,
+                std::uint32_t experts, const std::vector<std::vector<Segment>>& records,
+                std::vector<std::vector<float>> multipliers);
 
     [[nodiscard]] std::span<const std::filesystem::path> files() const noexcept { return files_; }
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
