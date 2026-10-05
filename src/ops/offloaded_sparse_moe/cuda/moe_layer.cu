@@ -6,17 +6,21 @@
 // expert (16 intermediates: exactly one A4 block of h) and a down CTA owns four output row groups,
 // so every weight unit is read once per pass of eight columns. Products are dp4a over doubled
 // E2M1 codes and the block sums are exact int64, so the outputs equal the CPU engine's bits.
+// Experts with more than eight columns in a call take the tensor-core wide route instead
+// (wide_expert.h); these kernels skip them.
 
 #include "ninfer/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
 
 #include "ops/common/canonical_math.h"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -98,11 +102,12 @@ __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& 
                       : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
 }
 
-// A call takes the fork route when it has a fork stream and fits one staging pass; moe_experts and
-// moe_experts_cpu_wait decide it identically.
-bool forked(const MoeExpertSource& source, std::int32_t max_jobs) {
+// A call takes the fork route when it has a fork stream, fits one staging pass and is narrow (no
+// expert can have more than eight columns); moe_experts and moe_experts_cpu_wait decide it
+// identically.
+bool forked(const MoeExpertSource& source, std::int32_t max_jobs, std::int32_t columns) {
     return source.fork_stream != nullptr && source.staging_slots > 0 &&
-           max_jobs <= std::min(source.staging_slots, 512);
+           max_jobs <= std::min(source.staging_slots, 512) && columns <= moe::kMaxColumns;
 }
 
 // Which jobs a pass launch computes: all of them, only those resident in frames (their record is
@@ -453,6 +458,7 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const bool split_input = scales.input_up != scales.input_gate;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
@@ -526,6 +532,7 @@ __global__ void __launch_bounds__(kThreads)
     const std::uint8_t* down = record + moe::kGateUpBytes;
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
                 kDownSliceBytes);
@@ -791,22 +798,18 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 }
 
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
-    return (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256 +
-           (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256 +
-           (static_cast<std::size_t>(max_jobs) * sizeof(std::int32_t) + 255) / 256 * 256 + 256;
+    return moe::wide::experts_workspace_bytes(max_jobs, entries);
 }
 
 namespace {
 
-// The CPU bookkeeping of a call, after the expert outputs and job records in its workspace.
+static_assert(sizeof(CpuCall) <= 256, "the workspace reserves 256 bytes for a call's CPU bookkeeping");
+
+// The CPU bookkeeping of a call in its workspace.
 CpuCall* cpu_call_of(void* workspace, std::int32_t max_jobs, std::int32_t entries, std::int32_t** flags) {
-    const std::size_t h_bytes =
-        (static_cast<std::size_t>(entries) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
-    const std::size_t records_bytes = (static_cast<std::size_t>(max_jobs) * sizeof(void*) + 255) / 256 * 256;
-    auto* cpu_flags = reinterpret_cast<std::int32_t*>(static_cast<std::byte*>(workspace) + h_bytes + records_bytes);
-    if (flags != nullptr) { *flags = cpu_flags; }
-    return reinterpret_cast<CpuCall*>(reinterpret_cast<std::byte*>(cpu_flags) +
-                                      (static_cast<std::size_t>(max_jobs) * sizeof(std::int32_t) + 255) / 256 * 256);
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries);
+    if (flags != nullptr) { *flags = layout.cpu_flags; }
+    return static_cast<CpuCall*>(layout.cpu_call);
 }
 
 bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
@@ -817,7 +820,7 @@ bool cpu_served(const Tensor& x, const MoeExpertSource& source) {
 
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
-    if (forked(source, max_jobs)) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
+    if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
     CpuCall* call = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
     cpu_wait_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, call, moe::kHidden,
@@ -836,10 +839,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");
-    auto* h_blocks = static_cast<canon::A4Block*>(workspace);
-    const std::size_t h_bytes =
-        (static_cast<std::size_t>(outputs.ne[1]) * kHBlocks * sizeof(canon::A4Block) + 255) / 256 * 256;
-    auto** job_records = reinterpret_cast<const std::uint8_t**>(static_cast<std::byte*>(workspace) + h_bytes);
+    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1]);
+    auto* h_blocks     = layout.h_blocks;
+    auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
     const bool cpu          = cpu_served(x, source);
@@ -856,11 +858,18 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     // Passes of at most staging_slots jobs (one pass covering every job without staging).
     const int pass_jobs = source.staging_slots > 0 ? std::min(source.staging_slots, kMaxPassJobs) : max_jobs;
     const int half      = source.staging_slots / 2;
-    if (source.overlap_stream != nullptr && half > 0 && max_jobs > half) {
+    const bool overlap  = source.overlap_stream != nullptr && half > 0 && max_jobs > half;
+    // In a call of more than eight columns, experts with more than eight take the wide route, pass
+    // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
+    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    std::optional<moe::wide::Call> wide;
+    if (overlap) {
         // Double-buffered passes: stage pass p+1 on the side stream while pass p computes.
         const auto* events = source.overlap_events;
         CUDA_CHECK(cudaEventRecord(events[0], stream));
         CUDA_CHECK(cudaStreamWaitEvent(source.overlap_stream, events[0], 0));
+        // Planned after the fork, so the first pass's staging overlaps the plan and quantization.
+        if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, half, layout, outputs, stream); }
         int pass = 0;
         for (int base = 0; base < max_jobs; base += half, ++pass) {
             const int jobs = std::min(half, max_jobs - base);
@@ -877,12 +886,13 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             launch_expert_pass<kPassColumns>(static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records,
                                              flags, base, jobs, h_blocks, outputs.ne[1],
                                              static_cast<bf16*>(outputs.data), stream);
+            if (wide) { moe::wide::run_pass(*wide, pass, stream); }
             CUDA_CHECK(cudaEventRecord(events[3 + b], stream));
         }
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
-    if (forked(source, max_jobs)) {
+    if (forked(source, max_jobs, x.ne[1])) {
         // One pass: the misses are staged and then computed on the fork stream while this stream
         // computes the resident experts; both write disjoint outputs and h blocks, and every
         // expert's arithmetic is the same as in a serial pass.
@@ -910,6 +920,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
+    if (use_wide) { wide = moe::wide::prepare(x, dispatch, source, top_k, max_jobs, pass_jobs, layout, outputs, stream); }
     for (int base = 0; base < max_jobs; base += pass_jobs) {
         const int jobs = std::min(pass_jobs, max_jobs - base);
         stage_kernel<<<source.staging_slots > 0 ? kStageCtas : 1, kThreads, 0, stream>>>(dispatch, source, base, jobs,
@@ -926,6 +937,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                                              flags, base, jobs, h_blocks, outputs.ne[1],
                                              static_cast<bf16*>(outputs.data), stream);
         }
+        if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }

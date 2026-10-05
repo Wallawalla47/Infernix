@@ -19,14 +19,18 @@ namespace ninfer::ops {
  *   p          = softmax(router logits[0:E, t]);  ids = top-k of p (lower id wins exact ties)
  *   w_i        = p[ids_i] / sum_j p[ids_j]                      -> moe_route
  *   s          = sigmoid(logits[E, t])  (the shared-expert gate)  -> moe_route
- *   y_i        = expert ids_i applied to x[:, t] with the canonical W4A4 arithmetic
+ *   y_i        = expert ids_i applied to x[:, t] with the W4A4 arithmetic of design §16.2
  *   y[:, t]    = bf16(sum_i w_i * y_i + s * y_shared[:, t])       -> moe_combine
  *
  * Expert placement is an execution resource, not a semantic input: an expert's record is read
  * from a device frame when `frames[e] >= 0` and from the pinned host bank otherwise, and its
- * BF16 output bits are identical either way and identical to the CPU engine's
- * (ops/offloaded_sparse_moe/cpu/w4a4_expert.h). The routed products are exact integer sums, so
- * no batch shape, split or order changes a bit of an expert output. Router logits stay FP32, as in
+ * BF16 output bits are identical either way. An expert with at most eight columns in a call takes
+ * the narrow route, whose products are exact integer sums: no batch shape, split or order changes
+ * a bit of its output, and the CPU engine (ops/offloaded_sparse_moe/cpu/w4a4_expert.h) returns
+ * the same bits. An expert with more columns (and one shared gate/up input scale) takes the wide
+ * route: the same A4 activations and BF16 boundaries, with the block products summed by FP32
+ * tensor cores (qualified against FP64; design §8.5, §13). Both routes depend only on the column
+ * count and the stored scales, never on placement. Router logits stay FP32, as in
  * the Qwen3.5 sparse MoE: rounding them to BF16 would turn experts within one BF16 step of the
  * top-k boundary into ties. Each logit is one FP32 dot product whose order depends only on H, so
  * a column's routing is identical in every batch shape. Routing weights, the shared gate and the

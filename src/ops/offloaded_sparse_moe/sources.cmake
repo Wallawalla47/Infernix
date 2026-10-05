@@ -17,5 +17,7 @@ target_link_libraries(ninfer_ops PUBLIC ninfer_offloaded_moe_cpu)
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/narrow_expert.cu")
 # A whole MoE layer: routing, device-side dispatch, the exact expert kernels and the combine.
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/moe_layer.cu")
+# The wide route: experts with more than eight columns on block-scaled tensor cores.
+target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cuda/wide_expert.cu")
 # The host side of CPU-served misses: mapped channel buffers and the service thread.
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/cpu/miss_service.cpp")

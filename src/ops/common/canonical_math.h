@@ -292,6 +292,39 @@ NINFER_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16_t
     return f32_to_bf16_rn(mul_rn(silu_c(bf16_to_f32(gate_bf16)), bf16_to_f32(up_bf16)));
 }
 
+// ---------------------------------------------------------------------------- A4 codes
+
+// The A4 rule of quantize_a4_block split into its two steps and returning the 4-bit E2M1 code
+// words that the block-scaled tensor-core (wide) route consumes instead of their doubled values.
+// For every block, the scale word equals quantize_a4_block's and e2m1_x2(code[j]) equals its
+// c2[j]; a block whose scale encodes to zero has all-zero codes.
+NINFER_CANON_HD std::uint8_t a4_scale_word(float amax, float input_scale) {
+    return e4m3_rn_satfinite(div_rn(amax, mul_rn(6.0F, input_scale)));
+}
+
+// The code of one element v of a block with a nonzero scale word s.
+NINFER_CANON_HD std::uint8_t a4_code(float v, std::uint8_t scale_word, float input_scale) {
+    return e2m1_rn_satfinite(div_rn(v, mul_rn(e4m3_value(scale_word), input_scale)));
+}
+
+struct A4Codes {
+    std::uint8_t code[16]; // E2M1 code words, sign in bit 3
+    std::uint8_t scale_word;
+};
+
+NINFER_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float input_scale) {
+    A4Codes out{};
+    float amax = 0.0F;
+    for (int j = 0; j < 16; ++j) {
+        const float a = f32_from_bits(f32_bits(bf16_to_f32(v_bf16[j])) & 0x7FFFFFFFU);
+        amax          = a > amax ? a : amax;
+    }
+    out.scale_word = a4_scale_word(amax, input_scale);
+    if (e4m3_scaled(out.scale_word) == 0) { return out; }
+    for (int j = 0; j < 16; ++j) { out.code[j] = a4_code(bf16_to_f32(v_bf16[j]), out.scale_word, input_scale); }
+    return out;
+}
+
 } // namespace ninfer::ops::canon
 
 #undef NINFER_CANON_HD
