@@ -164,8 +164,11 @@ __global__ void __launch_bounds__(kThreads)
             resolved        = true;
             expert          = dispatch.jobs[job_base + j];
             const int frame = source.frames[expert];
+            const int slot  = source.prefetched != nullptr ? source.prefetched[expert] : -1;
             if (frame >= 0) {
                 record = source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride;
+            } else if (slot >= 0) { // streamed by the caller (F2)
+                record = source.prefetch_base + static_cast<std::uint64_t>(slot) * source.record_stride;
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
@@ -1017,12 +1020,14 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     require(source.landing_slots >= 0 && source.landing_slots <= offloaded_moe::kMaxLandingSlots &&
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
+    require(source.prefetched == nullptr || source.prefetch_base != nullptr, "experts prefetch table without its base");
     const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1]);
     auto* h_blocks     = layout.h_blocks;
     auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
     const bool cpu          = cpu_served(x, source);
+    require(!cpu || source.prefetched == nullptr, "experts with streamed records take no CPU-served misses");
     if (cpu) {
         require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
                     source.cpu.done != nullptr && source.cpu.sequence != nullptr &&

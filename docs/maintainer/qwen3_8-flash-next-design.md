@@ -6914,6 +6914,72 @@ this section records the design decisions of F0 and F1. Results are recorded by 
 - **Merged without** the temporary toggle; the NVTX ranges of F0 were ported onto the current
   `advance_prefill`.
 
+#### F2 attribution (2026-10-05, dev 9ec2580a5, nsys, four cold then four warm 4096-token chunks)
+
+| Per chunk (ms) | Cold chunks 2-4 | Warm chunks 5-8 |
+|---|---:|---:|
+| Wall | 3,440-3,578 | 3,141-3,442 |
+| `stage_kernel` (SM zero-copy staging) | 2,417-2,568 | 2,072-2,493 |
+| Expert kernels (narrow + wide) | 158-160 | 154-160 |
+| Other kernels (dense, attention, norms) | 909-914 | 845-914 |
+| GPU idle | 14-16 | 16-18 |
+
+Staging is 70 % of a chunk. Its ~315 non-resident experts per layer (870 MB) move at ~17 GB/s
+through the SMs, against 27.6 GB/s for copy-engine DMA, and they cannot start before the layer's
+router, so the link idles during each layer's ~19 ms of dense and attention work. Floor: 48 × 870 MB /
+27.6 GB/s ≈ 1.5 s per chunk if the link never idles (prefill ~2,600 tok/s at chunk 4096, estimate).
+
+#### F2 and F3 as implemented (branch `claude/fn-prefill-f2`, 2026-10-05)
+
+- **Streaming without routing.** A chunk of T ≥ 256 columns routes nearly every expert of every layer
+  (P(unused) = (1 − 10/512)^T: 0.7 % at 256, ~10⁻⁹ at 1,024), so a layer's copies need not wait for
+  its router: `execution::ExpertStream` copies each layer's non-resident experts, in ascending id, by
+  `cudaMemcpyAsync` on its own stream (runs of consecutive experts coalesced into one copy), two
+  layers ahead of the compute stream, into half l % 2 of a ring. Events per layer: `landed[l]`
+  (compute waits before the layer's experts) and `consumed[l]` (recorded after the layer's
+  `moe_experts`; layer l + 2's copies wait for it). The slot tables (I32 [48][512], slot or −1) sit
+  in the ring's first bytes, uploaded per chunk on compute after the io upload, so the copies queue
+  behind the io on the copy engine. Experts beyond a half's capacity stay misses and are staged as
+  before; experts the chunk does not route cost a copy and nothing else.
+- **Op.** `MoeExpertSource::prefetched` / `prefetch_base`: a non-resident expert with a slot is
+  resolved like a resident one by `stage_kernel` (never staged, never CPU-served; calls with
+  CPU-served misses take no table). Results are unchanged by construction (the same record bytes).
+- **F3, lent frames.** At the first chunk of ≥ 256 columns the Program lends
+  2 × min(384, the largest non-resident count of any layer) + 1 frames (`ExpertResidency::lend`, the
+  Vision window's mechanism: the cheapest run is evicted, promotions into it are waited for), and
+  returns them when no lane is prefilling (after the prompt's last chunk is enqueued, on release, or
+  before a Vision window lends). A Vision quote counts the ring as lendable. The VRAM monitor's
+  resize waits while frames are lent. The startup frame count and decode are unchanged; the lent
+  experts refill through promotions after the prompt.
+- **Options.** `ProgramOptions::prefill_stream` (default on). Chunks below 256 columns keep the
+  staging path. A temporary toggle (`NINFER_Q4_PREFILL_STREAM_OFF`, never committed) gives the
+  A/B in one binary.
+- **Tests.** The layer test adds a streamed placement (every second non-resident expert in a slot
+  buffer, reverse order) on the serial, pass and fork routes, bitwise against the CPU engine.
+  Model gate: rig `fn/rigs/prefill/f2.bat` (prefix exactness, long-prompt ids with the stream on
+  and off, prefill ABBA at chunk 4096 and 1024, tg512).
+
+#### F2 results and the F1 nondeterminism (2026-10-05)
+
+- **Speed** (`ninfer_bench`, ABBA in one build with a temporary toggle, three repetitions each):
+  pp4096 at chunk 4096 1,128.8 → 1,567.3 tok/s (+38.8 %), pp16384 at chunk 4096 1,408.3 → 2,053.5
+  (+45.8 %), pp4096 at chunk 1024 508.9 → 526.7 (+3.5 %); tg512 100.3 → 100.1 (−0.25 %, within
+  noise). The ring was 769 lent frames and every half filled (384 experts per layer per chunk: a
+  cold cache has more misses than that), so a larger ring would gain more.
+- **Exactness of F2 itself:** with the wide route off (narrow arithmetic everywhere), the
+  7,448-token prompt's greedy ids are identical with the stream on and off and equal the pre-F2
+  build. The layer test's streamed placements are bitwise exact.
+- **F1 nondeterminism (open, blocks merging F2):** with the wide route on, the same prompt's ids with
+  the stream on differ from the stream-off run and between repeated runs. The prefix-cache test
+  (`ninfer_qwen4_exp_prefix_cache_real_test`) fails its tap-resume and Host-restore exactness checks
+  with the wide route on and passes with it off, already on dev (5df90b1ce onward); cold prompts in
+  fresh processes are reproducible, and the wide route's arithmetic equals the narrow route's on
+  this artifact. So the wide route's results depend on timing or placement inside a running
+  Program. Excluded so far: records straddling VMM chunks (layer test C7, identical outputs),
+  padding after records (the stride equals the record size), the epilogues' row guards and the
+  producer's tensor-map acquires (read). Under test: the prefill staging overlap (pass p+1 staged
+  on the side stream while pass p computes).
+
 ---
 
 ## 20. Documentation and authority changes

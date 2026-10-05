@@ -317,6 +317,9 @@ struct ProgramOptions {
     // than kAssistMaxColumns hand up to this many of each layer's thinnest misses to the CPU (same
     // divisor). 0 disables.
     std::uint32_t cpu_assist_jobs    = 256;
+    // Prefill expert streaming (design §19.3.8 F2, F3): chunks of at least 256 columns copy each
+    // layer's non-resident experts ahead by DMA into frames lent for the prompt.
+    bool prefill_stream              = true;
     // Prefix cache (design §19.3.1): requests resume from and publish to a shared block tree with
     // Host-born state snapshots in a pinned slab pool of prefix_host_bytes.
     bool prefix_cache                = false;

@@ -528,6 +528,14 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             }
         }
     }
+    // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
+    ExpertStream* const streaming =
+        eager_chunk_ && experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
+    if (streaming != nullptr) {
+        streaming->before_experts(layer, s);
+        source.prefetched    = streaming->slots(layer);
+        source.prefetch_base = streaming->base();
+    }
     if (experts_.frame_stride != 0 && experts_.frame_stride != source.record_stride) {
         throw std::invalid_argument("Qwen4Exp MoE: frame stride differs from the bank record stride");
     }
@@ -536,6 +544,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T));
     // The shared expert runs while the host computes the CPU-served misses.
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
+    if (streaming != nullptr) { streaming->after_experts(layer, s); }
 
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor product = work_.alloc(DType::BF16, {I, T});

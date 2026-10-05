@@ -86,6 +86,18 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     auto* d_landing    = device_copy(landing);
     auto* d_landed     = device_copy(std::vector<std::int32_t>(landing.size(), -1));
     auto* d_frames     = device_copy(frames);
+    // Streamed records (F2): every second non-resident expert sits in a slot of its own, in reverse
+    // order, as a ring the caller filled before the call.
+    std::vector<std::int32_t> prefetched(experts, -1);
+    std::vector<std::uint8_t> slot_bytes;
+    for (int e = experts - 1, slot = 0; e >= 0; --e) {
+        if (frames[e] >= 0 || e % 2 != 1) { continue; }
+        prefetched[e] = slot++;
+        slot_bytes.insert(slot_bytes.end(), bank[e].record.begin(), bank[e].record.end());
+    }
+    if (slot_bytes.empty()) { slot_bytes.resize(stride, 0); }
+    auto* d_prefetched    = device_copy(prefetched);
+    auto* d_prefetch_base = device_copy(slot_bytes);
     auto* d_scales     = device_copy(scales);
 
     // Routing from random FP32 logits.
@@ -163,6 +175,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         const moe::CpuMissService* service;
         bool fork = false;
         bool land = false;
+        bool streamed = false;
     };
     // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
@@ -196,7 +209,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{64, &service_narrow, true}, Config{64, nullptr, true, true},
                                 Config{64, &service_narrow, true, true}, Config{3, nullptr, false, true},
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
-                                Config{64, &service_assist, true}}) {
+                                Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
+                                Config{3, nullptr, false, false, true}, Config{64, nullptr, false, false, true},
+                                Config{64, nullptr, true, false, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -227,6 +242,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             source.landing_slots = static_cast<std::int32_t>(landing.size());
             cuda_check(cudaMemcpy(d_landed, std::vector<std::int32_t>(landing.size(), -1).data(),
                                   landing.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice), "cudaMemcpy");
+        if (config.streamed) {
+            source.prefetched    = d_prefetched;
+            source.prefetch_base = d_prefetch_base;
         }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
@@ -247,8 +265,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
         long mismatches = 0;
         for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != expected[i]; }
-        std::printf("E=%d T=%d k=%d staging slots %2d%s, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
-                    experts, columns, top_k, slots, config.fork ? " (fork)" : "",
+        std::printf("E=%d T=%d k=%d staging slots %2d%s%s, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
+                    experts, columns, top_k, slots, config.fork ? " (fork)" : "", config.streamed ? " (streamed)" : "",
                     config.service != nullptr ? config.service->channel(0).max_jobs : 0,
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
                     mismatches, got.size());
@@ -300,6 +318,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cudaFree(d_ids);
     cudaFree(d_logits);
     cudaFree(d_scales);
+    cudaFree(d_prefetch_base);
+    cudaFree(d_prefetched);
     cudaFree(d_frames);
     cudaFree(d_landed);
     cudaFree(d_landing);
