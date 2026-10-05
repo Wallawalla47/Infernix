@@ -242,6 +242,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             source.landing_slots = static_cast<std::int32_t>(landing.size());
             cuda_check(cudaMemcpy(d_landed, std::vector<std::int32_t>(landing.size(), -1).data(),
                                   landing.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice), "cudaMemcpy");
+        }
         if (config.streamed) {
             source.prefetched    = d_prefetched;
             source.prefetch_base = d_prefetch_base;
