@@ -21,6 +21,8 @@
 #    include <immintrin.h>
 #endif
 
+#include <cerrno>
+
 namespace ninfer::ops::offloaded_moe {
 namespace {
 
@@ -72,6 +74,8 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * kMaxCpuXColumns));
     y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * jobs_ * kMaxCpuColumns));
     done_    = static_cast<std::uint32_t*>(mapped(64));
+    status_  = done_ + 1;
+    heartbeat_ = done_ + 2;
     cuda_require(cudaMalloc(&sequence_, sizeof(std::uint32_t)), "cudaMalloc");
     cuda_require(cudaMemset(sequence_, 0, sizeof(std::uint32_t)), "cudaMemset");
     thread_ = std::thread([this] { serve(); });
@@ -93,6 +97,8 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
     out.x           = x_;
     out.y           = y_;
     out.done        = done_;
+    out.status      = status_;
+    out.heartbeat   = heartbeat_;
     out.sequence    = sequence_;
     out.layer       = layer;
     out.max_jobs    = options_.max_jobs;
@@ -109,6 +115,12 @@ void CpuMissService::serve() {
         pin(options_.cpus.empty() ? -1 : options_.cpus[0]);
         CpuExpertTeam team({.workers = options_.workers, .max_jobs = jobs_, .cpus = options_.cpus});
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
+        std::vector<CpuExpertJob> ready, read;
+        std::vector<std::uint32_t> tickets;
+        std::vector<int> read_jobs;
+        auto* volatile_status = reinterpret_cast<volatile std::uint32_t*>(status_);
+        auto* volatile_beat   = reinterpret_cast<volatile std::uint32_t*>(heartbeat_);
+        std::uint32_t beat    = 0;
         auto* volatile_sequence = reinterpret_cast<volatile std::uint32_t*>(&request_->sequence);
         auto* volatile_done     = reinterpret_cast<volatile std::uint32_t*>(done_);
         std::uint32_t seen      = *volatile_sequence;
@@ -116,6 +128,7 @@ void CpuMissService::serve() {
         std::uint32_t polls     = 0;
         while (!stop_.load(std::memory_order_acquire)) {
             const std::uint32_t sequence = *volatile_sequence;
+            *volatile_beat = ++beat;
             if (sequence == seen) {
                 relax();
                 // Spin while decoding; after 20 ms without a request, poll every 50 us.
@@ -130,6 +143,10 @@ void CpuMissService::serve() {
             const MissRequest& r = *request_;
             const Layer& layer   = layers_.at(static_cast<std::size_t>(r.layer));
             const int count      = r.jobs;
+            std::uint32_t status = 0;
+            ready.clear();
+            read_jobs.clear();
+            tickets.clear();
             for (int j = 0; j < count; ++j) {
                 CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
                 const auto expert = static_cast<std::uint64_t>(r.expert[j]);
@@ -141,8 +158,37 @@ void CpuMissService::serve() {
                     job.x[c] = x_ + static_cast<std::size_t>(r.column[j][c]) * kHidden;
                     job.y[c] = y_ + (static_cast<std::size_t>(j) * kMaxCpuColumns + c) * kHidden;
                 }
+                if (job.record != nullptr) {
+                    ready.push_back(job);
+                } else if (options_.records != nullptr) { // its read starts now, under the other jobs
+                    read_jobs.push_back(j);
+                    tickets.push_back(options_.records->demand(r.layer, static_cast<int>(expert)));
+                } else {
+                    status = ENOENT;
+                }
             }
-            team.run(std::span<const CpuExpertJob>(jobs.data(), static_cast<std::size_t>(count)));
+            team.run(std::span<const CpuExpertJob>(ready.data(), ready.size()));
+            if (!read_jobs.empty()) {
+                read.clear();
+                for (std::size_t i = 0; i < read_jobs.size(); ++i) {
+                    std::uint32_t st = 0;
+                    while (!options_.records->landed(tickets[i])) {
+                        *volatile_beat = ++beat;
+                        relax();
+                    }
+                    const std::uint8_t* record = options_.records->wait(tickets[i], st);
+                    if (record == nullptr) {
+                        status = st != 0 ? st : EIO;
+                        continue;
+                    }
+                    CpuExpertJob job = jobs[static_cast<std::size_t>(read_jobs[i])];
+                    job.record       = record;
+                    read.push_back(job);
+                }
+                team.run(std::span<const CpuExpertJob>(read.data(), read.size()));
+                for (const std::uint32_t t : tickets) { options_.records->done(t); }
+            }
+            *volatile_status = status;
             std::atomic_thread_fence(std::memory_order_release);
             *volatile_done = sequence;
             served_.fetch_add(1, std::memory_order_relaxed);

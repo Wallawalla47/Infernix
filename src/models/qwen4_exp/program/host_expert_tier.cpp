@@ -244,6 +244,10 @@ const std::uint8_t* HostExpertTier::wait(std::uint32_t t, std::uint32_t& status)
     }
 }
 
+bool HostExpertTier::landed(std::uint32_t t) const noexcept {
+    return t >= ticket_capacity_ || tickets_[t].state.load(std::memory_order_acquire) != 0;
+}
+
 void HostExpertTier::done(std::uint32_t t) noexcept {
     if (t < ticket_capacity_) { tickets_[t].done.store(true, std::memory_order_release); }
 }

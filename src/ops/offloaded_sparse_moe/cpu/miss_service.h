@@ -12,6 +12,7 @@
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
+#include "ops/offloaded_sparse_moe/cpu/record_provider.h"
 
 #include <atomic>
 #include <cstdint>
@@ -36,6 +37,11 @@ public:
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
+        // Tiered requests (design §19.3.7): a job without a record pointer is read through `records`
+        // (demanded before the other jobs run, computed after them); without a provider, or when a
+        // read fails, the request is answered with an errno in the status word. The service keeps its
+        // heartbeat word changing while it waits for a record, so the device waits as long as needed.
+        RecordProvider* records = nullptr;
     };
 
     CpuMissService(std::vector<Layer> layers, Options options);
@@ -57,6 +63,8 @@ private:
     std::uint16_t* y_     = nullptr; // mapped BF16 [H, max(max_jobs, wide_jobs) * kMaxCpuColumns]
     int jobs_             = 0;       // max(max_jobs, wide_jobs)
     std::uint32_t* done_  = nullptr; // mapped
+    std::uint32_t* status_ = nullptr; // mapped, beside done_
+    std::uint32_t* heartbeat_ = nullptr; // mapped, beside status_: advanced while the service thread lives
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
     std::atomic<std::uint64_t> served_{0}, experts_{0};

@@ -2758,8 +2758,9 @@ roughly halve the miss stall.
 3. A host service thread (`CpuMissService`, worker 0 of the existing `CpuExpertTeam`) computes
    those experts from the pinned bank into mapped memory. Meanwhile the GPU stages the remaining
    misses and computes everything else.
-4. A one-CTA kernel waits for the answer, which traps after 2 s instead of hanging, and places the
-   outputs before the combine.
+4. A one-CTA kernel waits for the answer and places the outputs before the combine. The wait
+   lasts while the service's heartbeat word changes; a silent host fails the call through its
+   error word after 1 s (§19.3.7, R9; it trapped after 2 s before).
 
 The outputs are bit-identical: the layer-route test checks CPU channels of 2 and 8 jobs against
 the CPU engine, and greedy token ids are unchanged. Prefill chunks (more than 64 columns) stay on
@@ -6935,9 +6936,32 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   service then uses those pointers. The CPU request sequence skips 0 when it wraps (an existing
   defect: after 2^32 requests a call's CPU jobs got no outputs). RT5: the layer test's routes with
   the records in shuffled host slots reached only through the table (zero-copy, staged, fork, CPU
-  jobs, prefill assist). **Not done:** the heartbeat wait and error word that replace the 2 s trap
-  (they need R10's error checks, so they land with it), the per-layer table in `Forward`, and
-  promotions through the host-pointer mirror (R10).
+  jobs, prefill assist). **Not done:** the per-layer table in `Forward` and promotions through
+  the host-pointer mirror (R10).
+- **R9** (2026-10-05, op level): `cpu_plan` takes SSD-only experts (null table entry) first, every
+  one of at most `max_job_columns` columns up to the cap, then host-memory misses under the divisor
+  rule over host-memory misses only. `CpuMissService::Options::records` (`RecordProvider`:
+  `demand`, `landed`, `wait`, `done`) serves a job without a record: its read is demanded
+  before the other jobs run and computed after them; a missing provider or failed read answers an
+  errno in the status word. The fetch channel (`MoeFetchChannel`, `cpu/fetch_request.h`,
+  host side `cpu/fetch_channel`) follows §4.6.3 with these choices: a one-CTA `fetch_plan_kernel`
+  after the CPU plan does the stable fetch-last partition (`cpu_flags` and the CPU call's job
+  indices move with it) and publishes the request; the poller is whichever stage CTA holds a
+  device token (no dedicated CTA, so no CTA must outlive its own copies), mirroring `landed`
+  into the call's workspace; `consumed` is one 64-bit word (sequence << 32 | records), stored by
+  the last CTA of each pass with fetch records (so a responder's ring must exceed the largest
+  pass's fetch records: 64 in decode, the staging half in prefill); the host's `land` accepts
+  any order and publishes the complete prefix. A fetch channel needs staging (the zero-copy route
+  could not release ring slots) and at most `kMaxFetch` = 512 jobs. Tier records are read with
+  `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
+  wait and the fetch poller end when the host's heartbeat has not changed for 1 s and write
+  `kErrorHostSilent` (no trap unless the source has no error word); host failures write their
+  errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
+  sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
+  passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
+  responder that fails a request or stays silent, an unserved set without a channel, and a silent
+  CPU host, each against the CPU engine's bits or the expected error word. **Not done:** the
+  tier's agent as responder (R10).
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 

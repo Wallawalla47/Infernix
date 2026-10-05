@@ -82,6 +82,7 @@ public:
 
     // ---- RecordProvider: the CPU service thread, during a round
     std::uint32_t demand(int layer, int expert) noexcept override;
+    [[nodiscard]] bool landed(std::uint32_t ticket) const noexcept override;
     const std::uint8_t* wait(std::uint32_t ticket, std::uint32_t& status) noexcept override;
     void done(std::uint32_t ticket) noexcept override;
 
