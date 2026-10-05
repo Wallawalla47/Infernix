@@ -5,7 +5,7 @@
 //   ninfer_qwen4_exp_forward_real_test TOKENS [--kv bf16|int8] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
 //   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
-//       [TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]]...
+//       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8] [--dump-from P]]...
 //   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv bf16|int8]
 //
 // With --cpu-columns the test checks that calls the Program serves with the CPU expert service
@@ -15,7 +15,9 @@
 // options after a TOKENS apply to it. With --dump-logits the test scores the text teacher-forced
 // instead: it prefills it in chunks of N (default 256) with FP32 logits at every position, writes
 // them in Strata's --dump-logits layout (int32 vocabulary, int32 rows, then one FP32 row per
-// position) and prints the perplexity. Several such texts are scored in order with one model load.
+// position) and prints the perplexity. With --dump-from P only positions from P on are written and
+// scored (long texts: the logits of every position would not fit on disk). Several such texts are
+// scored in order with one model load.
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -444,8 +446,9 @@ int main(int argc, char** argv) {
     struct Job {
         std::vector<std::int32_t> tokens;
         std::string logits_path, residuals_path, routes_path, blocks_path, dump_path;
-        std::int32_t chunk = 256;
-        KvCacheStorage kv  = KvCacheStorage::BFloat16;
+        std::int32_t chunk     = 256;
+        std::int32_t dump_from = 0;
+        KvCacheStorage kv      = KvCacheStorage::BFloat16;
         bool cpu_columns   = false;
     };
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -479,6 +482,9 @@ int main(int argc, char** argv) {
             } else if (arg == "--chunk") {
                 job.chunk = std::stoi(value);
                 if (job.chunk <= 0) { throw std::invalid_argument("--chunk must be positive"); }
+            } else if (arg == "--dump-from") {
+                job.dump_from = std::stoi(value);
+                if (job.dump_from < 0) { throw std::invalid_argument("--dump-from must not be negative"); }
             } else if (arg == "--kv") {
                 if (value != "bf16" && value != "int8") { throw std::invalid_argument("--kv takes bf16 or int8"); }
                 job.kv = value == "int8" ? KvCacheStorage::Int8Group64 : KvCacheStorage::BFloat16;
@@ -524,7 +530,8 @@ int main(int argc, char** argv) {
                 Harness harness(parameters, device, context, chunk, 1, job.kv);
                 DeviceBuffer logits(vocab * chunk * sizeof(float));
                 std::ofstream out(job.dump_path, std::ios::binary);
-                const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n};
+                const std::int32_t from      = std::min(job.dump_from, n);
+                const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n - from};
                 out.write(reinterpret_cast<const char*>(header), sizeof(header));
                 double nll = 0.0;
                 std::int32_t scored = 0, same_top1 = 0;
@@ -535,10 +542,13 @@ int main(int argc, char** argv) {
                     Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
                     harness.forward->run(call.batch, chunk_logits);
                     device.synchronize();
-                    const auto rows = to_float(logits, vocab * width);
-                    out.write(reinterpret_cast<const char*>(rows.data()),
-                              static_cast<std::streamsize>(rows.size() * sizeof(float)));
-                    for (std::int32_t i = 0; i < width && first + i + 1 < n; ++i) {
+                    if (first + width <= from) { continue; }
+                    const auto rows       = to_float(logits, vocab * width);
+                    const std::int32_t lo = std::max(0, from - first);
+                    out.write(reinterpret_cast<const char*>(rows.data() + static_cast<std::size_t>(lo) * vocab),
+                              static_cast<std::streamsize>((rows.size() - static_cast<std::size_t>(lo) * vocab) *
+                                                           sizeof(float)));
+                    for (std::int32_t i = lo; i < width && first + i + 1 < n; ++i) {
                         const float* row = rows.data() + static_cast<std::size_t>(i) * vocab;
                         const float peak = *std::max_element(row, row + vocab);
                         double sum = 0.0;

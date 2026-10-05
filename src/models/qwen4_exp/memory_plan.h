@@ -148,6 +148,11 @@ public:
     [[nodiscard]] std::uint32_t target(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
     [[nodiscard]] std::uint64_t headroom(DisplayState display) const;
     [[nodiscard]] std::uint64_t reserve_left(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;
+    // A fixed allocation grew (positive) or shrank by `bytes` since sizing (the elastic KV pool, design
+    // §19.3.11): it is not the reserve's use.
+    void account_fixed(std::int64_t bytes) noexcept {
+        usage_at_sizing_ = static_cast<std::uint64_t>(static_cast<std::int64_t>(usage_at_sizing_) + bytes);
+    }
 
 private:
     [[nodiscard]] std::int64_t frame_bytes(const VramSnapshot& snapshot, std::uint64_t pool_bytes) const;

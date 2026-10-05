@@ -145,6 +145,11 @@ struct ForwardBatch {
     // before it reads or writes its state or KV planes; the MTP block waits for the last entry.
     std::array<std::span<const cudaEvent_t>, 2> layer_waits{};
     const VisionInput* vision = nullptr;   // when set: image columns of a prefill call
+    // Prefill expert streaming (ExpertStream): the call's MoE reads the active stream's ring, and
+    // with `release_stream` frees each layer's half once its experts are enqueued. A layer walk sets
+    // release_stream on the span's last chunk only (every chunk reads the same layer copies).
+    bool stream         = false;
+    bool release_stream = true;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -194,6 +199,18 @@ public:
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
 
+    // The steps run() composes, for a layer walk over a prefill span (design §19.3.8 F4): the
+    // same chunks executed layer-major instead of chunk-major. Each step of a chunk starts with
+    // begin_call (it resets the workspace); `residual` (BF16 [S*H, T]) lives outside the
+    // workspace. embed writes the chunk's expanded embedding into it; layer runs one decoder
+    // layer; finish runs the chunk's MTP cells and, when logits is set, the final mixer and the
+    // LM head. Outputs are run()'s bit for bit: every step's kernels, inputs and order within the
+    // chunk are the same.
+    void begin_call(const ForwardBatch& batch, const Tensor* logits);
+    void embed(const ForwardBatch& batch, Tensor& residual);
+    void layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap = nullptr);
+    void finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits);
+
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
 
@@ -226,7 +243,9 @@ private:
         std::int32_t batch = 0, width = 0;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
-    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap);
+    Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
+               const ForwardBatch* batch = nullptr);
+    void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
 
     const Parameters& parameters_;

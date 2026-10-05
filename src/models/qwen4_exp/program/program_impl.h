@@ -3,6 +3,8 @@
 #include "models/qwen4_exp/program/program.h"
 
 #include "core/arena.h"
+#include "core/cuda_vmm.h"
+#include "core/vmm_arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
@@ -45,6 +47,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -239,6 +242,15 @@ struct DeviceLayout {
     MtpIo mtp_io;
     std::size_t gdn_bytes = 0, ple = 0, tails = 0, kv = 0, records_bytes = 0, ple_records = 0, qsa_records = 0;
     std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
+    // The arena wide prefill calls swap in (columns above static_columns), lent from expert frames
+    // while a prompt runs such calls; zero when the static arena covers every call.
+    std::size_t wide_work = 0;
+    std::int32_t static_columns = 0;
+    // Elastic KV (design §19.3.11): the backing reserves `kv` bytes of address space and maps the
+    // chunks pages [0, n) of every plane (and the block tables) need; `kv_base_pages` are mapped at
+    // startup and counted as fixed, the rest grows from the expert frames when admissions need it.
+    bool kv_elastic             = false;
+    std::uint32_t kv_base_pages = 0;
     std::size_t mtp_column_bytes = 0, mtp_ones = 0;
     ProgramDevicePlan bytes;
 };
@@ -368,6 +380,9 @@ public:
         d.tables = plan_kv_execution_tables(
             kv_builder, {.logical_page_capacity = static_cast<std::uint32_t>(d.pages_per_row), .table_rows = lanes});
         d.kv = kv_builder.finish(256);
+        // Pages [0, n) are a prefix of each page-major plane, so growth maps whole chunks at each plane's end.
+        d.kv_elastic = d.pool.spec.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor;
+        d.kv_base_pages = std::min<std::uint32_t>(d.kv_pages, kKvBaseTokens / kPagedKVPageSize);
 
         // Per-call inputs, logits and sampling counts.
         const std::size_t heads     = NgramHash(c.ple.ngram, 0).heads();
@@ -397,8 +412,12 @@ public:
         d.logits16     = 2ULL * c.vocab_size * lanes * W;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
 
-        // One workspace arena: the forward pass, sampling, draft acceptance and the drafter.
-        d.work = workspace_bytes(c, o, d, lanes);
+        // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
+        // decode, verification and calls of up to kStaticWorkColumns columns; a wider prefill call
+        // swaps in an arena of the chunk's size lent from expert frames (design §19.3.7, VRAM item 1).
+        d.static_columns = std::max(lanes * W, std::min(d.chunk, kStaticWorkColumns));
+        d.work           = workspace_bytes(c, o, d, lanes, d.static_columns);
+        d.wide_work      = d.chunk > d.static_columns ? workspace_bytes(c, o, d, lanes, d.chunk) : 0;
 
         // Verification (W > 1): GDN replay records, PLE and QSA records, the round's I32 arrays.
         if (W > 1) {
@@ -458,7 +477,8 @@ public:
 
         auto& b     = d.bytes;
         b.kv_pages  = d.kv_pages;
-        b.kv        = d.kv;
+        b.kv        = d.kv_elastic ? kv_mapped_bytes(d, d.kv_base_pages) : d.kv;
+        b.kv_max    = d.kv;
         b.workspace = d.work;
         b.staging   = d.staging;
         b.state     = d.gdn_bytes + d.ple + d.tails + d.records_bytes + d.ple_records + d.qsa_records +
@@ -474,15 +494,34 @@ public:
         return d;
     }
 
+    // The chunks of the KV backing that pages [0, pages) of every plane and the block tables need.
+    static std::vector<std::uint8_t> kv_chunks(const DeviceLayout& d, std::uint32_t pages) {
+        std::vector<std::uint8_t> need((d.kv + kKvChunkBytes - 1) / kKvChunkBytes, 0);
+        const auto mark = [&](std::size_t offset, std::size_t bytes) {
+            if (bytes == 0) { return; }
+            for (std::size_t c = offset / kKvChunkBytes; c <= (offset + bytes - 1) / kKvChunkBytes; ++c) { need[c] = 1; }
+        };
+        for (const auto& plane : d.pool.planes) { // page-major: the page is the outermost dimension
+            const auto total = static_cast<std::size_t>(d.pool.spec.page_group_count);
+            mark(plane.storage.region.offset, plane.storage.region.bytes / total * pages);
+        }
+        mark(d.tables.block_tables.region.offset, d.tables.block_tables.region.bytes);
+        return need;
+    }
+    static std::size_t kv_mapped_bytes(const DeviceLayout& d, std::uint32_t pages) {
+        const auto need = kv_chunks(d, pages);
+        return static_cast<std::size_t>(std::count(need.begin(), need.end(), std::uint8_t{1})) * kKvChunkBytes;
+    }
+
     // The workspace arena of a Program with `lanes` lanes and the plan's widths: the forward at its
     // widest call (a prefill chunk or every lane's widest round), sampling, acceptance and the
     // drafter. The plan sizes the arena with the Program's lane count; the per-lane report compares
     // lane counts.
     static std::size_t workspace_bytes(const TextConfig& c, const ProgramOptions& o, const DeviceLayout& d,
-                                       std::int32_t lanes) {
+                                       std::int32_t lanes, std::int32_t columns) {
         const std::int32_t W = d.max_width;
         std::size_t bytes =
-            execution::Forward::workspace_bytes(c, std::max(d.chunk, lanes * W), dim(o.max_context)) +
+            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context)) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
             bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
@@ -533,7 +572,7 @@ public:
 
         // Every fixed allocation below is checked against the plan and against device free memory
         // (an allocation the driver placed in system memory fails startup, design §19.3.7).
-        vram_ = open_vram_budget_source(device_.device);
+        vram_ = open_vram_budget_source(device_.device, options_.vram_past_budget);
         SpillGuard guard(*vram_);
         guard.begin();
         std::uint64_t allocated = 0;
@@ -546,11 +585,20 @@ public:
         allocate(tails_backing_, plan_.tails, allocated);
         tails_backing_.fill(0);
 
-        allocate(kv_backing_, plan_.kv, allocated);
         kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_);
-        kv_backing_.fill(0);
-        pool_   = std::make_unique<DeviceKVPagePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, plan_.pool);
-        tables_ = std::make_unique<KVExecutionTablePool>(DeviceSpan{kv_backing_.p, kv_backing_.bytes}, plan_.tables, *pool_);
+        if (plan_.kv_elastic) {
+            kv_vmm_  = std::make_unique<VmmRange>(device_.device, plan_.kv, kKvChunkBytes);
+            kv_span_ = DeviceSpan{kv_vmm_->base(), plan_.kv};
+            if (!map_kv(plan_.kv_base_pages)) { throw std::runtime_error("Qwen4Exp: the KV pool's base pages do not fit"); }
+            allocated += kv_vmm_->mapped_bytes();
+        } else {
+            allocate(kv_backing_, plan_.kv, allocated);
+            kv_backing_.fill(0);
+            kv_span_ = DeviceSpan{kv_backing_.p, kv_backing_.bytes};
+        }
+        pool_   = std::make_unique<DeviceKVPagePool>(kv_span_, plan_.pool);
+        tables_ = std::make_unique<KVExecutionTablePool>(kv_span_, plan_.tables, *pool_);
+        if (plan_.kv_elastic) { pool_->set_backed_pages(plan_.kv_base_pages); }
 
         io_layout_ = plan_.io;
         allocate(io_device_, io_layout_.bytes, allocated);
@@ -610,6 +658,7 @@ public:
         experts.frames.assign(c_.num_hidden_layers, nullptr);
         if (max_width_ > 1) { allocate_verification(lanes, allocated); }
         work_capacity_ = plan_.work;
+        wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
 
@@ -809,12 +858,13 @@ public:
             }
             impl->summary.service_work_quanta =
                 service_quanta(s.plan.ends.size(), impl->summary.effective_output_tokens, impl->vision.get());
-        } else if (pool_->available_pages() < base.impl_->pages) {
+        } else if (pool_->available_pages() < base.impl_->pages && !kv_growable(base.impl_->pages)) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
         // A window lends frames other lanes' handoffs may hold now.
-        if (impl->vision && residency_->lendable() + stream_lease_.count < impl->vision->window.frames) {
+        if (impl->vision &&
+            residency_->lendable() + (walk_.active ? 0U : stream_lease_.count) < impl->vision->window.frames) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
@@ -834,6 +884,7 @@ public:
         if (cancellation.requested() || quote.impl == nullptr) { return runtime::ContextTransactionReserveStatus::Aborted; }
         const QuoteImpl& q = *quote.impl;
         Lane& lane         = lanes_.at(q.lane);
+        kv_busy();
         if (lane.phase != Phase::Free || transaction_lane_) {
             throw std::logic_error("Qwen4Exp: admission destination is not free");
         }
@@ -876,8 +927,11 @@ public:
             lane.prefix.trailing_extra = prefix_trailing_extra(data);
             lane.prefix.hints  = data.tap_hints.hints;
             lane.prefix.exclusions = prefix_exclusions(data);
-            // Make room before reserving: the quote counted evictable cache pages as available.
+            // Make room before reserving: the quote counted evictable cache pages as available. An
+            // elastic pool grows only for what eviction cannot free, so idle cache blocks never hold
+            // memory the expert frames could use (design §19.3.11).
             pc_make_room(selection->need);
+            if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
             auto reservation = pool_->reserve(selection->need);
             if (!reservation) {
                 prefix_unpin(*selection);
@@ -892,6 +946,7 @@ public:
             lane.prefix.reused  = selection->frontier;
             lane.calls          = selection->plan.ends;
         } else {
+            if (pool_->available_pages() < q.pages) { (void)grow_kv(q.pages); }
             auto reservation = pool_->reserve(q.pages);
             if (!reservation) {
                 lane.row = KVExecutionRowLease{};
@@ -980,9 +1035,17 @@ public:
         const auto index  = lane_of(sequence);
         Lane& lane        = lanes_[index];
         if (lane.phase != Phase::Prefill) { throw std::logic_error("Qwen4Exp: prefill on a lane that is not prefilling"); }
+        if (walk_.active) {
+            if (walk_.lane != index) { throw std::logic_error("Qwen4Exp: another lane's prefill holds the layer walk"); }
+            return walk_step(lane, index, start);
+        }
         const std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens);
         if (lane.next_call >= lane.calls.size() || lane.calls[lane.next_call] <= lane.state_tokens) {
             throw std::logic_error("Qwen4Exp: the lane's prefill plan does not continue its state");
+        }
+        if (const std::size_t end = walk_span_end(lane, index); end > lane.next_call) {
+            walk_begin(lane, index, end);
+            return walk_step(lane, index, start);
         }
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
@@ -1003,9 +1066,12 @@ public:
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
         // a copy-out of this lane's state still in flight (design §19.3.1).
         next_waits_ = prefix_waits(lane);
-        const bool streamed = stream_chunk(width);
+        const bool streamed = !walk_.active && stream_chunk(width);
         run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
-        if (last && !prefilling_besides(index)) { return_stream_lease(); }
+        if (last && !prefilling_besides(index)) {
+            return_stream_lease();
+            return_wide_work();
+        }
         lane.state_tokens += static_cast<std::uint32_t>(width);
         prefix_after_prefill_call(lane, index, last);
         // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
@@ -1023,15 +1089,18 @@ public:
             apply_vram_target(false);
         }
 
+        return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
+    }
+
+    // The progress of a prefill unit whose calls were enqueued (the last ends at `begin + width`,
+    // `tokens` prompt tokens in all): for the prompt's last call the first token is sampled and the
+    // pending batch returned. Non-last units have already synchronized and applied their routes.
+    PrefillProgress prefill_progress(Lane& lane, std::uint32_t index, std::int32_t begin, std::int32_t width,
+                                     std::uint32_t tokens, bool last, std::size_t promotions,
+                                     Clock::time_point start) {
         PrefillProgress out;
-        out.summary = runtime::BeginSummary{
-            .prompt_tokens        = lane.prompt_tokens,
-            .reused_prompt_tokens = lane.prefix.reused,
-            .prefix_reuse_path    = lane.prefix.reused == 0 || !lane.prefix.resume ? PrefixReusePath::Root
-                                    : prefix_->index().valid(*lane.prefix.resume)
-                                        ? reuse_path_for(prefix_->index().snapshot(*lane.prefix.resume).kind)
-                                        : PrefixReusePath::SharedStablePrefix};
-        out.processed_prompt_tokens = static_cast<std::uint32_t>(width);
+        out.summary                 = prefill_summary(lane);
+        out.processed_prompt_tokens = tokens;
         out.complete                = last;
         if (last) {
             const std::uint32_t lanes[] = {index};
@@ -1045,7 +1114,7 @@ public:
                 residency_->after_round(device_.stream, width, promotions);
                 apply_vram_target(false);
             }
-            const SequenceHandle rows[] = {sequence};
+            const SequenceHandle rows[] = {handle(index)};
             out.timing.submit_host_ns = elapsed_ns(start);
             lane.prefill_ns += out.timing.submit_host_ns;
             out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, rows,
@@ -1057,6 +1126,16 @@ public:
             lane.prefill_ns += out.timing.submit_host_ns;
         }
         return out;
+    }
+
+    runtime::BeginSummary prefill_summary(const Lane& lane) const {
+        return runtime::BeginSummary{
+            .prompt_tokens        = lane.prompt_tokens,
+            .reused_prompt_tokens = lane.prefix.reused,
+            .prefix_reuse_path    = lane.prefix.reused == 0 || !lane.prefix.resume ? PrefixReusePath::Root
+                                    : prefix_->index().valid(*lane.prefix.resume)
+                                        ? reuse_path_for(prefix_->index().snapshot(*lane.prefix.resume).kind)
+                                        : PrefixReusePath::SharedStablePrefix};
     }
 
     PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets) {
@@ -1328,8 +1407,9 @@ public:
             const auto index = lane_of(sequence);
             out.timings      = timings(lanes_[index]);
             out.speculative  = lanes_[index].speculative;
-            // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from.
-            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free) {
+            // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from; inside
+            // a layer walk the layers are at different positions, so it leaves none.
+            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free && !(walk_.active && walk_.lane == index)) {
                 prefix_finish(lanes_[index], index);
             }
             release(index);
@@ -1365,7 +1445,7 @@ public:
         out.kv_capacity_page_groups = kv_pages_;
         out.kv_capacity_max_page_groups = kv_pages_;
         out.kv_cache                = options_.kv_cache;
-        out.kv_payload_bytes        = kv_backing_.bytes;
+        out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = work_capacity_;
         return out;
     }
@@ -1457,6 +1537,7 @@ private:
     // pool, warns once per pressure episode that nothing absorbs it.
     void on_vram_snapshot(const VramSnapshot& snapshot) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
+        if (kv_idle_due() && waker_) { waker_(); }
         if (control_) {
             const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
             if ((d.shrink || d.grow) && waker_) { waker_(); }
@@ -1547,6 +1628,11 @@ public:
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
     // cache to the control law's decision.
     void apply_vram_target(bool idle) {
+        if (idle && kv_idle_due() &&
+            std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
+            kv_busy(); // one attempt per idle period: blocks without host copies may still hold the top
+            shrink_kv(true);
+        }
         if (!control_) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
@@ -1573,6 +1659,8 @@ private:
     static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
     // Calls this narrow are CPU-served (design §16.2, prefix P0 step 3).
     static constexpr std::int32_t kServedCallColumns = 8;
+    // Prefill calls up to this many columns run in the static workspace; wider ones in the wide arena.
+    static constexpr std::int32_t kStaticWorkColumns = 512;
 
     // Appends the round whose routes after_round is about to apply to the internal route trace
     // (ProgramOptions::route_trace); rows' lanes are host_lanes_ as staged for the round.
@@ -1618,7 +1706,9 @@ private:
 
     // The workspace arena of a Program with `lanes` lanes: the forward at its widest call (a prefill
     // chunk or every lane's widest round), sampling, acceptance and the drafter.
-    std::size_t workspace_capacity(std::int32_t lanes) const { return workspace_bytes(c_, options_, plan_, lanes); }
+    std::size_t workspace_capacity(std::int32_t lanes) const {
+        return workspace_bytes(c_, options_, plan_, lanes, plan_.static_columns);
+    }
 
     // Reports at startup what each lane of --max-concurrency takes from the expert cache, in frames
     // (design 19.3.5): its KV extent unless --kv-capacity fixes the pool; its recurrent, convolution
@@ -1629,7 +1719,7 @@ private:
         try {
             const auto n         = static_cast<std::size_t>(lanes);
             const bool fixed_kv  = options_.kv_capacity_tokens != 0;
-            const std::size_t kv = fixed_kv ? 0 : kv_backing_.bytes / n;
+            const std::size_t kv = fixed_kv ? 0 : kv_span_.bytes / n;
             const std::size_t state =
                 (state_backing_.bytes + ple_backing_.bytes + tails_backing_.bytes + logits32_.bytes + logits16_.bytes +
                  token_counts_.bytes + records_backing_.bytes + ple_records_.bytes + qsa_records_.bytes +
@@ -1762,8 +1852,12 @@ private:
 
     void release(std::uint32_t index) noexcept {
         Lane& lane = lanes_[index];
+        if (walk_.active && walk_.lane == index) { walk_abandon(); }
         if (stream_lease_.valid() && !prefilling_besides(index)) {
             try { return_stream_lease(); } catch (...) {}
+        }
+        if (!prefilling_besides(index)) {
+            try { return_wide_work(); } catch (...) {}
         }
         prefix_release(lane);
         lane.pages.clear();
@@ -1777,6 +1871,29 @@ private:
         lane.phase        = Phase::Free;
         lane.state_tokens = 0;
         ++revision_;
+        kv_busy();
+        try { shrink_kv(); } catch (...) {}
+    }
+
+    // Whether the elastic pool could grow to make `need` pages available (the quote's check).
+    bool kv_growable(std::uint32_t need) const noexcept {
+        return static_cast<std::uint64_t>(pool_->available_pages()) + kv_grow_pages() >= need;
+    }
+
+    // The pages one growth could add at most: grow_kv takes up to a quarter of the frames, and none
+    // while frames are lent (an estimate; grow_kv decides).
+    std::uint32_t kv_grow_pages() const noexcept {
+        if (!kv_vmm_ || !residency_ || !residency_->elastic() || residency_->frames() == 0 ||
+            residency_->stats().lent_frames != 0) {
+            return 0;
+        }
+        const std::uint32_t room = pool_->capacity_pages() - pool_->backed_pages();
+        const std::uint64_t page_bytes =
+            std::max<std::uint64_t>(1, kv_span_.bytes / std::max<std::uint32_t>(1, pool_->capacity_pages()));
+        const std::uint64_t frame_room = static_cast<std::uint64_t>(residency_->frames() / 4) * residency_->frame_stride();
+        const std::uint64_t slack      = ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * plan_.pool.planes.size();
+        const std::uint64_t usable     = frame_room > slack ? frame_room - slack : 0;
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes));
     }
 
     // Zeroes a slot's recurrent state, PLE convolution history, QSA tails and penalty counts.
@@ -1959,8 +2076,9 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above.
-        if (streamed) { expert_stream_->begin(stream_lease_.memory, residency_->host_table(), s); }
-        forward_call(batch, width, logit_columns, nullptr, chunk, vision);
+        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s); }
+        const WideWork wide(*this, batch * width);
+        forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
         if (streamed) { expert_stream_->end(); }
         residency_->enqueue_route_download(s, batch * width);
     }
@@ -1976,8 +2094,11 @@ private:
     static constexpr std::int32_t kStreamMinColumns = 256;
     static constexpr std::uint32_t kStreamHalfMin   = 16;
 
-    // Whether this chunk streams; lends the ring first when none is held.
-    bool stream_chunk(std::int32_t width) {
+    // Whether this chunk streams; lends the ring first when none is held. With `walk_bytes`, the
+    // lease also holds a layer walk's area after the ring (stream_walk_bytes_; zero when the
+    // lendable frames do not cover it): the experts its frames evict widen each half by their
+    // per-layer share.
+    bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0) {
         if (!expert_stream_ || width < kStreamMinColumns || residency_->frames() == 0) { return false; }
         if (!stream_lease_.valid()) {
             const std::int32_t* table = residency_->host_table();
@@ -1988,25 +2109,113 @@ private:
                 for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
                 most = std::max(most, absent);
             }
-            const std::uint32_t half   = most;
-            const std::uint32_t frames = std::min(2 * half + 1, residency_->lendable());
-            if (half == 0 || expert_stream_->slots_in(static_cast<std::size_t>(frames) * residency_->frame_stride()) <
-                                 2 * kStreamHalfMin) {
+            const std::uint64_t stride  = residency_->frame_stride();
+            const auto frames_of        = [&](std::size_t bytes) {
+                return static_cast<std::uint32_t>((bytes + stride - 1) / stride);
+            };
+            // The wide arena rides in the lease whenever the plan has one: a prompt with a streamed
+            // call runs wide calls.
+            const std::uint32_t wide_frames = frames_of(wide_work_);
+            const auto walk_frames          = frames_of(walk_bytes);
+            const std::uint32_t lendable    = residency_->lendable();
+            if (wide_frames >= lendable) { return false; }
+            const std::uint32_t evicted = wide_frames + walk_frames;
+            const std::uint32_t widened = std::min(E, most + (evicted + c_.num_hidden_layers - 1) / c_.num_hidden_layers);
+            const bool walk = walk_frames > 0 && 2 * widened + 1 + wide_frames + walk_frames <= lendable;
+            const std::uint32_t half = walk ? widened : std::min(E, most + (wide_frames + c_.num_hidden_layers - 1) /
+                                                                              c_.num_hidden_layers);
+            const std::uint32_t ring = std::min(2 * half + 1, lendable - wide_frames);
+            if (half == 0 || expert_stream_->slots_in(static_cast<std::size_t>(ring) * stride) < 2 * kStreamHalfMin) {
                 return false;
             }
             const cudaStream_t writers[] = {expert_stream_->stream()};
-            stream_lease_    = residency_->lend(frames, device_.stream, writers);
-            stream_at_lease_ = expert_stream_->stats();
+            stream_lease_      = residency_->lend(ring + wide_frames + (walk ? walk_frames : 0U), device_.stream, writers);
+            stream_ring_bytes_ = static_cast<std::size_t>(ring) * stride;
+            stream_wide_bytes_ = static_cast<std::size_t>(wide_frames) * stride;
+            stream_walk_bytes_ = walk ? static_cast<std::size_t>(walk_frames) * stride : 0;
+            stream_at_lease_   = expert_stream_->stats();
         }
         return true;
     }
 
+    // The ring's part of the stream lease.
+    DeviceSpan ring_span() const noexcept { return DeviceSpan{stream_lease_.memory.data, stream_ring_bytes_}; }
+    // The walk's area: after the ring and the wide arena.
+    std::byte* walk_area() const noexcept {
+        return static_cast<std::byte*>(stream_lease_.memory.data) + stream_ring_bytes_ + stream_wide_bytes_;
+    }
+
+    // ---- the wide workspace (design §19.3.7, VRAM item 1) ----
+    // A call wider than the static arena's columns runs in the wide arena: the stream lease's part
+    // when it has one, else frames lent for it alone, else (no lendable frames: the VRAM monitor
+    // shrank the cache, or there are no frames) a temporary device allocation, with a warning. The
+    // Forward keeps its arena reference; the arenas' contents are swapped for the call.
+    class WideWork {
+    public:
+        WideWork(ProgramImpl& program, std::int32_t columns) : program_(program) {
+            if (columns > program.plan_.static_columns && program.wide_work_ > 0) {
+                program.enter_wide();
+                active_ = true;
+            }
+        }
+        ~WideWork() {
+            if (active_) { program_.leave_wide(); }
+        }
+        WideWork(const WideWork&)            = delete;
+        WideWork& operator=(const WideWork&) = delete;
+
+    private:
+        ProgramImpl& program_;
+        bool active_ = false;
+    };
+
+    void enter_wide() {
+        DeviceSpan span{};
+        if (stream_lease_.valid() && stream_wide_bytes_ >= wide_work_) {
+            span = {static_cast<std::byte*>(stream_lease_.memory.data) + stream_ring_bytes_, wide_work_};
+        } else {
+            if (!work_lease_.valid() && wide_fallback_.p == nullptr) {
+                const std::uint64_t stride = residency_->frame_stride();
+                const auto frames          = static_cast<std::uint32_t>((wide_work_ + stride - 1) / stride);
+                if (residency_->frames() > 0 && frames < residency_->lendable()) {
+                    const cudaStream_t writers[] = {device_.stream};
+                    work_lease_ = residency_->lend(frames, device_.stream, writers);
+                } else {
+                    diagnostic("the prefill workspace could not be lent from the expert cache; " +
+                                   std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt",
+                               DiagnosticLevel::Warning);
+                    wide_fallback_ = DeviceBuffer(wide_work_);
+                }
+            }
+            span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, wide_work_}
+                                       : DeviceSpan{wide_fallback_.p, wide_work_};
+        }
+        wide_arena_ = std::make_unique<WorkspaceArena>(span);
+        std::swap(*work_, *wide_arena_);
+    }
+
+    void leave_wide() noexcept { std::swap(*work_, *wide_arena_); }
+
+    // After a prompt's last wide call is enqueued: the wide arena's own lease or allocation goes back
+    // (the stream lease's part goes back with it).
+    void return_wide_work() {
+        if (work_lease_.valid()) { residency_->give_back(work_lease_, device_.stream); }
+        work_lease_ = {};
+        if (wide_fallback_.p != nullptr) {
+            device_.synchronize();
+            wide_fallback_ = DeviceBuffer{};
+        }
+    }
+
     // Returns the ring (after the last streamed chunk is enqueued: compute waited for every copy).
     void return_stream_lease() {
-        if (!stream_lease_.valid()) { return; }
+        if (!stream_lease_.valid() || walk_.active) { return; }
         const auto frames = stream_lease_.count;
         residency_->give_back(stream_lease_, device_.stream);
         stream_lease_         = {};
+        stream_ring_bytes_    = 0;
+        stream_wide_bytes_    = 0;
+        stream_walk_bytes_    = 0;
         const auto& now       = expert_stream_->stats();
         const auto streamed   = now.streamed - stream_at_lease_.streamed;
         const auto copies     = now.copies - stream_at_lease_.copies;
@@ -2092,9 +2301,28 @@ private:
 
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
-                      const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr) {
+                      const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
+                      bool streamed = false) {
+        execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
+        fb.ngram_gate    = gate;
+        fb.verify        = verify;
+        fb.mtp_chunk     = chunk;
+        fb.layer_waits   = next_waits_;
+        next_waits_      = {};
+        fb.vision        = vision;
+        fb.stream        = streamed;
+        // Decode and verification rounds export their final residuals for the MTP catch-up.
         const std::int32_t cols = batch * width;
-        auto* base = static_cast<std::byte*>(io_device_.p);
+        if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
+        Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
+        forward_->run(fb, logits);
+    }
+
+    // A call's inputs as the Forward reads them from a staged io image at `base` (the io, or one
+    // chunk's copy in a layer walk's area).
+    execution::ForwardBatch io_batch(std::byte* base, std::int32_t batch, std::int32_t width,
+                                     std::int32_t logit_columns) const {
+        const std::int32_t cols = batch * width;
         execution::ForwardBatch fb;
         fb.ids           = Tensor(base + io_layout_.ids, DType::I32, {cols});
         fb.positions     = Tensor(base + io_layout_.positions, DType::I32, {cols});
@@ -2105,20 +2333,11 @@ private:
         fb.logit_columns = Tensor(base + io_layout_.columns, DType::I32, {logit_columns});
         fb.ngram_rows    = Tensor(base + io_layout_.ngram, DType::U8,
                                   {dim(c_.ple.table.row_bytes), dim(hash_.heads()), cols});
-        fb.ngram_gate    = gate;
         fb.host_slots      = std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(batch));
         fb.host_table_rows = fb.host_slots;
         fb.batch           = batch;
         fb.width           = width;
-        fb.verify          = verify;
-        fb.mtp_chunk       = chunk;
-        fb.layer_waits     = next_waits_;
-        next_waits_        = {};
-        fb.vision          = vision;
-        // Decode and verification rounds export their final residuals for the MTP catch-up.
-        if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
-        Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
-        forward_->run(fb, logits);
+        return fb;
     }
 
     // ---------------------------------------------------------------- speculative verification
@@ -2736,6 +2955,116 @@ private:
     }
 
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
+    // ---- elastic KV (design §19.3.11) ----
+    static constexpr std::size_t kKvChunkBytes   = 2ULL << 20;
+    static constexpr std::uint32_t kKvBaseTokens = 32768; // backed at startup
+    static constexpr std::uint32_t kKvGrowPages  = 64;    // growth unit (4,096 tokens)
+    static constexpr std::chrono::seconds kKvIdleShrink{60};
+    // The last admission, release or idle shrink (steady-clock ticks), and whether the pool backs more
+    // than its base: the monitor thread reads both to wake an idle engine for the shrink.
+    std::atomic<std::int64_t> kv_busy_at_{0};
+    std::atomic<bool> kv_grown_{false};
+    void kv_busy() noexcept { kv_busy_at_.store(std::chrono::steady_clock::now().time_since_epoch().count()); }
+    bool kv_idle_due() const noexcept {
+        return kv_grown_.load() && std::chrono::steady_clock::now().time_since_epoch().count() - kv_busy_at_.load() >=
+                                       std::chrono::duration_cast<std::chrono::steady_clock::duration>(kKvIdleShrink).count();
+    }
+    std::unique_ptr<VmmRange> kv_vmm_;
+    DeviceSpan kv_span_{};
+
+    // Maps (and zeroes) the chunks pages [0, pages) need; false when the device has no memory.
+    bool map_kv(std::uint32_t pages) {
+        const auto need = kv_chunks(plan_, pages);
+        for (std::size_t c = 0; c < need.size(); ++c) {
+            if (!need[c] || kv_vmm_->mapped(c)) { continue; }
+            if (!kv_vmm_->map(c)) { return false; }
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(kv_vmm_->base()) + c * kKvChunkBytes, 0, kKvChunkBytes,
+                                       device_.stream));
+        }
+        return true;
+    }
+
+    // Raises the pool's backed pages so `need` pages are available, taking the memory from the expert
+    // frames (never below three quarters of them). False when it cannot: a lease holds the frames, or
+    // the pool is at its capacity.
+    bool grow_kv(std::uint32_t need) {
+        if (!kv_vmm_ || pool_->available_pages() >= need) { return pool_->available_pages() >= need; }
+        const std::uint32_t backed = pool_->backed_pages();
+        std::uint32_t target       = backed + (need - pool_->available_pages());
+        target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
+        if (target - backed < need - pool_->available_pages()) { return false; }
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
+        const std::uint64_t stride = residency_->frame_stride();
+        const std::uint32_t frames = residency_->frames();
+        // Memory the sizing function would give the frames anyway comes first; the rest is taken from
+        // the frames, one frame chunk over so the pool unmaps at least that much.
+        const std::uint32_t spare =
+            control_ ? std::max<std::uint32_t>(control_->target(vram_->query(), pool_now_), frames) - frames : 0;
+        const std::uint64_t spare_bytes = static_cast<std::uint64_t>(spare) * stride;
+        std::uint32_t give              = 0;
+        if (added > spare_bytes) {
+            give = static_cast<std::uint32_t>((added - spare_bytes + ExpertResidency::kChunkBytes + stride - 1) / stride);
+        }
+        if (give > frames / 4) { return false; } // grow by at most a quarter of the cache at once
+        device_.synchronize();
+        if (give != 0) {
+            const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
+            if (resized.frames > frames - give) { return false; } // a lease holds the frames
+        }
+        if (!map_kv(target)) {
+            if (give != 0) { (void)residency_->resize(frames, device_.stream, *vram_); }
+            return false;
+        }
+        pool_->set_backed_pages(target);
+        kv_grown_.store(true);
+        if (control_) { control_->account_fixed(static_cast<std::int64_t>(added)); }
+        frames_now_ = residency_->frames();
+        pool_now_   = residency_->pool_bytes();
+        diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
+                   std::to_string(kv_vmm_->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
+                   " -> " + std::to_string(residency_->frames()) + " frames");
+        return true;
+    }
+
+    // Lowers the pool's backed pages to the free top (not below the base), and returns the memory to the
+    // expert frames. Between rounds: nothing reads free pages. `evict` (every lane free for
+    // kKvIdleShrink): the cache's idle device blocks that have host copies are released first, in
+    // the index's order (nothing is lost: a later match restores them from the Host tier), so a long
+    // conversation that has ended gives its memory back to the frames. The delay keeps a follow-up
+    // turn from paying a restore and an expert reload for memory the idle gap never used.
+    void shrink_kv(bool evict = false) {
+        if (!kv_vmm_ || pool_->backed_pages() <= plan_.kv_base_pages) { return; }
+        if (evict && prefix_) {
+            runtime::prefix_cache::PrefixCacheIndex& index = prefix_->index();
+            for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
+                 budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
+        }
+        std::uint32_t target = pool_->backed_pages();
+        while (target > plan_.kv_base_pages && pool_->can_back(target - std::min(target, kKvGrowPages))) {
+            target -= std::min(target, kKvGrowPages);
+        }
+        target = std::max(target, plan_.kv_base_pages);
+        if (target == pool_->backed_pages()) { return; }
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        device_.synchronize();
+        const std::size_t before = kv_vmm_->mapped_bytes();
+        pool_->set_backed_pages(target);
+        const auto need = kv_chunks(plan_, target);
+        for (std::size_t c = 0; c < need.size(); ++c) {
+            if (!need[c] && kv_vmm_->mapped(c)) { kv_vmm_->unmap(c); }
+        }
+        kv_grown_.store(target > plan_.kv_base_pages);
+        const std::size_t freed   = before - kv_vmm_->mapped_bytes();
+        const std::uint64_t stride = residency_->frame_stride();
+        const std::uint32_t frames = residency_->frames();
+        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
+        if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
+        frames_now_ = residency_->frames();
+        pool_now_   = residency_->pool_bytes();
+        diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
+                   " -> " + std::to_string(residency_->frames()) + " frames");
+    }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
     PinnedHostBuffer io_host_{1}, host_sampled_{1}, host_configs_{1};
     IoLayout io_layout_;
@@ -2748,7 +3077,47 @@ private:
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
     ExpertResidency::FrameLease stream_lease_;
+    // The stream lease: the ring, the wide arena, then a walk area.
+    std::size_t stream_ring_bytes_ = 0, stream_wide_bytes_ = 0, stream_walk_bytes_ = 0;
+    std::size_t wide_work_ = 0;              // the plan's wide arena bytes (0: none)
+    ExpertResidency::FrameLease work_lease_; // the wide arena lent alone (no stream lease)
+    DeviceBuffer wide_fallback_;             // the wide arena when nothing could be lent
+    std::unique_ptr<WorkspaceArena> wide_arena_; // the arena swapped with *work_ around a wide call
     execution::ExpertStream::Stats stream_at_lease_;
+
+    // ---------------------------------------------------------------- layer walk (prefill_walk.cpp)
+    // Design §19.3.8 F4: a span of consecutive streamed calls of one prompt runs layer-major (every
+    // decoder layer over all of the span's chunks, then the next), so each layer's non-resident
+    // experts are streamed once per span instead of once per call. The chunk grid, and with it
+    // every output bit, is the chunk-major one. The span's residual stream [S*H, tokens] and each
+    // chunk's staged io image live in the stream lease after the ring.
+    struct LayerWalk {
+        bool active = false;
+        std::uint32_t lane = 0;
+        std::size_t first_call = 0, end_call = 0;
+        std::vector<std::int32_t> begins, widths, offsets; // per chunk: position, width, residual column
+        std::uint32_t next_layer      = 0;                // the next decoder layer to enqueue
+        std::uint32_t layers_per_step = 1;
+        std::size_t io_stride = 0, residual_bytes = 0;
+        std::int32_t host_slot = 0; // the lane's state slot as the Forward reads it on the host
+        std::array<std::span<const cudaEvent_t>, 2> waits{}; // the span's per-layer waits (chunk 0)
+        std::vector<std::optional<execution::MtpChunk>> mtp;
+        std::vector<std::optional<execution::VisionInput>> vision;
+        std::vector<std::vector<execution::VisionInput>> mtp_vision;
+        std::uint64_t steps = 0;
+    } walk_;
+    PinnedHostBuffer walk_host_{1}; // every chunk's io image, uploaded once per span
+    std::uint64_t walk_spans_ = 0, walk_calls_ = 0;
+    static constexpr std::uint32_t kWalkMaxTokens = 65536;
+
+    [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
+    std::size_t walk_span_end(const Lane& lane, std::uint32_t index);
+    void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
+    PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
+    void walk_pass(std::size_t chunk, std::uint32_t layer);
+    void walk_enqueue(std::uint32_t to_layer);
+    void walk_abandon() noexcept;
+    [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call) const;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
     // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.

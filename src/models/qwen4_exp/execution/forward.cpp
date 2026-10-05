@@ -22,6 +22,7 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
+#include <vector>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -109,106 +110,125 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     return bytes;
 }
 
-void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
+void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
     const std::int32_t T = batch.ids.ne[0];
     if (batch.verify != nullptr && (batch.width < 2 || batch.verify->gdn.spec.width != batch.width ||
                                     batch.verify->gdn.spec.record_capacity < batch.batch)) {
         throw std::invalid_argument("Qwen4Exp forward: verification records do not match the call");
     }
     if (batch.batch <= 0 || batch.width <= 0 || batch.batch * batch.width != T ||
-        logits.dtype != DType::FP32 || logits.ne[1] != batch.logit_columns.ne[0] ||
-        logits.ne[0] != dim(config_.vocab_size)) {
+        (logits != nullptr && (logits->dtype != DType::FP32 || logits->ne[1] != batch.logit_columns.ne[0] ||
+                               logits->ne[0] != dim(config_.vocab_size)))) {
         throw std::invalid_argument("Qwen4Exp forward: batch geometry is invalid");
     }
     if (batch.rope_positions.ne[0] != T || batch.rope_positions.ne[1] != 3 ||
         batch.block_start_rope.ne[0] != batch.batch || batch.block_start_rope.ne[1] != 3) {
         throw std::invalid_argument("Qwen4Exp forward: RoPE positions must be [T, 3] and block starts [batch, 3]");
     }
-    const cudaStream_t s = device_.stream;
-    const std::int32_t H = dim(config_.hidden_size), W = dim(config_.residual_width());
-    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
-    eager_chunk_ = batch.verify == nullptr && batch.width > 1;
-    work_.reset();
-    Tensor x0 = work_.alloc(DType::BF16, {H, T});
-    ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
-    if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
-        ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
-    }
-    Tensor residual = work_.alloc(DType::BF16, {W, T});
-    ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
-
-    const auto wait_layer = [&](std::size_t entry) {
-        for (const auto& events : batch.layer_waits) {
-            if (!events.empty()) { CUDA_CHECK(cudaStreamWaitEvent(s, events[entry], 0)); }
-        }
-    };
     for (const auto& events : batch.layer_waits) {
         if (!events.empty() && events.size() != config_.num_hidden_layers + 1U) {
             throw std::invalid_argument("Qwen4Exp forward: layer waits do not match the layers");
         }
     }
-    for (std::uint32_t layer = 0; layer < config_.num_hidden_layers; ++layer) {
-        const auto& block = parameters_.layers[layer];
-        wait_layer(layer);
-        try {
-            auto scope = work_.scope();
-            if (block.ple) { ple(*block.ple, residual, batch); }
-            Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
-            Tensor xa     = mix(block.attn_hc, residual, &inject);
-            const std::uint32_t compact = config_.compact_layer_indices[layer];
-            Tensor y;
-            if (config_.layer_types[layer] == MixerKind::Gdn) {
-                y = gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
-            } else {
-                // A verification call records the raw index keys for the tail commit.
-                const AttentionCall call{
-                    .layer        = kv_.layers.at(compact),
-                    .tails        = state_.qsa_tails.at(compact),
-                    .key_records  = batch.verify != nullptr
-                                        ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
-                                              .view({dim(config_.qsa.index_head_dim), T})
-                                        : Tensor{},
-                    .update_tails     = batch.verify == nullptr,
-                    .positions        = batch.positions,
-                    .rope_positions   = batch.rope_positions,
-                    .block_start_rope = batch.block_start_rope,
-                    .slots            = batch.slots,
-                    .table_rows   = batch.table_rows,
-                    .batch        = batch.batch,
-                    .width        = batch.width};
-                y = attention(std::get<AttentionParameters>(block.mixer), xa, call);
-            }
-            ops::hyper_connection_inject(y, inject, residual, s);
-            Tensor xm = mix(block.mlp_hc, residual, &inject);
-            Tensor ym = moe(block.moe, xm, layer,
-                            tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr);
-            ops::hyper_connection_inject(ym, inject, residual, s);
-            if (tap != nullptr) {
-                const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
-                    {tap->mixer_inputs, &xa}, {tap->mixer_outputs, &y}, {tap->moe_inputs, &xm}, {tap->moe_outputs, &ym}};
-                for (const auto& [targets, source] : copies) {
-                    if (targets != nullptr &&
-                        cudaMemcpyAsync(targets->at(layer).data, source->data, source->bytes(),
-                                        cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
-                        throw std::runtime_error("Qwen4Exp forward: block tap copy failed");
-                    }
+    // Prefill chunks and forced tokens run eagerly; decode and verification rounds may be captured.
+    eager_chunk_ = batch.verify == nullptr && batch.width > 1;
+    work_.reset();
+}
+
+void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
+    for (const auto& events : batch.layer_waits) {
+        if (!events.empty()) { CUDA_CHECK(cudaStreamWaitEvent(device_.stream, events[entry], 0)); }
+    }
+}
+
+void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap) {
+    begin_call(batch, &logits);
+    Tensor residual = work_.alloc(DType::BF16, {dim(config_.residual_width()), batch.ids.ne[0]});
+    embed(batch, residual);
+    for (std::uint32_t l = 0; l < config_.num_hidden_layers; ++l) { layer(l, batch, residual, tap); }
+    finish(batch, residual, &logits);
+}
+
+void Forward::embed(const ForwardBatch& batch, Tensor& residual) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size);
+    auto scope = work_.scope();
+    Tensor x0  = work_.alloc(DType::BF16, {H, T});
+    ops::embedding(batch.ids, parameters_.token_embedding, x0, s);
+    if (batch.vision != nullptr && batch.vision->columns.data != nullptr) {
+        ops::scatter(batch.vision->embeddings, batch.vision->columns, x0, s);
+    }
+    ops::hyper_connection_expand(x0, dim(config_.hc.streams), residual, s);
+}
+
+void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& residual, const ForwardTap* tap) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0];
+    const auto& block    = parameters_.layers[layer];
+    wait_layer(batch, layer);
+    try {
+        auto scope = work_.scope();
+        if (block.ple) { ple(*block.ple, residual, batch); }
+        Tensor inject = work_.alloc(DType::FP32, {dim(config_.hc.streams), T});
+        Tensor xa     = mix(block.attn_hc, residual, &inject);
+        const std::uint32_t compact = config_.compact_layer_indices[layer];
+        Tensor y;
+        if (config_.layer_types[layer] == MixerKind::Gdn) {
+            y = gdn(std::get<GdnParameters>(block.mixer), xa, compact, batch);
+        } else {
+            // A verification call records the raw index keys for the tail commit.
+            const AttentionCall call{
+                .layer        = kv_.layers.at(compact),
+                .tails        = state_.qsa_tails.at(compact),
+                .key_records  = batch.verify != nullptr
+                                    ? batch.verify->qsa_keys.slice(3, static_cast<std::int32_t>(compact), 1)
+                                          .view({dim(config_.qsa.index_head_dim), T})
+                                    : Tensor{},
+                .update_tails     = batch.verify == nullptr,
+                .positions        = batch.positions,
+                .rope_positions   = batch.rope_positions,
+                .block_start_rope = batch.block_start_rope,
+                .slots            = batch.slots,
+                .table_rows   = batch.table_rows,
+                .batch        = batch.batch,
+                .width        = batch.width};
+            y = attention(std::get<AttentionParameters>(block.mixer), xa, call);
+        }
+        ops::hyper_connection_inject(y, inject, residual, s);
+        Tensor xm = mix(block.mlp_hc, residual, &inject);
+        Tensor ym = moe(block.moe, xm, layer,
+                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch);
+        ops::hyper_connection_inject(ym, inject, residual, s);
+        if (tap != nullptr) {
+            const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
+                {tap->mixer_inputs, &xa}, {tap->mixer_outputs, &y}, {tap->moe_inputs, &xm}, {tap->moe_outputs, &ym}};
+            for (const auto& [targets, source] : copies) {
+                if (targets != nullptr &&
+                    cudaMemcpyAsync(targets->at(layer).data, source->data, source->bytes(),
+                                    cudaMemcpyDeviceToDevice, s) != cudaSuccess) {
+                    throw std::runtime_error("Qwen4Exp forward: block tap copy failed");
                 }
             }
-        } catch (const std::exception& error) {
-            throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
         }
-        if (tap != nullptr && tap->residuals != nullptr) {
-            Tensor& copy = tap->residuals->at(layer);
-            if (cudaMemcpyAsync(copy.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s) !=
-                cudaSuccess) {
-                throw std::runtime_error("Qwen4Exp forward: residual tap copy failed");
-            }
+    } catch (const std::exception& error) {
+        throw std::runtime_error("qwen4_exp/layers/" + std::to_string(layer) + ": " + error.what());
+    }
+    if (tap != nullptr && tap->residuals != nullptr) {
+        Tensor& copy = tap->residuals->at(layer);
+        if (cudaMemcpyAsync(copy.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s) !=
+            cudaSuccess) {
+            throw std::runtime_error("Qwen4Exp forward: residual tap copy failed");
         }
     }
+}
+
+void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits) {
+    const cudaStream_t s = device_.stream;
+    const std::int32_t T = batch.ids.ne[0], H = dim(config_.hidden_size), W = dim(config_.residual_width());
     if (batch.residual_out.data != nullptr) {
         CUDA_CHECK(cudaMemcpyAsync(batch.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
     }
-    wait_layer(config_.num_hidden_layers);
+    wait_layer(batch, config_.num_hidden_layers);
     if (batch.mtp_chunk != nullptr) {
         // The chunk's MTP cells from its live residuals, then its last residual becomes pending.
         const MtpChunk& chunk = *batch.mtp_chunk;
@@ -257,14 +277,16 @@ void Forward::run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* t
         CUDA_CHECK(cudaMemcpyAsync(chunk.saved.data, static_cast<const std::byte*>(residual.data) + column * (T - 1),
                                    column, cudaMemcpyDeviceToDevice, s));
     }
+    if (logits == nullptr) { return; }
+    auto scope    = work_.scope();
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
-    Tensor last = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
+    Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
     if (parameters_.output_head_q8) {
-        ops::projection_fp32(last, parameters_.output_head_q8->weight, logits, s);
+        ops::projection_fp32(last, parameters_.output_head_q8->weight, *logits, s);
     } else {
         const Tensor* head[] = {&parameters_.output_head};
-        ops::projection_fp32(last, head, logits, s);
+        ops::projection_fp32(last, head, *logits, s);
     }
 }
 
@@ -463,7 +485,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     return y;
 }
 
-Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap) {
+Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
+                    const ForwardBatch* batch) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -534,8 +557,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
-    ExpertStream* const streaming =
-        eager_chunk_ && experts_.stream != nullptr && experts_.stream->active() ? experts_.stream : nullptr;
+    ExpertStream* const streaming = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
+                                            experts_.stream->active()
+                                        ? experts_.stream
+                                        : nullptr;
     if (streaming != nullptr) {
         streaming->before_experts(layer, s);
         source.prefetched    = streaming->slots(layer);
@@ -549,7 +574,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T));
     // The shared expert runs while the host computes the CPU-served misses.
     ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
-    if (streaming != nullptr) { streaming->after_experts(layer, s); }
+    if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
 
     const std::int32_t I = dim(m.shared_intermediate);
     Tensor product = work_.alloc(DType::BF16, {I, T});

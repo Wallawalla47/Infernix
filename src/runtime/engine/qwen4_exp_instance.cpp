@@ -38,11 +38,17 @@ unsigned long long mib(std::uint64_t bytes) { return static_cast<unsigned long l
 
 // The fixed device allocations, largest first in the order a user can act on them.
 std::string device_contributors(std::uint64_t dense, const models::qwen4_exp::ProgramDevicePlan& plan) {
-    char text[256];
+    char kv[64];
+    if (plan.kv_max > plan.kv) {
+        std::snprintf(kv, sizeof(kv), "%llu (grows to %llu from the expert cache)", mib(plan.kv), mib(plan.kv_max));
+    } else {
+        std::snprintf(kv, sizeof(kv), "%llu", mib(plan.kv));
+    }
+    char text[320];
     std::snprintf(text, sizeof(text),
-                  "dense weights %llu MiB, KV %llu, workspace %llu, expert staging %llu, state and io %llu, expert "
+                  "dense weights %llu MiB, KV %s, workspace %llu, expert staging %llu, state and io %llu, expert "
                   "tables %llu",
-                  mib(dense), mib(plan.kv), mib(plan.workspace), mib(plan.staging), mib(plan.state + plan.io),
+                  mib(dense), kv, mib(plan.workspace), mib(plan.staging), mib(plan.state + plan.io),
                   mib(plan.residency));
     return text;
 }
@@ -185,6 +191,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.route_trace   = models::qwen4_exp::testing::route_trace();
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
+    program_options.vram_past_budget = options.vram_past_budget;
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom
@@ -192,7 +199,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
-    auto vram                 = open_vram_budget_source(device.device);
+    auto vram                 = open_vram_budget_source(device.device, options.vram_past_budget);
     const VramSnapshot before = vram->query();
     models::qwen4_exp::VramDemand vram_demand;
     vram_demand.headroom    = options.vram_headroom_bytes;
@@ -243,11 +250,15 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         const char* display = before.display == DisplayState::Headless   ? "no display"
                               : before.display == DisplayState::Attached ? "display attached"
                                                                          : "display unknown";
-        char line[640];
+        // --vram-past-budget: the allowance already counted as free.
+        const std::string past = before.budget_allowance == 0
+                                     ? std::string()
+                                     : " (" + std::to_string(mib(before.budget_allowance)) + " MiB past the OS budget)";
+        char line[704];
         std::snprintf(line, sizeof(line),
-                      "VRAM ledger: %llu MiB card, %s, %llu in use before loading; %s; reserve %llu (%u graphs); "
+                      "VRAM ledger: %llu MiB card, %s, %llu in use before loading%s; %s; reserve %llu (%u graphs); "
                       "headroom %llu (%s); expert frames %u (%.2f GiB); %llu free after startup",
-                      mib(before.device_total), display, mib(before.device_total - before.device_free),
+                      mib(before.device_total), display, mib(before.device_total - before.device_free), past.c_str(),
                       device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
                       mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
                       static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));

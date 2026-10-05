@@ -252,7 +252,8 @@ struct AbortResult {
 // constructor allocates exactly these sizes.
 struct ProgramDevicePlan {
     std::uint32_t kv_pages = 0;
-    std::uint64_t kv        = 0; // KV pages and execution tables
+    std::uint64_t kv        = 0; // KV pages and execution tables (an elastic pool: its base, mapped at startup)
+    std::uint64_t kv_max    = 0; // the KV at --max-context; above `kv`, an elastic pool takes it from the frames
     std::uint64_t workspace = 0; // the forward, sampling, acceptance and MTP workspace arena
     std::uint64_t staging   = 0; // the expert miss staging slots
     std::uint64_t state     = 0; // GDN, PLE and QSA tail state, verification records, MTP columns
@@ -297,6 +298,7 @@ struct ProgramOptions {
     // Device memory left free for the display and other programs once the fixed allocations and
     // the expert frames are made (design §19.3.7); empty selects it from the display state.
     std::optional<std::uint64_t> vram_headroom;
+    bool vram_past_budget = false; // EngineOptions::vram_past_budget
     bool expert_cache = true;
     // Speculative decoding with n-gram copy proposals (design section 11.3): at most this many
     // draft tokens per round (0 disables, at most 15), proposed only from a match of at least

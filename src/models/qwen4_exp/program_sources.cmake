@@ -17,6 +17,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/rope_positions.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_program.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefill_walk.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_window.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vram_monitor.cpp"

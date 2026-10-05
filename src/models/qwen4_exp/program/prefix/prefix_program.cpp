@@ -151,7 +151,8 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             if (view.tail_device_copy == pc::CopyState::Resident && view.pins == 0) { ++evictable_on_path; }
         }
         s.need                     = (E - s.shared) + host_only;
-        const std::uint64_t room   = static_cast<std::uint64_t>(pool_->available_pages()) + index.device_evictable_blocks();
+        const std::uint64_t room   = static_cast<std::uint64_t>(pool_->available_pages()) + index.device_evictable_blocks() +
+                                   kv_grow_pages();
         return static_cast<std::uint64_t>(s.need) + evictable_on_path <= room;
     };
     std::uint32_t cached_tokens = 0; // the prompt prefix held as cached blocks
@@ -492,6 +493,21 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     if (due && B >= lane.prefix.deepest + kBlock) {
         prefix_capture(lane, index, pc::SnapshotKind::Tap, false);
     }
+}
+
+// Whether prefix_after_prefill_call after the call that ends at calls[next_call - 1] would realize a
+// tap (the layer walk ends its span there: the capture needs that boundary's state in every layer).
+bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const {
+    if (!prefix_ || !lane.prefix.reuse || lane.prefix.taps.empty() || next_call == 0 ||
+        next_call >= lane.calls.size()) {
+        return false;
+    }
+    const std::uint32_t B = lane.calls[next_call - 1];
+    if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return false; }
+    const bool final_next = next_call + 1U == lane.calls.size();
+    return std::any_of(lane.prefix.taps.begin(), lane.prefix.taps.end(), [&](const pc::PlannedTap& tap) {
+        return tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
+    });
 }
 
 // Finish or a consistent abort: the M3 flush, the remaining blocks, the endpoint and write-through.
