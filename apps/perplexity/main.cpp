@@ -78,7 +78,7 @@ std::string usage_text() {
            "        FP16 for NVFP4, K8V4 and VQ2, which default to 8-bit; see ninfer-serve)\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
-           "        measuring activation quantization; about 3x slower on NVFP4 artifacts)\n"
+           "        measuring activation quantization; at least 3x slower on NVFP4 artifacts)\n"
            "       [--output <directory>]\n"
            "       [--save-top-tokens <file>] (record each position's 32 most probable tokens)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
