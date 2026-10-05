@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -23,7 +25,7 @@ T read_le(const std::byte* p) {
 } // namespace
 
 NgramVolume::NgramVolume(const std::filesystem::path& path, const NgramTableConfig& table)
-    : file_(path), table_(table), tags_(std::size_t{1} << kCacheBits, 0xFFFFFFFFU),
+    : file_(path, FileMapping::None), table_(table), tags_(std::size_t{1} << kCacheBits, 0xFFFFFFFFU),
       cache_((std::size_t{1} << kCacheBits) * table.row_bytes) {
     if (table.block_bytes < 4096 || table.block_bytes % 4096 != 0 || table.header_bytes % 4096 != 0) {
         throw std::runtime_error(path.string() + ": n-gram blocks and header must be whole 4 KiB pages");
@@ -82,6 +84,51 @@ void NgramVolume::read_rows(std::span<const std::uint32_t> rows, std::span<std::
         }
     }
     first_miss_.push_back(misses_.size());
+    const std::size_t blocks = offsets_.size();
+    if (blocks >= kParallelBlocks) {
+        // Each thread reads a contiguous range of the blocks into its own ring and copies their rows
+        // to `out` (distinct indices); the cache is filled afterwards on this thread, from `out`.
+        const std::size_t ring_bytes = kParallelInFlight * table_.block_bytes;
+        if (parallel_ring_ == nullptr) {
+            parallel_storage_.assign(kReadThreads * ring_bytes + 4096, std::byte{0});
+            const auto base = reinterpret_cast<std::uintptr_t>(parallel_storage_.data());
+            parallel_ring_  = parallel_storage_.data() + ((4096 - base % 4096) % 4096);
+        }
+        std::vector<std::exception_ptr> errors(kReadThreads);
+        std::vector<std::thread> threads;
+        threads.reserve(kReadThreads);
+        for (std::size_t t = 0; t < kReadThreads; ++t) {
+            const std::size_t lo = blocks * t / kReadThreads, hi = blocks * (t + 1) / kReadThreads;
+            threads.emplace_back([&, t, lo, hi] {
+                try {
+                    file_.read_direct_blocks(
+                        std::span<const std::uint64_t>(offsets_.data() + lo, hi - lo), table_.block_bytes,
+                        std::span<std::byte>(parallel_ring_ + t * ring_bytes, ring_bytes),
+                        [&](std::size_t b, std::span<const std::byte> block) {
+                            for (std::size_t m = first_miss_[lo + b]; m < first_miss_[lo + b + 1]; ++m) {
+                                const auto i = static_cast<std::size_t>(misses_[m] & 0xFFFFFFFFULL);
+                                std::memcpy(out.data() + i * row_bytes,
+                                            block.data() + (rows[i] % table_.rows_per_block) * row_bytes, row_bytes);
+                            }
+                        });
+                } catch (...) { errors[t] = std::current_exception(); }
+            });
+        }
+        for (auto& thread : threads) { thread.join(); }
+        for (const auto& error : errors) {
+            if (error) { std::rethrow_exception(error); }
+        }
+        for (const std::uint64_t miss : misses_) {
+            const auto i           = static_cast<std::size_t>(miss & 0xFFFFFFFFULL);
+            const std::size_t slot = slot_of(rows[i]);
+            tags_[slot]            = rows[i];
+            std::memcpy(cache_.data() + slot * row_bytes, out.data() + i * row_bytes, row_bytes);
+        }
+        counters_.reads += blocks;
+        counters_.read_ns += static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        return;
+    }
     file_.read_direct_blocks(
         offsets_, table_.block_bytes, std::span<std::byte>(ring_, kInFlight * table_.block_bytes),
         [&](std::size_t b, std::span<const std::byte> block) {

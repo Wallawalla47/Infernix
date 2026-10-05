@@ -2,7 +2,8 @@
 // closed-form row contents f(r, k), never the volume: random rows, duplicates and rows sharing a block
 // read each distinct block once (counters), more than 64 distinct blocks wrap the ring, a second
 // call hits the host cache, two rows of one cache slot both return their own bytes, a row past the
-// table throws, and a volume of the wrong size is refused at open.
+// table throws, and a volume of the wrong size is refused at open. A call of thousands of distinct
+// blocks (a prefill chunk) takes the multi-threaded route: the same oracle, counters and cache.
 
 #include "models/qwen4_exp/program/ngram_volume.h"
 
@@ -154,6 +155,24 @@ int main() {
         const std::vector<std::uint32_t> pair{a, b, a, b};
         check(rows_match(pair, read(volume, pair)), "rows sharing a cache slot return their own bytes");
         check(rows_match(pair, read(volume, pair)), "and again after evicting each other");
+
+        // A prefill-sized call (thousands of distinct blocks, duplicates and cache-slot collisions):
+        // the multi-threaded route, then every row from the cache.
+        std::vector<std::uint32_t> large(20000);
+        for (auto& r : large) { r = static_cast<std::uint32_t>(rng() % kRows); }
+        for (std::size_t i = 0; i < 2000; ++i) { large[rng() % large.size()] = large[rng() % large.size()]; }
+        const std::uint64_t large_blocks = [&] {
+            std::set<std::uint32_t> missing;
+            for (const auto r : large) {
+                if (!volume.cached(std::vector<std::uint32_t>{r})) { missing.insert(r / kRowsPerBlock); }
+            }
+            return static_cast<std::uint64_t>(missing.size());
+        }();
+        check(large_blocks >= 4000, "the large call has thousands of uncached blocks");
+        before = volume.counters();
+        check(rows_match(large, read(volume, large)), "a prefill-sized call equals the oracle");
+        check(volume.counters().reads - before.reads == large_blocks, "one read per distinct uncached block");
+        check(rows_match(large, read(volume, large)), "the large call's rows again equal the oracle");
 
         bool threw = false;
         try {
