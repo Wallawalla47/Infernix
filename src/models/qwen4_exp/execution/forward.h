@@ -10,6 +10,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
@@ -67,6 +68,9 @@ struct ForwardExperts {
     const std::int32_t* landing = nullptr;
     std::int32_t* landed        = nullptr;
     std::int32_t landing_slots  = 0;
+    // Prefill chunks read the experts this stream copied ahead while it is active (design §19.3.8
+    // F2; owned by the Program, which starts it per chunk).
+    ExpertStream* stream = nullptr;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It

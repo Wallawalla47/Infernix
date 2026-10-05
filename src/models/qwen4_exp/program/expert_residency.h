@@ -114,6 +114,11 @@ public:
     [[nodiscard]] const std::uint8_t* frame_base() const noexcept;
     [[nodiscard]] std::uint64_t frame_stride() const noexcept { return stride_; }
     [[nodiscard]] const std::int32_t* table(std::uint32_t layer) const noexcept;
+    // The host copy of every layer's table (I32 [layers][experts]), equal to the device tables
+    // once before_round has uploaded them.
+    [[nodiscard]] const std::int32_t* host_table() const noexcept {
+        return static_cast<const std::int32_t*>(table_host_.data());
+    }
     [[nodiscard]] std::int32_t* route_log() noexcept { return static_cast<std::int32_t*>(route_device_.p); }
     [[nodiscard]] std::size_t route_stride() const noexcept { return route_stride_; }
     // The last downloaded route log (valid once its round has completed), as after_round reads it.

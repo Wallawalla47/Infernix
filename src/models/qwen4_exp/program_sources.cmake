@@ -11,6 +11,7 @@ target_sources(ninfer_model_loading PRIVATE
 target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/execution/parameters.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/execution/forward.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/execution/expert_stream.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/ngram_volume.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/expert_residency.cpp"

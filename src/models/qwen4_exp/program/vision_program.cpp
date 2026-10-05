@@ -84,6 +84,7 @@ void ProgramImpl::vision_step(Lane& lane) {
         // Lend the handoff (W) or handoff and window (L); promotions still landing in the run are
         // waited for by compute and the weight stream's transfer stream.
         const cudaStream_t writers[] = {device_.transfer_stream};
+        return_stream_lease(); // a prefill ring is lent again by the next streamed chunk
         v.lease   = residency_->lend(window.frames, s, writers);
         v.handoff = Tensor(v.lease.memory.data, DType::BF16, {out, static_cast<std::int32_t>(window.encoded_tokens)});
         DeviceSpan memory;

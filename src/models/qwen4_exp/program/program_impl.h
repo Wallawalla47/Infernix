@@ -626,6 +626,15 @@ public:
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
+        if (options_.prefill_stream && options_.expert_cache) {
+            std::vector<const std::uint8_t*> stream_banks;
+            for (const auto& layer : parameters_.layers) {
+                stream_banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+            }
+            expert_stream_ =
+                std::make_unique<execution::ExpertStream>(c_.moe.experts, record_stride, std::move(stream_banks));
+            experts.stream = expert_stream_.get();
+        }
         // CPU-served misses for decode and verify calls, and for every call of at most
         // kMaxCpuColumns columns (short prompts, chunk remainders, forced tokens), whose experts are
         // all thin and so give the same bits on either device (design 16.2); wider prefill chunks
@@ -791,7 +800,7 @@ public:
             return out;
         }
         // A window lends frames other lanes' handoffs may hold now.
-        if (impl->vision && residency_->lendable() < impl->vision->window.frames) {
+        if (impl->vision && residency_->lendable() + stream_lease_.count < impl->vision->window.frames) {
             out.readiness = runtime::Readiness::TemporarilyBlocked;
             return out;
         }
@@ -977,7 +986,9 @@ public:
         // A resumed lane's first call waits per layer for its restore; any call waits per layer for
         // a copy-out of this lane's state still in flight (design §19.3.1).
         next_waits_ = prefix_waits(lane);
-        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width));
+        const bool streamed = stream_chunk(width);
+        run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
+        if (last && !prefilling_besides(index)) { return_stream_lease(); }
         lane.state_tokens += static_cast<std::uint32_t>(width);
         prefix_after_prefill_call(lane, index, last);
         // The handoff is read only by the prompt's calls: it returns once the last is enqueued.
@@ -1642,6 +1653,9 @@ private:
 
     void release(std::uint32_t index) noexcept {
         Lane& lane = lanes_[index];
+        if (stream_lease_.valid() && !prefilling_besides(index)) {
+            try { return_stream_lease(); } catch (...) {}
+        }
         prefix_release(lane);
         lane.pages.clear();
         lane.reservation.reset();
@@ -1757,12 +1771,75 @@ private:
     // Runs one eager Forward call over the staged inputs (prefill chunks, forced tokens); logits of
     // `logit_columns` columns land in logits32_.
     void run(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
-             const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr) {
+             const execution::MtpChunk* chunk = nullptr, const execution::VisionInput* vision = nullptr,
+             bool streamed = false) {
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
+        // The ring's copies queue on the copy engine behind the io upload above.
+        if (streamed) { expert_stream_->begin(stream_lease_.memory, residency_->host_table(), s); }
         forward_call(batch, width, logit_columns, nullptr, chunk, vision);
+        if (streamed) { expert_stream_->end(); }
         residency_->enqueue_route_download(s, batch * width);
+    }
+
+    // ---- prefill expert streaming (design §19.3.8 F2, F3) ----
+    // Chunks of at least kStreamMinColumns route nearly every expert of a layer, so all of a layer's
+    // non-resident experts are copied ahead; narrower chunks keep the MoE's staging. The ring holds
+    // two halves of up to kStreamHalfMax records (+ one frame for the slot tables), lent by the
+    // expert cache for the prompt and returned when no lane is prefilling.
+    static constexpr std::int32_t kStreamMinColumns = 256;
+    static constexpr std::uint32_t kStreamHalfMax   = 384;
+    static constexpr std::uint32_t kStreamHalfMin   = 16;
+
+    // Whether this chunk streams; lends the ring first when none is held.
+    bool stream_chunk(std::int32_t width) {
+        if (!expert_stream_ || width < kStreamMinColumns || residency_->frames() == 0) { return false; }
+        if (!stream_lease_.valid()) {
+            const std::int32_t* table = residency_->host_table();
+            const std::uint32_t E     = c_.moe.experts;
+            std::uint32_t most        = 0;
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                std::uint32_t absent = 0;
+                for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
+                most = std::max(most, absent);
+            }
+            const std::uint32_t half   = std::min(kStreamHalfMax, most);
+            const std::uint32_t frames = std::min(2 * half + 1, residency_->lendable());
+            if (half == 0 || expert_stream_->slots_in(static_cast<std::size_t>(frames) * residency_->frame_stride()) <
+                                 2 * kStreamHalfMin) {
+                return false;
+            }
+            const cudaStream_t writers[] = {expert_stream_->stream()};
+            stream_lease_    = residency_->lend(frames, device_.stream, writers);
+            stream_at_lease_ = expert_stream_->stats();
+        }
+        return true;
+    }
+
+    // Returns the ring (after the last streamed chunk is enqueued: compute waited for every copy).
+    void return_stream_lease() {
+        if (!stream_lease_.valid()) { return; }
+        const auto frames = stream_lease_.count;
+        residency_->give_back(stream_lease_, device_.stream);
+        stream_lease_         = {};
+        const auto& now       = expert_stream_->stats();
+        const auto streamed   = now.streamed - stream_at_lease_.streamed;
+        const auto copies     = now.copies - stream_at_lease_.copies;
+        char line[192];
+        std::snprintf(line, sizeof(line), "prefill expert stream: %llu experts (%.2f GiB) in %llu copies through %u lent frames",
+                      static_cast<unsigned long long>(streamed),
+                      static_cast<double>(streamed) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+                      static_cast<unsigned long long>(copies), frames);
+        diagnostic(line);
+    }
+
+    // Whether a lane other than `index` is prefilling.
+    [[nodiscard]] bool prefilling_besides(std::uint32_t index) const noexcept {
+        for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+            if (i != index && lanes_[i].phase == Phase::Prefill) { return true; }
+        }
+        return false;
     }
 
     // One decode round of `batch` sequences: its inputs are staged at fixed device addresses and
@@ -2452,6 +2529,9 @@ private:
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
     std::unique_ptr<ExpertResidency> residency_;
+    std::unique_ptr<execution::ExpertStream> expert_stream_;
+    ExpertResidency::FrameLease stream_lease_;
+    execution::ExpertStream::Stats stream_at_lease_;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
     // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.

@@ -149,6 +149,12 @@ struct MoeExpertSource {
     // Prefetched into L2 by extra CTAs of the CPU wait while the host computes this call's misses
     // (only when a request was published).
     MoeL2Warm l2_warm;
+    // Optional streamed records (design §19.3.8 F2): prefetched (device [E]) gives, for a
+    // non-resident expert, the slot whose record the caller has already copied to prefetch_base +
+    // slot * record_stride (ordered before this call), or -1. Such an expert is read there like a
+    // resident one: never staged and never CPU-served. Calls with CPU-served misses take none.
+    const std::int32_t* prefetched     = nullptr;
+    const std::uint8_t* prefetch_base  = nullptr;
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

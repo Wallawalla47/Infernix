@@ -1,0 +1,85 @@
+#pragma once
+
+// Prefill expert streaming (docs/maintainer/qwen3_8-flash-next-design.md §19.3.8 F2): the records of a
+// prefill chunk's non-resident experts reach the device by copy-engine DMA, two layers ahead, into a
+// ring of borrowed device memory (F3: frames lent by the expert cache), instead of through the MoE's
+// staging kernel, which reads pinned memory with the SMs at about two thirds of the link rate and
+// cannot start before the layer's router.
+//
+// A wide chunk routes nearly every expert of every layer, so a layer's copies do not wait for its
+// routing: they take the layer's non-resident experts in ascending id, up to one half of the ring.
+// Layer l uses half l % 2. Its copies wait until layer l - 2's experts finished reading that half,
+// and layer l's MoE waits for them (one event per layer each way). Experts beyond the half's
+// capacity, and any the chunk does not route, stay with the MoE (staged as before, or unused).
+// Results are unchanged: a streamed record is read exactly as a resident or staged one
+// (ops::MoeExpertSource::prefetched).
+//
+// The ring's first bytes hold the chunk's slot tables (I32 [layers][experts]: slot or -1), so the
+// stream owns no device memory of its own.
+
+#include "core/arena.h"
+
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace ninfer::models::qwen4_exp::execution {
+
+class ExpertStream {
+public:
+    // banks[l]: layer l's pinned host records, record_stride bytes apart.
+    ExpertStream(std::uint32_t experts, std::uint64_t record_stride, std::vector<const std::uint8_t*> banks);
+    ~ExpertStream();
+    ExpertStream(const ExpertStream&)            = delete;
+    ExpertStream& operator=(const ExpertStream&) = delete;
+
+    // The stream that writes the ring (a writer for the lender to order after its promotions).
+    [[nodiscard]] cudaStream_t stream() const noexcept { return stream_; }
+    // Records per ring of `bytes`: what is left after the slot tables, an even number.
+    [[nodiscard]] std::uint32_t slots_in(std::size_t bytes) const noexcept;
+
+    // Starts a chunk over `ring` with the frame tables `residency` (host I32 [layers][experts]:
+    // frame or -1, as the chunk's kernels see them). On `compute`: uploads the slot tables; on the
+    // copy stream, behind `compute`'s work so far, the copies of layers 0 and 1.
+    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute);
+    [[nodiscard]] bool active() const noexcept { return active_; }
+    // Layer l's slot table (device I32 [experts]) and the records' base.
+    [[nodiscard]] const std::int32_t* slots(std::uint32_t layer) const noexcept;
+    [[nodiscard]] const std::uint8_t* base() const noexcept { return records_; }
+    // Before layer `layer`'s experts: `compute` waits for the layer's copies.
+    void before_experts(std::uint32_t layer, cudaStream_t compute);
+    // After the layer's experts are enqueued on `compute`: the half is free once they finish; the
+    // copies of layer + 2 follow.
+    void after_experts(std::uint32_t layer, cudaStream_t compute);
+    // After the chunk's last layer: `compute` is ordered after every copy (each was waited for).
+    void end() noexcept { active_ = false; }
+
+    struct Stats {
+        std::uint64_t streamed = 0; // expert records copied
+        std::uint64_t copies   = 0; // DMA calls (runs of consecutive experts)
+    };
+    [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+
+private:
+    void enqueue(std::uint32_t layer);
+
+    std::uint32_t experts_ = 0, layers_ = 0;
+    std::uint64_t stride_  = 0;
+    std::vector<const std::uint8_t*> banks_;
+    cudaStream_t stream_ = nullptr;
+    cudaEvent_t start_   = nullptr;
+    cudaEvent_t uploaded_ = nullptr;
+    std::vector<cudaEvent_t> landed_, consumed_;
+    PinnedHostBuffer tables_host_{1};
+    std::int32_t* tables_     = nullptr; // device, at the ring's start
+    std::uint8_t* records_    = nullptr; // device, after the tables
+    std::uint32_t half_       = 0;       // slots per half
+    std::vector<std::uint8_t> streams_;  // per layer: whether it has copies
+    bool active_    = false;
+    bool uploading_ = false;
+    Stats stats_;
+};
+
+} // namespace ninfer::models::qwen4_exp::execution

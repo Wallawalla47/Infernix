@@ -28,6 +28,7 @@
 //   C6  Placement invariance: outputs bit-identical for records in frames, staged through 3 or 64
 //       slots, read zero-copy (bulk copies from mapped host memory, last, since only tests use it),
 //       in the double-buffered prefill passes, and on a rerun.
+#include "core/vmm_arena.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/common/canonical_math.h"
 #include "ops/host_parallel.h"
@@ -388,6 +389,67 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
             std::printf("   C6 %-24s: %ld outputs differ from the first run\n", config.name, differing);
             check(differing == 0, "C6: outputs are bit-identical for every placement and pass layout");
         }
+    }
+
+    // C7: the Program's frames (and the prefill stream's lent ring) live in a VMM arena mapped in
+    // 64 MiB chunks, so a record can straddle two separately mapped chunks. Frame 0 and staging slot
+    // 1 are placed across chunk boundaries; outputs must not change.
+    if (ninfer::VmmArena::supported(0)) {
+        constexpr std::size_t kChunk = 64ULL << 20;
+        ninfer::VmmArena arena(0, 6 * kChunk, kChunk);
+        bool mapped = true;
+        for (int c = 0; c < 6; ++c) { mapped = mapped && arena.map_chunk(); }
+        check(mapped, "C7: the VMM arena maps its chunks");
+        auto* base             = static_cast<std::uint8_t*>(arena.base());
+        std::uint8_t* frames_v = base + kChunk - stride / 2;
+        std::uint8_t* stage_v  = base + 2 * kChunk - stride - stride / 3;
+        cuda_check(cudaMemcpy(frames_v, d_frame_base, frame_bytes.size(), cudaMemcpyDeviceToDevice), "copy frames");
+        struct Placement {
+            const char* name;
+            const std::uint8_t* frames;
+            std::uint8_t* staging;
+            bool overlap;
+        };
+        for (const Placement& place : {Placement{"VMM frames across chunks", frames_v, d_staging, false},
+                                       Placement{"VMM staging across chunks", d_frame_base, stage_v, false},
+                                       Placement{"VMM both, prefill passes", frames_v, stage_v, true}}) {
+            cuda_check(cudaMemset(d_out, 0xFF, out_elements * sizeof(std::uint16_t)), "cudaMemset");
+            ninfer::ops::MoeExpertSource source{.frame_base    = place.frames,
+                                                .frames        = d_frames,
+                                                .host_records  = host_device,
+                                                .record_stride = stride,
+                                                .scales        = d_scales,
+                                                .staging_base  = place.staging,
+                                                .staging_slots = place.overlap ? 8 : 64};
+            if (place.overlap) {
+                source.overlap_stream = side;
+                for (int i = 0; i < 5; ++i) { source.overlap_events[i] = events[i]; }
+            }
+            Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+            Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
+            ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+            cuda_check(cudaDeviceSynchronize(), "moe_experts");
+            const auto again = host_copy(d_out, out_elements);
+            long differing   = 0;
+            for (std::size_t i = 0; i < again.size(); ++i) { differing += again[i] != first_outputs[i]; }
+            std::printf("   C7 %-26s: %ld outputs differ from the first run\n", place.name, differing);
+            check(differing == 0, "C7: outputs do not depend on records straddling VMM chunks");
+        }
+        // The probes below reuse the 64-slot run's job records and A4(h) plane: run it again before
+        // the arena (which those records would otherwise point into) is released.
+        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                            .frames        = d_frames,
+                                            .host_records  = host_device,
+                                            .record_stride = stride,
+                                            .scales        = d_scales,
+                                            .staging_base  = d_staging,
+                                            .staging_slots = 64};
+        Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+        Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
+        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "moe_experts");
+    } else {
+        std::printf("   C7 skipped: no VMM\n");
     }
 
     const std::vector<std::uint16_t>& got = first_outputs;
