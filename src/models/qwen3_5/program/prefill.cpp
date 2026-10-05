@@ -9,12 +9,15 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ninfer/ops/target_logprobs.h"
+#include "ninfer/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -166,6 +169,10 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
             state.execution.device.stream);
+    qwen3_5::constrain_round_logits(
+        state.execution.io, logits, nullptr,
+        dimension(state.execution.parameters.model.resources().public_token_count),
+        state.execution.device.stream);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -242,6 +249,22 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
         prefix_execution_splits.size() != lanes.size()) {
         throw std::invalid_argument("pending batch resolution has inconsistent membership");
+    }
+    // A constrained row's draws follow exactly the tokens the output policy accepted.
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        if (lanes[row] >= max_concurrency) { continue; }
+        RequestControl& request = requests[lanes[row]];
+        if (request.constraint_round.empty()) { continue; }
+        const std::size_t accepted = cancelled[row] ? 0U : accepted_tokens[row];
+        if (accepted > request.constraint_round.size()) {
+            throw std::logic_error("constrained row accepted more tokens than it drew");
+        }
+        request.constraint_trace.insert(
+            request.constraint_trace.end(),
+            std::make_move_iterator(request.constraint_round.begin()),
+            std::make_move_iterator(request.constraint_round.begin() +
+                                    static_cast<std::ptrdiff_t>(accepted)));
+        request.constraint_round.clear();
     }
 
     if (lanes.size() == 1 && lanes.front() < max_concurrency &&
@@ -501,6 +524,38 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     return timing.finish();
 }
 
+PromptReadout ProgramImpl::read_prompt_frontier(const Tensor& hidden,
+                                                std::span<const TokenId> tokens) {
+    if (tokens.empty() || tokens.size() > kMaximumReadoutTokens) {
+        throw std::invalid_argument("prompt readout names an invalid token count");
+    }
+    const auto count = static_cast<std::int32_t>(tokens.size());
+    const std::int32_t public_tokens =
+        execution::dimension(parameters.model.resources().public_token_count);
+    work.reset();
+    Tensor logits = io.logits.slice(1, 0, 1);
+    execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
+    Tensor ids         = work.alloc(DType::I32, {count, 1});
+    Tensor logprobs    = work.alloc(DType::FP32, {count, 1});
+    Tensor top_id      = work.alloc(DType::I32, {1, 1});
+    Tensor top_logprob = work.alloc(DType::FP32, {1, 1});
+    CUDA_CHECK(cudaMemcpyAsync(ids.data, tokens.data(), ids.bytes(), cudaMemcpyHostToDevice,
+                               device.stream));
+    ops::target_logprobs(logits, ids, public_tokens, logprobs, device.stream);
+    ops::top_logprobs(logits, public_tokens, top_id, top_logprob, device.stream);
+    PromptReadout readout;
+    readout.logprobs.resize(tokens.size());
+    CUDA_CHECK(cudaMemcpyAsync(readout.logprobs.data(), logprobs.data, logprobs.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(&readout.top_token, top_id.data, sizeof(TokenId),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(&readout.top_logprob, top_logprob.data, sizeof(float),
+                               cudaMemcpyDeviceToHost, device.stream));
+    device.synchronize();
+    work.reset();
+    return readout;
+}
+
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing) {
@@ -519,6 +574,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        // The prompt's last position samples output step 0 (descriptor column 0).
+        const ConstraintRow constraint = constraint_row(sequence.lane);
+        stage_constraint_columns(std::span<const ConstraintRow>(&constraint, 1), 1);
         StateImageSelectors selectors = state_selectors(sequence);
         // Hybrid prefix cache taps (docs/maintainer/hybrid-prefix-cache-spec.md §7.1): an exact tap
         // splits the chunk at its frontier; any chunk boundary may realize a flexible tap, so the
@@ -772,6 +830,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
+        if (constraint.plan != nullptr) {
+            request.constraint_round = read_constraint_draws(
+                *constraint.plan, 0, 0, std::span<const TokenId>(host_tokens, 1));
+        }
+        std::optional<PromptReadout> readout;
+        if (request.base && !request.base->readout_tokens.empty()) {
+            // After the first token is staged on the host: the projection reuses the logits row.
+            readout = read_prompt_frontier(sequence.tail_hidden, request.base->readout_tokens);
+        }
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds = staged.retired_vision_seconds +
                                       (staged.vision ? staged.vision->elapsed_seconds() : 0.0);
@@ -828,6 +895,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             .processed_prompt_tokens = processed_prompt_tokens,
             .complete                = true,
             .timing                  = timing.finish(),
+            .readout                 = std::move(readout),
         };
     } catch (...) {
         timing.begin_wait();

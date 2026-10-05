@@ -122,6 +122,7 @@ const char* endpoint_name(std::string_view request_path) noexcept {
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
+    if (path == "/v1/decide" || path == "/v1/systemone") { return "decide"; }
     return "http_route";
 }
 
@@ -518,6 +519,13 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_messages(req, res);
                  });
+    // /v1/systemone is TypeSafe Jev's name for the same request, so a Jev client needs only a URL.
+    for (const char* endpoint : {"/decide", "/systemone"}) {
+        server_.Post(api_route_pattern(endpoint),
+                     [this](const httplib::Request& req, httplib::Response& res) {
+                         handle_decide(req, res);
+                     });
+    }
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
@@ -554,6 +562,8 @@ void HttpServer::attach(GenerationService& service) {
     const ninfer::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     model_metadata_                     = service.model_metadata();
+    decide_labels_                      = build_decide_alphabet(
+        [&service](std::string_view text) { return service.tokenize_text(text); });
     service_                            = &service;
     metrics_.configure(public_model_id_, service.engine_options(), memory, baseline);
     request_jsonl_.write_server_start(options_, service.engine_options(),

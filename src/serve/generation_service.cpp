@@ -386,6 +386,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             prepared.thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        prepared.media         = prompt.summary().media;
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
@@ -473,6 +474,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
+    outcome.readout             = std::move(result.readout);
+    outcome.constrained_draws   = std::move(result.constrained_draws);
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

@@ -68,11 +68,27 @@ struct PreparedNgramIndex {
     std::unique_ptr<NgramProposer> index;
 };
 
+// A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written
+// into the lane's set columns when the request binds) and each step's descriptor relative to
+// the lane (a set index, or the forced-token encoding -2 - token).
+struct RequestConstraintPlan {
+    std::vector<std::vector<TokenId>> sets;
+    std::vector<std::int32_t> step_descriptors;
+    // Unique per planned request, so a lane's uploaded sets are never mistaken for a later
+    // request's.
+    std::uint64_t serial = 0;
+
+    [[nodiscard]] bool empty() const noexcept { return step_descriptors.empty(); }
+};
+
 struct RequestBasePlanImpl {
     std::shared_ptr<const PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
+    // Tokens whose prompt-frontier log-probabilities complete the request's prefill.
+    std::vector<TokenId> readout_tokens;
+    RequestConstraintPlan constraint;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
     std::vector<CaptureGroup> capture_groups;
     std::shared_ptr<const PreparedCaptureBacking> capture_backing;
@@ -224,6 +240,10 @@ struct RequestControl {
     std::vector<CaptureGroup> capture_groups;
     std::size_t next_capture = 0;
     bool capture_pending     = false;
+    // Constrained requests: the draws of the pending candidate (one per produced token, in
+    // order) and the committed trace they move into.
+    std::vector<ConstrainedDraw> constraint_round;
+    std::vector<ConstrainedDraw> constraint_trace;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -490,6 +510,12 @@ public:
 
     VisionHandoffState vision_handoff;
     std::array<SequenceState, kMaximumConcurrency> sequences;
+    // Constrained generation: the host mirror of the device descriptors, how many leading device
+    // columns may hold a constraint, and which plan each lane's set columns were written for.
+    std::vector<std::int32_t> constraint_descriptors_host_;
+    std::size_t constraint_device_columns_ = 0;
+    std::array<std::uint64_t, kMaximumConcurrency> constraint_bound_serials_{};
+    std::uint64_t next_constraint_serial_ = 1;
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::vector<CheckpointSlot> checkpoints;
@@ -701,6 +727,37 @@ public:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
+    // Log-probabilities of `tokens` and the unrestricted top token at the position after the
+    // final-normalized `hidden`, from the same output-head projection the first token samples.
+    [[nodiscard]] PromptReadout read_prompt_frontier(const Tensor& hidden,
+                                                     std::span<const TokenId> tokens);
+
+    // ---- constrained generation (constraint.cpp) ----
+    // One row of a round: the lane, its request's compiled constraint (null when
+    // unconstrained) and the output step its first logits column samples.
+    struct ConstraintRow {
+        std::uint32_t lane                 = 0;
+        const RequestConstraintPlan* plan  = nullptr;
+        std::uint32_t first_step           = 0;
+    };
+    // Writes the round's descriptors (row-major, `width` columns per row) for every
+    // constrain_logits call the round makes, and resets columns an earlier round constrained.
+    void stage_constraint_columns(std::span<const ConstraintRow> rows, std::uint32_t width);
+    void bind_constraint_sets(std::uint32_t lane, const RequestConstraintPlan* plan);
+    // After the round completed: the draws of `tokens`, produced by consecutive columns from
+    // `first_column` for output steps from `first_step`.
+    [[nodiscard]] std::vector<ConstrainedDraw>
+    read_constraint_draws(const RequestConstraintPlan& plan, std::uint32_t first_step,
+                          std::size_t first_column, std::span<const TokenId> tokens);
+    [[nodiscard]] const RequestConstraintPlan* constraint_plan(std::uint32_t lane) const noexcept;
+    // The output step the lane's next sampled token is: its generated-token count.
+    [[nodiscard]] std::uint32_t constraint_first_step(std::uint32_t lane) const;
+    [[nodiscard]] ConstraintRow constraint_row(std::uint32_t lane) const {
+        const RequestConstraintPlan* plan = constraint_plan(lane);
+        return ConstraintRow{.lane       = lane,
+                             .plan       = plan,
+                             .first_step = plan != nullptr ? constraint_first_step(lane) : 0U};
+    }
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);

@@ -659,6 +659,17 @@ when upstream replaced it in `abb7f14f`.
 
 ### API and client compatibility
 
+- **`POST /v1/decide`: decisions read, not generated.** `noul` (yes/no), `choice` and `score`
+  questions about a text, JSON or image `state` are answered from the label tokens' probabilities
+  where the answer would start, after one prefill, with the share of the distribution the options
+  hold (`answer_mass`); `number`, `scalar`, `point` and `box` (in the image's pixels) generate a
+  digit chain under a per-step token constraint, with a per-digit uncertainty trace. The wire
+  shape (TypeSafe Jev's `/v1/systemone`, also served) and the measured prompts come from
+  [gpillon/ignis](https://github.com/gpillon/ignis) (ADR 0034); a negative scalar may open with
+  the tokenizer's merged `":-` token, which raised its answer mass from about 1 % to 0.999.
+  Questions over one state reuse its cached prefix, images included. On ignis's authored
+  144-question set: balanced accuracy 0.958 (ignis published 0.934), median answer mass 0.998,
+  about 53 ms per question. See [Decisions](docs/serving.md#decisions).
 - **llama.cpp-style model details on `/v1/models`** (upstream PR #162 by
   [Hector Ramon Jimenez (hecrj)](https://github.com/hecrj)) and **`ignore_eos` on chat
   completions** (upstream PR #197 by [Thireus](https://github.com/Thireus)).

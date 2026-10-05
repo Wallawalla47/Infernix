@@ -41,6 +41,10 @@ ninfer_add_test(ninfer_openai_responses_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_responses_store.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_decide_schema_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decide_schema.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_anthropic_schema.cpp"
   LIBRARIES ninfer_serve)

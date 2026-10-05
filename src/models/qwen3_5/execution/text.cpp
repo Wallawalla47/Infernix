@@ -1385,6 +1385,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 // decode step, which reuses the same io_.pos).
                 ops::set_i32_scalar(io_.pos, base_i + T, s);
                 ops::set_i32_scalar(io_.rope_pos, base_i + T + rope_delta_, s);
+                // A constrained request's first output token (descriptor column 0).
+                qwen3_5::constrain_round_logits(
+                    io_, logits, nullptr,
+                    dimension(parameters_.model.resources().public_token_count), s);
                 if (sampling_config_ != nullptr) {
                     ops::sample(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count),

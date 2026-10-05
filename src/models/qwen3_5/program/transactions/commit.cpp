@@ -49,6 +49,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
     out.timing                  = step.timing;
+    out.readout                 = std::move(step.readout);
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
         const runtime::BatchedGeneratedRound round{
@@ -508,8 +509,9 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
     const auto lane = ContractAccess::lane(handle).value;
     auto& request   = requests[lane];
     if (request.lifecycle != Lifecycle::Finishable) { return out; }
-    out.timings     = request.timings;
-    out.speculative = std::move(request.speculative_stats);
+    out.timings           = request.timings;
+    out.speculative       = std::move(request.speculative_stats);
+    out.constrained_draws = std::move(request.constraint_trace);
     try {
         device.synchronize();
         if (hybrid_) {

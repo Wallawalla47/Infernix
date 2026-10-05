@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -76,6 +77,8 @@ struct GenerationOutcome {
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
+    std::optional<ninfer::PromptReadout> readout;
+    std::vector<ninfer::ConstrainedDraw> constrained_draws;
     GenerationMetrics metrics;
 };
 
@@ -113,6 +116,8 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    // Display size of each submitted media item, in prompt order.
+    std::vector<ninfer::MediaGeometry> media;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
@@ -149,6 +154,11 @@ public:
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
         return engine_->sampling_defaults();
+    }
+
+    // Artifact-tokenizer encoding of raw text, with no template or special token added.
+    [[nodiscard]] std::vector<ninfer::TokenId> tokenize_text(std::string_view text) const {
+        return engine_->tokenize_text(text);
     }
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,

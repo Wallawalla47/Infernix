@@ -200,6 +200,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (io.dflash_decode.has_value() != is_masked_draft_backend(speculative_backend)) {
         throw std::logic_error("DFlash decode frame does not match the sequence plan");
     }
+    if (io.constraint.has_value() == causal_scoring) {
+        throw std::logic_error("constraint controls do not match the program purpose");
+    }
+    if (io.constraint) {
+        // Every column starts unconstrained (-1); the choice tables are written per request.
+        CUDA_CHECK(cudaMemsetAsync(io.constraint->descriptors.data, 0xff,
+                                   io.constraint->descriptors.bytes(), device.stream));
+        constraint_descriptors_host_.assign(kTokenConstraintColumns, -1);
+    }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);

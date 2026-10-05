@@ -349,6 +349,7 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     bool capture_ready = false;
+    std::optional<PromptReadout> readout;
 };
 
 struct CommitRowResult {
@@ -381,6 +382,7 @@ struct FinishResult {
     runtime::ConsumeStatus status = runtime::ConsumeStatus::InvariantMismatch;
     GenerationTimings timings;
     SpeculativeStats speculative;
+    std::vector<ConstrainedDraw> constrained_draws;
     std::optional<CheckpointHandle> checkpoint;
 };
 

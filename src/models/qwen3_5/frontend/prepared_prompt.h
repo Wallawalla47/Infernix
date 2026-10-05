@@ -65,6 +65,8 @@ struct TokenSpan {
 struct VisionItem {
     PromptModality modality = PromptModality::Image;
     VisionGrid grid;
+    // The submitted media's display size before Vision resizing (PromptSummary::media).
+    MediaGeometry source;
     std::size_t patch_begin = 0;
     std::size_t patch_count = 0;
     // SHA-256 of the owned encoded media bytes. Grid/modality/span identity is carried

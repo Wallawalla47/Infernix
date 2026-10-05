@@ -316,6 +316,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     ninfer::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
+    options.execution.readout_tokens          = request.readout_tokens;
+    options.execution.constraint              = request.constraint;
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
@@ -326,6 +328,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
     options.output.tolerant_tool_calls  = server.tolerant_tool_calls;
     options.stop.include_model_defaults = !request.ignore_eos;
+    options.stop.token_ids              = request.stop_token_ids;
     options.stop.strings.reserve(request.stop_strings.size() *
                                  (request.stop_strings_apply_to_reasoning ? 2U : 1U));
     for (const std::string& stop : request.stop_strings) {

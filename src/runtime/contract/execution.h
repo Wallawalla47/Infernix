@@ -66,6 +66,8 @@ struct PrefillStepResult {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     ExecutionTiming timing;
+    // Set on the completing step of a request that named readout tokens.
+    std::optional<PromptReadout> readout;
 };
 
 struct RoundBudget {

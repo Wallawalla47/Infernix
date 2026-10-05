@@ -353,6 +353,7 @@ VisionItem convert_vision_item(fi::VisionItem item) {
     result.modality =
         item.modality == fi::Modality::Image ? PromptModality::Image : PromptModality::Video;
     result.grid = VisionGrid{.temporal = item.grid.t, .height = item.grid.h, .width = item.grid.w};
+    result.source         = MediaGeometry{.width = item.source.width, .height = item.source.height};
     result.patch_begin    = item.patch_begin;
     result.patch_count    = item.patch_count;
     result.content_digest = item.content_digest;
@@ -721,9 +722,12 @@ PreparedPrompt& PreparedPrompt::operator=(PreparedPrompt&&) noexcept = default;
 
 PromptSummary PreparedPrompt::summary() const {
     if (data_ == nullptr) { throw std::logic_error("prepared prompt is empty"); }
-    return PromptSummary{.starts_in_reasoning = data_->starts_in_reasoning,
-                         .prompt_tokens       = checked_token_count(data_->token_ids.size()),
-                         .has_media           = data_->has_media()};
+    PromptSummary summary{.starts_in_reasoning = data_->starts_in_reasoning,
+                          .prompt_tokens       = checked_token_count(data_->token_ids.size()),
+                          .has_media           = data_->has_media()};
+    summary.media.reserve(data_->vision_items.size());
+    for (const VisionItem& item : data_->vision_items) { summary.media.push_back(item.source); }
+    return summary;
 }
 
 PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {

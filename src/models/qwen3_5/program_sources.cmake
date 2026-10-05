@@ -12,6 +12,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_control.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/graphs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"

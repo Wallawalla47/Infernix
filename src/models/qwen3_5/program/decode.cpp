@@ -53,6 +53,10 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
+        qwen3_5::constrain_round_logits(
+            state.execution.io, logits, nullptr,
+            dimension(state.execution.parameters.model.resources().public_token_count),
+            state.execution.device.stream);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
@@ -379,6 +383,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *ordinary_host_egress,
             state_images->continuation_hidden_store()};
 
+        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            constraint_rows[row] = constraint_row(lanes[row]);
+        }
+        stage_constraint_columns(
+            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), 1);
+
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
@@ -400,6 +411,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t base_S = sequence.ledger_frontier;
             const TokenId token        = ordinary_host_egress->sampled_tokens[row];
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            if (const ConstraintRow& constrained = constraint_rows[row];
+                constrained.plan != nullptr) {
+                request.constraint_round =
+                    read_constraint_draws(*constrained.plan, constrained.first_step, row,
+                                          std::span<const TokenId>(&token, 1));
+            }
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
             sequence.tail_hidden_valid = true;
@@ -630,6 +647,13 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + mtp_ar_depth));
         }
 
+        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            constraint_rows[row] = constraint_row(lanes[row]);
+        }
+        stage_constraint_columns(
+            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), width);
+
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, *state_images, round_replay_records(verify_drafts),
              io, prefill_hidden, prefill_chunk, proposal_head, prompt_attention},
@@ -674,6 +698,11 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (const ConstraintRow& constrained = constraint_rows[row];
+                constrained.plan != nullptr) {
+                request.constraint_round = read_constraint_draws(
+                    *constrained.plan, constrained.first_step, row * width, row_tokens);
+            }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
             if (pcur == 0) {
@@ -834,8 +863,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             std::min({row_copy ? static_cast<std::uint32_t>(matches[row].tokens.size())
                                : (drafter_runs ? neural_draft_window : 0U),
                       max_by_budget, capacity - frontier - 1U});
+        // A constrained row verifies its chain: the constraint names one step per chain column.
         if (tree_round && extent == neural_draft_window &&
-            capacity - frontier - 1U >= verify_drafts) {
+            capacity - frontier - 1U >= verify_drafts && constraint_plan(lanes[row]) == nullptr) {
             return verify_drafts;
         }
         return extent;
@@ -903,6 +933,13 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        std::array<ConstraintRow, kMaximumConcurrency> constraint_rows{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            constraint_rows[row] = constraint_row(lanes[row]);
+        }
+        stage_constraint_columns(
+            std::span<const ConstraintRow>(constraint_rows.data(), lanes.size()), width);
+
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, *state_images,
              round_replay_records(verify_drafts), io, prefill_hidden, prefill_chunk,
@@ -952,6 +989,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (const ConstraintRow& constrained = constraint_rows[row];
+                constrained.plan != nullptr) {
+                // Chain row: licensed token i was chosen at verification column i.
+                request.constraint_round = read_constraint_draws(
+                    *constrained.plan, constrained.first_step, row * width, row_tokens);
+            }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {

@@ -119,6 +119,7 @@ const char* protocol_name(std::string_view protocol) noexcept {
     if (protocol == "anthropic_messages") { return "anthropic"; }
     if (protocol == "openai_responses_input_tokens") { return "openai-input-tokens"; }
     if (protocol == "anthropic_count_tokens") { return "anthropic-count-tokens"; }
+    if (protocol == "decide") { return "decide"; }
     return "http";
 }
 

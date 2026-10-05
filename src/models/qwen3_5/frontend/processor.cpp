@@ -303,6 +303,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     Prepared out;
     out.item.modality = Modality::Image;
     out.item.grid     = {1, gh, gw};
+    out.item.source = {image.width, image.height};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
     enforce_media_item_resource_limits(item_stats);
@@ -358,6 +359,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     Prepared out;
     out.item.modality = Modality::Video;
     out.item.grid     = {gt, gh, gw};
+    out.item.source = {video.width, video.height};
     PreprocessStats item_stats;
     add_budget(item_stats, out.item);
     enforce_media_item_resource_limits(item_stats);
@@ -436,6 +438,7 @@ VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const Process
     VisionItem item;
     item.modality = Modality::Image;
     item.grid     = {1, size.h / kPatch, size.w / kPatch};
+    item.source   = {image.width, image.height};
     return item;
 }
 
@@ -467,6 +470,7 @@ VisionItem inspect_video_item(std::span<const std::uint8_t> bytes, const Process
     VisionItem item;
     item.modality   = Modality::Video;
     item.grid       = {gt, size.h / kPatch, size.w / kPatch};
+    item.source     = {video.width, video.height};
     item.timestamps = video_timestamps(video.indices, gt, video.fps);
     return item;
 }
