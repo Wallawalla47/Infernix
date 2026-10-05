@@ -181,6 +181,12 @@ add_test(NAME ninfer_gdn_replay_fold_wide_test
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
+# hyper_connection_mix against the FP64 closed formula: fused Q8 route (T <= 16) and composed route.
+ninfer_add_op_test(ninfer_hyper_connection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
+  LIBRARIES ninfer_linear_test_support)
+set_tests_properties(ninfer_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
 ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"

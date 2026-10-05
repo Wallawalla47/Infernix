@@ -75,9 +75,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool large_shape = x.ne[0] == 5120 && out.ne[0] == 17408 && gate_up_weight.n == 34816 &&
                              gate_up_weight.k == 5120 && gate_up_weight.padded_shape[0] == 34816 &&
                              gate_up_weight.padded_shape[1] == 5120;
-    const bool q8_shape = x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
-                          gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
-                          gate_up_weight.padded_shape[1] == 2048;
+    const bool q8_shape = (x.ne[0] == 2048 && out.ne[0] == 6144 && gate_up_weight.n == 12288 &&
+                           gate_up_weight.k == 2048 && gate_up_weight.padded_shape[0] == 12288 &&
+                           gate_up_weight.padded_shape[1] == 2048) ||
+                          (x.ne[0] == 2560 && out.ne[0] == 640 && gate_up_weight.n == 1280 &&
+                           gate_up_weight.k == 2560 && gate_up_weight.padded_shape[0] == 1280 &&
+                           gate_up_weight.padded_shape[1] == 2560);
     if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
         out.ne[3] != 1 || (!large_shape && !q8_shape)) {
         throw std::invalid_argument("linear_swiglu: invalid tensor shape");
