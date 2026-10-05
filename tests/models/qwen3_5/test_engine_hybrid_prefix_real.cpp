@@ -698,6 +698,74 @@ int exercise_vision(const char* artifact) {
     return failures;
 }
 
+// Two requests submitted together carry the same system text and image and ask different
+// questions: the second waits for the first one's snapshot past the image and encodes nothing.
+// A different image behind the same text shares only the text before it and is encoded.
+int exercise_coalesce_vision(const char* artifact) {
+    ninfer::EngineOptions options =
+        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    options.max_concurrency = 2;
+    options.enable_vision   = true;
+    ninfer::Engine engine(std::move(options));
+
+    std::string system = "You inspect screenshots for a test automation service.";
+    for (int sentence = 0; sentence < 60; ++sentence) {
+        system += " Rule " + std::to_string(sentence) +
+                  ": report the colours, regions and any visible text exactly.";
+    }
+    const auto prompt = [&](const std::vector<std::uint8_t>& image, const char* question) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        ninfer::MessagePart media;
+        media.kind              = ninfer::MessagePartKind::Media;
+        media.media.kind        = ninfer::MediaKind::Image;
+        media.media.bytes       = image;
+        media.media.media_type  = "image/x-portable-pixmap";
+        media.media.source_name = "image.ppm";
+        user.parts.push_back(std::move(media));
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
+        return conversation({text_message(ninfer::ChatRole::System, system), std::move(user)});
+    };
+    const std::vector<std::uint8_t> image = gradient_ppm(512, 11);
+    const std::vector<std::uint8_t> other = gradient_ppm(512, 151);
+
+    int failures = 0;
+    const auto pair = [&](const std::vector<std::uint8_t>& second_image, bool same) {
+        ninfer::GenerationHandle leader =
+            engine.submit(engine.prepare(prompt(image, "Which colour dominates?")), greedy(1));
+        ninfer::GenerationHandle follower = engine.submit(
+            engine.prepare(prompt(second_image, "Is there any text in the image?")), greedy(4));
+        const ninfer::GenerationResult led      = leader.wait();
+        const ninfer::GenerationResult followed = follower.wait();
+        // The image's 256 merged tokens end within a few tokens of where the questions diverge.
+        const std::uint32_t question_tokens =
+            followed.prompt.prompt_tokens >= 40U ? 40U : followed.prompt.prompt_tokens;
+        const bool resumed_past_image =
+            followed.reused_prompt_tokens + question_tokens >= followed.prompt.prompt_tokens;
+        if (same && (!resumed_past_image || followed.timings.vision_seconds != 0.0)) {
+            std::cerr << "coalesce-vision: the same image reused " << followed.reused_prompt_tokens
+                      << " of " << followed.prompt.prompt_tokens << " tokens and encoded for "
+                      << followed.timings.vision_seconds << " s (expected past the image, 0 s)\n";
+            ++failures;
+        }
+        if (!same && (resumed_past_image || followed.timings.vision_seconds == 0.0)) {
+            std::cerr << "coalesce-vision: a different image reused "
+                      << followed.reused_prompt_tokens << " tokens and encoded for "
+                      << followed.timings.vision_seconds << " s\n";
+            ++failures;
+        }
+        if (led.generated_token_ids.size() != 1 || followed.generated_token_ids.size() != 4) {
+            std::cerr << "coalesce-vision: generation did not complete\n";
+            ++failures;
+        }
+    };
+    pair(image, true);
+    // The image is cached now; the different image starts from the shared system block.
+    pair(other, false);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -717,7 +785,7 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 14> kScenarios{"all",
+    constexpr std::array<std::string_view, 15> kScenarios{"all",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
@@ -727,6 +795,7 @@ int main() {
                                                           "persist",
                                                           "turns-protocol",
                                                           "coalesce",
+                                                          "coalesce-vision",
                                                           "interleaved",
                                                           "cancel-prefill",
                                                           "cancel-prefill-dflash2"};
@@ -760,6 +829,9 @@ int main() {
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);
+        }
+        if (all || scenario == "coalesce-vision") {
+            failures += exercise_coalesce_vision(artifact);
         }
         if (all || scenario == "turns-protocol") {
             protocol_hints = true;

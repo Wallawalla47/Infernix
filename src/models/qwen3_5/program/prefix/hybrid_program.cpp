@@ -64,6 +64,36 @@ bool inside_exclusion(std::uint32_t frontier,
     });
 }
 
+bool same_vision_item(const VisionItem& lhs, const VisionItem& rhs) noexcept {
+    const auto same_span = [](const TokenSpan& a, const TokenSpan& b) {
+        return a.begin == b.begin && a.count == b.count;
+    };
+    return lhs.modality == rhs.modality && lhs.grid.temporal == rhs.grid.temporal &&
+           lhs.grid.height == rhs.grid.height && lhs.grid.width == rhs.grid.width &&
+           lhs.patch_begin == rhs.patch_begin && lhs.patch_count == rhs.patch_count &&
+           lhs.content_digest == rhs.content_digest && lhs.timestamps == rhs.timestamps &&
+           std::equal(lhs.token_spans.begin(), lhs.token_spans.end(), rhs.token_spans.begin(),
+                      rhs.token_spans.end(), same_span);
+}
+
+// How much of `shared` equal leading tokens `waiting` really shares with `sibling`. Vision
+// placeholders are equal tokens for every image, so the agreement ends where the first media item
+// the two prompts do not carry identically (content, grid, timing, placement) begins.
+std::uint32_t media_agreed_prefix(const PreparedPromptData& waiting,
+                                  const PreparedPromptData& sibling,
+                                  std::uint32_t shared) noexcept {
+    for (std::size_t item = 0; item < waiting.vision_items.size(); ++item) {
+        const VisionItem& own = waiting.vision_items[item];
+        const std::size_t begin = own.token_spans.empty() ? 0 : own.token_spans.front().begin;
+        if (begin >= shared) { break; }
+        if (item >= sibling.vision_items.size() ||
+            !same_vision_item(own, sibling.vision_items[item])) {
+            return static_cast<std::uint32_t>(begin);
+        }
+    }
+    return shared;
+}
+
 PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
     return kind == pc::SnapshotKind::Endpoint ? PrefixReusePath::HybridEndpoint
                                               : PrefixReusePath::HybridSnapshot;
@@ -419,7 +449,7 @@ std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
 }
 
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
-    if (hybrid_coalesce_wait_seconds_ <= 0.0 || !prompt.vision_items.empty()) { return false; }
+    if (hybrid_coalesce_wait_seconds_ <= 0.0) { return false; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
 
     struct Wait {
@@ -437,23 +467,29 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
             continue;
         }
         const RequestControl::Prefill& prefill = *request.prefill;
-        // Vision placeholders are equal tokens for different media, so token equality proves
-        // nothing there.
-        if (!prefill.prompt.vision_items.empty()) { continue; }
         // The waiting request keeps at least one prompt token to prefill.
         const std::size_t limit = std::min<std::size_t>(n - 1U, prefill.prompt.token_ids.size());
-        const auto shared       = static_cast<std::uint32_t>(
+        const auto equal_tokens = static_cast<std::uint32_t>(
             std::mismatch(prompt.token_ids.begin(), prompt.token_ids.begin() + limit,
                           prefill.prompt.token_ids.begin())
                 .first -
             prompt.token_ids.begin());
+        // A sibling encoding the same image saves this request the encode as well as the prefill.
+        const std::uint32_t shared = media_agreed_prefix(prompt, prefill.prompt, equal_tokens);
         if (shared <= reuse) { continue; }
         const auto consider = [&](const Wait& wait) {
             if (!best || wait.target > best->target) { best = wait; }
         };
         // A new tap goes on the block boundary below the divergence: a frontier inside a block
         // publishes only once the sibling completes that block.
-        const std::uint32_t aligned = shared / kBlock * kBlock;
+        std::uint32_t aligned = shared / kBlock * kBlock;
+        // A block boundary inside an image both prompts carry moves to the image's end: the
+        // whole image is shared, and resuming past it saves its encode as well as its prefill.
+        for (const pc::TapExclusion& span : state.exclusions) {
+            if (span.begin < aligned && aligned < span.end && span.end <= shared) {
+                aligned = span.end;
+            }
+        }
         std::optional<Wait> wait;
         if (aligned > prefill.cursor && aligned > reuse) {
             wait = Wait{.lane = lane, .target = aligned, .plan_tap = true};

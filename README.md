@@ -316,7 +316,9 @@ alternatives that were tried and reverted.
   than its new tokens.
 - **Parallel requests with a new shared prefix prefill it once.** Later requests wait for the
   first one's snapshot where the prompts diverge. Four requests with a new 13.9K-token system
-  prompt: mean time to first token 1.48 s instead of 3.52 s.
+  prompt: mean time to first token 1.48 s instead of 3.52 s. A shared prefix may hold images:
+  requests that carry the same image (by content) behind the same text wait for the first one's
+  snapshot past it, so the image is encoded once.
 - **Host eviction keeps what the next turns reuse**, and **a request waiting for a lane prefetches
   its host-only blocks**: at the 52 GB production host tier, 9.2 % fewer prompt tokens prefilled
   and a 7.8 % shorter agentic workload.
