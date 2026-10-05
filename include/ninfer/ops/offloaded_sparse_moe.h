@@ -99,6 +99,15 @@ struct MoeCpuChannel {
     std::int32_t max_job_columns        = offloaded_moe::kMaxCpuColumns; // 1..kMaxCpuColumns
 };
 
+/// Device memory a call warms into L2 while it waits for its CPU-served misses (design §19.3.3
+/// Phase 2): typically the next layer's first weights. Spans start 16-byte aligned; a span's bytes
+/// are rounded down to 16. Warming changes no result.
+struct MoeL2Warm {
+    static constexpr int kSpans = 4;
+    const void* ptr[kSpans]   = {};
+    std::size_t bytes[kSpans] = {};
+};
+
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
@@ -131,6 +140,9 @@ struct MoeExpertSource {
     const std::int32_t* landing = nullptr;
     std::int32_t* landed        = nullptr;
     std::int32_t landing_slots  = 0;
+    // Prefetched into L2 by extra CTAs of the CPU wait while the host computes this call's misses
+    // (only when a request was published).
+    MoeL2Warm l2_warm;
 };
 
 [[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

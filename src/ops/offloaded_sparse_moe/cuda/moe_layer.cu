@@ -769,8 +769,41 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
-// kWaitCtas CTAs: each with jobs to place waits for the host's answer to this call's request, then
-// places the outputs of jobs blockIdx.x, blockIdx.x + gridDim.x, ...
+// CTAs that warm the source's L2 spans after the waiting CTAs (design §19.3.3 Phase 2).
+constexpr int kWarmCtas  = 8;
+constexpr int kWarmPiece = 16384; // bytes per prefetch instruction
+
+// CTA w of kWarmCtas: prefetches its 1/kWarmCtas share of the concatenated spans into L2, one piece
+// per thread per step. Prefetches are hints: no result depends on them.
+__device__ void warm_l2(const MoeL2Warm& warm, int w) {
+    std::size_t total = 0;
+#pragma unroll
+    for (int i = 0; i < MoeL2Warm::kSpans; ++i) { total += warm.bytes[i] / 16 * 16; }
+    const std::size_t share = (total / kWarmCtas + 15) / 16 * 16;
+    const std::size_t begin = share * static_cast<std::size_t>(w);
+    const std::size_t end   = begin + share < total ? begin + share : total;
+    for (std::size_t at = begin + static_cast<std::size_t>(threadIdx.x) * kWarmPiece; at < end;
+         at += static_cast<std::size_t>(blockDim.x) * kWarmPiece) {
+        // Locate the span holding byte `at` of the concatenation; a piece never crosses a span.
+        std::size_t offset = at;
+        int span           = 0;
+        while (span < MoeL2Warm::kSpans && offset >= warm.bytes[span] / 16 * 16) {
+            offset -= warm.bytes[span] / 16 * 16;
+            ++span;
+        }
+        if (span == MoeL2Warm::kSpans) { break; }
+        const std::size_t left  = warm.bytes[span] / 16 * 16 - offset;
+        std::size_t piece = end - at < static_cast<std::size_t>(kWarmPiece) ? end - at : static_cast<std::size_t>(kWarmPiece);
+        piece             = piece < left ? piece : left;
+        const auto* address = static_cast<const std::uint8_t*>(warm.ptr[span]) + offset;
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(address), "r"(static_cast<unsigned>(piece))
+                     : "memory");
+    }
+}
+
+// kWaitCtas (+ kWarmCtas) CTAs: each waiting CTA with jobs to place waits for the host's answer to
+// this call's request, then places the outputs of jobs blockIdx.x, blockIdx.x + kWaitCtas, ...; the
+// warming CTAs prefetch the source's L2 spans while the host works.
 __global__ void __launch_bounds__(kThreads)
     cpu_wait_kernel(MoeDispatch dispatch, MoeExpertSource source, const CpuCall* __restrict__ call, int hidden,
                     bf16* __restrict__ outputs) {
@@ -779,6 +812,10 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ int entries[kSlots];
     const auto sequence = static_cast<std::uint32_t>(call->pending);
     const int n         = call->jobs;
+    if (static_cast<int>(blockIdx.x) >= kWaitCtas) {
+        if (sequence != 0) { warm_l2(source.l2_warm, static_cast<int>(blockIdx.x) - kWaitCtas); }
+        return;
+    }
     if (sequence == 0 || static_cast<int>(blockIdx.x) >= n) { return; }
     if (threadIdx.x == 0) {
         std::uint64_t start;
@@ -796,10 +833,10 @@ __global__ void __launch_bounds__(kThreads)
     // output entry of its column c (-1: unused), as slot i * kMaxCpuColumns + c of y does for job i.
     for (int s = threadIdx.x; s < kSlots; s += blockDim.x) { entries[s] = -1; }
     __syncthreads();
-    const int mine = (n - 1 - static_cast<int>(blockIdx.x)) / static_cast<int>(gridDim.x) + 1;
+    const int mine = (n - 1 - static_cast<int>(blockIdx.x)) / kWaitCtas + 1;
     if (threadIdx.x < mine) {
         const int k      = threadIdx.x;
-        const int expert = dispatch.jobs[call->job[blockIdx.x + k * gridDim.x]];
+        const int expert = dispatch.jobs[call->job[blockIdx.x + k * kWaitCtas]];
         const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
         for (int c = 0; c < count; ++c) { entries[k * offloaded_moe::kMaxCpuColumns + c] = dispatch.entries[first + c]; }
     }
@@ -814,7 +851,7 @@ __global__ void __launch_bounds__(kThreads)
     auto* out            = reinterpret_cast<int4*>(outputs);
     const auto y_item    = [&](int item) {
         const int slot = item / vectors, k = slot / offloaded_moe::kMaxCpuColumns;
-        const int job  = static_cast<int>(blockIdx.x) + k * static_cast<int>(gridDim.x);
+        const int job  = static_cast<int>(blockIdx.x) + k * kWaitCtas;
         return (static_cast<std::size_t>(job) * offloaded_moe::kMaxCpuColumns + slot % offloaded_moe::kMaxCpuColumns) *
                    vectors + item % vectors;
     };
@@ -939,9 +976,16 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
-    CpuCall* call = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
-    cpu_wait_kernel<<<kWaitCtas, kThreads, 0, stream>>>(dispatch, source, call, moe::kHidden,
-                                                        static_cast<bf16*>(outputs.data));
+    CpuCall* call    = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
+    bool warm        = false;
+    for (int i = 0; i < MoeL2Warm::kSpans; ++i) {
+        require(source.l2_warm.bytes[i] == 0 || reinterpret_cast<std::uintptr_t>(source.l2_warm.ptr[i]) % 16 == 0,
+                "experts L2 warm spans must be 16-byte aligned");
+        warm = warm || source.l2_warm.bytes[i] >= 16;
+    }
+    const int ctas = kWaitCtas + (warm ? kWarmCtas : 0);
+    cpu_wait_kernel<<<ctas, kThreads, 0, stream>>>(dispatch, source, call, moe::kHidden,
+                                                   static_cast<bf16*>(outputs.data));
     check_launch("cpu wait");
 }
 

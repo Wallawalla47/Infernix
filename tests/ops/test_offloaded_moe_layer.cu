@@ -203,6 +203,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                             .staging_slots = slots,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
                                                                              : ninfer::ops::MoeCpuChannel{}};
+        if (config.service != nullptr) {
+            // The CPU wait warms these into L2 while the host works; no output may change.
+            source.l2_warm.ptr[0]   = d_frame_base;
+            source.l2_warm.bytes[0] = frame_bytes.size();
+            source.l2_warm.ptr[1]   = d_x;
+            source.l2_warm.bytes[1] = x.size() * sizeof(std::uint16_t);
+        }
         if (config.fork) {
             source.fork_stream    = fork_stream;
             source.fork_events[0] = fork_events[0];
