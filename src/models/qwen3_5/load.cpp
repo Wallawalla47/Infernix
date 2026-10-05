@@ -72,7 +72,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
-    loading::Bindings bindings(binder);
+    loading::Bindings bindings(binder, options.a16_activations);
     const auto& text  = out->config.text;
     out->weights.text = loading::bind_text(bindings, text, options);
     if (out->config.vision) {

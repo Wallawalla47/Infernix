@@ -22,7 +22,9 @@ struct PendingWeight {
 
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder(binder) {}
+    // a16_activations binds every Use A16Only (LoadOptions::a16_activations).
+    Bindings(artifact::Binder& binder, bool a16_activations)
+        : binder(binder), a16_activations(a16_activations) {}
 
     [[nodiscard]] WeightId parameter(std::string name, artifact::Shape shape,
                                      std::vector<std::string> inputs   = {},
@@ -37,6 +39,7 @@ public:
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
 
     artifact::Binder& binder;
+    bool a16_activations = false;
     std::vector<PendingWeight> weights;
 
 private:
