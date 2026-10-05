@@ -29,8 +29,11 @@ official Qwen3.8-27B NVFP4 artifact, chunks of 256-7168 tokens moved perplexity 
 a KL divergence of 0.025-0.033 from the one-pass run (about 4 % of positions change their top
 token), as large as switching the KV cache between BF16 and INT8. The Q6 artifact, with 16-bit
 activations, moved 15 times less (KL 0.0021). So treat a perplexity difference under about 1 %
-between two NVFP4 builds or settings as noise unless it holds at several chunk sizes. The
-available Main
+between two NVFP4 builds or settings as noise unless it holds at several chunk sizes.
+`--a16-activations` runs every linear with 16-bit activations (about 3x slower on NVFP4
+artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
+other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
+the recorded results. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `ninfer` and
 `ninfer-serve`, which default to `bf16`, `ninfer-perplexity` defaults to `fp8`. `int8` scores with the fast
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as

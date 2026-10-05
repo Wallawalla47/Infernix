@@ -465,6 +465,12 @@ Different production routes use different criteria only when their arithmetic or
 profiles differ materially. Widening a criterion requires a numerical reason and requalification
 of its complete affected domain; one failing implementation is not sufficient justification.
 
+Op qualification does not show what a change does to a whole model's output. On artifacts with
+4-bit activations even reordered arithmetic moves the output distribution measurably, so a
+model-level claim follows [Model-level numerical quality](model-quality.md): several prefill chunk
+sizes, KL divergence to the 16-bit-activation reference, and the decode-quality judge for decode
+paths.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,
