@@ -376,12 +376,15 @@ int run_vision_case(const DeviceWeight& weight, std::int32_t tokens,
 }
 
 // The BF16 vision tower projections of Qwen3.8-Flash-Next and Qwen3.5 (and Quasar's merger
-// [5120,4608]) are registered problems. Calls up to T = 4100 compare every output with the FP64
-// oracle; T = 16384 and 65536 compare complete columns at tile seams and both ends. [4304,1152]
-// and [1152,4304] exercise the N and K tails of the tail-capable TMA route.
+// [5120,4608]) and Flash-Next's BF16 text prefill projections are registered problems. Calls up to
+// T = 4100 compare every output with the FP64 oracle; T = 16384 and 65536 compare complete columns
+// at tile seams and both ends. [4304,1152] and [1152,4304] exercise the N and K tails of the
+// tail-capable TMA route, [96,2560] a problem narrower than one tile.
 int run_vision_bf16_linear() {
     constexpr std::int32_t kFullTokens = 4100;
     const std::vector<std::pair<int, int>> shapes = {
+        {13952, 2560}, // Flash-Next QSA query, gate, key, value and index projections (one group)
+        {96, 2560},    // Flash-Next GDN a/b projections
         {1152, 1536}, // patch embedding
         {3456, 1152}, // fused QKV
         {1152, 1152}, // attention output

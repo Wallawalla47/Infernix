@@ -151,3 +151,18 @@ is read from DRAM about once while the at most 47 MB weight stays in L2.
 Selection uses complete-Op cold-L2 CUDA-graph timings of private-launcher candidates at
 T = 9..65,536 (to 16,384 for the merger), the fallback, and the registered route, taking per
 interval the fastest candidate within a small tolerance.
+
+## 6. BF16 text problems of Qwen3.8-Flash-Next
+
+Recipe B keeps two text projection groups in BF16 (the converter's per-class 8-bit rule does not
+apply to them): the QSA group `[13952,2560]` (query, gate, key, value and the index projections in
+one object, 12 layers) and the GDN a/b projections `[96,2560]` (36 layers). T is a call's columns:
+1-8 in decode and verification, 9-255 for CPU-assisted prefill calls and short prompts, and the
+prefill chunk (typically 1,024-4,096) otherwise. T <= 8 keeps the fallback's skinny GEMV, so decode
+and verification outputs are unchanged; larger T routes per token interval to the fastest schedule
+of the V0 tile sweep (within 2 % at each measured T).
+
+Measured with that sweep (RTX 5090, cold-L2 CUDA graphs, median of 7): `[13952,2560]` 303.6 ->
+45.5 us at T = 9, 5,473 -> 347 us at T = 1,024, 21,491 -> 1,229 us at T = 4,096 (17.5x), 85,492 ->
+4,836 us at T = 16,384; `[96,2560]` 222-443 us -> 6.8-36 us from T = 9 to 8,192 (the fallback's
+32x32 tiles leave most SMs idle at N = 96).

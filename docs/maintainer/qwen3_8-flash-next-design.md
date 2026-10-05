@@ -4552,6 +4552,12 @@ that lends during the fill phase with landing reservations outstanding.
   projection [13952,2560], 24 calls × 22.2 ms at T = 4096, and [96,2560], 72 × 0.34 ms (measured).
   Tensor-core routes would recover ~0.45 s per 8K-token prefill (estimated), image prompts
   included. Prefill numerics would change, so this is the separate task above.
+  **Done 2026-10-05** (branch `claude/fn-bf16-text`): both problems are registered BF16 problems
+  ([linear tuning §6](linear-tuning.md)); T <= 8 is unchanged. Op-level: 21.5 -> 1.23 ms per
+  `[13952,2560]` call at T = 4,096, ~0.24 s per 4K chunk over the 12 QSA layers.
+  End to end (dense8m, ABBA): pp200 +4.6 %, pp4096 +0.3 %, pp16384 +0.6 %, tg512 unchanged; paired
+  NLL +0.011 +/- 0.009 (rounding level). The long-prompt gain is far below the op-level estimate;
+  the cause is not established (a profile of both builds would show where the 22 ms went).
 - **Prefill io upload through the copy-engine FIFO (unverified).** `run()` uploads the io layout
   with `cudaMemcpyAsync` (`program.cpp:979`), sharing the FIFO with up to ~77 ms of promotions
   issued after the previous chunk; decode avoids this with `upload_pinned` (§19.2). Worth checking
