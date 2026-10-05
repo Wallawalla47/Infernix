@@ -1078,7 +1078,10 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
    - It waits only when the prefill it saves exceeds the split it may add, and when twice the
      sibling's predicted prefill up to the target (other lanes' decode rounds interleave) is within
      half the Engine's queue timeout (`pending_timeout_ms`). A waiting head stays in the FIFO.
-   - Vision prompts do not coalesce: placeholder tokens are equal for different media.
+   - Vision placeholder tokens are equal for different media, so the shared prefix ends at the
+     first media item the two prompts do not carry identically (content digest, grid, timing,
+     token placement). A request whose shared prefix covers a sibling's image waits for the
+     snapshot past it and encodes nothing for that image (ignis ADR 0035's fan-out case).
    - Every sibling prefill boundary re-arms admission, and the head stops waiting once the sibling
      passes the target, finishes or is cancelled. So a missing snapshot never blocks it for long.
    - Gate: total prefill tokens reduced on the concurrent-shared-prefix trace, with no TTFT
