@@ -334,7 +334,7 @@ struct EngineOptions {
     // Every linear projection computes with 16-bit activations, even where the artifact permits
     // 8- or 4-bit activation compute. Same weights, no activation quantization: the reference for
     // measuring what activation quantization costs (ninfer-perplexity --a16-activations, the
-    // decode-quality judge). On the Qwen3.8-27B NVFP4 artifacts it makes prefill about 3x slower.
+    // decode-quality judge). On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
     bool a16_activations               = false;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

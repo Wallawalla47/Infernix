@@ -21,7 +21,7 @@ BF16 projections one pass uses, and activation divisors are static), yet:
 | Q6 artifact (16-bit activations), 256-token chunks | KL 0.0021, top-1 agreement 0.991 (15 times smaller) |
 
 Two NVFP4 runs differ from each other more (KL about 0.026) than either differs from the same
-weights run with 16-bit activations (KL about 0.020): each run scatters around the 16-bit answer,
+weights run with 16-bit activations at the 4-bit sites (KL about 0.020): each run scatters around the 16-bit answer,
 and the chunk size only picks the scatter. So:
 
 - A perplexity difference under about 1 % between two NVFP4 builds or settings is noise unless it
@@ -51,9 +51,11 @@ same source builds in an upstream checkout for a like-for-like comparison.
 
 Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `5fbfc3db` against
 upstream `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
-perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The 16-bit reference in these
-runs switched the 4-bit (MLP) sites; switching the attention and GDN projections changed nothing on
-these artifacts, so it equals `a16_activations`.
+perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
+lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
+projections) kept them. `a16_activations` lifts those too, so it is a stricter reference: the KL
+figures in sections 1, 3.1 and 3.4 are against the narrower one, and the decode comparison (3.3)
+was repeated with `a16_activations`.
 
 ### 3.1 Where the activation error comes from
 
@@ -63,10 +65,12 @@ KL to the reference at one pass / 4096-token chunks, with uncached prefill time 
 | 16-bit activations at | KL | Top-1 agreement | Prefill time |
 |---|---|---|---|
 | none (production) | 0.0200 / 0.0231 | 0.966 | 1.0x |
-| attention, GDN, output projections | unchanged (bit-identical) | | 1.0x |
+| attention, GDN, output projections (no 4-bit sites) | unchanged (bit-identical) | | 1.0x |
 | MLP gate and up | 0.0146 / 0.0134 | 0.974 | 2.6x |
 | MLP down | 0.0169 / 0.0184 | 0.969 | 1.4x |
-| everything (the reference) | 0 | 1 | 3.0x |
+| every 4-bit site (the reference here) | 0 | 1 | 3.0x |
+
+`a16_activations` also lifts the 8-bit sites, so it is at least as slow as the last row.
 
 ### 3.2 Fork against upstream, prefill
 
@@ -85,16 +89,19 @@ kernels are as accurate as upstream's within this resolution.
 ### 3.3 Fork against upstream, decode
 
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
-7 drafts and the proposal head, INT8 KV, judged against the 16-bit reference on each build's own
-prefixes:
+7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
+tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and by the committed
+`ninfer_decode_quality_judge` (`a16_activations`, every site at 16 bits):
 
-| Build | Reference-top agreement | Mean regret (nats) |
-|---|---|---|
-| Upstream | 0.9736 | 0.0080 |
-| Fork | 0.9736 | 0.0086 |
-| Fork with n-gram drafting (15 drafts, min match 12) | 0.9729 | 0.0087 |
+| Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
+|---|---|---|---|---|
+| Upstream | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
+| Fork | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
+| Fork with n-gram drafting (15 drafts, min match 12) | 0.9729 | 0.0087 | 0.9764 | 0.0071 |
 
-Greedy decode chooses the reference's top token as often as upstream's. Builds share their first
+Greedy decode chooses the reference's top token at least as often as upstream's under both
+references; the differences are a few tenths of a percent and change order between them, so they
+are within noise. Builds share their first
 54-68 generated tokens on average before rounding noise makes them diverge; the fork with and
 without n-gram drafting shares 267 of 384.
 
