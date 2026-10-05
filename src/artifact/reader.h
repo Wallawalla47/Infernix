@@ -43,6 +43,8 @@ public:
     [[nodiscard]] std::vector<std::byte> read_object(ObjectHandle handle) const;
     [[nodiscard]] std::size_t read_direct(std::size_t file_index, std::uint64_t file_offset,
                                           std::span<std::byte> destination) const;
+    // The path of file `file_index` (0: the entry), after its header is validated.
+    [[nodiscard]] std::filesystem::path file_path(std::size_t file_index) const;
 
 private:
     struct Impl;

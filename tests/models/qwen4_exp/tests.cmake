@@ -24,6 +24,13 @@ ninfer_add_test(ninfer_qwen4_exp_forward_real_test
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The SSD tier's in-place records on the real artifact (memory track R6, RT3/RT4): streamed records
+# read through DirectReadQueue equal the pinned load's bytes. Skips without NINFER_QWEN4_ARTIFACT.
+ninfer_add_test(ninfer_qwen4_exp_expert_store_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_store_real.cpp"
+  LIBRARIES ninfer_model_loading)
+set_tests_properties(ninfer_qwen4_exp_expert_store_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
 # The internal route trace through the public Engine on the real artifact (memory track R0): ids
 # identical with the trace on, the trace consistent with the requests, and the graph executables'
 # device memory. Skips without NINFER_QWEN4_ARTIFACT and a prompt list (arguments).

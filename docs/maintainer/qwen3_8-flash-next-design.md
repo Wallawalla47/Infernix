@@ -6904,6 +6904,41 @@ ledger and `--vram-headroom-mib N|auto`; RT7 and the engine smoke pass.
 R2 and R3 implemented on `claude/fn-memory`: the VMM frame pool with resize, the monitor, the law
 and the idle hook; RT8 (host), RT9 and RT13 (engine, fake source) are the tests.
 
+R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2026-10-05):
+
+- **R7** `core/direct_read_queue` as planned (IOCP; a `pread` pool on POSIX, where an issued read
+  cannot be cancelled, so the timeout is not enforced there and `cancel_all` waits). Two depth caps
+  plus a common one, 256 KiB prefetch sub-reads, transient backoff within `transient_bound`, one
+  retry for other errors and for a timeout (after `CancelIoEx`), short reads fail at once. RT3b
+  (`ninfer_direct_read_queue_test`) passes; the POSIX path is compiled only, not run.
+- **R8** `program/expert_cache/host_tier` as planned, with these choices: a ring or prefetch slot
+  stays `Free` while the agent writes it (the engine thread knows a landing only through its
+  serial at the boundary; `Landing` marks a demotion target during its D2H); a free resident slot
+  is used before any victim; the demotion list is refilled from free slots first. RT2
+  (`ninfer_qwen4_exp_host_tier_test`) checks the LFU against the naive sum (< 1e-9 relative), every
+  transition and a 2,000-round randomized run against a naive victim scan with the audit after
+  every round. **Deviation:** no Python reference fixtures; the C++ naive oracles decide the same
+  victims.
+- **R6** `artifact::Residency::Streamed`: the binder locates the object and the materializer
+  reads nothing; `MaterializedArtifact::stream_source()` keeps the file paths (entry and parts,
+  headers validated through `Reader::file_path`) and each streamed object's file segments after
+  the Reader is gone. `LoadOptions::stream_experts` binds the 48 banks `Streamed`; the load reads
+  each bank's scale tail into Model memory, `expert_bank_layout` gives the bank planes without
+  records, and the Model owns an `ExpertStore`: each record's one or two 4 KiB-aligned segments
+  (the constructor rejects any other). The product never sets the option until R10, and the
+  Program has no tier yet, so it is reachable only from tests. RT4
+  (`ninfer_qwen4_exp_expert_store_real_test`): every record of the first, last and straddling
+  layers read through R7 from the store's segments equals the pinned load's bytes.
+- **R5** (part): `MoeExpertSource::host_table` (device array of host record pointers; null keeps
+  today's `host_records + e x stride`), read by `record_of`, the stage kernel's zero-copy and
+  staging copies and the CPU plan, which writes `MissRequest::record[j]` and `tiered`; the CPU
+  service then uses those pointers. The CPU request sequence skips 0 when it wraps (an existing
+  defect: after 2^32 requests a call's CPU jobs got no outputs). RT5: the layer test's routes with
+  the records in shuffled host slots reached only through the table (zero-copy, staged, fork, CPU
+  jobs, prefill assist). **Not done:** the heartbeat wait and error word that replace the 2 s trap
+  (they need R10's error checks, so they land with it), the per-layer table in `Forward`, and
+  promotions through the host-pointer mirror (R10).
+
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
 Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");

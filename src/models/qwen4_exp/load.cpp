@@ -125,7 +125,7 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix) {
+MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix, Residency experts) {
     const std::uint64_t h = c.hidden_size, e = c.moe.experts, s = c.moe.shared_intermediate;
     const std::string input = prefix + "ffn_input", p = prefix + "moe/";
     MoeWeights out;
@@ -134,8 +134,7 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix)
     out.shared_gate  = b.parameter(p + "shared/gate", {s, h}, input);
     out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
     out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
-    out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, QType::NVFP4_MUL,
-                                   Residency::HostPinned);
+    out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, QType::NVFP4_MUL, experts);
     out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32,
                                    Residency::Values);
     return out;
@@ -155,7 +154,7 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& prefix)
     return out;
 }
 
-TextWeights bind_text(Bindings& b, const TextConfig& c) {
+TextWeights bind_text(Bindings& b, const TextConfig& c, Residency experts) {
     TextWeights out;
     const std::uint64_t h = c.hidden_size, v = c.vocab_size;
     out.token_embedding = b.parameter("text/token_embedding", {v, h}, {}, QType::BF16,
@@ -173,7 +172,7 @@ TextWeights bind_text(Bindings& b, const TextConfig& c) {
             block.mixer = bind_gdn(b, c, prefix);
         }
         block.mlp_hc = bind_hc(b, c, prefix + "mlp_hc/", true);
-        block.moe    = bind_moe(b, c, prefix);
+        block.moe    = bind_moe(b, c, prefix, experts);
         out.layers.push_back(std::move(block));
     }
     return out;
@@ -395,7 +394,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
     Bindings bindings(binder);
-    out->weights = bind_text(bindings, out->config.text);
+    out->weights = bind_text(bindings, out->config.text,
+                             options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
         out->weights.vision = bind_vision(bindings, *out->config.vision, out->config.text,
                                           options.overlay_vision() ? Residency::HostPinned : Residency::Device);
@@ -441,8 +441,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
 
 Model::Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
              std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-             std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing)
-    : backing_(std::move(backing)), config_(std::move(config)), options_(options),
+             std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing,
+             std::optional<ExpertStore> expert_store)
+    : backing_(std::move(backing)), expert_store_(std::move(expert_store)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), banks_(std::move(banks)),
       resources_(std::move(resources)), info_(std::move(info)), overlay_vision_(std::move(overlay_vision)) {}
 
@@ -452,8 +453,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                          const StartupObserver* observer) {
     if (!plan.impl_) { throw ArtifactError("load plan was already consumed"); }
     auto data    = std::move(plan.impl_);
-    auto backing = artifact::materialize(*data->materialization.source,
-                                         std::move(data->materialization), device, observer);
+    const artifact::Reader& reader = *data->materialization.source;
+    auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer);
     std::vector<BoundWeight> bound;
     bound.reserve(data->pending.size());
     for (auto& item : data->pending) {
@@ -469,6 +470,11 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     }
     std::vector<ExpertBank> banks;
     const auto& layers = data->weights.layers;
+    // Streamed banks (the SSD tier): the records stay in the artifact; each layer's multipliers
+    // (the scale tail) are read here into Model memory.
+    const bool streamed = data->options.stream_experts;
+    std::vector<artifact::ObjectHandle> bank_objects;
+    std::vector<std::vector<float>> multipliers;
     for (std::size_t i = 0; i < layers.size(); ++i) {
         const auto& view = bound.at(layers[i].moe.experts.index).view;
         if (view.parts.size() != 1 || !is_complete_weight(view)) {
@@ -476,7 +482,19 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
                                 ": an expert bank must be one complete parent");
         }
         ExpertBank bank;
-        bank.planes = expert_bank_planes(*view.parts.front().parent);
+        if (streamed) {
+            const auto& reference = data->pending.at(layers[i].moe.experts.index).reference;
+            const auto object     = reference.binding.parts.front().object;
+            const auto& parent    = *view.parts.front().parent;
+            std::vector<float> words(parent.geometry.scale_bytes / sizeof(float));
+            reader.read_into(artifact::object_offset(reader.directory().object(object)) + parent.geometry.scale_offset,
+                             std::as_writable_bytes(std::span(words)));
+            bank.planes = expert_bank_layout(parent.geometry, words.data());
+            bank_objects.push_back(object);
+            multipliers.push_back(std::move(words));
+        } else {
+            bank.planes = expert_bank_planes(*view.parts.front().parent);
+        }
         if (bank.planes.experts != data->config.text.moe.experts ||
             bank.planes.hidden != data->config.text.hidden_size ||
             bank.planes.intermediate != data->config.text.moe.intermediate) {
@@ -485,6 +503,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
                                     bound.at(layers[i].moe.input_scales.index).name);
         banks.push_back(std::move(bank));
+    }
+    std::optional<ExpertStore> store;
+    if (streamed) {
+        const auto& c = data->config.text;
+        store.emplace(backing.stream_source(), bank_objects, banks.front().planes.record_stride, c.moe.experts,
+                      std::move(multipliers)); // the vectors move, so the planes' pointers stay valid
     }
     std::optional<qwen3_5::VisionOverlayAssets> overlay;
     if (data->vision_overlay) {
@@ -499,7 +523,8 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     return std::unique_ptr<Model>(new Model(std::move(data->config), data->options,
                                             std::move(data->weights), std::move(bound),
                                             std::move(banks), std::move(data->resources),
-                                            std::move(data->info), std::move(overlay), std::move(backing)));
+                                            std::move(data->info), std::move(overlay), std::move(backing),
+                                            std::move(store)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

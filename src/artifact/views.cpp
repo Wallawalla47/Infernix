@@ -16,6 +16,8 @@ WeightView bind_view(const ParameterReference& reference,
             parent = &materialized.device_parent(part.object);
         } else if (reference.residency == Residency::HostPinned) {
             parent = &materialized.pinned_parent(part.object);
+        } else if (reference.residency == Residency::Streamed) {
+            parent = &materialized.streamed_parent(part.object);
         } else {
             parent = &materialized.host_parent(part.object);
         }

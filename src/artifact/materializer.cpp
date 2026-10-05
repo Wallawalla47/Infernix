@@ -187,6 +187,36 @@ const WeightParent& MaterializedArtifact::pinned_parent(ObjectHandle handle) con
     return *objects_[handle.index].pinned;
 }
 
+const WeightParent& MaterializedArtifact::streamed_parent(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].streamed) {
+        throw ArtifactError("object is not streamed");
+    }
+    return *objects_[handle.index].streamed;
+}
+
+bool StreamSource::contains(ObjectHandle object) const noexcept {
+    return object.index < objects_.size() && objects_[object.index].has_value();
+}
+
+std::uint64_t StreamSource::object_bytes(ObjectHandle object) const {
+    if (!contains(object)) { throw ArtifactError("object is not streamed"); }
+    return objects_[object.index]->bytes;
+}
+
+std::vector<FileSegment> StreamSource::segments(ObjectHandle object, std::uint64_t offset, std::uint64_t bytes) const {
+    if (!contains(object)) { throw ArtifactError("object is not streamed"); }
+    const Object& o = *objects_[object.index];
+    if (offset > o.bytes || bytes > o.bytes - offset) { throw ArtifactError("streamed range exceeds its object"); }
+    std::vector<FileSegment> out;
+    const std::uint64_t end = offset + bytes;
+    for (const auto& s : o.segments) {
+        const std::uint64_t lo = std::max(offset, s.at), hi = std::min(end, s.at + s.bytes);
+        if (lo >= hi) { continue; }
+        out.push_back({s.file, s.offset + (lo - s.at), lo - offset, hi - lo});
+    }
+    return out;
+}
+
 const PinnedHostBuffer& MaterializedArtifact::pinned_block() const {
     if (!pinned_) { throw ArtifactError("materialization has no pinned block"); }
     return *pinned_;
@@ -232,6 +262,30 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.device_object_count   = plan.device_objects.size();
     out.stats_.host_object_count     = plan.host_objects.size();
     out.stats_.pinned_object_count   = plan.pinned_objects.size();
+    // Streamed objects: their files and segments only; nothing is read.
+    if (!plan.streamed_objects.empty()) {
+        auto& source = out.stream_source_;
+        source.objects_.resize(plan.object_count);
+        std::vector<std::int32_t> file_of(reader.directory().files.size(), -1);
+        for (const auto handle : plan.streamed_objects) {
+            const auto& object   = reader.directory().object(handle);
+            const auto& geometry = reader.geometry(handle);
+            if (geometry.bytes != object_bytes(object)) { throw ArtifactError("streamed object size differs"); }
+            StreamSource::Object streamed;
+            streamed.bytes = geometry.bytes;
+            for (const auto& segment : reader.segments(object_offset(object), geometry.bytes)) {
+                auto& index = file_of.at(segment.file_index);
+                if (index < 0) {
+                    index = static_cast<std::int32_t>(source.files_.size());
+                    source.files_.push_back(reader.file_path(segment.file_index));
+                }
+                streamed.segments.push_back({static_cast<std::uint32_t>(index), segment.file_offset,
+                                             segment.destination_offset, segment.bytes});
+            }
+            source.objects_[handle.index] = std::move(streamed);
+            out.objects_.at(handle.index).streamed = WeightParent{geometry, nullptr};
+        }
+    }
     if (plan.device_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
         throw ArtifactError("device backing exceeds size_t");
     }
