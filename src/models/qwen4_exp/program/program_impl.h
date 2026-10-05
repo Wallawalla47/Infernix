@@ -1968,10 +1968,12 @@ private:
     // ---- prefill expert streaming (design §19.3.8 F2, F3) ----
     // Chunks of at least kStreamMinColumns route nearly every expert of a layer, so all of a layer's
     // non-resident experts are copied ahead; narrower chunks keep the MoE's staging. The ring holds
-    // two halves of up to kStreamHalfMax records (+ one frame for the slot tables), lent by the
-    // expert cache for the prompt and returned when no lane is prefilling.
+    // two halves of as many records as the layer with the most non-resident experts has when it is
+    // lent (+ one frame for the slot tables), so no streamed layer leaves misses to staging; it is
+    // lent by the expert cache for the prompt and returned when no lane is prefilling. Halves of
+    // 384 records (a cold cache misses all 512 of a layer) were 9 % slower at pp4096 (design
+    // §19.3.8, F2 ring size).
     static constexpr std::int32_t kStreamMinColumns = 256;
-    static constexpr std::uint32_t kStreamHalfMax   = 384;
     static constexpr std::uint32_t kStreamHalfMin   = 16;
 
     // Whether this chunk streams; lends the ring first when none is held.
@@ -1986,7 +1988,7 @@ private:
                 for (std::uint32_t e = 0; e < E; ++e) { absent += table[static_cast<std::size_t>(l) * E + e] < 0 ? 1U : 0U; }
                 most = std::max(most, absent);
             }
-            const std::uint32_t half   = std::min(kStreamHalfMax, most);
+            const std::uint32_t half   = most;
             const std::uint32_t frames = std::min(2 * half + 1, residency_->lendable());
             if (half == 0 || expert_stream_->slots_in(static_cast<std::size_t>(frames) * residency_->frame_stride()) <
                                  2 * kStreamHalfMin) {
