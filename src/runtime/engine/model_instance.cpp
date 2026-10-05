@@ -140,8 +140,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::CausalScoring:
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
-        options.prefill_chunk        = 1024;
-        options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
+        options.kv_capacity         = KvCapacityPolicy::explicit_capacity(options.max_context);
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
