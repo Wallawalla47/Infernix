@@ -54,6 +54,7 @@ struct Options {
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
+    std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
@@ -67,6 +68,8 @@ std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
+           "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"
+           "        default the Engine's 1024)\n"
            "       [--rope-yarn-factor F] (startup-fixed, finite [1,4], default 1; ceiling only)\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
@@ -121,6 +124,8 @@ Options parse_options(int argc, char** argv) {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
             out.stride = parse_integer<std::uint32_t>(value("--stride"), "stride");
+        } else if (option == "--prefill-chunk") {
+            out.prefill_chunk = parse_integer<std::uint32_t>(value("--prefill-chunk"), "prefill-chunk");
         } else if (option == "--device") {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--use-original-int8-prefill-kernel") {
@@ -261,6 +266,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
+    if (options.prefill_chunk) { engine_options.prefill_chunk = *options.prefill_chunk; }
     engine_options.kv_cache         = options.kv;
     engine_options.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
     engine_options.prefill_8bit_pv              = options.prefill_8bit_pv;
@@ -524,7 +530,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"prefill_8bit_pv", ninfer::prefill_pv8_name(options.prefill_8bit_pv)},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"stride_tokens", options.stride},
-          {"prefill_chunk_tokens", 1024},
+          {"prefill_chunk_tokens", engine.options().prefill_chunk},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)}}},
         {"timing",

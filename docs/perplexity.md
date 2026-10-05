@@ -19,7 +19,18 @@ English reference text, English long-form text, Chinese reference text, and NInf
 ```
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
-`--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
+`--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. Each window is
+prefilled in passes of `--prefill-chunk` tokens (a multiple of 128, default 1024), recorded in
+`report.json` as `prefill_chunk_tokens`; INT8, NVFP4, FP8 and K8V4 KV round it down to whole
+prompt-attention waves (896 tokens on Qwen3.8-27B). The pass size changes only the order of
+rounding, but on artifacts with 4-bit activations that order matters more than it seems: on the
+official Qwen3.8-27B NVFP4 artifact, chunks of 256-7168 tokens moved perplexity by -0.6 % to
++0.8 % against one pass per window, with no trend in the chunk size, and every chunked run sat at
+a KL divergence of 0.025-0.033 from the one-pass run (about 4 % of positions change their top
+token), as large as switching the KV cache between BF16 and INT8. The Q6 artifact, with 16-bit
+activations, moved 15 times less (KL 0.0021). So treat a perplexity difference under about 1 %
+between two NVFP4 builds or settings as noise unless it holds at several chunk sizes. The
+available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `ninfer` and
 `ninfer-serve`, which default to `bf16`, `ninfer-perplexity` defaults to `fp8`. `int8` scores with the fast
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as
