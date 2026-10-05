@@ -16,10 +16,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 namespace moe      = ninfer::ops::offloaded_moe;
@@ -126,6 +128,26 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     std::vector<moe::CpuMissService::Layer> layers{{.records = host, .record_stride = stride, .scales = scales.data()}};
     moe::CpuMissService service_two(layers, {.workers = 2, .max_jobs = 2, .max_columns = 64, .cpus = {}});
     moe::CpuMissService service_eight(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {}});
+    // The largest cap with every miss offered to the CPU, and a cap whose jobs are limited to two columns.
+    moe::CpuMissService service_all(layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
+                                             .pcie_divisor = 0, .cpus = {}});
+    moe::CpuMissService service_narrow(layers, {.workers = 6, .max_jobs = 24, .max_columns = 64, .pcie_divisor = 2,
+                                                .max_job_columns = 2, .cpus = {}});
+    // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
+    // with at most max_job_columns columns, so the number served is min(want, eligible misses).
+    std::vector<int> expert_columns(experts, 0);
+    for (const std::int32_t id : ids) { ++expert_columns[id]; }
+    const auto expected_cpu_jobs = [&](const moe::CpuMissService& service) {
+        const auto channel = service.channel(0);
+        int misses = 0, eligible = 0;
+        for (int e = 0; e < experts; ++e) {
+            if (expert_columns[e] == 0 || frames[e] >= 0) { continue; }
+            ++misses;
+            eligible += expert_columns[e] <= channel.max_job_columns ? 1 : 0;
+        }
+        const int want = std::min(channel.max_jobs, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        return std::min(want, eligible);
+    };
     struct Config {
         int slots;
         const moe::CpuMissService* service;
@@ -138,7 +160,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
     for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
-                                Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true}}) {
+                                Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
+                                Config{3, &service_all}, Config{64, &service_all, true}, Config{64, &service_narrow},
+                                Config{64, &service_narrow, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -158,8 +182,19 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+        const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
         ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
+        if (config.service != nullptr) {
+            // The service counts after answering, so its count may trail the device by a moment.
+            const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service));
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (config.service->served_experts() - served_before < want && std::chrono::steady_clock::now() < until) {
+                std::this_thread::yield();
+            }
+            check(config.service->served_experts() - served_before == want,
+                  "the CPU serves min(cap, M - M / divisor) of the eligible misses");
+        }
         std::vector<std::uint16_t> got(expected.size());
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
         long mismatches = 0;
@@ -304,6 +339,8 @@ int main() {
         test_layer(24, 8, 10, 11); // verify width: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert
         test_layer(9, 4, 3, 17);   // MTP verification width: one-column kernels, several passes per job
+        test_layer(96, 10, 10, 19); // more misses than the largest cap; publishes a subset of ten columns
+        test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

@@ -77,16 +77,17 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// of staging_slots jobs, so every miss is staged; staging_slots == 0 reads misses zero-copy.
 /// The staging slots are scratch of this call and are shared by every layer.
 /// CPU-served misses (design section 10.3). When enabled for a call (max_jobs > 0 and the call
-/// has at most max_columns columns), up to max_jobs of its non-resident experts with at most
-/// kMaxCpuColumns columns, the fewest-column ones first, are
-/// published as a request in mapped host memory and computed by the host's expert engine
-/// (offloaded_moe::CpuMissService) while the GPU computes the other jobs. moe_experts returns
-/// after placing the host's outputs. The arithmetic is the same exact W4A4, so where an expert
-/// is computed never changes a bit. A host that does not answer within 2 s traps the kernel.
+/// has at most max_columns <= kMaxCpuCallColumns columns), up to max_jobs <= kMaxCpuJobs of its
+/// non-resident experts with at most max_job_columns columns, the fewest-column ones first, are
+/// published as a request in mapped host memory, with the x columns they read, and computed by
+/// the host's expert engine (offloaded_moe::CpuMissService) while the GPU computes the other jobs.
+/// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
+/// so where an expert is computed never changes a bit. A host that does not answer within 2 s
+/// traps the kernel.
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, max_columns]
-    const std::uint16_t* y              = nullptr; // mapped BF16 [H, kMaxCpuJobs * kMaxCpuColumns]
+    const std::uint16_t* y              = nullptr; // mapped BF16 [H, max_jobs * kMaxCpuColumns]
     const std::uint32_t* done           = nullptr; // mapped; the host writes the answered sequence
     std::uint32_t* sequence             = nullptr; // device counter of published requests
     std::int32_t layer                  = 0;
@@ -95,6 +96,7 @@ struct MoeCpuChannel {
     // misses / pcie_divisor of a call's misses stay on the GPU stage (0: the CPU takes up to
     // max_jobs of them), so the CPU and the PCIe stage share the call's misses.
     std::int32_t pcie_divisor           = 3;
+    std::int32_t max_job_columns        = offloaded_moe::kMaxCpuColumns; // 1..kMaxCpuColumns
 };
 
 struct MoeExpertSource {

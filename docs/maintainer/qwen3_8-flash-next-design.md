@@ -5650,6 +5650,31 @@ C = 1 cold and turnover MTP change speed, plain C = 1 (M ≈ 3) only gets the fa
 C = 4 plain fill, then columns and workers on the top three, then every workload. Verification-heavy
 rounds must be in it; the single winner is committed.
 
+*S3 as implemented* (branch `claude/fn-conc-s3`, 2026-10-05):
+
+- **Capacity.** `kMaxCpuJobs` 32 and `kMaxCpuCallColumns` 128 (8 lanes × verify width 16; the
+  service and `moe_experts` refuse more). `MissRequest` 1,296 B. The service's mapped y and its
+  team are sized by the configured cap, not by `kMaxCpuJobs`. `CpuCall` (136 B) still fits the
+  256-byte workspace tail (static assertion).
+- **Job columns.** `MoeCpuChannel::max_job_columns` (1..8, default 8) bounds the width loop;
+  `CpuMissService::Options::max_job_columns` sets it.
+- **Plan.** One CTA of 256 threads: each thread counts its jobs' misses (M) and eligible misses
+  per width; thread 0 forms `want` and each width's take and first slot; then, per chunk of 256
+  jobs, a warp ballot per width ranks every miss among the same-width misses before it (earlier
+  chunks, lower warps, lower lanes), so the n-th chosen miss lands in today's slot (fewest
+  columns first, job order within a width) without a serial walk. It publishes only the x
+  columns the chosen jobs read (a shared bitmap; 16-byte stores at their original offsets).
+- **Wait.** `kWaitCtas = min(8, kMaxCpuJobs)` CTAs; a CTA with no job (index ≥ n) exits at once,
+  the others poll `done` (2 s trap) and place jobs c, c + 8, ...
+- **Tests.** `test_offloaded_moe_layer.cu`: services with cap 32 / divisor 0 and cap 24 /
+  divisor 2 / 2-column jobs, on the pass, serial and fork routes; an oracle of the number of
+  CPU-served experts (min(want, eligible misses)); shapes with more misses than the largest cap
+  (E 96, T 10: ten published columns of 10) and with more than 256 jobs (E 400, T 64).
+- **Sweep tooling (never committed).** `fn/rigs/conc/s3_sweep_patch.py` adds TEMP-S3 environment
+  overrides (`NINFER_Q4_CPU_JOBS`, `_DIVISOR`, `_WORKERS`, `_JOB_COLUMNS`) to a measurement
+  build; `s3_sweep.bat` (stage 1, cap × divisor, the 8/3 default three times as drift control)
+  and `analyze_s3.py`.
+
 **S4. Fill-phase landing (1.5 days).** While free frames remain, a staged miss lands in a reserved
 free frame instead of a staging slot and becomes resident, replacing its later promotion.
 CPU-served misses are still promoted within the budget.
