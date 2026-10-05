@@ -1,457 +1,603 @@
-# NInfer 资源调度与上下文缓存
+# NInfer Resource Scheduling and Context Cache
 
-本文说明 Generation 如何在有限显存和 Host RAM 中协调请求执行、上下文复用与抢占恢复，是这些
-策略的设计权威。全局执行与发布关系见 [Engine 架构](engine-architecture.md)，KV 的物理布局、
-页表和消费者约束见 [Paged KV](paged-kv-cache.md)。
+This document explains how Generation coordinates request execution, context reuse and preemption
+recovery within limited device memory and Host RAM, and it is the design authority for these
+policies. The global execution and publication relationships are in
+[Engine architecture](engine-architecture.md); the physical KV layout, page tables and consumer
+constraints are in [Paged KV](paged-kv-cache.md).
 
-## 1. 核心思路
+## 1. Core idea
 
-NInfer 在单 GPU、单常驻模型、启动固定的 1–8 个执行槽上运行。Hybrid 模型复用一个前缀，需要
-该位置的完整 recurrent state 和连续 KV 覆盖。KV 可以逐页共享，recurrent state 则是某个位置
-的完整恢复镜像。因此，缓存管理同时使用三个单位：
+NInfer runs on a single GPU with a single resident model and 1–8 execution slots fixed at startup.
+For a Hybrid model to reuse a prefix, it needs the complete recurrent state at that position and
+contiguous KV coverage. KV can be shared page by page, while recurrent state is a complete restore
+image of one position. Cache management therefore uses three units at once:
 
-- **续接记录**管理一条历史的恢复位置、命名入口和真实复用资格。
-- **检查点**表达可以恢复的精确位置、StateImage 与各后端 KV 覆盖。
-- **物理对象和副本**承担实际占用、共享、传输与释放。
+- **Continuation records** manage the restore positions, named entries and real reuse eligibility of
+  one history.
+- **Checkpoints** express an exact restorable position, its StateImage and the KV coverage of each
+  backend.
+- **Physical objects and replicas** carry the actual occupancy, sharing, transfers and release.
 
-普通执行按下一单元增量预留资源。工作集增长到无法共同驻留时，暂停较年轻的请求，优先推进
-较老请求。恢复另外取得覆盖旧 frontier 和首个新单元的完整许可，直到产生新进展再归还余额。
-请求的已提交历史与输出语义跨暂停保存，设备绑定可以重建。
+Ordinary execution reserves resources incrementally for the next unit. When the working set grows
+beyond what can be resident together, younger requests are paused and older requests advance first.
+A resume separately acquires a complete permit covering the old frontier and the first new unit, and
+returns the remainder only once new progress is made.
+A request's committed history and output semantics are preserved across a pause; the device binding
+can be rebuilt.
 
-缓存重点服务多轮对话、agent 工具往返、输入重试和共享前缀。保存机会来自输入语义与请求生命周期；
-prefill chunk 仅切分调度工作，不自动保存 state。真实采用和重复计算的需求证据决定热度；
-回收在 Native 给出的有限物理动作中，比较实际恢复损失与当前稀缺资源。
+The cache primarily serves multi-turn conversations, agent tool round trips, input retries and shared
+prefixes. Save opportunities come from input semantics and the request lifecycle; a prefill chunk only
+splits scheduling work and does not save state automatically. Evidence of real adoption and repeated
+computation determines heat; reclaim compares the actual restore loss against the currently scarce
+resource among the finite physical actions Native offers.
 
 <a id="ownership"></a>
-## 2. 所有权与调用关系
+## 2. Ownership and call relationships
 
-| 部分 | 拥有的事实与决定 |
+| Part | Facts and decisions it owns |
 |---|---|
-| Frontend | 模板渲染、token/位置/媒体身份、typed rewrite 与实际输入恢复位置、共享 marker 的精确边界 |
-| Engine 请求记录 | 原始票号、输入与输出对象、预算、取消、首次时间、跨暂停的续接关系 |
-| Scheduler | 执行成员、fresh 扫描与有限越过、prefill/replay 轮转、抢占和恢复门控 |
-| ResourceManager | 私有续接与公共条目、前缀索引、需求证据、候选排序与缓存准入 |
-| Native Program | 模型账本、后端 frontier、完整恢复点、工作单元需求、状态提交与恢复 |
-| Program 内的 stores | State、KV、Host backing、引用、reader lease、预留和副本的真实占用 |
+| Frontend | Template rendering, token/position/media identity, typed rewrite and the actual input restore position, exact boundaries of shared markers |
+| Engine request record | Original ticket, input and output objects, budget, cancellation, first-time stamps, continuation relationship across pauses |
+| Scheduler | Execution membership, fresh scans and bounded bypass, prefill/replay rotation, preemption and resume gating |
+| ResourceManager | Private continuations and public entries, prefix index, demand evidence, candidate ordering and cache admission |
+| Native Program | Model ledger, backend frontiers, complete restore points, work-unit demand, state commit and restore |
+| Stores inside the Program | Actual occupancy of State, KV, Host backing, references, reader leases, reservations and replicas |
 
 ```mermaid
 flowchart TD
-    F[Frontend：精确输入与恢复边界] --> Q[请求记录]
-    Q --> S[Scheduler：本轮工作集合]
-    Q --> R[ResourceManager：候选与保留顺序]
-    R --> N[Program：校验、绑定、执行与提交]
+    F[Frontend: exact input and restore boundaries] --> Q[Request record]
+    Q --> S[Scheduler: this round's work set]
+    Q --> R[ResourceManager: candidates and retention order]
+    R --> N[Program: validate, bind, execute and commit]
     S --> N
-    N --> P[Stores：实际分配与引用]
-    P --> T[传输：预留、复制、发布、释放]
+    N --> P[Stores: actual allocations and references]
+    P --> T[Transfers: reserve, copy, publish, release]
     T --> N
-    N --> E[Engine：输出与生命周期发布]
+    N --> E[Engine: output and lifecycle publication]
 ```
 
-Runtime 从 Program 查询真实占用和可释放量。逻辑记录可以共享同一份物理内容，解除一个记录也
-可能释放零字节。检查点所有者要求内容保持可恢复；reader lease 则保护本次实际读取的副本，直到
-计算或传输完成。缓存记录的保留等级不等于整条历史被 pin。
+The runtime queries the Program for actual occupancy and releasable amounts. Logical records can share
+the same physical content, and dropping one record may release zero bytes. A checkpoint owner requires
+its content to stay restorable; a reader lease protects the replica actually being read until the
+computation or transfer completes. A cache record's retention tier does not mean the whole history is
+pinned.
 
-一个 Engine 控制线程推进策略、事务和引用结算。Program 拥有自己的可变 state、workspace、
-context stores 和 CUDA Graph，不与其他 Program 共享可变分配。
+One Engine control thread advances policy, transactions and reference settlement. A Program owns its
+own mutable state, workspace, context stores and CUDA Graphs and shares no mutable allocation with
+other Programs.
 
 <a id="capacity"></a>
-## 3. 容量与执行许可
+## 3. Capacity and execution permits
 
-### 3.1 启动容量
+### 3.1 Startup capacity
 
-Device 按模型的实际布局准备 Main KV、所选 backend KV、StateImage、workspace 和 Graph 空间。
-Main KV 页为 64 token；每种 KV 的物理字节数由其层数、几何和存储格式决定。
+The Device prepares Main KV, the selected backend KV, StateImage, workspace and Graph space according to
+the model's actual layout. A Main KV page is 64 tokens; the physical byte size of each KV kind is
+determined by its layer count, geometry and storage format.
 
-| 配置 | 当前含义 |
+| Setting | Current meaning |
 |---|---|
-| `max_context` | 一个请求的逻辑上下文上限 |
-| `kv_capacity` | Main KV 物理池的 token 等价容量，按页舍入；也可由启动显存预算自动求解 |
-| `max_concurrency` | 同时占用执行绑定的上限 C，范围 1–8 |
-| `context_cache.device_state_slots` | C 个基本 Device StateImage 之外的额外槽数，缺省为 C |
-| `context_cache.host_capacity_bytes` | StateImage、Main/backend KV、暂停快照及传输目的共用的 pinned Host 字节容量 |
+| `max_context` | The logical context limit of one request |
+| `kv_capacity` | Token-equivalent capacity of the Main KV physical pool, rounded to pages; can also be solved automatically from the startup memory budget |
+| `max_concurrency` | The limit C on simultaneously held execution bindings, range 1–8 |
+| `context_cache.device_state_slots` | Extra slots beyond the C basic Device StateImages; defaults to C |
+| `context_cache.host_capacity_bytes` | Pinned Host byte capacity shared by StateImage, Main/backend KV, pause snapshots and transfer destinations |
 
-Main KV 容量曲线的页数下界为 `max(ceil(max_context / 64), C)`，上界为
-`C × ceil(max_context / 64)`。下界分别满足单请求独占最大上下文和 C 个最小页的几何要求。Native 同时
-计算所选后端、state、workspace 和 Graph 的布局；显式或自动容量都要落在这条曲线内并满足可用
-显存。容量并不平均切给每个 lane。
+The page lower bound of the Main KV capacity curve is `max(ceil(max_context / 64), C)` and the upper
+bound is `C × ceil(max_context / 64)`. The lower bound satisfies, respectively, one request
+exclusively using the maximum context and the geometric requirement of C minimum pages. Native also
+computes the layout of the selected backends, state, workspace and Graphs; explicit or automatic
+capacity must fall within this curve and fit the available device memory. Capacity is not divided
+evenly among lanes.
 
-Host 缺省容量为 `8 GiB + 8 × 当前模型 Host StateImage 大小`。它是一个共享 backing，State 与
-KV 的分项占用用于观测，不能再次相加成额外配额。传输目标从预留时就计费，发布只改变其状态，
-不减少占用。Host extent 的分裂、最后引用释放和合并由 allocator 管理。
+The default Host capacity is `8 GiB + 8 × the current model's Host StateImage size`. It is one shared
+backing; the separate State and KV occupancy figures are for observation and must not be added up into
+extra quotas. A transfer destination is charged from the moment it is reserved; publication only
+changes its state and does not reduce occupancy. The allocator manages splitting of Host extents,
+release on the last reference and coalescing.
 
-必要请求输入、token 账本、prepared media、Responses 存储和 Frontend 媒体缓存各有自己的
-生命周期与现有数量、长度或媒体预算约束。Host context 容量不覆盖这些内存，也不限制进程总 RAM。
-物理容量同时约束 Native 元数据规模；空逻辑记录和索引分支及时删除。
+Required request input, the token ledger, prepared media, Responses storage and the Frontend media
+cache each have their own lifecycle and existing count, length or media budget limits. The Host context
+capacity does not cover this memory and does not limit total process RAM.
+Physical capacity also bounds the size of Native metadata; empty logical records and index branches
+are deleted promptly.
 
-### 3.2 执行与恢复许可
+### 3.2 Execution and resume permits
 
-Program 根据实际绑定状态计算 Prefill、Replay、Decode/Verify、Control 或 Normalize 的 typed KV
-覆盖，包含 speculative 峰值与后端需要。State、缺失副本和尾页 COW 在绑定或捕获时另外取得。
-一次 unit 的多个 typed pool 申请共同成功，失败归还本次部分预留并返回具体缺口。
+The Program computes the typed KV coverage of Prefill, Replay, Decode/Verify, Control or Normalize from
+the actual binding state, including the speculative peak and backend needs. State, missing replicas
+and tail-page COW are acquired separately at bind or capture time.
+The requests to multiple typed pools for one unit succeed together; on failure the partial
+reservation of this attempt is returned and the specific shortfall is reported.
 
-Engine 按恢复优先、原票号优先取得 resident 单元许可，形成可运行子集；一行暂时不足不会阻止
-其他已许可行执行。Fresh admission 使用余量，不能花掉现存许可。普通 unit 结算释放未用预留，
-后续增长继续按需申请。算子内部不选择缓存受害者。
+The Engine acquires resident unit permits with resumes first and original ticket order first, forming
+the runnable subset; one row temporarily lacking resources does not stop other permitted rows from
+executing. Fresh admission uses the remaining headroom and cannot spend existing permits. Ordinary unit
+settlement releases unused reservations, and later growth keeps requesting on demand. Operators do not
+select cache victims internally.
 
-同步回收已经改变容量时，当场重试当前许可；需要等待传输完成时才交回调度周期。
+When a synchronous reclaim has already changed capacity, the current permit is retried on the spot;
+control returns to the scheduling cycle only when a transfer must complete first.
 
-暂停恢复一次取得完整 State、缺失 KV、尾页以及“重建至旧 frontier + 首个真实新单元”的覆盖。
-Native 跨 Replay chunk 持有尚未物化的真实 reservation；到达旧 frontier 或完成 bridge 不解除
-保护。新 prefill 提交、生成/control 提交新 token 或请求进入终态后，恢复许可才结束。
+A pause resume acquires, at once, coverage for the complete State, missing KV, the tail page and
+"rebuild to the old frontier + the first real new unit".
+Native holds the real, not-yet-materialized reservation across Replay chunks; reaching the old
+frontier or completing the bridge does not lift the protection. The resume permit ends only when a new
+prefill commits, generation/control commits a new token, or the request enters a terminal state.
 
-一个请求可以暂时独占大部分 KV。回收可选缓存并暂停其他请求后，唯一请求仍无法取得合法单元时，
-Engine 报告容量合同错误，不等待不存在的释放者。
+One request can temporarily hold most of the KV. If, after reclaiming optional cache and pausing other
+requests, the only request still cannot acquire a legal unit, the Engine reports a capacity contract
+error instead of waiting for a releaser that does not exist.
 
 <a id="checkpoints"></a>
-## 4. 续接记录与完整检查点
+## 4. Continuation records and complete checkpoints
 
-### 4.1 私有恢复位置
+### 4.1 Private restore positions
 
-私有记录保留一个生成终点 E、一个输入侧恢复点，以及最多四个显式私有长锚点。
+A private record keeps one generation end point E, one input-side restore point and at most four
+explicit private long anchors.
 
-| 位置 | 用途 |
+| Position | Purpose |
 |---|---|
-| E | 已提交的生成终点，服务包含上轮输出的续接 |
-| typed R：`ResponseReplay` | 当前 assistant 响应开始前，表达重试、结构化 tool call 与规范化历史的改写上界 |
-| typed R：`TurnClosure` | 当前真实 user 后的首个 assistant 开始前，表达新用户轮次对 open turn 的改写上界 |
-| `recovery_frontier` | 实际保留 State 的输入位置；可与 R 相同，或位于能精确补算闭合结构的较早内容边界 |
-| P | 没有 typed rewrite 的 raw/token 输入终点 |
-| 显式私有锚点 | 调用者指定的其他有限恢复位置 |
+| E | The committed generation end point; serves continuations that include the previous turn's output |
+| typed R: `ResponseReplay` | Before the current assistant response starts; expresses the rewrite upper bound for retries, structured tool calls and normalized history |
+| typed R: `TurnClosure` | Before the first assistant start after the current real user; expresses the rewrite upper bound a new user turn imposes on an open turn |
+| `recovery_frontier` | The input position whose State is actually kept; may equal R, or be an earlier content boundary from which the closing structure can be recomputed exactly |
+| P | The raw/token input end point when there is no typed rewrite |
+| Explicit private anchors | Other finite restore positions specified by the caller |
 
-Frontend 根据模板渲染和 next-user probe 选择 typed R，再独立决定实际恢复位置。例如：
+The Frontend chooses typed R from template rendering and a next-user probe, then independently decides
+the actual restore position. For example:
 
 ```text
-[user header][正文] C [模板闭合结构] R [assistant generation header] P
+[user header][body] C [template closing structure] R [assistant generation header] P
 ```
 
-只有当 provenance 证明 R 前紧邻 User/System/Developer 消息的 C→R 纯属模板闭合结构、没有
-遗漏内容或媒体，且 C 能映射
-为精确 token frontier 时，实际保存 C；恢复后重新计算闭合 token。否则保存 R。这一选择来自 typed R
-对应的消息结构，与本次自动共享 marker 位置无关。输入规划、source 携带检查使用同一恢复位置。
+Only when provenance proves that the C→R span immediately after a User/System/Developer message before
+R is purely template closing structure, with no omitted content or media, and C maps to an exact token
+frontier, is C actually saved; after a restore the closing tokens are recomputed. Otherwise R is saved.
+This choice comes from the message structure corresponding to typed R and is independent of where this
+request's automatic shared markers fall. Input planning and the source carry check use the same restore
+position.
 
-`rewrite_execution_frontiers` 另行约束数学执行的切分，可能位于 assistant header 之后。
-实际恢复位置前移或可选保存失败都不改变这些数学边界。
+`rewrite_execution_frontiers` separately constrains how the mathematical execution is split, and can
+lie after the assistant header. Moving the actual restore position earlier or a failed optional save
+does not change these mathematical boundaries.
 
-从较深 E 恢复时，Native 携带仍精确兼容的输入点。需要更靠后位置时，旧点可在申请新目的之前
-退休；新保存失败不恢复旧点。较早 state 不能从更深 state 倒推。每次生成不另存固定 P 镜像；
-同位置用途可以共享物理 state。锚点同位置更新，超限替换最旧发布点；无法安全替换则放弃本次保存。
+When restoring from a deeper E, Native carries input points that remain exactly compatible. When a
+later position is needed, the old point can be retired before the new destination is requested; if the
+new save fails, the old point is not restored. An earlier state cannot be derived backwards from a
+deeper state. Each generation does not separately store a fixed P image; uses at the same position can
+share physical state. An anchor at the same position is updated in place; beyond the limit the oldest
+published point is replaced; if it cannot be replaced safely, this save is abandoned.
 
-### 4.2 完整性与身份
+### 4.2 Integrity and identity
 
-检查点包含精确输入身份、Native frontier、不可变 StateImage 和所需的各 typed KV 覆盖。
-StateImage 包括 GDN/conv、continuation hidden，以及所选后端的必要 local state。Main、MTP、
-DFlash 的 frontier 分别解释，由模型代码保证相容。
+A checkpoint contains the exact input identity, the Native frontier, an immutable StateImage and the
+required coverage of each typed KV.
+The StateImage includes GDN/conv, the continuation hidden and the necessary local state of the selected
+backend. The Main, MTP and DFlash frontiers are interpreted separately, and model code guarantees they
+are compatible.
 
-普通生成通常有：
+Ordinary generation usually has:
 
 ```text
-execution_frontier = 已计算 KV/state 的长度
+execution_frontier = length of the computed KV/state
 ledger_frontier    = execution_frontier + 1
-ledger[execution_frontier] = 已提交、下一次待输入的 token
+ledger[execution_frontier] = the committed token waiting to be input next
 ```
 
-精确命中可以使用保存的 tail hidden 进入采样。MTP 的 frontier−1 bridge、DFlash context
-append 和 speculative accepted-prefix fold 由 Native 完成。尚未提交的 suffix 不成为恢复点。
+An exact hit can enter sampling using the saved tail hidden. The MTP frontier−1 bridge, the DFlash
+context append and the speculative accepted-prefix fold are completed by Native. An uncommitted suffix
+does not become a restore point.
 
-前缀索引的 digest 用于缩小候选范围，采用前还要校验 token、位置、媒体与执行身份。独立重算得到
-的 state 与 KV 不能因为 token 相同就拼接；共享页和跨介质副本沿用其真实内容身份。
+The prefix index's digest narrows the candidate set; before adoption, tokens, positions, media and
+execution identity are still verified. State and KV obtained from independent recomputation cannot be
+spliced together just because the tokens are the same; shared pages and cross-medium replicas keep
+their real content identity.
 
-### 4.3 共享用途与自动边界
+### 4.3 Shared uses and automatic boundaries
 
-公共共享条目是可供多个请求分叉的独立入口。它与私有实际恢复点同位时，两种逻辑用途都保留，
-物理对象按引用共享。Frontend 将最多四个调用方 marker 解析为精确 frontier，同点合并，按序提供
-保存机会。较浅位置仍可服务后来改变的后缀。
+A public shared entry is an independent entry point from which multiple requests can fork. When it
+coincides with a private actual restore point, both logical uses are kept and the physical object is
+shared by reference. The Frontend resolves at most four caller markers to exact frontiers, merges those
+at the same point, and offers save opportunities in order. A shallower position can still serve a
+suffix that changes later.
 
-产品入口选择自动 marker，Frontend 验证其实际序列化边界：
+The product entry point chooses automatic markers, and the Frontend verifies their actual serialized
+boundaries:
 
-- OpenAI 默认选择最后一个可缓存 source part 的末端；结构化 tool call 使用其消息边界，没有消息
-  内容时可选择 tools 边界。正文继续增长时，先前 source part 的 token 前缀仍一致就可以复用。
-- 自动提示与同点显式 marker 合并；四个显式位置占满时自动提示让位。显式消息边界仍按调用方
-  指定位置解释，不改成内容边界。
-- Responses 展开存储历史并规范化本次输入后应用策略；原始存储输入不携带新增自动 marker。
-- 允许模型自动结构位置的其他输入，Frontend 可提供 leading instructions、tools 等有限机会。
+- OpenAI by default chooses the end of the last cacheable source part; a structured tool call uses its
+  message boundary, and when there is no message content the tools boundary can be chosen. As the body
+  keeps growing, the token prefix of earlier source parts can be reused as long as it still matches.
+- An automatic hint is merged with an explicit marker at the same point; when all four explicit
+  positions are used, the automatic hint gives way. An explicit message boundary is still interpreted at
+  the position the caller specified and is not changed into a content boundary.
+- Responses expands the stored history and normalizes this request's input before applying the policy;
+  the original stored input does not carry newly added automatic markers.
+- For other inputs that allow automatic structural positions, the Frontend can offer finite
+  opportunities such as leading instructions and tools.
 
-Source provenance、tokenizer 的精确 frontier 和完整媒体范围共同决定位置是否有效。字符串追加
-可能改变 BPE 尾 token，因此 source-part 位置仍须通过真实前缀匹配。协议参数见 [Serving](../serving.md)。
+Source provenance, the tokenizer's exact frontier and the complete media range together determine
+whether a position is valid. String appends can change the BPE tail token, so source-part positions
+must still pass a real prefix match. Protocol parameters are in [Serving](../serving.md).
 
-## 5. 保存与物理交接
+## 5. Saving and physical handoff
 
-### 5.1 保存机会
+### 5.1 Save opportunities
 
-保存来自实际输入恢复点、显式锚点、共享 marker、正常生成终点，以及实际抢占需要的执行快照。
-Prefill/Replay chunk 结束本身不产生保存机会。
+Saves come from actual input restore points, explicit anchors, shared markers, normal generation end
+points, and the execution snapshots that an actual preemption needs.
+The end of a Prefill/Replay chunk does not by itself produce a save opportunity.
 
-Engine 在跨过语义 frontier 前调用 Native 准备目的 state、检查点描述与必要尾页空间。私有输入
-点可先退休本记录已经过时的输入点，再尝试 Device 槽，容量不足时可使用 Host。私有输入点共用
-原 KV 历史，只增加恢复 state 与保护 frontier；公共条目需要独立视图时，另取得必要的尾页复制空间。
+Before crossing a semantic frontier, the Engine calls Native to prepare the destination state, the
+checkpoint descriptor and the necessary tail-page space. A private input point can first retire input
+points of this record that are already obsolete, then try a Device slot, and use Host when capacity is
+insufficient. Private input points share the original KV history and only add restore state and a
+protected frontier; when a public entry needs an independent view, the necessary tail-page copy space
+is acquired separately.
 
-同点兼有私有与共享用途时，共享部分不足仍可保留私有点。捕获属于可选缓存写入，回收须通过
-新增恢复收益与被替换内容的准入检查，不抢占 active 请求。没有合适空间就跳过保存，继续必要执行。
-已有兼容输入点直接携带；完整恢复许可生效期间跳过可选捕获，必要数学分界仍执行。
+When one point has both a private and a shared use, the private point can still be kept if the shared
+part does not fit. Capture is an optional cache write; reclaim must pass the admission check comparing
+the new restore benefit with the content being replaced, and it does not preempt active requests. If no
+suitable space exists, the save is skipped and necessary execution continues.
+An existing compatible input point is carried directly; while a complete resume permit is in effect,
+optional capture is skipped but necessary mathematical boundaries are still executed.
 
-### 5.2 历史、Move 与 Fork
+### 5.2 History, Move and Fork
 
 ```mermaid
 flowchart LR
-    H[选定私有恢复点] --> O{是否接管原逻辑记录}
-    O -->|是| C[续接关系前移]
-    O -->|否| B[独立分支]
-    C --> P{实际物理引用}
+    H[Selected private restore point] --> O{Take over the original logical record?}
+    O -->|yes| C[Continuation relationship moves forward]
+    O -->|no| B[Independent branch]
+    C --> P{Actual physical references}
     B --> P
-    P -->|可独占交接| M[Move]
-    P -->|需要保留不可变来源| F[Fork state / KV 写视图]
+    P -->|exclusive handoff possible| M[Move]
+    P -->|immutable source must be kept| F[Fork state / KV write view]
 ```
 
-非活跃且允许更新其入口的私有记录可被接管。已有独立请求占用该关系、跨命名入口等情况保留父
-记录并建立分支。公共别名或物理 reader 决定是否需要 Fork，并不要求保留一个额外私有父记录。
+A private record that is inactive and allows its entry to be updated can be taken over. If an
+independent request already occupies that relationship, or the request crosses named entries, the
+parent record is kept and a branch is created. Public aliases or physical readers determine whether a
+Fork is needed; they do not require keeping an extra private parent record.
 
-同一历史的 E、输入点和锚点引用一份 KV 目录及各自覆盖。保存内部输入点不复制整套 KV，也不因其位于
-部分页就额外复制尾页。从较早输入点重算时，先退休被替代的更深私有点，再按剩余保护范围裁剪。
-独立分支或公共视图共享完整页，必要时复制未满尾页，保持一个可写历史与外部不可变内容隔离。
+The E, input points and anchors of one history reference one KV directory, each with its own coverage.
+Saving an internal input point does not copy the whole KV set, nor does it copy an extra tail page
+because the point falls inside a partial page. When recomputing from an earlier input point, the deeper
+private points it supersedes are retired first and then trimmed to the remaining protected range.
+An independent branch or public view shares full pages and copies the partial tail page when needed,
+keeping one writable history isolated from external immutable content.
 
-不可变 state 与 active writer 分开。可独占 E 直接 Move；需要保留来源时，Fork 可由下一次计算
-完成 state 转移，后端必要 local copy 仍执行。Device 槽紧张且有 Host 副本时，可以保留旧身份的
-Host 内容，将 Device 槽交给新的 active identity；只有 Device 副本则先完成 D2H。无法兼顾保存
-与执行时，允许放弃可选恢复点，reader lease 始终保留。
+Immutable state is kept separate from the active writer. An exclusively owned E is Moved directly; when
+the source must be kept, a Fork can let the next computation perform the state transfer, while the
+backend's necessary local copy still runs. When Device slots are tight and a Host replica exists, the
+old identity's Host content can be kept and the Device slot handed to the new active identity; with only
+a Device replica, D2H completes first. When saving and execution cannot both be satisfied, the optional
+restore point may be abandoned; reader leases are always kept.
 
-正常结束将合法执行态 freeze 为新 E。取消可以使本请求已接管的可选旧缓存消失，其他独立所有者
-继续有效。Session 是查找提示和命名入口，较旧请求晚完成不能覆盖较新的 `publication_order`。
-未命名历史仍可按精确内容复用。
+A normal finish freezes the legal execution state into a new E. Cancellation can make optional old
+cache that this request took over disappear, while other independent owners remain valid. A session is
+a lookup hint and a named entry; an older request finishing late cannot overwrite a newer
+`publication_order`.
+Unnamed history can still be reused by exact content.
 
 <a id="sources"></a>
-## 6. 来源查询与绑定
+## 6. Source lookup and binding
 
-一次接纳或 Replay 恢复查询命中路径上的私有和公共完整点，并包含 root。Native 逐个检查精确
-匹配、允许的最大 frontier、可携带私有点和物理交接方式。
+An admission or Replay resume queries the private and public complete points on the hit path,
+including the root. Native checks each one for an exact match, the maximum allowed frontier, carryable
+private points and the physical handoff method.
 
-候选按“恢复传输成本 + 剩余 prefill 成本”排序。成本相同时依次考虑搬运字节、更深复用位置、
-合法 session 提示、私有用途、较新 publication order 和稳定序号。同一 Native handle、相同
-接管方式与携带点的重复候选合并；独立计算得到的同语义位置仍分别处理。
+Candidates are ordered by "restore transfer cost + remaining prefill cost". On a tie they are compared
+by bytes moved, deeper reuse position, a legal session hint, private use, newer publication order and a
+stable sequence number, in that order. Duplicate candidates with the same Native handle, the same
+takeover method and the same carried points are merged; independently computed positions with the same
+semantics are still handled separately.
 
-来源成本模型比较当前恢复传输与剩余计算。机器传输与 artifact prefill 校准影响排序，不决定
-内容是否可恢复。缓存回收另用实际恢复覆盖损失，不估计未来请求概率；实际许可由 Native 申请。
+The source cost model compares the current restore transfer with the remaining computation. Machine
+transfer and artifact prefill calibration affect ordering but do not decide whether content is
+restorable. Cache reclaim uses the actual lost restore coverage instead and does not estimate the
+probability of future requests; the actual permit is requested by Native.
 
-选定候选后才准备接管、退休可替代的更深私有位置并申请目的空间。一次决策固定允许回收的逻辑范围；
-候选失效或资源不足就推进至后续候选。实际回收结果不回滚，后续尝试读取新事实。绑定在准备、
-传输和依赖完成后安装状态，再报告采用的逻辑来源；ResourceManager 在这个不可逆提交点记使用
-并接管记录。此前取消不产生一次成功命中。
+Only after a candidate is selected are the takeover prepared, the replaceable deeper private positions
+retired and the destination space requested. One decision fixes the logical range it may reclaim; if
+the candidate becomes invalid or resources are insufficient, it advances to the next candidate. Actual
+reclaim results are not rolled back, and later attempts read the new facts. Binding installs the state
+after preparation, transfers and dependencies complete, then reports the logical source adopted; the
+ResourceManager records the use and takes over the record at this irreversible commit point. A
+cancellation before that point does not produce a successful hit.
 
-Fresh admission 不为自己的进入抢占 resident。等待必须有真实的执行、传输或释放事件；没有
-其他驻留工作且全部候选都不能取得首单元时，报告具体缺口。恢复自己的完整 Snapshot 时优先兑现
-该快照，不主动将它替换为另一条便宜来源。
+Fresh admission does not preempt resident requests for its own entry. Waiting must have a real
+execution, transfer or release event; when no other resident work exists and no candidate can acquire
+the first unit, the specific shortfall is reported. When resuming its own complete Snapshot, a request
+redeems that snapshot first and does not proactively replace it with another cheaper source.
 
 <a id="retention"></a>
-## 7. 保留与回收
+## 7. Retention and reclaim
 
-### 7.1 真实需求与两段保留
+### 7.1 Real demand and two-tier retention
 
-私有记录和公共条目各有普通/复用等级。私有 owner 将真实需求时刻与实际采用位置
-`proven_frontier` 成对保存。Consume 按本次 source 重设这一对；Fork 子记录取得本次采用的时刻和
-位置。Fork 从父记录较浅位置启动时，父记录保留原有一对证据；source 已覆盖父记录的证明位置
-时才更新父记录。公共使用独立更新公共条目。完成、单纯保存、搬运和自己的暂停恢复不刷新证据。
+Private records and public entries each have an ordinary/reuse tier. A private owner stores the time of
+real demand and the actually adopted position `proven_frontier` as a pair. Consume resets this pair from
+this request's source; a Fork child takes this adoption's time and position. When a Fork starts from a
+shallower position of the parent record, the parent keeps its original pair of evidence; the parent is
+updated only when the source already covers the parent's proven position. Public use updates the public
+entry independently. Completion, a plain save, moves and the request's own pause resume do not refresh
+the evidence.
 
-另有最多 256 项的需求摘要，记录有限候选位置的 digest、frontier、identity tag 和实际请求观察。
-成功采用非零跨请求来源时，记录该精确采用位置的重复需求；新 prefill **提交并跨过候选位置**时
-记录计算需求，同一请求同一位置只记一次。两个不同请求的真实计算也能证明重复需求，即使此前
-没有物理副本可命中，后续捕获仍能取得该位置的复用资格。
-Rendering、候选查询、轮询、自己的 Snapshot/Replay 恢复和单纯保存不产生观察；摘要命中只影响
-保留与准入，不增加 cache-hit 或 reused-token 统计，也不持有 State/KV。输入恢复点因这份真实
-重复需求证据提升私有 owner 时，同时把证明位置设为该输入点。
+There is also a demand summary of at most 256 entries, recording the digest, frontier, identity tag and
+actual request observations of a finite set of candidate positions. When a nonzero cross-request source
+is adopted successfully, repeated demand is recorded for that exact adopted position; when a new
+prefill **commits and crosses a candidate position**, computation demand is recorded, once per request
+per position. Real computation by two different requests also proves repeated demand, so even if no
+physical replica existed to hit before, a later capture can still gain reuse eligibility for that
+position.
+Rendering, candidate queries, polling, the request's own Snapshot/Replay resume and a plain save do not
+produce observations; a summary hit only affects retention and admission, does not increase cache-hit
+or reused-token statistics, and holds no State/KV. When an input restore point promotes the private
+owner on the strength of this real repeated-demand evidence, the proven position is also set to that
+input point.
 
-复用段按最近实际采用或重复需求时间排序，以各物理池容量的 3/4 为软目标，降级较老记录。
-计费使用唯一物理 footprint；单个最新的大记录可超过软目标。等级决定回收次序，不承诺永久保留。
+The reuse tier is ordered by the most recent actual adoption or repeated-demand time, with 3/4 of each
+physical pool's capacity as a soft target; older records are demoted.
+Accounting uses the unique physical footprint; a single newest large record can exceed the soft
+target. The tier determines reclaim order and does not promise permanent retention.
 
-### 7.2 有限物理动作
+### 7.2 Finite physical actions
 
-Native 根据实际 State/KV 引用枚举有限的降级和删除动作，每个动作携带真实持有者集合、可释放量
-与必要传输。共享内容的所有可选持有者必须一起满足准入；active/transfer reader 另外限制能否
-动它。释放零个当前稀缺资源的动作不参加比较。
+Native enumerates a finite set of demotion and deletion actions from the actual State/KV references;
+each action carries its real set of holders, its releasable amount and the necessary transfers. All
+optional holders of shared content must pass admission together; active/transfer readers separately
+restrict whether it can be touched. Actions that release zero of the currently scarce resource do not
+take part in the comparison.
 
-同一次同步报价共用历史持有者、物理页归属与精确前缀关系，迁移和删除候选使用同一组事实。
-Runtime 将候选的恢复损失与保留资格用于各项准入检查和排序；权限分别检查，事实无需重复计算。
-这些评估资料不取得资源引用或 reader lease，资源、引用发生变化或交回调度周期后即失效。
-提交仍针对选中对象核对当前完整持有者、内容版本与 pin，再取得真实预约。
+One synchronous quote shares the history holders, physical page ownership and exact prefix
+relationships, and migration and deletion candidates use the same set of facts.
+The runtime uses each candidate's restore loss and retention eligibility for the admission checks and
+ordering; permissions are checked separately, and the facts need not be recomputed.
+This evaluation data acquires no resource references or reader leases, and becomes invalid once
+resources or references change or control returns to the scheduling cycle.
+A commit still checks the selected object's current complete holders, content version and pins before
+acquiring the real reservation.
 
-私有热保护对应其已证明的采用位置。同一 owner 真正幸存的较早、精确兼容恢复点仍覆盖这个位置
-时，更深且尚未证明的新后缀可以按普通边际损失处理；过浅的输入点不能代替曾实际采用的深位置。
-独立 Shared 热所有者仍保护涉及它的完整物理动作。降级与删除使用相同的保护判断。
+Private hot protection corresponds to its proven adoption position. When an earlier, exactly
+compatible restore point that actually survives in the same owner still covers this position, a deeper,
+not-yet-proven new suffix can be handled by ordinary marginal loss; an input point that is too shallow
+cannot stand in for a deep position that was actually adopted.
+An independent Shared hot owner still protects complete physical actions that involve it. Demotion and
+deletion use the same protection test.
 
-每次按当前处理的 typed 缺口比较；Device 内优先处理 State，再处理 Main/backend KV，Host 目的
-单独预检。Runtime 在这个稀缺单位内排序：
+Each comparison uses the typed shortfall currently being handled; within the Device, State is handled
+first, then Main/backend KV, and Host destinations are prechecked separately. Within this scarce unit
+the runtime orders:
 
-1. 普通内容先于复用内容。
-2. 普通动作比较“边际恢复 token 损失 / 对本次缺口有用的释放量”，同分按保留顺序。
-3. 复用动作按最近真实需求时间，优先处理较旧内容。
+1. Ordinary content before reuse content.
+2. Ordinary actions compare "marginal restore-token loss / release useful for this shortfall", with ties
+   broken by retention order.
+3. Reuse actions are ordered by most recent real demand time, older content first.
 
-删除损失依据动作后的真实 surviving fallback 计算。嵌套 E、输入点与 Shared 不重复累加同一
-历史的覆盖；同时删除的别名不能充当彼此 fallback。Device→Host 降级在排序前固定所需 Host
-受害者，完整动作的净损失包含这些删除。只有无需删除完整恢复内容时才是零损失，不能仅因
-Device 来源得到保全就优先。提交前复核同一受害集合，变化后重新报价。
+Deletion loss is computed from the real surviving fallback after the action. Nested E, input points
+and Shared do not add up coverage of the same history twice; aliases deleted together cannot serve as
+each other's fallback. A Device→Host demotion fixes the required Host victims before ordering, and the
+complete action's net loss includes those deletions. It is zero-loss only when no complete restore
+content needs to be deleted; it is not preferred merely because the Device source is preserved. Before
+commit the same victim set is rechecked, and it is requoted if it changed.
 
-只缺几页时，降级选取满足缺口的有限页组，State 和另一 typed pool 不因同属一条历史而全部搬走。
-有完整 Host 副本时直接释放 Device 副本；否则报价并申请 Host 目的。启动动作前重新验证内容和
-引用，完成后重新查询真实缺口。
+When only a few pages are short, demotion picks a finite page group that satisfies the shortfall; State
+and another typed pool are not all moved out just because they belong to the same history.
+With a complete Host replica, the Device replica is released directly; otherwise a Host destination is
+quoted and requested. Content and references are revalidated before the action starts, and the real
+shortfall is queried again after it completes.
 
-同一个 KV pool 中，按回收顺序选择的迁移组可以共用一笔事务。若中间删除候选实际能释放的目标
-Device 页已全部被前面选中的迁移覆盖，它不再增加本次容量，可以略过这个备选；判定依据是
-Native 的完整物理页身份，而非检查点名称或名义页数。其他删除动作，以及需要 Host 受害者的
-迁移，结束这批。Runtime 检查每组及完整批次的权限，Native 按实际缺口和 Host 余量裁切严格前缀。
-全部目的与源 lease 预约成功后才提交，已有完整 Host 副本的 Device 页在提交时释放，其余页在
-复制完成后释放。原始候选列表保留，批量预约失败时仍可依次尝试单个迁移和删除备选。
+Within the same KV pool, migration groups selected in reclaim order can share one transaction. If all
+the target Device pages an intermediate deletion candidate could actually release are already covered
+by migrations selected earlier, it adds no capacity this time and this alternative can be skipped; the
+test uses Native's complete physical page identity, not checkpoint names or nominal page counts. Other
+deletion actions, and migrations that need Host victims, end the batch. The runtime checks the
+permissions of each group and of the complete batch, and Native trims a strict prefix according to the
+actual shortfall and Host headroom.
+The commit happens only after all destination and source lease reservations succeed; Device pages that
+already have a complete Host replica are released at commit, and the other pages are released after
+the copy completes. The original candidate list is kept, so if the batch reservation fails, individual
+migration and deletion alternatives can still be tried in turn.
 
-### 7.3 必要执行与可选写入
+### 7.3 Necessary execution and optional writes
 
-必要执行可以按上述顺序回收允许的可选内容；其本次 source 和在途 reader 始终保留。可选捕获
-及保留现有内容的 Host 写回只拥有自身的准入资格。
+Necessary execution can reclaim allowed optional content in the order above; its own source for this
+step and in-flight readers are always kept. Optional capture and Host write-back that preserves existing
+content hold only their own admission eligibility.
 
-新捕获区分候选精确位置自身的重复需求与 owner 继承的保留热度。前者来自该候选的真实跨请求
-采用或重复提交的需求观察；按重复需求进行工作集替换时，使用候选自己的需求时刻，不能借用
-owner 更新的热度。
+A new capture distinguishes repeated demand for the candidate's own exact position from the retention
+heat the owner inherits. The former comes from real cross-request adoption of that candidate or
+observations of repeated committed demand; when replacing the working set by repeated demand, the
+candidate's own demand time is used and the owner's newer heat cannot be borrowed.
 
-| 申请与受害内容 | 准入条件 |
+| Request and victim content | Admission condition |
 |---|---|
-| 新捕获没有候选自身的重复需求 | owner 的保留等级界定可替换范围；固定新增恢复覆盖收益须大于累计删除损失，继承热度也不免除预算 |
-| 新捕获已有候选自身的重复需求 | 以该候选的实际需求时间替换普通或更旧复用内容，不以新增覆盖长度限制工作集替换 |
-| 既有内容的 Host 写回 | 按所保留内容自身的资格与恢复覆盖收益准入 |
-| 暂停 Snapshot | 可选缓存，再考虑票号更晚的暂停快照 |
+| New capture without repeated demand of the candidate itself | The owner's retention tier bounds the replaceable range; the fixed added restore coverage benefit must exceed the cumulative deletion loss, and inherited heat does not exempt it from the budget |
+| New capture with repeated demand of the candidate itself | Replaces ordinary or older reuse content using the candidate's actual demand time; working-set replacement is not limited by added coverage length |
+| Host write-back of existing content | Admitted by the kept content's own eligibility and restore coverage benefit |
+| Pause Snapshot | Optional cache first, then pause snapshots with a later ticket |
 
-没有候选自身重复需求的新捕获，在开始决策时固定相对 surviving fallback 的新增恢复覆盖预算。
-Host 与 Device 分步删除共用预算，累计已经牺牲的恢复覆盖；不能因删掉 fallback 再抬高申请者
-收益。分步损失采用保守累计，可能放弃本可通过更复杂组合保留的点。
+A new capture without repeated demand of the candidate itself fixes, when the decision starts, a budget
+of added restore coverage relative to the surviving fallback.
+Stepwise Host and Device deletions share the budget and accumulate the restore coverage already
+sacrificed; the requester's benefit cannot be raised by deleting the fallback. Stepwise loss uses a
+conservative accumulation and may give up a point that a more complex combination could have kept.
 
-准入完成后，私有 owner 的整体保留热度仍可继承真实采用资格；这不赋予它尚未被重复需要的新
-捕获位置同等替换权限。
+After admission, the private owner's overall retention heat can still inherit real adoption
+eligibility; this does not grant a newly captured position that has not yet been repeatedly needed the
+same replacement authority.
 
-降级的 Host 受害集合同时满足迁移源与外层可选捕获的保留权限，并受捕获剩余预算约束。必要执行需要 Device 空间
-不会把自己的权限转授给正在尝试保存的冷缓存。保存没有足够收益或空间时跳过，不阻塞必要执行。
+The Host victim set of a demotion satisfies the retention permissions of both the migration source and
+the outer optional capture, and is bounded by the capture's remaining budget. Necessary execution that
+needs Device space does not delegate its own permission to cold cache that is attempting to save. A save
+without enough benefit or space is skipped and does not block necessary execution.
 
-Host 先释放安全的重复副本，再对有限物理动作作完整预检：实际释放并集足额，且联合持有者都能
-被本次申请替换，才执行删除。Shared 引用的名义大小不重复累加。预检后 allocator 仍须满足
-完整 StateImage 与连续 extent geometry；分配失败可放弃保存，已完成删除不回滚。
+The Host first releases safe duplicate replicas, then performs a complete precheck on the finite
+physical actions: deletion executes only if the actual released union is sufficient and all joint
+holders can be replaced by this request. The nominal size of Shared references is not added up twice.
+After the precheck, the allocator must still satisfy the complete StateImage and contiguous extent
+geometry; an allocation failure can abandon the save, and completed deletions are not rolled back.
 
 <a id="scheduling"></a>
-## 8. 调度、抢占与恢复
+## 8. Scheduling, preemption and resume
 
-### 8.1 普通周期
+### 8.1 Ordinary cycle
 
-每个周期先处理传输、终态与取消，在真实容量事件上尝试最老 paused 请求的完整恢复。然后按
-恢复优先、原票号优先逐行申请 resident 单元许可，保留可运行子集，再用余量尝试 fresh admission。
-执行已许可的紧凑 Control/Decode 集合和一个 Prefill/Replay chunk；Control 提交的行下一周期
-重新取得 Decode 许可。Graph 使用实际成员数与执行 profile。
+Each cycle first processes transfers, terminal states and cancellation, and on a real capacity event
+tries a complete resume of the oldest paused request. It then requests resident unit permits row by
+row, resumes first and original ticket order first, keeps the runnable subset, and uses the remaining
+headroom to try fresh admission.
+It executes the permitted compact Control/Decode set and one Prefill/Replay chunk; rows committed by
+Control reacquire Decode permits in the next cycle. Graphs use the actual member count and execution
+profile.
 
-Fresh 队列保留 FIFO 票号，每个受阻请求最多被 C 个更年轻请求成功越过。每次扫描检查队首及最多
-C 个后续候选，失败检查不消耗额度，未完成扫描按票号继续。队列或容量变化触发扫描，普通 decode
-不不断重做已失败决策。Paused 请求的等待只约束它自身，空闲 lane 和容量可服务能够进入的 fresh。
+The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
+younger requests. Each scan checks the queue head and at most C following candidates; failed checks do
+not consume the allowance, and an incomplete scan continues in ticket order. Queue or capacity changes
+trigger a scan; ordinary decode does not keep redoing decisions that already failed. A paused request's
+wait constrains only itself; idle lanes and capacity can serve fresh requests that are able to enter.
 
-### 8.2 压力与完整恢复
+### 8.2 Pressure and complete resume
 
 ```text
-单元缺口 → 可选预留与缓存回收 → 必要时撤销暂停快照
-         → 为最老必要工作收回较年轻 resident，或暂停自身无法前进的年轻行
+unit shortfall → reclaim optional reservations and cache → revoke pause snapshots if needed
+              → take back younger residents for the oldest necessary work, or pause a young row that cannot advance itself
 ```
 
-Materializing、已终结和持完整恢复许可的请求不作为抢占对象。暂停发生在 Native 稳定提交边界，
-不打断 kernel。已许可的其他请求继续执行，不要求整批全部可放入才运行。
+Requests that are Materializing, already terminated or holding a complete resume permit are not
+preemption victims. A pause happens at a stable Native commit boundary and does not interrupt a
+kernel. Other permitted requests keep executing; the whole batch does not need to fit before running.
 
-Paused 队列按原票号尝试恢复。存在更老 resident 时，暂停请求只尝试空闲和可选缓存空间；不能
-仅为试探恢复而反复暂停年轻 borrower。更老 resident 离开后，最老 paused 可以收回年轻请求占用的
-lane 和容量。Fresh admission 不主动抢占 resident。
+The paused queue tries resumes in original ticket order. While an older resident exists, a paused
+request only tries idle and optional cache space; it cannot repeatedly pause young borrowers merely to
+probe a resume. After the older resident leaves, the oldest paused request can take back the lane and
+capacity held by younger requests. Fresh admission does not proactively preempt residents.
 
-同时最多一个请求持有完整恢复许可。它优先重建旧历史并完成首个真实新单元，其他可运行单元
-继续执行；恢复期跳过可选 capture。Native 持有跨 chunk 的真实容量，Runtime 以
-`recovery_pending` 判断保护结束。到达旧 frontier、完成 MTP bridge 或单纯回读 Snapshot 都不算
-新进展；新 prefill、生成/control 提交或终态才结束保护。
+At most one request holds a complete resume permit at a time. It rebuilds its old history and completes
+its first real new unit first, while other runnable units keep executing; optional capture is skipped
+during the resume. Native holds the real capacity across chunks, and the runtime uses
+`recovery_pending` to decide when protection ends. Reaching the old frontier, completing the MTP bridge
+or simply reading back a Snapshot does not count as new progress; a new prefill, a generation/control
+commit or a terminal state ends the protection.
 
-Prefill chunk 的边界为已经驻留的请求提供轮转机会。全部 lane 被占用时，新请求仍要等到某个
-resident 结束、取消或因资源压力暂停；缩短 chunk 本身不会使它提前进入。因此，短请求排队可能
-跨过长请求的多个 chunk，分析这类时延要分别检查 lane 准入和每个执行单元的耗时。
+Prefill chunk boundaries give resident requests a chance to rotate. When all lanes are occupied, a new
+request still has to wait for some resident to finish, be cancelled or pause under resource pressure;
+shortening chunks by itself does not let it enter earlier. A short request may therefore queue across
+several chunks of a long request, and analyzing such latency requires checking lane admission and the
+time of each execution unit separately.
 
-Engine 在轮首、准入后的执行选择前、Control/Decode 后各有界推进上下文事务。已完成的绑定
-及时进入原有许可与语义 capture 流程；Control/Decode 执行后只刷新尚未执行的 Prefill/Replay
-许可，每轮仍为一个 compact decode batch 和一个 prefill turn。未完成的异步事件不自旋等待。
+The Engine advances context transactions in a bounded way at the start of the round, after admission
+before execution selection, and after Control/Decode. Completed bindings promptly enter the existing
+permit and semantic capture flow; after Control/Decode executes, only Prefill/Replay permits that have
+not yet executed are refreshed, and each round is still one compact decode batch and one prefill turn.
+Incomplete asynchronous events are not spin-waited on.
 
-完成、取消、永久缩减、较年轻请求暂停释放资源等事件提供恢复机会。失败的恢复局部等待下一事件；
-刚暂停的请求不因自身释放立刻恢复。没有真实执行或传输能够释放资源时，最老请求须通过回收与
-合法许可推进，容量合同不满足则报错。
+Events such as completion, cancellation, permanent shrink and a younger request pausing to release
+resources provide resume opportunities. A failed resume waits locally for the next event; a request that
+just paused does not resume immediately because of its own release. When no real execution or transfer
+can release resources, the oldest request must advance through reclaim and a legal permit, and an error
+is reported if the capacity contract is not met.
 
-### 8.3 Snapshot 与 Replay
+### 8.3 Snapshot and Replay
 
-请求的输入、输出对象、预算、首次时间和续接关系持续存在；Native 的暂停状态保留已提交账本、
-frontier、sampling 与后端恢复信息。Lane 归还后，这些信息仍由请求持有。
+The request's input, output objects, budget, first-time stamps and continuation relationship persist;
+Native's pause state keeps the committed ledger, frontier, sampling and backend resume information.
+After the lane is returned, this information is still held by the request.
 
-| 恢复路线 | 所保留的内容与工作 |
+| Resume route | Content and work kept |
 |---|---|
-| Snapshot | 完整执行位置及其 State/KV 引用；回读缺失 Device 副本后恢复执行 |
-| Replay | 保留提交账本与输入，释放设备执行态；重新计算到暂停 frontier 后恢复原 phase |
+| Snapshot | The complete execution position and its State/KV references; execution resumes after reading back missing Device replicas |
+| Replay | Keeps the committed ledger and input and releases the device execution state; recomputes to the pause frontier and then resumes the original phase |
 
-Snapshot 保存先完成必要后端规范化，只复制释放 Device 所缺的唯一内容；其他 active 正在使用的
-不可变页可以继续共享。保存资源不足时使用不新增 Device 分配的破坏性暂停并转为 Replay，不为
-保存一个受害者递归抢占另一个请求。
+Saving a Snapshot first completes the necessary backend normalization and copies only the unique
+content missing for releasing the Device; immutable pages that other active requests are using can stay
+shared. When resources for the save are insufficient, a destructive pause that adds no Device allocation
+is used and converted to Replay; it does not recursively preempt another request to save one victim.
 
-暂停快照可以撤销。撤销释放整份执行快照的引用并转入 Replay；此前输入恢复点和锚点仍按自身
-完整性与缓存规则存活。已有快照暂时放不下时等待真实容量事件，不仅为减少恢复体积主动丢掉快照。
+Pause snapshots can be revoked. Revocation releases the references of the whole execution snapshot and
+switches to Replay; earlier input restore points and anchors still survive according to their own
+integrity and cache rules. When an existing snapshot temporarily does not fit, it waits for a real
+capacity event, and the snapshot is not proactively dropped just to reduce the resume volume.
 
-Replay 不重新发布旧输出、不重复扣预算、不再次采样历史 token。Penalty counts 按已提交输出和
-实际计数的 forced control 恢复；RNG 沿用逻辑位置、seed 和 purpose。Replay 跨 chunk 推进，
-不增加跨请求复用热度。
+Replay does not republish old output, does not charge the budget again and does not resample historical
+tokens. Penalty counts are restored from committed output and actually counted forced control; the RNG
+keeps its logical position, seed and purpose. Replay advances across chunks and does not increase
+cross-request reuse heat.
 
-MTP 丢弃未使用 drafts，并在恢复后的合法单元中重建；DFlash/DFlash2 保持各自 context 和 local
-state 规则。Vision 保留 prepared media、媒体身份和 MRoPE，失效的视觉 handoff 按需重新编码。
-这些恢复约束与普通执行使用同一模型数学实现。
+MTP discards unused drafts and rebuilds them in a legal unit after the resume; DFlash/DFlash2 keep their
+respective context and local state rules. Vision keeps prepared media, media identity and MRoPE, and a
+stale vision handoff is re-encoded on demand.
+These resume constraints use the same model mathematics implementation as ordinary execution.
 
 <a id="transfers"></a>
-## 9. 传输与取消
+## 9. Transfers and cancellation
 
-Program 同时至多有一个上下文事务，可执行绑定、捕获、demotion 或暂停；已经取得许可且不依赖
-其来源的工作可以继续运行。事务遵循：
+A Program has at most one context transaction at a time, which can perform a bind, capture, demotion or
+pause; work that already holds a permit and does not depend on that source can keep running. A
+transaction follows:
 
 ```text
-确定源与物理集合 → 取得源 lease 与目的预留 → 提交复制
-                → 等待完成事件 → 发布副本/交接 → 释放可释放的来源
+determine source and physical set → acquire source lease and destination reservation → submit copies
+                                 → wait for completion events → publish replica/handoff → release releasable sources
 ```
 
-初次绑定还取得首单元许可；暂停恢复绑定取得完整恢复许可。DMA 提交前取消撤销本次预留；
-提交后等待真实 reader 完成再释放。绑定的不可逆所有权交接另外由采用提交点界定。未完成副本不能成为查询来源。
-Sequence、checkpoint 和 pending handle 的 owner/generation 检查防止迟到完成误用已复用描述。
-设备错误进入 Engine 统一 failure cleanup；普通资源不足返回策略层处理。
+An initial bind also acquires the first unit's permit; a pause resume bind acquires the complete resume
+permit. A cancellation before DMA submission revokes this reservation; after submission, release waits
+for the real readers to finish. The irreversible ownership handoff of a bind is separately bounded by
+the adoption commit point. An incomplete replica cannot become a lookup source.
+Owner/generation checks on sequences, checkpoints and pending handles prevent late completions from
+misusing reused descriptors.
+Device errors go to the Engine's unified failure cleanup; ordinary resource shortfalls return to the
+policy layer.
 
-恢复取得完整目的空间，可能出现最终驻留分布可容纳、交换中间态却不能同时容纳的情况。例如 GPU
-中有 B、Host 中有 A，恢复 A 的完整目的与 B 的 Host 写回目标可能竞争同一余量。没有其他释放者
-时可以丢弃可选 B 推进。有限页组回收减少过量搬运，但不提供流式分段恢复。
+A resume acquires the complete destination space, so the final resident distribution may fit while the
+intermediate state of the swap does not. For example, with B on the GPU and A on the Host, the complete
+destination for restoring A and the Host write-back target for B may compete for the same headroom.
+With no other releaser, optional B can be dropped to make progress. Finite page-group reclaim reduces
+excess movement but does not provide streamed, segmented resume.
 
 <a id="examples"></a>
-## 10. 规则在请求链中的作用
+## 10. How the rules act along a request chain
 
-| 场景 | 从输入到执行的结果 |
+| Scenario | Result from input to execution |
 |---|---|
-| agent 采用上轮 E，随后客户端规范化 tool call | 正常续接 Move/Fork E；更深位置失配时，采用 typed R 对应的实际输入恢复点并补算后缀 |
-| 私有输入恢复点与公共 marker 同点 | 一份 state 可有两种用途；私有记录接管前移，公共入口继续按自己的引用和热度存活 |
-| 前缀 α 与 α+β 都有显式 marker，后来请求 α+γ | 两个位置各有保存机会；较浅 α 仍可作为完整来源 |
-| 热前驱产生多个一次性分支 | 各分支携带实际采用时刻，完成不再加热；总 footprint 超过软目标时降级较老记录 |
-| 长输入没有语义保存点 | 按 chunk 让出执行机会，chunk 不保存 state；压力导致暂停时才采用 Snapshot 或 Replay |
-| 只缺几页 Main KV | 比较该稀缺单位的有限物理动作，选择所需页组；backend KV 与 State 不自动全部搬走 |
-| Host 为零且 Device state 极少 | 可选输入点/共享保存可能失败；必要执行回收空间，Replay 在完整恢复许可下推进 |
-| 长请求暂停，另有更老 resident | 长请求局部等待；能装入余量的短请求继续进入，更老 resident 结束后按原票号恢复 |
-| 未保留的同一候选被多个请求重新计算 | 新提交观察形成重复需求证据，后续保存可进入复用段，缓存命中统计仍只计实际复用 |
+| An agent adopts the previous turn's E, then the client normalizes a tool call | Normal continuation Moves/Forks E; when deeper positions mismatch, the actual input restore point corresponding to typed R is adopted and the suffix recomputed |
+| A private input restore point coincides with a public marker | One state can have both uses; the private record takes over and moves forward, and the public entry survives by its own references and heat |
+| Prefixes α and α+β both have explicit markers, and a later request is α+γ | Each position gets a save opportunity; the shallower α can still serve as a complete source |
+| A hot predecessor produces many one-off branches | Each branch carries its actual adoption time and completion does not heat it further; older records are demoted when the total footprint exceeds the soft target |
+| A long input has no semantic save point | Execution opportunities are yielded per chunk and chunks do not save state; Snapshot or Replay is used only when pressure causes a pause |
+| Only a few Main KV pages are short | Finite physical actions in that scarce unit are compared and the required page group is chosen; backend KV and State are not automatically all moved out |
+| Host is zero and Device state is very small | Optional input-point/shared saves may fail; necessary execution reclaims space, and Replay advances under a complete resume permit |
+| A long request is paused while an older resident exists | The long request waits locally; short requests that fit in the headroom keep entering, and after the older resident finishes it resumes in original ticket order |
+| The same unretained candidate is recomputed by several requests | New commit observations form repeated-demand evidence, later saves can enter the reuse tier, and cache-hit statistics still count only actual reuse |
 
 <a id="observability"></a>
-## 11. 观测与性能边界
+## 11. Observability and performance limits
 
-日志和 [TTFT 工具](../../tools/bench/ttft/README.md)分别报告请求结果、命中与真实工作、物理搬运、
-抢占恢复和用户可见时延。初次 prefill 与 Replay 分开计数；取消只计已经执行的工作。
-`GenerationStart` 和首次 admitted/first-token 只发布一次，暂停不重新计算 ingress 超时。
+Logs and the [TTFT tool](../../tools/bench/ttft/README.md) report request results, hits and real work,
+physical movement, preemption resumes and user-visible latency respectively. Initial prefill and
+Replay are counted separately; cancellation counts only work already executed.
+`GenerationStart` and the first admitted/first-token events are published only once, and a pause does
+not recompute the ingress timeout.
 
-评估顺序是：先检查是否失去应有的完整恢复点，再看严重退化和流中停顿，最后分析单个场景的复制、
-重算、CPU 调度和协议准备成本。完整命中也可能需要大量 H2D；低 TTFT 也可能伴随长时间暂停后的
-输出空窗。两者分别报告。
+The evaluation order is: first check whether a complete restore point that should exist was lost, then
+look at severe regressions and in-stream stalls, and finally analyze the copy, recompute, CPU scheduling
+and protocol preparation costs of individual scenarios. A complete hit may still need a lot of H2D; a
+low TTFT may still come with an output gap after a long pause. Report the two separately.
 
-有限恢复点无法覆盖任意历史改写。整记录保留、新共享保存的竞争、固定 typed pools、完整恢复
-目的空间、Replay 和 Vision 重编码都可能产生实际成本。吞吐、TTFT、完成时间与最大输出间隔
-共同描述结果；单 sample 只说明该次轨迹，不建立延迟分布保证。
+Finite restore points cannot cover arbitrary history rewrites. Whole-record retention, competition from
+new shared saves, fixed typed pools, complete resume destination space, Replay and Vision re-encoding
+can all incur real costs. Throughput, TTFT, completion time and the maximum output gap together describe
+the result; a single sample describes only that trajectory and establishes no latency distribution
+guarantee.
 
-实现入口：
+Implementation entry points:
 
-- [Scheduler](../../src/runtime/engine/scheduler.h)、[ResourceManager](../../src/runtime/engine/context_cache/resource_manager.h)：成员与策略。
-- [EngineCore](../../src/runtime/engine/engine_core.h)：事务编排、生命周期与发布。
-- [Program](../../src/models/qwen3_5/program/program.h)：模型恢复与资源操作合同。
-- [Native 源码组织](../../src/models/qwen3_5/program_sources.cmake)：规划、存储、绑定和各事务实现。
+- [Scheduler](../../src/runtime/engine/scheduler.h), [ResourceManager](../../src/runtime/engine/context_cache/resource_manager.h): membership and policy.
+- [EngineCore](../../src/runtime/engine/engine_core.h): transaction orchestration, lifecycle and publication.
+- [Program](../../src/models/qwen3_5/program/program.h): model restore and resource operation contracts.
+- [Native source organization](../../src/models/qwen3_5/program_sources.cmake): planning, stores, binding and the implementation of each transaction.

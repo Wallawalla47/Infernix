@@ -1,68 +1,76 @@
-# ReplaySSM：GDN speculative state 的 raw-input replay
+# ReplaySSM: raw-input replay of GDN speculative state
 
-本文讨论 Gated DeltaNet（GDN）在短窗口 speculative decoding 中的 ReplaySSM：
-target verify 保留原有的逐 token recurrence，但不保存每个 verify position 的完整 recurrent
-state；它只记录驱动状态转移的 raw inputs。最终接受长度确定后，再从 committed checkpoint
-顺序重放 accepted prefix，得到下一轮 state。
+This document discusses ReplaySSM for Gated DeltaNet (GDN) in short-window speculative decoding:
+target verify keeps the original token-by-token recurrence but does not save the complete recurrent
+state of every verify position; it records only the raw inputs that drive the state transitions. Once
+the final accepted length is known, the accepted prefix is replayed sequentially from the committed
+checkpoint to obtain the next round's state.
 
-这里的关键问题不只是“能否由 record 重建 state”。GDN recurrence 可以写出多种代数等价形式，
-但不同形式会改变归一化、reduction、乘加结合、Tensor Core 精度和 cast boundary。State 是跨轮持久
-值；很小的重建误差也会进入下一轮并继续传播。因此，本技术的核心要求是：
+The key question here is not just "can the state be rebuilt from the records". The GDN recurrence can be
+written in several algebraically equivalent forms, but different forms change the normalization,
+reductions, multiply-add association, Tensor Core precision and cast boundaries. State is a value that
+persists across rounds; even a tiny reconstruction error enters the next round and keeps propagating.
+The core requirement of this technique is therefore:
 
-> Replay fold 必须执行与 verify recurrence 相同的有限精度状态转移，而不仅是在实数域中计算一个
-> 等价公式。
+> The replay fold must execute the same finite-precision state transition as the verify recurrence, not
+> merely compute an equivalent formula over the reals.
 
-本文依次说明状态和 record 的数学定义、accepted-prefix replay、浮点漂移的来源、closed-loop
-bitwise clone 的条件、causal-conv history，以及当前 Qwen3.5 模型实例的空间与计算特征。
+This document covers, in order, the mathematical definition of state and records, accepted-prefix
+replay, the sources of floating-point drift, the conditions for a closed-loop bitwise clone, the
+causal-conv history, and the space and compute characteristics of the current Qwen3.5 model instances.
 
-Record/Fold 的实现与合同见 [`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) 和
-[`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp)。模型配置决定 layer/head
-数量，Program 按启用的 MTP、DFlash 或 DFlash2 窗口预留 record capacity。
+The Record/Fold implementation and contract are in
+[`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) and
+[`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp). The model config determines the
+layer/head counts, and the Program reserves record capacity for the enabled MTP, DFlash or DFlash2
+window.
 
 ---
 
-## 1. 问题：speculative verify 需要可选择的状态前缀
+## 1. Problem: speculative verify needs a selectable state prefix
 
-### 1.1 GDN state 的尺寸
+### 1.1 Size of the GDN state
 
-对每个 GDN layer 和 value head，recurrent state 是一个 FP32 矩阵
+For each GDN layer and value head, the recurrent state is an FP32 matrix
 
 \[
 S\in\mathbb{R}^{V\times K}.
 \]
 
-当前实例使用 \(K=V=128\)。一个 value head 的 state 包含 16,384 个 FP32 元素，即 64 KiB。
-乘上全部 GDN layers 和 value heads，一份完整 recurrent state image 为：
+The current instances use \(K=V=128\). The state of one value head contains 16,384 FP32 elements, i.e.
+64 KiB. Multiplied over all GDN layers and value heads, one complete recurrent state image is:
 
-| 模型 | GDN layers | value heads | 一份 recurrent state |
+| Model | GDN layers | value heads | One recurrent state |
 |---|---:|---:|---:|
 | Qwen3.6/3.8-27B | 48 | 48 | 144 MiB |
 | Qwen3.6-35B-A3B | 30 | 32 | 60 MiB |
 
 ### 1.2 Snapshot baseline
 
-设一次 target verify 处理 \(T\) 个 inputs，并从 committed state \(S_0\) 顺序得到
+Suppose one target verify processes \(T\) inputs and, starting from the committed state \(S_0\),
+sequentially produces
 
 \[
 S_1,S_2,\ldots,S_T.
 \]
 
-最终只会提交其中一个 prefix \(S_m\)。直接支持 rollback 的方法是把每个 state 都保存下来：
+In the end only one prefix \(S_m\) is committed. The direct way to support rollback is to save every
+state:
 
 ~~~text
 S0 ── input 1 ──> S1 ── input 2 ──> ... ── input T ──> ST
                     │                    │                  │
-                    └──────── 保存完整 state trajectory ──┘
+                    └──── save the complete state trajectory ──┘
 
-final commit length = m：选择 Sm
+final commit length = m: select Sm
 ~~~
 
-这会为每个 verify position 写一份 \(V\times K\) FP32 matrix。窗口增加一列，就增加一份完整
-state 的容量和写流量。
+This writes one \(V\times K\) FP32 matrix per verify position. Each extra window column adds the
+capacity and write traffic of one complete state.
 
 ### 1.3 Raw-input ReplaySSM
 
-Raw-input ReplaySSM 只保留：
+Raw-input ReplaySSM keeps only:
 
 \[
 \text{committed checkpoint }S_0
@@ -70,8 +78,8 @@ Raw-input ReplaySSM 只保留：
 R_1,R_2,\ldots,R_T,
 \]
 
-其中 \(R_t\) 是第 \(t\) 个 state transition 的紧凑 record。Verify 仍然产生全部 outputs，但不把
-\(S_1,\ldots,S_T\) 写入持久存储。最终 \(m\) 已知后计算
+where \(R_t\) is a compact record of the \(t\)-th state transition. Verify still produces all outputs,
+but does not write \(S_1,\ldots,S_T\) to persistent storage. Once the final \(m\) is known, it computes
 
 \[
 S_m=F_{\mathrm{fp}}\left(
@@ -81,18 +89,19 @@ F_{\mathrm{fp}}\left(
 \right),
 \]
 
-并只发布这一份 state。
+and publishes only this one state.
 
-这里 \(F_{\mathrm{fp}}\) 特意表示实际有限精度 transition，而不是抽象实数公式。后文会说明这一区别
-为何决定了 reconstructed state 能否与 verify trajectory 对齐。
+Here \(F_{\mathrm{fp}}\) deliberately denotes the actual finite-precision transition, not an abstract
+real-valued formula. The sections below explain why this distinction decides whether the reconstructed
+state lines up with the verify trajectory.
 
 ---
 
-## 2. GDN recurrence 与 raw transition record
+## 2. GDN recurrence and the raw transition record
 
-### 2.1 有限精度路径所对应的逻辑顺序
+### 2.1 The logical order of the finite-precision path
 
-以下省略 layer 和 value-head 下标。设
+Layer and value-head subscripts are omitted below. Let
 
 \[
 q_t^{raw},k_t^{raw}\in\mathbb{R}^{K},
@@ -100,7 +109,7 @@ q_t^{raw},k_t^{raw}\in\mathbb{R}^{K},
 v_t\in\mathbb{R}^{V}.
 \]
 
-Query 和 key 先做 L2 normalization：
+Query and key are first L2-normalized:
 
 \[
 \bar q_t=
@@ -112,13 +121,13 @@ Query 和 key 先做 L2 normalization：
 {\sqrt{\sum_i(k_{t,i}^{raw})^2+\epsilon}}.
 \]
 
-令
+Let
 
 \[
 \alpha_t=\exp(g_t).
 \]
 
-一次 GDN transition 可以按以下顺序写出：
+One GDN transition can be written in the following order:
 
 \[
 S_t^{decay}=\alpha_tS_{t-1},
@@ -142,7 +151,7 @@ y_t=c\,S_t\bar q_t,
 c=\frac{1}{\sqrt{128}}.
 \]
 
-合并后得到常见的紧凑写法：
+Combining them gives the common compact form:
 
 \[
 u_t=\beta_t
@@ -153,12 +162,13 @@ u_t=\beta_t
 S_t=\alpha_tS_{t-1}+u_t\bar k_t^{\mathsf T}.
 \]
 
-这两组公式在实数域中完全相同；第一组同时展示了实际 transition 中需要保持一致的运算边界：
-先 decay state，再从 decayed state 读取 correction，最后做 rank-one update。
+The two sets of formulas are identical over the reals; the first also shows the operation boundaries
+that must stay consistent in the actual transition: decay the state first, then read the correction
+from the decayed state, and finally apply the rank-one update.
 
 ### 2.2 Grouped q/k heads
 
-若 \(H_v\) 个 value heads 共享 \(H_{qk}\) 个 q/k heads，令
+If \(H_v\) value heads share \(H_{qk}\) q/k heads, let
 
 \[
 G=H_v/H_{qk},
@@ -166,73 +176,77 @@ G=H_v/H_{qk},
 h_q=\lfloor h/G\rfloor.
 \]
 
-Value head \(h\) 使用 q/k head \(h_q\)。每个 value head 有独立的 \(S\)、\(v\)、\(g\) 和
-\(\beta\)，同一 group 共享 raw \(q/k\)。
+Value head \(h\) uses q/k head \(h_q\). Each value head has its own \(S\), \(v\), \(g\) and \(\beta\),
+and a group shares the raw \(q/k\).
 
-### 2.3 State transition 的充分输入
+### 2.3 Sufficient inputs of the state transition
 
-给定 \(S_{t-1}\)，计算 \(S_t\) 只需要
+Given \(S_{t-1}\), computing \(S_t\) needs only
 
 \[
 R_t^{raw}=
 \left(k_t^{raw},v_t,g_t,\beta_t\right).
 \]
 
-各字段的作用是：
+The role of each field is:
 
-- \(k_t^{raw}\)：重新执行与 verify 相同的 normalization、state read 和 rank-one write；
-- \(v_t\)：重新计算 corrected value；
-- \(g_t\)：通过相同的 \(\exp\) 路径形成 decay；
-- \(\beta_t\)：形成 correction；
-- \(q_t\)：只用于本轮 output readout，不改变 state，因此不进入 replay record。
+- \(k_t^{raw}\): re-executes the same normalization, state read and rank-one write as verify;
+- \(v_t\): recomputes the corrected value;
+- \(g_t\): forms the decay through the same \(\exp\) path;
+- \(\beta_t\): forms the correction;
+- \(q_t\): used only for this round's output readout; it does not change the state, so it does not enter
+  the replay record.
 
-对于常见的 Qwen3.6 数值边界，raw \(k/v\) 是 BF16 represented values，\(g/\beta\) 是 FP32
-represented values，checkpoint 是 FP32。所谓 raw record，是对这些实际 transition inputs 的
-lossless side copy，而不是重新从 hidden state 或上游 projection 推导一次。
+At the usual Qwen3.6 numerical boundaries, raw \(k/v\) are BF16 represented values, \(g/\beta\) are
+FP32 represented values, and the checkpoint is FP32. The raw record is a lossless side copy of these
+actual transition inputs, not a second derivation from the hidden state or the upstream projection.
 
 ---
 
 ## 3. Accepted-prefix replay
 
-### 3.1 Verify input、output 与 commit length
+### 3.1 Verify input, output and commit length
 
-设 speculative drafter 给出 \(D\) 个 draft tokens。Target verify 处理
+Suppose the speculative drafter gives \(D\) draft tokens. Target verify processes
 
 \[
 T=D+1
 \]
 
-个 inputs：
+inputs:
 
 ~~~text
-input 1       = round 开始时尚未处理的 anchor
+input 1       = the anchor not yet processed at the start of the round
 input i + 1   = draft i, 1 <= i <= D
 ~~~
 
-若前 \(A\) 个 drafts 与 target 匹配，target 许可输出
+If the first \(A\) drafts match the target, the target licenses
 
 \[
 p=A+1
 \]
 
-个 tokens：\(A\) 个 accepted drafts 加一个 correction/bonus token。
+output tokens: \(A\) accepted drafts plus one correction/bonus token.
 
-需要推进 state 的 inputs 恰好是前 \(p\) 个 verify inputs，也就是旧 anchor 加前 \(A\) 个 accepted
-drafts。最后产生的 correction/bonus 尚未作为 input 执行；它成为下一轮 anchor。
+The inputs that need to advance the state are exactly the first \(p\) verify inputs, i.e. the old
+anchor plus the first \(A\) accepted drafts. The final correction/bonus has not yet been executed as an
+input; it becomes the next round's anchor.
 
-最终输出边界可能只保留 licensed outputs 的前 \(m\) 个，因此 state 的 commit length 是
+The final output boundary may keep only the first \(m\) of the licensed outputs, so the state's commit
+length is
 
 \[
 0\le m\le p.
 \]
 
-例如 \(D=5,A=3\) 时，\(p=4\)。四个候选 state transitions 是“旧 anchor + 前三个 accepted
-drafts”，四个 outputs 是“三个 accepted drafts + correction”。若最终 \(m=2\)，只重放“旧 anchor +
-第一个 accepted draft”；第二个 output 是新的 pending anchor。
+For example, with \(D=5,A=3\), \(p=4\). The four candidate state transitions are "old anchor + the first
+three accepted drafts", and the four outputs are "three accepted drafts + correction". If finally
+\(m=2\), only "old anchor + the first accepted draft" is replayed; the second output is the new pending
+anchor.
 
-### 3.2 Verify：产生 outputs 和 raw records
+### 3.2 Verify: produce outputs and raw records
 
-Verify 从 committed checkpoint 开始，顺序执行原 recurrence：
+Verify starts from the committed checkpoint and runs the original recurrence in order:
 
 ~~~text
 S_verify <- S0
@@ -248,12 +262,12 @@ for t = 1 .. T:
     record[t] <- (k_raw[t], v[t], g[t], beta[t])
 ~~~
 
-这里的 \(S_{verify}\) 是生成当前 window outputs 所需的 transient trajectory。Verify 结束后，它不作为
-committed state 发布；持久 checkpoint \(S_0\) 保持不变。
+Here \(S_{verify}\) is the transient trajectory needed to produce the current window's outputs. After
+verify ends it is not published as committed state; the persistent checkpoint \(S_0\) stays unchanged.
 
-### 3.3 Fold：只重放 accepted prefix
+### 3.3 Fold: replay only the accepted prefix
 
-最终 \(m\) 已知后，fold 从同一 \(S_0\) 出发：
+Once the final \(m\) is known, fold starts from the same \(S_0\):
 
 ~~~text
 S_fold <- S0
@@ -268,15 +282,15 @@ for t = 1 .. m:
 publish S_fold
 ~~~
 
-\(m=0\) 时 state 严格不变。Rejected suffix \(R_{m+1:T}\) 从未被 fold 读取。
+When \(m=0\) the state is strictly unchanged. The rejected suffix \(R_{m+1:T}\) is never read by fold.
 
-单个 head 内仍有最多 \(m\) 次顺序 transition，但不同 layers、value heads 和 batch rows 相互独立。
-Qwen3.6 的并行宽度来自 30/48 个 GDN layers、32/48 个 value heads 和多个 active rows，而单行
-token loop 最多只有 6 或 16 次。
+Within one head there are still up to \(m\) sequential transitions, but different layers, value heads and
+batch rows are independent of one another. Qwen3.6's parallel width comes from 30/48 GDN layers, 32/48
+value heads and multiple active rows, while the per-row token loop has at most 6 or 16 iterations.
 
-### 3.4 Accepted-prefix 正确性
+### 3.4 Accepted-prefix correctness
 
-把 verify 使用的有限精度 transition 记为 \(F_{\mathrm{fp}}\)：
+Denote the finite-precision transition used by verify as \(F_{\mathrm{fp}}\):
 
 \[
 S_t^{verify}=
@@ -285,7 +299,7 @@ F_{\mathrm{fp}}(S_{t-1}^{verify},R_t),
 S_0^{verify}=S_0.
 \]
 
-若 fold 使用完全相同的 \(F_{\mathrm{fp}}\)：
+If fold uses exactly the same \(F_{\mathrm{fp}}\):
 
 \[
 S_t^{fold}=
@@ -294,33 +308,35 @@ F_{\mathrm{fp}}(S_{t-1}^{fold},R_t),
 S_0^{fold}=S_0,
 \]
 
-则可以直接按 \(t\) 归纳：
+then by direct induction on \(t\):
 
 \[
 S_t^{fold}=S_t^{verify},
 \qquad 0\le t\le m.
 \]
 
-所以
+So
 
 \[
 S_m^{fold}=S_m^{verify}
 \]
 
-可以是有限精度下的逐 bit 结论，而不只是实数域中的等价。它成立的前提是两条路径调用的是同一个
-deterministic floating-point transition，并消费相同的 record bits。
+can be a bit-exact conclusion under finite precision, not merely an equivalence over the reals. It holds
+provided both paths call the same deterministic floating-point transition and consume the same record
+bits.
 
-这里比较的是同一个物理 verify block 的 recorded prefix。它不要求另起一次较短 verify、不同
-prefill 分块或另一套数值实现产生相同 inputs、logits 或 state。Record 之前的计算已确定本轮输入；
-Fold 要忠实提交这些输入形成的轨迹。
+What is compared here is the recorded prefix of the same physical verify block. It does not require a
+separate shorter verify, a different prefill chunking or another numerical implementation to produce
+the same inputs, logits or state. The computation before the record has already fixed this round's
+inputs; Fold must faithfully commit the trajectory those inputs form.
 
 ---
 
-## 4. 数值核心：为什么“代数等价”仍会产生 state drift
+## 4. Numerical core: why "algebraically equivalent" still produces state drift
 
-### 4.1 有限精度中的计算路径
+### 4.1 The computation path under finite precision
 
-对同一组 inputs，一次 GDN transition 在实数域中可以写成
+For the same inputs, one GDN transition over the reals can be written as
 
 \[
 S_t=
@@ -329,7 +345,7 @@ S_t=
 \bar k_t^{\mathsf T},
 \]
 
-也可以写成
+or as
 
 \[
 S_t=
@@ -338,32 +354,36 @@ S_t=
 +\beta_tv_t\bar k_t^{\mathsf T}.
 \]
 
-这两个表达式定义同一个实数映射，但 floating-point state 是具体求值程序的结果。它取决于：
+These two expressions define the same real-valued mapping, but the floating-point state is the result of
+a concrete evaluation program. It depends on:
 
-- raw key normalization 的 reduction tree、sqrt 和 division；
-- \(g_t\) 到 \(\alpha_t\) 的 \(\exp\) 路径；
-- \(S\bar k\) 的累加顺序和 operand precision；
-- state decay、correction 和 rank-one update 的先后顺序；
-- FMA contraction、tile decomposition 和 state-store boundary。
+- the reduction tree, sqrt and division of raw key normalization;
+- the \(\exp\) path from \(g_t\) to \(\alpha_t\);
+- the accumulation order and operand precision of \(S\bar k\);
+- the order of state decay, correction and rank-one update;
+- FMA contraction, tile decomposition and the state-store boundary.
 
-代数等价不会自动带来 represented state 相等。Replay 一旦改变上述任一环节，就定义了一个新的有限精度
-transition；单步差异会进入 committed state，并成为下一轮 recurrence 的输入。
+Algebraic equivalence does not automatically give equal represented state. As soon as replay changes any
+of these steps, it defines a new finite-precision transition; a single-step difference enters the
+committed state and becomes an input to the next round's recurrence.
 
-### 4.2 Raw record 与 replay path
+### 4.2 Raw record and replay path
 
-Raw record
+The raw record
 
 \[
 R_t=(k_t^{raw},v_t,g_t,\beta_t)
 \]
 
-固定了 transition 的 represented inputs。完整的 replay state 还由有限精度映射 \(F_{\mathrm{fp}}\) 共同决定：
+fixes the represented inputs of the transition. The complete replay state is also determined by the
+finite-precision mapping \(F_{\mathrm{fp}}\):
 
 \[
 S_t=F_{\mathrm{fp}}(S_{t-1},R_t).
 \]
 
-若 fold 实际执行另一个求值程序 \(\widetilde F_{\mathrm{fp}}\)，即使两者在实数域中对应同一个公式，
+If fold actually executes another evaluation program \(\widetilde F_{\mathrm{fp}}\), then even when both
+correspond to the same formula over the reals,
 
 \[
 \widetilde F_{\mathrm{fp}}(S,R)
@@ -371,42 +391,45 @@ S_t=F_{\mathrm{fp}}(S_{t-1},R_t).
 F_{\mathrm{fp}}(S,R)
 \]
 
-仍然可能成立。Raw record 固定 inputs identity；verbatim replay 固定 transition identity。
+can still hold. The raw record fixes input identity; verbatim replay fixes transition identity.
 
 ### 4.3 Verbatim closed-loop replay
 
-Closed-loop replay 的 record 和计算职责是：
+The record and compute responsibilities of closed-loop replay are:
 
-| 项目 | 要求 |
+| Item | Requirement |
 |---|---|
-| raw \(v\) | 保存 verify recurrence 实际消费的 represented bits |
-| raw \(k\) | 保存 normalization 之前的 represented bits |
-| \(g\) | 保存 verify 已得到的 FP32 log-decay gate，不从上游重新计算 |
-| \(\beta\) | 保存 verify 已得到的 FP32 correction gate |
-| normalization | 相同的 epsilon、reduction tree、sqrt/division 形式 |
-| decay | 相同的 \(\exp\) 与 state multiply 顺序 |
-| correction | 从 replay 到当前位置的 state 重新计算 \(u\) |
-| rank-one update | 相同的 operand precision、FMA contraction 和 tile decomposition |
-| state store | 相同的 FP32 represented boundary |
+| raw \(v\) | Store the represented bits the verify recurrence actually consumed |
+| raw \(k\) | Store the represented bits before normalization |
+| \(g\) | Store the FP32 log-decay gate verify already obtained; do not recompute it from upstream |
+| \(\beta\) | Store the FP32 correction gate verify already obtained |
+| normalization | The same epsilon, reduction tree and sqrt/division form |
+| decay | The same \(\exp\) and state multiply order |
+| correction | Recompute \(u\) from the state replayed up to the current position |
+| rank-one update | The same operand precision, FMA contraction and tile decomposition |
+| state store | The same FP32 represented boundary |
 
-“Closed loop”表示每个 corrected value 都从当前 replay state、raw \(v/k\) 和 gate bits 当场计算。
-这使 fold 的每一步都进入与 verify 相同的 transition，并使上一步得到的 represented state 成为下一步
-correction 的直接输入。
+"Closed loop" means every corrected value is computed on the spot from the current replay state, raw
+\(v/k\) and the gate bits. This makes each fold step enter the same transition as verify, and makes the
+represented state obtained in one step the direct input to the next step's correction.
 
-SGLang 在 Kimi K3 bring-up 中观察到了这一数值边界：早期 fold 从另一条计算路径重算 gate，虽然当时
-outputs 仍看起来正常，recurrent state 已经开始漂移。改为直接记录 verify 产生的 gate values，并在 fold
-中复刻 recurrence 后，state 与 recurrent baseline 达到 bit-identical。SGLang 的 GDN exact fold 同样对齐了
-verify branch 的 state tile、division-form L2 normalization 和 operation order。
+SGLang observed this numerical boundary during the Kimi K3 bring-up: an early fold recomputed the gates
+from a different compute path, and although the outputs still looked normal at the time, the recurrent
+state had already started to drift. After switching to directly recording the gate values produced by
+verify and replicating the recurrence in fold, the state became bit-identical to the recurrent baseline.
+SGLang's GDN exact fold likewise aligns with the verify branch's state tile, division-form L2
+normalization and operation order.
 
-### 4.4 State drift 如何传播
+### 4.4 How state drift propagates
 
-先考虑两条 trajectory 使用相同 represented inputs 和同一个实数 GDN 公式，但起始 state 存在差异
+First consider two trajectories that use the same represented inputs and the same real-valued GDN
+formula but start from different states
 
 \[
 \Delta S_t=\widetilde S_t-S_t.
 \]
 
-由 recurrence 可得
+From the recurrence,
 
 \[
 \Delta S_{t+1}
@@ -414,7 +437,8 @@ verify branch 的 state tile、division-form L2 normalization 和 operation orde
 \left(I-\beta_{t+1}\bar k_{t+1}\bar k_{t+1}^{\mathsf T}\right).
 \]
 
-若 reconstructed transition 本身还引入局部浮点偏差 \(E_{t+1}\)，则可以写成误差模型
+If the reconstructed transition itself also introduces a local floating-point deviation \(E_{t+1}\),
+the error model can be written as
 
 \[
 \Delta S_{t+1}
@@ -423,70 +447,73 @@ verify branch 的 state tile、division-form L2 normalization 和 operation orde
 +E_{t+1}.
 \]
 
-对应的 state readout 差异是
+The corresponding state readout difference is
 
 \[
 \Delta y_{t+1}=c\,\Delta S_{t+1}\bar q_{t+1}.
 \]
 
-本轮已由 verify trajectory 产生的 outputs 不会被 fold 追溯修改。真正的问题出现在下一轮：
-attention/KV、hidden 和已发布 outputs 来自 verify trajectory，而 GDN checkpoint 来自另一个数值
-trajectory。即使单轮 output cast 暂时掩盖了差异，persistent state 仍会在后续 token 中反复参与
-correction 和 readout。
+The outputs already produced by the verify trajectory in this round are not retroactively changed by
+fold. The real problem appears in the next round: attention/KV, the hidden state and the published
+outputs come from the verify trajectory, while the GDN checkpoint comes from another numerical
+trajectory. Even if one round's output cast temporarily masks the difference, the persistent state keeps
+taking part in correction and readout in later tokens.
 
-Decay \(\alpha<1\) 可以衰减部分旧误差，但
+Decay \(\alpha<1\) can attenuate some of the old error, but
 
 \[
 I-\beta\bar k\bar k^{\mathsf T}
 \]
 
-是方向相关的更新，且每轮还可能注入新的 \(E_t\)。因此不能用“gate 会衰减误差”代替对 committed
-state 的直接验证。
+is a direction-dependent update, and each round can also inject a new \(E_t\). So "the gate will decay
+the error" cannot replace direct verification of the committed state.
 
-### 4.5 正确性的两个层次
+### 4.5 Two levels of correctness
 
-ReplaySSM state reconstruction 应区分两个判据：
+ReplaySSM state reconstruction should distinguish two criteria:
 
-1. **数学正确性**
+1. **Mathematical correctness**
 
-   从 represented BF16/FP32 inputs 和 FP32 \(S_0\) 出发，相对于独立 FP32/FP64 GDN oracle，
-   output 和 final state 满足规定误差。
+   Starting from the represented BF16/FP32 inputs and the FP32 \(S_0\), the output and final state meet
+   the specified error relative to an independent FP32/FP64 GDN oracle.
 
-2. **有限精度 clone**
+2. **Finite-precision clone**
 
-   对同一 \(S_0\)、同一 raw record bits 和同一 accepted prefix，fold 后的 FP32 state 与
-   同一物理 verify block 的对应 trajectory 在每个 element 上逐 bit 相同。
+   For the same \(S_0\), the same raw record bits and the same accepted prefix, the FP32 state after
+   fold is bit-identical in every element to the corresponding trajectory of the same physical verify
+   block.
 
-验证 bitwise clone 时，最终文本或 BF16 output parity 都不够。直接证据应覆盖：
+When verifying a bitwise clone, neither final text nor BF16 output parity is sufficient. Direct evidence
+should cover:
 
-- raw \(k/v\) 与 \(g/\beta\) record 的 exact bit copy；
-- verify 期间 committed checkpoint 完全不变；
-- \(m=0,1,T\) 和中间 \(m\) 的 final state exact comparison；
-- 不同 accepted-length 序列组成的长链 replay；
-- 很小 key norm、gate 极值和多个 q/k-to-value-head groups；
-- rejected suffix 改写后，committed state 仍保持不变。
+- exact bit copies of the raw \(k/v\) and \(g/\beta\) records;
+- the committed checkpoint staying completely unchanged during verify;
+- exact final-state comparison for \(m=0,1,T\) and intermediate \(m\);
+- long-chain replay composed of sequences with different accepted lengths;
+- very small key norms, gate extremes and multiple q/k-to-value-head groups;
+- the committed state staying unchanged after the rejected suffix is rewritten.
 
-若 fold 与 verify 采用不同的算术路径，就应按独立 oracle 声明 numerical tolerance，而不能把结果称为
-bitwise clone。
+If fold and verify use different arithmetic paths, a numerical tolerance should be declared against an
+independent oracle, and the result must not be called a bitwise clone.
 
 ---
 
-## 5. Causal convolution 的有限窗口状态
+## 5. The finite-window state of the causal convolution
 
-GDN block 通常在 recurrence 之前带有 causal depthwise convolution。若卷积宽度为 \(W\)，持久
-history 只包含最近 \(W-1\) 个 projection columns：
+A GDN block usually has a causal depthwise convolution before the recurrence. If the convolution width is
+\(W\), the persistent history contains only the most recent \(W-1\) projection columns:
 
 \[
 H_0=[p_{-(W-2)},\ldots,p_0].
 \]
 
-Verify 产生
+Verify produces
 
 \[
 p_1,p_2,\ldots,p_T.
 \]
 
-最终 commit length 为 \(m\) 时，正确 history 是
+When the final commit length is \(m\), the correct history is
 
 \[
 H_m=
@@ -494,133 +521,136 @@ H_m=
 \left(H_0\mathbin\Vert[p_1,\ldots,p_m]\right).
 \]
 
-因此每个 verify position 只需记录一列 represented projection history，而不是保存整个
-\(W-1\)-column window：
+So each verify position only needs to record one column of represented projection history rather than
+saving the whole \(W-1\)-column window:
 
-- \(m=0\)：history 不变；
-- \(0<m<W-1\)：保留部分旧 columns 并追加 accepted columns；
-- \(m\ge W-1\)：使用 accepted prefix 的最后 \(W-1\) 列。
+- \(m=0\): the history is unchanged;
+- \(0<m<W-1\): some old columns are kept and the accepted columns appended;
+- \(m\ge W-1\): the last \(W-1\) columns of the accepted prefix are used.
 
-只要 record 是 baseline 将写入 history 的同一 BF16 represented column，这个 commit 是 exact gather，
-没有 recurrent reduction 或浮点重关联。Qwen3.6 使用 \(W=4\)，所以一列 record 是一份三列 snapshot
-的 \(1/3\)。
+As long as the record is the same BF16 represented column the baseline would write into the history,
+this commit is an exact gather, with no recurrent reduction or floating-point reassociation. Qwen3.6 uses
+\(W=4\), so a one-column record is \(1/3\) of a three-column snapshot.
 
 ---
 
-## 6. 空间与计算特征
+## 6. Space and compute characteristics
 
-### 6.1 通用公式
+### 6.1 General formulas
 
-令：
+Let:
 
-- \(L_g\)：GDN layer 数；
-- \(H_q\)：q/k head 数；
-- \(H_v\)：value head 数；
-- \(K,V\)：key/value dimension；
-- \(C_p\)：causal-conv projection channels；
-- \(W-1\)：conv history columns；
-- \(T\)：verify window。
+- \(L_g\): the number of GDN layers;
+- \(H_q\): the number of q/k heads;
+- \(H_v\): the number of value heads;
+- \(K,V\): the key/value dimensions;
+- \(C_p\): the causal-conv projection channels;
+- \(W-1\): the conv history columns;
+- \(T\): the verify window.
 
-一份 FP32 recurrent state 的字节数为
+The byte size of one FP32 recurrent state is
 
 \[
 R=4L_gH_vVK.
 \]
 
-一份 BF16 conv history 的字节数为
+The byte size of one BF16 conv history is
 
 \[
 Q=2L_gC_p(W-1).
 \]
 
-若 raw \(k/v\) 为 BF16、\(g/\beta\) 为 FP32，每 token 的 GDN record 为
+With raw \(k/v\) in BF16 and \(g/\beta\) in FP32, the per-token GDN record is
 
 \[
 P_{gdn}=
 2L_g(H_qK+H_vV)+8L_gH_v.
 \]
 
-每 token 的 conv column record 为
+The per-token conv column record is
 
 \[
 P_{conv}=2L_gC_p.
 \]
 
-长度为 \(T\) 的完整 replay log 为
+A complete replay log of length \(T\) is
 
 \[
 P_{record}(T)=T(P_{gdn}+P_{conv}).
 \]
 
-Snapshot trajectory 的窗口相关容量是
+The window-dependent capacity of a snapshot trajectory is
 
 \[
 T(R+Q),
 \]
 
-而 raw ReplaySSM 是
+whereas raw ReplaySSM is
 
 \[
 T(P_{gdn}+P_{conv}).
 \]
 
-### 6.2 当前 Qwen 实例尺寸
+### 6.2 Current Qwen instance sizes
 
-| 模型 | \(L_g\) | \(H_q\) | \(H_v\) | \(K/V\) | \(C_p\) | \(W\) |
+| Model | \(L_g\) | \(H_q\) | \(H_v\) | \(K/V\) | \(C_p\) | \(W\) |
 |---|---:|---:|---:|---:|---:|---:|
 | 27B | 48 | 16 | 48 | 128/128 | 10,240 | 4 |
 | 35B-A3B | 30 | 16 | 32 | 128/128 | 8,192 | 4 |
 
-对应的每 token state/record 尺寸为：
+The corresponding per-token state/record sizes are:
 
-| 模型 | recurrent image | conv history | raw GDN record | conv record | record total |
+| Model | recurrent image | conv history | raw GDN record | conv record | record total |
 |---|---:|---:|---:|---:|---:|
 | 27B | 144.000 MiB | 2.8125 MiB | 0.767578 MiB | 0.9375 MiB | 1.705078 MiB |
 | 35B-A3B | 60.000 MiB | 1.40625 MiB | 0.358887 MiB | 0.46875 MiB | 0.827637 MiB |
 
-单个 raw record 与一份 recurrent+conv snapshot 的比例是：
+The ratio of one recurrent+conv snapshot to one raw record is:
 
-| 模型 | snapshot/position | raw record/position | 尺寸比 |
+| Model | snapshot/position | raw record/position | Size ratio |
 |---|---:|---:|---:|
-| 27B | 146.8125 MiB | 1.705078 MiB | 约 86.1× |
-| 35B-A3B | 61.40625 MiB | 0.827637 MiB | 约 74.2× |
+| 27B | 146.8125 MiB | 1.705078 MiB | about 86.1× |
+| 35B-A3B | 61.40625 MiB | 0.827637 MiB | about 74.2× |
 
-典型 verify windows 的 record 容量为：
+The record capacity of typical verify windows is:
 
-| 模型与窗口 | raw GDN records | conv records | 合计 |
+| Model and window | raw GDN records | conv records | Total |
 |---|---:|---:|---:|
-| 27B，\(T=6\) | 4.605469 MiB | 5.625000 MiB | 10.230469 MiB |
-| 27B，\(T=16\) | 12.281250 MiB | 15.000000 MiB | 27.281250 MiB |
-| 35B-A3B，\(T=6\) | 2.153320 MiB | 2.812500 MiB | 4.965820 MiB |
-| 35B-A3B，\(T=16\) | 5.742188 MiB | 7.500000 MiB | 13.242188 MiB |
+| 27B, \(T=6\) | 4.605469 MiB | 5.625000 MiB | 10.230469 MiB |
+| 27B, \(T=16\) | 12.281250 MiB | 15.000000 MiB | 27.281250 MiB |
+| 35B-A3B, \(T=6\) | 2.153320 MiB | 2.812500 MiB | 4.965820 MiB |
+| 35B-A3B, \(T=16\) | 5.742188 MiB | 7.500000 MiB | 13.242188 MiB |
 
-### 6.3 计算形态
+### 6.3 Compute shape
 
-Raw-input replay 保持 verify 的 serial recurrence，并在 commit 增加最多 \(m\) 次 transition：
+Raw-input replay keeps verify's serial recurrence and adds at most \(m\) transitions at commit:
 
-| 项目 | Snapshot baseline | Raw-input replay |
+| Item | Snapshot baseline | Raw-input replay |
 |---|---|---|
-| verify state read | 一份 checkpoint | 一份 checkpoint |
-| verify full-state writes | \(T\) 份 | 0 |
-| verify record writes | 0 | \(T\) 份小 record |
-| commit work | 选择 snapshot | 重放 \(m\) 次 transition，写一份 state |
-| rollback | 选择对应 snapshot | 只读取 accepted record prefix |
-| persistent numerical path | verify recurrence | verify recurrence 的 closed-loop clone |
+| verify state read | one checkpoint | one checkpoint |
+| verify full-state writes | \(T\) copies | 0 |
+| verify record writes | 0 | \(T\) small records |
+| commit work | select a snapshot | replay \(m\) transitions, write one state |
+| rollback | select the corresponding snapshot | read only the accepted record prefix |
+| persistent numerical path | verify recurrence | closed-loop clone of the verify recurrence |
 
-本场景的 token 维度很短：MTP 最多 \(T=6\)，DFlash/DFlash2 最多 \(T=16\)。沿单个 layer、value head
-和 batch row，fold 有 \(m\) 次顺序 transition；不同 layers、heads 和 batch rows 之间相互独立。
-因此整体计算形态是大量彼此独立的短 recurrence。Fold 计算量随 accepted length \(m\) 线性增长，
-record traffic 随 verify length \(T\) 线性增长，最后只写一份 committed state。
+The token dimension in this scenario is short: MTP has at most \(T=6\), and DFlash/DFlash2 at most
+\(T=16\). Along a single layer, value head and batch row, fold has \(m\) sequential transitions; different
+layers, heads and batch rows are independent of one another.
+The overall compute shape is therefore a large number of mutually independent short recurrences. Fold
+work grows linearly with the accepted length \(m\), record traffic grows linearly with the verify length
+\(T\), and only one committed state is written at the end.
 
-这项技术首先是 capacity 与 state-traffic 优化。Verify 少写 \(T\) 份大 state，代价是写小 records，并在
-接受后多做一次短 prefix fold。端到端 latency 取决于 state traffic、accept length 和可用的
-layer/head/batch parallelism，不能从空间压缩比直接推出。
+This technique is first and foremost a capacity and state-traffic optimization. Verify writes \(T\) fewer
+large states, at the cost of writing small records and doing one extra short prefix fold after
+acceptance. End-to-end latency depends on state traffic, accept length and the available
+layer/head/batch parallelism, and cannot be inferred directly from the space compression ratio.
 
 ---
 
-## 7. 核心结论
+## 7. Core conclusions
 
-GDN speculative ReplaySSM 的状态表示是
+The state representation of GDN speculative ReplaySSM is
 
 \[
 \text{one committed checkpoint}
@@ -628,24 +658,29 @@ GDN speculative ReplaySSM 的状态表示是
 \text{one short raw transition log}.
 \]
 
-其正确性依赖以下不变量：
+Its correctness relies on the following invariants:
 
-1. Verify 从 committed checkpoint 产生 outputs 和 raw records，但不修改 checkpoint；
-2. record 保存 raw pre-normalization \(k\)、raw \(v\) 以及 verify 自己产生的 \(g/\beta\) bits；
-3. final commit length 同时定义需要重放的 record prefix；
-4. rejected suffix 不被 fold 读取；
-5. fold closed-loop 重算每个 corrected value；
-6. fold 与 verify 使用相同的 normalization、gate、reduction、operation order 和 state-store boundary；
-7. committed state 直接与同一物理 verify block 的对应 state prefix 比较。
+1. Verify produces outputs and raw records from the committed checkpoint but does not modify the
+   checkpoint;
+2. the record stores the raw pre-normalization \(k\), the raw \(v\) and the \(g/\beta\) bits verify itself
+   produced;
+3. the final commit length also defines the record prefix to replay;
+4. the rejected suffix is not read by fold;
+5. fold recomputes each corrected value in a closed loop;
+6. fold and verify use the same normalization, gates, reductions, operation order and state-store
+   boundary;
+7. the committed state is compared directly with the corresponding state prefix of the same physical
+   verify block.
 
-Raw inputs 决定“可以重放什么”，verbatim recurrence 决定“重放后是否得到同一个有限精度 state”。
-前者解决 snapshot 容量，后者阻止跨轮 state drift；两者共同构成短窗口 GDN ReplaySSM。
+The raw inputs determine "what can be replayed", and the verbatim recurrence determines "whether replay
+yields the same finite-precision state". The former solves snapshot capacity and the latter prevents
+cross-round state drift; together they make up short-window GDN ReplaySSM.
 
 ---
 
-## 参考资料
+## References
 
-- [SGLang and Miles Add Day-0 Support for Kimi K3](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support)：raw-input replay、stored gates 与 bit-identical state fold。
-- [SGLang GDN exact fold](https://github.com/sgl-project/sglang/blob/bc285b2064c0373227cfb6ada77a37e7b8c43510/python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py)：与 verify recurrence 对齐的 closed-loop fold。
-- [ReplaySSM: Cache SSM Inputs, Not State](https://tridao.me/blog/2026/replayssm/)：缓存 SSM transition inputs 并在需要时 fold state 的基本思路。
-- [Gated Delta Networks](https://arxiv.org/abs/2412.06464)：GDN 与 gated delta-rule 的数学来源。
+- [SGLang and Miles Add Day-0 Support for Kimi K3](https://www.lmsys.org/blog/2026-07-27-kimi-k3-day0-support): raw-input replay, stored gates and bit-identical state fold.
+- [SGLang GDN exact fold](https://github.com/sgl-project/sglang/blob/bc285b2064c0373227cfb6ada77a37e7b8c43510/python/sglang/kernels/ops/attention/fla/gdn_replayssm_spec_fold.py): a closed-loop fold aligned with the verify recurrence.
+- [ReplaySSM: Cache SSM Inputs, Not State](https://tridao.me/blog/2026/replayssm/): the basic idea of caching SSM transition inputs and folding the state when needed.
+- [Gated Delta Networks](https://arxiv.org/abs/2412.06464): the mathematical origin of GDN and the gated delta rule.

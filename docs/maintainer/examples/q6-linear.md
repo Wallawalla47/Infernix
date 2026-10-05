@@ -1,53 +1,59 @@
-# Q6 Linear 性能报告：N=34816，K=5120
+# Q6 Linear performance report: N=34816, K=5120
 
-2026-09-19 测量。本文记录 `text/layers/*/mlp/gate_up` 在 Q6 权重下的完整 Linear Op 性能，
-供评估该 shape 和后续调优参考。
+Measured 2026-09-19. This document records the complete Linear Op performance of
+`text/layers/*/mlp/gate_up` with Q6 weights, as a reference for evaluating this shape and for further
+tuning.
 
-## 测量对象与条件
+## Measured target and conditions
 
-| 项目 | 本次测量 |
+| Item | This measurement |
 |---|---|
-| 权重 | `Q6_G64_FP16`，row-split layout；每 64 个权重共享一个 FP16 scale，另有 16 字节高位平面 |
-| 数学形状 | `W[34816,5120] × X[5120,T] → Y[34816,T]` |
-| 输入、输出与 policy | BF16 输入、BF16 输出，`A16Only` |
-| GPU / 工具链 | NVIDIA GeForce RTX 5090；CUDA 13.4，Release，`sm_120a` |
-| 计时入口 | `ninfer::ops::linear`；每个 CUDA Graph 包含一次完整 Op 调用 |
-| cache / 采样 | 每个样本前清除 256 MiB L2；5 次 warmup、50 次测量，报告 median |
-| 输入 fixture | 使用公开 bench 的 Q6 packed-weight 与 BF16 activation fixture |
-| 覆盖 | T=1～128 每个整数；512、1024 两个大 T 锚点 |
-| 并发条件 | 测量时同机有一个空闲的常驻 NInfer 服务占用显存；bench 每样本清 256 MiB L2 |
+| Weights | `Q6_G64_FP16`, row-split layout; every 64 weights share one FP16 scale, plus a 16-byte high-bit plane |
+| Mathematical shape | `W[34816,5120] × X[5120,T] → Y[34816,T]` |
+| Input, output and policy | BF16 input, BF16 output, `A16Only` |
+| GPU / toolchain | NVIDIA GeForce RTX 5090; CUDA 13.4, Release, `sm_120a` |
+| Timing entry point | `ninfer::ops::linear`; each CUDA Graph contains one complete Op call |
+| Cache / sampling | 256 MiB L2 flush before each sample; 5 warmups, 50 measurements, median reported |
+| Input fixture | The public bench's Q6 packed-weight and BF16 activation fixtures |
+| Coverage | Every integer T=1–128; two large-T anchors at 512 and 1024 |
+| Concurrent conditions | During measurement an idle resident NInfer service on the same machine held device memory; the bench flushed 256 MiB of L2 per sample |
 
-当前被测调用均只有一个 Graph kernel 节点，外部 workspace 为零。测量范围是纯 Linear Op。
+Every currently measured call has exactly one Graph kernel node and zero external workspace. The
+measurement scope is the pure Linear Op.
 
-## 最终耗时曲线
+## Final latency curve
 
-![Q6 Linear 最终耗时曲线](q6-linear.svg)
+![Q6 Linear final latency curve](q6-linear.svg)
 
-左图包含全部 128 个实测点，圆点标出重点 T，橙色强调 T=1、4、8。
-右图分别展示 512、1024。图中连线仅连接相邻实测点。
+The left plot contains all 128 measured points; dots mark the key T values, with T=1, 4 and 8 highlighted
+in orange.
+The right plot shows 512 and 1024 separately. Lines in the plots connect only adjacent measured points.
 
-## 逻辑带宽与 Tensor Core 利用率
+## Logical bandwidth and Tensor Core utilization
 
-权重包含 `34816 × 5120 / 64 × 50 = 139,264,000` 字节（32 字节低位码 + 16 字节高位平面 +
-2 字节 FP16 scale，每 64 个权重一组）。沿用
-[Linear bench 指标定义](../linear-benchmark.md#5-数学工作量与-route-neutral-指标)：
+The weights contain `34816 × 5120 / 64 × 50 = 139,264,000` bytes (32 bytes of low-bit codes + a 16-byte
+high-bit plane + a 2-byte FP16 scale, per group of 64 weights). Following the
+[Linear bench metric definitions](../linear-benchmark.md#5-mathematical-work-and-route-neutral-metrics):
 
 ```text
 model_bytes = 139,264,000 + 2 × 5120 × T + 2 × 34816 × T
-逻辑带宽 GB/s = model_bytes / seconds / 1e9
-带宽利用率 = 逻辑带宽 / 1792 GB/s × 100%
+logical bandwidth GB/s = model_bytes / seconds / 1e9
+bandwidth utilization = logical bandwidth / 1792 GB/s × 100%
 
-有效算力 TFLOP/s = 2 × 34816 × 5120 × T / seconds / 1e12
-TC 利用率 = 有效算力 / 209.5 TFLOP/s × 100%
+effective compute TFLOP/s = 2 × 34816 × 5120 × T / seconds / 1e12
+TC utilization = effective compute / 209.5 TFLOP/s × 100%
 ```
 
-分母取自 bench 的 RTX 5090 固定规格常量。T=1 使用 GEMV，TC 利用率填 `—`；T≥2 的最终路径
-均使用 BF16 输入、FP32 累加的 dense MMA，使用对应的 **209.5 TFLOP/s** 峰值。
-当前 bench 的 Q6 行未填充 TC 字段，本文按上述公式补算；不加入 padding 或额外 tile 工作量。
+The denominators are the bench's fixed RTX 5090 specification constants. T=1 uses GEMV and its TC
+utilization is shown as `—`; the final paths for T≥2 all use dense MMA with BF16 input and FP32
+accumulation and use the corresponding **209.5 TFLOP/s** peak.
+The current bench's Q6 rows do not fill the TC fields, so this document computes them with the formulas
+above; no padding or extra tile work is added.
 
-“READ %”列是相对 bench 另列的 1674.5 GB/s 实测持续读上限的口径。
+The "READ %" column is relative to the 1674.5 GB/s measured sustained-read limit the bench lists
+separately.
 
-| T | 延迟 µs | 逻辑带宽 GB/s | 带宽利用率 | READ % | 有效算力 TFLOP/s | TC 利用率 |
+| T | Latency µs | Logical bandwidth GB/s | Bandwidth utilization | READ % | Effective compute TFLOP/s | TC utilization |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1 | 105.504 | 1320.7 | 73.70% | 78.87% | 3.38 | — |
 | 2 | 109.280 | 1275.8 | 71.20% | 76.19% | 6.52 | 3.11% |
@@ -74,29 +80,31 @@ TC 利用率 = 有效算力 / 209.5 TFLOP/s × 100%
 | 512 | 997.984 | 180.5 | 10.07% | 10.78% | 182.91 | 87.31% |
 | 1024 | 1868.510 | 118.3 | 6.60% | 7.07% | 195.38 | 93.26% |
 
-## 曲线解读与验证
+## Curve interpretation and validation
 
-[shape 实现](../../../src/ops/linear/q6/shapes/n34816_k5120.cpp) 按 T 选择 SIMT GEMV、
-`k128` 小块 MMA 和固定列宽 MMA 容量：
+The [shape implementation](../../../src/ops/linear/q6/shapes/n34816_k5120.cpp) chooses, by T, among SIMT
+GEMV, `k128` small-block MMA and fixed-column-width MMA capacities:
 
-- **T=1 为 105.504µs、1320.7 GB/s、
-  标称带宽利用率 73.70%**（持续读口径
-  78.87%）。权重 139.3 MB 构成该点的全部流量。
-- **T=1～7 使用 SIMT 路径**（容量 4、5、6、7），**T=8 起进入 MMA**。T=7→8 是本曲线最大的
-  相邻台阶，`delta_pct` 为 +31.2%，从 152.224µs 到
-  199.712µs。SIMT 段每增加一列约 +10µs，MMA 段则有约 200µs 的固定
-  权重量，两者组织不同，当前保留更低延迟的单 token 专用路径。
-- **T=8～48 使用 `k128` 小块 MMA**，容量 16、24、32、48。跨容量时曲线平滑，
-  T=16～48 的相邻涨幅均小于 2%。这一段是**带宽受限**的：逻辑带宽 701..659 GB/s、
-  标称利用率 39.1..36.8%，明显低于 T=1 的 73.7%。
-  该区间的耗时几乎与 T 无关（T=8 为 199.712µs、T=48 为
-  217.216µs），说明固定成本是权重读取，尚未达到 T=1 路径的读效率；
-  这是当前实现的已知限制，未在本次分派调优范围内。
-- **T=49～128 使用固定列宽容量**，是本形状相对注册词表形状最主要的差别。词表形状
-  （N=248320）在 49～128 整段只保留一个 128 列 tile，而本形状的 N 小 7 倍，
-  `r64` tile 的行块数为 544 而非 3880。按调优规程的候选流程划分后：
+- **T=1 is 105.504µs, 1320.7 GB/s, a nominal bandwidth utilization of 73.70%** (78.87% on the
+  sustained-read basis). The 139.3 MB of weights make up all the traffic at this point.
+- **T=1–7 use the SIMT path** (capacities 4, 5, 6, 7), and **from T=8 MMA is used**. T=7→8 is the largest
+  adjacent step on this curve, with a `delta_pct` of +31.2%, from 152.224µs to 199.712µs. The SIMT segment
+  adds about +10µs per column, while the MMA segment has a fixed weight cost of about 200µs; the two are
+  organized differently, and the lower-latency single-token dedicated path is currently kept.
+- **T=8–48 use `k128` small-block MMA**, with capacities 16, 24, 32 and 48. The curve is smooth across
+  capacities, and every adjacent increase over T=16–48 is below 2%. This segment is
+  **bandwidth-bound**: logical bandwidth 701..659 GB/s and nominal utilization 39.1..36.8%, clearly below
+  the 73.7% at T=1.
+  The latency in this range is almost independent of T (199.712µs at T=8, 217.216µs at T=48), showing
+  that the fixed cost is reading the weights, which has not yet reached the read efficiency of the T=1
+  path; this is a known limitation of the current implementation and was outside the scope of this
+  dispatch tuning.
+- **T=49–128 use fixed-column-width capacities**, the main difference of this shape relative to the
+  registered vocabulary shape. The vocabulary shape (N=248320) keeps only one 128-column tile over the
+  whole 49–128 range, whereas this shape's N is 7 times smaller and the `r64` tile has 544 row blocks
+  instead of 3880. After partitioning by the candidate process of the tuning procedure:
 
-| T | 词表形状的阶梯 | 本形状最终阶梯 | 变化 |
+| T | Vocabulary shape ladder | Final ladder of this shape | Change |
 |---:|---:|---:|---:|
 | 48 | 217.408 | 217.216 | -0.1% |
 | 56 | 330.528 | 228.096 | -31.0% |
@@ -106,24 +114,22 @@ TC 利用率 = 有效算力 / 209.5 TFLOP/s × 100%
 | 112 | 335.104 | 334.976 | -0.0% |
 | 128 | 325.792 | 325.600 | -0.1% |
 
-  全部 128 个实测点相对该基线的变化区间为 **-31.0% .. +0.7%**：最大降幅 -31.0%（T=56），
-  最大涨幅 +0.7%（T=25，落在逐点重复测量的波动范围内）。
-- **T=112 到 128 不再细分**：T=112 为 334.976µs，T=128 为
-  325.600µs。候选在 97～128 段测得的收益不足 1%，
-  不值得再加一条路由。
-- **大 T 锚点**：T=512 为 **997.984µs、
-  182.91 TFLOP/s、TC 利用率
-  87.31%**；T=1024 为
-  **1868.510µs、195.38 TFLOP/s、
-  TC 利用率 93.26%**。
-  两者单独测量，避免平均值掩盖其中一个的回归。
+  Across all 128 measured points, the change relative to this baseline ranges from **-31.0% .. +0.7%**:
+  the largest decrease is -31.0% (T=56), and the largest increase is +0.7% (T=25, within the fluctuation
+  of repeated per-point measurement).
+- **T=112 to 128 are not subdivided further**: T=112 is 334.976µs and T=128 is 325.600µs. The gain
+  measured for candidates in the 97–128 range was below 1%, not worth adding another route.
+- **Large-T anchors**: T=512 is **997.984µs, 182.91 TFLOP/s, TC utilization 87.31%**; T=1024 is
+  **1868.510µs, 195.38 TFLOP/s, TC utilization 93.26%**.
+  The two are measured separately so that an average cannot hide a regression in one of them.
 
-`ninfer_linear_q6_a16_test` 已通过。新增的 `N=34816, K=5120` case 覆盖 ladder 区分出的
-全部边界（1、4、5、6、7、8、9、16、17、24、25、32、33、48、49、50、128、129），并以现有
-A16 误差标准对独立解码的 packed code 与 FP16 scale 作 FP64 oracle 比较。
-调优过程中每次改动 ladder 都重跑该测试，均通过。
+`ninfer_linear_q6_a16_test` passed. The new `N=34816, K=5120` case covers every boundary the ladder
+distinguishes (1, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33, 48, 49, 50, 128, 129), and compares against an
+FP64 oracle over independently decoded packed codes and FP16 scales using the existing A16 error
+criteria.
+The test was rerun after every ladder change during tuning, and passed every time.
 
-## 复现
+## Reproduction
 
 ```bash
 cmake --build build -j --target ninfer_linear_bench ninfer_linear_q6_a16_test
@@ -139,5 +145,7 @@ cmake --build build -j --target ninfer_linear_bench ninfer_linear_q6_a16_test
   --csv-out profiles/bench/q6_n34816_k5120/final_bulk.csv
 ```
 
-继续调优时，按 [Linear 调优与报告规范](../linear-tuning.md) 选择候选、验证数值并收敛分派；
-本报告提供最终实现的测量结果与曲线，不承诺这些容量适用于其他 shape。
+For further tuning, choose candidates, validate numerics and converge the dispatch according to the
+[Linear tuning and reporting specification](../linear-tuning.md);
+this report provides the measured results and curves of the final implementation and does not promise
+that these capacities apply to other shapes.
