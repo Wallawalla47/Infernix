@@ -4,8 +4,17 @@
 #include "runtime/contract/timing.h"
 #include <compare>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
+
+// A unit of execution failed in a way that leaves the engine usable (an expert record that could
+// not be read, a host service that stopped answering): the engine fails the requests the unit
+// served, as for a recoverable logic error, and keeps serving.
+class RecoverableExecutionError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct LaneId {
     std::uint32_t value = 0;

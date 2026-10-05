@@ -57,7 +57,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         throw std::invalid_argument("CPU miss service options are out of range");
     }
     for (const auto& layer : layers_) {
-        if (layer.records == nullptr || layer.scales == nullptr || layer.record_stride < kRecordBytes) {
+        // Without a bank (the SSD tier) every request is tiered: it carries its records' addresses.
+        if ((layer.records == nullptr && options_.records == nullptr) || layer.scales == nullptr ||
+            layer.record_stride < kRecordBytes) {
             throw std::invalid_argument("CPU miss service layer is incomplete");
         }
     }

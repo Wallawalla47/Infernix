@@ -565,8 +565,58 @@ void test_landing() {
     for (const auto f : reserved) { cache.release(f); }
 }
 
+// The SSD tier's pieces (design §19.3.7): the admission filter and the eviction gate of the LFRU step,
+// and a demoted expert's frame held past quiescence until its copy completes.
+void test_tier_gates() {
+    LfruPolicy policy(16, 2);
+    LfruPolicy::Step step;
+    const LfruPolicy::Admissible only_even = [](std::uint32_t key) { return key % 2 == 0; };
+    const std::uint32_t first[] = {0, 1, 2};
+    policy.step(first, step, static_cast<std::size_t>(-1), &only_even);
+    check(policy.resident(0) && policy.resident(2) && !policy.resident(1) && step.misses.size() == 3,
+          "a key without a host copy counts as used but is not admitted");
+    // A hotter key would replace the coldest resident, but the gate refuses that victim.
+    for (int i = 0; i < 5; ++i) {
+        const std::uint32_t hot[] = {4};
+        const LfruPolicy::Admissible refuse = [](std::uint32_t) { return false; };
+        policy.step(hot, step, static_cast<std::size_t>(-1), nullptr, &refuse);
+        check(step.victims.empty() && !policy.resident(4), "a refused victim stops the admission");
+    }
+    const std::uint32_t hot[] = {4};
+    const LfruPolicy::Admissible allow = [](std::uint32_t) { return true; };
+    policy.step(hot, step, static_cast<std::size_t>(-1), nullptr, &allow);
+    check(policy.resident(4) && step.victims.size() == 1, "an allowed victim makes room");
+
+    CacheController cache(8, 2, 0, 1);
+    std::vector<CacheController::Command> cmds;
+    const std::uint32_t a[] = {1, 2};
+    cache.on_route(a, 1, cmds);
+    cache.on_quiescent(cmds);
+    std::uint32_t frame_of_1 = cache.entry(1).frame;
+    // Key 3 replaces key 1 (key 2 is in the group); key 1's frame is held for its demotion.
+    for (int i = 0; i < 3; ++i) {
+        const std::uint32_t b[] = {2, 3};
+        cmds.clear();
+        cache.on_route(b, 2, cmds);
+    }
+    if (cache.entry(1).state == ResidencyState::kAbsent) {
+        cache.hold(frame_of_1);
+        cmds.clear();
+        cache.on_quiescent(cmds);
+        check(cache.free_frames() == 0 && cache.entry(3).state == ResidencyState::kAbsent,
+              "a held frame is not freed by quiescence and its newcomer waits");
+        cmds.clear();
+        cache.release_held(frame_of_1, cmds);
+        check(cache.entry(3).state != ResidencyState::kAbsent && cache.entry(3).frame == frame_of_1,
+              "releasing the held frame loads the queued newcomer into it");
+    } else {
+        check(false, "key 1 should have been evicted");
+    }
+}
+
 int main() {
     test_residency_entries();
+    test_tier_gates();
     test_lfru_conformance();
     test_budgeted_admission();
     test_frame_epochs();

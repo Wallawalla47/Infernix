@@ -367,6 +367,10 @@ struct EngineOptions {
     // Physical Host memory every pinned allocation (weights, caches, buffers) must leave free for
     // the OS and other programs; startup refuses a lock that would take it.
     std::uint64_t ram_headroom_bytes = kDefaultRamHeadroomBytes;
+    // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
+    // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
+    // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
+    std::optional<std::uint64_t> expert_ram_bytes;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;

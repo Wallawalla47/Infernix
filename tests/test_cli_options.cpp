@@ -243,6 +243,13 @@ int run_tests() {
                       "CLI help omits the log-colours control");
     failures += check(help.find("--vram-headroom-mib") != std::string::npos,
                       "CLI help omits the VRAM headroom control");
+    failures += check(help.find("--expert-ram-mib") != std::string::npos, "CLI help omits the expert RAM control");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "40960"}).expert_ram_bytes ==
+                              (40960ULL << 20) &&
+                          !parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "auto"}).expert_ram_bytes,
+                      "--expert-ram-mib must parse a MiB count and auto");
+    failures += check(rejects([] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-ram-mib", "0"}); }),
+                      "--expert-ram-mib must reject zero");
     const char* const cli_help_sections[] = {"CONTEXT", "KV CACHE", "SPECULATIVE DECODING",
                                              "SAMPLING", "VISION", "LOGGING"};
     for (const char* section : cli_help_sections) {

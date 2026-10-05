@@ -217,6 +217,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--ram-headroom-mib N` | physical Host RAM in MiB that pinned weights and caches leave free for the system; startup refuses a lock that would take it (Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger) | `2048` |
+| `--expert-ram-mib N\|auto` | Qwen3.8-Flash-Next: Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage | `bf16` |
 | `--use-original-int8-prefill-kernel` | prefill INT8 KV with the original prompt-attention kernel; requires `--kv-dtype int8` | fast kernel |
 | `--prefill-8bit-pv` | force prompt attention's P×V onto 8-bit Tensor Cores where its kernel has both forms (the fast INT8 and NVFP4 prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel); INT8 and K4V2 only override their default, FP16 P×V, which is 5-7 % slower on long prompts but has half (INT8) or 1.09x (K4V2) the KL divergence from a BF16 KV reference | INT8, K4V2 |

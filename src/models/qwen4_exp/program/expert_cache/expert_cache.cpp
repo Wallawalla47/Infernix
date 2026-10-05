@@ -99,7 +99,8 @@ void LfruPolicy::select_victims(std::size_t need, std::span<const std::uint32_t>
     for (std::size_t i = 0; i < need; ++i) { out.push_back(scratch_[i].second); }
 }
 
-void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size_t admission_budget) {
+void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size_t admission_budget,
+                      const Admissible* admissible, const Admissible* evictable) {
     out.hits.clear();
     out.misses.clear();
     out.admitted.clear();
@@ -121,11 +122,21 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         }
     }
     if (out.misses.empty()) { return; }
-    if (admission_budget >= out.misses.size()) {
-        const std::size_t total = residents_.size() + out.misses.size();
+    // The misses that may become resident.
+    const std::vector<std::uint32_t>* misses = &out.misses;
+    if (admissible != nullptr) {
+        candidates_.clear();
+        for (std::uint32_t k : out.misses) {
+            if ((*admissible)(k)) { candidates_.push_back(k); }
+        }
+        if (candidates_.empty()) { return; }
+        misses = &candidates_;
+    }
+    if (admission_budget >= misses->size() && evictable == nullptr) {
+        const std::size_t total = residents_.size() + misses->size();
         if (total > capacity_) { select_victims(total - capacity_, group, out.victims); }
         for (std::uint32_t v : out.victims) { erase(v); }
-        for (std::uint32_t k : out.misses) {
+        for (std::uint32_t k : *misses) {
             if (residents_.size() < capacity_) {
                 insert(k);
                 out.admitted.push_back(k);
@@ -134,7 +145,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         return;
     }
     // Budgeted admission: best candidates first, each only if it outranks the victim it replaces.
-    std::vector<std::uint32_t> candidates = out.misses;
+    std::vector<std::uint32_t> candidates = *misses;
     std::sort(candidates.begin(), candidates.end(), [this](std::uint32_t a, std::uint32_t b) {
         const double sa = score(a), sb = score(b);
         return sa != sb ? sa > sb : a < b;
@@ -145,6 +156,7 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
             std::vector<std::uint32_t> v;
             select_victims(1, group, v);
             if (v.empty() || !(score(k) > score(v[0]))) { break; }
+            if (evictable != nullptr && !(*evictable)(v[0])) { break; } // the tier's demotion allowance is spent
             erase(v[0]);
             out.victims.push_back(v[0]);
         }
@@ -286,6 +298,19 @@ void FramePool::on_round_done(std::uint64_t round_done) {
     }
 }
 
+void FramePool::hold(std::uint32_t frame) {
+    if (state_.at(frame) != kPending) { throw std::logic_error("frame held while not retired"); }
+    const auto it = std::find_if(pending_.begin(), pending_.end(), [&](const auto& p) { return p.second == frame; });
+    if (it != pending_.end()) { pending_.erase(it); }
+    state_[frame] = kDemoting;
+}
+
+void FramePool::release_held(std::uint32_t frame) {
+    if (state_.at(frame) != kDemoting) { throw std::logic_error("frame released while not held for a demotion"); }
+    state_[frame] = kFree;
+    free_.push_back(frame);
+}
+
 void FramePool::on_quiescent() {
     for (const auto& [round, frame] : pending_) {
         state_[frame] = kFree;
@@ -382,8 +407,9 @@ void CacheController::drain_queue(std::vector<Command>& out) {
 }
 
 void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,
-                               std::vector<Command>& out, std::size_t admission_budget) {
-    policy_.step(group, step_, admission_budget);
+                               std::vector<Command>& out, std::size_t admission_budget,
+                               const LfruPolicy::Admissible* admissible, const LfruPolicy::Admissible* evictable) {
+    policy_.step(group, step_, admission_budget, admissible, evictable);
     for (std::uint32_t v : step_.victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // was still queued
         frames_.retire(make_absent(v, out), round_started);
@@ -394,6 +420,11 @@ void CacheController::on_route(std::span<const std::uint32_t> group, std::uint64
             is_queued_[k] = 1;
         }
     }
+    drain_queue(out);
+}
+
+void CacheController::release_held(std::uint32_t frame, std::vector<Command>& out) {
+    frames_.release_held(frame);
     drain_queue(out);
 }
 

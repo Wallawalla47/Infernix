@@ -4,22 +4,28 @@
 // memory-tiers.md §4.3-§4.6): pinned slots holding expert records read in place from the artifact,
 // the RAM-tier controller that decides which keys they hold (expert_cache::HostTier), and an agent
 // thread that owns the unbuffered read queue. The engine thread drives the controller at round
-// boundaries; during a round the agent serves demand reads (the CPU service's SSD-only experts,
-// through RecordProvider) into the ring the boundary handed it. A landed record is admitted at the
-// next boundary when it outranks the RAM victim.
+// boundaries; during a round the agent serves demand reads into the ring the boundary handed it:
+// the CPU service's SSD-only experts (through RecordProvider) and the device's fetch requests
+// (Options::fetch: the responder of ops::offloaded_moe::FetchChannel). A ring slot is reused within
+// a round once its reader is done with it (the CPU job finished, or the device consumed the fetched
+// record); a landed record still in its slot is admitted at the next boundary when it outranks the
+// RAM victim.
 //
 // Threads: the engine thread calls every method except the RecordProvider ones, and only while no
-// round is in flight (begin_round, record_uses, prefill, the controller); the CPU service thread
-// calls demand / wait / done during a round. The agent is internal.
+// round is in flight (begin_round, end_round, record_uses, prefill, the controller); the CPU service
+// thread calls demand / wait / done during a round. The agent is internal: it spins while a round is
+// open (begin_round to end_round), so a request waits for no timer, and sleeps otherwise.
 
 #include "core/direct_read_queue.h"
 #include "models/qwen4_exp/expert_store.h"
 #include "models/qwen4_exp/program/expert_cache/host_tier.h"
+#include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -43,10 +49,14 @@ public:
         // Pinned memory the device can read (default: cudaHostAlloc portable | mapped) and its release.
         std::function<void*(std::size_t)> allocate;
         std::function<void(void*)> release;
+        // The device's fetch channel this tier answers (owned by the caller; null: CPU demands only).
+        // The ring must exceed the CPU jobs of one call plus the largest pass's fetched records.
+        ops::offloaded_moe::FetchChannel* fetch = nullptr;
     };
 
     struct Stats {
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
+        std::uint64_t fetch_requests = 0, fetch_records = 0, fetch_from_ram = 0; // the fetch channel's
         std::uint64_t read_ns = 0; // demand reads, submit to landing, summed
     };
 
@@ -65,9 +75,11 @@ public:
     // ---- engine thread, no round in flight
     // Reads the first keys of `ranked` (best first) into free resident slots; returns how many.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked);
-    // A round boundary: admits the last round's landings (T10), then hands the agent a fresh ring.
-    // `allowance` is the boundary's demotion allowance (HostTier::begin_round).
+    // A round boundary: admits the last round's landings (T10), then hands the agent a fresh ring and
+    // opens the round. `allowance` is the boundary's demotion allowance (HostTier::begin_round).
     void begin_round(std::uint32_t allowance);
+    // The round's kernels have completed (or it was abandoned): the agent stops spinning.
+    void end_round() noexcept;
     // The decayed-LFU clock and the round's routed keys.
     void record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
         tier_.record_uses(dt, keys, weight);
@@ -89,6 +101,8 @@ public:
     // A ticket demand() returns when a round has demanded more records than it can track (wait
     // then reports ENOBUFS).
     static constexpr std::uint32_t kNoTicket = 0xFFFFFFFFU;
+    // Every key can be demanded once per round (a layer call reads each of its experts once).
+    [[nodiscard]] std::uint32_t ticket_capacity() const noexcept { return ticket_capacity_; }
 
 private:
     struct Ticket {
@@ -98,6 +112,7 @@ private:
         std::uint64_t submitted_ns = 0;
         bool resident = false;       // the key was already in RAM: nothing read, nothing to admit
         bool recycled = false;       // its slot was reused for a later demand of the round
+        std::int32_t fetch = -1;     // its index in the fetch request it belongs to (-1: a CPU demand)
         std::atomic<bool> done{false};
         std::atomic<std::uint32_t> state{0}; // 0 pending, 1 landed, 2 failed
         std::atomic<std::uint32_t> status{0};
@@ -110,6 +125,11 @@ private:
     void agent_main();
     // Agent: submits the reads of `key` into `slot` with tags (kind, index, segment).
     void submit(std::uint32_t key, std::uint32_t slot, std::uint64_t tag_base);
+    // A new ticket of this round for `key` (kNoTicket when the round has run out); resident when the
+    // key is in RAM, else pending a read.
+    std::uint32_t new_ticket(std::uint32_t key, std::int32_t fetch);
+    // Agent: a ring slot for ticket t (a free one, else the oldest holder whose reader is done).
+    bool take_slot(std::uint32_t t);
     // Waits until every request handed to the agent has completed.
     void drain();
 
@@ -125,6 +145,9 @@ private:
     bool stop_ = false;
     std::vector<std::uint32_t> new_demands_; // ticket indices
     std::vector<RingSlot> ring_;             // free ring slots of this round, taken from the back
+    std::deque<std::uint32_t> holding_;      // tickets holding a ring slot, oldest first
+    std::uint64_t round_ = 0;                // begin_round count
+    bool open_           = false;            // a round is open: the agent spins
     std::vector<std::pair<std::uint32_t, std::uint32_t>> prefill_jobs_; // (key, slot)
     std::uint32_t prefill_pending_ = 0;
     std::condition_variable prefill_done_;
@@ -141,6 +164,7 @@ private:
     Stats stats_;
     // Written by the agent; read at boundaries.
     std::atomic<std::uint64_t> agent_reads_{0}, agent_failures_{0}, agent_read_ns_{0};
+    std::atomic<std::uint64_t> agent_fetch_requests_{0}, agent_fetch_records_{0}, agent_fetch_from_ram_{0};
     std::uint32_t prefill_failures_ = 0; // published to prefill() by prefill_done_
     std::thread agent_;
 };

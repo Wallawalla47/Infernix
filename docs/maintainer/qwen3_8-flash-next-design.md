@@ -6962,6 +6962,43 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   responder that fails a request or stays silent, an unserved set without a channel, and a silent
   CPU host, each against the CPU engine's bits or the expected error word. **Not done:** the
   tier's agent as responder (R10).
+- **R10.1** (2026-10-05, tier mode end to end without demotions): the ledger's tier placement (or
+  `--expert-ram-mib N`, new in `ninfer`, `ninfer-serve` and `ninfer_bench`; a cap above what is free is an
+  error) loads the banks streamed and gives the Program the expert RAM less its lock overhead. The
+  Program pins the tier (refused below 1,024 slots), its ring max(128, CPU cap + 2 x 64 staging
+  slots) so one call's CPU jobs and a pass's fetched records always fit, and owns the
+  `FetchChannel` the tier's agent answers: a key in RAM lands at its slot at once, the rest are read
+  into ring slots that are reused once the device consumed them or the CPU job finished (the agent
+  hands out every ring slot, so neither path fails for want of one); the agent spins from
+  `begin_round` to `end_round` (2 s without work: 1 ms polls). `ExpertResidency` owns the interplay: the
+  tier's boundary and the per-layer host-pointer table upload in `before_round`; in `after_round` the
+  round's routed keys feed the decayed LFU (clock + min(live columns, 16)), only keys with a host copy
+  are admitted (LFRU admission filter; SSD-only experts reach VRAM through S4 landing), VRAM
+  evictions are reported (T3 keeps the RAM copy as a resident, T5 drops), promotions copy from RAM
+  slots under Queue (T8/T9) and H2D (T1/T2, counted per key for the ABA re-issue) pins. F2 streams
+  only experts with a host copy, one copy per record (adjacent slots of separately pinned chunks
+  cannot be one copy: the first GPU run failed with `cudaErrorInvalidValue` until this was fixed). Startup pre-fills RAM
+  with the saved ranking, then file order; VRAM seeds only from RAM. Every MoE call has an error word
+  (full mode too: a silent CPU host is now recoverable); the Program checks it after each round's
+  synchronization and throws `runtime::RecoverableExecutionError`, which the engine handles like a
+  recoverable logic error (fails the round's requests, keeps serving); the release then clears the
+  prefix cache, since the failed round may have published state it never computed. **Not done:**
+  the state file's RAM section (the VRAM ranking leads the pre-fill), prefetch, the prompt landing
+  reserve (R11); lending and resizing drop rather than demote; the host-pointer table (196 KiB) is
+  outside the Program's device plan. Each request logs its SSD reads, fetched records, admissions and
+  demotions. Measured (dense8m, int8 KV, cold, `--expert-state off`, one run each; full / 32 GiB /
+  8 GiB): greedy ids identical to full mode for code plain, code MTP and the long prompt at chunk
+  4,096 (6/6); tg512 109.6 / 86.3 / 46.3 tok/s; code decode 79.6 / 39.1 / 18.6, MTP 128.1 / 54.1 /
+  24.4; long-prompt prefill 977 / 542 / 407 tok/s. Mean read 0.6-0.8 ms in decode, 17-62 ms in
+  prefill (queued behind the layer's other reads).
+- **R10.2** (2026-10-05, demotions, T4/T6/T7): the LFRU's budgeted loop consults the tier's
+  `allow_evict` gate (tier mode always takes that loop; a refused victim stops the layer's
+  admissions); after the routes and before `on_quiescent`, a victim without a host copy whose frame
+  is published and that outranks the RAM victim is demoted: `CacheController::hold` keeps its frame
+  (FramePool `kDemoting`) and in the table, a D2H stream copies it to a demotion-list slot; the next
+  `before_round` after the copy publishes the slot (T7), unmaps the frame, releases it and issues
+  the queued loads. The allowance is 32 per decode or verification boundary, unlimited at prefill
+  chunk boundaries.
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 

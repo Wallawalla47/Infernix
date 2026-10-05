@@ -599,6 +599,18 @@ int main() {
                               "--vram-headroom-mib", "auto"})
                            .vram_headroom_bytes,
                       "--vram-headroom-mib auto must select the automatic headroom");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-ram-mib", "32768"}).expert_ram_bytes == (32768ULL << 20) &&
+                          !parse({"ninfer-serve", "model.ninfer", "--expert-ram-mib", "32768", "--expert-ram-mib", "auto"})
+                               .expert_ram_bytes &&
+                          !parse({"ninfer-serve", "model.ninfer"}).expert_ram_bytes,
+                      "--expert-ram-mib must parse a MiB count and auto");
+    for (const auto* bad : {"0", "-1", "12x", ""}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--expert-ram-mib", bad});
+        } catch (const std::exception&) { rejected = true; }
+        failures += check(rejected, "--expert-ram-mib must reject a zero or malformed size");
+    }
     const ServeOptions hybrid_explicit_kv =
         parse({"ninfer-serve", "model.ninfer", "--max-context", "8192", "--kv-capacity", "16384",
                "--host-context-mib", "0"});

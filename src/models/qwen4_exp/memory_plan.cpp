@@ -35,8 +35,15 @@ HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const Host
         out.commit_limited = true;
     }
     out.expert_ram = std::min(room, out.full_need);
-    out.placement  = room >= out.full_need ? ExpertPlacement::Full : ExpertPlacement::Tier;
-    if (out.placement == ExpertPlacement::Full) { out.commit_limited = false; }
+    if (demand.expert_cap) {
+        out.cap_too_large = *demand.expert_cap > room && *demand.expert_cap < out.full_need;
+        if (*demand.expert_cap < out.expert_ram) {
+            out.expert_ram = *demand.expert_cap;
+            out.capped     = true;
+        }
+    }
+    out.placement = out.expert_ram >= out.full_need ? ExpertPlacement::Full : ExpertPlacement::Tier;
+    if (out.placement == ExpertPlacement::Full || out.capped) { out.commit_limited = false; }
     return out;
 }
 
@@ -45,15 +52,16 @@ std::string HostMemoryLedger::describe() const {
     std::snprintf(line, sizeof(line),
                   "RAM ledger: available %.2f GiB of %.2f (commit %.2f); reserve %.2f; other pins %.2f; later pins "
                   "%.2f; prefix cache %.2f; caches %.2f; staging %.2f; growth %.2f -> experts %.2f GiB of %.2f needed "
-                  "(banks %.2f + margin %.2f)%s; %s",
+                  "(banks %.2f + margin %.2f)%s%s; %s",
                   gib(snapshot.available_physical), gib(snapshot.total_physical), gib(snapshot.available_commit),
                   gib(demand.reserve), gib(demand.other_pinned), gib(demand.later_pinned), gib(demand.prefix_cache),
                   gib(demand.pageable),
                   gib(demand.load_staging),
                   gib(demand.process_growth), gib(expert_ram), gib(full_need), gib(demand.expert_banks),
                   gib(demand.full_margin), commit_limited ? ", limited by the page file" : "",
+                  capped ? ", capped by --expert-ram-mib" : "",
                   placement == ExpertPlacement::Full ? "full mode (every expert in RAM)"
-                                                     : "too little RAM to hold every expert");
+                                                     : "SSD tier (experts not in RAM are read from the artifact)");
     return line;
 }
 

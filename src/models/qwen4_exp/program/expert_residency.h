@@ -13,6 +13,18 @@
 // visible in its table only after its copy has completed. Expert outputs are placement-invariant
 // (design §16.2), so the round a promotion lands in does not change any result.
 //
+// SSD tier (design §19.3.7, attach_tier). The banks are not in RAM: a key's record is in a frame, in
+// a RAM slot of the HostExpertTier, or only in the artifact. The residency then keeps a per-layer
+// table of host record pointers (null: SSD-only) beside the frame table, uploaded with it before
+// each round after the tier's boundary; promotions copy from RAM slots, pinned in the tier while
+// queued and while the copy runs; only keys with a host copy are admitted (SSD-only experts reach
+// VRAM through landing); each round's routed keys feed the tier's decayed LFU. A VRAM victim with a
+// host copy keeps it (a shadow becomes a resident); one without is demoted when it outranks the
+// RAM victim and the boundary's allowance lasts (32 per decode boundary): its frame stays held and
+// readable while a D2H stream copies it to a RAM slot, and the next before_round after the copy
+// publishes the slot and frees the frame. Evictions the gate refuses stop that layer's admissions.
+// Lending and resizing finish pending demotions first and drop, not demote, their victims.
+//
 // Size. The frames live in a VMM arena whose base never moves (design §19.3.7): resize() backs more
 // frames chunk by chunk, or releases the top chunks after evicting the lowest-score experts and
 // moving the survivors below the new top, so kernels and captured graphs keep their addresses.
@@ -35,6 +47,8 @@
 
 namespace ninfer::models::qwen4_exp {
 
+class HostExpertTier;
+
 class ExpertResidency {
 public:
     struct Stats {
@@ -45,6 +59,7 @@ public:
         std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
         std::uint64_t seeded         = 0; // experts loaded by the warm start
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
+        std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)
     };
     // Landing frames per layer and round (design §19.3.5 S4): free frames are reserved before a
     // decode or verification round, the round's forked MoE calls copy their first staged misses
@@ -59,8 +74,9 @@ public:
     std::uint32_t warm_start(const SavedState& state, std::uint32_t count_cap, std::uint32_t max_keys,
                              cudaStream_t compute);
 
-    // banks[l]: layer l's pinned host records (record_stride bytes apart). max_columns: the most
-    // columns one round routes. The cache starts with no frames: resize() backs them.
+    // banks[l]: layer l's pinned host records (record_stride bytes apart; null entries with a tier).
+    // max_columns: the most columns one round routes. The cache starts with no frames: resize()
+    // backs them.
     ExpertResidency(const TextConfig& config, std::vector<const std::uint8_t*> banks, std::uint64_t record_stride,
                     std::int32_t max_columns, int device);
     ~ExpertResidency();
@@ -105,6 +121,13 @@ public:
     // Returns a lease. The caller has ordered `compute` after every access to it; promotions into
     // its frames start after `compute` reaches this point.
     void give_back(FrameLease& lease, cudaStream_t compute);
+
+    // SSD tier mode: records come from `tier` (owned by the caller, outliving this), not the banks.
+    // Before the first round and before warm_start.
+    void attach_tier(HostExpertTier* tier);
+    [[nodiscard]] bool tiered() const noexcept { return tier_ != nullptr; }
+    // Layer l's host record pointers (device [E]; null entries: SSD-only), or null without a tier.
+    [[nodiscard]] const std::uint8_t* const* record_table(std::uint32_t layer) const noexcept;
 
     // Whether the pool can resize after its first size (VMM).
     [[nodiscard]] bool elastic() const noexcept { return arena_ != nullptr; }
@@ -159,6 +182,15 @@ private:
     void publish_landed();
     // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
     void issue_loads(cudaStream_t compute);
+    // Tier mode: VRAM evictions among commands_ (T3/T5), and Queue pins of the controller's queue.
+    void report_evictions();
+    void sync_queue_pins();
+    // Tier mode, after_round before on_quiescent: each evicted expert is kept in RAM (T3), demoted
+    // (T4: frame held, D2H) or dropped (T5).
+    void demote_or_drop(std::int32_t* table);
+    // Tier mode: completes the demotions whose copies finished (all of them, waiting, with `wait`):
+    // publishes their slots (T7), frees their frames and loads queued experts into them.
+    void finish_demotions(cudaStream_t compute, bool wait);
 
     const TextConfig& c_;
     std::vector<const std::uint8_t*> banks_;
@@ -202,6 +234,25 @@ private:
     std::vector<Batch> in_flight_;
     std::vector<cudaEvent_t> spare_events_;
     Stats stats_;
+
+    HostExpertTier* tier_ = nullptr;
+    expert_cache::LfruPolicy::Admissible admissible_;
+    DeviceBuffer records_device_;       // tier: const uint8_t* [layers][experts]
+    PinnedHostBuffer records_host_{1};
+    std::vector<std::uint32_t> dirty_;  // keys whose host pointer changed (tier.take_dirty)
+    std::vector<std::uint32_t> uses_;   // the round's routed keys (the tier's LFU)
+    std::vector<std::uint8_t> queue_pinned_;     // per key: holds the tier's Queue pin
+    std::vector<std::uint32_t> queue_pinned_keys_;
+    std::vector<std::uint8_t> queue_mark_;
+    std::vector<std::uint16_t> copies_in_flight_; // per key: promotion copies holding its H2D pin
+    expert_cache::LfruPolicy::Admissible evictable_; // the tier's eviction gate
+    cudaStream_t d2h_stream_ = nullptr;
+    struct Demotion {
+        std::uint32_t key, frame, slot;
+        cudaEvent_t done;
+    };
+    std::vector<Demotion> demotions_;
+    std::vector<std::uint8_t> demoting_; // per key
 };
 
 } // namespace ninfer::models::qwen4_exp

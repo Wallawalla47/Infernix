@@ -24,6 +24,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
 #include "models/qwen4_exp/program/expert_residency.h"
+#include "models/qwen4_exp/program/host_expert_tier.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/prefix/call_plan.h"
@@ -36,6 +37,7 @@
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/program/route_trace.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
+#include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/cast.h"
@@ -59,6 +61,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ninfer::models::qwen4_exp {
 namespace detail {
@@ -354,6 +357,7 @@ public:
         std::uint64_t decode_share_ns = 0;
         ExpertResidency::Stats cache_at_admission;
         std::uint64_t cpu_served_at_admission = 0;
+        HostExpertTier::Stats tier_at_admission{}; // SSD tier mode
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
@@ -744,13 +748,54 @@ public:
         for (auto& event : overlap_.events) { CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming)); }
         experts.overlap_stream = overlap_.stream;
         experts.overlap_events = overlap_.events;
-        if (options_.prefill_stream && options_.expert_cache) {
-            std::vector<const std::uint8_t*> stream_banks;
-            for (const auto& layer : parameters_.layers) {
-                stream_banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+        // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
+        // records the tier keeps and the rest are read from the artifact when a round needs them.
+        if (const auto& store = parameters_.model.expert_store(); store.has_value()) {
+            if (store->record_bytes() != record_stride) {
+                throw std::logic_error("Qwen4Exp: the expert store's records differ from the banks' stride");
             }
-            expert_stream_ =
-                std::make_unique<execution::ExpertStream>(c_.moe.experts, record_stride, std::move(stream_banks));
+            // A call's CPU jobs hold their ring slots until the call's answer, and a pass's fetched
+            // records until the pass has copied them: the ring holds both with a pass to spare.
+            const std::uint32_t cpu_cap =
+                options_.cpu_expert_workers > 0 && options_.cpu_expert_jobs > 0
+                    ? std::min<std::uint32_t>(std::max(options_.cpu_expert_jobs, options_.cpu_assist_jobs),
+                                              static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs))
+                    : 0U;
+            HostExpertTier::Options tier;
+            tier.ring  = std::max<std::uint32_t>(128, cpu_cap + 2U * kStagingSlots);
+            tier.slots = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                options_.expert_ram_bytes / record_stride, static_cast<std::uint64_t>(store->layers()) * store->experts()));
+            const std::uint32_t lists = tier.ring + tier.prefetch + tier.demotion;
+            if (tier.slots < std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2)) {
+                throw std::runtime_error("Qwen3.8-Flash-Next: the SSD expert tier needs RAM for at least " +
+                                         std::to_string(std::max<std::uint32_t>(kMinTierSlots, lists + kMinTierSlots / 2)) +
+                                         " expert slots (" + std::to_string(tier.slots) + " fit in the RAM ledger's expert share)");
+            }
+            fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
+            tier.fetch     = fetch_channel_.get();
+            tier_          = std::make_unique<HostExpertTier>(*store, std::move(tier));
+            residency_->attach_tier(tier_.get());
+        }
+        expert_error_ = PinnedHostBuffer(64);
+        std::memset(expert_error_.data(), 0, 64);
+        experts.error = static_cast<std::uint32_t*>(expert_error_.data());
+        if (options_.prefill_stream && options_.expert_cache) {
+            execution::ExpertStream::RecordOf record_of;
+            if (tier_) {
+                record_of = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
+                    return tier->record(tier->key(layer, expert));
+                };
+            } else {
+                std::vector<const std::uint8_t*> banks;
+                for (const auto& layer : parameters_.layers) {
+                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+                }
+                record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
+                    return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
+                };
+            }
+            expert_stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts,
+                                                                       record_stride, std::move(record_of), !tier_);
             experts.stream = expert_stream_.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most
@@ -780,7 +825,8 @@ public:
                     .pcie_divisor = pcie_divisor(),
                     .wide_from   = assist ? decode_columns + 1 : 0,
                     .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
-                    .cpus        = {}});
+                    .cpus        = {},
+                    .records     = tier_.get()}); // tier mode: SSD-only jobs read through the tier
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
             }
@@ -824,6 +870,12 @@ public:
         experts.landing       = residency_->landing_table();
         experts.landed        = residency_->landed_log();
         experts.landing_slots = static_cast<std::int32_t>(ExpertResidency::kLandingSlots);
+        if (tier_) {
+            for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
+                experts.host_tables.push_back(residency_->record_table(l));
+                experts.fetch.push_back(fetch_channel_->channel(static_cast<int>(l)));
+            }
+        }
         warm_start_experts();
         if (!options_.route_trace.empty()) {
             trace_ = std::make_unique<RouteTrace>(
@@ -1083,6 +1135,7 @@ public:
         lane.decode_share_ns = 0;
         lane.cache_at_admission = residency_->stats();
         lane.cpu_served_at_admission = cpu_service_ ? cpu_service_->served_experts() : 0;
+        if (tier_) { lane.tier_at_admission = tier_->stats(); }
         lane.ngram                   = {};
         lane.gate                    = {};
         lane.begin = runtime::BeginSummary{.prompt_tokens        = lane.prompt_tokens,
@@ -1496,6 +1549,7 @@ public:
                 const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
                 device_.synchronize();
             }
+            check_expert_error();
             const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                     static_cast<std::uint64_t>(width));
             trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
@@ -1708,6 +1762,7 @@ public:
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
             run(1, static_cast<std::int32_t>(stride), 1, chunk ? &*chunk : nullptr);
             device_.synchronize();
+            check_expert_error();
             trace_round(RouteTraceKind::ForcedTokens, 1, static_cast<std::int32_t>(stride), stride,
                         kDecodePromotionsPerLayer, static_cast<std::uint32_t>(begin));
             residency_->after_round(device_.stream, static_cast<std::int32_t>(stride), kDecodePromotionsPerLayer);
@@ -1862,6 +1917,10 @@ public:
         transaction_lane_.reset();
         pending_transaction_ = 0;
         try { device_.synchronize(); } catch (...) {}
+        if (clear_prefix_on_release_) { // a failed round may have published state it never computed
+            if (prefix_) { prefix_->clear(); }
+            clear_prefix_on_release_ = false;
+        }
     }
 
     PhysicalUsageSnapshot usage() const noexcept {
@@ -1901,6 +1960,8 @@ private:
     // Misses staged per pass of a layer's experts: every decode and verify call's misses in one
     // pass; a prefill chunk's in several.
     static constexpr std::int32_t kStagingSlots = 64;
+    // The SSD tier's smallest RAM (design §19.3.7 H_min: 1,024 slots, 2.6 GiB).
+    static constexpr std::uint32_t kMinTierSlots = 1024;
     // Promotions follow the tokens a round advances (the longest row's), not rounds: a verification
     // round that advances four tokens promotes what four decode rounds would, so a speculative
     // round's cache warms per token as plain decode does.
@@ -2011,9 +2072,13 @@ public:
     // ---- warm start (design §19.3.5 S4b) ----
     // Fills the frames from the saved state, before the first request.
     void warm_start_experts() {
-        if (options_.expert_state.empty() || !options_.expert_cache) { return; }
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
-        const expert_cache::ExpertStateLoad load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        expert_cache::ExpertStateLoad load;
+        if (!options_.expert_state.empty() && options_.expert_cache) {
+            load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
+        }
+        if (tier_) { prefill_tier(load.state ? &*load.state : nullptr); }
+        if (options_.expert_state.empty() || !options_.expert_cache) { return; }
         if (!load.state) {
             diagnostic("expert cache starts empty: " + load.message);
             expert_state_saved_ = std::chrono::steady_clock::now();
@@ -2032,6 +2097,55 @@ public:
         diagnostic(line);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;
+    }
+
+    // The SSD tier's RAM pre-fill: the saved state's ranking first, then every other key in file
+    // order, until the resident slots are full (design §19.3.7 §4.9).
+    void prefill_tier(const expert_cache::SavedState* state) {
+        const auto start         = std::chrono::steady_clock::now();
+        const std::uint32_t keys = tier_->keys();
+        std::vector<std::uint32_t> ranked;
+        ranked.reserve(keys);
+        std::vector<std::uint8_t> listed(keys, 0);
+        if (state != nullptr) {
+            for (const std::uint32_t key : state->ranked) {
+                if (key < keys && listed[key] == 0) {
+                    ranked.push_back(key);
+                    listed[key] = 1;
+                }
+            }
+        }
+        for (std::uint32_t key = 0; key < keys; ++key) {
+            if (listed[key] == 0) { ranked.push_back(key); }
+        }
+        const std::uint32_t filled = tier_->prefill(ranked);
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const double gib     = static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "SSD expert tier: %u RAM slots (%.1f GiB); pre-filled %u experts%s in %.1f s; %u of %u experts are "
+                      "read from the artifact when used",
+                      tier_->controller().config().slots, gib * tier_->controller().config().slots, filled,
+                      state != nullptr ? " (saved ranking first)" : "", seconds, keys - filled, keys);
+        diagnostic(line);
+    }
+
+    // After every synchronization of a round with MoE layers: a call that could not serve an expert
+    // (design §19.3.7: an unreadable record, a host service that stopped answering) left undefined
+    // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
+    // round may have published are dropped when the lanes are released.
+    void check_expert_error() {
+        auto* word                 = static_cast<volatile std::uint32_t*>(expert_error_.data());
+        const std::uint32_t value  = *word;
+        if (value == 0) { return; }
+        *word                    = 0;
+        clear_prefix_on_release_ = true;
+        const std::uint32_t code = value & 0xFFFFU;
+        std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
+                                   : code == ops::offloaded_moe::kErrorHostSilent   ? "the host expert service stopped answering"
+                                                                                     : "an expert record could not be read (" +
+                                                                                       std::generic_category().message(static_cast<int>(code)) + ")";
+        throw runtime::RecoverableExecutionError("Qwen3.8-Flash-Next layer " + std::to_string(value >> 16U) + ": " + what);
     }
 
 public:
@@ -2146,6 +2260,24 @@ private:
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
             diagnostic(text);
+            if (tier_) {
+                // The tier's counters as of the last round boundary.
+                const auto& t = tier_->stats();
+                const auto& a = lane.tier_at_admission;
+                const auto reads = t.demand_reads - a.demand_reads;
+                std::snprintf(text, sizeof(text),
+                              "SSD expert tier: request %llu expert reads (%.2f GiB, mean %.2f ms), %llu failed; %llu "
+                              "fetched (%llu from RAM); %llu admitted to RAM, %llu demoted from VRAM",
+                              static_cast<unsigned long long>(reads),
+                              static_cast<double>(reads) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
+                              reads ? 1e-6 * static_cast<double>(t.read_ns - a.read_ns) / static_cast<double>(reads) : 0.0,
+                              static_cast<unsigned long long>(t.demand_failures - a.demand_failures),
+                              static_cast<unsigned long long>(t.fetch_records - a.fetch_records),
+                              static_cast<unsigned long long>(t.fetch_from_ram - a.fetch_from_ram),
+                              static_cast<unsigned long long>(t.admitted - a.admitted),
+                              static_cast<unsigned long long>(s.demotions - at_admission.demotions));
+                diagnostic(text);
+            }
         } catch (...) {}
     }
 
@@ -2933,6 +3065,7 @@ private:
             release_gate.owner = nullptr;
         }
         device_.synchronize();
+        check_expert_error();
 
         const std::int32_t* licensed_host = spec_host(spec_layout_.licensed);
         for (std::int32_t b = 0; b < batch; ++b) {
@@ -3355,6 +3488,7 @@ private:
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
         if (before_wait) { before_wait(); }
         device_.synchronize();
+        check_expert_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
         for (std::int32_t b = 0; b < batch; ++b) { pending_tokens_[b] = tokens[b]; }
         if (constrained) {
@@ -3649,6 +3783,12 @@ private:
     std::unique_ptr<KVExecutionTablePool> tables_;
     std::size_t work_capacity_ = 0;
     std::unique_ptr<WorkspaceArena> work_;
+    // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
+    // their memory (the residency's promotion copies, the stream, the CPU service), declared later.
+    std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
+    std::unique_ptr<HostExpertTier> tier_;
+    PinnedHostBuffer expert_error_{1}; // mapped u32: ops::MoeExpertSource::error of every call
+    bool clear_prefix_on_release_ = false;
     std::unique_ptr<ExpertResidency> residency_;
     std::unique_ptr<execution::ExpertStream> expert_stream_;
     ExpertResidency::FrameLease stream_lease_;
