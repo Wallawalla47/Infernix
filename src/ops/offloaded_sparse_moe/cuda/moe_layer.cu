@@ -96,10 +96,16 @@ __device__ __forceinline__ void stage_async(const std::uint8_t* src, std::uint8_
 
 __device__ __forceinline__ void stage_wait() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
 
+// A non-resident expert's host record (MoeExpertSource::host_table, else the pinned bank).
+__device__ __forceinline__ const std::uint8_t* host_record(const MoeExpertSource& source, int expert) {
+    return source.host_table != nullptr ? source.host_table[expert]
+                                        : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+}
+
 __device__ __forceinline__ const std::uint8_t* record_of(const MoeExpertSource& source, int expert) {
     const int frame = source.frames[expert];
     return frame >= 0 ? source.frame_base + static_cast<std::uint64_t>(frame) * source.record_stride
-                      : source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+                      : host_record(source, expert);
 }
 
 // A call takes the fork route when it has a fork stream, fits one staging pass and is narrow (no
@@ -172,7 +178,7 @@ __global__ void __launch_bounds__(kThreads)
             } else if (source.staging_slots > 0) {
                 miss = true;
             } else {
-                record = source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride;
+                record = host_record(source, expert);
             }
         }
         const unsigned ballot = __ballot_sync(0xFFFFFFFFU, miss);
@@ -209,8 +215,7 @@ __global__ void __launch_bounds__(kThreads)
         const int m = c / kChunks, offset = (c % kChunks) * kStageChunk;
         const int bytes = min(kStageChunk, static_cast<int>(moe::kRecordBytes) - offset);
         const int expert = dispatch.jobs[miss_jobs[m]];
-        const auto* src = reinterpret_cast<const uint4*>(
-            source.host_records + static_cast<std::uint64_t>(expert) * source.record_stride + offset);
+        const auto* src = reinterpret_cast<const uint4*>(host_record(source, expert) + offset);
         auto* dst = reinterpret_cast<uint4*>(miss_dst[m] + offset);
         const int vectors = bytes / 16;
         uint4 v[kVec / kThreads];
@@ -735,6 +740,8 @@ __global__ void __launch_bounds__(kThreads)
                 cpu_flags[j]                  = 1;
                 call->job[slot]               = j;
                 channel.request->expert[slot] = expert;
+                channel.request->record[slot] =
+                    source.host_table != nullptr ? reinterpret_cast<std::uint64_t>(source.host_table[expert]) : 0;
                 channel.request->ncols[slot]  = width;
                 slot_first[slot]              = first;
                 for (int c = 0; c < width; ++c) {
@@ -758,8 +765,9 @@ __global__ void __launch_bounds__(kThreads)
             }
         }
         publish_count          = k;
-        channel.request->layer = channel.layer;
-        channel.request->jobs  = chosen;
+        channel.request->layer  = channel.layer;
+        channel.request->jobs   = chosen;
+        channel.request->tiered = source.host_table != nullptr ? 1 : 0;
     }
     __syncthreads();
     // Each chosen job's columns by compact index.
@@ -780,7 +788,9 @@ __global__ void __launch_bounds__(kThreads)
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        const std::uint32_t sequence = atomicAdd(channel.sequence, 1U) + 1U;
+        // 0 means "nothing published" to the wait (CpuCall::pending): skip it when the counter wraps.
+        std::uint32_t sequence = atomicAdd(channel.sequence, 1U) + 1U;
+        if (sequence == 0) { sequence = atomicAdd(channel.sequence, 1U) + 1U; }
         *reinterpret_cast<volatile std::uint32_t*>(&channel.request->sequence) = sequence;
         __threadfence_system();
         call->pending = static_cast<std::int32_t>(sequence);
@@ -1014,7 +1024,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     require(x.ne[0] == moe::kHidden && outputs.ne[0] == moe::kHidden && outputs.ne[1] == x.ne[1] * top_k,
             "experts geometry differs from the nvfp4_expert_rg16_v1 record");
     require(max_jobs > 0 && max_jobs <= 65535 && source.scales != nullptr && source.frames != nullptr &&
-                source.host_records != nullptr && source.record_stride >= moe::kRecordBytes &&
+                (source.host_records != nullptr || source.host_table != nullptr) &&
+                source.record_stride >= moe::kRecordBytes &&
                 source.record_stride % 16 == 0 && source.staging_slots >= 0 &&
                 (source.staging_slots == 0 || source.staging_base != nullptr),
             "experts source is incomplete");

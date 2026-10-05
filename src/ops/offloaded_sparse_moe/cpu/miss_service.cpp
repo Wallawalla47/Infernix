@@ -133,7 +133,8 @@ void CpuMissService::serve() {
             for (int j = 0; j < count; ++j) {
                 CpuExpertJob& job = jobs[static_cast<std::size_t>(j)];
                 const auto expert = static_cast<std::uint64_t>(r.expert[j]);
-                job.record        = layer.records + expert * layer.record_stride;
+                job.record        = r.tiered != 0 ? reinterpret_cast<const std::uint8_t*>(r.record[j])
+                                                      : layer.records + expert * layer.record_stride;
                 job.scales        = layer.scales[expert];
                 job.ncols         = r.ncols[j];
                 for (int c = 0; c < job.ncols; ++c) {

@@ -73,6 +73,22 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     for (int e = 0; e < experts; ++e) { std::memcpy(host + stride * e, bank[e].record.data(), moe::kRecordBytes); }
     std::uint8_t* host_device = nullptr;
     cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&host_device), host, 0), "cudaHostGetDevicePointer");
+    // The same records in shuffled host slots, reached through a host-pointer table (the SSD tier's
+    // RAM slots, design §19.3.7 R5): every route must read identical bits through it.
+    std::uint8_t* shuffled = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&shuffled), stride * experts, cudaHostAllocMapped), "cudaHostAlloc");
+    std::vector<int> slot_of(experts);
+    for (int e = 0; e < experts; ++e) { slot_of[e] = e; }
+    std::shuffle(slot_of.begin(), slot_of.end(), rng);
+    std::vector<const std::uint8_t*> table(experts);
+    for (int e = 0; e < experts; ++e) {
+        std::memcpy(shuffled + stride * slot_of[e], bank[e].record.data(), moe::kRecordBytes);
+        std::uint8_t* mapped = nullptr;
+        cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped), shuffled + stride * slot_of[e], 0),
+                   "cudaHostGetDevicePointer");
+        table[e] = mapped;
+    }
+    auto* d_table = device_copy(table);
     std::vector<std::int32_t> frames(experts, -1);
     std::vector<std::uint8_t> frame_bytes;
     int resident = 0;
@@ -185,6 +201,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         bool fork = false;
         bool land = false;
         bool streamed = false;
+        bool table    = false;
     };
     // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
@@ -231,7 +248,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
                                 Config{3, nullptr, false, false, true}, Config{64, nullptr, false, false, true},
                                 Config{64, nullptr, true, false, true}, Config{64, &service_wide},
-                                Config{0, &service_wide}, Config{64, &service_wide, false, false, true}}) {
+                                Config{0, &service_wide}, Config{64, &service_wide, false, false, true},
+                                Config{0, nullptr, false, false, false, true},
+                                Config{3, nullptr, false, false, false, true}, Config{64, nullptr, true, false, false, true},
+                                Config{64, &service_two, true, false, false, true}, Config{3, &service_all, false, false, false, true},
+                                Config{64, &service_assist, false, false, false, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -267,6 +288,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             source.prefetched    = d_prefetched;
             source.prefetch_base = d_prefetch_base;
         }
+        if (config.table) {
+            source.host_records = nullptr; // only the table may be read
+            source.host_table   = d_table;
+        }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
@@ -291,9 +316,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             mismatches += narrow[i / moe::kHidden] && got[i] != expected[i];
             moved += got[i] != placed[i];
         }
-        std::printf("E=%d T=%d k=%d staging slots %2d%s%s, CPU jobs %d (served %llu): %ld narrow-route outputs differ "
-                    "from the CPU engine, %ld outputs from the first placement, of %zu\n",
+        std::printf("E=%d T=%d k=%d staging slots %2d%s%s%s, CPU jobs %d (served %llu): %ld narrow-route outputs "
+                    "differ from the CPU engine, %ld outputs from the first placement, of %zu\n",
                     experts, columns, top_k, slots, config.fork ? " (fork)" : "", config.streamed ? " (streamed)" : "",
+                    config.table ? " (host table)" : "",
                     config.service != nullptr ? config.service->channel(0).max_jobs : 0,
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
                     mismatches, moved, got.size());
@@ -347,6 +373,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cudaFree(d_logits);
     cudaFree(d_scales);
     cudaFree(d_prefetch_base);
+    cudaFree(d_table);
+    cudaFreeHost(shuffled);
     cudaFree(d_prefetched);
     cudaFree(d_frames);
     cudaFree(d_landed);
