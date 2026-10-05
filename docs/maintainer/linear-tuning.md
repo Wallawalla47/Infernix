@@ -119,3 +119,35 @@ These utilization figures use logical workload divided by elapsed time and the s
 rather than hardware counters. Retained reports omit old-implementation comparisons, speedup
 ratios, aggregate improvement scores, and candidate-search history. Candidate measurements remain
 working evidence for dispatch decisions; the report presents the resulting implementation.
+
+## 5. BF16 Vision tower problems
+
+The BF16 Vision towers of Qwen3.8-Flash-Next and of 27B artifacts that keep Vision in BF16 (for
+example Quasar) register eight contiguous BF16 problems: patch embedding `[1152,1536]`, fused QKV
+`[3456,1152]`, attention output `[1152,1152]`, MLP fc1 `[4304,1152]` and fc2 `[1152,4304]`,
+merger fc1 `[4608,4608]`, and merger fc2 `[2560,4608]` (Flash-Next) or `[5120,4608]` (27B). The
+tower encodes one item per call, so T is that item's raw-patch count P for the first five problems
+and its merged-token count V = P/4 for the merger.
+
+| Extent | Source |
+|---|---|
+| P = 256..65,536 for images | `min_pixels` 65,536 (256 patches); the 16,384-merged-token item cap |
+| P from 16 per temporal patch for video | video `shortest_edge` 4,096 pixels per frame |
+| V = P/4, up to 16,384 | merger input |
+
+The small-T priorities of §2 do not apply: Vision has no speculative or per-request columns. The
+tuning anchors are P = 1,024, 4,096 and 16,384 for the tower problems and V = 256, 1,024 and
+4,096 for the merger, reported separately, with P = 65,536 as the large-item bound. T <= 8 occurs
+only for the merger of tiny inputs and keeps the runtime-shape fallback's skinny GEMV, so its output
+is unchanged by the registration.
+
+All routes above T = 8 are instances of the BF16 TMA MMA template. The 4304 problems use its
+tail-capable form: both operands are read through two-dimensional tensor maps in 64-element K
+boxes, the hardware zero-fills the out-of-bounds part of fc1's last row tile and of fc2's last K
+tile, and the store skips rows at or beyond N. Large-T routes rasterize row-fast: every row tile of
+one token tile runs before the next token tile, so the activation, which exceeds L2 at large P,
+is read from DRAM about once while the at most 47 MB weight stays in L2.
+
+Selection uses complete-Op cold-L2 CUDA-graph timings of private-launcher candidates at
+T = 9..65,536 (to 16,384 for the merger), the fallback, and the registered route, taking per
+interval the fastest candidate within a small tolerance.

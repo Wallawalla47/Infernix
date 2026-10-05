@@ -572,6 +572,16 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
         profile = "BF16_F32ACC";
         return kRtx5090Bf16Fp32AccumulateTFLOPs;
     }
+    // The BF16 Vision tower problems run MMA routes above T = 8 and the skinny GEMV at or below.
+    const bool bf16_vision_problem =
+        (point.n == 1152 && (point.k == 1536 || point.k == 1152 || point.k == 4304)) ||
+        (point.n == 3456 && point.k == 1152) || (point.n == 4304 && point.k == 1152) ||
+        ((point.n == 4608 || point.n == 2560 || point.n == 5120) && point.k == 4608);
+    if (point.qtype == QType::BF16 && point.policy == LinearPolicy::A16Only &&
+        bf16_vision_problem && point.t > 8) {
+        profile = "BF16_F32ACC";
+        return kRtx5090Bf16Fp32AccumulateTFLOPs;
+    }
     profile = "";
     return std::numeric_limits<double>::quiet_NaN();
 }
