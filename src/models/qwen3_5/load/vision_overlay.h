@@ -51,6 +51,14 @@ struct VisionOverlayAssets {
     VisionOverlayLayout layout;
 };
 
+// The overlay layout from each group's objects in staging order (prelude: patch and position
+// embedding; one list per layer; merger), as placed by the materialization plan. Objects shared by
+// several bindings (a fused qkv) are staged once. Shared by Qwen3.5 and Qwen4Exp loading.
+[[nodiscard]] VisionOverlayLayout make_vision_overlay_layout(
+    const artifact::MaterializationPlan& plan, const std::vector<artifact::ObjectHandle>& prelude,
+    const std::vector<std::vector<artifact::ObjectHandle>>& layers,
+    const std::vector<artifact::ObjectHandle>& merger);
+
 // Resolve each vision group's contiguous byte range in the pinned block. Throws when a
 // group's objects are not all pinned or are not packed contiguously (gap beyond alignment).
 [[nodiscard]] VisionOverlayLayout compute_vision_overlay_layout(

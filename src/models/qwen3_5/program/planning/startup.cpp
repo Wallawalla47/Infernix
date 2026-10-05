@@ -886,7 +886,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         parameters.model.config().text.full_attention_layers == 0) {
         throw std::invalid_argument("Qwen3.5 Program requires at least one full-attention layer");
     }
-    if (parameters.model.options() != models::load_options(options)) {
+    if (parameters.model.options() != models::load_options(options, Architecture::Qwen3_5)) {
         throw std::invalid_argument(
             "loaded components do not match the requested execution options");
     }
@@ -1192,7 +1192,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,
         .proposal_head        = options.speculative.proposal_head,
-        .features             = models::load_options(options),
+        .features             = models::load_options(options, Architecture::Qwen3_5),
         .use_cuda_graph       = options.use_cuda_graph,
         .causal_scoring       = options.purpose == EnginePurpose::CausalScoring,
         .device               = options.device,

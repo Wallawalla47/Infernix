@@ -65,7 +65,7 @@ struct ServeOptions {
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
     bool enable_vision                     = false;
-    bool vision_offload                    = false;
+    VisionOffload vision_offload                    = VisionOffload::Auto;
     std::uint32_t vision_max_merged_tokens = 32768;
     bool use_cuda_graph                    = true;
     bool allow_prefix_reuse                = true;

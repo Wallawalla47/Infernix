@@ -218,7 +218,7 @@ int main() {
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
-    failures += check(!defaults.vision_offload, "Vision offload is not off by default");
+    failures += check(defaults.vision_offload == ninfer::VisionOffload::Auto, "Vision offload is not auto by default");
     failures += check(defaults.vision_max_merged_tokens == 32768,
                       "merged Vision token default mismatch");
     failures += check(defaults.request_log_jsonl.empty(),
@@ -346,13 +346,17 @@ int main() {
 
     const ServeOptions offload = parse({"ninfer-serve", "model.ninfer", "--vision",
                                         "--vision-offload", "on", "--vision-max-merged", "512"});
-    failures += check(offload.enable_vision && offload.vision_offload,
+    failures += check(offload.enable_vision && offload.vision_offload == ninfer::VisionOffload::On,
                       "--vision-offload on did not reach serving options");
     failures += check(offload.vision_max_merged_tokens == 512,
                       "--vision-max-merged did not preserve its value");
     failures +=
-        check(!parse({"ninfer-serve", "model.ninfer", "--vision-offload", "off"}).vision_offload,
+        check(parse({"ninfer-serve", "model.ninfer", "--vision-offload", "off"}).vision_offload ==
+                  ninfer::VisionOffload::Off,
               "--vision-offload off did not reach serving options");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision-offload", "auto"}).vision_offload ==
+                          ninfer::VisionOffload::Auto,
+                      "--vision-offload auto (no --vision) is accepted");
     bool offload_without_vision_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--vision-offload", "on"});

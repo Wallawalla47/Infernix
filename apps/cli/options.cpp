@@ -96,7 +96,7 @@ std::string usage_text(const char* argv0) {
            "       [--chat-template FILE] [--ngram-volume FILE] [--ram-headroom-mib N]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
-           "       [--vision] [--vision-offload on|off] [--vision-max-merged N]\n"
+           "       [--vision] [--vision-offload auto|on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "\n"
@@ -189,8 +189,9 @@ std::string usage_text(const char* argv0) {
            "\n"
            "VISION (off by default)\n"
            "  --vision                 enable image/video input\n"
-           "  --vision-offload on|off  keep the vision tower in pinned system RAM instead of\n"
-           "                           VRAM (default off; on adds no steady-state VRAM)\n"
+           "  --vision-offload auto|on|off  keep the vision tower in pinned system RAM\n"
+           "                           instead of VRAM; on adds no steady-state VRAM (default\n"
+           "                           auto: on for Qwen3.8-Flash-Next, off for Qwen3.5)\n"
            "  --vision-max-merged N    max merged vision tokens per item (default 32768);\n"
            "                           oversized media downscales at preprocessing\n"
            "\n"
@@ -298,12 +299,14 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--vision-offload") {
             const std::string_view mode = value(arg);
-            if (mode == "on") {
-                options.vision_offload = true;
+            if (mode == "auto") {
+                options.vision_offload = VisionOffload::Auto;
+            } else if (mode == "on") {
+                options.vision_offload = VisionOffload::On;
             } else if (mode == "off") {
-                options.vision_offload = false;
+                options.vision_offload = VisionOffload::Off;
             } else {
-                throw std::invalid_argument("--vision-offload accepts on or off");
+                throw std::invalid_argument("--vision-offload accepts auto, on or off");
             }
         } else if (arg == "--vision-max-merged") {
             const std::uint32_t merged = parse_u32(value(arg), "vision-max-merged");

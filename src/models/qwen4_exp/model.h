@@ -3,11 +3,13 @@
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -54,13 +56,18 @@ public:
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
+    // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
+    // window borrows device memory from the expert cache, design §19.3.2).
+    [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {
+        return overlay_vision_;
+    }
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*);
     Model(Config config, LoadOptions options, TextWeights weights, std::vector<BoundWeight> bound,
           std::vector<ExpertBank> banks, FrontendResources resources, InstanceInfo info,
-          artifact::MaterializedArtifact backing);
+          std::optional<qwen3_5::VisionOverlayAssets> overlay_vision, artifact::MaterializedArtifact backing);
 
     // Borrowers are declared after the backing they view, so they are destroyed first.
     artifact::MaterializedArtifact backing_;
@@ -71,6 +78,7 @@ private:
     std::vector<ExpertBank> banks_;
     FrontendResources resources_;
     InstanceInfo info_;
+    std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;
 };
 
 } // namespace ninfer::models::qwen4_exp

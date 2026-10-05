@@ -7,7 +7,9 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <span>
 #include <string>
+#include <string_view>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -180,14 +182,16 @@ TextConfig text(const Json& value, bool mtp) {
     return out;
 }
 
-VisionConfig vision(const Json& value) {
+VisionConfig vision_config(const Json& value, std::span<const std::string_view> model_types) {
     require_members(value,
                     {"model_type", "depth", "hidden_size", "intermediate_size", "num_heads",
                      "patch_size", "temporal_patch_size", "spatial_merge_size",
                      "num_position_embeddings"},
                     {}, "vision config");
-    if (value.at("model_type") != "qwen3_5_vision" &&
-        value.at("model_type") != "qwen3_5_moe_vision") {
+    const auto& type = value.at("model_type");
+    if (!type.is_string() || std::none_of(model_types.begin(), model_types.end(), [&](std::string_view t) {
+            return type.get<std::string>() == t;
+        })) {
         throw ArtifactError("unknown Vision model_type");
     }
     VisionConfig out;
@@ -345,7 +349,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         } else if (options.rope_yarn_factor != 1.0F) {
             throw ArtifactError("YaRN requires a text RoPE configuration");
         }
-        if (options.vision) { out.vision = vision(companion(directory, "vision").config); }
+        if (options.vision) {
+            constexpr std::string_view types[] = {"qwen3_5_vision", "qwen3_5_moe_vision"};
+            out.vision = vision_config(companion(directory, "vision").config, types);
+        }
         if (out.mtp) {
             const auto& config = companion(directory, "mtp").config;
             require_members(config, {"architectures"}, {}, "MTP config");
@@ -368,6 +375,10 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
     } catch (const std::exception& error) {
         throw ArtifactError(std::string("Qwen3.5 config: ") + error.what());
     }
+}
+
+VisionConfig parse_vision_config(const artifact::Json& value, std::span<const std::string_view> model_types) {
+    return vision_config(value, model_types);
 }
 
 } // namespace ninfer::models::qwen3_5

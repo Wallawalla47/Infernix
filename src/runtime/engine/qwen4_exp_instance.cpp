@@ -61,7 +61,6 @@ void validate(const EngineOptions& options) {
     if (options.purpose != EnginePurpose::Generation) {
         throw std::invalid_argument("Qwen3.8-Flash-Next serves generation only (causal scoring is not wired yet)");
     }
-    if (options.enable_vision) { throw std::invalid_argument("Qwen3.8-Flash-Next vision is not supported yet"); }
     if ((options.speculative.backend != SpeculativeBackend::None &&
          options.speculative.backend != SpeculativeBackend::Mtp) ||
         options.speculative.ngram_archive_bytes != 0) {
@@ -87,11 +86,12 @@ Qwen4ExpInstance::Qwen4ExpInstance(std::unique_ptr<models::qwen4_exp::Model> sou
       frontend(models::qwen3_5::make_frontend(model->resources(),
                                               {.chat_template_path      = options.chat_template_path,
                                                .architecture            = models::Architecture::Qwen4Exp,
-                                               .vision_enabled          = false,
+                                               .vision_enabled          = options.enable_vision,
                                                .max_context             = options.max_context,
                                                .media_cache_bytes       = options.media_cache_bytes,
                                                .media_live_bytes        = options.media_live_bytes,
                                                .media_preprocess_threads = options.media_preprocess_threads,
+                                               .vision_max_merged_tokens = options.vision_max_merged_tokens,
                                                .thinking_budget_message = options.thinking_budget_message})),
       capacity(options.max_context) {}
 
@@ -106,7 +106,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("artifact is not Qwen4ExpForCausalLM");
     }
     inspect.complete();
-    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options));
+    auto plan = models::qwen4_exp::plan_load(reader, models::load_options(options, models::Architecture::Qwen4Exp));
     // The RAM ledger (design §19.3.7): the experts take what the reserve and every other planned
     // allocation leave, before anything is pinned or read.
     models::qwen4_exp::HostMemoryDemand demand;

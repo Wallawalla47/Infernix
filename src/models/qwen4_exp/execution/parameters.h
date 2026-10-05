@@ -6,6 +6,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/weight_input.h"
@@ -98,6 +99,7 @@ public:
     std::vector<BlockParameters> layers;
     std::optional<MtpParameters> mtp;
     DraftHeadParameters draft_head;
+    std::optional<qwen3_5::execution::VisionParameters> vision; // --vision (shared tower types)
 
 private:
     // Device copy of every layer's ExpertScales, [layers][E].
