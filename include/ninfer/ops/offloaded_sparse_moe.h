@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ops/offloaded_sparse_moe/cpu/fetch_request.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -84,13 +85,19 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
 /// the host's expert engine (offloaded_moe::CpuMissService) while the GPU computes the other jobs.
 /// Calls of at least wide_from columns (prefill; 0: none) take wide_jobs as their cap instead.
 /// moe_experts returns after placing the host's outputs. The arithmetic is the same exact W4A4,
-/// so where an expert is computed never changes a bit. A host that does not answer within 2 s
-/// traps the kernel.
+/// so where an expert is computed never changes a bit. The wait lasts as long as the host's
+/// heartbeat word keeps changing; when it stops for kHeartbeatTimeoutNs the call writes
+/// kErrorHostSilent to the source's error word and leaves its CPU outputs unwritten (without an
+/// error word, or without a heartbeat after 2 s, it traps).
 struct MoeCpuChannel {
     offloaded_moe::MissRequest* request = nullptr; // mapped host memory
     std::uint16_t* x                    = nullptr; // mapped BF16 [H, kMaxCpuXColumns]
     const std::uint16_t* y              = nullptr; // mapped BF16 [H, max(max_jobs, wide_jobs) * kMaxCpuColumns]
     const std::uint32_t* done           = nullptr; // mapped; the host writes the answered sequence
+    // Mapped; written before `done`: 0, or an errno value when an expert could not be computed (its
+    // record could not be read). Null for services without one.
+    const std::uint32_t* status         = nullptr;
+    const std::uint32_t* heartbeat      = nullptr; // mapped; changes at least every few ms while the host is alive
     std::uint32_t* sequence             = nullptr; // device counter of published requests
     std::int32_t layer                  = 0;
     std::int32_t max_jobs               = 0;       // 0 disables
@@ -114,21 +121,44 @@ struct MoeL2Warm {
     std::size_t bytes[kSpans] = {};
 };
 
+/// The SSD expert tier's fetch channel (design §19.3.7; protocol in
+/// ops/offloaded_sparse_moe/cpu/fetch_request.h). With a host table, a call's SSD-only experts that
+/// no CPU job takes (and no F2 stream holds) are fetch-served: the call moves them to the end of
+/// dispatch.jobs (a stable partition; outputs are indexed by entry, so no bit changes), publishes
+/// them as one request before any pass, and its stage kernels copy each record from the host's
+/// answer as soon as it lands, so a pass waits only for its own records and the reads run under
+/// the earlier passes. One request is outstanding at a time (layers run in stream order).
+struct MoeFetchChannel {
+    offloaded_moe::FetchRequest* request        = nullptr; // mapped host memory
+    const offloaded_moe::FetchResponse* response = nullptr; // mapped host memory
+    std::uint64_t* consumed                     = nullptr; // mapped: sequence << 32 | records copied
+    std::uint32_t* sequence                     = nullptr; // device counter of published requests
+    const std::uint32_t* heartbeat              = nullptr; // mapped; changes while the host is alive
+    std::int32_t layer                          = 0;
+};
+
 struct MoeExpertSource {
     const std::uint8_t* frame_base   = nullptr;
     const std::int32_t* frames       = nullptr; // device [E]
     // A non-resident expert's host record: host_table[e] when host_table is set (device [E] of
-    // host pointers, the SSD tier's RAM slots, design §19.3.7; a null entry is an expert that is
-    // in no host slot and must not reach this call's staging or CPU jobs), else host_records + e *
+    // host pointers, the SSD tier's RAM slots, design §19.3.7; a null entry is an SSD-only expert:
+    // CPU jobs take those first and read them through the service's RecordProvider, and the fetch
+    // channel serves the rest), else host_records + e *
     // record_stride. A record is read from a frame, a host pointer or a landing; its bits are
     // identical in each.
     const std::uint8_t* host_records = nullptr;
     const std::uint8_t* const* host_table = nullptr;
+    // Optional mapped word: a call that cannot serve an expert (an SSD-only record with no CPU job
+    // and no fetch channel, a record the host could not read, or a host whose heartbeat stopped)
+    // writes layer << 16 | code there (offloaded_moe::kError* or an errno); that call's outputs are
+    // undefined and the caller must fail the round. The word is the caller's to clear.
+    std::uint32_t* error = nullptr;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
+    MoeFetchChannel fetch; // with host_table only; needs staging_slots > 0 and max_jobs <= kMaxFetch
     // Optional overlap of staging with compute for calls of several passes (prefill chunks): the
     // slots are split in two halves and pass p+1 is staged on `overlap_stream` while pass p
     // computes. The stream and the five events (start, staged[2], consumed[2]) are caller-owned;

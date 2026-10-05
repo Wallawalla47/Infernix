@@ -2,7 +2,9 @@
 // engine, with expert records split between device frames and the pinned host bank and misses
 // read zero-copy, staged through 1, 3 or 64 device slots (one or several staging passes), or
 // served by the host expert engine through the CPU miss channel
-// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2).
+// (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2), and with SSD-only experts
+// (the SSD tier, §19.3.7) read through a RecordProvider by CPU jobs or fetched through the fetch
+// channel from a host responder, including its failure paths (host status, silent host).
 //
 // Oracle: the CPU engine's output of each routed (column, expert) pair of the narrow route, bit
 // for bit; the narrow route's arithmetic is exact. Every output, the wide route's included (its own
@@ -11,6 +13,7 @@
 // moe_dispatch has its own exact oracle (test_dispatch).
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
+#include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 #include "ops/op_tester.h"
@@ -18,6 +21,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -57,6 +62,104 @@ std::vector<std::uint16_t> cpu_column(const fixtures::Expert& e, const std::uint
     moe::expert_forward(moe::best_cpu_isa(), e.record.data(), e.scales, 1, xp, yp);
     return y;
 }
+
+// Serves SSD-only records to the CPU service from private copies of the bank (the SSD tier's role).
+struct CopiedRecords final : moe::RecordProvider {
+    const std::uint8_t* bank = nullptr;
+    std::size_t stride       = 0;
+    std::vector<std::vector<std::uint8_t>> copies;
+    std::uint32_t demand(int, int expert) noexcept override {
+        const auto* record = bank + static_cast<std::size_t>(expert) * stride;
+        copies.emplace_back(record, record + moe::kRecordBytes);
+        return static_cast<std::uint32_t>(copies.size() - 1);
+    }
+    bool landed(std::uint32_t) const noexcept override { return true; }
+    const std::uint8_t* wait(std::uint32_t ticket, std::uint32_t& status) noexcept override {
+        status = 0;
+        return copies[ticket].data();
+    }
+    void done(std::uint32_t) noexcept override {}
+};
+
+// The SSD tier's agent in miniature (design §19.3.7): answers each fetch request with copies of the
+// bank's records written into a ring of mapped slots, landing them in swapped pairs (record i + 1
+// before record i) and reusing a slot only once the device has consumed its previous record.
+// Modes: answer, fail the request at record fail_at (EIO), or stay silent (acknowledge, then
+// neither land nor beat).
+class Responder {
+public:
+    enum class Mode { kAnswer, kFail, kSilent };
+    static constexpr std::uint32_t kRing = 72; // more than the largest pass (64 jobs) plus one swap
+
+    Responder(const std::uint8_t* bank, std::size_t stride) : bank_(bank), stride_(stride) {
+        cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&ring_), stride * kRing, cudaHostAllocMapped), "cudaHostAlloc");
+        thread_ = std::thread([this] { run(); });
+    }
+    ~Responder() {
+        stop_.store(true);
+        thread_.join();
+        cudaFreeHost(ring_);
+    }
+    [[nodiscard]] ninfer::ops::MoeFetchChannel channel(int layer) const { return channel_.channel(layer); }
+    // Before a call, with no request open.
+    void set(Mode mode, std::uint32_t fail_at = 0) {
+        fail_at_.store(fail_at);
+        mode_.store(mode);
+    }
+    // After a call: the records of its request, and how many the device consumed.
+    [[nodiscard]] std::uint32_t count() const { return count_.load(); }
+    [[nodiscard]] std::uint32_t consumed() const { return consumed_.load(); }
+    [[nodiscard]] std::uint64_t requests() const { return requests_.load(); }
+
+private:
+    void run() {
+        moe::FetchChannel::Request request;
+        while (!stop_.load()) {
+            const Mode mode = mode_.load();
+            if (mode != Mode::kSilent) { channel_.beat(); }
+            consumed_.store(channel_.consumed());
+            if (!channel_.poll(request)) {
+                std::this_thread::yield();
+                continue;
+            }
+            requests_.fetch_add(1);
+            const auto count = static_cast<std::uint32_t>(request.experts.size());
+            count_.store(count);
+            if (mode == Mode::kSilent) { continue; }
+            for (std::uint32_t pair = 0; pair < count; pair += 2) {
+                bool failed = false;
+                for (const std::uint32_t i : {pair + 1, pair}) {
+                    if (i >= count) { continue; }
+                    if (mode == Mode::kFail && i == fail_at_.load()) {
+                        channel_.fail(EIO);
+                        failed = true;
+                        break;
+                    }
+                    // Slot i % kRing held record i - kRing: wait until the device has copied it.
+                    while (i >= kRing && channel_.consumed() <= i - kRing && !stop_.load()) {
+                        channel_.beat();
+                        std::this_thread::yield();
+                    }
+                    std::uint8_t* slot = ring_ + static_cast<std::size_t>(i % kRing) * stride_;
+                    std::memcpy(slot, bank_ + static_cast<std::size_t>(request.experts[i]) * stride_, moe::kRecordBytes);
+                    channel_.land(i, slot);
+                    channel_.beat();
+                }
+                if (failed) { break; }
+            }
+        }
+    }
+
+    const std::uint8_t* bank_;
+    std::size_t stride_;
+    std::uint8_t* ring_ = nullptr;
+    moe::FetchChannel channel_;
+    std::atomic<Mode> mode_{Mode::kAnswer};
+    std::atomic<std::uint32_t> fail_at_{0}, count_{0}, consumed_{0};
+    std::atomic<std::uint64_t> requests_{0};
+    std::atomic<bool> stop_{false};
+    std::thread thread_;
+};
 
 void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     std::mt19937 rng(seed);
@@ -177,23 +280,75 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
                                               .pcie_divisor = 0, .wide_from = 256, .wide_jobs = moe::kMaxCpuJobs,
                                               .cpus = {}});
+    // SSD tier (design §19.3.7): services that read SSD-only records through a provider.
+    CopiedRecords copied;
+    copied.bank   = host;
+    copied.stride = stride;
+    moe::CpuMissService service_ssd_all(layers, {.workers = 6, .max_jobs = moe::kMaxCpuJobs, .max_columns = 64,
+                                                 .pcie_divisor = 0, .cpus = {}, .records = &copied});
+    moe::CpuMissService service_ssd8(layers, {.workers = 4, .max_jobs = 8, .max_columns = 64, .cpus = {},
+                                              .records = &copied});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
     // with at most max_job_columns columns, so the number served is min(want, eligible misses).
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
-    // A streamed record counts as resident: the CPU takes only misses the stream left out.
-    const auto expected_cpu_jobs = [&](const moe::CpuMissService& service, bool streamed) {
+    // SSD-only experts have no host record in the table. Narrow set: every third non-resident
+    // expert of at most kMaxCpuColumns columns (CPU jobs can take every one). Full set: every third
+    // non-resident expert, wide ones too (only the fetch channel can serve those).
+    std::vector<std::uint8_t> ssd_narrow(experts, 0), ssd_full(experts, 0);
+    std::vector<const std::uint8_t*> narrow_table = table, full_table = table;
+    for (int e = 0; e < experts; ++e) {
+        if (frames[e] >= 0 || e % 3 != 1) { continue; }
+        ssd_full[e]   = 1;
+        full_table[e] = nullptr;
+        if (expert_columns[e] >= 1 && expert_columns[e] <= moe::kMaxCpuColumns) {
+            ssd_narrow[e]   = 1;
+            narrow_table[e] = nullptr;
+        }
+    }
+    auto* d_narrow_table = device_copy(narrow_table);
+    auto* d_full_table   = device_copy(full_table);
+    Responder responder(host, stride);
+    // The overlap route (prefill passes staged on a side stream) and its five events.
+    cudaStream_t overlap_stream = nullptr;
+    cudaEvent_t overlap_events[5] = {};
+    cuda_check(cudaStreamCreateWithFlags(&overlap_stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    for (auto& event : overlap_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+    std::uint32_t* error_host = nullptr;
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&error_host), 64, cudaHostAllocMapped), "cudaHostAlloc");
+    std::uint32_t* error_device = nullptr;
+    cuda_check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&error_device), error_host, 0), "cudaHostGetDevicePointer");
+    // A streamed record counts as resident: the CPU takes only misses the stream left out. With SSD-only
+    // experts (`ssd`), the eligible ones are taken first up to the cap; the divisor rule then applies to
+    // the host-memory misses.
+    const auto expected_cpu_jobs = [&](const moe::CpuMissService& service, bool streamed,
+                                       const std::vector<std::uint8_t>* ssd) {
         const auto channel = service.channel(0);
         if (columns > channel.max_columns) { return 0; } // a call this wide takes no CPU-served misses
-        int misses = 0, eligible = 0;
+        int misses = 0, eligible = 0, ssd_misses = 0;
         for (int e = 0; e < experts; ++e) {
             if (expert_columns[e] == 0 || frames[e] >= 0 || (streamed && prefetched[e] >= 0)) { continue; }
+            if (ssd != nullptr && (*ssd)[e] != 0) {
+                ssd_misses += expert_columns[e] <= channel.max_job_columns ? 1 : 0;
+                continue;
+            }
             ++misses;
             eligible += expert_columns[e] <= channel.max_job_columns ? 1 : 0;
         }
         const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
-        const int want = std::min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
-        return std::min(want, eligible);
+        const int take = std::min(cap, ssd_misses);
+        const int want = std::min(cap - take, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        return take + std::min(want, eligible);
+    };
+    // Narrow SSD-only experts no CPU job takes (no service, a call wider than its columns, or past
+    // its cap): without a fetch channel nothing can serve them, so the call must set its error word.
+    const auto ssd_unserved = [&](const moe::CpuMissService* service) {
+        int ssd_misses = 0;
+        for (int e = 0; e < experts; ++e) { ssd_misses += ssd_narrow[e]; }
+        if (service == nullptr || columns > service->channel(0).max_columns) { return ssd_misses; }
+        const auto channel = service->channel(0);
+        const int cap = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
+        return std::max(0, ssd_misses - cap);
     };
     struct Config {
         int slots;
@@ -202,6 +357,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         bool land = false;
         bool streamed = false;
         bool table    = false;
+        int ssd       = 0;     // the table leaves SSD-only experts without a host record: 1 narrow set, 2 full set
+        Responder::Mode fetch = Responder::Mode::kAnswer;
+        bool fetched  = false; // the fetch channel serves SSD-only experts no CPU job takes
+        bool overlap  = false; // passes staged on the overlap stream
     };
     // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
@@ -252,8 +411,34 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{0, nullptr, false, false, false, true},
                                 Config{3, nullptr, false, false, false, true}, Config{64, nullptr, true, false, false, true},
                                 Config{64, &service_two, true, false, false, true}, Config{3, &service_all, false, false, false, true},
-                                Config{64, &service_assist, false, false, false, true}}) {
+                                Config{64, &service_assist, false, false, false, true},
+                                Config{3, &service_ssd_all, false, false, false, true, true},
+                                Config{64, &service_ssd_all, true, false, false, true, true},
+                                Config{0, &service_ssd_all, false, false, false, true, true},
+                                Config{3, &service_ssd8, false, false, false, true, true},
+                                Config{64, &service_ssd8, true, false, false, true, true},
+                                Config{3, nullptr, false, false, false, true, true},
+                                // Fetch channel: serial passes, overlap, fork, landing, with CPU jobs, failures.
+                                Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
+                                Config{.slots = 1, .service = nullptr, .table = true, .ssd = 2, .fetched = true},
+                                Config{.slots = 16, .service = nullptr, .table = true, .ssd = 2, .fetched = true,
+                                       .overlap = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .table = true, .ssd = 2,
+                                       .fetched = true},
+                                Config{.slots = 64, .service = nullptr, .fork = true, .land = true, .table = true,
+                                       .ssd = 2, .fetched = true},
+                                Config{.slots = 3, .service = &service_ssd8, .table = true, .ssd = 2, .fetched = true},
+                                Config{.slots = 64, .service = &service_ssd8, .fork = true, .table = true, .ssd = 2,
+                                       .fetched = true},
+                                Config{.slots = 16, .service = &service_ssd_all, .table = true, .ssd = 2,
+                                       .fetched = true, .overlap = true},
+                                Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
+                                       .fetch = Responder::Mode::kFail, .fetched = true},
+                                Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
+                                       .fetch = Responder::Mode::kSilent, .fetched = true}}) {
         const int slots = config.slots;
+        // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
+        ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
         ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
@@ -290,8 +475,20 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         }
         if (config.table) {
             source.host_records = nullptr; // only the table may be read
-            source.host_table   = d_table;
+            source.host_table   = config.ssd == 1 ? d_narrow_table : config.ssd == 2 ? d_full_table : d_table;
         }
+        if (config.overlap) {
+            source.overlap_stream = overlap_stream;
+            for (int i = 0; i < 5; ++i) { source.overlap_events[i] = overlap_events[i]; }
+        }
+        constexpr int kFetchLayer = 5; // names the call in its error word
+        if (config.fetched) {
+            responder.set(config.fetch, 5);
+            source.fetch = responder.channel(kFetchLayer);
+        }
+        const std::uint64_t requests_before = responder.requests();
+        *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+        source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
@@ -299,7 +496,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         if (config.service != nullptr) {
             // The service counts after answering, so its count may trail the device by a moment.
-            const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service, config.streamed));
+            const auto* ssd = config.ssd == 1 ? &ssd_narrow : config.ssd == 2 ? &ssd_full : nullptr;
+            const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service, config.streamed, ssd));
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             while (config.service->served_experts() - served_before < want && std::chrono::steady_clock::now() < until) {
                 std::this_thread::yield();
@@ -307,6 +505,42 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             check(config.service->served_experts() - served_before == want,
                   "the CPU serves min(cap, M - M / divisor) of the eligible misses");
         }
+        const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+        const int unserved        = config.ssd == 1 && !config.fetched ? ssd_unserved(config.service) : 0;
+        if (unserved > 0) {
+            // Its outputs are undefined; the word names the layer and the staging code.
+            std::printf("E=%d T=%d k=%d staging slots %2d (SSD-only experts), %d unserved: error word %#x\n", experts,
+                        columns, top_k, slots, unserved, error);
+            check(error == moe::kErrorUnservedRecord, "an SSD-only expert outside the CPU jobs sets the call's error word");
+            continue;
+        }
+        if (config.fetched) {
+            // Every fetch-served expert: SSD-only, routed, not taken by a CPU job.
+            const bool published = responder.requests() > requests_before;
+            const std::uint32_t count = published ? responder.count() : 0;
+            if (config.fetch != Responder::Mode::kAnswer) {
+                // The wait ends without a trap; the word names the layer and the host's errno or the silence.
+                const std::uint32_t want = config.fetch == Responder::Mode::kFail ? EIO : moe::kErrorHostSilent;
+                std::printf("E=%d T=%d k=%d staging slots %2d (fetch, %s): %u records requested, error word %#x\n",
+                            experts, columns, top_k, slots, config.fetch == Responder::Mode::kFail ? "failing host" : "silent host",
+                            count, error);
+                if (count > (config.fetch == Responder::Mode::kFail ? 5U : 0U)) {
+                    check(error == (static_cast<std::uint32_t>(kFetchLayer) << 16U | want),
+                          "a failed fetch request sets the call's error word (layer << 16 | code)");
+                } else {
+                    check(error == 0, "a request that fails after its last record (or no request) fails no copy");
+                }
+                responder.set(Responder::Mode::kAnswer);
+                if (error != 0) { continue; }
+            } else if (published) {
+                // The device consumed every record it was sent (the last pass stores the total).
+                const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                while (responder.consumed() != count && std::chrono::steady_clock::now() < until) { std::this_thread::yield(); }
+                std::printf("  fetch: %u records requested, %u consumed\n", count, responder.consumed());
+                check(responder.consumed() == count, "the device reports every fetched record consumed");
+            }
+        }
+        check(error == 0, "a call that serves every expert leaves its error word clear");
         std::vector<std::uint16_t> got(expected.size());
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
         // The first configuration (every miss zero-copy on the GPU) fixes the wide-route outputs.
@@ -319,7 +553,11 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         std::printf("E=%d T=%d k=%d staging slots %2d%s%s%s, CPU jobs %d (served %llu): %ld narrow-route outputs "
                     "differ from the CPU engine, %ld outputs from the first placement, of %zu\n",
                     experts, columns, top_k, slots, config.fork ? " (fork)" : "", config.streamed ? " (streamed)" : "",
-                    config.table ? " (host table)" : "",
+                    config.fetched ? (config.overlap ? " (host table, SSD-only experts fetched, overlap)"
+                                                     : " (host table, SSD-only experts fetched)")
+                    : config.ssd != 0 ? " (host table, SSD-only experts)"
+                    : config.table    ? " (host table)"
+                                      : "",
                     config.service != nullptr ? config.service->channel(0).max_jobs : 0,
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
                     mismatches, moved, got.size());
@@ -360,8 +598,55 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             cuda_check(cudaMemset(d_frame_base + static_cast<std::size_t>(resident) * stride, 0, 3 * stride), "cudaMemset");
         }
     }
+    if (experts == 12) {
+        // A CPU channel whose host never answers and whose heartbeat stands still: the wait gives up
+        // after kHeartbeatTimeoutNs and reports it in the error word instead of trapping, and the
+        // device stays usable.
+        const auto mapped = [](std::size_t bytes) {
+            void* p = nullptr;
+            cuda_check(cudaHostAlloc(&p, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "cudaHostAlloc");
+            std::memset(p, 0, bytes);
+            return p;
+        };
+        auto* request = static_cast<moe::MissRequest*>(mapped(sizeof(moe::MissRequest)));
+        auto* cx      = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * moe::kHidden * moe::kMaxCpuXColumns));
+        auto* cy      = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * moe::kHidden * 8 * moe::kMaxCpuColumns));
+        auto* words   = static_cast<std::uint32_t*>(mapped(64));
+        std::uint32_t* sequence = nullptr;
+        cuda_check(cudaMalloc(&sequence, sizeof(std::uint32_t)), "cudaMalloc");
+        cuda_check(cudaMemset(sequence, 0, sizeof(std::uint32_t)), "cudaMemset");
+        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                            .frames        = d_frames,
+                                            .host_records  = host_device,
+                                            .record_stride = stride,
+                                            .scales        = d_scales,
+                                            .staging_base  = d_staging,
+                                            .staging_slots = 3};
+        source.cpu = {.request = request, .x = cx, .y = cy, .done = words, .status = words + 1, .heartbeat = words + 2,
+                      .sequence = sequence, .layer = 7, .max_jobs = 8, .max_columns = 64};
+        *reinterpret_cast<volatile std::uint32_t*>(error_host) = 0;
+        source.error = error_device;
+        Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+        Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+        const auto start = std::chrono::steady_clock::now();
+        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        const cudaError_t status = cudaDeviceSynchronize();
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
+        std::printf("silent CPU host: %s after %.2f s, error word %#x\n", cudaGetErrorString(status), seconds, error);
+        check(status == cudaSuccess && error == (7U << 16U | moe::kErrorHostSilent),
+              "a silent CPU host fails the call through its error word, without a trap");
+        cuda_check(cudaMemset(d_out, 0, 16), "a device that is still usable");
+        cudaFree(sequence);
+        cudaFreeHost(words);
+        cudaFreeHost(cy);
+        cudaFreeHost(cx);
+        cudaFreeHost(request);
+    }
     for (auto event : fork_events) { cudaEventDestroy(event); }
     cudaStreamDestroy(fork_stream);
+    for (auto event : overlap_events) { cudaEventDestroy(event); }
+    cudaStreamDestroy(overlap_stream);
     cudaFree(d_out);
     cudaFree(d_workspace);
     cudaFree(d_staging);
@@ -374,6 +659,9 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cudaFree(d_scales);
     cudaFree(d_prefetch_base);
     cudaFree(d_table);
+    cudaFree(d_narrow_table);
+    cudaFree(d_full_table);
+    cudaFreeHost(error_host);
     cudaFreeHost(shuffled);
     cudaFree(d_prefetched);
     cudaFree(d_frames);
