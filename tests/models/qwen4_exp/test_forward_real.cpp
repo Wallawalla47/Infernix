@@ -30,6 +30,7 @@
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
+#include "models/qwen4_exp/program/rope_positions.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
 
 #include <cuda_bf16.h>
@@ -255,6 +256,9 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const std::size_t row_bytes = c.ple.table.row_bytes;
     const std::size_t heads     = hash.heads();
     std::vector<std::int32_t> ids, positions, last;
+    // Text prompts: RoPE positions equal the index on all three axes.
+    std::vector<std::int32_t> rope(3 * static_cast<std::size_t>(columns)), block_rope(3 * static_cast<std::size_t>(batch));
+    const q4::LaneRope text;
     std::vector<std::byte> ngram(columns * heads * row_bytes);
     for (std::int32_t b = 0; b < batch; ++b) {
         const auto& history = histories[b];
@@ -268,6 +272,9 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
             ids.push_back(history[first + i]);
             positions.push_back(first + i);
         }
+        q4::stage_rope(text, static_cast<std::uint32_t>(first), width, rope, columns, b * width);
+        q4::stage_rope_value(q4::block_start_rope(text, static_cast<std::uint32_t>(first), c.qsa.compress_ratio),
+                             block_rope, batch, b);
         if (every_column) {
             for (std::int32_t i = 0; i < width; ++i) { last.push_back(b * width + i); }
         } else {
@@ -278,6 +285,7 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     const std::size_t i32 = sizeof(std::int32_t);
     const auto padded_bytes = [](std::size_t n) { return (n + 255) / 256 * 256; };
     const std::size_t bytes = padded_bytes(ids.size() * i32) + padded_bytes(positions.size() * i32) +
+                              padded_bytes(rope.size() * i32) + padded_bytes(block_rope.size() * i32) +
                               padded_bytes(slots.size() * i32) + padded_bytes(rows.size() * i32) +
                               padded_bytes(last.size() * i32) + padded_bytes(ngram.size());
     call.buffer = DeviceBuffer(bytes);
@@ -291,6 +299,8 @@ Call make_call(const q4::TextConfig& c, const q4::NgramVolume& volume, const std
     };
     call.batch.ids        = Tensor(put(ids.data(), ids.size() * i32), DType::I32, {columns});
     call.batch.positions  = Tensor(put(positions.data(), positions.size() * i32), DType::I32, {columns});
+    call.batch.rope_positions   = Tensor(put(rope.data(), rope.size() * i32), DType::I32, {columns, 3});
+    call.batch.block_start_rope = Tensor(put(block_rope.data(), block_rope.size() * i32), DType::I32, {batch, 3});
     call.batch.slots      = Tensor(put(slots.data(), slots.size() * i32), DType::I32, {batch});
     call.batch.table_rows = Tensor(put(rows.data(), rows.size() * i32), DType::I32, {batch});
     call.batch.logit_columns =

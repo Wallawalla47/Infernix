@@ -18,15 +18,19 @@ namespace ninfer::ops {
  * For a query at absolute position p of a sequence, with ratio R and budget B:
  *
  *   visible          = positions 0..p;  complete blocks c = floor((p + 1) / R)
- *   pooled key b     = RoPE(norm(bf16(mean(raw_key[R b .. R b + R - 1]))), position R b)
+ *   pooled key b     = RoPE(norm(bf16(mean(raw_key[R b .. R b + R - 1]))), rope(R b))
  *   score_b          = (1/sqrt(Di)) * sum_h relu(<index_q_h(p), pooled key b>)
  *   selected blocks  = top-(B/R) scores among the c complete blocks (all when c <= B/R; equal
  *                      scores select the lower block id)
  *   attended tokens  = tokens of the selected blocks, then the tail positions R c .. p
  *   out_h(p)         = softmax_j(scale <q_h, k_j>) v_j over the attended tokens (GQA)
  *
- * norm() is RMSNorm with unit-offset weight, RoPE the half-split rotation of the first
- * `rotary_dim` dimensions with theta. While p + 1 <= B + R - 1 every token is attended, so QSA
+ * norm() is RMSNorm with unit-offset weight. RoPE is the half-split rotation of the first
+ * `rotary_dim` dimensions with theta, interleaved M-RoPE: pair i rotates by axis i % 3 of the token's
+ * three-axis RoPE position rope(token) (the index query by its own column's, a pooled key by its
+ * block's first token's). Text tokens have three equal axes, which give the 1-D rotation exactly;
+ * an image has distinct ones. Visibility, blocks and selection use the KV position p, never the
+ * RoPE position. While p + 1 <= B + R - 1 every token is attended, so QSA
  * equals causal attention. Keys and values are read from the layer's paged planes in the
  * configured KV storage; pooled keys live in their own BF16 plane, [Di/R, 64, 1, pages], so the
  * pooled key of block b fills the R token slots of its block. Pooling and selection are FP32
@@ -58,8 +62,14 @@ struct QsaKVLayer {
 struct QsaBatch {
     Tensor block_tables;  // I32 [pages per row, rows]
     Tensor table_rows;    // I32 [batch]
-    Tensor positions;     // I32 [batch * width]: absolute position of each column
+    Tensor positions;     // I32 [batch * width]: absolute (KV) position of each column
     Tensor tail_slots;    // I32 [batch]: raw-key tail state slot of each sequence
+    // Read by qsa_pool_keys only. rope_positions: I32 [batch * width, 3] axis-major, the RoPE
+    // position of each column (axis a of column t at word a * batch * width + t). block_start_rope:
+    // I32 [batch, 3] axis-major, the RoPE position of token R * floor(start / R) of each sequence
+    // (start = its first column's position), read when that token precedes the call.
+    Tensor rope_positions;
+    Tensor block_start_rope;
     std::int32_t batch = 0;
     std::int32_t width = 0;
     // False leaves the tails unchanged (speculative verification, committed later by
@@ -67,8 +77,9 @@ struct QsaBatch {
     bool update_tails = true;
 };
 
-/// q: BF16 [Di, index_heads, T] in place: q = RoPE(norm(q; weight), positions).
-void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& positions,
+/// q: BF16 [Di, index_heads, T] in place: q = RoPE(norm(q; weight), rope_positions), with
+/// rope_positions I32 [T, 3] axis-major (axis a of column t at word a * T + t).
+void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_positions,
                      const QsaGeometry& geometry, cudaStream_t stream);
 
 /// raw_keys: BF16 [Di, T], the un-normalized index keys of the call's columns. Writes the pooled

@@ -33,6 +33,16 @@ ninfer_add_test(ninfer_qwen4_exp_vram_pressure_real_test
   LIBRARIES ninfer_engine ninfer_model_runtime)
 set_tests_properties(ninfer_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# The Vision encode window's placement and visual columns (host only).
+ninfer_add_test(ninfer_qwen4_exp_vision_window_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+# RoPE staging of a lane: prompt M-RoPE, later tokens, block starts, MTP sub-chunks (host only).
+ninfer_add_test(ninfer_qwen4_exp_rope_positions_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"
+  LIBRARIES ninfer_model_runtime)
+
 # The startup RAM ledger (host only).
 ninfer_add_test(ninfer_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"

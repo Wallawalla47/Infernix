@@ -57,11 +57,13 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
     return total;
 }
 
-// Half-split RoPE angle of pair i (i < rotary/2) at `position`, in FP32 like the reference.
-__device__ __forceinline__ void rope_angle(int position, int i, int rotary, float theta, float& c,
-                                           float& s) {
+// Half-split RoPE angle of pair i (i < rotary/2) at the token whose axis a of its RoPE position is
+// rope[a * stride], in FP32 like the reference. Interleaved M-RoPE: pair i takes axis i % 3, so a
+// text token (three equal axes) rotates exactly as by its 1-D position.
+__device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_t stride, int i, int rotary,
+                                           float theta, float& c, float& s) {
     const float inv   = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
-    const float angle = static_cast<float>(position) * inv;
+    const float angle = static_cast<float>(rope[(i % 3) * stride]) * inv;
     sincosf(angle, &s, &c);
 }
 
@@ -69,7 +71,7 @@ __device__ __forceinline__ void rope_angle(int position, int i, int rotary, floa
 
 // One CTA (128 threads) per (index head, column).
 __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
-                                   const std::int32_t* __restrict__ positions, int heads, int rotary,
+                                   const std::int32_t* __restrict__ rope, int heads, int rotary,
                                    float theta, float eps) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
@@ -83,7 +85,7 @@ __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict_
     if (d < rotary) {
         const int half = rotary / 2, i = d % half;
         float c, s;
-        rope_angle(positions[t], i, rotary, theta, c, s);
+        rope_angle(rope + t, gridDim.y, i, rotary, theta, c, s);
         out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
     }
     row[d] = __float2bfloat16_rn(out);
@@ -103,8 +105,10 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
                             const bf16* __restrict__ tails, const std::int32_t* __restrict__ tables,
                             int table_stride, const std::int32_t* __restrict__ table_rows,
                             const std::int32_t* __restrict__ positions,
-                            const std::int32_t* __restrict__ tail_slots, int width, int ratio,
-                            int rotary, float theta, float eps, bf16* __restrict__ pooled) {
+                            const std::int32_t* __restrict__ tail_slots,
+                            const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
+                            int batch, int width, int ratio, int rotary, float theta, float eps,
+                            bf16* __restrict__ pooled) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     const int t = blockIdx.x, d = threadIdx.x;
@@ -128,7 +132,12 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
     if (d < rotary) {
         const int half = rotary / 2, i = d % half;
         float c, s;
-        rope_angle(first, i, rotary, theta, c, s);
+        // The block's first token: a column of this call, or the sequence's block start before it.
+        if (first >= start) {
+            rope_angle(rope + (t - (p - first)), gridDim.x, i, rotary, theta, c, s);
+        } else {
+            rope_angle(block_rope + sequence, batch, i, rotary, theta, c, s);
+        }
         out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
     }
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[sequence]) * table_stride;
@@ -510,19 +519,21 @@ void require_batch(const QsaBatch& b, int columns) {
 
 } // namespace
 
-void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& positions,
+void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_positions,
                      const QsaGeometry& geometry, cudaStream_t stream) {
     require_geometry(geometry);
-    require(contiguous(q, DType::BF16) && contiguous(norm_weight, DType::BF16) && contiguous(positions, DType::I32),
-            "index query needs BF16 q, BF16 weight and I32 positions");
+    require(contiguous(q, DType::BF16) && contiguous(norm_weight, DType::BF16) &&
+                contiguous(rope_positions, DType::I32),
+            "index query needs BF16 q, BF16 weight and I32 RoPE positions");
     const int columns = q.ne[2];
-    require(q.ne[0] == kIndexDim && q.ne[1] == geometry.index_heads && positions.numel() == columns &&
+    require(q.ne[0] == kIndexDim && q.ne[1] == geometry.index_heads && rope_positions.ne[0] == columns &&
+                rope_positions.numel() == 3 * static_cast<std::int64_t>(columns) &&
                 norm_weight.numel() == kIndexDim && columns > 0,
-            "index query shapes disagree");
+            "index query shapes disagree (RoPE positions are [T, 3])");
     index_query_kernel<<<dim3(geometry.index_heads, columns), kIndexDim, 0, stream>>>(
         static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
-        static_cast<const std::int32_t*>(positions.data), geometry.index_heads, geometry.rotary_dim, geometry.theta,
-        geometry.eps);
+        static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, geometry.rotary_dim,
+        geometry.theta, geometry.eps);
     check_launch("index query");
 }
 
@@ -537,13 +548,19 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
                 contiguous(layer.pooled_pages, DType::BF16) &&
                 layer.pooled_pages.ne[0] == kIndexDim / geometry.ratio && contiguous(norm_weight, DType::BF16),
             "pool shapes disagree");
+    require(contiguous(batch.rope_positions, DType::I32) && batch.rope_positions.ne[0] == columns &&
+                batch.rope_positions.numel() == 3 * static_cast<std::int64_t>(columns) &&
+                contiguous(batch.block_start_rope, DType::I32) && batch.block_start_rope.ne[0] == batch.batch &&
+                batch.block_start_rope.numel() == 3 * static_cast<std::int64_t>(batch.batch),
+            "pool RoPE positions are [T, 3] and block starts [batch, 3]");
     pool_kernel<<<columns, kIndexDim, 0, stream>>>(
         static_cast<const bf16*>(raw_keys.data), static_cast<const bf16*>(norm_weight.data),
         static_cast<const bf16*>(tails.data), static_cast<const std::int32_t*>(batch.block_tables.data),
         batch.block_tables.ne[0], static_cast<const std::int32_t*>(batch.table_rows.data),
         static_cast<const std::int32_t*>(batch.positions.data), static_cast<const std::int32_t*>(batch.tail_slots.data),
-        batch.width, geometry.ratio, geometry.rotary_dim, geometry.theta, geometry.eps,
-        static_cast<bf16*>(layer.pooled_pages.data));
+        static_cast<const std::int32_t*>(batch.rope_positions.data),
+        static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
+        geometry.rotary_dim, geometry.theta, geometry.eps, static_cast<bf16*>(layer.pooled_pages.data));
     check_launch("pool");
     if (!batch.update_tails) { return; }
     tail_kernel<<<batch.batch, kIndexDim, 0, stream>>>(

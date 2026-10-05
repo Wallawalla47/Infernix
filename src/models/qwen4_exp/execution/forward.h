@@ -22,6 +22,10 @@
 
 namespace ninfer::models::qwen4_exp::execution {
 
+// Columns of one MTP call inside a prefill chunk (bounds the drafter's share of the workspace);
+// the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
+inline constexpr std::int32_t kMtpChunkColumns = 512;
+
 // Program-owned recurrent state of every slot.
 struct ForwardState {
     LinearAttentionStatePool* gdn = nullptr; // one layer per GDN block
@@ -69,21 +73,39 @@ struct ForwardVerify {
     Tensor qsa_keys;      // BF16 [Di, W, B, attention layers]: the raw index keys
 };
 
+// Visual embeddings of a call's image columns (design §19.3.2): they replace those columns' token
+// embeddings before the stream expand (transformers' masked_scatter precedes repeat).
+struct VisionInput {
+    Tensor embeddings; // BF16 [H, m]: the columns' embeddings, in column order
+    Tensor columns;    // I32 [m]: call-local columns, ascending; empty (no data) when m = 0
+};
+
 // The MTP cells of a prefill or forced-token chunk (one sequence), written from the chunk's own
 // residuals while they are live: cell c pairs the residual at position c with the token at c + 1.
 // The columns are `saved` (the residual of the position before the chunk) when `prepend`, then
-// the chunk's first `columns` residuals; the chunk's last residual then replaces `saved`.
+// the chunk's first `columns` residuals; the chunk's last residual then replaces `saved`. Cells
+// run in sub-chunks of kMtpChunkColumns; sub-chunk k's RoPE positions are the [n_k, 3] block at
+// word 3 * kMtpChunkColumns * k of `rope_positions`, its pooled-block start the three words at
+// 3 * k of `block_start_rope`.
 struct MtpChunk {
     Tensor saved;     // BF16 [S*H]: the sequence's pending residual
     bool prepend = false;
     std::int32_t columns = 0;
     Tensor ids;       // I32 [prepend + columns]: the token after each cell
     Tensor positions; // I32 [prepend + columns]: the cells
+    std::int32_t* rope_positions   = nullptr; // device words, per sub-chunk [n_k, 3]
+    std::int32_t* block_start_rope = nullptr; // device words, [3] per sub-chunk
+    // Per sub-chunk: the visual embeddings of cells whose next token is an image token (empty
+    // columns when none); null for a prompt without media.
+    const VisionInput* vision = nullptr;
 };
 
 struct ForwardBatch {
     Tensor ids;        // I32 [T]
-    Tensor positions;  // I32 [T]
+    Tensor positions;  // I32 [T]: KV position of each column
+    Tensor rope_positions;   // I32 [T, 3] axis-major: RoPE position of each column
+    Tensor block_start_rope; // I32 [batch, 3] axis-major: RoPE position of each sequence's first
+                             // pooled-block token (ops::QsaBatch::block_start_rope)
     Tensor ngram_rows; // U8 [row bytes, heads, T]: each column's FP8 n-gram rows
     Tensor slots;      // I32 [batch]: state slot of each sequence, updated in place
     Tensor table_rows; // I32 [batch]: KV block-table row of each sequence
@@ -100,15 +122,18 @@ struct ForwardBatch {
     // empty or one event per decoder layer, then one for the MTP block. Layer l waits for entry l
     // before it reads or writes its state or KV planes; the MTP block waits for the last entry.
     std::array<std::span<const cudaEvent_t>, 2> layer_waits{};
+    const VisionInput* vision = nullptr;   // when set: image columns of a prefill call
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
 // (the main model's, or the drafter's own output for a chained step) with the token at c + 1, at
-// rope position c; the block's output predicts the token at c + 2.
+// the target's RoPE position of c; the block's output predicts the token at c + 2.
 struct MtpCall {
     Tensor residuals;  // BF16 [S*H, T]
     Tensor ids;        // I32 [T]
     Tensor positions;  // I32 [T]: the cells
+    Tensor rope_positions;   // I32 [T, 3] axis-major
+    Tensor block_start_rope; // I32 [batch, 3] axis-major
     Tensor slots;      // I32 [batch]
     Tensor table_rows; // I32 [batch]
     std::int32_t batch = 0, width = 0;
@@ -120,6 +145,8 @@ struct MtpCall {
     // draft head's argmax token of each column.
     Tensor residual_out; // BF16 [S*H, T]
     Tensor drafts;       // I32 [T]
+    // Cells whose next token is an image token take its visual embedding (prompt cells only).
+    const VisionInput* vision = nullptr;
 };
 
 // Optional observation of every block, for reference comparison.
@@ -170,6 +197,8 @@ private:
         bool update_tails = true;
         bool kv_only      = false;
         const Tensor& positions;
+        const Tensor& rope_positions;
+        const Tensor& block_start_rope;
         const Tensor& slots;
         const Tensor& table_rows;
         std::int32_t batch = 0, width = 0;
