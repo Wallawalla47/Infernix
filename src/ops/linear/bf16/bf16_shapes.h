@@ -19,6 +19,10 @@ namespace ninfer::ops::detail {
 [[nodiscard]] Bf16Launch select_bf16_n4608_k4608(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n2560_k4608(std::int32_t tokens);
 [[nodiscard]] Bf16Launch select_bf16_n5120_k4608(std::int32_t tokens);
+// Qwen3.8-Flash-Next text projections stored BF16: the QSA query/gate/key/value/index group and the
+// GDN a/b projections (prefill; T <= 8 keeps the skinny GEMV).
+[[nodiscard]] Bf16Launch select_bf16_n13952_k2560(std::int32_t tokens);
+[[nodiscard]] Bf16Launch select_bf16_n96_k2560(std::int32_t tokens);
 
 // Runtime-shape GEMM fallback for any (n, k) the table above does not specialise.
 [[nodiscard]] Bf16Launch select_bf16_general_launch(std::int32_t tokens);
