@@ -7863,6 +7863,86 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 - With the CPU split, the modelled link-plus-CPU time per call falls 1.7-2.2x against copying the
   touched experts. That is about 2.5-3x against today's full pass, at x8 and x16 alike.
 
+### 19.3.13 Preemption (2026-10-06)
+
+Gold's Engine pauses the youngest resident when an older one cannot obtain the KV pages of its next
+unit, and resumes paused requests oldest first. Qwen4Exp used to reserve a request's whole extent
+(prompt plus every output token) at binding, so no unit ever ran short and nothing was paused: a
+request whose extent did not fit waited at the queue head while the residents' extents were mostly
+unwritten.
+
+**Pages per round.**
+
+- A binding reserves the prompt plus one round: `round_positions = max(W, k + 1) + 1` positions
+  past the frontier, W the widest verification and k the MTP drafter's steps (the cells a round
+  writes), within the extent.
+- `reserve_units` grows a decode or control unit's lane to its frontier plus one round before the
+  round: it evicts unpinned cached blocks, grows the elastic pool (§19.3.11), reserves and maps the
+  missing pages at the end of the lane's block table. A shortage goes back to the Engine, which
+  reclaims and then pauses the youngest resident.
+- The extent check at admission is unchanged (`feasible`: the extent fits the pool on its own), so
+  the oldest resident can always grow to its extent once the younger ones are paused.
+- The MTP drafter clamps its cells to the lane's mapped positions: the shared prefix pages plus the
+  private ones (`prefix.page_base + pages`). Before this change the clamp counted only the private
+  pages, which with a long reused prefix put every draft cell on one position inside a shared cached
+  page (fixed separately on the items branch).
+
+**Pause.** `start_pause` runs at a committed boundary (no round or transaction open).
+
+- It publishes the lane exactly as a consistent abort does (`prefix_finish`): the pending MTP cell,
+  the remaining blocks, the state at the frontier as a Host-born snapshot, and write-through. A
+  request the prefix cache does not publish (`allow_prefix_reuse` off, a non-reusable prompt)
+  publishes nothing.
+- Inside a layer walk's span the layers are at different positions: the walk is abandoned and
+  nothing past the span's start is published (its taps were).
+- The ResumeState keeps the ledger (prompt and committed output), the frontier, and the request's
+  measurements and decisions (timings, speculative statistics, the drafter's acceptance policy,
+  `/v1/decide` draws, cache and n-gram counters). The model state is not owned: the cache entry
+  stays evictable, so the Engine sees no snapshot handle and records the Replay route.
+
+**Resume.**
+
+- A request paused inside its prompt binds its prompt again; the selection finds the state the pause
+  published (or an earlier tap) and prefill continues.
+- A request paused after its first token binds its ledger: lookup keys are the prompt's, chained
+  over the output blocks as publication chains them (`ledger_prompt`), and the index may return a
+  snapshot at the paused frontier itself. The deepest affordable one restores; prefill calls
+  (no taps) replay the ledger from there to the frontier with sampling suppressed, after which the
+  lane decodes from the ledger's next input. When the restored state is the frontier, nothing
+  replays and the Engine counts a snapshot restore.
+- A Vision item inside the replayed range is encoded again (the window is planned from the restore
+  frontier); penalty counts are rebuilt from the committed output; the prompt readout is not
+  repeated.
+
+**Bits.** A restore from the published state is exact: the state image and the blocks are those the
+lane held, so greedy output equals an unpaused run. A replay recomputes the replayed positions with
+prefill arithmetic, which may round differently from the decode rounds that produced them, so the
+tokens after a replay may differ from an unpaused run (as on Qwen3.5).
+
+**Test.** `ninfer_qwen4_exp_preemption_real_test` (two lanes, a 48-page pool, prompts of 1,024
+tokens and 1,200 outputs each, plain and MTP): the exact path's outputs equal the solo runs; the
+replay path keeps every token committed before the pause, completes at full length and reports
+the tokens that still equal the solo run.
+
+**Measured** (RTX 5090, dense8m, int8 KV, 2026-10-06): the older lane ran short at frontier 1,596-1,599
+with the 50-page pool full and the younger one was paused once in every scenario.
+
+- Exact path, plain and MTP: one snapshot restore; both requests' greedy outputs equal their solo runs
+  (1,200 of 1,200 tokens).
+- Replay path: one replay restore of ~1,600 tokens; plain decode still equalled its solo run (1,200
+  of 1,200), MTP diverged after 572 tokens (replay arithmetic), and both completed at full length.
+- `/v1/decide` and prefix-cache real tests pass. The decide test's prefetch scenario needed a longer
+  holding prompt (3,300 tokens): a binding no longer holds a request's whole extent, so the waiting
+  head would have bound at once.
+- Speed against the Gold base (ABBA): tg512 110.73 → 110.70 tok/s, pp4096 2.470 → 2.459 s,
+  MTP tg512 140.83 → 140.33 tok/s (-0.35 %, both pairs).
+
+**Faults the tests found.** (1) A paused lane's pages become cached blocks pinned by their in-flight
+Host writes; the older lane then found nothing to evict and no resident to pause, and the Engine
+failed ("oldest resident cannot obtain its legal unit"). `reserve_units` and `hybrid_reclaim` now drain
+pending transfers before reporting a shortage. (2) A resume whose cached state is the paused frontier
+itself has no suffix to plan; it decodes at once.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
@@ -7878,12 +7958,13 @@ compile on their own, because the new contract changed the Program surface under
 | `plan_request(PreparedPrompt&&)` | Keeps the prepared prompt on the plan; compiles a token constraint and checks readout tokens against the public token domain. |
 | `hybrid_sources` | Offers two sources: the prefix cache's affordable snapshot, chosen without a lane, then the root. Returns none while the request should wait for a prefilling sibling's snapshot (coalescing, below). |
 | `hybrid_prefetch` | Copies a blocked FIFO head's Host-only blocks into free and Host-backed Device pages while it waits. |
-| `start_binding` | Re-selects the source for the actual lane, crediting a lane-resident snapshot. A changed choice returns no reservation and no shortage, so the Engine falls back to the root. Otherwise it makes room and reserves the whole KV extent; a shortage is reported as `main_kv_pages`. Vision is reserved after the KV. |
+| `start_binding` | Re-selects the source for the actual lane, crediting a lane-resident snapshot. A changed choice returns no reservation and no shortage, so the Engine falls back to the root. Otherwise it makes room and reserves the pages of the prompt plus one round (§19.3.13); a shortage is reported as `main_kv_pages`. Vision is reserved after the KV. A resumed request binds its ledger (§19.3.13). |
 | Begin summary | `{prompt_tokens, reused_tokens, reuse_path}`. The reuse path is `HybridSnapshot`, `HybridEndpoint` or `Root`. |
 | `poll_context` | Runs Vision steps, then publishes the bound sequence. On cancellation it releases the binding. |
-| `reserve_units` | Always reserved: the binding already holds the whole extent. |
-| `start_pause` | Returns false: a Qwen4Exp request is never paused. |
-| Replay, checkpoints, capture | Stubs that are never reached (`advance_replay` throws). |
+| `reserve_units` | Grows a decode or control unit's lane to its next round, evicting cached blocks and growing the elastic pool first; a shortage is `main_kv_pages` (§19.3.13). |
+| `start_pause` | Publishes the lane's state at its frontier to the prefix cache and releases the lane (§19.3.13). |
+| `advance_replay` | One prefill call of the resumed ledger, without sampling (§19.3.13). |
+| Checkpoints, capture | Stubs that are never reached: the prefix cache holds every snapshot. |
 
 The ops' new `DeviceExecutionView` parameter is passed as `execution_view().on_stream(s)`. The
 recurrent update and the replay record keep a bare stream. Gold's renames (`host_capacity_bytes`,
