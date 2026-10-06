@@ -860,13 +860,21 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
     out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
 }
 
-// Splits per (column, KV head): one wave of the decode kernel's CTAs (one 512-thread CTA per SM),
-// at most 48 (a split keeps at least ~43 of a column's 2,051 tokens; more partials cost more merge),
-// and at least 4 when a call is split at all (a CTA's serial walk stays near 8 tiles). A call that
-// fills half the SMs unsplit takes the prompt route. Measured against the earlier 340-CTA / 33-split
-// rule: equal at W = 1-2, 5-18 % faster at W = 3-8, 42-73 % at 43-85 columns (now the prompt route;
-// design §19.3.15).
-int attention_splits(int columns, int kv_heads) {
+// Calls of at most this many columns: decode, one row's verification, up to eight plain lanes.
+constexpr int kSmallCallColumns = 8;
+
+// Splits per (column, KV head).
+// - Calls of at most kSmallCallColumns columns: one 64-token tile per split of a column's attended
+//   bound (33 at budget 2048, ratio 4), whatever the width. A column's bits then do not depend on how
+//   many columns share the call, so concurrent sequences decode as they do alone (the preemption and
+//   prefix-cache resumes rely on it; test_qsa checks it). Against one wave per call (the rule below)
+//   this costs ~2 us at W = 5 and ~10 us at W = 8 per call, under 0.2 % of a round; W = 1-2 are equal.
+// - Wider calls: one wave of the decode kernel's CTAs (one 512-thread CTA per SM), at most 48 and at
+//   least 4 once split. A call that fills half the SMs unsplit takes the prompt route. Against the
+//   earlier 340-CTA / 33-split rule: 42-73 % faster at 43-85 columns (design §19.3.15).
+int attention_splits(int columns, const QsaGeometry& g) {
+    const int attended = g.budget + g.ratio - 1;
+    if (columns <= kSmallCallColumns) { return (attended + kTokenTile - 1) / kTokenTile; }
     static const int sms = [] {
         int device = 0, count = 0;
         if (cudaGetDevice(&device) != cudaSuccess ||
@@ -875,7 +883,7 @@ int attention_splits(int columns, int kv_heads) {
         }
         return count;
     }();
-    const int splits = std::clamp(sms / std::max(1, columns * kv_heads), 1, 48);
+    const int splits = std::clamp(sms / (columns * g.kv_heads), 1, 48);
     return splits == 1 ? 1 : std::max(splits, 4);
 }
 
@@ -905,7 +913,7 @@ Workspace carve(void* base, const QsaGeometry& g, int columns, int max_context, 
     const std::size_t selected = align(sizeof(std::int32_t) * top_blocks * static_cast<std::size_t>(columns));
     const std::size_t counts   = align(sizeof(std::int32_t) * static_cast<std::size_t>(columns));
     const std::size_t select   = align(detail::qsa_select_scratch_bytes(g, columns, max_context));
-    const int splits           = attention_splits(columns, g.kv_heads);
+    const int splits           = attention_splits(columns, g);
     const std::size_t partial  = splits > 1 ? align(sizeof(float) * static_cast<std::size_t>(columns) * splits *
                                                     g.heads * (kHeadDim + 2))
                                             : 0;
@@ -1025,10 +1033,14 @@ void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Ten
 std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry, std::int32_t columns,
                                           std::int32_t max_context, KvCacheStorage storage) {
     require_geometry(geometry);
-    std::size_t bytes = 0;
-    // Bounded by the staging a windowed call of this width would need.
+    // Bounded by the staging a windowed call of this width would need. Covers every narrower call
+    // too: a call of kSmallCallColumns columns keeps more split partials than wider calls up to ~21
+    // columns, and every other term grows with the width.
+    std::size_t bytes = 0, small = 0;
     (void)carve(nullptr, geometry, columns, max_context, staged_call(storage, true, columns), bytes);
-    return bytes;
+    const int narrow = std::min<int>(columns, kSmallCallColumns);
+    (void)carve(nullptr, geometry, narrow, max_context, staged_call(storage, true, narrow), small);
+    return std::max(bytes, small);
 }
 
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
@@ -1106,7 +1118,7 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
                        {ws.selected, ws.counts}, stream, layer.spaces);
     // Calls this kernel would run unsplit take the Tensor Core prompt route (qsa_prompt.h): the same
     // width-invariance class, so a column's bits still do not depend on its call's width there.
-    const int splits = attention_splits(columns, geometry.kv_heads);
+    const int splits = attention_splits(columns, geometry);
     if (splits == 1 && detail::qsa_prompt_supported(layer, geometry)) {
         detail::qsa_prompt_attention(q, layer, batch, geometry, scale, ws.selected, ws.counts, out, stream,
                                      vq_args);

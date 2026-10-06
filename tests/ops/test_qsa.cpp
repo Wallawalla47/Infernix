@@ -1189,6 +1189,35 @@ void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_
         }
         expect(same, tag + ": a 100-column call equals the same columns of the wider call bit for bit");
     }
+    // Width invariance of decode and verification calls (at most 8 columns): the last row alone gives
+    // the bits it gives beside the other rows, so concurrent sequences decode as they do alone (the
+    // preemption and prefix-cache resumes rely on it).
+    if (rows > 1 && columns <= 8) {
+        const int r     = rows - 1;
+        const int first = r * width;
+        const ops::QsaBatch sub{.block_tables = Tensor(dtables.p, DType::I32, {pages_per_row, rows}),
+                                .table_rows   = Tensor(static_cast<std::int32_t*>(drows.p) + r, DType::I32, {1}),
+                                .positions = Tensor(static_cast<std::int32_t*>(dpos.p) + first, DType::I32, {width}),
+                                .tail_slots = Tensor(static_cast<std::int32_t*>(dslots.p) + r, DType::I32, {1}),
+                                .batch      = 1,
+                                .width      = width};
+        DeviceBuffer dsub(static_cast<std::size_t>(kD) * kHeads * width * 2);
+        Tensor sub_out(dsub.p, DType::BF16, {kD, kHeads, width});
+        ops::qsa_attention(Tensor(static_cast<std::uint16_t*>(dq.p) + static_cast<std::size_t>(first) * kD * kHeads,
+                                  DType::BF16, {kD, kHeads, width}),
+                           Tensor(static_cast<std::uint16_t*>(diq.p) +
+                                      static_cast<std::size_t>(first) * kDi * kIndexHeads,
+                                  DType::BF16, {kDi, kIndexHeads, width}),
+                           layer, sub, kGeometry, 1.0F / 16.0F, max_context, workspace.p, workspace_bytes, sub_out,
+                           nullptr);
+        synchronize("attention single row");
+        const auto part = t::from_device_bf16(dsub, static_cast<std::size_t>(kD) * kHeads * width);
+        bool same = true;
+        for (std::size_t i = 0; i < part.size() && same; ++i) {
+            same = part[i] == got[static_cast<std::size_t>(first) * kD * kHeads + i];
+        }
+        expect(same, tag + ": the last row alone equals its columns of the batched call bit for bit");
+    }
 
     // Page spaces (design §19.3.11): the same KV with every page whose id is 1 mod 3 in a mapped host
     // plane and every page 2 mod 3 in a separate device ("lent") plane, their pool copies zeroed so
@@ -1336,6 +1365,9 @@ int main() {
         // narrowest call. Every column of a prompt-route call must also equal, bit for bit, the
         // same column computed in a call of another width of the class (checked below).
         const AttentionCase cases[] = {{"decode W=1 B=2", 1, {2050, 2051}},
+                                       {"decode W=1 B=4", 1, {2600, 3100, 4093, 2051}},
+                                       {"decode W=1 B=8", 1, {2051, 2300, 2700, 3001, 3500, 4000, 4500, 5003}},
+                                       {"verify W=4 B=2", 4, {2500, 3700}},
                                        {"verify W=5 B=2", 5, {3001, 4093}},
                                        {"prefill W=192 B=1", 192, {1900}},
                                        {"prefill W=40 B=1", 40, {5000}},
