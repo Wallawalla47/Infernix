@@ -185,15 +185,17 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.prefix_taps.max_new_taps   = cache.hybrid.max_new_taps.value();
         program_options.prefix_taps.ladder_tokens  = cache.hybrid.tap_ladder_tokens.value();
         program_options.prefix_taps.min_gap_tokens = cache.hybrid.tap_min_gap_tokens.value();
-        // Fitted 2026-10-05 (RTX 5090, INT8 KV; design §19.4): 1.67 s per layer-walk span, 0.16 s per
-        // further call, 22 us per token and 1.06 ns per attention pair, within 5 % from 4K to 128K.
+        // Fitted 2026-10-05 (RTX 5090 at PCIe 5.0 x8, INT8 KV; design §19.4): 1.67 s per layer-walk
+        // span, 0.16 s per further call, 22 us per token and 1.06 ns per attention pair, within 5 %
+        // from 4K to 128K. The span is one pass of the experts over the link: the Program rescales
+        // it, and the restore rate, to the link it measures at startup.
         program_options.prefix_cost.chunk_seconds          = 0.1645;
         program_options.prefix_cost.chunk_tokens           = chunk;
         program_options.prefix_cost.token_seconds          = 2.23e-5;
         program_options.prefix_cost.attention_pair_seconds = 1.06e-9;
         program_options.prefix_cost.call_route_fraction    = 10.0 / 512.0;
         program_options.prefix_span_seconds                = 1.67;
-        program_options.prefix_cost.h2d_bytes_per_second   = 26.0e9;
+        program_options.prefix_cost.h2d_bytes_per_second   = 27.5e9; // the reference link, until measured
         program_options.prefix_cost.transfer_batch_seconds = 20.0e-6;
         program_options.prefix_save                        = cache.hybrid.persistent_save;
         // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait is

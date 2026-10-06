@@ -152,7 +152,7 @@ struct MoeExpertSource {
     // Optional streamed records (design §19.3.8 F2): prefetched (device [E]) gives, for a
     // non-resident expert, the slot whose record the caller has already copied to prefetch_base +
     // slot * record_stride (ordered before this call), or -1. Such an expert is read there like a
-    // resident one: never staged and never CPU-served. Calls with CPU-served misses take none.
+    // resident one: never staged and never CPU-served (the CPU takes misses the stream left out).
     const std::int32_t* prefetched     = nullptr;
     const std::uint8_t* prefetch_base  = nullptr;
 };

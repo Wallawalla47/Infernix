@@ -12,6 +12,7 @@
 #include "ninfer/ops/ple.h"
 #include "ninfer/ops/projection_fp32.h"
 #include "ninfer/ops/argmax.h"
+#include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ninfer/ops/cast.h"
 #include "ninfer/ops/resident_moe.h"
 #include "ninfer/ops/rmsnorm.h"
@@ -82,6 +83,17 @@ Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceA
         experts_.frames.size() != config_.num_hidden_layers) {
         throw std::invalid_argument("Qwen4Exp forward: state, KV or expert residency is incomplete");
     }
+    if (experts_.split != nullptr) {
+        const auto E   = static_cast<std::size_t>(config_.moe.experts);
+        split_offsets_ = PinnedHostBuffer((E + 1) * sizeof(std::int32_t));
+        split_columns_.assign(E, 0);
+        split_cpu_.assign(E, 0);
+        CUDA_CHECK(cudaEventCreateWithFlags(&split_ready_, cudaEventDisableTiming | cudaEventBlockingSync));
+    }
+}
+
+Forward::~Forward() {
+    if (split_ready_ != nullptr) { (void)cudaEventDestroy(split_ready_); }
 }
 
 std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context) {
@@ -562,6 +574,31 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                             experts_.stream->active()
                                         ? experts_.stream
                                         : nullptr;
+    if (streaming != nullptr && streaming->gated()) {
+        // A gated call (design §19.3.12): the layer's routing decides which experts the link copies
+        // and which the CPU serves. The CPU takes exactly the experts the stream leaves out: every
+        // narrow miss is offered (no PCIe share), capped at the policy's count.
+        CUDA_CHECK(cudaMemcpyAsync(split_offsets_.data(), dispatch.offsets, (static_cast<std::size_t>(E) + 1) * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaEventRecord(split_ready_, s));
+        CUDA_CHECK(cudaEventSynchronize(split_ready_));
+        const auto* offsets = static_cast<const std::int32_t*>(split_offsets_.data());
+        for (std::int32_t e = 0; e < E; ++e) { split_columns_[static_cast<std::size_t>(e)] = offsets[e + 1] - offsets[e]; }
+        std::fill(split_cpu_.begin(), split_cpu_.end(), std::uint8_t{0});
+        const std::uint32_t cpu = batch->split && experts_.split != nullptr && source.cpu.max_jobs > 0
+                                      ? experts_.split->choose(layer, split_columns_, split_cpu_)
+                                      : 0U;
+        split_streamed_experts_ += streaming->plan_layer(layer, split_columns_, split_cpu_);
+        split_cpu_experts_ += cpu;
+        if (cpu > 0) {
+            source.cpu.max_columns  = ops::offloaded_moe::kMaxCpuCallColumns;
+            source.cpu.pcie_divisor = 0;
+            source.cpu.wide_from    = 1;
+            source.cpu.wide_jobs    = static_cast<std::int32_t>(cpu);
+        } else {
+            source.cpu = ops::MoeCpuChannel{};
+        }
+    }
     if (streaming != nullptr) {
         streaming->before_experts(layer, s);
         source.prefetched    = streaming->slots(layer);

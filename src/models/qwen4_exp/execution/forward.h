@@ -43,6 +43,17 @@ struct ForwardKV {
     Tensor block_tables;                 // I32 [pages per row, rows]
 };
 
+// The CPU's share of a gated prefill call's experts (design §19.3.12): from the call's columns per
+// expert in one layer, marks in `cpu` the experts the CPU serves, which must be non-resident and
+// have at most ops::offloaded_moe::kMaxCpuColumns columns (the narrow route, placement-invariant),
+// and returns their number. Owned by the Program, which knows the link and the CPU's rates.
+class CpuSplitPolicy {
+public:
+    virtual ~CpuSplitPolicy() = default;
+    virtual std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+                                 std::span<std::uint8_t> cpu) const = 0;
+};
+
 // Where each layer's routed experts live: device frames for resident experts, the pinned host
 // bank otherwise.
 struct ForwardExperts {
@@ -71,6 +82,8 @@ struct ForwardExperts {
     // Prefill chunks read the experts this stream copied ahead while it is active (design §19.3.8
     // F2; owned by the Program, which starts it per chunk).
     ExpertStream* stream = nullptr;
+    // A gated stream's split of each layer's experts between the link and the CPU (§19.3.12).
+    const CpuSplitPolicy* split = nullptr;
 };
 
 // A speculative verification call (design §11): `batch` sequences of `width` >= 2 positions. It
@@ -150,6 +163,9 @@ struct ForwardBatch {
     // release_stream on the span's last chunk only (every chunk reads the same layer copies).
     bool stream         = false;
     bool release_stream = true;
+    // With a gated stream (ExpertStream::gated): each layer's routing decides, through
+    // ForwardExperts::split, which experts the stream copies and which the CPU serves.
+    bool split          = false;
 };
 
 // One call of the MTP drafter (design §11.2). Cell c of a sequence pairs a residual at position c
@@ -195,6 +211,9 @@ class Forward {
 public:
     Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
             ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context);
+    ~Forward();
+    Forward(const Forward&)            = delete;
+    Forward& operator=(const Forward&) = delete;
 
     // FP32 logits [V, n] of batch.logit_columns.
     void run(const ForwardBatch& batch, Tensor& logits, const ForwardTap* tap = nullptr);
@@ -257,6 +276,21 @@ private:
     ForwardExperts experts_;
     std::int32_t max_context_;
     bool eager_chunk_ = false;
+    // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
+    // event that lands them, and the per-expert columns and CPU marks derived from them.
+    PinnedHostBuffer split_offsets_{1};
+    cudaEvent_t split_ready_ = nullptr;
+    std::vector<std::int32_t> split_columns_;
+    std::vector<std::uint8_t> split_cpu_;
+    // The CPU-served and streamed experts of gated calls (diagnostics).
+    std::uint64_t split_cpu_experts_ = 0, split_streamed_experts_ = 0;
+
+public:
+    struct SplitStats {
+        std::uint64_t cpu_experts      = 0;
+        std::uint64_t streamed_experts = 0;
+    };
+    [[nodiscard]] SplitStats split_stats() const noexcept { return {split_cpu_experts_, split_streamed_experts_}; }
 };
 
 } // namespace ninfer::models::qwen4_exp::execution
