@@ -382,12 +382,12 @@ __device__ __forceinline__ KVCacheVqRowTarget kv_cache_append_vq_target(
     return target;
 }
 
-// Shifts the per-batch-row operands of an append to batch row `batch`.
-template <typename Geometry, typename Metadata, bool MultiBatch>
-__device__ __forceinline__ void kv_cache_append_vq_select_batch(int batch, Metadata& metadata,
-                                                                const __nv_bfloat16*& k,
-                                                                const __nv_bfloat16*& v,
-                                                                const std::int32_t*& positions,
+// Shifts the per-batch-row operands of an append to batch row `batch`. The pointer types are
+// deduced so they keep the kernel parameters' __restrict__ (GCC binds no plain pointer reference
+// to a restrict-qualified pointer).
+template <typename Geometry, typename Metadata, bool MultiBatch, typename Values, typename Positions>
+__device__ __forceinline__ void kv_cache_append_vq_select_batch(int batch, Metadata& metadata, Values& k,
+                                                                Values& v, Positions& positions,
                                                                 std::int32_t width) {
     if constexpr (MultiBatch) {
         metadata.table_rows += batch;
