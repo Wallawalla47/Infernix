@@ -8335,6 +8335,24 @@ from the committed window.
   draft acceptance falls from 2.31 to 2.24 tokens per round, with 228 rounds instead of 222.
   Measured on the CLI code prompt, whose output is identical in both builds: MTP decode +0.4 %
   (int8) and +0.8 % (bf16).
+- **Correction: the decode split rule broke width invariance and is reverted for narrow calls.**
+  - Under the wave rule, a column's split count depended on its call's width. A sequence decoding
+    beside others (W = 2: 42 splits) rounded differently from the same sequence alone (W = 1: 48).
+  - The Qwen4Exp preemption and prefix-cache real tests caught it. "A equals its solo run" failed,
+    with 2 of 1,200 tokens equal after the first difference. These tests had not run before
+    `a47578934` landed on Gold.
+  - **Now:** calls of at most 8 columns split by one 64-token tile per split, 33 for every width,
+    as before round 1 for W ≤ 5. Wider calls keep the wave rule. `test_qsa` now checks that the
+    last row of a 2-, 4- and 8-row decode call, and of a 2-row verification call, gives the same bits
+    when called alone. The rule it replaces fails that check.
+  - `qsa_attention_workspace_bytes` covers every narrower call, because an 8-column call keeps
+    more partials than wider calls up to ~21 columns.
+  - **Cost against the wave rule** (op bench, int8 8K): W = 1-2 equal, W = 5 +2.4 µs, W = 8
+    +11 µs per call. That is under 0.2 % of a round at 12 QSA layers.
+  - **Round 1's narrow-call claims no longer apply.** The 5-18 % at W = 3-8, and the W = 1 rounding
+    change with its chunk-1 quality numbers, are gone. Decode at W ≤ 5 is again the pre-round-1
+    partition. W = 6-8 used 28-21 splits before and now use 33, which also makes C = 6-8 plain
+    decode invariant.
 
 ### 19.3.16 Decode misses between the CPU and the link (2026-10-06)
 
