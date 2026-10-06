@@ -6268,6 +6268,28 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
        scoring (~2.2× the FP32 FMA floor of 512 FMAs per block and column), ~0.35 ms per layer at
        8K and ~3 ms at 128K (Q0 at chunk 1024: 2.75 / 40.8 ms per 1,024 columns); a 128K prompt's
        selection ~0.6 s instead of 31.6 s.
+   - **Q3: prompt rows on the FP32 pipes (2026-10-06, item 2).** The 128K profile put QSA
+     scoring at 73 ms per late 4,096-token call (13 layers), about five times its FP32 FMA
+     floor: the reduce-scatter's shuffles and selects cost more issue slots than the FMAs.
+     - `qsa_score_wide_kernel` serves rows of at least 32 columns. A CTA scores a 16-column row
+       tile against key tiles of 64 blocks staged as FP32 in shared memory (rows of 32 float4
+       lanes plus one pad, conflict-free; 99 KiB per block on sm_120 leaves room for one key
+       buffer, so the next tile travels in registers). A thread owns one column's four head dots
+       against four blocks: it forms each dot's 32 lane partials itself (the j chain from 0, as
+       lane l would) and adds them in the butterfly's tree, leaves in bit-reversed lane order so
+       that a six-entry stack per dot holds every open subtree. FP32 addition is commutative, so
+       every sum is bitwise the butterfly's. 188 registers, no local memory.
+     - Bits: `ninfer_qsa_select_test` compares scores and ids bit for bit with the original
+       kernel on wide cases (partial tiles, two rows, zero-heavy and tied keys, 1 and 3 index
+       heads, ratio 8, a 4,096-column chunk at 27K blocks); all pass. The ~40K prompt's greedy
+       ids are identical with and without it.
+     - Speed, one 4,096-column selection (score and select): 1.119 → 1.006 ms at 8K (1.11x),
+       2.39 → 2.08 ms at 32K (1.15x), 6.50 → 5.35 ms at 110K (1.22x), 14.04 → 11.44 ms at 250K
+       (1.23x). pp131072 (ABBA): 6,935 / 6,948 → 7,020 / 7,012 tok/s (+1.1 %).
+     - The gain is a third of what the scoring alone predicted: the select kernel (a histogram
+       pass and a filter pass over the scores, ~1.5 µs per prompt token at 110K) now dominates.
+       Fusing the bin histogram into the score kernel would save one pass, but per-column
+       histograms (16 × 2,048 bins) do not fit beside the staged tiles; not done.
 3. **Warm start** (§19.3.5 S4b).
    - Save the LFRU state; at load, seed it and bulk-fill the frames (26.1 GB, ~0.95 s).
      `LfruPolicy::seed` has no caller today.
@@ -7520,6 +7542,79 @@ and ~736 MiB that `cudaMemGetInfo` reports as unavailable.
 
 ---
 
+### 19.3.9 Host time between decode rounds (2026-10-05)
+
+**Measured** (n-gram S0 phase timers, warm tg512 plain, per round of ~11.6 ms, dev before S3/S4):
+the GPU idles ~0.45 ms per plain round while the host works: ~0.21 ms in `settle_round` (the
+round's `after_round`: route statistics, the LFRU policy, landing adoption, table upload,
+promotions) after the commit's GPU work, and ~0.25 ms between staging and the graph launch
+(io upload, `before_round`, `cudaGraphLaunch`). That is ~4 % of a plain round; MTP rounds pay
+the same per round (~1-2 % of a 22-28 ms round). n-gram reads add to the second part on cold
+text (S2/S4b move them behind the launch).
+
+**Step 1, done: the LFRU victim search.** `LfruPolicy::select_victims` computed every resident's
+score (~9,000, a division each, through scattered `count_`/`last_` loads), built a (score, key)
+pair per resident and partially sorted them, each time it needed a victim; the budgeted steady
+state asks for one victim per admitted expert, in many layers per round. Most of the cost was the
+scattered score computation, not the sort: a one-victim scan alone measured the same. The policy now
+keeps each resident's count and last use as doubles in arrays parallel to the resident list (exact:
+both are integers below 2^53, so every score is bit-identical to `score()`), computes all scores in
+one contiguous loop, marks protected residents, and takes the minimum score and then the lowest key
+holding it (one victim) or partially sorts as before (several). Decisions are unchanged: the
+conformance test against the replay tool (1,200 groups, 0 mismatching steps) and a single-victim
+oracle in the budgeted test pass. A budgeted step at 9,000 residents (host test, 2,000 steps)
+went from 22.8 to 10.9 us. Engine effect (Gold port, `fn/rigs/short/combo.bat`, ABBA, the build
+before and after): tg512 110.53 / 110.67 → 110.57 / 110.66 tok/s, MTP tg512 140.65 / 140.80 →
+140.81 / 140.61, code MTP decode 134.6 / 134.7 → 134.6 / 135.2: neutral within noise (the estimate
+was ~0.1 ms per round, ~1 % of a plain round). Kept: decisions are identical and the host step is
+half as long.
+
+**Step 2, proposed: pipelined decode.** The next round's input token is on the device when the
+round ends; only the host's sync, commit and staging stand between rounds. Launching round r + 1
+before the host has committed round r removes the whole gap. Design sketch:
+- The decode graph reads its input ids from the sampled-token buffer (a device copy into the io
+  ids at the top of the graph), so round r + 1 can be enqueued right behind round r's sampling.
+- n-gram rows of round r + 1 depend on token r: they go behind the S2/S4b gate, read once the host
+  has token r.
+- `after_round(r)` runs on the host while round r + 1 runs: promotions and evictions it decides are
+  published one round later. The route log needs two host buffers (round r + 1's download must not
+  overwrite round r's before it is read), and S4 landing reservations must not be released by
+  round r + 1's `before_round` before round r adopts them.
+- A round launched speculatively behind a stop (EOS, a stop string, cancellation) must be
+  discarded: its KV cells and recurrent state writes are past the committed frontier, so the lane's
+  state must not be published or captured (prefix cache, state image) until the discarded round has
+  finished and the state has been restored or the lane released.
+- The runtime contract changes: today the worker alternates `decode` and `commit`; a pipelined
+  Program needs `decode(r + 1)` admissible before `commit(r)` returns, with the scheduler's lane
+  changes (admissions, finishes) applied only at a drained boundary.
+- Expected: ~0.4 ms per plain round (+3-4 % plain decode), ~0.3-0.4 ms per MTP round (+1-2 %).
+  MTP rounds also wait on the drafts' host round trip (n-gram S3, device-assembled verification).
+- Not started: it changes the runtime's execution contract and the S4/VRAM-resize boundary rules,
+  so it needs its own reviewed plan before code.
+
+**Option B, built and measured, not kept (2026-10-05/06).** Within the existing contract, one-row
+MTP rounds were pipelined in two parts: B1 chained the drafter into the verification on the device
+(the host no longer waits for the drafts before launching the round), and B2 committed a round
+ahead into a spare recurrent-state slot (a lane-to-slot indirection) with the next drafter launched
+behind it (~420 lines in `program_impl.h`).
+
+- Correct: greedy ids identical with B off and on (code, the long prompt through a layer walk, a
+  37-token limit, a stop string, a thinking budget), the prefix-cache real test 27/27 in both arms,
+  and serve at C = 2 identical to C = 1 (8/8).
+- Speed on the Gold port (`fn/rigs/pipe/pipegold.bat`, one binary with temporary toggles):
+
+  | | off | B1 | B1 + B2 |
+  |---|---:|---:|---:|
+  | Code MTP decode, CLI (3 runs each) | 135.47 | 135.00 | 135.10 |
+  | tg512 MTP, bench (2 x 3 runs each) | 140.36 | 140.39 | 141.83 |
+
+  On dev the same split had been tg512 +1.4 % and code decode neutral.
+- B1 gains nothing (likely because the drafter is short enough to finish while the host stages the
+  round; not profiled). B2
+  gains 1 % on the synthetic tg512 and loses 0.3 % on the real code decode (single-run cases lost
+  1-1.5 %), for ~420 lines and a state-slot indirection in every path. Not kept; the branch
+  `claude/fn-pipe-gold` holds it (with the drafter clamp fix and the layer walk's slot use).
+
 ### 19.3.11 Long-context KV in host RAM (§9.6 as built; VRAM item 3, 2026-10-05)
 
 **Why.** The deployed configurations run `--max-context` 220K-500K at concurrency 2-4. At 220K × 2
@@ -7642,6 +7737,131 @@ elastic pool does the same job with no kernel change:
 - **K5:** prefix-cache publish and restore.
 - **K6:** measurement — frames gained, decode at 4K/64K/128K/220K context against the device-only
   build, and the prefill rate.
+
+### 19.3.12 Short prompts: the link, and a CPU share of the experts (2026-10-06)
+
+**Diagnosis** (Gold port, `ninfer_bench`, chunk 4096, INT8 KV, `fn/rigs/short`).
+
+- Prompts of 512, 2,048, 4,096 and 16,384 tokens prefill in 2.57, 2.37, 2.28 and 2.48 s. The cost is
+  nearly constant across lengths.
+- In nsys, the measured pp4096 call takes 2,563 ms, of which 2,556 ms are H2D copies. Its 411 ms of
+  kernels are hidden under them.
+- pp16384 is four walk steps of about 615 ms each, every one a copy of 12 layers' experts. Its
+  ~1.7 s of kernels are again hidden.
+- A wide call routes nearly every expert, so the stream copies one pass of the experts (up to
+  63.3 GiB, 24,576 records) at 27.4-27.6 GB/s. That is the rate of PCIe 5.0 x8: this machine gives
+  8 of the CPU's lanes to a network card.
+- Every prompt up to the 64K walk span therefore pays about 2.3 s, minus what the expert cache holds.
+
+**Requirement: scale with the link.**
+
+- Another machine may run x16, about twice the rate, so nothing may be tuned to x8.
+- The Program measures the host-to-device rate at startup, by copying expert records from the
+  pinned banks into the miss staging slots before any call uses them: best of three, 64 records,
+  a few tens of milliseconds (`core/link_probe`; `ProgramOptions::link_bytes_per_second` fixes it
+  in tests). The diagnostic line `host-to-device link: ...` reports it and the choices below.
+- It rescales the link-bound costs from the reference rate at which they were fitted (27.5 GB/s): the
+  prefix cost's restore rate and the walk-span cost.
+- The decode miss split keeps 1 / d of a call's misses on the link, with
+  d = max(2, round(1 + 2 × 27.5 GB/s / link)): 3 at x8, where 3 measured fastest, and 2 at x16
+  (`cpu_pcie_divisor = 0`, the default, derives it; a positive value fixes it).
+- Decode promotes into the expert cache every `4 × 27.5 GB/s / link` tokens once the frames are full
+  (4 at x8, where it measured fastest; 2 at x16). A promotion moves the bytes of serving its expert
+  once, and on a faster link the rounds leave the link idler, so promotions cost less wall time. The
+  x16 value follows from that argument and is not measured.
+- The CPU split below takes the measured rate as an input, and so does its width limit.
+- Not link-dependent: the prefill promotions per layer (the stream has copied the experts already)
+  and the walk's span (bounded by the lent workspace).
+
+**The CPU's capacity** (`tools/flash_next_probe/host_probe`, i9-13900K, AVX-VNNI, 24 workers):
+
+| | Rate |
+|---|---|
+| DRAM | 82-85 GB/s |
+| W4A4 expert, 1-4 columns, cold records | ~30,000 experts/s (DRAM-bound) |
+| 8 columns, cold | ~19,000-21,000 experts/s (compute-bound) |
+| 8 columns, warm | ~150,000 expert-columns/s |
+| The link, for comparison | ~10,000 records/s at x8, ~20,000 at x16 |
+
+An expert with few columns is cheaper to compute on the CPU than to move.
+
+**Placement invariance limits the split to n <= 8.** Experts with at most 8 columns in a call use the
+canonical arithmetic (§16.2), which is bit-identical on the CPU and the GPU. Wider ones always take
+the GPU's wide route. So the CPU may serve only experts with n <= 8 columns. The split then changes
+no output, and greedy output cannot depend on the link or the CPU.
+
+**Design: a gated stream for narrow single-call prompts (256 columns up to the width limit).**
+
+1. After `moe_dispatch`, a small kernel publishes the layer's per-expert column counts to mapped
+   memory, and the host waits for them (tens of microseconds).
+2. The host chooses the CPU set. It takes non-resident experts with n <= 8, fewest columns first,
+   while the CPU's predicted time stays below the link's time for the rest. Rates come from the
+   startup link probe and a CPU rate that starts from the probe values above and follows the
+   service times observed.
+3. The stream copies only the GPU set. The CPU set stays misses, which `cpu_plan_kernel` hands to
+   the CPU miss service, fewest columns first.
+4. The miss service's limits grow to the call width: 4,096 columns, 512 jobs, and the mapped x
+   buffer sized to match.
+5. Copies start after the layer's router instead of two layers ahead. The link idles for the
+   previous layer's MoE compute plus this layer's attention: about 2 ms against 20+ ms of copies
+   at 512 tokens.
+6. Wider calls keep the blind stream: the split takes calls of at most `cpu_split_columns` (1,536)
+   × 27.5 GB/s / link columns (1,536 at x8, 768 at x16). The bytes gating saves cost less on a
+   faster link, while the idle link between layers does not shrink.
+
+**Measured** (2026-10-06, Gold port, `fn/rigs/short/split.bat`, one binary with a temporary
+toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
+
+- Greedy ids identical off and on for chat prompts of ~600, ~2,000 (prose, code) and ~4,000 tokens,
+  plain and MTP. The prefix-cache and `/v1/decide` real tests pass with the split on. tg512 110.2
+  tok/s (decode does not use it).
+- `ninfer_bench`, warm expert cache, chunk 4096, ABBA (two runs per arm, mean of 3):
+
+  | Prompt | Off | On | Change |
+  |---:|---:|---:|---:|
+  | 512 | 2.46 s | 1.57 s | 1.57x |
+  | 1,024 | 2.27 s | 1.75 s | 1.30x |
+  | 2,048 | 2.18 s | 2.14 s | 1.02x |
+  | 4,096 | 2.05 s | 2.35 s | 0.87x |
+
+- CLI, cold expert cache (first call after load, two runs per arm): 512 tokens 146 -> 179 tok/s
+  (1.23x); the 2,000-token prompts 0.96x and 0.99x; 4,000 tokens 1.00x.
+- So the gated stream pays where a call leaves many experts untouched or narrow and loses at 4,096
+  columns, where nearly every expert is touched and the idle link between a layer's routing and
+  its copies costs more than the bytes saved. The width limit (1,536 at x8) keeps 512-1,024-column
+  calls on the split and leaves 2,000 and above on the blind stream. The x16 limit (768) follows
+  from the same model (saved link time halves, the idle time does not) and is not measured.
+- With the limit (`fn/rigs/short/combo.bat`, same method): ids identical for the four prompts;
+  pp512 2.463 → 1.567 s (1.57x), pp1024 2.272 → 1.752 s (1.30x), pp2048 and pp4096 unchanged
+  (2.178 / 2.054 s, the blind stream); CLI cold 512 tokens 147 → 179 tok/s, the 2,000- and
+  4,000-token prompts 0.99-1.00x. The prefix-cache and `/v1/decide` real tests pass.
+
+**N-gram reads and the walk (item 3, assessed 2026-10-06; the overlap is not built).**
+
+- A walk span's chunk needs its n-gram rows before its layer-0 pass. Each 4,096-column chunk reads
+  about 74,000 rows (~37 ms on Windows), while that pass takes a few milliseconds. Within a span,
+  the reads therefore cannot hide behind compute.
+- Across spans, the next span's rows could be read while the current span's later layers run: the
+  engine thread waits there anyway.
+- But a 64K-token span needs about 1.15 million rows. The direct-mapped host cache holds 2^20 rows
+  (~170 MB), so a span prefetched into it would evict itself. A separate store would add ~190 MB of
+  host RAM.
+- The saving is at most about half of the ~1.2 s of reads at 128K (about 3 %), and nothing for
+  prompts up to 64K. It is not worth that RAM.
+- The large n-gram cost was Linux's serial direct reads: 8 reads in flight against 128 on Windows,
+  5.8 s against 0.5 s for a 40K prompt. Kernel AIO fixed it (`read_only_file_posix.cpp`, 9.5x more
+  random 4 KiB reads in WSL2).
+
+**Expected gain** (cold cache, CPU rate derated for the DRAM the DMA shares):
+
+- 512 tokens: about 2.5 s to 1.0 s at x8, and about 1.75x at x16.
+- Measured routing (route trace of chat prompts, calls of 524-1,024 columns):
+  - such a call touches 323-355 of the 512 experts per layer;
+  - 42-54 % of the touched experts have n <= 8 (21-65 % by layer).
+- The blind stream copies every non-resident expert, touched or not. The gated stream copies only
+  touched ones, which alone saves about a third of the link time at these widths.
+- With the CPU split, the modelled link-plus-CPU time per call falls 1.7-2.2x against copying the
+  touched experts. That is about 2.5-3x against today's full pass, at x8 and x16 alike.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
