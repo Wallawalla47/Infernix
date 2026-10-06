@@ -94,8 +94,14 @@ private:
     std::vector<std::uint64_t> last_;
     std::vector<std::uint32_t> slot_;      // index into residents_, or kNone
     std::vector<std::uint32_t> residents_; // dense list of resident keys
+    // count_ and last_ of residents_[i] at i, as doubles, so a victim search is one contiguous
+    // floating-point loop. Both are integers below 2^53, so they and now_ - last_ + 1 are exact in
+    // binary64 and every score equals score()'s.
+    std::vector<double> resident_count_;
+    std::vector<double> resident_last_;
     std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
     std::vector<std::pair<double, std::uint32_t>> scratch_;
+    std::vector<double> scores_;           // scratch: residents' scores, in residents_ order
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
