@@ -7729,7 +7729,7 @@ tokens per query, so most of that KV is cold at any moment.
 - **Writers are unchanged.** KV append and pooled keys only ever write the frontier's pages, which
   are space 0 by rule.
 - **Readers translate.** The page spaces are QSA-owned, so only QSA's kernels change:
-  - the decode attention kernel (`KVReader`);
+  - the decode attention kernel (its `cp.async` tile gathers, §19.3.14);
   - the prompt kernel (its `cp.async` gathers; space-1 pages are read zero-copy);
   - the selection kernels and `pool_kernel` (pooled-plane offsets).
 - **Space-1 pages are read zero-copy**, as §9.6 planned. A selected 4-token block of one layer is
@@ -8041,6 +8041,66 @@ Host writes; the older lane then found nothing to evict and no resident to pause
 failed ("oldest resident cannot obtain its legal unit"). `reserve_units` and `hybrid_reclaim` now drain
 pending transfers before reporting a shortage. (2) A resume whose cached state is the paused frontier
 itself has no suffix to plan; it decodes at once.
+
+### 19.3.14 QSA decode attention: staged tiles (2026-10-06)
+
+**Profile** (nsys, Gold `283613d8b`, dense8m, `int8` KV, 128 decoded tokens after 8K and 128K
+prompts; `fn/prof/dprof`). The attention family is 2.4-4.8 % of a decode token's kernel time. Its
+largest part is K3b, `attention_kernel`:
+- 45 µs per call, 12-13 calls per main forward: 545 µs of a 14.8 ms plain token at 8K;
+- the same at 128K, since attention covers ≤ 2,051 tokens;
+- about 15× its §8.3 budget of ~3 µs for 2.2 MB.
+
+In the same profile, selection (`qsa_score_kernel` + `qsa_select_global_kernel`) takes 12 µs per
+call at 8K and 24 µs at 128K, and `merge_kernel` 3.3 µs.
+
+The old kernel had 66 CTAs (33 splits × 2 KV heads) at T = 1. Every key and value element was a
+dependent chain: block-table entry → page space → code (and scale) load. The keys were fetched one
+token ahead per warp and the values in batches of 8 cells, so a 63-token split paid about 16
+round-trip latencies. The softmax was serial: 12 threads made 63 `expf` calls each.
+
+**Change** (`attention_kernel<Storage, Group>`, same grid, same split partition):
+- **Staging.** Each 64-token tile's K rows, V rows and INT8 group scales are gathered into dynamic
+  shared memory by `cp.async`: one round of loads per tile, across the page spaces of §19.3.11.
+  - INT8 double-buffers its 33 KiB stages, so the next tile streams under the current one.
+  - BF16 uses one 64 KiB stage.
+  - The first tile is issued before the query heads load and rotate.
+- **Softmax.** The tile maximum is a warp reduction, which is exact, and the exponentials are
+  computed in parallel. Each head's l is still summed serially in token order.
+- **Launches.** Attention and the merge launch as PDL consumers.
+- **Arithmetic is unchanged:** the score's fma order and butterfly, the online-softmax update
+  sequence and the in-order value fold. The outputs are therefore bit-identical to the previous
+  kernel.
+
+**Verification.** A temporary check ran the previous kernel beside the new one in
+`ninfer_qsa_test`. All 12 calls matched bit for bit: bf16 and int8; W = 1, 5 and 40, the last with 8
+tiles per split; pool pages and host/lent page spaces. The FP64-oracle cases pass.
+
+**Measured** (RTX 5090, dense8m, `int8` KV, 2026-10-06, A = Gold `283613d8b`):
+- **Greedy ids are identical, A against B**, on seven workloads: the four short prompts (dense QSA,
+  96 tokens), the code prompt with MTP (295 tokens), and the ~40K prompt plain and MTP (selected
+  blocks, 96 tokens).
+- **Decode, two ABBA pairs** (bench, tok/s, A → B):
+
+  | Context and mode | A | B | Change |
+  |---|---:|---:|---:|
+  | 8K plain | 96.91 | 100.13 | +3.32 % |
+  | 8K MTP | 134.54 | 136.45 | +1.42 % |
+  | 128K plain | 59.99 | 61.36 | +2.28 % |
+  | 128K MTP | 51.61 | 51.59 | −0.03 % |
+
+  At 128K MTP the B runs were 52.07 and 51.12 against 51.61 and 51.60 for A, so the change is
+  neutral there within that spread.
+- **Exposed time per call** in the decode profiles (attention end − selection end, median). Under
+  PDL a kernel's own duration includes its wait.
+
+  | Workload | Before | After |
+  |---|---:|---:|
+  | T = 1, 8K and 128K | 45-47 µs | 18.2 µs |
+  | MTP at 8K (264 CTAs) | 46 µs | 34 µs |
+  | Merge | 3.3 µs | 3.3 µs |
+
+  These are still well above the ~3 µs budget (open; see the next note).
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
