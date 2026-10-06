@@ -8407,6 +8407,57 @@ identical. Change against cap 8:
 - **The tg128k −0.1 %** is inside its reps' spread: 61.2-61.8 against 61.4-61.6.
 - **Cap 32** gains nothing more and has the larger tg128k drop.
 
+### 19.3.17 Prefill: batched expert copies, no promotions between walk spans (2026-10-06)
+
+**Profile** (nsys, Gold `a1e40253a`, int8 KV; `fn/rigs/prof/analyze_pf.py`). Prefill under nsys runs
+within 2-4 % of its bare rate.
+
+| Prompt | Span | Main stream busy | Largest idle gaps |
+|---|---:|---:|---|
+| 32K | 4.5 s | 72 % | 0.63 s after the first token is sampled; 8 × ~35 ms before each chunk's embedding (n-gram rows) |
+| 128K | 18.3 s | 76 % | 1.4 s between the two 64K walk spans; 1.3 s after sampling; 32 × ~30 ms before the embeddings |
+
+The two large gaps are `prefill.residency`: `after_round` with 16 promotions per layer and chunk,
+about 12,300 record copies (31-37 GB) per span.
+- **The host was blocked while issuing them.** On Windows, a `cudaMemcpyAsync` into a full copy
+  queue waits about one record's transfer time (~94 µs at x8). Issuing the copies took as long as
+  running them, and the first token was returned only afterwards.
+- **Between spans the copies were pure waste.** The stream lease still held most frames, so the
+  promotions churned through the rest, and the next span waited for them.
+
+A probe (`fn/probes/batch_copy_probe.cu`) issued 4,000 records as one `cudaMemcpyBatchAsync`: 1.3 ms
+on the host instead of 316-416 ms, at the same 27.5 GB/s.
+
+**Changes.**
+- **`core/copy_batch.h`.** `CopyBatch` enqueues copies through `cudaMemcpyBatchAsync`. A copy whose
+  destination overlaps a pending one first flushes the pending batch, so the stream-order result
+  (the later copy wins) is kept. `ninfer_copy_batch_test` checks disjoint, repeated and
+  partially overlapping destinations.
+- **`ExpertResidency::issue_loads`** enqueues the promotions in groups of 64 records, each with its
+  own completion event, so decode rounds publish them as they land rather than all at once at the end.
+- **The prefill expert stream** enqueues each layer's runs as one batch.
+- **A walk span that is not the prompt's last** promotes nothing; the last span still promotes for
+  decode.
+
+**Results** (ABBA, A = Gold `a1e40253a`, int8; both arms still on round 1's wave split rule):
+
+| Workload | Metric | A | B | Change |
+|---|---|---:|---:|---:|
+| pp32k | prefill (first token) | 5.795 s | 5.297 s | −8.6 % |
+| pp128k | prefill (first token) | 19.40 s | 17.03 s | −12.2 % |
+| -pg 32768,128 | prefill / decode / total | 4.37 s / 80.4 tok/s / 5.99 s | 3.83 s / 67.6 tok/s / 5.75 s | −12.3 % / −16.0 % / −4.0 % |
+| -pg 131072,64 | prefill / decode / total | 17.94 s / 56.5 tok/s / 19.19 s | 15.64 s / 26.8 tok/s / 18.15 s | −12.8 % / −52.7 % / −5.4 % |
+| tg8k MTP | prefill / decode / total | 2.48 s / 108.1 / 4.90 s | 2.42 s / 105.8 / 4.88 s | −2.4 % / −2.1 % / −0.3 % |
+
+- **The first token arrives 8.6-12.8 % sooner.**
+- **Decode right after a long prefill is slower.** Its staged misses now share the link with the
+  promotions that used to delay the first token. After 32K and 128K the first 128 / 64 tokens run
+  at 84 % / 47 % of the earlier rate.
+- **Prefill plus decode still finishes 4-5 % sooner.**
+- **Greedy ids are identical** for the ~40K walk prompt, code MTP and prose2k.
+- **In the same rig the preemption and prefix-cache real tests failed.** The cause was round 1's
+  width-dependent split rule (§19.3.15, correction), not these copies.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto

@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/execution/expert_stream.h"
 
+#include "core/copy_batch.h"
 #include "core/device.h"
 
 #include <algorithm>
@@ -126,7 +127,9 @@ void ExpertStream::enqueue(std::uint32_t layer) {
     if (layer >= 2) { CUDA_CHECK(cudaStreamWaitEvent(stream_, consumed_[layer - 2], 0)); }
     const auto* row = static_cast<const std::int32_t*>(tables_host_.data()) + static_cast<std::size_t>(layer) * experts_;
     // Runs of consecutive experts in consecutive slots and adjacent records of one allocation: one
-    // copy per run (a copy may not span two pinned allocations, even adjacent ones).
+    // copy per run (a copy may not span two pinned allocations, even adjacent ones), all enqueued as
+    // one batch so the host does not wait on the copy queue.
+    CopyBatch copies(stream_);
     for (std::uint32_t e = 0; e < experts_;) {
         if (row[e] < 0) {
             ++e;
@@ -139,12 +142,12 @@ void ExpertStream::enqueue(std::uint32_t layer) {
             ++end;
         }
         const std::size_t bytes = static_cast<std::size_t>(end - e) * stride_;
-        CUDA_CHECK(cudaMemcpyAsync(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes,
-                                   cudaMemcpyHostToDevice, stream_));
+        copies.add(records_ + static_cast<std::size_t>(row[e]) * stride_, source, bytes);
         stats_.streamed += end - e;
         ++stats_.copies;
         e = end;
     }
+    copies.flush();
     CUDA_CHECK(cudaEventRecord(landed_[layer], stream_));
 }
 

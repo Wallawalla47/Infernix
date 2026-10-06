@@ -238,9 +238,12 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         }
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
-        // The route log holds the span's last chunk (every chunk routes nearly every expert).
-        trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, promotions, static_cast<std::uint32_t>(begin));
-        residency_->after_round(device_.stream, width, promotions);
+        // The route log holds the span's last chunk (every chunk routes nearly every expert). No
+        // promotions: the stream lease still holds most frames, so they would churn through the
+        // rest (~12,000 records, ~1.2 s of link per 64K span), and the next span would wait for
+        // them; the prompt's last span promotes.
+        trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
+        residency_->after_round(device_.stream, width, 0);
         apply_vram_target(false);
     }
     return prefill_progress(lane, index, begin, width, tokens, last, promotions, start);
