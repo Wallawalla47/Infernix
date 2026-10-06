@@ -4,6 +4,8 @@
 
 #include "ninfer/ops/qsa.h"
 
+#include "core/pdl.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/qsa/page_spaces.cuh"
@@ -45,6 +47,11 @@ bool contiguous(const Tensor& t, DType dtype) {
 
 __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) { v += __shfl_xor_sync(0xFFFFFFFFU, v, o); }
+    return v;
+}
+
+__device__ __forceinline__ float warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) { v = fmaxf(v, __shfl_xor_sync(0xFFFFFFFFU, v, o)); }
     return v;
 }
 
@@ -194,66 +201,6 @@ __global__ void commit_tail_kernel(const bf16* __restrict__ raw, const std::int3
 
 // ----------------------------------------------------------------------------------- attention
 
-template <KvCacheStorage Storage>
-struct KVReader;
-
-template <>
-struct KVReader<KvCacheStorage::BFloat16> {
-    static constexpr bool kRotatedKeys = false;
-    // Element d of the key / value of `token` for `head` (its page's space resolved).
-    __device__ static float key(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
-                                int head, int token, int d, int kv_heads) {
-        int page;
-        const auto* plane = static_cast<const bf16*>(detail::qsa_space_plane(
-            spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, table[token >> kPagedKVPageShift], page));
-        const std::int64_t i = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
-                               static_cast<std::int64_t>(kHeadDim) * (token & kPagedKVPageMask) + d;
-        return __bfloat162float(plane[i]);
-    }
-    __device__ static float value(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
-                                  int head, int token, int d, int kv_heads) {
-        int page;
-        const auto* plane = static_cast<const __half*>(detail::qsa_space_plane(
-            spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v, table[token >> kPagedKVPageShift], page));
-        const std::int64_t i = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
-                               static_cast<std::int64_t>(kHeadDim) * (token & kPagedKVPageMask) + d;
-        return __half2float(plane[i]);
-    }
-};
-
-template <>
-struct KVReader<KvCacheStorage::Int8Group64> {
-    static constexpr bool kRotatedKeys = true;
-    __device__ static float read(const void* codes, const void* scales, int page, int head, int token, int d,
-                                 int kv_heads) {
-        const int off = token & kPagedKVPageMask;
-        const std::int64_t ci = static_cast<std::int64_t>(kHeadDim) * kPagedKVPageSize * (head + kv_heads * page) +
-                                static_cast<std::int64_t>(kHeadDim) * off + d;
-        const std::int64_t si = static_cast<std::int64_t>(4) * kPagedKVPageSize * (head + kv_heads * page) +
-                                static_cast<std::int64_t>(4) * off + d / 64;
-        return static_cast<float>(static_cast<const std::int8_t*>(codes)[ci]) *
-               __half2float(static_cast<const __half*>(scales)[si]);
-    }
-    __device__ static float key(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
-                                int head, int token, int d, int kv_heads) {
-        const int id = table[token >> kPagedKVPageShift];
-        int page;
-        const void* codes  = detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k, id, page);
-        const void* scales = detail::qsa_space_plane(spaces, kv.k_scale_pages.data, spaces.host_k_scale,
-                                                     spaces.lent_k_scale, id, page);
-        return read(codes, scales, page, head, token, d, kv_heads);
-    }
-    __device__ static float value(const PagedKVLayerView& kv, const QsaPageSpaces& spaces, const std::int32_t* table,
-                                  int head, int token, int d, int kv_heads) {
-        const int id = table[token >> kPagedKVPageShift];
-        int page;
-        const void* codes  = detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v, id, page);
-        const void* scales = detail::qsa_space_plane(spaces, kv.v_scale_pages.data, spaces.host_v_scale,
-                                                     spaces.lent_v_scale, id, page);
-        return read(codes, scales, page, head, token, d, kv_heads);
-    }
-};
-
 // The attended token at index i of column t's list.
 __device__ __forceinline__ int attended_token(int i, int count, const std::int32_t* selected, int ratio, int p) {
     if (count < 0) { return i; } // dense: tokens 0..p
@@ -305,15 +252,65 @@ __device__ __forceinline__ void scatter_head_sums(const float (&part)[Group], in
     }
 }
 
-// Value cells whose loads one thread issues together before folding them in order.
-constexpr int kValueBatch = 8;
+// One stage of attended tokens in shared memory: every token's K row, V row and (INT8) group
+// scales, gathered by cp.async from the token's page space. Planes are [K rows | V rows | K scales |
+// V scales] over kTokenTile tokens; a cell decodes to exactly the stored value.
+template <KvCacheStorage Storage>
+struct KVTile;
+
+template <>
+struct KVTile<KvCacheStorage::BFloat16> {
+    static constexpr bool kRotatedKeys = false;
+    static constexpr int kRowBytes     = kHeadDim * 2; // BF16 keys, FP16 values
+    static constexpr int kScaleBytes   = 0;
+    static constexpr int kStages       = 1; // 64 KiB a stage
+    __device__ static float key(const unsigned char* stage, int j, int d) {
+        return __bfloat162float(reinterpret_cast<const bf16*>(stage + j * kRowBytes)[d]);
+    }
+    __device__ static float value(const unsigned char* stage, int j, int d) {
+        return __half2float(reinterpret_cast<const __half*>(stage + (kTokenTile + j) * kRowBytes)[d]);
+    }
+};
+
+template <>
+struct KVTile<KvCacheStorage::Int8Group64> {
+    static constexpr bool kRotatedKeys = true;
+    static constexpr int kRowBytes     = kHeadDim;
+    static constexpr int kScaleBytes   = kHeadDim / 64 * 2; // FP16 per 64 elements
+    static constexpr int kStages       = 2; // 33 KiB a stage: the next tile streams under this one
+    __device__ static float cell(const unsigned char* stage, int plane, int j, int d) {
+        const auto* codes  = reinterpret_cast<const std::int8_t*>(stage + (plane * kTokenTile + j) * kRowBytes);
+        const auto* scales = reinterpret_cast<const __half*>(stage + 2 * kTokenTile * kRowBytes +
+                                                             (plane * kTokenTile + j) * kScaleBytes);
+        return static_cast<float>(codes[d]) * __half2float(scales[d / 64]);
+    }
+    __device__ static float key(const unsigned char* stage, int j, int d) { return cell(stage, 0, j, d); }
+    __device__ static float value(const unsigned char* stage, int j, int d) { return cell(stage, 1, j, d); }
+};
+
+// Dynamic shared memory of attention_kernel<Storage, Group>, in bytes and offsets.
+template <KvCacheStorage Storage, int Group>
+struct AttentionShared {
+    using Tile                           = KVTile<Storage>;
+    static constexpr std::size_t kStage  = std::size_t{2} * kTokenTile * (Tile::kRowBytes + Tile::kScaleBytes);
+    static constexpr std::size_t kQ      = Tile::kStages * kStage;
+    static constexpr std::size_t kProbs  = kQ + sizeof(float) * Group * kHeadDim;
+    static constexpr std::size_t kStats  = kProbs + sizeof(float) * Group * kTokenTile;
+    static constexpr std::size_t kTokens = kStats + sizeof(float) * 4 * ((3 * Group + 3) / 4); // tokens, ids [2][64]
+    static constexpr std::size_t kBytes  = kTokens + sizeof(std::int32_t) * 4 * kTokenTile;
+    static_assert(kStage % 16 == 0 && kBytes <= 99 * 1024, "one CTA's shared memory on sm_120");
+};
 
 // One CTA per (split, KV head, column): the column's query heads of this KV head over one slice of
 // its attended tokens. Partials (max, sum, unnormalized output) go to workspace when split > 1.
 // `Group` bounds the query heads per KV head (group = heads / kv_heads <= Group), so every head
-// loop has a compile-time trip count and the accumulators stay in registers. Each head's
-// arithmetic (the score's fma order and butterfly, the serial online softmax, the in-order value
-// fold) does not depend on Group.
+// loop has a compile-time trip count and the accumulators stay in registers.
+//
+// Each 64-token tile's K/V rows are gathered into shared memory by cp.async in one round (INT8:
+// double-buffered, the next tile streams under this one). A head's arithmetic is the reference
+// order and does not depend on Group or the staging: the score's fma order and butterfly, the
+// tile's online-softmax update (an exact maximum, then l summed serially in token order) and the
+// in-order value fold, under the fixed split partition.
 template <KvCacheStorage Storage, int Group>
 __global__ void __launch_bounds__(256)
     attention_kernel(const bf16* __restrict__ q, int heads, int kv_heads, PagedKVLayerView kv, QsaPageSpaces spaces,
@@ -322,7 +319,9 @@ __global__ void __launch_bounds__(256)
                      int width, int ratio, const std::int32_t* __restrict__ selected,
                      const std::int32_t* __restrict__ counts, int top_blocks, int splits, float scale,
                      float* __restrict__ partial, bf16* __restrict__ out) {
-    using Reader = KVReader<Storage>;
+    using Tile   = KVTile<Storage>;
+    using Shared = AttentionShared<Storage, Group>;
+    pdl::enter();
     const int split = blockIdx.x, kv_head = blockIdx.y, t = blockIdx.z;
     const int group = heads / kv_heads;
     const int p = positions[t];
@@ -330,30 +329,88 @@ __global__ void __launch_bounds__(256)
     const int total = attended_count(count, ratio, p);
     const int per_split = (total + splits - 1) / splits;
     const int begin = split * per_split, end = min(total, begin + per_split);
+    const int tiles = begin < end ? (end - begin + kTokenTile - 1) / kTokenTile : 0;
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t / width]) * table_stride;
     const std::int32_t* list  = selected + static_cast<std::size_t>(t) * top_blocks;
 
-    __shared__ float qs[Group][kHeadDim];
-    __shared__ float probs[Group][kTokenTile];
-    __shared__ float m_run[Group], l_run[Group], rescale[Group];
-    __shared__ int tokens[kTokenTile];
+    extern __shared__ __align__(16) unsigned char smem[];
+    auto* qs       = reinterpret_cast<float(*)[kHeadDim]>(smem + Shared::kQ);
+    auto* probs    = reinterpret_cast<float(*)[kTokenTile]>(smem + Shared::kProbs);
+    float* m_run   = reinterpret_cast<float*>(smem + Shared::kStats);
+    float* l_run   = m_run + Group;
+    float* rescale = l_run + Group;
+    auto* tokens   = reinterpret_cast<std::int32_t(*)[kTokenTile]>(smem + Shared::kTokens); // [2]
+    auto* ids      = tokens + 2;                                                            // [2]
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+
+    // Tile i's tokens and their block-table page ids into slot `buf`.
+    const auto prepare = [&](int i, int buf) {
+        const int first = begin + i * kTokenTile;
+        if (threadIdx.x < min(kTokenTile, end - first)) {
+            const int token          = attended_token(first + threadIdx.x, count, list, ratio, p);
+            tokens[buf][threadIdx.x] = token;
+            ids[buf][threadIdx.x]    = table[token >> kPagedKVPageShift];
+        }
+    };
+    // Gathers the K/V rows (and scales) of tile i's tokens (slot `buf`) into stage s.
+    const auto issue = [&](int i, int buf, int s) {
+        unsigned char* stage = smem + s * Shared::kStage;
+        const int n          = min(kTokenTile, end - (begin + i * kTokenTile));
+        constexpr int Chunks = Tile::kRowBytes / 16;
+        for (int c = threadIdx.x; c < n * 2 * Chunks; c += blockDim.x) {
+            const int j = c / (2 * Chunks), plane = c / Chunks % 2, chunk = c % Chunks;
+            int page;
+            const void* base = plane == 0
+                                   ? detail::qsa_space_plane(spaces, kv.k_pages.data, spaces.host_k, spaces.lent_k,
+                                                             ids[buf][j], page)
+                                   : detail::qsa_space_plane(spaces, kv.v_pages.data, spaces.host_v, spaces.lent_v,
+                                                             ids[buf][j], page);
+            const std::size_t at = (static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize +
+                                    (tokens[buf][j] & kPagedKVPageMask)) *
+                                       Tile::kRowBytes +
+                                   16 * chunk;
+            cp_async<16, Cache::cg>(stage + (plane * kTokenTile + j) * Tile::kRowBytes + 16 * chunk,
+                                    static_cast<const unsigned char*>(base) + at);
+        }
+        if constexpr (Tile::kScaleBytes > 0) {
+            static_assert(Tile::kScaleBytes == 8);
+            for (int c = threadIdx.x; c < n * 2; c += blockDim.x) {
+                const int j = c / 2, plane = c % 2;
+                int page;
+                const void* base = plane == 0 ? detail::qsa_space_plane(spaces, kv.k_scale_pages.data,
+                                                                        spaces.host_k_scale, spaces.lent_k_scale,
+                                                                        ids[buf][j], page)
+                                              : detail::qsa_space_plane(spaces, kv.v_scale_pages.data,
+                                                                        spaces.host_v_scale, spaces.lent_v_scale,
+                                                                        ids[buf][j], page);
+                const std::size_t at = (static_cast<std::size_t>(kv_head + kv_heads * page) * kPagedKVPageSize +
+                                        (tokens[buf][j] & kPagedKVPageMask)) *
+                                       Tile::kScaleBytes;
+                cp_async<8>(stage + 2 * kTokenTile * Tile::kRowBytes + (plane * kTokenTile + j) * Tile::kScaleBytes,
+                            static_cast<const unsigned char*>(base) + at);
+            }
+        }
+        cp_commit();
+    };
+
+    // The first tile streams while the query heads load and rotate.
+    if (tiles > 0) {
+        prepare(0, 0);
+        __syncthreads();
+        issue(0, 0, 0);
+    }
     for (int i = threadIdx.x; i < group * kHeadDim; i += blockDim.x) {
         const int h = i / kHeadDim, d = i % kHeadDim;
         qs[h][d] = __bfloat162float(q[(static_cast<std::size_t>(t) * heads + kv_head * group + h) * kHeadDim + d]);
     }
+    if (threadIdx.x < group) {
+        m_run[threadIdx.x] = -INFINITY;
+        l_run[threadIdx.x] = 0.0F;
+    }
     __syncthreads();
-    if constexpr (Reader::kRotatedKeys) {
+    if constexpr (Tile::kRotatedKeys) {
         // Keys are stored in the normalized Hadamard domain; rotate each query head the same way.
-        if (warp < group) {
-            float v[8];
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { v[r] = qs[warp][lane + 32 * r]; }
-            normalized_hadamard_d256_inplace(v, lane);
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { qs[warp][lane + 32 * r] = v[r]; }
-        }
-        for (int h = warp + 8; h < group; h += 8) {
+        for (int h = warp; h < group; h += 8) {
             float v[8];
 #pragma unroll
             for (int r = 0; r < 8; ++r) { v[r] = qs[h][lane + 32 * r]; }
@@ -363,34 +420,36 @@ __global__ void __launch_bounds__(256)
         }
         __syncthreads();
     }
-    if (threadIdx.x < group) {
-        m_run[threadIdx.x] = -INFINITY;
-        l_run[threadIdx.x] = 0.0F;
-    }
     float acc[Group];
 #pragma unroll
     for (int h = 0; h < Group; ++h) { acc[h] = 0.0F; }
     const int d_own = threadIdx.x; // this thread's output dimension
-    __syncthreads();
-    for (int tile = begin; tile < end; tile += kTokenTile) {
-        const int n = min(kTokenTile, end - tile);
-        if (threadIdx.x < n) { tokens[threadIdx.x] = attended_token(tile + threadIdx.x, count, list, ratio, p); }
-        __syncthreads();
-        // Scores: one warp per token, all query heads of the group; the next token's key loads are
-        // issued before this token's sums.
-        float k[8];
-        if (warp < n) {
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { k[r] = Reader::key(kv, spaces, table, kv_head, tokens[warp], lane + 32 * r, kv_heads); }
+    for (int i = 0; i < tiles; ++i) {
+        const int n = min(kTokenTile, end - (begin + i * kTokenTile));
+        const int s = Tile::kStages == 2 ? i % 2 : 0;
+        bool ahead  = false;
+        if (Tile::kStages == 1 && i > 0) {
+            prepare(i, i % 2);
+            __syncthreads();
+            issue(i, i % 2, 0);
+        } else if (Tile::kStages == 2 && i + 1 < tiles) {
+            prepare(i + 1, (i + 1) % 2);
+            __syncthreads();
+            issue(i + 1, (i + 1) % 2, 1 - s);
+            ahead = true;
         }
+        if (ahead) {
+            cp_wait<1>();
+        } else {
+            cp_wait<0>();
+        }
+        __syncthreads();
+        const unsigned char* stage = smem + s * Shared::kStage;
+        // Scores: one warp per token, all query heads of the group.
         for (int j = warp; j < n; j += 8) {
-            float next[8];
-            if (j + 8 < n) {
+            float k[8];
 #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    next[r] = Reader::key(kv, spaces, table, kv_head, tokens[j + 8], lane + 32 * r, kv_heads);
-                }
-            }
+            for (int r = 0; r < 8; ++r) { k[r] = Tile::key(stage, j, lane + 32 * r); }
             float part[Group];
 #pragma unroll
             for (int h = 0; h < Group; ++h) {
@@ -402,46 +461,39 @@ __global__ void __launch_bounds__(256)
                 part[h] = dot;
             }
             scatter_head_sums<Group>(part, group, lane, scale, probs, j);
-#pragma unroll
-            for (int r = 0; r < 8; ++r) { k[r] = next[r]; }
         }
         __syncthreads();
-        // Online softmax per head.
+        // Online softmax per head: the tile's exact maximum, the exponentials in parallel, then l
+        // in token order.
+        for (int h = warp; h < group; h += 8) {
+            const float a = lane < n ? probs[h][lane] : -INFINITY;
+            const float b = lane + 32 < n ? probs[h][lane + 32] : -INFINITY;
+            const float m = fmaxf(m_run[h], warp_max(fmaxf(a, b)));
+            if (lane < n) { probs[h][lane] = expf(a - m); }
+            if (lane + 32 < n) { probs[h][lane + 32] = expf(b - m); }
+            __syncwarp();
+            if (lane == 0) {
+                rescale[h] = expf(m_run[h] - m);
+                m_run[h]   = m;
+            }
+        }
+        __syncthreads();
         if (threadIdx.x < group) {
             const int h = threadIdx.x;
-            float m = m_run[h];
-            for (int j = 0; j < n; ++j) { m = fmaxf(m, probs[h][j]); }
-            const float r = expf(m_run[h] - m);
-            float l = l_run[h] * r;
-            for (int j = 0; j < n; ++j) {
-                const float e = expf(probs[h][j] - m);
-                probs[h][j]   = e;
-                l += e;
-            }
-            m_run[h]   = m;
-            l_run[h]   = l;
-            rescale[h] = r;
+            float l     = l_run[h] * rescale[h];
+            for (int j = 0; j < n; ++j) { l += probs[h][j]; }
+            l_run[h] = l;
         }
-        __syncthreads();
 #pragma unroll
         for (int h = 0; h < Group; ++h) {
             if (h < group) { acc[h] *= rescale[h]; }
         }
-        // Values: a batch of cells' loads in flight together, then folded in token order.
-        for (int j0 = 0; j0 < n; j0 += kValueBatch) {
-            float v[kValueBatch];
+        // Values, folded in token order.
+        for (int j = 0; j < n; ++j) {
+            const float v = Tile::value(stage, j, d_own);
 #pragma unroll
-            for (int u = 0; u < kValueBatch; ++u) {
-                if (j0 + u < n) { v[u] = Reader::value(kv, spaces, table, kv_head, tokens[j0 + u], d_own, kv_heads); }
-            }
-#pragma unroll
-            for (int u = 0; u < kValueBatch; ++u) {
-                if (j0 + u < n) {
-#pragma unroll
-                    for (int h = 0; h < Group; ++h) {
-                        if (h < group) { acc[h] += probs[h][j0 + u] * v[u]; }
-                    }
-                }
+            for (int h = 0; h < Group; ++h) {
+                if (h < group) { acc[h] += probs[h][j] * v; }
             }
         }
         __syncthreads();
@@ -466,6 +518,7 @@ __global__ void __launch_bounds__(256)
 }
 
 __global__ void merge_kernel(const float* __restrict__ partial, int heads, int splits, bf16* __restrict__ out) {
+    pdl::enter();
     const int head = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     float m = -INFINITY;
     for (int s = 0; s < splits; ++s) {
@@ -644,23 +697,31 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
         return;
     }
     const dim3 grid(splits, geometry.kv_heads, columns);
-    const auto launch = [&](auto kernel) {
-        kernel<<<grid, 256, 0, stream>>>(static_cast<const bf16*>(q.data), geometry.heads, geometry.kv_heads, layer.kv,
-                                         layer.spaces,
-                                         tables, stride, rows, pos, batch.width, geometry.ratio, ws.selected, ws.counts,
-                                         top_blocks, splits, scale, ws.partial, static_cast<bf16*>(out.data));
+    const auto launch = [&]<KvCacheStorage Storage, int Group>() {
+        constexpr std::size_t bytes = AttentionShared<Storage, Group>::kBytes;
+        static const bool reserved  = [] {
+            return cudaFuncSetAttribute(attention_kernel<Storage, Group>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(AttentionShared<Storage, Group>::kBytes)) == cudaSuccess;
+        }();
+        require(reserved, "attention shared memory cannot be reserved");
+        const cudaError_t error = pdl::launch_consumer(
+            {grid, dim3(256), bytes, stream}, attention_kernel<Storage, Group>, static_cast<const bf16*>(q.data),
+            geometry.heads, geometry.kv_heads, layer.kv, layer.spaces, tables, stride, rows, pos, batch.width,
+            geometry.ratio, static_cast<const std::int32_t*>(ws.selected), static_cast<const std::int32_t*>(ws.counts),
+            top_blocks, splits, scale, ws.partial, static_cast<bf16*>(out.data));
+        if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa attention: ") + cudaGetErrorString(error)); }
     };
     // Query heads per KV head, rounded up to a multiple of four (Qwen4Exp: 24 / 2 = 12).
     const auto launch_storage = [&]<KvCacheStorage Storage>() {
         const int group = geometry.heads / geometry.kv_heads;
         if (group <= 4) {
-            launch(attention_kernel<Storage, 4>);
+            launch.template operator()<Storage, 4>();
         } else if (group <= 8) {
-            launch(attention_kernel<Storage, 8>);
+            launch.template operator()<Storage, 8>();
         } else if (group <= 12) {
-            launch(attention_kernel<Storage, 12>);
+            launch.template operator()<Storage, 12>();
         } else {
-            launch(attention_kernel<Storage, kMaxGroup>);
+            launch.template operator()<Storage, kMaxGroup>();
         }
     };
     switch (layer.kv.storage) {
@@ -675,9 +736,11 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     }
     check_launch("attention");
     if (splits > 1) {
-        merge_kernel<<<dim3(geometry.heads, columns), kHeadDim, 0, stream>>>(ws.partial, geometry.heads, splits,
-                                                                            static_cast<bf16*>(out.data));
-        check_launch("merge");
+        const cudaError_t error =
+            pdl::launch_consumer({dim3(geometry.heads, columns), dim3(kHeadDim), 0, stream}, merge_kernel,
+                                 static_cast<const float*>(ws.partial), geometry.heads, splits,
+                                 static_cast<bf16*>(out.data));
+        if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa merge: ") + cudaGetErrorString(error)); }
     }
 }
 
