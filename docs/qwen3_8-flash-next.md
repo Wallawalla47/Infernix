@@ -110,7 +110,7 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
     9,000.
   - A request running alone at `--max-concurrency 2` therefore has a slightly smaller expert
     cache than at 1 (estimated ~0.5 % slower decode at 16K and ~1.5 % at 64K).
-- The engine starts six CPU worker threads for missed experts (up to eight per layer call). They
+- The engine starts six CPU worker threads for missed experts (up to 16 per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
