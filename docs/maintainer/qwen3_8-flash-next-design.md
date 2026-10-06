@@ -7885,7 +7885,10 @@ unwritten.
 - The MTP drafter clamps its cells to the lane's mapped positions: the shared prefix pages plus the
   private ones (`prefix.page_base + pages`). Before this change the clamp counted only the private
   pages, which with a long reused prefix put every draft cell on one position inside a shared cached
-  page (fixed separately on the items branch).
+  page (fixed in its own commit). Measured with `ninfer-serve` (MTP, 4 drafts): a 44,783-token chat,
+  then its continuation resuming 44,942 cached tokens. The continuation took 98 rounds for 176 tokens
+  before the fix (accepted per draft position 63 / 13 / 0 / 0) and 76 after (65 / 32 / 3 / 0), 22 %
+  fewer, with identical tokens; the first, uncached request was the same in both builds.
 
 **Pause.** `start_pause` runs at a committed boundary (no round or transaction open).
 
