@@ -206,6 +206,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
+        residency_->tier_step(device_.stream);
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;

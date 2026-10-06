@@ -773,6 +773,9 @@ public:
             }
             fetch_channel_ = std::make_unique<ops::offloaded_moe::FetchChannel>();
             tier.fetch     = fetch_channel_.get();
+            // A layer walk's step calls ceil(layers / n) layers once per chunk of its n-chunk span (one
+            // tier round per step): at most layers + n - 1 layer calls.
+            tier.layer_calls = store->layers() + kWalkMaxTokens / static_cast<std::uint32_t>(std::max(chunk_, 1)) + 1U;
             tier_          = std::make_unique<HostExpertTier>(*store, std::move(tier));
             residency_->attach_tier(tier_.get());
         }
