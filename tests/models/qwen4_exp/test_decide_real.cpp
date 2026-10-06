@@ -252,9 +252,10 @@ int prefetch(ninfer::Engine& engine) {
     const auto reference = run(engine, head, greedy(8, false)).generated_token_ids;
     (void)run(engine, synthetic_tokens(3900, 63), greedy(1, false)); // evicts the Device blocks
     const ninfer::RuntimeStats before = engine.runtime_stats();
-    // A long request holds 52 of the 72 pages for its whole extent: the head, with a lane free, waits
-    // for KV pages (its path is Host-only), and its blocks are copied into what is free meanwhile.
-    ninfer::GenerationHandle a = engine.submit(engine.prepare_tokens(synthetic_tokens(3000, 64)), greedy(300, false));
+    // A long request's prompt holds 52 of the 72 pages (a binding reserves the prompt plus one round,
+    // and decode grows it): the head, with a lane free, waits for KV pages (its path is Host-only),
+    // and its blocks are copied into what is free meanwhile.
+    ninfer::GenerationHandle a = engine.submit(engine.prepare_tokens(synthetic_tokens(3300, 64)), greedy(300, false));
     ninfer::GenerationHandle h = engine.submit(engine.prepare_tokens(head), greedy(8, true));
     (void)a.wait();
     const auto waited                = h.wait();

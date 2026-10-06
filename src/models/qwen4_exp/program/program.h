@@ -49,6 +49,7 @@ namespace detail {
 class ProgramImpl;
 struct BasePlanImpl;
 struct QuoteImpl;
+struct ResumeStateImpl;
 struct ContractAccess;
 } // namespace detail
 
@@ -152,20 +153,26 @@ struct SourceCandidate {
     PrefixReusePath reuse_path = PrefixReusePath::Root;
 };
 
-// A paused request's recovery state. Qwen4Exp reserves a request's whole KV extent at admission and
-// never pauses one, so no ResumeState is ever produced; the type completes the Engine surface.
+// A paused request (design §19.3.13): its ledger, frontier and request-level state. The state at
+// the frontier is not owned: the pause published it to the prefix cache as an evictable snapshot,
+// so the Engine sees no snapshot handle (recovery route Replay) and the resume binding restores
+// from that snapshot when it is still cached, replaying the ledger from the deepest one otherwise.
 class ResumeState {
 public:
-    ResumeState(ResumeState&&) noexcept            = default;
-    ResumeState& operator=(ResumeState&&) noexcept = default;
-    ResumeState(const ResumeState&)                = delete;
-    ResumeState& operator=(const ResumeState&)     = delete;
+    ResumeState(ResumeState&&) noexcept;
+    ResumeState& operator=(ResumeState&&) noexcept;
+    ~ResumeState();
+    ResumeState(const ResumeState&)            = delete;
+    ResumeState& operator=(const ResumeState&) = delete;
     [[nodiscard]] bool has_snapshot() const noexcept { return false; }
     [[nodiscard]] std::optional<CheckpointHandle> snapshot_handle() const noexcept { return std::nullopt; }
-    [[nodiscard]] std::uint32_t frontier() const noexcept { return 0; }
+    [[nodiscard]] std::uint32_t frontier() const noexcept;
 
 private:
-    ResumeState() noexcept = default;
+    explicit ResumeState(std::unique_ptr<detail::ResumeStateImpl>) noexcept;
+    std::unique_ptr<detail::ResumeStateImpl> impl_;
+
+    friend class detail::ProgramImpl;
 };
 
 enum class ExecutionUnitKind : std::uint8_t { Prefill, Replay, Decode, Control, Normalize };
@@ -459,8 +466,9 @@ public:
     // (a root start only, without a prefix cache).
     [[nodiscard]] std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base,
                                                               std::uint32_t maximum_frontier);
-    // Reserves the request's whole KV extent on `lane` and stages its prefix restore; a shortage
-    // reports the pages missing. Qwen4Exp never pauses, so `resume` must be null.
+    // Reserves the KV pages of the request's prompt plus one round on `lane` and stages its prefix
+    // restore; a shortage reports the pages missing. With `resume`, binds the paused request's
+    // ledger instead: the deepest cached state up to its paused frontier, then replay to it.
     [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                                              const SourceCandidate& source,
                                                              ResumeState* resume           = nullptr,
@@ -478,16 +486,20 @@ public:
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
 
-    // ---- execution units: the whole extent is reserved at admission, so every unit fits ----
-    [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>) {
-        return {.reserved = true};
-    }
+    // ---- execution units (design §19.3.13): a binding reserves the KV pages of its prompt (or
+    // replay) plus one round; a decode or control unit grows the lane's pages to its next round, and
+    // a shortage the Engine cannot reclaim pauses the youngest resident ----
+    [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     void release_units(std::span<const SequenceHandle>) noexcept {}
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept { return false; }
 
-    // ---- pause, replay, checkpoints and captures: never offered by Qwen4Exp ----
-    [[nodiscard]] bool start_pause(SequenceHandle, bool, runtime::ExecutionTiming* = nullptr) { return false; }
-    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming* = nullptr);
+    // ---- pause and replay (design §19.3.13); no checkpoints or captures ----
+    // Publishes the lane's state at its frontier to the prefix cache, releases the lane and opens a
+    // Pause transaction that returns the ResumeState (a lane inside a layer walk's span publishes
+    // nothing past the span's start). False while another transaction or a round is open.
+    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot, runtime::ExecutionTiming* = nullptr);
+    // One prefill call of a resumed lane's ledger, without sampling, toward its paused frontier.
+    [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence, runtime::ExecutionTiming* = nullptr);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept { return false; }
     [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState&) const { return {}; }
     [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle) const { return std::nullopt; }

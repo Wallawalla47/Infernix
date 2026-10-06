@@ -145,7 +145,7 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
                                                                        std::uint32_t lane) {
     pc::PrefixCacheIndex& index = prefix_->index();
     const auto n                = static_cast<std::uint32_t>(prompt.token_ids.size());
-    const std::uint32_t E       = base.pages;
+    const std::uint32_t E       = binding_pages(base, n);
     const auto fits = [&](PrefixSelection& s) {
         // Entries this admission pins stop being evictable: its unpinned Device path blocks and a
         // Device copy-on-write source.
@@ -335,7 +335,8 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
     };
     for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
         const Lane& lane = lanes_[i];
-        if (lane.phase == Phase::Free || !lane.prefix.reuse || !lane.prompt) { continue; }
+        // A replaying lane plans no taps (its blocks are already cached up to its frontier).
+        if (lane.phase == Phase::Free || !lane.prefix.reuse || !lane.prompt || lane.replay) { continue; }
         const auto& sibling = qwen3_5::PreparedPromptAccess::view(*lane.prompt);
         // The waiting request keeps at least one prompt token to prefill.
         const std::size_t limit = std::min<std::size_t>(n - 1U, lane.prompt_tokens);
@@ -600,6 +601,44 @@ std::vector<pc::TapExclusion> ProgramImpl::prefix_exclusions(const qwen3_5::Prep
     for (const auto& range : qwen3_5::detail::vision_ranges(prompt)) { out.push_back({range.begin, range.end}); }
     return out;
 }
+
+// ---- pause and replay (design §19.3.13) --------------------------------------------------------------
+
+// The resumed request's ledger as a prompt: its tokens through the next input, their RoPE positions,
+// and its lookup keys (the prompt's, chained over the output blocks as prefix_publish chains them);
+// no tap hints (a replay publishes blocks, not taps).
+qwen3_5::PreparedPromptData ProgramImpl::ledger_prompt(const qwen3_5::PreparedPromptData& prompt,
+                                                   const ResumeStateImpl& r) const {
+    qwen3_5::PreparedPromptData out = prompt;
+    const std::size_t n = r.history.size(), p = prompt.token_ids.size();
+    if (r.prompt_tokens != p || n <= p || !std::equal(prompt.token_ids.begin(), prompt.token_ids.end(), r.history.begin())) {
+        throw std::logic_error("Qwen4Exp: a paused ledger does not extend its prompt");
+    }
+    out.token_ids.assign(r.history.begin(), r.history.end());
+    out.token_types.resize(n, 0);
+    if (prompt.positions.size() != 3 * p) { throw std::logic_error("Qwen4Exp: a prompt carries no RoPE positions"); }
+    out.positions.resize(3 * n);
+    for (std::size_t axis = 3; axis-- > 0;) {
+        // Axis-major [3, n]: move the prompt's rows to their new stride, then continue each.
+        std::copy_backward(prompt.positions.begin() + static_cast<std::ptrdiff_t>(axis * p),
+                           prompt.positions.begin() + static_cast<std::ptrdiff_t>((axis + 1) * p),
+                           out.positions.begin() + static_cast<std::ptrdiff_t>(axis * n + p));
+        for (std::size_t token = p; token < n; ++token) {
+            out.positions[axis * n + token] = static_cast<std::int32_t>(static_cast<std::int64_t>(token) + prompt.rope_delta);
+        }
+    }
+    const std::uint64_t trailing = prefix_trailing_extra(prompt);
+    const bool extras            = !prompt.block_extras.empty();
+    for (std::size_t b = out.block_hashes.size(); b < n / kBlock; ++b) {
+        const std::uint64_t previous = b == 0 ? pc::kRootLookupHash : out.block_hashes[b - 1];
+        const std::span<const TokenId> tokens(out.token_ids.data() + b * kBlock, kBlock);
+        out.block_hashes.push_back(pc::block_lookup_hash(previous, tokens, trailing));
+        if (extras) { out.block_extras.push_back(trailing); }
+    }
+    out.tap_hints.hints.clear();
+    return out;
+}
+
 
 // ---- publication -------------------------------------------------------------------------------------
 

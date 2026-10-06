@@ -59,7 +59,7 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     if (!stream_lease_.valid()) {
         // Sized for the prompt's largest span: as many tokens as remain (at most the cap) in calls
         // of the configured chunk, plus a remainder call.
-        const std::uint32_t remaining = std::min(lane.prompt_tokens - lane.state_tokens, kWalkMaxTokens);
+        const std::uint32_t remaining = std::min(lane.prefill_end - lane.state_tokens, kWalkMaxTokens);
         const std::size_t chunks      = remaining / static_cast<std::uint32_t>(chunk_) + 2;
         if (!stream_chunk(static_cast<std::int32_t>(lane.calls[first] - lane.state_tokens),
                           walk_bytes(remaining, chunks))) {

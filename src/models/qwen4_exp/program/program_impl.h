@@ -83,8 +83,9 @@ struct BasePlanImpl {
     ops::SamplingConfig sampling;
     std::vector<TokenId> readout_tokens;               // read at the prompt's frontier (/v1/decide)
     std::shared_ptr<const ConstraintPlan> constraint;  // null: unconstrained
-    std::uint32_t pages = 0; // KV page groups the request needs
-    bool reuse          = false; // the prefix cache may resume and publish this request
+    std::uint32_t pages     = 0; // KV page groups the request needs at most (its extent)
+    std::uint32_t positions = 0; // the extent: prompt + effective output, at most max_context
+    bool reuse              = false; // the prefix cache may resume and publish this request
     std::shared_ptr<const VisionAdmission> vision;
     std::shared_ptr<const PreparedPrompt> prompt; // the request's prompt, moved in by plan_request
 };
@@ -291,6 +292,31 @@ inline ops::SamplingConfig translate(const ResolvedSamplingParameters& s) {
     return out;
 }
 
+// A paused request (design §19.3.13): what its lane held besides model state. The pause published
+// the state at `target` to the prefix cache (a request the cache publishes); a resume binds the
+// ledger from the deepest cached state up to `target` and replays the rest without sampling.
+struct ResumeStateImpl {
+    std::uint32_t target = 0;   // the paused frontier: the positions the lane's state held
+    bool generated       = false; // paused after its first token (the ledger runs past the prompt)
+    std::vector<std::int32_t> history; // prompt, then committed output
+    std::uint32_t prompt_tokens = 0;
+    // Prefix-cache lookup keys over the ledger (the prompt's, extended over published output
+    // blocks), and the capture the pause published.
+    std::vector<std::uint64_t> hashes;
+    std::uint64_t capture = 0;
+    runtime::BeginSummary begin;
+    std::uint64_t prefill_ns = 0, decode_ns = 0, decode_share_ns = 0;
+    double vision_seconds = 0;
+    SpeculativeStats speculative;
+    std::array<double, 8> mtp_accept{};
+    std::uint64_t mtp_policy_rounds = 0;
+    std::vector<ConstrainedDraw> constraint_trace;
+    ExpertResidency::Stats cache_at_admission;
+    std::uint64_t cpu_served_at_admission = 0;
+    NgramVolume::Counters ngram;
+    GateTraffic gate;
+};
+
 class ProgramImpl {
 public:
     enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable };
@@ -302,6 +328,11 @@ public:
         std::vector<std::int32_t> history; // prompt, then committed output
         std::uint32_t prompt_tokens = 0;
         std::uint32_t state_tokens  = 0; // positions already in the model state
+        // Where the prefill phase ends: the prompt, or a resumed lane's paused frontier, which its
+        // replay reaches without sampling (design §19.3.13).
+        std::uint32_t prefill_end = 0;
+        bool replay               = false;
+        std::uint32_t extent      = 0; // the positions the request may ever hold (prompt + output)
         // The prompt's planned prefill calls (design §19.3.1): exclusive ends, the last prompt_tokens.
         std::vector<std::uint32_t> calls;
         std::size_t next_call = 0;
@@ -846,7 +877,8 @@ public:
         base->vision   = std::move(vision);
         base->sampling = translate(options.sampling);
         const std::uint32_t positions = std::min(options_.max_context, n + base->summary.effective_output_tokens);
-        base->pages  = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
+        base->positions = positions;
+        base->pages     = (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
         base->prompt = std::make_shared<const PreparedPrompt>(std::move(prompt));
         return RequestBasePlan(std::move(base));
     }
@@ -857,6 +889,19 @@ public:
                             base.impl_->vision->window.frames <= residency_->frames() - residency_->frames() / 4;
         return base.impl_ != nullptr && frames && base.impl_->pages <= pool_->capacity_pages() &&
                base.impl_->pages <= static_cast<std::uint32_t>(pages_per_row_);
+    }
+
+    // The positions one round may write past the lane's frontier: a verification's columns and the
+    // MTP drafter's cells (design §19.3.13).
+    std::uint32_t round_positions() const noexcept {
+        return static_cast<std::uint32_t>(std::max(max_width_, mtp_ ? mtp_k_ + 1 : 1)) + 1U;
+    }
+
+    // The KV pages a binding of `base` whose prefill ends at `end` reserves: through one round past
+    // it, within the request's extent.
+    std::uint32_t binding_pages(const BasePlanImpl& base, std::uint32_t end) const noexcept {
+        const std::uint32_t positions = std::min(base.positions, end + round_positions());
+        return (positions + kPagedKVPageSize - 1) / kPagedKVPageSize;
     }
 
     static PrefixReusePath reuse_path_for(runtime::prefix_cache::SnapshotKind kind) noexcept {
@@ -870,7 +915,7 @@ public:
         auto impl      = std::make_shared<QuoteImpl>();
         impl->summary  = base.summary;
         impl->sampling = base.sampling;
-        impl->pages    = base.pages;
+        impl->pages    = binding_pages(base, base.summary.prompt_tokens);
         impl->vision   = base.vision;
         SourceCandidate out;
         std::size_t calls = plan_prefill(data, 0, {}, base.reuse).ends.size();
@@ -917,13 +962,16 @@ public:
     // falls back to the next source (the root).
     runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,
                                                const SourceCandidate& source, ResumeState* resume) {
-        if (resume != nullptr) { throw std::logic_error("Qwen4Exp: a request is never paused, so none resumes"); }
         if (source.hybrid == nullptr) { throw std::logic_error("Qwen4Exp: a binding source carries no quote"); }
+        if (resume != nullptr && resume->impl_ == nullptr) { throw std::logic_error("Qwen4Exp: a resume carries no state"); }
         const QuoteImpl& q = *source.hybrid;
         const std::uint32_t index = destination.value;
-        if (index >= options_.max_concurrency || lanes_[index].phase != Phase::Free || transaction_lane_) {
+        if (index >= options_.max_concurrency || lanes_[index].phase != Phase::Free || in_transaction()) {
             throw std::logic_error("Qwen4Exp: the binding destination is not free");
         }
+        // A request paused after its first token binds its ledger; one paused inside its prompt binds
+        // the prompt again, from the deepest cached state (its pause published the frontier).
+        if (resume != nullptr && resume->impl_->generated) { return bind_replay(*base.impl_, index, *resume->impl_); }
         Lane& lane = lanes_[index];
         kv_busy();
         const BasePlanImpl& b = *base.impl_;
@@ -1043,9 +1091,289 @@ public:
                                                source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * index, 0, kGateStatsBytes,
                                    device_.stream));
+        lane.prefill_end = lane.prompt_tokens;
+        lane.replay      = false;
+        lane.extent      = b.positions;
+        // A request paused inside its prompt keeps what it had measured and decided.
+        if (resume != nullptr) { restore_request(lane, *resume->impl_); }
         transaction_lane_ = index;
+        replaying_        = false;
         ++revision_;
         runtime::ResourceReservation out;
+        out.reserved = true;
+        return out;
+    }
+
+    // ---------------------------------------------------------------- pause and replay (design §19.3.13)
+
+    // The lane's request-level state a pause keeps (everything but the model state and the pages).
+    void save_request(const Lane& lane, ResumeStateImpl& r) const {
+        r.begin                   = lane.begin;
+        r.prefill_ns              = lane.prefill_ns;
+        r.decode_ns               = lane.decode_ns;
+        r.decode_share_ns         = lane.decode_share_ns;
+        r.vision_seconds          = lane.vision_seconds;
+        r.speculative             = lane.speculative;
+        r.mtp_accept              = lane.mtp_accept;
+        r.mtp_policy_rounds       = lane.mtp_policy_rounds;
+        r.constraint_trace        = lane.constraint_trace;
+        r.cache_at_admission      = lane.cache_at_admission;
+        r.cpu_served_at_admission = lane.cpu_served_at_admission;
+        r.ngram                   = lane.ngram;
+        r.gate                    = lane.gate;
+    }
+
+    void restore_request(Lane& lane, const ResumeStateImpl& r) {
+        lane.begin                   = r.begin;
+        lane.prefill_ns              = r.prefill_ns;
+        lane.decode_ns               = r.decode_ns;
+        lane.decode_share_ns         = r.decode_share_ns;
+        lane.vision_seconds          = r.vision_seconds;
+        lane.speculative             = r.speculative;
+        lane.mtp_accept              = r.mtp_accept;
+        lane.mtp_policy_rounds       = r.mtp_policy_rounds;
+        lane.constraint_trace        = r.constraint_trace;
+        lane.cache_at_admission      = r.cache_at_admission;
+        lane.cpu_served_at_admission = r.cpu_served_at_admission;
+        lane.ngram                   = r.ngram;
+        lane.gate                    = r.gate;
+    }
+
+    // The resumed request's ledger as a prompt: its tokens through the next input, their RoPE
+    // positions, and its lookup keys (the prompt's, chained over the output blocks as
+    // prefix_publish chains them); no tap hints (a replay publishes blocks, not taps).
+    qwen3_5::PreparedPromptData ledger_prompt(const qwen3_5::PreparedPromptData& prompt,
+                                              const ResumeStateImpl& r) const;
+
+    // Binds a request paused after its first token: the deepest cached state of its ledger up to
+    // the paused frontier (the pause's own capture when it is still cached), then a replay of the
+    // ledger to that frontier, without sampling. The pages cover the replay and one round.
+    runtime::ResourceReservation bind_replay(const BasePlanImpl& b, std::uint32_t index, ResumeStateImpl& r) {
+        Lane& lane = lanes_[index];
+        kv_busy();
+        const auto& prompt = qwen3_5::PreparedPromptAccess::view(*b.prompt);
+        const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, r);
+        const std::uint32_t pages = binding_pages(b, r.target + 1U);
+        std::optional<PrefixSelection> selection;
+        if (prefix_) {
+            // The pause's capture lands first, so the selection can see it.
+            prefix_->drain();
+            selection = b.reuse ? prefix_select(ledger, b, index) : prefix_root(ledger, b);
+            if (!selection) {
+                runtime::ResourceReservation out;
+                out.shortage.main_kv_pages = pages > pool_->available_pages() ? pages - pool_->available_pages() : 1U;
+                return out;
+            }
+            // A state cached at the paused frontier itself leaves nothing to replay.
+            selection->plan = selection->frontier < r.target
+                                  ? prefix::plan_calls(selection->frontier, r.target, static_cast<std::uint32_t>(chunk_), {},
+                                                       prefix::CallCost{.model = options_.prefix_cost,
+                                                                        .span_seconds = options_.prefix_span_seconds})
+                                  : prefix::CallPlan{};
+            prefix_pin(*selection);
+        }
+        lane.history       = r.history;
+        lane.prompt_tokens = r.prompt_tokens;
+        lane.rope.prompt_tokens = r.prompt_tokens;
+        lane.rope.delta         = prompt.rope_delta;
+        if (prompt.has_media()) {
+            lane.rope.prompt.assign(prompt.positions.begin(), prompt.positions.end());
+        } else {
+            lane.rope.prompt.clear();
+        }
+        lane.state_tokens   = 0;
+        lane.vision_seconds = 0;
+        lane.speculative    = {};
+        lane.mtp_cells      = 0;
+        lane.mtp_live       = mtp_;
+        lane.row            = tables_->acquire(static_cast<std::int32_t>(index));
+        if (selection) {
+            lane.prefix.reuse          = b.reuse;
+            lane.prefix.hashes         = ledger.block_hashes;
+            lane.prefix.extras         = prompt.block_extras;
+            lane.prefix.trailing_extra = prefix_trailing_extra(prompt);
+            lane.prefix.hints.clear();
+            lane.prefix.exclusions = prefix_exclusions(prompt);
+            pc_make_room(selection->need);
+            if (pool_->available_pages() < selection->need) { (void)grow_kv(selection->need); }
+            auto reservation = pool_->reserve(selection->need);
+            if (!reservation) {
+                runtime::ResourceReservation out;
+                out.shortage.main_kv_pages = selection->need - std::min(selection->need, pool_->available_pages());
+                prefix_unpin(*selection);
+                lane.row = KVExecutionRowLease{};
+                return out;
+            }
+            if (b.vision) { vision_reserve(lane, plan_vision(ledger, selection->frontier), ledger); }
+            const std::uint64_t restored = prefix_->counters().host_restore_bytes;
+            prefix_activate(lane, index, *selection, *reservation, pages);
+            lane.prefix.cached_tokens  = selection->cached_tokens;
+            lane.prefix.restored_bytes = prefix_->counters().host_restore_bytes - restored;
+            lane.prefix.taps.clear();
+            lane.reservation   = std::move(*reservation);
+            lane.prefix.reused = selection->frontier;
+            lane.calls         = selection->plan.ends;
+        } else {
+            if (pool_->available_pages() < pages) { (void)grow_kv(pages); }
+            auto reservation = pool_->reserve(pages);
+            if (!reservation) {
+                runtime::ResourceReservation out;
+                out.shortage.main_kv_pages = pages - std::min(pages, pool_->available_pages());
+                lane.row = KVExecutionRowLease{};
+                return out;
+            }
+            if (b.vision) { vision_reserve(lane, plan_vision(ledger, 0), ledger); }
+            lane.pages.clear();
+            lane.pages.reserve(pages);
+            pool_->materialize(*reservation, pages, lane.pages);
+            lane.reservation = std::move(*reservation);
+            tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages), device_.stream);
+            reset_slot(index);
+            lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {},
+                                            prefix::CallCost{.model = options_.prefix_cost,
+                                                             .span_seconds = options_.prefix_span_seconds})
+                             .ends;
+        }
+        lane.next_call = 0;
+        if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
+            lane.proposer = std::make_unique<qwen3_5::detail::NgramProposer>(proposer_tokens_, proposer_tokens_ / 2);
+            for (const auto token : lane.history) { lane.proposer->append(token); }
+        }
+        lane.sampling = b.sampling;
+        lane.sampling.token_counts =
+            static_cast<std::int32_t*>(token_counts_.p) + static_cast<std::size_t>(index) * token_domain_;
+        rebuild_token_counts(lane);
+        lane.readout.clear(); // the prompt's readout was delivered before the pause
+        lane.prompt     = b.prompt;
+        lane.constraint = b.constraint;
+        lane.constraint_round.clear();
+        lane.epoch = ++next_epoch_;
+        restore_request(lane, r);
+        CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * index, 0, kGateStatsBytes,
+                                   device_.stream));
+        lane.extent      = b.positions;
+        lane.prefill_end = r.target;
+        // The cached state may reach the paused frontier itself: then nothing replays.
+        lane.replay = lane.state_tokens < r.target;
+        lane.phase  = lane.replay ? Phase::Prefill : Phase::Decode;
+        if (!lane.replay && lane.vision) { vision_release(lane); }
+        transaction_lane_ = index;
+        replaying_        = lane.replay;
+        ++revision_;
+        runtime::ResourceReservation out;
+        out.reserved = true;
+        return out;
+    }
+
+    // Penalty counts over the request's output so far (the sampler counts output tokens only),
+    // counted on the host: a binding may overlap a round that still uses the workspace.
+    void rebuild_token_counts(const Lane& lane) {
+        const cudaStream_t s = device_.stream;
+        auto* counts         = lane.sampling.token_counts;
+        if (lane.sampling.presence_penalty == 0.0F && lane.sampling.frequency_penalty == 0.0F) {
+            CUDA_CHECK(cudaMemsetAsync(counts, 0, 4ULL * token_domain_, s));
+            return;
+        }
+        std::vector<std::int32_t> host(static_cast<std::size_t>(token_domain_), 0);
+        for (std::size_t i = lane.prompt_tokens; i < lane.history.size(); ++i) {
+            const std::int32_t token = lane.history[i];
+            if (token >= 0 && token < token_domain_) { ++host[static_cast<std::size_t>(token)]; }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(counts, host.data(), 4ULL * token_domain_, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaStreamSynchronize(s)); // the host table is read before it goes out of scope
+    }
+
+    // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
+    // lane's blocks and its state at the frontier, exactly as a consistent abort leaves them, the
+    // lane is released and a Pause transaction hands the Engine the ResumeState.
+    bool start_pause(SequenceHandle sequence) {
+        if (in_transaction() || pending_transaction_ != 0) {
+            diagnostic(std::string("Qwen4Exp: pause refused: ") +
+                           (in_transaction() ? "a context transaction is open" : "a round awaits its commit"),
+                       DiagnosticLevel::Warning);
+            return false;
+        }
+        const std::uint32_t index = lane_of(sequence);
+        Lane& lane                = lanes_[index];
+        if (lane.phase != Phase::Prefill && lane.phase != Phase::Decode) {
+            diagnostic("Qwen4Exp: pause refused: lane " + std::to_string(index) + " is in phase " +
+                           std::to_string(static_cast<int>(lane.phase)),
+                       DiagnosticLevel::Warning);
+            return false;
+        }
+        // Inside a layer walk's span the layers are at different positions: the pause publishes
+        // nothing past the span's start (its taps did), and the walk is abandoned with the lane.
+        const bool walking = walk_.active && walk_.lane == index;
+        device_.synchronize();
+        auto saved           = std::make_unique<ResumeStateImpl>();
+        saved->generated     = lane.replay || lane.phase == Phase::Decode;
+        saved->target        = lane.replay ? lane.prefill_end : lane.state_tokens;
+        saved->history       = lane.history;
+        saved->prompt_tokens = lane.prompt_tokens;
+        save_request(lane, *saved);
+        // A replaying lane short of its frontier publishes what it has rebuilt so far.
+        if (!walking) { prefix_finish(lane, index); }
+        saved->capture = lane.prefix.capture;
+        release(index);
+        pause_.emplace(ResumeState(std::move(saved)));
+        ++revision_;
+        return true;
+    }
+
+    // One prefill call of a resumed lane's ledger toward its paused frontier, without sampling.
+    ReplayProgress advance_replay(SequenceHandle sequence) {
+        const std::uint32_t index = lane_of(sequence);
+        if (!lanes_[index].replay || lanes_[index].phase != Phase::Prefill) {
+            throw std::logic_error("Qwen4Exp: replay on a lane that is not replaying");
+        }
+        const PrefillProgress progress = advance_prefill(sequence);
+        ReplayProgress out;
+        out.processed_tokens = progress.processed_prompt_tokens;
+        out.complete         = progress.complete;
+        out.timing           = progress.timing;
+        return out;
+    }
+
+    // Grows each unit's lane to its next round (design §19.3.13): a decode or control unit needs the
+    // positions it writes, a verification's columns and the drafter's cells, within the request's
+    // extent. A shortage cached blocks and the elastic pool cannot cover is reported, and the Engine
+    // reclaims or pauses the youngest resident.
+    runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units) {
+        runtime::ResourceReservation out;
+        for (const ExecutionUnit& unit : units) {
+            const std::uint32_t index = lane_of(unit.sequence);
+            Lane& lane                = lanes_[index];
+            std::uint32_t end         = lane.state_tokens + round_positions();
+            if (unit.kind == ExecutionUnitKind::Control) { end += unit.tokens; }
+            if (unit.kind == ExecutionUnitKind::Prefill || unit.kind == ExecutionUnitKind::Replay) {
+                end = lane.prefill_end + round_positions();
+            }
+            const std::uint32_t needed = (std::min(end, lane.extent) + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            const std::uint32_t have   = lane.prefix.page_base + static_cast<std::uint32_t>(lane.pages.size());
+            if (needed <= have) { continue; }
+            const std::uint32_t missing = needed - have;
+            kv_busy();
+            if (prefix_) { pc_make_room(missing); }
+            if (pool_->available_pages() < missing) { (void)grow_kv(missing); }
+            if (pool_->available_pages() < missing && prefix_ && prefix_->transfers_pending()) {
+                // Blocks pinned only by their in-flight Host writes (a lane just paused or finished)
+                // become evictable once those land: wait for them before reporting a shortage.
+                prefix_->drain();
+                pc_make_room(missing);
+            }
+            auto reservation = pool_->reserve(missing);
+            if (!reservation) {
+                out.shortage.main_kv_pages += std::max(1U, missing - std::min(missing, pool_->available_pages()));
+                return out;
+            }
+            std::vector<DeviceKVPageLease> grown;
+            grown.reserve(missing);
+            pool_->materialize(*reservation, missing, grown);
+            tables_->publish(lane.row.handle(), static_cast<std::int32_t>(have), std::span<const DeviceKVPageLease>(grown),
+                             device_.stream);
+            for (DeviceKVPageLease& page : grown) { lane.pages.push_back(std::move(page)); }
+            ++revision_;
+        }
         out.reserved = true;
         return out;
     }
@@ -1053,6 +1381,15 @@ public:
     // Advances the binding: a media prompt's encode window one step per call (design §19.3.2; other
     // lanes run between steps), then the lane is published.
     ContextProgress poll_context(runtime::CancellationFlagView cancellation) {
+        if (pause_) {
+            ContextProgress out{.kind = ContextOperationKind::Pause};
+            out.advanced  = true;
+            out.complete  = true;
+            out.published = true;
+            out.paused.emplace(std::move(*pause_));
+            pause_.reset();
+            return out;
+        }
         if (!transaction_lane_) { throw std::logic_error("Qwen4Exp: there is no context operation"); }
         ContextProgress out{.kind = ContextOperationKind::Bind};
         Lane& admitted = lanes_[*transaction_lane_];
@@ -1076,12 +1413,13 @@ public:
         out.advanced  = true;
         out.complete  = true;
         out.published = true;
+        out.replaying = replaying_;
         out.sequence  = handle(*transaction_lane_);
         transaction_lane_.reset();
         return out;
     }
 
-    [[nodiscard]] bool in_transaction() const noexcept { return transaction_lane_.has_value(); }
+    [[nodiscard]] bool in_transaction() const noexcept { return transaction_lane_.has_value() || pause_.has_value(); }
 
     // Whether the open binding holds `sequence` back (its lane is still being published).
     // A lane's context is blocked while it is being bound, and a prefilling lane while another
@@ -1098,6 +1436,11 @@ public:
         if (!prefix_ || shortage.main_kv_pages == 0) { return false; }
         const std::uint32_t before = pool_->available_pages();
         pc_make_room(before + shortage.main_kv_pages);
+        if (pool_->available_pages() == before && prefix_->transfers_pending()) {
+            // Blocks pinned only by in-flight Host writes become evictable once those land.
+            prefix_->drain();
+            pc_make_room(before + shortage.main_kv_pages);
+        }
         return pool_->available_pages() > before;
     }
 
@@ -1120,7 +1463,7 @@ public:
             return walk_step(lane, index, start);
         }
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
-        const bool last          = begin + width == static_cast<std::int32_t>(lane.prompt_tokens);
+        const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
         // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate, so it
         // does not churn the expert cache (design §19.3.1).
         const std::size_t promotions = width <= kServedCallColumns
@@ -1174,6 +1517,23 @@ public:
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = tokens;
         out.complete                = last;
+        if (last && lane.replay) {
+            // A replay ends at its paused frontier, whose next input the ledger already holds: the
+            // lane decodes from there (design §19.3.13).
+            {
+                const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
+                device_.synchronize();
+            }
+            trace_round(RouteTraceKind::PrefillChunk, 1, width, static_cast<std::uint32_t>(width), promotions,
+                        static_cast<std::uint32_t>(begin));
+            residency_->after_round(device_.stream, width, promotions);
+            apply_vram_target(false);
+            lane.replay = false;
+            lane.phase  = Phase::Decode;
+            out.timing.submit_host_ns = elapsed_ns(start);
+            lane.prefill_ns += out.timing.submit_host_ns;
+            return out;
+        }
         if (last) {
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
@@ -1960,6 +2320,9 @@ private:
         lane.constraint_trace.clear();
         lane.phase        = Phase::Free;
         lane.state_tokens = 0;
+        lane.prefill_end  = 0;
+        lane.replay       = false;
+        lane.extent       = 0;
         ++revision_;
         kv_busy();
         try { shrink_kv(); } catch (...) {}
@@ -3031,7 +3394,7 @@ private:
     // The root start of a request with a prefix cache: every page reserved, the cold call grid.
     PrefixSelection prefix_root(const qwen3_5::PreparedPromptData& prompt, const BasePlanImpl& base) {
         PrefixSelection root;
-        root.need = base.pages;
+        root.need = binding_pages(base, static_cast<std::uint32_t>(prompt.token_ids.size()));
         root.plan = plan_prefill(prompt, 0, {}, base.reuse);
         return root;
     }
@@ -3450,6 +3813,8 @@ private:
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;
     std::optional<std::uint32_t> transaction_lane_;
+    std::optional<ResumeState> pause_; // the open Pause transaction's result
+    bool replaying_ = false;           // the open binding replays toward a paused frontier
     std::uint64_t next_epoch_          = 0;
     std::uint64_t next_transaction_    = 0;
     std::uint64_t pending_transaction_ = 0;

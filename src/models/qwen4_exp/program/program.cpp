@@ -9,6 +9,12 @@ RequestBasePlan::~RequestBasePlan()                                     = defaul
 
 const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept { return impl_->summary; }
 
+ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept : impl_(std::move(impl)) {}
+ResumeState::ResumeState(ResumeState&&) noexcept            = default;
+ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
+ResumeState::~ResumeState()                                 = default;
+std::uint32_t ResumeState::frontier() const noexcept { return impl_ ? impl_->target : 0U; }
+
 Program::Program(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
     : impl_(std::make_unique<detail::ProgramImpl>(parameters, device, std::move(options))) {}
 
@@ -60,8 +66,16 @@ bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) { return im
 std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) { return impl_->hybrid_prefetch(base); }
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
 
-ReplayProgress Program::advance_replay(SequenceHandle, runtime::ExecutionTiming*) {
-    throw std::logic_error("Qwen4Exp never pauses a request, so none replays");
+runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
+    return impl_->reserve_units(units);
+}
+
+bool Program::start_pause(SequenceHandle sequence, bool, runtime::ExecutionTiming*) {
+    return impl_->start_pause(sequence);
+}
+
+ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::ExecutionTiming*) {
+    return impl_->advance_replay(sequence);
 }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*) {
