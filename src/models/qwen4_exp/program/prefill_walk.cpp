@@ -261,7 +261,6 @@ void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
 
 PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::time_point start) {
     const std::uint32_t L = c_.num_hidden_layers;
-    const std::size_t n   = walk_.widths.size();
     std::uint32_t tokens  = 0;
     for (const auto w : walk_.widths) { tokens += static_cast<std::uint32_t>(w); }
     // The first step already ran layer 0 while staging.
@@ -299,7 +298,6 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     // The span is enqueued: the lane's state is at its end in every layer.
     const std::int32_t begin = walk_.begins.back(), width = walk_.widths.back();
     const bool last          = walk_.end_call == lane.calls.size();
-    const std::size_t promotions = kPrefillPromotionsPerLayer * n;
     lane.state_tokens = lane.calls[walk_.end_call - 1];
     lane.next_call    = walk_.end_call;
     residency_->enqueue_route_download(device_.stream, width);
@@ -319,15 +317,18 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         }
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
-        // The route log holds the span's last chunk (every chunk routes nearly every expert). No
-        // promotions: the stream lease still holds most frames, so they would churn through the
-        // rest (~12,000 records, ~1.2 s of link per 64K span), and the next span would wait for
-        // them; the prompt's last span promotes.
+        // The route log holds the span's last chunk (every chunk routes nearly every expert).
         trace_round(RouteTraceKind::PrefillChunk, 1, width, tokens, 0, static_cast<std::uint32_t>(begin));
         residency_->after_round(device_.stream, width, 0);
         apply_vram_target(false);
     }
-    return prefill_progress(lane, index, begin, width, tokens, last, promotions, start);
+    // A walk promotes no experts (its routes still count toward the cache's scores). Between spans
+    // the stream lease holds most frames, so promotions would churn through the rest (~12,000
+    // records, ~1.2 s of link per 64K span) and the next span would wait for them. After the
+    // prompt they would fill the returned frames with the prompt's experts while the answer's own
+    // staged misses land there anyway: 16 per layer and chunk measured slower than none for every
+    // answer length (128K + 512 tokens: 23.16 -> 21.10 s; design §19.3.17).
+    return prefill_progress(lane, index, begin, width, tokens, last, 0, start);
 }
 
 void ProgramImpl::walk_abandon() noexcept {
