@@ -9,6 +9,7 @@
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
+#include "core/link_probe.h"
 #include "core/linear_attention_state.h"
 #include "core/nvtx.h"
 #include "core/paged_kv_cache.h"
@@ -698,6 +699,7 @@ public:
         allocate(staging_, plan_.staging, allocated);
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
+        measure_link();
         // The expert cache's tables and route log; its frames come last (below).
         residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device);
         allocated += plan_.bytes.residency;
@@ -744,12 +746,16 @@ public:
                     .workers     = static_cast<int>(cpu_workers),
                     .max_jobs    = static_cast<int>(std::min<std::uint32_t>(cpu_jobs, ops::offloaded_moe::kMaxCpuJobs)),
                     .max_columns = assist ? kAssistMaxColumns : decode_columns,
-                    .pcie_divisor = options_.cpu_pcie_divisor,
+                    .pcie_divisor = pcie_divisor(),
                     .wide_from   = assist ? decode_columns + 1 : 0,
                     .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
                     .cpus        = {}});
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));
+            }
+            if (assist && expert_stream_ && options_.prefill_cpu_split) {
+                split_policy_ = std::make_unique<SplitPolicy>(*this);
+                experts.split = split_policy_.get();
             }
         }
         create_prefix_cache();
@@ -1527,10 +1533,10 @@ private:
     // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
     // promotion moves as many PCIe bytes as serving the expert once zero-copy.
     static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
-    // Once the frames are full, decode promotes only every kDecodePromotionInterval-th round: a
-    // promotion moves as many PCIe bytes as serving its expert once, and fewer of them measured
-    // faster at 512 tokens (design section 19.2). Until then every round promotes, so a cold cache
-    // fills at the full rate.
+    // Once the frames are full, decode promotes only every kDecodePromotionInterval-th round on the
+    // reference link (promotion_interval scales it to the measured one): a promotion moves as many
+    // PCIe bytes as serving its expert once, and fewer of them measured faster at 512 tokens (design
+    // section 19.2). Until then every round promotes, so a cold cache fills at the full rate.
     static constexpr std::uint64_t kDecodePromotionInterval = 4;
     // Misses staged per pass of a layer's experts: every decode and verify call's misses in one
     // pass; a prefill chunk's in several.
@@ -1547,10 +1553,18 @@ private:
         if (stats.promotions + stats.landed < residency_->frames()) {
             return kDecodePromotionsPerLayer * tokens;
         }
+        const std::uint64_t interval = promotion_interval();
         budget_tokens_ += tokens;
-        const std::uint64_t due = budget_tokens_ / kDecodePromotionInterval;
-        budget_tokens_ %= kDecodePromotionInterval;
+        const std::uint64_t due = budget_tokens_ / interval;
+        budget_tokens_ %= interval;
         return static_cast<std::size_t>(due) * kDecodePromotionsPerLayer;
+    }
+    // The interval at the measured link (design §19.3.12): a promotion's bytes cost less wall time
+    // on a faster link, whose rounds leave it more idle, so it promotes proportionally more often
+    // (x8 4, x16 2; the x16 value is derived, not measured).
+    std::uint64_t promotion_interval() const noexcept {
+        const double scaled = static_cast<double>(kDecodePromotionInterval) * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
+        return static_cast<std::uint64_t>(std::clamp(std::lround(scaled), 1L, 8L));
     }
     std::uint64_t budget_tokens_ = 0;
 
@@ -2151,11 +2165,14 @@ private:
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         residency_->before_round(s);
-        // The ring's copies queue on the copy engine behind the io upload above.
-        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s); }
+        // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
+        // share (design §19.3.12) gates the stream on each layer's routing.
+        split_call_ = streamed && split_policy_ && batch * width <= split_columns();
+        if (streamed) { expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_); }
         const WideWork wide(*this, batch * width);
         forward_call(batch, width, logit_columns, nullptr, chunk, vision, nullptr, streamed);
         if (streamed) { expert_stream_->end(); }
+        split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
     }
 
@@ -2210,6 +2227,7 @@ private:
             stream_wide_bytes_ = static_cast<std::size_t>(wide_frames) * stride;
             stream_walk_bytes_ = walk ? static_cast<std::size_t>(walk_frames) * stride : 0;
             stream_at_lease_   = expert_stream_->stats();
+            split_at_lease_    = forward_->split_stats();
         }
         return true;
     }
@@ -2295,11 +2313,16 @@ private:
         const auto& now       = expert_stream_->stats();
         const auto streamed   = now.streamed - stream_at_lease_.streamed;
         const auto copies     = now.copies - stream_at_lease_.copies;
-        char line[192];
-        std::snprintf(line, sizeof(line), "prefill expert stream: %llu experts (%.2f GiB) in %llu copies through %u lent frames",
+        const auto split      = forward_->split_stats();
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "prefill expert stream: %llu experts (%.2f GiB) in %llu copies through %u lent frames; "
+                      "CPU split: %llu experts on the CPU, %llu gated copies",
                       static_cast<unsigned long long>(streamed),
                       static_cast<double>(streamed) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
-                      static_cast<unsigned long long>(copies), frames);
+                      static_cast<unsigned long long>(copies), frames,
+                      static_cast<unsigned long long>(split.cpu_experts - split_at_lease_.cpu_experts),
+                      static_cast<unsigned long long>(split.streamed_experts - split_at_lease_.streamed_experts));
         diagnostic(line);
     }
 
@@ -2387,6 +2410,7 @@ private:
         next_waits_      = {};
         fb.vision        = vision;
         fb.stream        = streamed;
+        fb.split         = streamed && split_call_;
         // Decode and verification rounds export their final residuals for the MTP catch-up.
         const std::int32_t cols = batch * width;
         if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
@@ -3067,6 +3091,54 @@ private:
     [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
                                                 std::span<const std::uint32_t> existing, bool taps) const;
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
+
+    // ---- the host-to-device link (design §19.4: bandwidth-dependent choices follow the machine) ----
+    // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
+    static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
+    double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
+    // Measures the link once, by copying expert records from the pinned banks into the staging
+    // slots before any call uses them (or takes ProgramOptions::link_bytes_per_second), and
+    // rescales the link-bound costs: the prefix cost's restore rate and the walk-span cost (one pass
+    // of the experts over the link).
+    void measure_link() {
+        double rate = options_.link_bytes_per_second;
+        if (rate <= 0.0 && staging_.p != nullptr && plan_.staging > 0) {
+            rate = measure_h2d_bytes_per_second(parameters_.layers.front().moe.bank->planes.records, staging_.p,
+                                                plan_.staging, 3);
+        }
+        if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
+        link_bytes_per_second_ = rate;
+        options_.prefix_cost.h2d_bytes_per_second = rate;
+        options_.prefix_span_seconds *= kReferenceLinkBytesPerSecond / rate;
+        if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
+        char text[256];
+        std::snprintf(text, sizeof(text),
+                      "host-to-device link: %.1f GB/s%s; decode misses kept on the link: 1/%d; decode promotes every "
+                      "%llu tokens; prefill CPU split up to %d columns",
+                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured", pcie_divisor(),
+                      static_cast<unsigned long long>(promotion_interval()),
+                      options_.prefill_cpu_split ? split_columns() : 0);
+        diagnostic(text);
+    }
+
+    // The share of a decode call's misses the PCIe stage keeps (misses / divisor): 3 measured
+    // fastest on the reference link; a faster link carries more of them (x16: 2), a slower one fewer.
+    [[nodiscard]] int pcie_divisor() const noexcept {
+        if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
+        return std::max(2, static_cast<int>(std::lround(1.0 + 2.0 * kReferenceLinkBytesPerSecond / link_bytes_per_second_)));
+    }
+
+    // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
+    // link, inversely to the measured one; at most the CPU channel's call width).
+    [[nodiscard]] std::int32_t split_columns() const noexcept {
+        const double scaled = options_.cpu_split_columns * kReferenceLinkBytesPerSecond / link_bytes_per_second_;
+        return static_cast<std::int32_t>(std::min<double>(scaled, ops::offloaded_moe::kMaxCpuCallColumns));
+    }
+
+public:
+    [[nodiscard]] double link_bytes_per_second() const noexcept { return link_bytes_per_second_; }
+
+private:
     // ---- elastic KV (design §19.3.11) ----
     static constexpr std::size_t kKvChunkBytes   = 2ULL << 20;
     static constexpr std::uint32_t kKvBaseTokens = 32768; // backed at startup
@@ -3224,6 +3296,7 @@ private:
     DeviceBuffer wide_fallback_;             // the wide arena when nothing could be lent
     std::unique_ptr<WorkspaceArena> wide_arena_; // the arena swapped with *work_ around a wide call
     execution::ExpertStream::Stats stream_at_lease_;
+    execution::Forward::SplitStats split_at_lease_;
 
     // ---------------------------------------------------------------- layer walk (prefill_walk.cpp)
     // Design §19.3.8 F4: a span of consecutive streamed calls of one prompt runs layer-major (every
@@ -3260,6 +3333,63 @@ private:
     [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call) const;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
+
+    // ---- prefill CPU split (design §19.3.12) ----
+    // Gives the CPU the thinnest non-resident experts of a layer while the link carries the rest:
+    // narrow ones (n <= 8) in order of n, then expert id, as many as minimise the later of the
+    // CPU's predicted time and the link's time for the experts left to it.
+    class SplitPolicy final : public execution::CpuSplitPolicy {
+    public:
+        explicit SplitPolicy(const ProgramImpl& program) : program_(program) {}
+        std::uint32_t choose(std::uint32_t layer, std::span<const std::int32_t> columns,
+                             std::span<std::uint8_t> cpu) const override {
+            const auto& p              = program_;
+            const std::uint32_t E      = p.c_.moe.experts;
+            const std::int32_t* frames = p.residency_->host_table() + static_cast<std::size_t>(layer) * E;
+            const double link          = static_cast<double>(p.residency_->frame_stride()) / p.link_bytes_per_second_;
+            const double per_expert    = 1.0 / p.options_.cpu_split_expert_rate;
+            const double per_column    = 1.0 / p.options_.cpu_split_column_rate;
+            constexpr int kNarrow      = ops::offloaded_moe::kMaxCpuColumns;
+            std::array<std::uint32_t, kNarrow + 1> width_count{};
+            std::uint32_t absent = 0;
+            for (std::uint32_t e = 0; e < E; ++e) {
+                if (columns[e] <= 0 || frames[e] >= 0) { continue; }
+                ++absent;
+                if (columns[e] <= kNarrow) { ++width_count[static_cast<std::size_t>(columns[e])]; }
+            }
+            // The best count: the CPU's time grows and the link's shrinks with each expert moved.
+            double best_time = absent * link, cpu_time = 0.0;
+            std::uint32_t best = 0, k = 0;
+            for (int n = 1; n <= kNarrow; ++n) {
+                for (std::uint32_t i = 0; i < width_count[static_cast<std::size_t>(n)]; ++i) {
+                    if (k == static_cast<std::uint32_t>(ops::offloaded_moe::kMaxCpuJobs)) { break; }
+                    cpu_time += std::max(per_expert, n * per_column);
+                    ++k;
+                    const double time = std::max(cpu_time, (absent - k) * link);
+                    if (time < best_time) {
+                        best_time = time;
+                        best      = k;
+                    }
+                }
+            }
+            // Mark the first `best` in that order.
+            std::uint32_t marked = 0;
+            for (int n = 1; n <= kNarrow && marked < best; ++n) {
+                for (std::uint32_t e = 0; e < E && marked < best; ++e) {
+                    if (columns[e] == n && frames[e] < 0) {
+                        cpu[e] = 1;
+                        ++marked;
+                    }
+                }
+            }
+            return marked;
+        }
+
+    private:
+        const ProgramImpl& program_;
+    };
+    std::unique_ptr<SplitPolicy> split_policy_;
+    bool split_call_ = false;
     // Prefill staging overlap (see ForwardExperts); destroyed after every call has completed.
     struct OverlapResources {
         ~OverlapResources() {

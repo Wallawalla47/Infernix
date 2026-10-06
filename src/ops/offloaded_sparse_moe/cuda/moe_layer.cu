@@ -681,7 +681,8 @@ __global__ void __launch_bounds__(kThreads)
     int own = 0;
     for (int j = threadIdx.x; j < jobs; j += blockDim.x) {
         const int expert = dispatch.jobs[j];
-        if (source.frames[expert] >= 0) { continue; }
+        // A streamed record counts as resident: neither staged nor CPU-served.
+        if (source.frames[expert] >= 0 || (source.prefetched != nullptr && source.prefetched[expert] >= 0)) { continue; }
         ++own;
         const int count = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
         if (count <= max_width) { atomicAdd(&width_misses[count], 1); }
@@ -712,7 +713,7 @@ __global__ void __launch_bounds__(kThreads)
         int width = 0, expert = -1, first = 0;
         if (j < jobs) {
             expert = dispatch.jobs[j];
-            if (source.frames[expert] < 0) {
+            if (source.frames[expert] < 0 && (source.prefetched == nullptr || source.prefetched[expert] < 0)) {
                 first           = dispatch.offsets[expert];
                 const int count = dispatch.offsets[expert + 1] - first;
                 width           = count <= max_width ? count : 0;
@@ -1027,7 +1028,6 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
     const bool cpu          = cpu_served(x, source);
-    require(!cpu || source.prefetched == nullptr, "experts with streamed records take no CPU-served misses");
     if (cpu) {
         require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
                     source.cpu.done != nullptr && source.cpu.sequence != nullptr &&

@@ -16,6 +16,10 @@
 //
 // The ring's first bytes hold the chunk's slot tables (I32 [layers][experts]: slot or -1), so the
 // stream owns no device memory of its own.
+//
+// Gated chunks (design §19.3.12, a short prompt's CPU share) copy nothing ahead: once a layer's
+// routing is known, plan_layer copies only the experts the call routes that are neither resident
+// nor left to the CPU, and uploads the layer's slot table with them.
 
 #include "core/arena.h"
 
@@ -23,6 +27,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp::execution {
@@ -43,7 +48,16 @@ public:
     // Starts a chunk over `ring` with the frame tables `residency` (host I32 [layers][experts]:
     // frame or -1, as the chunk's kernels see them). On `compute`: uploads the slot tables; on the
     // copy stream, behind `compute`'s work so far, the copies of layers 0 and 1.
-    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute);
+    // `gated`: no copies now; plan_layer enqueues each layer's.
+    void begin(DeviceSpan ring, const std::int32_t* residency, cudaStream_t compute, bool gated = false);
+    // A gated chunk's layer `layer`, in layer order: copies (and the slot table of) every expert with
+    // columns[e] > 0 that is not resident and has cpu[e] == 0, up to the layer's half, behind the
+    // release of layer - 2's half. Returns how many it copies.
+    std::uint32_t plan_layer(std::uint32_t layer, std::span<const std::int32_t> columns,
+                             std::span<const std::uint8_t> cpu);
+    [[nodiscard]] bool gated() const noexcept { return gated_; }
+    // Records per half of the active ring.
+    [[nodiscard]] std::uint32_t half() const noexcept { return half_; }
     [[nodiscard]] bool active() const noexcept { return active_; }
     // Layer l's slot table (device I32 [experts]) and the records' base.
     [[nodiscard]] const std::int32_t* slots(std::uint32_t layer) const noexcept;
@@ -79,6 +93,8 @@ private:
     std::vector<std::uint8_t> streams_;  // per layer: whether it has copies
     bool active_    = false;
     bool uploading_ = false;
+    bool gated_     = false;
+    const std::int32_t* residency_ = nullptr; // host [layers][experts] of the active chunk
     Stats stats_;
 };
 

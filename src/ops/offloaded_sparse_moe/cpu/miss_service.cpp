@@ -66,7 +66,9 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
         return p;
     };
     request_ = static_cast<MissRequest*>(mapped(sizeof(MissRequest)));
-    jobs_    = std::max(options_.max_jobs, options_.wide_jobs);
+    // A service that takes prefill calls sizes for every job a call may hand it: a gated call's cap
+    // (MoeCpuChannel::wide_jobs, set per call) may rise to kMaxCpuJobs.
+    jobs_    = options_.wide_jobs > 0 ? kMaxCpuJobs : options_.max_jobs;
     x_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * kMaxCpuXColumns));
     y_       = static_cast<std::uint16_t*>(mapped(sizeof(std::uint16_t) * kHidden * jobs_ * kMaxCpuColumns));
     done_    = static_cast<std::uint32_t*>(mapped(64));

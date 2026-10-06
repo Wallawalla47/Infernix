@@ -4,9 +4,11 @@
 // served by the host expert engine through the CPU miss channel
 // (docs/maintainer/qwen3_8-flash-next-design.md §8.6, §10.3, §16.2).
 //
-// Oracle: the CPU engine's output of each routed (column, expert) pair, bit for bit. Expert
-// arithmetic is exact and placement-invariant, so neither the record's location nor the staging
-// pass a job falls in may change an output bit. moe_dispatch has its own exact oracle (test_dispatch).
+// Oracle: the CPU engine's output of each routed (column, expert) pair of the narrow route, bit
+// for bit; the narrow route's arithmetic is exact. Every output, the wide route's included (its own
+// FP64 qualification is test_offloaded_moe_wide), equals the first configuration's: neither the record's
+// location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
+// moe_dispatch has its own exact oracle (test_dispatch).
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -154,15 +156,22 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     // Prefill CPU assist (P7): calls of at least 9 columns take up to 256 CPU-served misses.
     moe::CpuMissService service_assist(layers, {.workers = 6, .max_jobs = 8, .max_columns = 255, .pcie_divisor = 4,
                                                 .wide_from = 9, .wide_jobs = moe::kMaxCpuJobs, .cpus = {}});
+    // A prefill call's CPU share (design §19.3.12): calls up to a chunk of 4,096 columns, every narrow
+    // miss offered (no PCIe share), up to every expert of the layer.
+    moe::CpuMissService service_wide(layers, {.workers = 6, .max_jobs = 8, .max_columns = moe::kMaxCpuCallColumns,
+                                              .pcie_divisor = 0, .wide_from = 256, .wide_jobs = moe::kMaxCpuJobs,
+                                              .cpus = {}});
     // The CPU's share of the misses (design §19.3.5 S3): want = min(cap, M - M / divisor) of the misses
     // with at most max_job_columns columns, so the number served is min(want, eligible misses).
     std::vector<int> expert_columns(experts, 0);
     for (const std::int32_t id : ids) { ++expert_columns[id]; }
-    const auto expected_cpu_jobs = [&](const moe::CpuMissService& service) {
+    // A streamed record counts as resident: the CPU takes only misses the stream left out.
+    const auto expected_cpu_jobs = [&](const moe::CpuMissService& service, bool streamed) {
         const auto channel = service.channel(0);
+        if (columns > channel.max_columns) { return 0; } // a call this wide takes no CPU-served misses
         int misses = 0, eligible = 0;
         for (int e = 0; e < experts; ++e) {
-            if (expert_columns[e] == 0 || frames[e] >= 0) { continue; }
+            if (expert_columns[e] == 0 || frames[e] >= 0 || (streamed && prefetched[e] >= 0)) { continue; }
             ++misses;
             eligible += expert_columns[e] <= channel.max_job_columns ? 1 : 0;
         }
@@ -179,17 +188,20 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     };
     // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
-    const auto cpu_selection = [&](const moe::CpuMissService* service, const std::vector<std::int32_t>& jobs) {
+    const auto cpu_selection = [&](const moe::CpuMissService* service, const std::vector<std::int32_t>& jobs,
+                                   bool streamed) {
         std::vector<std::uint8_t> chosen(experts, 0);
         if (service == nullptr || columns > service->channel(0).max_columns) { return chosen; }
         const auto channel = service->channel(0);
+        const auto miss    = [&](std::int32_t e) { return frames[e] < 0 && !(streamed && prefetched[e] >= 0); };
         int misses = 0;
-        for (const std::int32_t e : jobs) { misses += frames[e] < 0 ? 1 : 0; }
-        const int want = std::min(channel.max_jobs, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
+        for (const std::int32_t e : jobs) { misses += miss(e) ? 1 : 0; }
+        const int cap  = channel.wide_from > 0 && columns >= channel.wide_from ? channel.wide_jobs : channel.max_jobs;
+        const int want = std::min(cap, channel.pcie_divisor > 0 ? misses - misses / channel.pcie_divisor : misses);
         int n = 0;
         for (int width = 1; width <= channel.max_job_columns && n < want; ++width) {
             for (const std::int32_t e : jobs) {
-                if (n < want && frames[e] < 0 && expert_columns[e] == width) {
+                if (n < want && miss(e) && expert_columns[e] == width) {
                     chosen[e] = 1;
                     ++n;
                 }
@@ -197,6 +209,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         }
         return chosen;
     };
+    // Outputs of the narrow route (design §8.5): an expert with at most eight columns, or one whose
+    // gate and up projections keep separate input scales (the fixture's every third expert).
+    std::vector<std::uint8_t> narrow(static_cast<std::size_t>(top_k) * columns);
+    for (std::size_t i = 0; i < narrow.size(); ++i) {
+        narrow[i] = expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
+    }
+    std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.
     cudaStream_t fork_stream = nullptr;
     cudaEvent_t fork_events[2] = {};
@@ -211,7 +230,8 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                 Config{64, &service_assist}, Config{3, &service_assist}, Config{0, &service_assist},
                                 Config{64, &service_assist, true}, Config{0, nullptr, false, false, true},
                                 Config{3, nullptr, false, false, true}, Config{64, nullptr, false, false, true},
-                                Config{64, nullptr, true, false, true}}) {
+                                Config{64, nullptr, true, false, true}, Config{64, &service_wide},
+                                Config{0, &service_wide}, Config{64, &service_wide, false, false, true}}) {
         const int slots = config.slots;
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
@@ -254,7 +274,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         if (config.service != nullptr) {
             // The service counts after answering, so its count may trail the device by a moment.
-            const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service));
+            const auto want = static_cast<std::uint64_t>(expected_cpu_jobs(*config.service, config.streamed));
             const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
             while (config.service->served_experts() - served_before < want && std::chrono::steady_clock::now() < until) {
                 std::this_thread::yield();
@@ -264,14 +284,21 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         }
         std::vector<std::uint16_t> got(expected.size());
         cuda_check(cudaMemcpy(got.data(), d_out, got.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
-        long mismatches = 0;
-        for (std::size_t i = 0; i < got.size(); ++i) { mismatches += got[i] != expected[i]; }
-        std::printf("E=%d T=%d k=%d staging slots %2d%s%s, CPU jobs %d (served %llu): %ld mismatching outputs of %zu\n",
+        // The first configuration (every miss zero-copy on the GPU) fixes the wide-route outputs.
+        if (placed.empty()) { placed = got; }
+        long mismatches = 0, moved = 0;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            mismatches += narrow[i / moe::kHidden] && got[i] != expected[i];
+            moved += got[i] != placed[i];
+        }
+        std::printf("E=%d T=%d k=%d staging slots %2d%s%s, CPU jobs %d (served %llu): %ld narrow-route outputs differ "
+                    "from the CPU engine, %ld outputs from the first placement, of %zu\n",
                     experts, columns, top_k, slots, config.fork ? " (fork)" : "", config.streamed ? " (streamed)" : "",
                     config.service != nullptr ? config.service->channel(0).max_jobs : 0,
                     config.service != nullptr ? static_cast<unsigned long long>(config.service->served_experts()) : 0ULL,
-                    mismatches, got.size());
-        check(mismatches == 0, "layer route equals the CPU engine for every placement and staging pass");
+                    mismatches, moved, got.size());
+        check(mismatches == 0, "the narrow route equals the CPU engine for every placement and staging pass");
+        check(moved == 0, "no placement or staging pass changes an output bit");
         if (config.land) {
             // Oracle: the staged misses in job order (resident and CPU-served jobs excluded); landing slot n
             // receives the n-th of them on the forked route, and nothing on the other routes.
@@ -280,10 +307,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
             std::vector<std::int32_t> jobs(static_cast<std::size_t>(job_count));
             cuda_check(cudaMemcpy(jobs.data(), dispatch.jobs, jobs.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
                        "cudaMemcpy");
-            const auto cpu = cpu_selection(config.service, jobs);
+            const auto cpu = cpu_selection(config.service, jobs, config.streamed);
             std::vector<std::int32_t> staged;
             for (const std::int32_t e : jobs) {
-                if (frames[e] < 0 && cpu[e] == 0) { staged.push_back(e); }
+                if (frames[e] < 0 && !(config.streamed && prefetched[e] >= 0) && cpu[e] == 0) { staged.push_back(e); }
             }
             const bool forked_route = config.fork && max_jobs <= std::min(slots, 512) && columns <= 8;
             std::vector<std::int32_t> landed(landing.size());
@@ -446,6 +473,8 @@ int main() {
         test_layer(9, 4, 3, 17);   // MTP verification width: one-column kernels, several passes per job
         test_layer(96, 10, 10, 19); // more misses than the largest cap; publishes a subset of ten columns
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
+        test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
+        test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

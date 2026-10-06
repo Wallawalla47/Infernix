@@ -77,7 +77,7 @@ struct ExpertsWorkspace {
 };
 
 // Bytes of a call's CPU bookkeeping (moe_layer.cu's CpuCall: two words and kMaxCpuJobs job indices).
-inline constexpr std::size_t kCpuCallBytes = 1280;
+inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rounded to 256
 
 [[nodiscard]] std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries);
 [[nodiscard]] std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);

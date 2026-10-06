@@ -374,16 +374,30 @@ struct ProgramOptions {
     // n-gram proposal, when enabled, replaces a round's MTP drafts.
     std::uint32_t mtp_draft_tokens = 0;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
-    // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor).
+    // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
+    // 0 derives it from the measured link: 3 at PCIe 5.0 x8, where it measured fastest, 2 at x16).
     // Defaults measured fastest on the i9-13900K (design section 19.2); 8 jobs pay under MTP's
     // wider verification calls and are neutral for plain decode.
     std::uint32_t cpu_expert_workers = 6;
     std::uint32_t cpu_expert_jobs    = 8;
-    std::int32_t cpu_pcie_divisor    = 3;
+    std::int32_t cpu_pcie_divisor    = 0;
     // Prefill CPU assist (design §19.3.1 P7): prefill calls wider than a decode round and narrower
     // than kAssistMaxColumns hand up to this many of each layer's thinnest misses to the CPU (same
     // divisor). 0 disables.
     std::uint32_t cpu_assist_jobs    = 256;
+    // Prefill CPU split (design §19.3.12): a narrow streamed call outside a layer walk copies each
+    // layer's experts only once its routing is known, leaving the thinnest non-resident ones (at
+    // most 8 columns, the placement-invariant narrow route) to the CPU while the link carries the
+    // rest. The split balances the measured link against the CPU's rates for cpu_expert_workers
+    // workers: experts per second while memory-bound (1-4 columns) and expert columns per second
+    // while compute-bound (i9-13900K, 6 workers, from host_probe). Gating waits for each layer's
+    // routing, an idle link the blind stream does not have: it pays up to cpu_split_columns columns
+    // on the reference link (PCIe 5.0 x8, 27.5 GB/s), a limit that scales inversely with the
+    // measured link (the bytes it saves cost less on a faster one).
+    bool prefill_cpu_split           = true;
+    double cpu_split_expert_rate     = 21000.0;
+    double cpu_split_column_rate     = 66000.0;
+    std::uint32_t cpu_split_columns  = 1536;
     // Prefill expert streaming (design §19.3.8 F2, F3): chunks of at least 256 columns copy each
     // layer's non-resident experts ahead by DMA into frames lent for the prompt.
     bool prefill_stream              = true;
@@ -393,8 +407,12 @@ struct ProgramOptions {
     std::uint64_t prefix_host_bytes  = 0;
     runtime::prefix_cache::TapPlannerConfig prefix_taps;
     runtime::prefix_cache::CacheCostModel prefix_cost;
-    // What a cut that ends a layer walk's span costs (the next span streams the experts again).
+    // What a cut that ends a layer walk's span costs (the next span streams the experts again), at
+    // the reference link rate kReferenceLinkBytesPerSecond; the Program rescales it to its link.
     double prefix_span_seconds = 0.0;
+    // The host-to-device link rate in bytes per second; 0 measures it at startup (a fixed rate is
+    // for tests of the bandwidth-dependent choices).
+    double link_bytes_per_second = 0.0;
     // The longest predicted wait for a prefilling sibling's snapshot a fresh request accepts instead
     // of prefilling the shared prefix itself (0: no coalescing).
     double prefix_coalesce_wait_seconds = 0.0;
