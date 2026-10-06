@@ -2,7 +2,8 @@
 
 // QSA attention for prompt calls on Tensor Cores (docs/maintainer/qwen3_8-flash-next-design.md
 // §19.3.8 F5), the internal route qsa_attention takes for exactly the calls its FP32 kernel would
-// run unsplit (columns x KV heads above 170: 86+ columns for Qwen4Exp). Within that class a
+// run unsplit (columns x KV heads of at least half the SMs: 43+ columns for Qwen4Exp on an RTX
+// 5090's 170 SMs). Within that class a
 // column's FP32 result never depended on the call's width, and the prefix cache relies on it: a
 // resumed prompt may compute a position in a call of another width than the run that captured the
 // state. This kernel's result is width-independent too, so the class keeps that property; narrower

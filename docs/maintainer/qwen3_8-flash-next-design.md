@@ -8292,6 +8292,50 @@ from the committed window.
   vector-quantized storages. It now appends them with each sequence's window slots.
 - **Unit tests:** QSA, Qwen4Exp, KV-cache append and softmax-attention tests pass (29/29).
 
+**Optimisation round 1** (after landing, 2026-10-06):
+- **Changes.**
+  - **Decode splits** follow the SM count: `clamp(SMs / (columns × KV heads), 1, 48)`, at least 4
+    once a call is split. This replaces 340 CTAs at most 33 splits. A call that fills half the SMs
+    unsplit (43+ columns at 2 KV heads on 170 SMs) now takes the prompt route.
+  - **Prompt kernel.** One stage at two CTAs per SM when it fits and the call fills a wave, with a
+    sequential warp merge whose bits do not depend on the stage count.
+  - **Per-format kernel changes.** NVFP4 values decode in half tiles, k8v4 runs three warps, and the
+    q load is vectorized.
+- **Op bench** (`ninfer_qsa_attention_bench`, attention time, cold L2, before → after):
+  - W = 1-2: equal.
+  - W = 3-8: 5-18 % faster.
+  - 43-85 columns: 42-73 % faster, now on the prompt route.
+  - W = 256 at 8K: int8 227 → 195 µs, nvfp4 241 → 180, vq2 621 → 395, k4v2 866 → 532.
+
+  At 128K, selection dominates W = 256: 390 µs of the call's 580-700 µs.
+- **Quality.**
+  - The prompt route is bit-identical to the landed build: the int8, nvfp4 and vq2 chunk-256 dumps
+    give the same KL and dNLL as the tables above.
+  - Decode at W = 1 rounds differently because the split partition changed. Teacher-forced at
+    chunk 1 on the code text, int8 against bf16 KV, before → after: KL 0.0249 → 0.0242, dNLL
+    +0.008 → +0.016 ± 0.010. The two builds differ from each other by KL 0.015.
+  - Plain greedy ids therefore diverge after 9-87 tokens on all ten int8/bf16 workloads.
+  - The MTP code output (W = 5) is identical.
+- **Speed** (ABBA, against the landed build `7a4a13b4d`):
+
+  | Workload | Before | After | Change |
+  |---|---:|---:|---:|
+  | pp32k bf16 | 5,369 | 5,466 | +1.8 % |
+  | pp32k int8 | 5,529 | 5,603 | +1.3 % |
+  | pp32k fp8 | 5,512 | 5,560 | +0.9 % |
+  | pp32k nvfp4 | 5,512 | 5,583 | +1.3 % |
+  | pp32k k8v4 | 5,500 | 5,541 | +0.7 % |
+  | pp32k vq2 | 5,217 | 5,423 | +4.0 % |
+  | pp32k k4v2 | 5,052 | 5,320 | +5.3 % |
+  | tg8k int8 | 100.97 | 101.99 | +1.0 % |
+  | tg8k int8 MTP | 137.83 | 131.73 | −4.4 % |
+
+  pp32k and tg8k plain are int8 unless named.
+- **The tg8k MTP loss is a text change, not a kernel cost.** The corpus continuation diverges, so
+  draft acceptance falls from 2.31 to 2.24 tokens per round, with 228 rounds instead of 222.
+  Measured on the CLI code prompt, whose output is identical in both builds: MTP decode +0.4 %
+  (int8) and +0.8 % (bf16).
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto

@@ -1329,7 +1329,8 @@ int main() {
         // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
         // verification across a page boundary, prefill columns crossing the boundary inside one
         // call (one attention split), and a split-K prefill width.
-        // Calls the FP32 kernel would run unsplit (86+ columns here) take the Tensor Core prompt
+        // Calls the FP32 kernel would run unsplit (columns x KV heads of at least half the SMs: 43+
+        // columns on an RTX 5090) take the Tensor Core prompt
         // route: dense columns, the dense/selected boundary inside the call, selected blocks with
         // tails over several pages, two rows, a list length off the 16-token tile, and the class's
         // narrowest call. Every column of a prompt-route call must also equal, bit for bit, the
@@ -1342,7 +1343,8 @@ int main() {
                                        {"prompt W=300 B=1 boundary", 300, {1901}},
                                        {"prompt W=256 B=2 selected", 256, {6001, 9013}},
                                        {"prompt W=257 B=1 selected", 257, {4093}},
-                                       {"prompt W=86 B=1 class edge", 86, {7000}}};
+                                       {"prompt W=86 B=1 selected", 86, {7000}},
+                                       {"prompt W=43 B=1 class edge (170 SMs)", 43, {7000}}};
         for (const auto storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
                                    KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
             std::uint32_t seed = 31;
