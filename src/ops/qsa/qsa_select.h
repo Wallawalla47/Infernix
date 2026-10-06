@@ -19,7 +19,10 @@
 // Execution, per group of at most kQsaSelectGroupColumns columns:
 //   1. qsa_score_kernel: CTAs split each row's blocks; a warp reads 8 pooled keys once and scores
 //      them for every column of its row tile (up to 16), reduce-scattering the 32 (block, head)
-//      lane partials of a column in the butterfly's pairing. FP32 scores go to scratch.
+//      lane partials of a column in the butterfly's pairing. FP32 scores go to scratch. Rows of at
+//      least 32 columns (prompt chunks) take qsa_score_wide_kernel instead: register-tiled on the
+//      FP32 pipes, a thread forms all 32 lane partials of its 16 dots and adds them in the
+//      butterfly's tree (leaves in bit-reversed lane order), so its scores are the same bits.
 //   2. the selection, an exact radix select over the 64-bit (score, lower-id-first) order key
 //      (ops/common/score_id_order.cuh): a 2048-bin histogram of the scores' bits [30:20] finds the
 //      bin holding the top-th score; scores above it are selected, the bin's blocks are

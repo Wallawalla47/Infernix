@@ -713,6 +713,22 @@ std::vector<Case> cases() {
     add("prefill W=1024 across the budget", 1, 1024, {1500});
     add("prefill W=300 at 3K blocks", 1, 300, {12000});
     add("prefill W=200 at 30K blocks", 1, 200, {120000});
+    // Wide rows (the register-tiled scoring): partial tiles, two rows, the edge key families,
+    // fewer index heads, ratio 8, and a full serving chunk deep in the context.
+    add("prefill W=33 partial tiles", 1, 33, {9000});
+    add("prefill B=2 W=40 two rows", 2, 40, {20000, 6000});
+    add("prefill W=64 zero scores at the threshold", 1, 64, {2100}, Keys::ZeroHeavy, 470);
+    add("prefill W=48 zero scores, all blocks", 1, 48, {40000}, Keys::ZeroHeavy, 0);
+    add("prefill W=40 ties period 97", 1, 40, {16000}, Keys::Ties, 97);
+    add("prefill W=36 near ties", 1, 36, {20000}, Keys::NearTies);
+    auto* wide_h1 = add("prefill W=48 index heads 1", 1, 48, {12000});
+    wide_h1->index_heads = 1;
+    auto* wide_h3 = add("prefill W=40 index heads 3", 1, 40, {20000});
+    wide_h3->index_heads = 3;
+    auto* wide_r8 = add("prefill W=36 ratio 8, budget 512", 1, 36, {12000});
+    wide_r8->ratio  = 8;
+    wide_r8->budget = 512;
+    add("prefill W=4096 at 27K blocks", 1, 4096, {110000});
     // Ties and near ties.
     add("ties period 97, 4K blocks", 2, 3, {16000, 16100}, Keys::Ties, 97);
     add("ties period 3, 1K blocks", 1, 2, {4000}, Keys::Ties, 3);
