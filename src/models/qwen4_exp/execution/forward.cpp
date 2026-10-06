@@ -96,7 +96,8 @@ Forward::~Forward() {
     if (split_ready_ != nullptr) { (void)cudaEventDestroy(split_ready_); }
 }
 
-std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context) {
+std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, std::int32_t max_context,
+                                     KvCacheStorage storage) {
     const std::size_t t = static_cast<std::size_t>(columns);
     const std::size_t h = c.hidden_size, w = c.residual_width(), k = c.moe.top_k;
     const std::size_t bf = 2;
@@ -110,7 +111,7 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
     const std::size_t qkv = 2 * std::size_t(c.attention.query_width()) + 2 * c.attention.key_width() +
                             std::size_t(c.qsa.index_heads + 1) * c.qsa.index_head_dim;
     bytes += qkv * t * bf * 2 + std::size_t(c.attention.query_width()) * t * bf * 2;
-    bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context);
+    bytes += ops::qsa_attention_workspace_bytes(qsa_geometry(c), columns, max_context, storage);
     bytes += (c.moe.experts + 1) * t * 4 + k * t * 8 + t * 4;           // FP32 router logits, routing
     bytes += ops::moe_dispatch_bytes(dim(c.moe.experts), dim(k * t));
     bytes += h * k * t * bf + ops::moe_experts_workspace_bytes(dim(c.moe.experts), dim(k * t));
@@ -455,8 +456,16 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
               device_.execution_view().on_stream(s));
 
     // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
-    const auto& layer = call.layer;
-    {
+    // The vector-quantized storages' exact window is addressed by the sequences' state slots, and
+    // qsa_attention appends their K/V itself (a wide call stages its window rows); a K/V-only call
+    // appends here.
+    ops::QsaKVLayer layer = call.layer;
+    if (layer.kv.window.present()) { layer.kv.window.slots = call.slots; }
+    const bool vq = layer.kv.storage == KvCacheStorage::Vq2 || layer.kv.storage == KvCacheStorage::Q4KeyVq2Value;
+    const std::int32_t KVH = dim(a.kv_heads);
+    const ops::QsaAppend append{.k = kn.view({D, KVH, call.width, call.batch}),
+                                .v = v.view({D, KVH, call.width, call.batch})};
+    if (!vq || call.kv_only) {
         const PagedKVBatchLayerView view{.k_pages       = layer.kv.k_pages,
                                          .v_pages       = layer.kv.v_pages,
                                          .k_scale_pages = layer.kv.k_scale_pages,
@@ -466,9 +475,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
                                          .num_kv_heads  = layer.kv.num_kv_heads,
                                          .storage       = layer.kv.storage,
                                          .window        = layer.kv.window};
-        const std::int32_t KVH = dim(a.kv_heads);
-        ops::kv_cache_append_batch(kn.view({D, KVH, call.width, call.batch}), v.view({D, KVH, call.width, call.batch}),
-                                   call.positions.view({call.width, call.batch}), call.table_rows, view, s);
+        ops::kv_cache_append_batch(append.k, append.v, call.positions.view({call.width, call.batch}),
+                                   call.table_rows, view, s);
     }
     const ops::QsaGeometry geometry = qsa_geometry(config_);
     const ops::QsaBatch qsa_batch{.block_tables     = kv_.block_tables,
@@ -485,11 +493,11 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     ops::qsa_index_query(iq, p.index_query_norm, call.rope_positions, geometry, s);
 
     Tensor out = work_.alloc(DType::BF16, {D, dim(a.heads), T});
-    const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_);
+    const std::size_t scratch = ops::qsa_attention_workspace_bytes(geometry, T, max_context_, layer.kv.storage);
     const DeviceSpan span     = work_.alloc_bytes(scratch);
     ops::qsa_attention(qn, iq, layer, qsa_batch, geometry,
                        static_cast<float>(1.0 / std::sqrt(static_cast<double>(D))), max_context_, span.data,
-                       span.bytes, out, s);
+                       span.bytes, out, s, vq ? &append : nullptr);
     // Output gate: out * sigmoid(gate), then o_proj.
     Tensor gated = out.view({QW, T});
     ops::sigmoid_mul(gate, gated, s);
@@ -746,13 +754,14 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
 }
 
 std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t kv_columns, std::int32_t draft_columns,
-                                         std::int32_t vocabulary_rows, std::int32_t max_context) {
+                                         std::int32_t vocabulary_rows, std::int32_t max_context,
+                                         KvCacheStorage storage) {
     const std::size_t t = static_cast<std::size_t>(std::max(std::min(kv_columns, kMtpChunkColumns), draft_columns));
     const std::size_t d = static_cast<std::size_t>(draft_columns);
     // One block at t columns (as the text forward sizes it), the input fusion's and the copied
     // residuals; the draft head's logits and the resident experts only at full steps, which run
     // one column per sequence.
-    return workspace_bytes(c, static_cast<std::int32_t>(t), max_context) +
+    return workspace_bytes(c, static_cast<std::int32_t>(t), max_context, storage) +
            std::size_t(c.residual_width()) * t * 2 * 4 + std::size_t(c.hidden_size) * t * 2 * 4 +
            std::size_t(vocabulary_rows) * d * 6 +
            ops::resident_moe_workspace_bytes(dim(c.moe.top_k * d), dim(c.moe.intermediate));

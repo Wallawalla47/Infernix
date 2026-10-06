@@ -2,11 +2,13 @@
 // (tools/flash_next/reference.py). Skips unless NINFER_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
 //   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram]
-//   ninfer_qwen4_exp_forward_real_test TOKENS [--kv bf16|int8] [--logits OUT.bin] [--residuals OUT.bin]
+//   ninfer_qwen4_exp_forward_real_test TOKENS [--kv KV] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
-//   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8]
-//       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv bf16|int8] [--dump-from P]]...
-//   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv bf16|int8]
+//   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
+//       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
+//   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
+//
+// KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
 // With --cpu-columns the test checks that calls the Program serves with the CPU expert service
 // (decode widths, and prefill calls up to 255 columns with the assist) give the GPU route's logits
@@ -25,6 +27,7 @@
 // comparison with the reference.
 
 #include "artifact/reader.h"
+#include "kv_cache_storage.h"
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/layout.h"
@@ -35,6 +38,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/load.h"
+#include "models/qwen4_exp/program/prefix/state_image.h"
 #include "models/qwen4_exp/program/ngram_volume.h"
 #include "models/qwen4_exp/program/rope_positions.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -191,6 +195,12 @@ struct Harness {
                                                  static_cast<std::size_t>(l) * di * (r - 1) * rows * 2,
                                              DType::BF16, {di, r - 1, rows}));
         }
+        // vq2/k4v2: the exact window of every attention layer and row, zeroed (no tag matches).
+        window_geometry = q4::prefix::kv_window_geometry(c, storage, false, static_cast<std::uint32_t>(rows));
+        if (window_geometry.present()) {
+            window_backing = DeviceBuffer(window_geometry.bytes());
+            window_backing.fill(0);
+        }
         q4::execution::ForwardKV kv;
         kv.block_tables = tables->matrix();
         std::size_t plane   = 0;
@@ -205,13 +215,16 @@ struct Harness {
             layer.kv.v_pages = pool->plane(plane++);
             if (layout.value.has_scale()) { layer.kv.v_scale_pages = pool->plane(plane++); }
             layer.pooled_pages = pool->plane(plane++);
+            if (window_geometry.present()) {
+                layer.kv.window = q4::prefix::kv_window_view(window_geometry, window_backing.p, l);
+            }
             kv.layers.push_back(layer);
         }
         q4::execution::ForwardExperts experts;
         for (std::uint32_t l = 0; l < c.num_hidden_layers; ++l) {
             experts.frames.push_back(static_cast<const std::int32_t*>(frames_backing.p) + l * c.moe.experts);
         }
-        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context);
+        work_capacity = q4::execution::Forward::workspace_bytes(c, columns, context, storage);
         work          = std::make_unique<WorkspaceArena>(work_capacity);
         state_view    = state;
         kv_view       = kv;
@@ -234,6 +247,8 @@ struct Harness {
     q4::execution::ForwardExperts experts_view;
     std::size_t state_bytes = 0;
     DeviceBuffer state_backing, ple_backing, tails_backing, kv_backing, frames_backing;
+    DeviceBuffer window_backing;
+    q4::prefix::KvWindowGeometry window_geometry;
     std::unique_ptr<LinearAttentionStatePool> gdn;
     std::unique_ptr<DeviceKVPagePool> pool;
     std::unique_ptr<KVExecutionTablePool> tables;
@@ -486,8 +501,7 @@ int main(int argc, char** argv) {
                 job.dump_from = std::stoi(value);
                 if (job.dump_from < 0) { throw std::invalid_argument("--dump-from must not be negative"); }
             } else if (arg == "--kv") {
-                if (value != "bf16" && value != "int8") { throw std::invalid_argument("--kv takes bf16 or int8"); }
-                job.kv = value == "int8" ? KvCacheStorage::Int8Group64 : KvCacheStorage::BFloat16;
+                job.kv = ninfer::test::parse_kv_cache_storage(value);
             } else {
                 throw std::invalid_argument("unknown option " + arg);
             }

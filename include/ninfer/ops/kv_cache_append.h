@@ -80,9 +80,10 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  *
  * k/v are contiguous BF16 [256,Hkv,T,B] with Hkv 2 or 4, positions is contiguous device I32 [T,B]
  * and table_rows contiguous device I32 [B]. Column (t,b) is stored at logical position
- * positions[t,b] through table row table_rows[b] with kv_cache_append's storage conversions
- * (BF16, INT8-G64, FP8 row and NVFP4-family storages; not the vector-quantized ones). Every row is
- * chosen on the device, so a captured call serves any assignment of sequences to rows.
+ * positions[t,b] through table row table_rows[b] with kv_cache_append's storage conversions, every
+ * storage included. With a vector-quantized storage's exact window, each sequence's window slots
+ * (row cache.window.slots[b]) are written as kv_cache_append writes them. Every row is chosen on the
+ * device, so a captured call serves any assignment of sequences to rows.
  */
 void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& positions,
                            const Tensor& table_rows, PagedKVBatchLayerView cache, cudaStream_t stream);

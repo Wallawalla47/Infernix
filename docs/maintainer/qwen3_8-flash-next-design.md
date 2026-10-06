@@ -8102,6 +8102,196 @@ tiles per split; pool pages and host/lent page spaces. The FP64-oracle cases pas
 
   These are still well above the ~3 µs budget (open; see the next note).
 
+**Instruction count (ncu, op bench, int8, 8K, W = 1).** The staged kernel ran 24 µs for 57K cycles.
+Issue slots were 11.7 % busy, with 0.38 eligible warps per scheduler and 4.45M warp instructions
+(~8,400 per warp). The time went to two places:
+- the value fold (~1/3): 12 broadcast loads and a predicated FMA per head and token;
+- the score loop (~1/3): 96 scalar query loads per token.
+
+The kernel was latency-chained, not memory-bound (DRAM 4.6 %).
+
+**Restructured (bit-exact)** in `attention_kernel<Storage, Group, Exact, Stages>`:
+- **512 threads.** Sixteen warps score the tokens. In the value phase two threads share each
+  dimension, six heads each.
+- **Query layout.** A lane reads its eight query values of a head as two 16-byte words,
+  `[head][r / 4][lane][r % 4]`.
+- **Probabilities** are read four tokens at a time.
+- **Exact group.** An instance for exactly 12 query heads per KV head drops the head-loop
+  predicates; other groups up to 16 use a bounded instance.
+
+No per-(head, dimension) order changes, so outputs equal the previous kernel's.
+
+Results:
+- **Greedy ids** are identical, A (`cbcde52a4`) against B, on fourteen workloads: int8 and bf16, with
+  the short prompts, code MTP and ~40K plain and MTP.
+- **Op bench** (cold L2, graph, attention and merge), every storage:
+
+  | Width | Before | After |
+  |---|---:|---:|
+  | W = 1 | ~27 µs | 18.4-22.5 µs |
+  | W = 5 | ~47 µs | 37-43 µs |
+  | W = 8 | ~74 µs | 49-55 µs |
+
+- **int8 decode ABBA:** 8K plain +0.77 %, MTP +0.92 % (both pairs).
+- **Clock caveat.** These runs, and every engine run after 11:44 on 2026-10-06 until the reset, had
+  GPU clocks locked near 2.4 GHz (an interrupted ncu session). Same-rig A/B comparisons hold, but
+  absolute rates are about 13 % low.
+
+### 19.3.15 Every NInfer KV profile on Flash-Next (2026-10-06)
+
+Until now QSA served only `bf16` and `int8`. Its kernels now take the other five profiles:
+- `fp8` (E4M3-row256, K rotated);
+- `nvfp4` (NVFP4-G16, K and V rotated);
+- `k8v4` (FP8 K, NVFP4 V, both rotated);
+- `vq2` and `k4v2` (vector-quantized, both rotated, with the exact recent-key window; below).
+
+The paged planes were already generic (`paged_kv_storage_layout`), and so was the append, except for
+the window.
+
+**Decode attention.** One tile layer serves every profile: `KVTile<Storage>` over `StagePlanes`,
+with planes `[K rows | V rows | K scales | V scales]` in the paged planes' own byte layout.
+- Each cell decodes to its exact represented value in FP32 (code × scale is exact in FP32).
+- Rotated values are rotated back on the unnormalized output. That map is linear, so split partials
+  still merge by their weights.
+- FP8's 2-byte row scales are plain loads, issued after the rows' `cp.async`.
+
+**Prompt route.** `qsa_prompt_kernel<Storage>` is generic over a key code and a value code:
+- **FP8 keys** use the INT8 path: an exact `e4m3x2` → `f16x2` widening and one row-scale group.
+- **NVFP4 keys** decode to exact FP16 values: E2M1 × E4M3 fits FP16. The query takes a k-step order
+  in which one 16-byte ldmatrix chunk feeds two k-steps.
+- **FP8 values** use the INT8 path's transposed decode, with a scale guard of 64 instead of 256.
+- **NVFP4 values** decode into a per-warp FP16 tile and take the FP16 ldmatrix.trans path. The merged
+  rows are rotated back.
+- **Scales.** FP8 row scales are gathered as their aligned 4-byte word, plus a parity bit per token.
+- **Gather.** Each lane locates its tile row once; the lanes copying a row's chunks receive its
+  addresses by shuffle. The first version located every chunk separately, once for K and once for
+  V. At W = 256 that made the int8 prompt kernel 436 → 612 µs and bf16 1,093 → 1,829 µs; it was
+  fixed before landing (results below).
+
+**Qualification.** `ninfer_qsa_test` is storage-generic and covers every profile:
+- the FP64 oracle over decoded K/V, with rotations;
+- decode, verify and prefill widths, and the prompt route;
+- width invariance;
+- host and lent page spaces.
+
+`ninfer_qsa_attention_bench` (new) times the Op and the selection alone, for any storage, context
+and width.
+
+**Quality** (teacher-forced, `ninfer_qwen4_exp_forward_real_test --dump-logits`, chunk 256,
+dense8m; 3,580 positions over code/doc/chat in the dense regime and the last 1,024 positions of a
+16K text in the sparse regime). Measured against bf16 KV:
+
+| `--kv-dtype` | KL mean | dNLL, all | dNLL, long16k (sparse) |
+|---|---:|---:|---:|
+| int8 | 0.061 | +0.007 ± 0.007 | +0.016 ± 0.014 |
+| fp8 | 0.069 | +0.006 ± 0.008 | +0.024 ± 0.013 |
+| nvfp4 | 0.070 | +0.004 ± 0.008 | +0.001 ± 0.013 |
+| k8v4 | 0.069 | +0.001 ± 0.008 | +0.012 ± 0.015 |
+
+All three new profiles are within noise of int8 on these texts. KV memory per token and KV head is
+516 B (fp8), 288 B (nvfp4) and 402 B (k8v4), against int8's 528 B.
+
+**Speed** (B, clocks locked as above): decode at 8K is within ±1 % of int8 for every profile, since
+decode attention is latency-bound and format-independent. Prefill at 32K, before the gather fix:
+
+| `--kv-dtype` | Before the prompt route (SIMT kernel) | With the prompt route |
+|---|---:|---:|
+| fp8 | ~3,770 tok/s | 4,796 tok/s (+27 %) |
+| nvfp4 | ~3,770 tok/s | 4,966 tok/s (+31 %) |
+| k8v4 | ~3,770 tok/s | 4,886 tok/s (+29 %) |
+
+For comparison, int8 ran 4,773 tok/s (old kernel: 4,914).
+
+**After the gather fix, clocks reset** (F1c, B = the landed build):
+- **Prefill ABBA at 32K against the old prompt kernel:** int8 5,179 → 5,559 tok/s (+7.3 %), bf16
+  4,946 → 5,366 (+8.5 %). One A run was 4,952 against 5,406, so the int8 gain is uncertain by about
+  ±4 %.
+- **int8 decode ABBA:** 8K plain +0.25 %, 8K MTP +0.85 %, 128K plain +1.0 %.
+- **Greedy ids** are identical A/B on all fourteen int8/bf16 workloads.
+- **Per profile (B):**
+
+  | `--kv-dtype` | pp32k tok/s | tg8k | tg8k MTP | tg128k |
+  |---|---:|---:|---:|---:|
+  | bf16 | 5,384 | 99.2 | 139.9 | 57.5 |
+  | int8 | 5,552 | 99.4 | 136.3 | 61.4 |
+  | fp8 | 5,551 | 100.1 | 143.6 | 61.8 |
+  | nvfp4 | 5,501 | 99.5 | 128.6 | 60.9 |
+  | k8v4 | 5,549 | 99.7 | 126.9 | 60.5 |
+
+  MTP rates differ with each profile's draft acceptance, single run each.
+
+**vq2 and k4v2.** These use the exact INT8-G64 recent-key window
+([paged KV §9.3](paged-kv-cache.md#93-vq2k4v2-exact-recent-key-window)). A selected key j of
+query p is read exactly when `vq_exact_key(j, p)` holds (j < 64 or j ≥ p − 768) and its row
+matches the stored codes; otherwise its codes are read. As built, mirroring Qwen3.5:
+- **Program.** One window plane set per KV layer (Main Text and MTP), each plane `[leading, 1,088
+  slots, KVH, lanes]` (`prefix::KvWindowGeometry`), is bound as `layer.kv.window`.
+  - The forward pass sets each call's `slots` to the sequences' state slots.
+  - At 2 KV heads this is ~1.1 MB per layer and lane, ~15 MB per lane.
+  - A slot reset zeroes the lane's tags.
+- **State image.** Five `QsaWindow` parts per KV layer (K/V codes, K/V group scales, tags) join that
+  layer's group, so prefix snapshots, pause and replay carry the window like the raw-key tails.
+- **Append inside the Op.** For these profiles `qsa_attention` takes the call's K and V
+  (`QsaAppend`) and appends them itself:
+  - Calls up to `kKVWindowInlineWidth` write their window slots directly.
+  - Wider calls (one sequence) stage every column's exact row in the Op's workspace, attend reading
+    in-call keys from staging, and commit the slot-bound rows afterwards.
+
+  The forward pass appends them itself only for K/V-only calls.
+- **Kernels.** Both QSA kernels expand each tile into the INT8-G64 planes before running the INT8
+  arithmetic:
+  - **Gather:** paged codes and row scales, plus the exact rows (window slot or staged row) and the
+    window tags of the keys the column reads exactly.
+  - **Keep or decode:** a row stays when it is staged or its tag matches the stored codes.
+    Otherwise its codes are decoded (VQ2 codebook in shared memory, Q4 levels by byte permute), with
+    the row scale as all four group scales.
+  - **Output:** rotated back.
+
+  The prompt kernel runs three warps per CTA to fit two stages, the codes and the codebook.
+
+**vq2/k4v2 qualification.** `ninfer_qsa_test` covers:
+- the Op's own append;
+- a pre-call window in which every fourth slot is stale (its keys must read their codes);
+- decode, verify, two-sequence and prompt-route calls;
+- a staged 300-column call;
+- calls without a window.
+
+The oracle decodes the VQ2 codebook and Q4 levels independently and reads the call's exact rows back
+from the committed window.
+
+**vq2/k4v2 results** (dense8m, 2026-10-06):
+- **Quality against bf16** (same texts):
+
+  | `--kv-dtype` | KL mean | dNLL, all | dNLL, long16k |
+  |---|---:|---:|---:|
+  | vq2 | 0.071 | +0.010 ± 0.008 | +0.019 ± 0.014 |
+  | k4v2 | 0.070 | +0.009 ± 0.007 | +0.014 ± 0.014 |
+
+  Both are close to int8. On the 512-token code text vq2 and k4v2 give identical results, since every
+  key there is read from the exact window.
+- **Speed** (single runs):
+
+  | `--kv-dtype` | pp32k | tg8k | tg128k |
+  |---|---:|---:|---:|
+  | int8 | 5,557 | 100.9 | 61.6 |
+  | vq2 | 5,261 | 99.8 | 63.1 |
+  | k4v2 | 5,063 | 94.8 | 56.0 |
+
+  - vq2's smaller KV leaves more expert frames at 128K.
+  - k4v2 pays for its Q4 key encoding and decoding.
+- **Op bench, decode W = 1** (including the Op's append): vq2 22.5 µs, k4v2 24.6 µs, int8 15.8 µs.
+  At W = 256 they are 621 / 866 µs against 227 µs; the append's VQ encoding dominates.
+- **Real tests with `NINFER_QWEN4_KV=vq2` and `=k4v2`,** plain and MTP: every prefix-cache scenario
+  passes, including tap and Host-block resumes identical to the cold run. Preemption passes too:
+  - The exact path equals the solo runs.
+  - Replay completes every token. MTP replay diverges after 607 tokens with vq2 (replay
+    arithmetic, as int8's 572).
+- **MTP decode at 8K** (single runs): vq2 114.6 tok/s, k4v2 135.3 tok/s; draft acceptance differs
+  per profile.
+- **A fault the tests found.** `kv_cache_append_batch` (the drafter's K/V-only calls) refused the
+  vector-quantized storages. It now appends them with each sequence's window slots.
+- **Unit tests:** QSA, Qwen4Exp, KV-cache append and softmax-attention tests pass (29/29).
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto

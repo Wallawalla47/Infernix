@@ -5,8 +5,9 @@
 // QSA raw-key tails and MTP state that its KV pages do not hold. Parts follow the forward pass, so a
 // restore lands each decoder layer's state as one group the forward pass can wait for on its own:
 //
-//   header | layer 0 .. L-1: GDN (recurrent, conv) or attention (QSA tail); the PLE history joins
-//          the group of the layer it precedes | MTP group: saved residual, MTP tail
+//   header | layer 0 .. L-1: GDN (recurrent, conv) or attention (QSA tail, and with a vector-quantized
+//          KV storage its exact window's five planes); the PLE history joins the group of the layer
+//          it precedes | MTP group: saved residual, MTP tail (and window)
 //
 // Every part starts on a 256-byte boundary. All copies are byte copies; nothing is requantized. On
 // the Host the packed byte o lives at segments[o / segment_bytes] + o % segment_bytes (the slabs of
@@ -31,6 +32,30 @@ namespace ninfer::models::qwen4_exp::prefix {
 inline constexpr std::size_t kStateImageHeaderBytes = 256;
 inline constexpr std::size_t kStateImageAlignment   = 256;
 
+// The exact recent-key window of the vector-quantized KV storages (core/paged_kv_storage.h,
+// kv_window.cuh) per KV layer (the attention layers, then MTP's) and lane: five planes, each
+// [leading, kKVWindowSlots, kv_heads, lanes]: K codes and V codes (I8, 256), K and V group scales
+// (FP16, 4), tags (I32, 2). A KV layer's planes follow each other; layers follow each other.
+struct KvWindowGeometry {
+    static constexpr int kPlanes = 5;
+    std::int32_t kv_heads   = 0; // 0: the storage has no window
+    std::uint32_t kv_layers = 0;
+    std::uint32_t lanes     = 0;
+
+    [[nodiscard]] bool present() const noexcept { return kv_heads > 0; }
+    // One lane's bytes of plane p of a KV layer.
+    [[nodiscard]] std::size_t lane_bytes(int plane) const;
+    [[nodiscard]] std::size_t layer_bytes() const;
+    [[nodiscard]] std::size_t bytes() const { return layer_bytes() * kv_layers; }
+    // Offset of plane p of a KV layer from the window's base.
+    [[nodiscard]] std::size_t plane_offset(std::uint32_t kv_layer, int plane) const;
+};
+
+[[nodiscard]] KvWindowGeometry kv_window_geometry(const TextConfig& config, KvCacheStorage storage, bool mtp,
+                                                  std::uint32_t lanes);
+// KV layer k's window planes at `base` (slots unset: the forward pass sets each call's).
+[[nodiscard]] PagedKVWindowView kv_window_view(const KvWindowGeometry& geometry, void* base, std::uint32_t kv_layer);
+
 // Byte sizes of one lane's state, per layer where it is per layer.
 struct StateImageSpec {
     std::vector<MixerKind> layer_types; // decoder layers in order
@@ -42,15 +67,19 @@ struct StateImageSpec {
     bool mtp                         = false;
     std::size_t mtp_saved_bytes      = 0;
     std::size_t mtp_tail_bytes       = 0;
+    // One lane's bytes of each exact-window plane per KV layer (zero without a window).
+    std::array<std::size_t, KvWindowGeometry::kPlanes> window_bytes{};
 };
 
-[[nodiscard]] StateImageSpec state_image_spec(const TextConfig& config, bool mtp);
+[[nodiscard]] StateImageSpec state_image_spec(const TextConfig& config, bool mtp, KvCacheStorage storage);
 
 struct StateImagePart {
-    enum class Kind : std::uint8_t { Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail };
+    enum class Kind : std::uint8_t { Header, Ple, GdnRecurrent, GdnConv, QsaTail, MtpSaved, MtpTail, QsaWindow };
 
     Kind kind           = Kind::Header;
-    std::uint32_t index = 0; // the layer's index among GDN or attention layers; 0 otherwise
+    // The layer's index among GDN or attention layers; for a window plane, KV layer x 5 + plane;
+    // 0 otherwise.
+    std::uint32_t index = 0;
     std::size_t offset  = 0; // in the packed image
     std::size_t bytes   = 0;
 };
@@ -100,6 +129,9 @@ struct LaneStateBuffers {
     // tails + (k * lanes + l) * spec.qsa_tail_bytes.
     std::byte* tails     = nullptr;
     std::byte* mtp_saved = nullptr; // lane l at mtp_saved + l * spec.mtp_saved_bytes
+    // The exact window (vector-quantized storages): KvWindowGeometry's planes at `window`.
+    std::byte* window = nullptr;
+    KvWindowGeometry window_geometry;
 };
 
 // Host placement of one packed image.

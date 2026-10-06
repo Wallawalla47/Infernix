@@ -1,5 +1,6 @@
 // Qwen4Exp preemption on the real artifact (design §19.3.13). Skips unless NINFER_QWEN4_ARTIFACT
 // names a Qwen4Exp artifact (NINFER_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
+// NINFER_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
 //
 // Two lanes share a KV pool too small for both requests' full extents: each binds its prompt and
 // grows per round, so the younger request is paused when the pool runs out and resumes once the
@@ -15,6 +16,7 @@
 //
 //   ninfer_qwen4_exp_preemption_real_test [--mtp] [--plain]   (default: both modes)
 
+#include "kv_cache_storage.h"
 #include "ninfer/engine.h"
 
 #include <algorithm>
@@ -71,7 +73,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     // 48 pages: both prompts bind (2 x 17 pages) but both extents (2 x 35) do not fit.
     options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(3072);
     options.prefill_chunk        = 512;
-    options.kv_cache             = ninfer::KvCacheStorage::Int8Group64;
+    const char* kv               = std::getenv("NINFER_QWEN4_KV");
+    options.kv_cache             = kv != nullptr ? ninfer::test::parse_kv_cache_storage(kv)
+                                                 : ninfer::KvCacheStorage::Int8Group64;
     options.max_concurrency      = 2;
     options.max_pending_requests = 4;
     options.context_cache.mode                = ninfer::ContextCacheMode::Hybrid;

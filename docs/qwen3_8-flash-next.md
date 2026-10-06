@@ -62,7 +62,12 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
   --prefill-chunk 4096
 ```
 
-- `--kv-dtype` accepts `int8` (recommended) or `bf16`.
+- `--kv-dtype` accepts every NInfer KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
+  `k8v4`, `vq2` and `k4v2`.
+  - `fp8`, `nvfp4` and `k8v4` measured within noise of `int8` in teacher-forced quality. `nvfp4`
+    holds a context in 55 % of `int8`'s KV memory, which leaves more VRAM to the expert cache.
+  - `vq2` and `k4v2` keep each sequence's recent and first tokens exact and quantize older ones
+    harder (design §19.3.15).
 - **Context.** Measurements so far cover 4-8K contexts. Longer contexts work the same way, but
   their KV cache takes VRAM from the expert cache, and they have not been benchmarked yet.
 - `--prefill-chunk 2048` or `4096` speeds up long prompts by 1.4-1.6×. Each costs ~2-5 % of

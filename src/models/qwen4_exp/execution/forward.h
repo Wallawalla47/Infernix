@@ -242,12 +242,12 @@ public:
     void run_mtp(const MtpCall& call);
 
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
-                                                     std::int32_t max_context);
+                                                     std::int32_t max_context, KvCacheStorage storage);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks
     // run them inside run()) and full steps over `draft_columns` sequences.
     [[nodiscard]] static std::size_t mtp_workspace_bytes(const TextConfig& config, std::int32_t kv_columns,
                                                          std::int32_t draft_columns, std::int32_t vocabulary_rows,
-                                                         std::int32_t max_context);
+                                                         std::int32_t max_context, KvCacheStorage storage);
 
 private:
     void ple(const PleParameters& p, Tensor& residual, const ForwardBatch& batch);

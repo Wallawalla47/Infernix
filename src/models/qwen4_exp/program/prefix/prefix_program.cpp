@@ -39,14 +39,16 @@ PrefixCachePersistence public_result(const prefix::PersistResult& result) {
 void ProgramImpl::create_prefix_cache() {
     if (!options_.prefix_cache) { return; }
     const auto lanes = static_cast<std::uint32_t>(options_.max_concurrency);
-    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_));
+    image_layout_    = prefix::plan_state_image(prefix::state_image_spec(c_, mtp_, options_.kv_cache));
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),
                                  .lanes     = lanes,
                                  .ple       = static_cast<std::byte*>(ple_backing_.p),
                                  .tails     = static_cast<std::byte*>(tails_backing_.p),
-                                 .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr});
+                                 .mtp_saved = mtp_ ? static_cast<std::byte*>(mtp_saved_.p) : nullptr,
+                                 .window    = static_cast<std::byte*>(window_backing_.p),
+                                 .window_geometry = window_geometry_});
     prefix::PrefixCacheConfig config;
     config.index.cost = options_.prefix_cost;
     config.taps       = options_.prefix_taps;

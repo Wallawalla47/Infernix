@@ -118,7 +118,7 @@ struct HostSlabs {
 };
 
 void test_layout(const TextConfig& c) {
-    const StateImageLayout layout = plan_state_image(state_image_spec(c, true));
+    const StateImageLayout layout = plan_state_image(state_image_spec(c, true, KvCacheStorage::Int8Group64));
     // Design §19.3.1: 115,673,088 bytes per image with MTP (124 slabs of a 931,840-byte block).
     require(layout.image_bytes == 115'673'088ULL, "image bytes " + std::to_string(layout.image_bytes));
     require(layout.groups() == c.num_hidden_layers + 1U, "one group per decoder layer plus MTP");
@@ -154,7 +154,7 @@ void test_layout(const TextConfig& c) {
     require(layout.group_begin[layout.mtp_group() + 1] - m == 2 && layout.parts[m].kind == StateImagePart::Kind::MtpSaved &&
                 layout.parts[m + 1].kind == StateImagePart::Kind::MtpTail,
             "the MTP group is the saved residual then the MTP tail");
-    const StateImageLayout plain = plan_state_image(state_image_spec(c, false));
+    const StateImageLayout plain = plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64));
     require(plain.group_begin[plain.mtp_group()] == plain.group_begin[plain.mtp_group() + 1] &&
                 plain.fingerprint != layout.fingerprint && plain.image_bytes < layout.image_bytes,
             "without MTP the MTP group is empty and the layout differs");
@@ -162,7 +162,7 @@ void test_layout(const TextConfig& c) {
 
 void test_round_trips(const TextConfig& c) {
     constexpr std::uint32_t kLanes = 3;
-    const StateImageLayout layout  = plan_state_image(state_image_spec(c, true));
+    const StateImageLayout layout  = plan_state_image(state_image_spec(c, true, KvCacheStorage::Int8Group64));
     const StateImageSpec& spec     = layout.spec;
 
     LayoutBuilder builder;
@@ -246,7 +246,7 @@ void test_round_trips(const TextConfig& c) {
     require(read_state_image_header(layout, b.segments[0]).has_value(), "a written header is read back");
     b.segments[0][8] ^= std::byte{1};
     require(!read_state_image_header(layout, b.segments[0]), "a damaged header is rejected");
-    require(!read_state_image_header(plan_state_image(state_image_spec(c, false)), a.segments[0]),
+    require(!read_state_image_header(plan_state_image(state_image_spec(c, false, KvCacheStorage::Int8Group64)), a.segments[0]),
             "a header of another layout is rejected");
     const HostSlabs short_image(used - 1, kSlab, used - 1, 3);
     require_throws([&] { image.copy_lane_to_host(0, short_image.image(), stream); }, "too few segments");

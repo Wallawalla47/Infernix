@@ -227,10 +227,18 @@ void kv_cache_append_batch(const Tensor& k, const Tensor& v, const Tensor& posit
     require_contiguous_nonnull(v, kAppendOp, "v");
     require_contiguous_nonnull(positions, kAppendOp, "positions");
     require_contiguous_nonnull(table_rows, kAppendOp, "table rows");
-    if (kv_storage_has_exact_window(cache.storage) || cache.head_dim != kFullHeadDim ||
-        cache.num_kv_heads != kv_heads || cache.block_tables.dtype != DType::I32 ||
+    if (cache.head_dim != kFullHeadDim || cache.num_kv_heads != kv_heads || cache.block_tables.dtype != DType::I32 ||
         cache.block_tables.data == nullptr) {
         throw std::invalid_argument("kv_cache_append_batch: invalid cache geometry or storage");
+    }
+    if (kv_storage_has_exact_window(cache.storage)) {
+        if (cache.window.present() &&
+            (cache.window.slots.dtype != DType::I32 || cache.window.slots.data == nullptr ||
+             cache.window.slots.numel() < batch)) {
+            throw std::invalid_argument("kv_cache_append_batch: the window's slots give each sequence's window row");
+        }
+        detail::kv_cache_append_vq_batch_launch(k, v, positions, Tensor{}, table_rows, cache, nullptr, stream);
+        return;
     }
     // INT8-G64 and FP8-row storage have a multi-row kernel; the other storages' batched launch
     // addresses one table row, so each row gets its own launch (its row still chosen on the device).
