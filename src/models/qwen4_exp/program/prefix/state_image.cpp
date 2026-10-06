@@ -54,7 +54,53 @@ void for_each_segment_run(std::size_t offset, std::size_t bytes, std::size_t seg
 
 } // namespace
 
-StateImageSpec state_image_spec(const TextConfig& c, bool mtp) {
+KvWindowGeometry kv_window_geometry(const TextConfig& c, KvCacheStorage storage, bool mtp, std::uint32_t lanes) {
+    KvWindowGeometry g;
+    if (!kv_storage_has_exact_window(storage)) { return g; }
+    g.kv_heads  = static_cast<std::int32_t>(c.attention.kv_heads);
+    g.kv_layers = c.attention_layers + (mtp ? 1U : 0U);
+    g.lanes     = lanes;
+    return g;
+}
+
+std::size_t KvWindowGeometry::lane_bytes(int plane) const {
+    const std::size_t rows = static_cast<std::size_t>(kKVWindowSlots) * static_cast<std::size_t>(kv_heads);
+    switch (plane) {
+    case 0:
+    case 1: return rows * kD256KVCacheHeadDim;              // K, V codes
+    case 2:
+    case 3: return rows * kKVWindowGroups * sizeof(std::uint16_t); // K, V group scales
+    default: return rows * 2 * sizeof(std::int32_t);         // tags
+    }
+}
+
+std::size_t KvWindowGeometry::layer_bytes() const {
+    std::size_t bytes = 0;
+    for (int p = 0; p < kPlanes; ++p) { bytes += lane_bytes(p) * lanes; }
+    return bytes;
+}
+
+std::size_t KvWindowGeometry::plane_offset(std::uint32_t kv_layer, int plane) const {
+    std::size_t offset = layer_bytes() * kv_layer;
+    for (int p = 0; p < plane; ++p) { offset += lane_bytes(p) * lanes; }
+    return offset;
+}
+
+PagedKVWindowView kv_window_view(const KvWindowGeometry& g, void* base, std::uint32_t kv_layer) {
+    if (!g.present()) { return {}; }
+    if (kv_layer >= g.kv_layers) { throw std::out_of_range("Qwen4Exp window: KV layer out of range"); }
+    auto* bytes            = static_cast<std::byte*>(base);
+    const std::int32_t s   = kKVWindowSlots, h = g.kv_heads, l = static_cast<std::int32_t>(g.lanes);
+    const auto plane       = [&](int p) { return bytes + g.plane_offset(kv_layer, p); };
+    return PagedKVWindowView{.k_codes  = Tensor(plane(0), DType::I8, {kD256KVCacheHeadDim, s, h, l}),
+                             .v_codes  = Tensor(plane(1), DType::I8, {kD256KVCacheHeadDim, s, h, l}),
+                             .k_scales = Tensor(plane(2), DType::FP16, {kKVWindowGroups, s, h, l}),
+                             .v_scales = Tensor(plane(3), DType::FP16, {kKVWindowGroups, s, h, l}),
+                             .tags     = Tensor(plane(4), DType::I32, {2, s, h, l}),
+                             .slots    = {}};
+}
+
+StateImageSpec state_image_spec(const TextConfig& c, bool mtp, KvCacheStorage storage) {
     StateImageSpec spec;
     spec.layer_types         = c.layer_types;
     spec.ple_layer           = c.ple.layer;
@@ -67,6 +113,10 @@ StateImageSpec state_image_spec(const TextConfig& c, bool mtp) {
     if (mtp) {
         spec.mtp_saved_bytes = static_cast<std::size_t>(c.residual_width()) * 2U;
         spec.mtp_tail_bytes  = spec.qsa_tail_bytes;
+    }
+    const KvWindowGeometry window = kv_window_geometry(c, storage, mtp, 1);
+    if (window.present()) {
+        for (int p = 0; p < KvWindowGeometry::kPlanes; ++p) { spec.window_bytes[p] = window.lane_bytes(p); }
     }
     return spec;
 }
@@ -83,6 +133,13 @@ StateImageLayout plan_state_image(const StateImageSpec& spec) {
         layout.parts.push_back(StateImagePart{kind, index, offset, bytes});
         offset = align_up(offset + bytes);
     };
+    // A KV layer's exact-window planes (vector-quantized storages) join its group.
+    const auto add_window = [&](std::uint32_t kv_layer) {
+        if (spec.window_bytes[0] == 0) { return; }
+        for (std::uint32_t p = 0; p < KvWindowGeometry::kPlanes; ++p) {
+            add_part(StateImagePart::Kind::QsaWindow, kv_layer * KvWindowGeometry::kPlanes + p, spec.window_bytes[p]);
+        }
+    };
     add_part(StateImagePart::Kind::Header, 0, kStateImageHeaderBytes);
     std::uint32_t gdn = 0, attention = 0;
     for (std::uint32_t layer = 0; layer < spec.layer_types.size(); ++layer) {
@@ -94,6 +151,7 @@ StateImageLayout plan_state_image(const StateImageSpec& spec) {
             ++gdn;
         } else {
             add_part(StateImagePart::Kind::QsaTail, attention, spec.qsa_tail_bytes);
+            add_window(attention);
             ++attention;
         }
     }
@@ -101,6 +159,7 @@ StateImageLayout plan_state_image(const StateImageSpec& spec) {
     if (spec.mtp) {
         add_part(StateImagePart::Kind::MtpSaved, 0, spec.mtp_saved_bytes);
         add_part(StateImagePart::Kind::MtpTail, 0, spec.mtp_tail_bytes);
+        add_window(attention);
     }
     layout.group_begin.push_back(static_cast<std::uint32_t>(layout.parts.size()));
     layout.image_bytes = offset;
@@ -158,6 +217,13 @@ LaneStateImage::LaneStateImage(const StateImageLayout& layout, const LaneStateBu
         (spec.mtp && buffers.mtp_saved == nullptr)) {
         throw std::invalid_argument("Qwen4Exp state image: lane buffers are missing");
     }
+    if (spec.window_bytes[0] != 0) {
+        const KvWindowGeometry& w = buffers.window_geometry;
+        bool same = buffers.window != nullptr && w.lanes >= buffers.lanes &&
+                    w.kv_layers == attention_layers + (spec.mtp ? 1U : 0U);
+        for (int p = 0; same && p < KvWindowGeometry::kPlanes; ++p) { same = w.lane_bytes(p) == spec.window_bytes[p]; }
+        if (!same) { throw std::invalid_argument("Qwen4Exp state image: the exact window does not match the layout"); }
+    }
     if (gdn_layers > 0) {
         if (buffers.gdn == nullptr || buffers.gdn->layer_count() != gdn_layers ||
             buffers.gdn->slot_count() < static_cast<std::int32_t>(buffers.lanes) ||
@@ -186,6 +252,12 @@ std::byte* LaneStateImage::device_part(const StateImagePart& part, std::uint32_t
         return buffers_.mtp_saved + static_cast<std::size_t>(lane) * spec.mtp_saved_bytes;
     case StateImagePart::Kind::MtpTail:
         return buffers_.tails + (static_cast<std::size_t>(attention_layers) * buffers_.lanes + lane) * spec.qsa_tail_bytes;
+    case StateImagePart::Kind::QsaWindow: {
+        const KvWindowGeometry& w = buffers_.window_geometry;
+        const int plane           = static_cast<int>(part.index % KvWindowGeometry::kPlanes);
+        return buffers_.window + w.plane_offset(part.index / KvWindowGeometry::kPlanes, plane) +
+               static_cast<std::size_t>(lane) * w.lane_bytes(plane);
+    }
     }
     throw std::logic_error("Qwen4Exp state image: the header has no Device bytes");
 }

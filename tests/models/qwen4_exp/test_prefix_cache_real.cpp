@@ -1,5 +1,6 @@
 // Qwen4Exp prefix cache on the real artifact (design §19.3.1). Skips unless NINFER_QWEN4_ARTIFACT
 // names a Qwen4Exp artifact (NINFER_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
+// NINFER_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
 // One Engine per drafter mode serves every scenario, so the 64.5 GiB model loads once per mode:
 //
 //   tap resume   (E3) A request resumes from another's flexible tap at a prefill-chunk boundary; its
@@ -20,6 +21,7 @@
 //
 //   ninfer_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
+#include "kv_cache_storage.h"
 #include "ninfer/engine.h"
 
 #include <cstdint>
@@ -86,7 +88,9 @@ ninfer::EngineOptions base_options(const char* artifact, const char* ngram) {
     // 72 pages (+1 copy-on-write page): a 3,900-token pressure prompt evicts nearly every block.
     options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(4608);
     options.prefill_chunk        = kChunk;
-    options.kv_cache             = ninfer::KvCacheStorage::Int8Group64;
+    const char* kv               = std::getenv("NINFER_QWEN4_KV");
+    options.kv_cache             = kv != nullptr ? ninfer::test::parse_kv_cache_storage(kv)
+                                                 : ninfer::KvCacheStorage::Int8Group64;
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
     options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;

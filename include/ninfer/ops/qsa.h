@@ -126,16 +126,34 @@ void qsa_commit_tails(const Tensor& raw_keys, const Tensor& positions, const Ten
                       Tensor& tails, const Tensor& tail_slots, const QsaGeometry& geometry,
                       cudaStream_t stream);
 
+/// Workspace of qsa_attention for `columns` columns of the given KV storage (the vector-quantized
+/// storages add the staging of a wide call's exact window rows).
 [[nodiscard]] std::size_t qsa_attention_workspace_bytes(const QsaGeometry& geometry,
                                                         std::int32_t columns,
-                                                        std::int32_t max_context);
+                                                        std::int32_t max_context,
+                                                        KvCacheStorage storage);
+
+/// The call's keys and values for the vector-quantized storages (vq2, k4v2), which qsa_attention
+/// appends itself: BF16 K (normalized, after RoPE) and V [head_dim, kv_heads, width, batch].
+struct QsaAppend {
+    Tensor k;
+    Tensor v;
+};
 
 /// q: BF16 [head_dim, heads, T] (normalized, rotated); index_q: BF16 [Di, index_heads, T] from
-/// qsa_index_query. Every column's keys and values (and the call's pooled keys) are already in
-/// the planes. out: BF16 [head_dim, heads, T].
+/// qsa_index_query. out: BF16 [head_dim, heads, T]. The call's pooled keys are already in their
+/// plane. Keys and values:
+///   - every storage but vq2/k4v2: already in the planes (kv_cache_append_batch), `append` null;
+///   - vq2/k4v2: `append` holds them and the Op appends them (kv_cache_append_batch's encoding).
+///     With an exact window (layer.kv.window present; its `slots` gives each sequence's window row)
+///     a key j of query p is read from its exact INT8-G64 row when j < kKVWindowSinkTokens or
+///     j >= p - kKVWindowRecentTokens and the row matches the stored codes (core/paged_kv_storage.h):
+///     a window slot for keys before the call, the call's own row for its columns (staged in the
+///     workspace for calls wider than kKVWindowInlineWidth, which take one sequence, and committed
+///     to the window afterwards); from its codes otherwise.
 void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& layer,
                    const QsaBatch& batch, const QsaGeometry& geometry, float scale,
                    std::int32_t max_context, void* workspace, std::size_t workspace_bytes,
-                   Tensor& out, cudaStream_t stream);
+                   Tensor& out, cudaStream_t stream, const QsaAppend* append = nullptr);
 
 } // namespace ninfer::ops

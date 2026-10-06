@@ -729,6 +729,20 @@ cmake --build build --parallel --target ninfer_packed_softmax_attention_bench
   --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
+`ninfer_qsa_attention_bench` measures Qwen3.8-Flash-Next's public QSA attention (24/2 heads, D256,
+a 4 x 128 indexer, budget 2048 in blocks of 4) for one row of W columns at the end of a C-token
+context, in any KV storage:
+- It reports the whole call (selection, attention, merge; for vq2/k4v2 also the Op's own append,
+  with a zeroed exact window) and the selection alone. Their difference is attention and merge.
+- Every sample is a captured graph launched after an L2 flush.
+- W = 1 is decode, 5 or 8 verification, and 86 or more columns the Tensor Core prompt route.
+
+```bash
+cmake --build build --parallel --target ninfer_qsa_attention_bench
+./build/bench/ninfer_qsa_attention_bench --storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2 \
+  --contexts 8192,131072 --widths 1,5,8,256
+```
+
 The bandwidth and FLOP fields are semantic useful-work models. They do not infer private scratch
 traffic, launch decomposition, or selected implementation from kernel names; physical traffic and
 instruction utilization require a profiler capture of the complete public call.

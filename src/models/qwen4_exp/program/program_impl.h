@@ -259,6 +259,8 @@ struct DeviceLayout {
     SpecLayout spec;
     MtpIo mtp_io;
     std::size_t gdn_bytes = 0, ple = 0, tails = 0, kv = 0, records_bytes = 0, ple_records = 0, qsa_records = 0;
+    // The vq2/k4v2 exact window of every KV layer and lane (prefix::KvWindowGeometry; zero otherwise).
+    std::size_t window = 0;
     std::size_t logits32 = 0, logits16 = 0, token_counts = 0, work = 0, staging = 0;
     // The arena wide prefill calls swap in (columns above static_columns), lent from expert frames
     // while a prompt runs such calls; zero when the static arena covers every call.
@@ -381,9 +383,6 @@ public:
         if (o.max_concurrency == 0 || o.max_concurrency > kMaximumConcurrency) {
             throw std::invalid_argument("Qwen4Exp: max_concurrency must be in [1,8]");
         }
-        if (o.kv_cache != KvCacheStorage::BFloat16 && o.kv_cache != KvCacheStorage::Int8Group64) {
-            throw std::invalid_argument("Qwen4Exp supports --kv-dtype bf16 or int8");
-        }
         if (o.max_context == 0 || o.prefill_chunk == 0) {
             throw std::invalid_argument("Qwen4Exp: max_context and prefill_chunk must be nonzero");
         }
@@ -427,6 +426,7 @@ public:
         d.ple       = width * c.ple.conv_span() * lanes * 2;
         d.kv_layers = c.attention_layers + (d.mtp ? 1U : 0U);
         d.tails     = d.kv_layers * di * (r - 1) * lanes * 2;
+        d.window    = prefix::kv_window_geometry(c, o.kv_cache, d.mtp, static_cast<std::uint32_t>(lanes)).bytes();
 
         // Paged KV: one page group holds 64 positions of every attention layer.
         // The page group's planes, in the order the prefix cache's records also use.
@@ -537,7 +537,7 @@ public:
         b.kv_max    = d.kv;
         b.workspace = d.work;
         b.staging   = d.staging;
-        b.state     = d.gdn_bytes + d.ple + d.tails + d.records_bytes + d.ple_records + d.qsa_records +
+        b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
@@ -577,14 +577,14 @@ public:
                                        std::int32_t lanes, std::int32_t columns) {
         const std::int32_t W = d.max_width;
         std::size_t bytes =
-            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context)) +
+            execution::Forward::workspace_bytes(c, std::max(columns, lanes * W), dim(o.max_context), o.kv_cache) +
             ops::sampling_workspace_capacity_bytes(d.token_domain, 1, lanes);
         if (W > 1) {
             bytes += ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(d.token_domain, 1, W - 1, 1, lanes);
         }
         if (d.mtp) {
             bytes += execution::Forward::mtp_workspace_bytes(c, std::max(lanes * W, std::min(d.chunk, 512)), lanes,
-                                                             d.head_rows, dim(o.max_context));
+                                                             d.head_rows, dim(o.max_context), o.kv_cache);
         }
         return bytes;
     }
@@ -640,6 +640,12 @@ public:
         ple_backing_.fill(0);
         allocate(tails_backing_, plan_.tails, allocated);
         tails_backing_.fill(0);
+        window_geometry_ = prefix::kv_window_geometry(c_, options_.kv_cache, mtp_,
+                                                      static_cast<std::uint32_t>(options_.max_concurrency));
+        if (window_geometry_.present()) {
+            allocate(window_backing_, plan_.window, allocated);
+            window_backing_.fill(0); // zero tags never match a row's (tags are odd)
+        }
 
         kv_geometry_ = prefix::kv_page_geometry(c_, options_.kv_cache, mtp_);
         if (plan_.kv_elastic) {
@@ -698,6 +704,7 @@ public:
             layer.kv.v_pages = pool_->plane(plane++);
             if (layout.value.has_scale()) { layer.kv.v_scale_pages = pool_->plane(plane++); }
             layer.pooled_pages = pool_->plane(plane++);
+            if (window_geometry_.present()) { layer.kv.window = prefix::kv_window_view(window_geometry_, window_backing_.p, l); }
             if (plane != planes.end) { throw std::logic_error("Qwen4Exp: KV planes do not match the page geometry"); }
             if (l < c_.attention_layers) {
                 kv.layers.push_back(layer);
@@ -2486,7 +2493,8 @@ private:
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes));
     }
 
-    // Zeroes a slot's recurrent state, PLE convolution history, QSA tails and penalty counts.
+    // Zeroes a slot's recurrent state, PLE convolution history, QSA tails (and exact-window tags) and
+    // penalty counts.
     void reset_slot(std::uint32_t slot) {
         const cudaStream_t s = device_.stream;
         for (std::uint32_t l = 0; l < c_.gdn_layers; ++l) {
@@ -2502,6 +2510,12 @@ private:
         for (std::uint32_t l = 0; l < c_.attention_layers + (mtp_ ? 1U : 0U); ++l) {
             CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(tails_backing_.p) + (l * lanes + slot) * tail_bytes, 0,
                                        tail_bytes, s));
+            if (window_geometry_.present()) { // the window's tags: no earlier history's row is read
+                const std::size_t tags = window_geometry_.lane_bytes(4);
+                CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(window_backing_.p) +
+                                               window_geometry_.plane_offset(l, 4) + slot * tags,
+                                           0, tags, s));
+            }
         }
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts_.p) + slot * static_cast<std::size_t>(token_domain_),
                                    0, 4ULL * token_domain_, s));
@@ -3593,6 +3607,9 @@ private:
     [[nodiscard]] prefix::CallPlan plan_prefill(const qwen3_5::PreparedPromptData& prompt, std::uint32_t frontier,
                                                 std::span<const std::uint32_t> existing, bool taps) const;
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
+    // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
+    DeviceBuffer window_backing_;
+    prefix::KvWindowGeometry window_geometry_;
 
     // ---- the host-to-device link (design §19.4: bandwidth-dependent choices follow the machine) ----
     // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
