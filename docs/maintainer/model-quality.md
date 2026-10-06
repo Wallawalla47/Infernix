@@ -119,7 +119,123 @@ Also rejected for the same trade-off: 16-bit MLP activations in prefill (table 3
 activation path would need FP4 x FP8 block-scaled MMA, which takes UE8M0 scales per 32 values,
 not NVFP4's E4M3 scales per 16.
 
-## 4. Repeating the measurements
+## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
+
+Recorded 2026-10-05/06. This compares NInfer's Flash-Next artifacts, which import NVIDIA's NVFP4
+checkpoint bit-exactly
+([design §6.1](qwen3_8-flash-next-design.md#61-recipes-qwen3_8_flash_next_nvfp4-a-and-qwen3_8_flash_next_nvfp4_dense8-b)),
+with `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL`. That GGUF is the file the Strata engine runs
+on this machine. The quality figures were measured. The speed figures are **estimates, not
+measurements**: no UD-Q4_K_XL support exists in NInfer.
+
+### 4.1 Measured quality
+
+Teacher-forced on identical token ids
+([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)).
+NInfer ran recipe A with INT8 KV; Strata ran UD-Q4_K_XL with INT8 KV. The texts were 2,557
+positions of code, a document and a chat transcript, all ≤ 1,024 tokens.
+
+| | Perplexity | ΔNLL (NInfer − Strata) |
+|---|---:|---:|
+| Code | 1.9052 / 1.9051 | +0.000 ± 0.016 |
+| Document | 9.5874 / 9.7671 | −0.019 ± 0.017 |
+| Chat | 3.3611 / 3.8692 | **−0.141 ± 0.024** |
+| All | 4.564 / 4.864 | **−0.064 ± 0.012** |
+
+Recipe B (8-bit dense) costs +0.008 ± 0.010 nats against recipe A. It therefore keeps the same
+lead over Strata.
+
+**This compares engines as well as weights.** Several of Strata's numerical choices differ from
+NInfer's:
+- It rounds 195 of the file's Q8_0 tensors to BF16 when it packs them: every hyper-connection
+  up/down matrix, `output_hc_*` and the PLE value projection (`--compat-bf16`).
+- It keeps an FP32 residual stream. In NInfer that measured +0.030 ± 0.009 nats worse.
+- It quantizes expert activations to Q8_1.
+
+How much of the chat gap comes from the weights alone has not been measured.
+
+### 4.2 What the file contains
+
+These facts come from the GGUF headers (4 shards, 111.3 GB).
+
+| Tensor class | GGUF format | NInfer recipe B |
+|---|---|---|
+| Routed experts | Q4_K gate/up (Q5_K in layer 2); Q5_1 down (Q8_0 in layers 2, 4, 30, 46, 47). 71.73 GiB | NVFP4, 63.3 GiB |
+| Bytes per expert | 3,072,000; 3,584,000 in the Q8_0-down layers; 3,993,600 in layer 2. **+13 %** on average | 2,764,800 |
+| All dense projections, `lm_head`, embedding | Q8_0: the same codes and FP16 scale per 32 as `q8_g32_fp16`, so the same bytes | `q8_g32_fp16` |
+| Router, GDN a/b, HC inject | F32 holding exact BF16 values | BF16 |
+| QSA indexer | BF16 | BF16 |
+| PLE n-gram table | IQ4_NL, 28.8 GB (90 B per row) | FP8, 51.2 GB |
+| MTP layer, vision tower | **absent** | present |
+
+At 4.5 bits per weight, Q4_K is the same size as NVFP4. The dense path has the same bytes in both
+artifacts. The differences are the larger down projections, plus the format of the arithmetic.
+
+### 4.3 Conclusion
+
+- **Quality.** A bit-exact UD-Q4_K_XL artifact in NInfer would likely land near Strata's quality,
+  perhaps slightly above it, because NInfer can run every Q8_0 tensor exactly. It would likely
+  stay below the NVFP4 artifacts, particularly on chat. This is unmeasured. Before such an
+  artifact could be adopted, it would have to pass the same §16.5 comparison.
+- **Speed** (estimates, against recipe B on the RTX 5090; nothing measured). Offloading narrows
+  the gap. The causes are:
+  - 13 % more bytes per expert;
+  - about 12 % fewer VRAM frames (roughly 9,400 → 8,300), so more misses, each carrying more
+    bytes;
+  - expert GEMMs in prefill would run on INT8 tensor cores (half the FP4 rate) instead of
+    `mxf4nvf4`.
+
+  | Workload | Estimated slowdown |
+  |---|---|
+  | Warm decode (dense-path-bound, identical bytes) | ~5-10 % |
+  | Cold or first-time decode and MTP verification (miss- and link-bound) | ~10-25 % |
+  | Link-bound prefill | ~12-15 % |
+  | GPU-bound long-prompt prefill | ~5-15 % |
+
+  Strata's 72-80 tok/s on this file therefore reflects its engine, not the format.
+- **Overall.** Such an artifact would probably be both slower and lower quality than recipe B.
+  Its value would be a like-for-like comparison with Strata and a smaller n-gram table on disk.
+  It is not built.
+
+### 4.4 What support would require
+
+Neither path below is built.
+
+- **Converter.**
+  - The existing GGUF source (`tools/convert/sources/gguf.py`) dequantizes to FP32. Using it here
+    would quantize the values a second time, so a bit-exact artifact needs an encoded import of
+    the raw blocks instead.
+  - A `qwen4exp` name map, which must undo llama.cpp's export transforms (for example, `ssm_a`
+    stored as −exp(A_log)). It is verified against the NVIDIA checkpoint's unquantized tensors.
+  - Q8_0 copies into `q8_g32_fp16` exactly, provided no code is −128.
+  - New formats `q4_k`, `q5_k`, `q5_1` and `iq4_nl`, each with an exact decode oracle.
+  - An expert record layout for the mixed formats.
+  - MTP and vision taken from the NVIDIA checkpoint.
+- **Runtime.**
+  - A second implementation family in `offloaded_sparse_moe`, which today is fixed to the NVFP4
+    record (`kRecordBytes`). It needs:
+    - a GPU narrow route;
+    - a GPU wide route (INT8 MMA);
+    - AVX-VNNI CPU miss kernels;
+    - canonical arithmetic (integer A8 block products and a fixed-order epilogue), so placement
+      invariance still holds.
+  - Frame-pool size classes for the three record sizes.
+  - IQ4_NL row decoding in the PLE gather.
+  - About 72.4 GiB of pinned RAM instead of 64.5 GiB. About 77 GiB must be free at startup, or
+    81 GiB with `ninfer-serve`. Alternatively, the SSD expert tier.
+  - Rough size of the work: 2-3 weeks, mostly the expert kernels.
+- **Native GGUF loading.**
+  - Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
+    `.ninfer` is the only artifact, and runtime repacking is forbidden. The 2-byte-aligned 34-byte
+    Q8_0 blocks would slow the dense kernels unless repacked.
+  - The preferred form is a thin `.ninfer`. It would reference the GGUF's byte ranges for the
+    experts and the PLE table and embed only the repacked dense weights and the MTP layer. It adds
+    about 6 GB on disk instead of about 106 GB. Each expert matrix is a whole number of 4 KiB
+    pages, but tensor bases are only 32-byte aligned, so reads need aligned over-reads.
+  - Arbitrary GGUFs would need every ggml type on every kernel route, plus each architecture's
+    export conventions. That is not recommended.
+
+## 5. Repeating the measurements
 
 ```bat
 rem 16-bit reference, one pass per window
