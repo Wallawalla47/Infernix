@@ -103,7 +103,9 @@ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std:
     const std::int32_t* frames = residency_ + static_cast<std::size_t>(layer) * experts_;
     std::uint32_t taken        = 0;
     for (std::uint32_t e = 0; e < experts_; ++e) {
-        const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && taken < half_;
+        // An SSD-only expert has no host record to copy: the CPU or the fetch channel serves it.
+        const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && taken < half_ &&
+                          record_of_(layer, e) != nullptr;
         row[e]          = copy ? static_cast<std::int32_t>((layer % 2) * half_ + taken++) : -1;
     }
     streams_[layer] = 1; // the MoE waits for the table upload even when nothing is copied
