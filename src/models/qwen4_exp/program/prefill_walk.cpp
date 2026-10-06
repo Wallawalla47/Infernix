@@ -94,7 +94,10 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.vision.assign(n, std::nullopt);
     walk_.mtp_vision.assign(n, {});
     walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
-    if (walk_host_.size() < n * walk_.io_stride) { walk_host_ = PinnedHostBuffer(n * walk_.io_stride); }
+    if (walk_host_.size() < n * walk_.io_stride) {
+        walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
+        walk_prefetch_ = WalkPrefetch{};
+    }
     walk_.waits = prefix_waits(lane);
     walk_.active = true;
 
@@ -114,16 +117,26 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     expert_stream_->begin(ring_span(), residency_->host_table(), s);
     for (std::size_t c = 0; c < n; ++c) {
         const std::int32_t b = walk_.begins[c], w = walk_.widths[c];
+        // Rows the previous span prefetched already stand at this chunk's slot.
+        const bool prefetched = walk_prefetched(index, walk_.first_call, c, b, w);
         {
             const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
                                                static_cast<std::uint64_t>(w));
-            stage_sequence(index, b, w, lane.history);
+            stage_sequence(index, b, w, lane.history, !prefetched);
         }
         std::optional<execution::MtpChunk> chunk = stage_mtp_chunk(lane, index, b, w);
         const execution::VisionInput* vision     = stage_vision(lane, static_cast<std::uint32_t>(b), w);
         std::byte* host_slot = host_area + c * walk_.io_stride;
         std::byte* slot      = area + walk_.residual_bytes + c * walk_.io_stride;
-        std::memcpy(host_slot, io_host_.data(), io_layout_.bytes);
+        if (prefetched) {
+            const std::size_t rows = static_cast<std::size_t>(w) * hash_.heads() * c_.ple.table.row_bytes;
+            const std::size_t tail = io_layout_.ngram + rows;
+            std::memcpy(host_slot, io_host_.data(), io_layout_.ngram);
+            std::memcpy(host_slot + tail, static_cast<const std::byte*>(io_host_.data()) + tail, io_layout_.bytes - tail);
+            ++walk_prefetched_chunks_;
+        } else {
+            std::memcpy(host_slot, io_host_.data(), io_layout_.bytes);
+        }
         CUDA_CHECK(cudaMemcpyAsync(slot, host_slot, io_layout_.bytes, cudaMemcpyHostToDevice, s));
         if (chunk) {
             chunk->ids              = rebase_tensor(chunk->ids, slot);
@@ -148,8 +161,68 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         walk_pass(c, 0);
     }
     walk_.next_layer = 1;
+    walk_prefetch_   = WalkPrefetch{}; // consumed; the slots now hold this span's chunks
     ++walk_spans_;
     walk_calls_ += n;
+}
+
+std::uint64_t ProgramImpl::window_key() const noexcept {
+    std::uint64_t h = 1469598103934665603ULL; // FNV-1a over the window's token ids
+    for (const std::int32_t t : window_) {
+        h ^= static_cast<std::uint32_t>(t);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+bool ProgramImpl::walk_prefetched(std::uint32_t index, std::size_t first_call, std::size_t c, std::int32_t begin,
+                                  std::int32_t width) {
+    const WalkPrefetch& f = walk_prefetch_;
+    if (!f.valid || f.lane != index || f.first_call != first_call || c >= f.widths.size() || f.begins[c] != begin ||
+        f.widths[c] != width) {
+        return false;
+    }
+    ngram_window(lanes_[index].history, begin, width);
+    return window_key() == f.keys[c];
+}
+
+// Reads up to `chunks` more chunks of the span after the current one (calls from walk_.end_call, as
+// walk_span_end would group them) into walk_host_'s slots. Only after the span's first device
+// synchronization: until then its own slots may still be uploading.
+void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_t chunks) {
+    WalkPrefetch& f = walk_prefetch_;
+    if (!f.valid || f.lane != index || f.first_call != walk_.end_call) {
+        f            = WalkPrefetch{};
+        f.valid      = true;
+        f.lane       = index;
+        f.first_call = walk_.end_call;
+    }
+    const std::size_t slots = walk_host_.size() / walk_.io_stride;
+    std::uint32_t tokens    = 0;
+    for (const auto w : f.widths) { tokens += static_cast<std::uint32_t>(w); }
+    for (std::size_t added = 0; added < chunks && !f.done; ++added) {
+        const std::size_t k = f.widths.size(), call = f.first_call + k;
+        if (k >= slots || call >= lane.calls.size()) {
+            f.done = true;
+            break;
+        }
+        const std::uint32_t from  = lane.calls[call - 1];
+        const std::uint32_t width = lane.calls[call] - from;
+        if (width < static_cast<std::uint32_t>(kStreamMinColumns) || tokens + width > kWalkMaxTokens) {
+            f.done = true;
+            break;
+        }
+        const nvtx::ScopedRange rows_range(nvtx::Name::PrefillPleRows, nvtx::Category::Prefill,
+                                           static_cast<std::uint64_t>(width));
+        ngram_window(lane.history, static_cast<std::int32_t>(from), static_cast<std::int32_t>(width));
+        auto* slot = static_cast<std::byte*>(walk_host_.data()) + k * walk_.io_stride;
+        read_ngram_to(lane, static_cast<std::int32_t>(width), slot + io_layout_.ngram);
+        f.begins.push_back(static_cast<std::int32_t>(from));
+        f.widths.push_back(static_cast<std::int32_t>(width));
+        f.keys.push_back(window_key());
+        tokens += width;
+        if (prefix_tap_due(lane, call + 1)) { f.done = true; }
+    }
 }
 
 // Layer l of chunk c (with the embedding before layer 0, and the MTP cells and, for the prompt's
@@ -202,6 +275,14 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     }
     ++walk_.steps;
     if (to < L) {
+        // While the device runs this step, read the next span's n-gram rows (one span's chunks spread
+        // over the remaining steps; ~35-70 ms of NVMe reads per 4,096-token chunk).
+        if (walk_.steps > 1 && walk_.end_call < lane.calls.size()) {
+            const std::size_t remaining = (L - to + walk_.layers_per_step - 1) / walk_.layers_per_step + 1;
+            const std::size_t slots     = walk_host_.size() / walk_.io_stride;
+            const std::size_t have      = walk_prefetch_.valid ? walk_prefetch_.widths.size() : 0;
+            walk_prefetch_rows(lane, index, slots > have ? (slots - have + remaining - 1) / remaining : 0);
+        }
         {
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
@@ -255,7 +336,8 @@ void ProgramImpl::walk_abandon() noexcept {
         device_.synchronize();
     } catch (...) {}
     expert_stream_->end();
-    walk_ = LayerWalk{};
+    walk_          = LayerWalk{};
+    walk_prefetch_ = WalkPrefetch{};
 }
 
 } // namespace ninfer::models::qwen4_exp::detail
