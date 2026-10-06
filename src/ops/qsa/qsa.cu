@@ -860,8 +860,23 @@ __global__ void merge_kernel(const float* __restrict__ partial, int heads, int s
     out[(static_cast<std::size_t>(t) * heads + head) * kHeadDim + d] = __float2bfloat16_rn(l > 0.0F ? acc / l : 0.0F);
 }
 
+// Splits per (column, KV head): one wave of the decode kernel's CTAs (one 512-thread CTA per SM),
+// at most 48 (a split keeps at least ~43 of a column's 2,051 tokens; more partials cost more merge),
+// and at least 4 when a call is split at all (a CTA's serial walk stays near 8 tiles). A call that
+// fills half the SMs unsplit takes the prompt route. Measured against the earlier 340-CTA / 33-split
+// rule: equal at W = 1-2, 5-18 % faster at W = 3-8, 42-73 % at 43-85 columns (now the prompt route;
+// design §19.3.15).
 int attention_splits(int columns, int kv_heads) {
-    return std::clamp(340 / std::max(1, columns * kv_heads), 1, 33);
+    static const int sms = [] {
+        int device = 0, count = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
+            throw std::runtime_error("qsa: cannot query the multiprocessor count");
+        }
+        return count;
+    }();
+    const int splits = std::clamp(sms / std::max(1, columns * kv_heads), 1, 48);
+    return splits == 1 ? 1 : std::max(splits, 4);
 }
 
 struct Workspace {

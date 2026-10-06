@@ -109,10 +109,11 @@ struct PromptShape<KvCacheStorage::Q4KeyVq2Value> {
     static constexpr int Warps = 3;
     static constexpr Code Key = Code::Int8, Value = Code::Int8;
 };
+// Three warps: one stage and the NVFP4 value tile then fit two CTAs per SM.
 template <>
 struct PromptShape<KvCacheStorage::Fp8KeyNvfp4Value> {
     static constexpr int Vq    = 0;
-    static constexpr int Warps = 4;
+    static constexpr int Warps = 3;
     static constexpr Code Key = Code::Fp8, Value = Code::Nvfp4;
 };
 
@@ -136,20 +137,22 @@ struct Stage {
     static constexpr int VqTags       = VqCodeScales + (Shape::Vq > 0 ? kTile * 8 : 0);
     static constexpr int VqMeta       = VqTags + (Shape::Vq > 0 ? kTile * 8 : 0);
     static constexpr int Bytes        = VqMeta + (Shape::Vq > 0 ? kTile * 8 : 0);
-    // NVFP4 values decode into one FP16 [16][256] tile per warp.
-    static constexpr int Scratch = Shape::Value == Code::Nvfp4 ? kTile * 2 * kD : 0;
+    // NVFP4 values decode into one FP16 [16][128] tile per warp, half the dimensions at a time.
+    static constexpr int Scratch = Shape::Value == Code::Nvfp4 ? kTile * kD : 0; // half the dimensions, FP16
     static constexpr bool RotatedKeys   = Shape::Key != Code::Bf16;
     static constexpr bool RotatedValues = Shape::Value == Code::Nvfp4 || Shape::Vq > 0;
     static constexpr bool EvenOddValues = Shape::Value == Code::Int8 || Shape::Value == Code::Fp8;
     static_assert(Values % 16 == 0 && KeyScales % 16 == 0 && ValueScales % 16 == 0 && ParityWord % 16 == 0);
 };
 
-template <KvCacheStorage Storage>
+// Shared memory: the query rows, then each warp's `Stages` stages (and NVFP4 value tile), later the merge:
+// one FP32 row buffer the warps accumulate into and every warp's (max, sum) per row; then the codebook.
+template <KvCacheStorage Storage, int Stages>
 __host__ __device__ constexpr int prompt_smem_bytes() {
     using S              = Stage<Storage>;
     constexpr int Warps  = PromptShape<Storage>::Warps;
-    constexpr int stages = Warps * (2 * S::Bytes + S::Scratch);
-    constexpr int merge  = Warps * (kRows * kD + kRows * 2) * 4 + (S::RotatedValues ? kRows * kD * 4 : 0);
+    constexpr int stages = Warps * (Stages * S::Bytes + S::Scratch);
+    constexpr int merge  = (kRows * kD + Warps * kRows * 2) * 4;
     constexpr int book   = PromptShape<Storage>::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0;
     return kQRow * kRows + (stages > merge ? stages : merge) + book;
 }
@@ -258,8 +261,8 @@ __device__ __forceinline__ void decode_v_pair(unsigned codes, __half2 scales, un
     }
 }
 
-template <KvCacheStorage Storage>
-__global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
+template <KvCacheStorage Storage, int Stages>
+__global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, Stages == 1 ? 2 : 1)
     qsa_prompt_kernel(const bf16* __restrict__ q, int heads, int kv_heads, const void* __restrict__ k_pages,
                       const void* __restrict__ v_pages, const void* __restrict__ k_scales,
                       const void* __restrict__ v_scales, const std::int32_t* __restrict__ tables,
@@ -314,7 +317,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
     __syncthreads();
 
     // VQ2 codebook (vector-quantized storages): behind the stages and the merge rows.
-    constexpr int kCodebookAt = prompt_smem_bytes<Storage>() -
+    constexpr int kCodebookAt = prompt_smem_bytes<Storage, Stages>() -
                                 (Shape::Vq > 0 ? static_cast<int>(sizeof(kKVCacheVq2Codebook)) : 0);
     const auto* codebook = reinterpret_cast<const std::int8_t*>(smem + kCodebookAt);
     if constexpr (Shape::Vq > 0) {
@@ -326,8 +329,8 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
     }
     const int call_first = positions[(t / width) * width];
     const int window_row = vq.slots != nullptr ? vq.slots[t / width] : 0;
-    unsigned char* stages  = smem + kQRow * kRows + warp * (2 * S::Bytes + S::Scratch);
-    unsigned char* scratch = stages + 2 * S::Bytes;
+    unsigned char* stages  = smem + kQRow * kRows + warp * (Stages * S::Bytes + S::Scratch);
+    unsigned char* scratch = stages + Stages * S::Bytes;
     const int tiles        = (total + kTile - 1) / kTile;
 
     // Gathers tile i's keys, values and scales into stage s; tokens past the column's list are
@@ -664,31 +667,6 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
                 }
             }
         } else {
-            const unsigned char* fp16_rows = v_s;
-            if constexpr (Shape::Value == Code::Nvfp4) {
-                // Lane l decodes key l / 2's dimensions 128 (l % 2) .. + 127 into the FP16 tile.
-                const int key = lane >> 1, half = lane & 1;
-                const unsigned char* vs = k_s + S::ValueScales + key * V::ScaleSlot;
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    const int chunk = 4 * half + c; // 16 code bytes: dimensions 32 chunk .. + 31
-                    const uint4 codes = load_vec<uint4>(v_s + swizzled(key, V::Bytes, chunk));
-                    const unsigned words[4] = {codes.x, codes.y, codes.z, codes.w};
-#pragma unroll
-                    for (int w = 0; w < 4; ++w) { // dimensions 32 chunk + 8 w .. + 7
-                        const __half sc  = e4m3_to_half(vs[2 * chunk + (w >> 1)]);
-                        const __half2 s2 = __halves2half2(sc, sc);
-                        uint4 values;
-                        values.x = e2m1x2_times(words[w] & 0xffu, s2);
-                        values.y = e2m1x2_times((words[w] >> 8) & 0xffu, s2);
-                        values.z = e2m1x2_times((words[w] >> 16) & 0xffu, s2);
-                        values.w = e2m1x2_times(words[w] >> 24, s2);
-                        store_vec(scratch + swizzled(key, 2 * kD, 4 * chunk + w), values);
-                    }
-                }
-                __syncwarp();
-                fp16_rows = scratch;
-            }
             unsigned pa[4];
             pa[0] = pack_f16x2(pr[0][0], pr[0][1]);
             pa[1] = pack_f16x2(pr[0][2], pr[0][3]);
@@ -696,34 +674,64 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
             pa[3] = pack_f16x2(pr[1][2], pr[1][3]);
             const int v_mat = lane >> 3, v_rin = lane & 7;
             const int v_row = v_rin + ((v_mat & 1) << 3);
+            // P x V over FP16 rows of `row_bytes` holding dimensions 8 c0 .. 8 c1 - 1 (16-byte chunks).
+            const auto pv = [&]<int C0, int C1>(const unsigned char* fp16_rows, int row_bytes) {
 #pragma unroll
-            for (int c = 0; c < 32; c += 2) {
-                unsigned r[4];
-                ldmatrix_x4_t(r[0], r[1], r[2], r[3],
-                              smem_addr(fp16_rows + swizzled(v_row, 2 * kD, c + (v_mat >> 1))));
-                float* first  = o[c >> 1][0];
-                float* second = o[c >> 1][1];
-                mma_f16(first[0], first[1], first[2], first[3], pa[0], pa[1], pa[2], pa[3], r[0], r[1]);
-                mma_f16(second[0], second[1], second[2], second[3], pa[0], pa[1], pa[2], pa[3], r[2], r[3]);
+                for (int c = C0; c < C1; c += 2) {
+                    unsigned r[4];
+                    ldmatrix_x4_t(r[0], r[1], r[2], r[3],
+                                  smem_addr(fp16_rows + swizzled(v_row, row_bytes, c - C0 + (v_mat >> 1))));
+                    float* first  = o[c >> 1][0];
+                    float* second = o[c >> 1][1];
+                    mma_f16(first[0], first[1], first[2], first[3], pa[0], pa[1], pa[2], pa[3], r[0], r[1]);
+                    mma_f16(second[0], second[1], second[2], second[3], pa[0], pa[1], pa[2], pa[3], r[2], r[3]);
+                }
+            };
+            if constexpr (Shape::Value == Code::Nvfp4) {
+                // Each half: lane l decodes key l / 2's code chunks 4 half + 2 (l % 2) and + 1 (32
+                // dimensions each) into the [16][128] FP16 tile, then P x V over those dimensions.
+                const int key = lane >> 1, sub = lane & 1;
+                const unsigned char* vs = k_s + S::ValueScales + key * V::ScaleSlot;
+#pragma unroll
+                for (int half = 0; half < 2; ++half) {
+#pragma unroll
+                    for (int c = 0; c < 2; ++c) {
+                        const int chunk = 4 * half + 2 * sub + c; // 16 code bytes: dimensions 32 chunk .. + 31
+                        const uint4 codes = load_vec<uint4>(v_s + swizzled(key, V::Bytes, chunk));
+                        const unsigned words[4] = {codes.x, codes.y, codes.z, codes.w};
+#pragma unroll
+                        for (int w = 0; w < 4; ++w) { // dimensions 32 chunk + 8 w .. + 7
+                            const __half sc  = e4m3_to_half(vs[2 * chunk + (w >> 1)]);
+                            const __half2 s2 = __halves2half2(sc, sc);
+                            uint4 values;
+                            values.x = e2m1x2_times(words[w] & 0xffu, s2);
+                            values.y = e2m1x2_times((words[w] >> 8) & 0xffu, s2);
+                            values.z = e2m1x2_times((words[w] >> 16) & 0xffu, s2);
+                            values.w = e2m1x2_times(words[w] >> 24, s2);
+                            store_vec(scratch + swizzled(key, kD, 4 * (chunk - 4 * half) + w), values);
+                        }
+                    }
+                    __syncwarp();
+                    if (half == 0) {
+                        pv.template operator()<0, 16>(scratch, kD);
+                    } else {
+                        pv.template operator()<16, 32>(scratch, kD);
+                    }
+                    __syncwarp();
+                }
+            } else {
+                pv.template operator()<0, 32>(v_s, 2 * kD);
             }
         }
     };
 
-    int s = 0;
-    if (warp < tiles) { issue(warp, 0); }
-    for (int i = warp; i < tiles; i += Warps) {
-        if (i + Warps < tiles) {
-            issue(i + Warps, s ^ 1);
-            cp_wait<1>();
-        } else {
-            cp_wait<0>();
-        }
-        __syncwarp();
+    // Vector-quantized storages: settle stage st's rows (exact rows kept, codes decoded).
+    const auto expand = [&](int st) {
         if constexpr (Shape::Vq > 0) {
             // Lane l takes row l % 16 of role l / 16 (K, V): its exact row stays when the read is from
             // the call's staged row or the window slot's tag matches the stored codes; otherwise the
             // codes are decoded into the INT8 row and the code scale becomes every group's scale.
-            unsigned char* k_s = stages + s * S::Bytes;
+            unsigned char* k_s = stages + st * S::Bytes;
             const int row = lane & 15, role = lane >> 4;
             const int token = reinterpret_cast<const int*>(k_s + S::VqMeta)[2 * row];
             const int mode  = reinterpret_cast<const int*>(k_s + S::VqMeta)[2 * row + 1];
@@ -756,33 +764,46 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
             }
             __syncwarp();
         }
-        compute(i, s);
-        __syncwarp();
-        s ^= 1;
+    };
+    if constexpr (Stages == 1) {
+        // Two CTAs per SM: the other warps hide each tile's gather.
+        for (int i = warp; i < tiles; i += Warps) {
+            issue(i, 0);
+            cp_wait<0>();
+            __syncwarp();
+            expand(0);
+            compute(i, 0);
+            __syncwarp();
+        }
+    } else {
+        int s = 0;
+        if (warp < tiles) { issue(warp, 0); }
+        for (int i = warp; i < tiles; i += Warps) {
+            if (i + Warps < tiles) {
+                issue(i + Warps, s ^ 1);
+                cp_wait<1>();
+            } else {
+                cp_wait<0>();
+            }
+            __syncwarp();
+            expand(s);
+            compute(i, s);
+            __syncwarp();
+            s ^= 1;
+        }
     }
     cp_wait<0>();
 
-    // Merge the warps' rows: each publishes its unnormalized rows and (max, sum).
+    // Merge the warps' rows in warp order: every warp publishes its (max, sum) per row, then the warps
+    // add their scaled unnormalized rows into one FP32 buffer in turn (fma per element in warp order,
+    // skipping a warp without keys for the row), and l the same way.
     l0 += __shfl_xor_sync(FullMask, l0, 1);
     l0 += __shfl_xor_sync(FullMask, l0, 2);
     l1 += __shfl_xor_sync(FullMask, l1, 1);
     l1 += __shfl_xor_sync(FullMask, l1, 2);
     __syncthreads();
-    float* rows  = reinterpret_cast<float*>(smem + kQRow * kRows);
-    float* stats = rows + Warps * kRows * kD;
-    float* mine  = rows + warp * kRows * kD;
-#pragma unroll
-    for (int b = 0; b < 16; ++b) {
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int row = gid + 8 * (j >> 1);
-                const int d   = S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h : 16 * b + 8 * h + 2 * lid + (j & 1);
-                mine[row * kD + d] = o[b][h][j];
-            }
-        }
-    }
+    float* rows  = reinterpret_cast<float*>(smem + kQRow * kRows); // [kRows][kD]
+    float* stats = rows + kRows * kD;                               // [Warps][kRows][2]
     if (lid == 0) {
         stats[(warp * kRows + gid) * 2]         = m0;
         stats[(warp * kRows + gid) * 2 + 1]     = l0;
@@ -790,24 +811,51 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
         stats[(warp * kRows + gid + 8) * 2 + 1] = l1;
     }
     __syncthreads();
-    float* merged = stats + Warps * kRows * 2; // rotated values: the merged rows, rotated back below
-    for (int e = tid; e < group * kD; e += Threads) {
-        const int row = e / kD, d = e % kD;
+    const auto row_max = [&](int row) {
         float m = -CUDART_INF_F;
 #pragma unroll
         for (int w = 0; w < Warps; ++w) { m = fmaxf(m, stats[(w * kRows + row) * 2]); }
-        float l = 0.0f, acc = 0.0f;
+        return m;
+    };
+    const float f0 = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - row_max(gid)) * scale_l2);
+    const float f1 = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - row_max(gid + 8)) * scale_l2);
+    for (int w = 0; w < Warps; ++w) {
+        if (warp == w) {
+#pragma unroll
+            for (int b = 0; b < 16; ++b) {
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const int upper = j >> 1;
+                        const int row   = gid + 8 * upper;
+                        const int d = S::EvenOddValues ? 16 * b + 4 * lid + 2 * (j & 1) + h : 16 * b + 8 * h + 2 * lid + (j & 1);
+                        const bool live = (upper ? m1 : m0) != -CUDART_INF_F;
+                        float& a        = rows[row * kD + d];
+                        if (w == 0) {
+                            a = live ? __fmaf_rn(upper ? f1 : f0, o[b][h][j], 0.0f) : 0.0f;
+                        } else if (live) {
+                            a = __fmaf_rn(upper ? f1 : f0, o[b][h][j], a);
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int e = tid; e < group * kD; e += Threads) {
+        const int row = e / kD, d = e % kD;
+        const float m = row_max(row);
+        float l       = 0.0f;
 #pragma unroll
         for (int w = 0; w < Warps; ++w) {
             const float mw = stats[(w * kRows + row) * 2];
             if (mw == -CUDART_INF_F) { continue; }
-            const float f = exp2_approx((mw - m) * scale_l2);
-            l             = __fmaf_rn(f, stats[(w * kRows + row) * 2 + 1], l);
-            acc           = __fmaf_rn(f, rows[(w * kRows + row) * kD + d], acc);
+            l = __fmaf_rn(exp2_approx((mw - m) * scale_l2), stats[(w * kRows + row) * 2 + 1], l);
         }
-        const float value = l > 0.0f ? acc / l : 0.0f;
+        const float value = l > 0.0f ? rows[row * kD + d] / l : 0.0f;
         if constexpr (S::RotatedValues) {
-            merged[row * kD + d] = value;
+            rows[row * kD + d] = value;
         } else {
             out[(static_cast<std::size_t>(t) * heads + kv_head * group + row) * kD + d] = __float2bfloat16_rn(value);
         }
@@ -818,7 +866,7 @@ __global__ void __launch_bounds__(PromptShape<Storage>::Warps * 32, 1)
         for (int row = warp; row < group; row += Warps) {
             float v[8];
 #pragma unroll
-            for (int k = 0; k < 8; ++k) { v[k] = merged[row * kD + lane + 32 * k]; }
+            for (int k = 0; k < 8; ++k) { v[k] = rows[row * kD + lane + 32 * k]; }
             normalized_hadamard_d256_inplace(v, lane);
 #pragma unroll
             for (int k = 0; k < 8; ++k) {
@@ -837,19 +885,40 @@ template <KvCacheStorage Storage>
 void launch(const Tensor& q, const QsaKVLayer& layer, const QsaBatch& batch, const QsaGeometry& g, float scale,
             const std::int32_t* selected, const std::int32_t* counts, Tensor& out, cudaStream_t stream,
             const QsaVqWindow& vq) {
-    constexpr int bytes = prompt_smem_bytes<Storage>();
-    static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
-    static const cudaError_t configured =
-        cudaFuncSetAttribute(qsa_prompt_kernel<Storage>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
-    require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
-    const int columns = q.ne[2];
-    const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
-    qsa_prompt_kernel<Storage><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
-        static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
-        layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
-        static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
-        static_cast<const std::int32_t*>(batch.table_rows.data), static_cast<const std::int32_t*>(batch.positions.data),
-        batch.width, g.ratio, selected, counts, g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
+    const auto run = [&]<int Stages>() {
+        constexpr int bytes = prompt_smem_bytes<Storage, Stages>();
+        static_assert(bytes <= 99 * 1024, "one CTA's shared memory on sm_120");
+        static const cudaError_t configured = cudaFuncSetAttribute(
+            qsa_prompt_kernel<Storage, Stages>, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes);
+        require(configured == cudaSuccess, "cannot reserve the kernel's shared memory");
+        const int columns = q.ne[2];
+        const dim3 grid(static_cast<unsigned>(columns), static_cast<unsigned>(g.kv_heads));
+        qsa_prompt_kernel<Storage, Stages><<<grid, PromptShape<Storage>::Warps * 32, bytes, stream>>>(
+            static_cast<const bf16*>(q.data), g.heads, g.kv_heads, layer.kv.k_pages.data, layer.kv.v_pages.data,
+            layer.kv.k_scale_pages.data, layer.kv.v_scale_pages.data,
+            static_cast<const std::int32_t*>(batch.block_tables.data), batch.block_tables.ne[0],
+            static_cast<const std::int32_t*>(batch.table_rows.data),
+            static_cast<const std::int32_t*>(batch.positions.data), batch.width, g.ratio, selected, counts,
+            g.budget / g.ratio, scale, static_cast<bf16*>(out.data), layer.spaces, vq);
+    };
+    // One stage where two CTAs fit an SM and the call fills a wave: the second CTA's warps hide each
+    // tile's gather better than a second stage does (26-41 % faster at 86-512 columns, design
+    // §19.3.15). Narrower calls, and storages whose stages and value tile keep one CTA per SM, keep
+    // two stages.
+    static const int sms = [] {
+        int device = 0, count = 0;
+        if (cudaGetDevice(&device) != cudaSuccess ||
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || count <= 0) {
+            throw std::runtime_error("qsa prompt: cannot query the multiprocessor count");
+        }
+        return count;
+    }();
+    constexpr bool two_ctas = 2 * (prompt_smem_bytes<Storage, 1>() + 1024) <= 100 * 1024;
+    if (two_ctas && q.ne[2] * g.kv_heads >= sms) {
+        run.template operator()<1>();
+    } else {
+        run.template operator()<2>();
+    }
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) { throw std::runtime_error(std::string("qsa prompt attention: ") + cudaGetErrorString(error)); }
 }
