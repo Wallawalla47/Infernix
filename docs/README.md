@@ -59,7 +59,7 @@ other references own narrower contracts:
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |
-| [Model-level numerical quality](maintainer/model-quality.md) | rounding noise at model scale, the 16-bit-activation reference, fork-versus-upstream prefill and decode results |
+| [Model-level numerical quality](maintainer/model-quality.md) | rounding noise at model scale, the 16-bit-activation reference, fork-versus-upstream prefill and decode results, Flash-Next NVFP4 against Unsloth UD-Q4_K_XL |
 | [Operational logging](maintainer/logging.md) | log ownership, presentation, severity and data policy |
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
