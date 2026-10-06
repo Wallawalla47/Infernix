@@ -8,6 +8,7 @@
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
 #include "core/weight.h"
+#include "ops/host_parallel.h"
 #include "ops/input_projection_test_common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 #include "ops/op_tester.h"
@@ -123,55 +124,59 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     std::vector<std::uint16_t> key_records(records.key.numel(), 0xffffU);
     std::vector<std::uint16_t> value_records(records.value.numel(), 0xffffU);
     std::vector<std::uint32_t> gate_records(records.gate.numel(), 0xffffffffU);
-    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
-        for (std::int32_t row = 0; row < rows; ++row) {
-            const std::int32_t commit = commits[static_cast<std::size_t>(row)];
-            const std::int64_t record_outer =
-                static_cast<std::int64_t>(layer) * kRecordCapacity + row;
-            for (std::int32_t token = 0; token < (commit == 0 ? 0 : width); ++token) {
-                const std::int64_t column = record_outer * width + token;
-                for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
-                    conv_records[static_cast<std::size_t>(column) * profile.conv_channels +
-                                 channel] =
-                        bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
-                }
-                for (std::int32_t head = 0; head < kQkHeads; ++head) {
-                    const std::size_t base =
-                        static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
-                    for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                        key_records[base + dim] =
-                            bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
-                                             head * 5U + dim,
-                                         0.08F);
+    // Every record value is a function of its indices, and each layer fills only its own
+    // records, so layers fill on separate host threads.
+    parallel_ranges(profile.layers, profile.layers, [&](std::int64_t first, std::int64_t last) {
+        for (auto layer = static_cast<std::int32_t>(first); layer < last; ++layer) {
+            for (std::int32_t row = 0; row < rows; ++row) {
+                const std::int32_t commit = commits[static_cast<std::size_t>(row)];
+                const std::int64_t record_outer =
+                    static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                for (std::int32_t token = 0; token < (commit == 0 ? 0 : width); ++token) {
+                    const std::int64_t column = record_outer * width + token;
+                    for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
+                        conv_records[static_cast<std::size_t>(column) * profile.conv_channels +
+                                     channel] =
+                            bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
                     }
-                }
-                for (std::int32_t head = 0; head < profile.value_heads; ++head) {
-                    const std::size_t vector_base =
-                        static_cast<std::size_t>((column * profile.value_heads + head) * kStateDim);
-                    for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
-                        value_records[vector_base + dim] =
-                            bf16_pattern(seed + 200003U + layer * 211U + row * 29U + token * 13U +
-                                             head * 7U + dim,
-                                         0.08F);
+                    for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                        const std::size_t base =
+                            static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+                        for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
+                            key_records[base + dim] =
+                                bf16_pattern(seed + 100003U + layer * 197U + row * 23U +
+                                                 token * 11U + head * 5U + dim,
+                                             0.08F);
+                        }
                     }
-                    const std::size_t gate_base =
-                        static_cast<std::size_t>((column * profile.value_heads + head) * 2);
-                    const float g =
-                        -0.03F -
-                        static_cast<float>(mix(seed + layer * 31U + row * 17U + token * 7U + head) %
-                                           900U) /
-                            1000.0F;
-                    const float beta =
-                        0.05F + static_cast<float>(mix(seed + 300007U + layer * 37U + row * 19U +
-                                                       token * 11U + head) %
-                                                   900U) /
-                                    1000.0F;
-                    gate_records[gate_base]     = std::bit_cast<std::uint32_t>(g);
-                    gate_records[gate_base + 1] = std::bit_cast<std::uint32_t>(beta);
+                    for (std::int32_t head = 0; head < profile.value_heads; ++head) {
+                        const std::size_t vector_base = static_cast<std::size_t>(
+                            (column * profile.value_heads + head) * kStateDim);
+                        for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
+                            value_records[vector_base + dim] =
+                                bf16_pattern(seed + 200003U + layer * 211U + row * 29U +
+                                                 token * 13U + head * 7U + dim,
+                                             0.08F);
+                        }
+                        const std::size_t gate_base =
+                            static_cast<std::size_t>((column * profile.value_heads + head) * 2);
+                        const float g =
+                            -0.03F -
+                            static_cast<float>(
+                                mix(seed + layer * 31U + row * 17U + token * 7U + head) % 900U) /
+                                1000.0F;
+                        const float beta =
+                            0.05F + static_cast<float>(mix(seed + 300007U + layer * 37U +
+                                                           row * 19U + token * 11U + head) %
+                                                       900U) /
+                                        1000.0F;
+                        gate_records[gate_base]     = std::bit_cast<std::uint32_t>(g);
+                        gate_records[gate_base + 1] = std::bit_cast<std::uint32_t>(beta);
+                    }
                 }
             }
         }
-    }
+    });
     cuda_check(cudaMemcpy(records.conv.data, conv_records.data(), records.conv.bytes(),
                           cudaMemcpyHostToDevice),
                "upload conv records");
@@ -790,23 +795,62 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
-    if (argc == 2 && std::string(argv[1]) == "--wide-only") {
-        for (const int width : {33, 48, 64}) {
-            for (int commit = 0; commit <= width; ++commit) {
-                failures += run_case({48, 48, 10240}, width, 1, {commit}, 2200U + commit, true);
-                failures += run_case({30, 32, 8192}, width, 1, {commit}, 2300U + commit, true);
+    if (argc >= 2 && std::string(argv[1]) == "--wide-only") {
+        // The wide sweep splits into independent parts that CTest runs concurrently: every
+        // commit of one width (--width 33|48|64) for one profile (--layers 48|30), and the
+        // batched cases with the record-fold rounds (--batched). No selector runs them all.
+        int width_only = 0, layers_only = 0;
+        bool batched_only = false;
+        for (int i = 2; i < argc; ++i) {
+            const std::string argument(argv[i]);
+            if (argument == "--width" && i + 1 < argc) {
+                width_only = std::stoi(argv[++i]);
+            } else if (argument == "--layers" && i + 1 < argc) {
+                layers_only = std::stoi(argv[++i]);
+            } else if (argument == "--batched") {
+                batched_only = true;
+            } else {
+                std::cerr << "usage: ninfer_gdn_replay_fold_test --wide-only "
+                             "[--width 33|48|64] [--layers 48|30] [--batched]\n";
+                return 2;
             }
         }
-        // Batched ngram copy rounds above 16 columns.
-        for (const int width : {17, 32, 48, 64}) {
-            failures +=
-                run_case({48, 48, 10240}, width, 2, {width, width / 2}, 2400U + width, true);
-            failures += run_case({30, 32, 8192}, width, 4, {0, width, 1, width - 1}, 2450U + width);
-            failures +=
-                run_case({48, 48, 10240}, width, 8, {width, 0, 1, 2, width / 3, width - 1, 7, 16},
-                         2500U + width, true);
+        if ((width_only != 0 && width_only != 33 && width_only != 48 && width_only != 64) ||
+            (layers_only != 0 && layers_only != 48 && layers_only != 30)) {
+            std::cerr << "--width selects 33, 48 or 64 and --layers 48 or 30\n";
+            return 2;
         }
-        failures += run_record_fold_rounds<64>();
+        const bool sweep_selected = width_only != 0 || layers_only != 0;
+        if (batched_only && sweep_selected) {
+            std::cerr << "--batched excludes --width and --layers\n";
+            return 2;
+        }
+        if (!batched_only) {
+            for (const int width : {33, 48, 64}) {
+                if (width_only != 0 && width != width_only) continue;
+                for (int commit = 0; commit <= width; ++commit) {
+                    if (layers_only == 0 || layers_only == 48)
+                        failures +=
+                            run_case({48, 48, 10240}, width, 1, {commit}, 2200U + commit, true);
+                    if (layers_only == 0 || layers_only == 30)
+                        failures +=
+                            run_case({30, 32, 8192}, width, 1, {commit}, 2300U + commit, true);
+                }
+            }
+        }
+        if (!sweep_selected) {
+            // Batched ngram copy rounds above 16 columns.
+            for (const int width : {17, 32, 48, 64}) {
+                failures +=
+                    run_case({48, 48, 10240}, width, 2, {width, width / 2}, 2400U + width, true);
+                failures +=
+                    run_case({30, 32, 8192}, width, 4, {0, width, 1, width - 1}, 2450U + width);
+                failures +=
+                    run_case({48, 48, 10240}, width, 8,
+                             {width, 0, 1, 2, width / 3, width - 1, 7, 16}, 2500U + width, true);
+            }
+            failures += run_record_fold_rounds<64>();
+        }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " wide gdn_replay_fold\n";
         return failures == 0 ? 0 : 1;
     }
@@ -823,7 +867,8 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc != 1) {
-        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only]\n";
+        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only [--width W] "
+                     "[--layers L] [--batched]]\n";
         return 2;
     }
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
