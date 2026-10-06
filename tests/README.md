@@ -72,7 +72,12 @@ actual error, active limit, and error-to-limit ratio. The switch changes reporti
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
 `ninfer_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
-`--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type.
+`--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and
+`--non-causal-only` runs only the packed and context sections. CTest registers the latter as
+`ninfer_softmax_attention_test` and the causal suite as one entry per KV type
+(`ninfer_softmax_attention_<type>_test`, and `ninfer_softmax_attention_wide_<type>_test` for
+`--wide-only`), so `ctest -j` runs the KV types concurrently; together the entries run exactly the
+cases of one unsharded invocation.
 
 The vector-quantized `vq2` and `k4v2` caches have their own suites. `ninfer_kv_cache_vq_test`
 compares every stored code, row scale, exact-window slot and tag with independent host encoders
@@ -87,8 +92,10 @@ The suite covers prefill, decode/spec widths, batched prefixes, cache effects, a
 updates with changing live lengths. Numerical cases include small, unit-RMS and RMS1.8 Q/K inputs.
 The FP64 oracle retains internal Q quantization error; the INT8/FP8 compute budgets account for
 that accepted approximation. The default invocation also runs packed and context attention.
-Large causal reference calculations use at most eight CPU workers while preserving each output's
-FP64 accumulation order; small cases remain serial. Cache fixtures populate the reachable KV
+Large causal reference calculations spread their query rows over the host threads while
+preserving each output's FP64 accumulation order, and a batch case evaluates its requests'
+references concurrently when they use distinct cache rows; small cases remain serial. Fixture
+values are the serial mt19937 stream mapped in parallel, so they equal a serial fill exactly. Cache fixtures populate the reachable KV
 prefix while reserving the full execution-envelope page table. The runner reports elapsed time
 per KV type.
 

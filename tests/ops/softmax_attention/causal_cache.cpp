@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <chrono>
@@ -339,16 +340,64 @@ std::vector<T> gather_paged(std::span<const T> physical, std::int32_t leading_ex
     return logical;
 }
 
+// Elementwise host conversions of fixtures this large run on host threads.
+constexpr std::int64_t kParallelElements = 1 << 16;
+
+// The values of fill_uniform followed by round_to_bf16. The mt19937 stream is drawn serially, and
+// the same std::uniform_real_distribution then maps it in parallel through a generator that replays
+// the stream. A float takes one 32-bit draw, so value i uses draw i whatever the partition; were a
+// library ever to draw twice for one value, the serial fill_uniform recomputes the whole vector.
 std::vector<float> make_bf16_values(std::size_t count, std::uint32_t seed, float lo, float hi) {
     std::vector<float> values(count);
-    fill_uniform(values, seed, lo, hi);
-    round_to_bf16(values);
+    if (count < static_cast<std::size_t>(kParallelElements)) {
+        fill_uniform(values, seed, lo, hi);
+        round_to_bf16(values);
+        return values;
+    }
+    std::vector<std::mt19937::result_type> draws(count);
+    std::mt19937 generator(seed);
+    for (auto& draw : draws) draw = generator();
+    struct Replay {
+        using result_type = std::mt19937::result_type;
+        static constexpr result_type min() { return std::mt19937::min(); }
+        static constexpr result_type max() { return std::mt19937::max(); }
+        const result_type* next;
+        const result_type* end;
+        bool overrun = false;
+        result_type operator()() {
+            if (next == end) {
+                overrun = true;
+                return min();
+            }
+            return *next++;
+        }
+    };
+    std::atomic<bool> one_draw_each{true};
+    parallel_ranges(static_cast<std::int64_t>(count), host_thread_count(),
+                    [&](std::int64_t begin, std::int64_t end) {
+                        std::uniform_real_distribution<float> distribution(lo, hi);
+                        Replay replay{draws.data() + begin, draws.data() + end};
+                        for (std::int64_t i = begin; i < end && !replay.overrun; ++i)
+                            values[static_cast<std::size_t>(i)] =
+                                bf16_to_f32(f32_to_bf16(distribution(replay)));
+                        if (replay.overrun || replay.next != replay.end) one_draw_each = false;
+                    });
+    if (!one_draw_each) {
+        fill_uniform(values, seed, lo, hi);
+        round_to_bf16(values);
+    }
     return values;
 }
 
 std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
+    const auto count = static_cast<std::int64_t>(values.size());
+    parallel_ranges(count, count < kParallelElements ? 1 : host_thread_count(),
+                    [&](std::int64_t begin, std::int64_t end) {
+                        for (std::int64_t i = begin; i < end; ++i)
+                            bits[static_cast<std::size_t>(i)] =
+                                f32_to_bf16(values[static_cast<std::size_t>(i)]);
+                    });
     return bits;
 }
 
@@ -418,7 +467,13 @@ float round_to_f16(float value) { return f16_bits_to_f32(f32_to_f16_bits(value))
 
 std::vector<std::uint16_t> to_f16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_f16_bits(values[i]); }
+    const auto count = static_cast<std::int64_t>(values.size());
+    parallel_ranges(count, count < kParallelElements ? 1 : host_thread_count(),
+                    [&](std::int64_t begin, std::int64_t end) {
+                        for (std::int64_t i = begin; i < end; ++i)
+                            bits[static_cast<std::size_t>(i)] =
+                                f32_to_f16_bits(values[static_cast<std::size_t>(i)]);
+                    });
     return bits;
 }
 
@@ -949,14 +1004,13 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                 }
             }
         });
-    // Amortize thread startup with enough dot-product work per worker. Bound CPU workers and
-    // their per-row score buffers; parallel rows retain each FP64 sum's original order.
-    constexpr unsigned kMaxOracleWorkers      = 8;
+    // Amortize thread startup with enough dot-product work per worker, up to every host thread
+    // (each worker owns one score buffer of `visible` doubles). Parallel rows retain each FP64
+    // sum's original order.
     constexpr std::int64_t kProductsPerWorker = 1 << 20;
     const auto products = static_cast<std::int64_t>(tokens) * geometry.q_heads * visible * kHeadDim;
     const int workers   = static_cast<int>(std::min<std::int64_t>(
-        std::min(kMaxOracleWorkers, std::max(1u, std::thread::hardware_concurrency())),
-        std::max<std::int64_t>(1, products / kProductsPerWorker)));
+        host_thread_count(), std::max<std::int64_t>(1, products / kProductsPerWorker)));
     naive_dense_softmax_attention(
         op_geometry(geometry), tokens, visible, double(kAttentionScale),
         [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
@@ -1319,6 +1373,30 @@ public:
         upload_rows(rows);
     }
 
+    // A cache with exactly the source's block tables and device contents, copied on the device
+    // instead of scattering and uploading the host rows again.
+    struct CloneOf {
+        const BatchDeviceCache& source;
+    };
+    explicit BatchDeviceCache(CloneOf clone)
+        : geometry_(clone.source.geometry_), storage_(clone.source.storage_),
+          layout_(clone.source.layout_), rows_(clone.source.rows_),
+          logical_capacity_(clone.source.logical_capacity_),
+          logical_pages_(clone.source.logical_pages_),
+          physical_pages_(clone.source.physical_pages_),
+          block_tables_host_(clone.source.block_tables_host_),
+          k_code_elements_(clone.source.k_code_elements_),
+          v_code_elements_(clone.source.v_code_elements_),
+          k_scale_elements_(clone.source.k_scale_elements_),
+          v_scale_elements_(clone.source.v_scale_elements_), k_(clone.source.k_.bytes()),
+          v_(clone.source.v_.bytes()), k_scale_(clone.source.k_scale_.bytes()),
+          v_scale_(clone.source.v_scale_.bytes()),
+          block_tables_(clone.source.block_tables_.bytes()) {
+        block_tables_.copy_from_host(block_tables_host_.data(),
+                                     block_tables_host_.size() * sizeof(std::int32_t));
+        copy_from(clone.source);
+    }
+
     PagedKVBatchLayerView view() {
         PagedKVBatchLayerView result;
         result.k_pages = Tensor(
@@ -1343,6 +1421,17 @@ public:
                                            geometry_.kv_heads, physical_pages_});
         }
         return result;
+    }
+
+    // Calls body(row) for every row on its own host thread. Every block-table entry is distinct,
+    // so rows own disjoint physical pages and their scatters write disjoint elements.
+    template <typename Body>
+    void for_each_row(const Body& body) const {
+        parallel_ranges(static_cast<std::int64_t>(rows_), static_cast<std::int64_t>(rows_),
+                        [&](std::int64_t begin, std::int64_t end) {
+                            for (std::int64_t row = begin; row < end; ++row)
+                                body(static_cast<std::size_t>(row));
+                        });
     }
 
     using Bytes = std::array<std::vector<std::uint8_t>, 4>;
@@ -1437,7 +1526,7 @@ public:
             std::vector<std::int8_t> expected_v(v_code_elements_, 0);
             std::vector<std::uint16_t> expected_ks(k_scale_elements_, 0);
             std::vector<std::uint16_t> expected_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(expected[row].k_i8, kHeadDim, geometry_, logical_capacity_,
                                    table, expected_k);
@@ -1447,7 +1536,7 @@ public:
                                    logical_capacity_, table, expected_ks);
                 scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
                                    logical_capacity_, table, expected_vs);
-            }
+            });
             failures += verify_plane(label + " cache-k-code", actual[0], expected_k);
             failures += verify_plane(label + " cache-k-scale", actual[2], expected_ks);
             failures += verify_plane(label + " cache-v-code", actual[1], expected_v);
@@ -1457,7 +1546,7 @@ public:
             std::vector<std::uint8_t> expected_v(v_code_elements_, 0);
             std::vector<std::uint16_t> expected_ks(k_scale_elements_, 0);
             std::vector<std::uint16_t> expected_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_, logical_capacity_,
                                    table, expected_k);
@@ -1467,7 +1556,7 @@ public:
                                    logical_capacity_, table, expected_ks);
                 scatter_paged_into(expected[row].v_scale, kFp8QuantGroups, geometry_,
                                    logical_capacity_, table, expected_vs);
-            }
+            });
             failures += verify_plane(label + " cache-k-code", actual[0], expected_k);
             failures += verify_plane(label + " cache-v-code", actual[1], expected_v);
             failures += verify_plane(label + " cache-k-scale", actual[2], expected_ks);
@@ -1477,7 +1566,7 @@ public:
             std::vector<std::uint8_t> expected_v(v_code_elements_, 0);
             std::vector<std::uint16_t> expected_ks(k_scale_elements_, 0);
             std::vector<std::uint8_t> expected_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(expected[row].k_fp8, kHeadDim, geometry_, logical_capacity_,
                                    table, expected_k);
@@ -1487,7 +1576,7 @@ public:
                                    logical_capacity_, table, expected_ks);
                 scatter_paged_into(expected[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
                                    logical_capacity_, table, expected_vs);
-            }
+            });
             failures += verify_plane(label + " cache-k-code", actual[0], expected_k);
             failures += verify_plane(label + " cache-v-code", actual[1], expected_v);
             failures += verify_plane(label + " cache-k-scale", actual[2], expected_ks);
@@ -1497,7 +1586,7 @@ public:
             std::vector<std::uint8_t> expected_v(v_code_elements_, 0);
             std::vector<std::uint8_t> expected_ks(k_scale_elements_, 0);
             std::vector<std::uint8_t> expected_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(expected[row].k_nvfp4, kNvfp4CodeBytes, geometry_,
                                    logical_capacity_, table, expected_k);
@@ -1507,7 +1596,7 @@ public:
                                    logical_capacity_, table, expected_ks);
                 scatter_paged_into(expected[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
                                    logical_capacity_, table, expected_vs);
-            }
+            });
             failures += verify_plane(label + " cache-k-code", actual[0], expected_k);
             failures += verify_plane(label + " cache-v-code", actual[1], expected_v);
             failures += verify_plane(label + " cache-k-scale", actual[2], expected_ks);
@@ -1538,11 +1627,11 @@ private:
 
     void scatter_bf16_rows(std::span<const HostCache> rows, std::vector<std::uint16_t>& k,
                            std::vector<std::uint16_t>& v) const {
-        for (std::size_t row = 0; row < rows_; ++row) {
+        for_each_row([&](std::size_t row) {
             const std::span<const std::int32_t> table = row_table(row);
             scatter_paged_into(rows[row].k_bf16, kHeadDim, geometry_, logical_capacity_, table, k);
             scatter_paged_into(rows[row].v_fp16, kHeadDim, geometry_, logical_capacity_, table, v);
-        }
+        });
     }
 
     void upload_rows(std::span<const HostCache> rows) {
@@ -1559,7 +1648,7 @@ private:
             std::vector<std::int8_t> physical_v(v_code_elements_, 0);
             std::vector<std::uint16_t> physical_ks(k_scale_elements_, 0);
             std::vector<std::uint16_t> physical_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(rows[row].k_i8, kHeadDim, geometry_, logical_capacity_, table,
                                    physical_k);
@@ -1569,7 +1658,7 @@ private:
                                    table, physical_ks);
                 scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_, logical_capacity_,
                                    table, physical_vs);
-            }
+            });
             k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::int8_t));
             v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::int8_t));
             k_scale_.copy_from_host(physical_ks.data(), physical_ks.size() * sizeof(std::uint16_t));
@@ -1581,7 +1670,7 @@ private:
             std::vector<std::uint8_t> physical_v(v_code_elements_, 0);
             std::vector<std::uint16_t> physical_ks(k_scale_elements_, 0);
             std::vector<std::uint16_t> physical_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
                                    physical_k);
@@ -1591,7 +1680,7 @@ private:
                                    table, physical_ks);
                 scatter_paged_into(rows[row].v_scale, kFp8QuantGroups, geometry_, logical_capacity_,
                                    table, physical_vs);
-            }
+            });
             k_.copy_from_host(physical_k.data(), physical_k.size());
             v_.copy_from_host(physical_v.data(), physical_v.size());
             k_scale_.copy_from_host(physical_ks.data(), physical_ks.size() * sizeof(std::uint16_t));
@@ -1603,7 +1692,7 @@ private:
             std::vector<std::uint8_t> physical_v(v_code_elements_, 0);
             std::vector<std::uint16_t> physical_ks(k_scale_elements_, 0);
             std::vector<std::uint8_t> physical_vs(v_scale_elements_, 0);
-            for (std::size_t row = 0; row < rows_; ++row) {
+            for_each_row([&](std::size_t row) {
                 const std::span<const std::int32_t> table = row_table(row);
                 scatter_paged_into(rows[row].k_fp8, kHeadDim, geometry_, logical_capacity_, table,
                                    physical_k);
@@ -1613,7 +1702,7 @@ private:
                                    table, physical_ks);
                 scatter_paged_into(rows[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
                                    logical_capacity_, table, physical_vs);
-            }
+            });
             k_.copy_from_host(physical_k.data(), physical_k.size());
             v_.copy_from_host(physical_v.data(), physical_v.size());
             k_scale_.copy_from_host(physical_ks.data(), physical_ks.size() * sizeof(std::uint16_t));
@@ -1624,7 +1713,7 @@ private:
         std::vector<std::uint8_t> physical_v(v_code_elements_, 0);
         std::vector<std::uint8_t> physical_ks(k_scale_elements_, 0);
         std::vector<std::uint8_t> physical_vs(v_scale_elements_, 0);
-        for (std::size_t row = 0; row < rows_; ++row) {
+        for_each_row([&](std::size_t row) {
             const std::span<const std::int32_t> table = row_table(row);
             scatter_paged_into(rows[row].k_nvfp4, kNvfp4CodeBytes, geometry_, logical_capacity_,
                                table, physical_k);
@@ -1634,7 +1723,7 @@ private:
                                logical_capacity_, table, physical_ks);
             scatter_paged_into(rows[row].v_nvfp4_scale, kNvfp4QuantGroups, geometry_,
                                logical_capacity_, table, physical_vs);
-        }
+        });
         k_.copy_from_host(physical_k.data(), physical_k.size());
         v_.copy_from_host(physical_v.data(), physical_v.size());
         k_scale_.copy_from_host(physical_ks.data(), physical_ks.size());
@@ -2202,19 +2291,46 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         cuda_synchronize();
         if (control) control->copy_from(cache);
         std::vector<double> reference(q.size(), 0.0);
+        const auto row_positions = [&](int b) {
+            return std::vector<int>(positions.begin() + b * width,
+                                    positions.begin() + b * width + valid[b]);
+        };
+        const auto oracle = [&](int b) {
+            insert_request_columns(
+                ideal_attention(extract_request_columns(q, q_column_elements, width, b, valid[b]),
+                                expected[lanes[b]], row_positions(b),
+                                tree ? test_case.tree_masks.data() + b * width : nullptr),
+                q_column_elements, width, b, reference);
+        };
+        const auto append = [&](int b) {
+            append_cache(expected[lanes[b]],
+                         extract_request_columns(k, kv_column_elements, width, b, valid[b]),
+                         extract_request_columns(v, kv_column_elements, width, b, valid[b]),
+                         row_positions(b));
+        };
+        // Requests on distinct cache rows are independent: append every row, then evaluate each
+        // request's oracle on its own thread (each writes only its own output columns). Requests
+        // sharing a row keep the serial order, where each oracle sees only earlier appends.
+        std::vector<int> live;
         for (int b = 0; b < batch; ++b)
-            if (valid[b]) {
-                const std::vector<int> row_positions(positions.begin() + b * width,
-                                                     positions.begin() + b * width + valid[b]);
-                auto row_q = extract_request_columns(q, q_column_elements, width, b, valid[b]);
-                auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
-                auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
-                append_cache(expected[lanes[b]], row_k, row_v, row_positions);
-                insert_request_columns(
-                    ideal_attention(row_q, expected[lanes[b]], row_positions,
-                                    tree ? test_case.tree_masks.data() + b * width : nullptr),
-                    q_column_elements, width, b, reference);
+            if (valid[b]) live.push_back(b);
+        std::vector<int> live_lanes;
+        for (const int b : live) live_lanes.push_back(lanes[b]);
+        std::sort(live_lanes.begin(), live_lanes.end());
+        if (std::adjacent_find(live_lanes.begin(), live_lanes.end()) == live_lanes.end()) {
+            for (const int b : live) append(b);
+            parallel_ranges(static_cast<std::int64_t>(live.size()),
+                            static_cast<std::int64_t>(live.size()),
+                            [&](std::int64_t begin, std::int64_t end) {
+                                for (std::int64_t i = begin; i < end; ++i)
+                                    oracle(live[static_cast<std::size_t>(i)]);
+                            });
+        } else {
+            for (const int b : live) {
+                append(b);
+                oracle(b);
             }
+        }
         if (test_case.graph_replay && (phase == 0 || !graph_limits.empty())) {
             launch();
             cuda_synchronize(
@@ -3162,8 +3278,11 @@ int run_masked_prefix_invariance_case(DeviceExecutionView execution, const Geome
     const auto capacity = ops::causal_softmax_attention_workspace_capacity_bytes(
         op_geometry(geometry), storage, envelope, batch, width, width, execution);
 
-    const auto run = [&](const std::vector<std::int32_t>& valid) {
-        BatchDeviceCache cache(initial, MappingPattern::Fragmented, envelope.max_visible_keys);
+    // Both launches start from the same cache: upload it once, and run the first launch on a
+    // device copy so the upload stays pristine for the second.
+    BatchDeviceCache second_cache(initial, MappingPattern::Fragmented, envelope.max_visible_keys);
+    BatchDeviceCache first_cache(BatchDeviceCache::CloneOf{second_cache});
+    const auto run = [&](BatchDeviceCache& cache, const std::vector<std::int32_t>& valid) {
         GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
             dp(columns * 4), dvalid(batch * 4), dlanes(batch * 4), dout(q_bits.size() * 2);
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
@@ -3194,8 +3313,8 @@ int run_masked_prefix_invariance_case(DeviceExecutionView execution, const Geome
         return copy_from_guarded<std::uint16_t>(dout, q_bits.size());
     };
 
-    const auto longer  = run(long_valid);
-    const auto shorter = run(short_valid);
+    const auto longer  = run(first_cache, long_valid);
+    const auto shorter = run(second_cache, short_valid);
     int failures       = 0;
     for (int b = 0; b < batch; ++b)
         for (int j = 0; j < short_valid[b]; ++j) {
