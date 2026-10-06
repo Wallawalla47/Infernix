@@ -8437,7 +8437,7 @@ on the host instead of 316-416 ms, at the same 27.5 GB/s.
   own completion event, so decode rounds publish them as they land rather than all at once at the end.
 - **The prefill expert stream** enqueues each layer's runs as one batch.
 - **A walk span that is not the prompt's last** promotes nothing; the last span still promotes for
-  decode.
+  decode. That changed later in this section: no span promotes now.
 
 **Results** (ABBA, A = Gold `a1e40253a`, int8; both arms still on round 1's wave split rule):
 
@@ -8476,6 +8476,29 @@ the device waits: ~0.5 s per 64K span.
   reproduce it.
 - Greedy ids identical on a ~100K prompt (12 chunks prefetched) and a ~40K prompt.
 - Prefix-cache and preemption real tests pass.
+
+**No promotions after a walked prompt.** The prompt's last span promoted 16 experts per layer and
+chunk (~6,100 records at 32K, ~12,300 at 128K). The copies no longer delayed the first token, but
+they shared the link with the answer's staged misses, and decode right after ran slower.
+
+A sweep with a TEMP cap per layer (one build, outputs identical by construction; `fn/rigs/split`
+promo, promo2; 3 rotated reps, then ABAB) compared the current budget with caps of 64, 32 and 0:
+
+| Workload | Current | 0 | Total | Decode rate |
+|---|---:|---:|---:|---:|
+| -pg 32768,256 | 7.425 s | 7.181 s | −3.3 % | 72.3 → 77.2 tok/s |
+| -pg 131072,128 | 18.705 s | 17.272 s | −7.7 % | 38.6 → 65.0 |
+| -pg 16384,512 MTP | 7.355 s | 7.128 s | −3.1 % | 108.8 → 114.0 |
+| -pg 32768,1536 | 21.854 s | 21.493 s | −1.7 % | 86.7 → 88.3 |
+| -pg 131072,512 | 23.161 s | 21.096 s | −8.9 % | 66.3 → 89.5 |
+
+- **Caps 64 and 32 fell between the current budget and zero.**
+- **Zero wins for long answers too.** The answer's misses land in the returned frames and pick
+  exactly its experts. The prompt's experts would have displaced them: decode after a 128K prompt
+  stays at 89 tok/s instead of 66 over 512 tokens.
+- **No walk span promotes now.** Its routes still update the cache's scores.
+- **Chunk-major prompts are unchanged.** That covers single-call prompts and calls while another
+  lane prefills; they still promote 16 per layer per call.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
