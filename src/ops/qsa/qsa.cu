@@ -3,6 +3,7 @@
 // Hadamard-rotated keys, as written by kv_cache_append).
 
 #include "ninfer/ops/qsa.h"
+#include "ninfer/ops/rope.h"
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
@@ -77,10 +78,22 @@ __device__ __forceinline__ float block_sum(float value, float* scratch) {
 // rope[a * stride], in FP32 like the reference. Interleaved M-RoPE: pair i takes axis i % 3, so a
 // text token (three equal axes) rotates exactly as by its 1-D position.
 __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_t stride, int i, int rotary,
-                                           float theta, float& c, float& s) {
-    const float inv   = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
-    const float angle = static_cast<float>(rope[(i % 3) * stride]) * inv;
-    sincosf(angle, &s, &c);
+                                           float theta, const PreparedRope& yarn, float& c, float& s) {
+    if (yarn.factor == 1.0F) {
+        const float inv   = 1.0F / powf(theta, static_cast<float>(2 * i) / static_cast<float>(rotary));
+        const float angle = static_cast<float>(rope[(i % 3) * stride]) * inv;
+        sincosf(angle, &s, &c);
+        return;
+    }
+    // YaRN: the attention rotation's coefficients (ops/kernel/rope.cuh PreparedRopeCoefficients): the
+    // angle in FP64, reduced to one turn, FP32 sincos, both scaled by the attention scale.
+    constexpr double kInvTwoPi = 1.59154943091895336e-01;
+    constexpr double kTwoPi    = 6.28318530717958648e+00;
+    const double angle   = static_cast<double>(rope[(i % 3) * stride]) * yarn.inverse[i];
+    const float reduced  = static_cast<float>(angle - nearbyint(angle * kInvTwoPi) * kTwoPi);
+    sincosf(reduced, &s, &c);
+    s *= yarn.attention_scale;
+    c *= yarn.attention_scale;
 }
 
 // ------------------------------------------------------------------------------- index query
@@ -88,7 +101,7 @@ __device__ __forceinline__ void rope_angle(const std::int32_t* rope, std::int64_
 // One CTA (128 threads) per (index head, column).
 __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict__ weight,
                                    const std::int32_t* __restrict__ rope, int heads, int rotary,
-                                   float theta, float eps) {
+                                   float theta, PreparedRope yarn, float eps) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
@@ -101,7 +114,7 @@ __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict_
     if (d < rotary) {
         const int half = rotary / 2, i = d % half;
         float c, s;
-        rope_angle(rope + t, gridDim.y, i, rotary, theta, c, s);
+        rope_angle(rope + t, gridDim.y, i, rotary, theta, yarn, c, s);
         out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
     }
     row[d] = __float2bfloat16_rn(out);
@@ -125,7 +138,7 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
                             const std::int32_t* __restrict__ positions,
                             const std::int32_t* __restrict__ tail_slots,
                             const std::int32_t* __restrict__ rope, const std::int32_t* __restrict__ block_rope,
-                            int batch, int width, int ratio, int rotary, float theta, float eps,
+                            int batch, int width, int ratio, int rotary, float theta, PreparedRope yarn, float eps,
                             bf16* __restrict__ pooled, QsaPageSpaces spaces) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
@@ -152,9 +165,9 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
         float c, s;
         // The block's first token: a column of this call, or the sequence's block start before it.
         if (first >= start) {
-            rope_angle(rope + (t - (p - first)), gridDim.x, i, rotary, theta, c, s);
+            rope_angle(rope + (t - (p - first)), gridDim.x, i, rotary, theta, yarn, c, s);
         } else {
-            rope_angle(block_rope + sequence, batch, i, rotary, theta, c, s);
+            rope_angle(block_rope + sequence, batch, i, rotary, theta, yarn, c, s);
         }
         out = d < half ? normed[d] * c - normed[d + half] * s : normed[d] * c + normed[d - half] * s;
     }
@@ -949,6 +962,16 @@ void require_geometry(const QsaGeometry& g) {
                 kIndexDim % g.ratio == 0 && g.budget % g.ratio == 0 && g.rotary_dim > 0 &&
                 g.rotary_dim <= kIndexDim && g.rotary_dim % 2 == 0 && g.theta > 0 && g.eps > 0,
             "unsupported geometry");
+    require(std::isfinite(g.yarn_factor) && g.yarn_factor >= 1.0F && g.yarn_factor <= 4.0F &&
+                (g.yarn_factor == 1.0F || (g.original_positions > 0 && g.theta > 1.0F)),
+            "YaRN needs a factor in [1,4], original positions and theta above 1");
+}
+
+// The index rotation's YaRN preparation (factor 1: the plain rotation).
+PreparedRope index_rope(const QsaGeometry& g) {
+    if (g.yarn_factor == 1.0F) { return PreparedRope{}; }
+    return prepare_rope(g.rotary_dim, g.theta,
+                        {g.yarn_factor, static_cast<std::uint32_t>(g.original_positions)});
 }
 
 void require_batch(const QsaBatch& b, int columns) {
@@ -975,7 +998,7 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
     index_query_kernel<<<dim3(geometry.index_heads, columns), kIndexDim, 0, stream>>>(
         static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
         static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, geometry.rotary_dim,
-        geometry.theta, geometry.eps);
+        geometry.theta, index_rope(geometry), geometry.eps);
     check_launch("index query");
 }
 
@@ -1002,7 +1025,8 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
         static_cast<const std::int32_t*>(batch.positions.data), static_cast<const std::int32_t*>(batch.tail_slots.data),
         static_cast<const std::int32_t*>(batch.rope_positions.data),
         static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
-        geometry.rotary_dim, geometry.theta, geometry.eps, static_cast<bf16*>(layer.pooled_pages.data), layer.spaces);
+        geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps,
+        static_cast<bf16*>(layer.pooled_pages.data), layer.spaces);
     check_launch("pool");
     if (!batch.update_tails) { return; }
     tail_kernel<<<batch.batch, kIndexDim, 0, stream>>>(

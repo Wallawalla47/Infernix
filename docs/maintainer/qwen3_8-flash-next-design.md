@@ -8519,6 +8519,69 @@ measured bench total time and serve throughput, change against 16:
 **Now no prefill call promotes.** Zero is best or within the reps' spread of 4 everywhere, and it
 keeps one rule.
 
+### 19.3.18 Text YaRN beyond 262,144 positions (2026-10-06)
+
+The reference model has one shared rotary embedding. A YaRN `rope_scaling` changes every rotation
+it makes: attention Q/K, the QSA indexer's queries, the pooled index keys and the MTP layer. NInfer
+used to refuse `rope_yarn_factor` for Qwen4Exp. Now the startup option drives all of those
+rotations.
+
+**Contract.**
+- `--rope-yarn-factor F`, finite and in [1, 4]. `max_position_embeddings` (262,144) is the original
+  span, and theta must be above 1.
+- The context ceiling is 262,144 × F, capped at 1,048,576. A `--max-context` above it is refused
+  at planning, with or without a factor. The factor does not raise `--max-context` itself.
+- Factor 1 keeps every existing rotation bit for bit.
+
+**Implementation.**
+- Attention Q/K use `ops::rope` with the model's `PreparedRope`, built once per Forward by
+  `prepare_rope(rotary_dim, theta, {F, 262144})`. That is the qualified Qwen3.5 YaRN path:
+  correction range, linear ramp, attention scale 1 + 0.1 ln F.
+- `QsaGeometry` carries `yarn_factor` and `original_positions`. The index-query and pool kernels
+  take the same preparation and follow the attention kernel's coefficients:
+  - the FP64 angle, reduced to one turn;
+  - FP32 `sincosf`;
+  - cosine and sine both multiplied by the attention scale.
+- At factor 1 they keep the FP32 `powf` path unchanged.
+
+**Tests.**
+- `ninfer_qsa_test` gains YaRN index rotations (factor 4, original 4,096), checked against an
+  independent YaRN formula in its FP64 oracle.
+- `ninfer_rope_test` gains Flash-Next YaRN cases: 24 Q / 2 KV heads at 1, 5 and 4,096 tokens, and a
+  factor-1 case at position 0.
+  - A factor-1 case at position 262,137 failed at first. The FP32 default route is not qualified
+    that far, so the case moved to position 0.
+- `ninfer_qwen4_exp_forward_real_test` takes `--rope-yarn-factor` for teacher-forced scoring.
+
+**Gate** (RTX 5090, int8 KV, `qwen3_8_flash_next_nvfp4_dense8m`; rig `fn/rigs/qsaattn` yarn/yarn2).
+- **Factor 1 is unchanged.** Greedy ids are identical to Gold `b454cd836` for prose2k, code MTP and
+  the ~40K walk prompt. Prefix-cache and preemption real tests pass.
+- **The ceiling holds.** `--max-ctx 300000` without a factor is refused.
+- **Quality.** Teacher-forced NLL over the same last 1,023 positions of one 327,680-token code and
+  docs stream, at different context lengths and factors. `pair_nll` gives the paired dNLL ± its
+  95 % interval:
+
+  | Context | Factor | NLL (nats) | Against |
+  |---|---:|---:|---|
+  | 16K | 1 | 1.95308 | |
+  | 16K | 2 | 1.96378 | +0.0107 ± 0.0137 vs 16K f1; KL 0.078 |
+  | 240K | 1 | 1.33160 | |
+  | 240K | 2 | 1.34469 | +0.0131 ± 0.0137 vs 240K f1; KL 0.085 |
+  | 320K | 2 | 1.33085 | −0.0008 ± 0.0169 vs 240K f1 |
+  | 320K | 4 | 1.33653 | +0.0057 ± 0.0141 vs 320K f2 |
+
+  - Inside the native span, factor 2 costs ~0.011-0.013 nats at both lengths. Neither change is
+    significant on its own, but they agree. That is why the guide says to enable YaRN only when the
+    length is needed.
+  - Beyond the native span, YaRN works. At 320K with factor 2, the extra 80K tokens of context score
+    the same tail as native 240K. Factor 4 at 320K is within noise of factor 2.
+- **Speed** (`ninfer_bench -pg 311296,128 --max-ctx 327680 --rope-yarn-factor 2 --prefill-chunk
+  4096`, one rep):
+  - prefill: 7,955 tok/s (39.1 s);
+  - decode: 66.4 tok/s plain, 76.0 tok/s with MTP K4 and the draft head.
+  - Against 245,760 tokens at `--max-context 262144` without YaRN (8.2K, 73.7, 87.9), these numbers
+    follow the length. The YaRN index rotation's own cost was not measured at equal length.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto

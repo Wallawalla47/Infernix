@@ -386,6 +386,11 @@ public:
         if (o.max_context == 0 || o.prefill_chunk == 0) {
             throw std::invalid_argument("Qwen4Exp: max_context and prefill_chunk must be nonzero");
         }
+        if (o.max_context > c.context_ceiling()) {
+            throw std::invalid_argument("Qwen4Exp: max_context " + std::to_string(o.max_context) + " exceeds the " +
+                                        std::to_string(c.context_ceiling()) +
+                                        " positions of the model (native positions x the YaRN factor)");
+        }
         if (o.ngram_draft_tokens > 15 ||
             (o.ngram_draft_tokens > 0 && (o.ngram_min_match < 4 || o.ngram_min_match > 64))) {
             throw std::invalid_argument("Qwen4Exp: n-gram drafts must be 0..15 with a minimum match of 4..64");

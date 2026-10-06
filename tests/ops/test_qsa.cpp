@@ -86,6 +86,9 @@ const ops::QsaGeometry kGeometry{.heads          = kHeads,
                                  .theta          = 1.0e7F,
                                  .eps            = 1.0e-6F};
 
+// The geometry of the index-query, pool and tail tests: kGeometry, or kGeometry with YaRN.
+ops::QsaGeometry g_index_geometry = kGeometry;
+
 // Index queries and pooled keys are normalized, rotated BF16 vectors. The Op rounds the normalized
 // vector to BF16 before rotating it (the reference RMSNorm's output) and rounds the output: two
 // roundings of at most 2^-9 relative each (relative RMS about 2^-9 * sqrt(2/3) = 1.6e-3), plus FP32
@@ -190,13 +193,24 @@ std::vector<double> normalize(const std::vector<double>& x,
 using Rope = std::array<int, 3>;
 
 // The half-split rotation of the first kRotary dimensions at RoPE position `rope`, pair i by
-// axis i % 3 (interleaved M-RoPE).
+// axis i % 3 (interleaved M-RoPE). Under YaRN (g_index_geometry.yarn_factor f > 1, original span L),
+// written from its definition: d(beta) = R ln(L / (2 pi beta)) / (2 ln theta), low = max(floor(d(32)), 0),
+// high = min(ceil(d(1)), R - 1) (+0.001 if equal), ramp_i = clamp((i - low) / (high - low), 0, 1); pair i
+// turns by theta^(-2i/R) ((1 - ramp_i) + ramp_i / f), and cos and sin are scaled by 1 + 0.1 ln f.
 void rotate(std::vector<double>& x, const Rope& rope) {
-    constexpr int half = kRotary / 2;
+    constexpr int half  = kRotary / 2;
+    const double theta  = g_index_geometry.theta, f = g_index_geometry.yarn_factor;
+    const double span   = g_index_geometry.original_positions;
+    const auto d        = [&](double beta) { return kRotary * std::log(span / (2.0 * std::acos(-1.0) * beta)) / (2.0 * std::log(theta)); };
+    const double low    = f > 1.0 ? std::max(std::floor(d(32.0)), 0.0) : 0.0;
+    double high         = f > 1.0 ? std::min(std::ceil(d(1.0)), static_cast<double>(kRotary - 1)) : 1.0;
+    if (low == high) { high += 0.001; }
+    const double scale  = f > 1.0 ? 1.0 + 0.1 * std::log(f) : 1.0;
     for (int i = 0; i < half; ++i) {
-        const double inv   = std::pow(static_cast<double>(kGeometry.theta), -2.0 * i / kRotary);
+        const double ramp  = f > 1.0 ? std::clamp((i - low) / (high - low), 0.0, 1.0) : 0.0;
+        const double inv   = std::pow(theta, -2.0 * i / kRotary) * ((1.0 - ramp) + ramp / f);
         const double angle = rope[i % 3] * inv;
-        const double c = std::cos(angle), s = std::sin(angle);
+        const double c = scale * std::cos(angle), s = scale * std::sin(angle);
         const double a = x[i], b = x[i + half];
         x[i]        = a * c - b * s;
         x[i + half] = a * s + b * c;
@@ -258,7 +272,7 @@ void test_index_query(int columns, std::uint32_t seed) {
     DeviceBuffer dq = upload(q), dw = upload(weight), dp = upload(rope);
     Tensor tq(dq.p, DType::BF16, {kDi, kIndexHeads, columns});
     ops::qsa_index_query(tq, Tensor(dw.p, DType::BF16, {kDi}), Tensor(dp.p, DType::I32, {columns, 3}),
-                         kGeometry, nullptr);
+                         g_index_geometry, nullptr);
     synchronize("index query");
     const auto got = t::from_device_bf16(dq, q.size());
     std::vector<double> ref;
@@ -274,7 +288,10 @@ void test_index_query(int columns, std::uint32_t seed) {
             ref.insert(ref.end(), out.begin(), out.end());
         }
     }
-    g_failures += t::verify_reduction("qsa_index_query T=" + std::to_string(columns), got, ref,
+    g_failures += t::verify_reduction(std::string("qsa_index_query") +
+                                          (g_index_geometry.yarn_factor > 1.0F ? " yarn" : "") +
+                                          " T=" + std::to_string(columns),
+                                      got, ref,
                                       kKeyCriterion);
 }
 
@@ -430,7 +447,7 @@ private:
                        DType::BF16, {kDi, batch * width});
             Tensor tails(tails_layer(l), DType::BF16, {kDi, kR - 1, slots_});
             ops::qsa_pool_keys(raw, Tensor(weights_[l].p, DType::BF16, {kDi}), tails, layer_view(l),
-                               qsa_batch, kGeometry, nullptr);
+                               qsa_batch, g_index_geometry, nullptr);
         }
         synchronize("pool");
         if (positions_out != nullptr) {
@@ -472,15 +489,16 @@ private:
             ops::qsa_commit_tails(Tensor(keys.p, DType::BF16, {kDi, s.width, rows_, kLayers}),
                                   Tensor(positions.p, DType::I32, {s.width, rows_}),
                                   Tensor(dcommit.p, DType::I32, {rows_}), tails,
-                                  Tensor(commit_slots_.p, DType::I32, {rows_}), kGeometry, nullptr);
+                                  Tensor(commit_slots_.p, DType::I32, {rows_}), g_index_geometry, nullptr);
         }
         synchronize("pool step");
         for (int r = 0; r < rows_; ++r) {
             written_[r] = std::max(written_[r], starts[r] + s.width);
             frontier_[r] += s.verify ? s.commit[r] : s.width;
         }
-        const std::string tag = std::string(case_.name) + " step " + std::to_string(index) +
-                                (s.verify ? " verify W=" : " call W=") + std::to_string(s.width);
+        const std::string tag = std::string(case_.name) + (g_index_geometry.yarn_factor > 1.0F ? " yarn" : "") +
+                                " step " + std::to_string(index) + (s.verify ? " verify W=" : " call W=") +
+                                std::to_string(s.width);
         check_tails(tag);
         check_planes(tag);
         for (int r = 0; r < rows_; ++r) {
@@ -1355,6 +1373,13 @@ int main() {
     try {
         for (const int columns : {1, 5, 64, 1024}) { test_index_query(columns, 100U + columns); }
         test_pool(7);
+        // Under YaRN (factor 4 over an original span of 4096, so the ramp falls inside the rotary
+        // pairs and positions reach past the span).
+        g_index_geometry.yarn_factor        = 4.0F;
+        g_index_geometry.original_positions = 4096;
+        for (const int columns : {1, 64}) { test_index_query(columns, 200U + columns); }
+        test_pool(9);
+        g_index_geometry = kGeometry;
         // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
         // verification across a page boundary, prefill columns crossing the boundary inside one
         // call (one attention split), and a split-K prefill width.

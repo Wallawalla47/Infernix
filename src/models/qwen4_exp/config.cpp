@@ -235,11 +235,16 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         if (options.speculative != SpeculativeBackend::None && !options.mtp()) {
             throw ArtifactError("Qwen4Exp speculative decoding uses its MTP drafter (--spec mtp)");
         }
-        if (options.rope_yarn_factor != 1.0F) {
-            throw ArtifactError("Qwen4Exp does not support RoPE scaling");
+        if (!std::isfinite(options.rope_yarn_factor) || options.rope_yarn_factor < 1.0F ||
+            options.rope_yarn_factor > 4.0F) {
+            throw ArtifactError("rope_yarn_factor must be finite and in [1,4]");
         }
         Config out;
         out.text = text(directory.component("text").config);
+        out.text.rope.yarn_factor = options.rope_yarn_factor;
+        if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
+            throw ArtifactError("YaRN needs a RoPE theta above 1");
+        }
         if (options.vision) {
             if (!directory.components.contains("vision")) { throw ArtifactError("the artifact has no vision component"); }
             constexpr std::string_view types[] = {"qwen4_exp_vision"};

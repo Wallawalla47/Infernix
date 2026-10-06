@@ -71,13 +71,17 @@ ops::QsaGeometry qsa_geometry(const TextConfig& c) {
             .budget         = dim(c.qsa.budget),
             .ratio          = dim(c.qsa.compress_ratio),
             .theta          = c.rope.theta,
-            .eps            = c.rms_norm_eps};
+            .eps            = c.rms_norm_eps,
+            .yarn_factor    = c.rope.yarn_factor,
+            .original_positions = dim(c.max_position_embeddings)};
 }
 
 Forward::Forward(const Parameters& parameters, DeviceContext& device, WorkspaceArena& work,
                  ForwardState state, ForwardKV kv, ForwardExperts experts, std::int32_t max_context)
     : parameters_(parameters), config_(parameters.model.config().text), device_(device), work_(work),
-      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context) {
+      state_(std::move(state)), kv_(std::move(kv)), experts_(std::move(experts)), max_context_(max_context),
+      rope_(ops::prepare_rope(dim(config_.rope.rotary_dim), config_.rope.theta,
+                              {config_.rope.yarn_factor, config_.max_position_embeddings})) {
     if (state_.gdn == nullptr || state_.gdn->layer_count() != config_.gdn_layers ||
         state_.qsa_tails.size() != config_.attention_layers || kv_.layers.size() != config_.attention_layers ||
         experts_.frames.size() != config_.num_hidden_layers) {
@@ -452,8 +456,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
         ops::rmsnorm(q.view({D, dim(a.heads) * T}), p.query_norm, config_.rms_norm_eps, true, qn_rows, s);
         ops::rmsnorm(k.view({D, dim(a.kv_heads) * T}), p.key_norm, config_.rms_norm_eps, true, kn_rows, s);
     }
-    ops::rope(call.rope_positions, dim(config_.rope.rotary_dim), config_.rope.theta, qn, kn,
-              device_.execution_view().on_stream(s));
+    ops::rope(call.rope_positions, rope_, qn, kn, device_.execution_view().on_stream(s));
 
     // Append K/V of every sequence through its device-chosen table row, then the pooled index keys.
     // The vector-quantized storages' exact window is addressed by the sequences' state slots, and

@@ -9,6 +9,7 @@
 #include "models/qwen3_5/config.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -38,6 +39,10 @@ struct RopeConfig {
     std::uint32_t rotary_dim   = 0;
     std::array<std::uint32_t, 3> mrope_section{};
     std::vector<std::uint8_t> pair_axes; // [rotary_dim / 2]: 0 = T, 1 = H, 2 = W
+    // Text YaRN (the startup option rope_yarn_factor, [1, 4]; 1 = none): like the reference's one
+    // shared rotary embedding, it scales every text rotation (attention Q/K, the QSA indexer's
+    // queries and pooled keys, the MTP layer), with max_position_embeddings as the original span.
+    float yarn_factor = 1.0F;
 };
 
 struct GdnConfig {
@@ -128,6 +133,12 @@ struct TextConfig {
     HyperConnectionConfig hc;
     QsaConfig qsa;
     PleConfig ple;
+
+    // The positions a context may use: the native ones times the YaRN factor, at most 1,048,576.
+    [[nodiscard]] std::uint32_t context_ceiling() const noexcept {
+        return static_cast<std::uint32_t>(
+            std::min(double(max_position_embeddings) * double(rope.yarn_factor), 1048576.0));
+    }
 
     [[nodiscard]] std::uint32_t residual_width() const noexcept { return hc.streams * hidden_size; }
 };
