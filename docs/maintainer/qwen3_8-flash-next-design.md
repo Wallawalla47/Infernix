@@ -8497,8 +8497,27 @@ promo, promo2; 3 rotated reps, then ABAB) compared the current budget with caps 
   exactly its experts. The prompt's experts would have displaced them: decode after a 128K prompt
   stays at 89 tok/s instead of 66 over 512 tokens.
 - **No walk span promotes now.** Its routes still update the cache's scores.
-- **Chunk-major prompts are unchanged.** That covers single-call prompts and calls while another
-  lane prefills; they still promote 16 per layer per call.
+- **CLI check** (~40K prompt, ABBAABBA): the time to first token stays 6.7 s in all 8 runs, decode
+  goes 2.2 → 1.5 s, and the total 9.0 → 8.2 s. An earlier single B run showed a 7.3 s prefill
+  that did not recur.
+
+**Chunk-major prompts too.** That covers single-call prompts and calls while another lane prefills.
+They promoted 16 per layer per call; CPU-served tiny calls keep the decode rate. The sweep
+(`fn/rigs/split` cpromo, TEMP per-layer value 16 / 4 / 0, 3 rotated reps, outputs identical)
+measured bench total time and serve throughput, change against 16:
+
+| Workload | 4 | 0 |
+|---|---:|---:|
+| bench -pg 2048,256 (total) | −0.7 % | −0.7 % |
+| bench -pg 4096,256 MTP (total) | −0.4 % | −0.8 % |
+| serve C = 1 MTP, fill | +1.8 % | +2.6 % |
+| serve C = 1 MTP, warm | +1.8 % | +1.0 % |
+| serve C = 1 MTP, lone | +0.6 % | +1.2 % |
+| serve C = 4 plain, fill | +3.9 % | +4.5 % |
+| serve C = 4 plain, warm | +6.2 % | +5.9 % |
+
+**Now no prefill call promotes.** Zero is best or within the reps' spread of 4 everywhere, and it
+keeps one rule.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 

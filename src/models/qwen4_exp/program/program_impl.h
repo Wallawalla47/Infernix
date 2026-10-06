@@ -1529,11 +1529,13 @@ public:
         }
         const std::int32_t width = static_cast<std::int32_t>(lane.calls[lane.next_call++] - lane.state_tokens);
         const bool last          = begin + width == static_cast<std::int32_t>(lane.prefill_end);
-        // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate, so it
-        // does not churn the expert cache (design §19.3.1).
-        const std::size_t promotions = width <= kServedCallColumns
-                                           ? decode_budget(static_cast<std::uint32_t>(width))
-                                           : kPrefillPromotionsPerLayer;
+        // A call the CPU serves (an opener tail, a tiny suffix) promotes at the decode rate (design
+        // §19.3.1). Wider prefill calls promote nothing: the answer's staged misses land in free
+        // frames and pick its experts, while the prompt's would displace them (16 per layer per
+        // call measured slower than none in every regime: serve C = 4 fill -4.3 %, warm -5.6 %;
+        // design §19.3.17). Their routes still count toward the cache's scores.
+        const std::size_t promotions =
+            width <= kServedCallColumns ? decode_budget(static_cast<std::uint32_t>(width)) : 0;
         // Host phases of a chunk for nsys attribution (the GPU side is in the CUDA trace).
         const nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                             static_cast<std::uint64_t>(width));
@@ -2227,7 +2229,6 @@ public:
     }
 
 private:
-    static constexpr std::size_t kPrefillPromotionsPerLayer = 16;
     // Calls this narrow are CPU-served (design §16.2, prefix P0 step 3).
     static constexpr std::int32_t kServedCallColumns = 8;
     // Prefill calls up to this many columns run in the static workspace; wider ones in the wide arena.
