@@ -676,6 +676,17 @@ int main() {
         execution,
         {"prepared generic stride", 256, 64, 3, 7, kTextTheta, {2.0F, 262144}, true}, 4, 524288,
         1);
+    // Qwen3.8-Flash-Next's attention (24 query / 2 KV heads, MRoPE): the generic launch under YaRN,
+    // decode and prefill widths, inside and past the native span, captured and eager.
+    for (int tokens : {1, 5, 4096}) {
+        failures += run_pair_case(execution,
+                                  {"flash-next yarn", 256, 64, 3, tokens, 1.0e7F, {4.0F, 262144}, true},
+                                  24, 2, tokens == 4096 ? 258048 : 1048570, 0, 0, 0, tokens == 5);
+    }
+    // Factor 1 through the prepared API is the unchanged FP32 route (qualified near position 0, as the
+    // YaRN loop above), bit for bit.
+    failures += run_pair_case(execution, {"flash-next factor1", 256, 64, 3, 7, 1.0e7F, {1.0F, 262144}, true},
+                              24, 2, 0);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rope correctness\n";
     return failures == 0 ? 0 : 1;

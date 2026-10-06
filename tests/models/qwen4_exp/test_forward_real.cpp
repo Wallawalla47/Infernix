@@ -19,7 +19,8 @@
 // them in Strata's --dump-logits layout (int32 vocabulary, int32 rows, then one FP32 row per
 // position) and prints the perplexity. With --dump-from P only positions from P on are written and
 // scored (long texts: the logits of every position would not fit on disk). Several such texts are
-// scored in order with one model load.
+// scored in order with one model load. --rope-yarn-factor F, anywhere, loads the model with that text
+// YaRN factor (contexts up to the native positions times F).
 // Otherwise the test prefills all but the last token as one chunk,
 // then decodes the last token twice in one batch (two sequences with identical histories), and
 // checks that both decode rows equal each other bit for bit and agree with a single prefill of
@@ -469,8 +470,14 @@ int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     try {
         std::vector<Job> jobs;
+        models::LoadOptions load; // --rope-yarn-factor F (anywhere): the model's YaRN factor
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
+            if (arg == "--rope-yarn-factor") {
+                if (i + 1 >= argc) { throw std::invalid_argument("--rope-yarn-factor needs a value"); }
+                load.rope_yarn_factor = std::stof(argv[++i]);
+                continue;
+            }
             if (arg.rfind("--", 0) != 0) {
                 jobs.push_back(Job{parse_tokens(arg)});
                 if (jobs.back().tokens.size() < 2) { throw std::invalid_argument("pass at least two tokens"); }
@@ -518,7 +525,7 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
         artifact::Reader reader(artifact_env);
         if (!q4::is_qwen4_exp(reader)) { throw std::invalid_argument("artifact is not Qwen4Exp"); }
-        auto plan  = q4::plan_load(reader, models::LoadOptions{});
+        auto plan  = q4::plan_load(reader, load);
         print_memory("load plan");
         auto model = q4::materialize_model(std::move(plan), device);
         device.synchronize();

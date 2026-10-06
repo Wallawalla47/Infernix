@@ -14,6 +14,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "ninfer/ops/offloaded_sparse_moe.h"
 #include "ninfer/ops/qsa.h"
+#include "ninfer/ops/rope.h"
 
 #include <array>
 #include <cstdint>
@@ -283,6 +284,7 @@ private:
     ForwardKV kv_;
     ForwardExperts experts_;
     std::int32_t max_context_;
+    ops::PreparedRope rope_; // the text rotation (YaRN-scaled when the factor is above 1)
     bool eager_chunk_ = false;
     // A gated call's layer routing on the host: the dispatch offsets (pinned I32 [E + 1]), the
     // event that lands them, and the per-expert columns and CPU marks derived from them.

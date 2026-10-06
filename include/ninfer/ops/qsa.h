@@ -50,6 +50,12 @@ struct QsaGeometry {
     std::int32_t ratio          = 0; // R
     float theta                 = 0;
     float eps                   = 0;
+    // Text YaRN of the index rotation: with yarn_factor > 1 (at most 4), pair i takes
+    // prepare_rope(rotary_dim, theta, {yarn_factor, original_positions})'s inverse frequency and
+    // both its cosine and sine are multiplied by that preparation's attention scale, as the
+    // model's attention rotation is (ops/rope.h); 1 keeps the plain rotation above, bit for bit.
+    float yarn_factor                 = 1.0F;
+    std::int32_t original_positions   = 0;
 };
 
 /// KV pages outside the device pool (docs/maintainer/qwen3_8-flash-next-design.md §19.3.11). Block

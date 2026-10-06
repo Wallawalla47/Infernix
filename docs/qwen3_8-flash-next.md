@@ -68,8 +68,20 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
     holds a context in 55 % of `int8`'s KV memory, which leaves more VRAM to the expert cache.
   - `vq2` and `k4v2` keep each sequence's recent and first tokens exact and quantize older ones
     harder (design §19.3.15).
-- **Context.** Measurements so far cover 4-8K contexts. Longer contexts work the same way, but
-  their KV cache takes VRAM from the expert cache, and they have not been benchmarked yet.
+- **Context.** The model's native context is 262,144 tokens. Long contexts work the same way, but
+  their KV cache takes VRAM from the expert cache.
+  - Measured on an RTX 5090 at `--max-context 262144`, INT8 KV, with a 245,760-token prompt of code
+    and docs:
+    - prefill ran at 8.2K tok/s (30 s);
+    - decode ran at 73.7 tok/s plain and 87.9 tok/s with MTP, against ~102 and ~132 at 8K;
+    - the KV took 3.2 GB, which cut the expert cache from 9,541 to 8,469 frames.
+  - At that length `nvfp4` KV decoded 74.2 tok/s and `vq2` 76.9, because their smaller KV leaves
+    more frames.
+- **Beyond 262,144 tokens: `--rope-yarn-factor F`** (1-4). It enables YaRN on every rotation of
+  the model and raises the context ceiling to 262,144 × F (1,048,576 at 4). It does not raise
+  `--max-context` itself: set both. Without a factor, a `--max-context` above 262,144 is refused.
+  YaRN also changes shorter contexts slightly (design §19.3.18), so use it only when you need the
+  length.
 - `--prefill-chunk 2048` or `4096` speeds up long prompts by 1.4-1.6×. Each costs ~2-5 % of
   decode speed, because the larger prefill workspace takes expert frames.
 - `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
