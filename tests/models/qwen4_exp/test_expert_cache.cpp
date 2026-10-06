@@ -8,6 +8,7 @@
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <cstdio>
 #include <fstream>
@@ -101,8 +102,58 @@ void test_budgeted_admission() {
         check(step.admitted.size() <= std::max<std::size_t>(budget, 0) || budget >= step.misses.size(), "budget respected");
         check(policy.resident_count() <= policy.capacity(), "capacity respected");
         for (std::uint32_t v : step.victims) { check(!g.count(v), "current group never evicted"); }
+        // With one admission, the victim is the lowest (score, key) resident outside the group, as
+        // a full sort of the residents would order them (scores of other keys are unchanged by
+        // the eviction).
+        if (budget == 1 && step.victims.size() == 1) {
+            const std::uint32_t v = step.victims[0];
+            for (std::uint32_t r : policy.residents()) {
+                if (g.count(r) || std::find(step.admitted.begin(), step.admitted.end(), r) != step.admitted.end()) {
+                    continue;
+                }
+                const double sr = policy.score(r), sv = policy.score(v);
+                check(sr > sv || (sr == sv && r > v), "the single victim is the lowest (score, key) resident");
+            }
+        }
         if (g_failures) { return; }
     }
+    // The cost of one budgeted step at production size (9,000 residents of 24,576 keys), reported
+    // for comparison; no bound is asserted.
+    LfruPolicy big(24576, 9000);
+    std::mt19937 rng2(5);
+    for (int i = 0; i < 9000 / 8 + 200; ++i) {
+        std::set<std::uint32_t> g;
+        while (g.size() < 8) { g.insert(static_cast<std::uint32_t>(rng2() % 24576)); }
+        big.step(std::vector<std::uint32_t>(g.begin(), g.end()), step);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    constexpr int kSteps = 2000;
+    for (int i = 0; i < kSteps; ++i) {
+        std::set<std::uint32_t> g;
+        while (g.size() < 8) { g.insert(static_cast<std::uint32_t>(rng2() % 24576)); }
+        big.step(std::vector<std::uint32_t>(g.begin(), g.end()), step, 1);
+    }
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    // The previous selection (a (score, key) pair per resident, partially sorted) on the same
+    // residents, for the comparison; it must name the same key as a scan.
+    std::vector<std::pair<double, std::uint32_t>> pairs;
+    std::uint32_t named = 0;
+    const auto start_sort = std::chrono::steady_clock::now();
+    for (int i = 0; i < kSteps; ++i) {
+        pairs.clear();
+        for (std::uint32_t k : big.residents()) { pairs.emplace_back(big.score(k), k); }
+        std::partial_sort(pairs.begin(), pairs.begin() + 1, pairs.end());
+        named = pairs[0].second;
+    }
+    const double us_sort = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start_sort).count();
+    std::uint32_t scanned = big.residents()[0];
+    for (std::uint32_t k : big.residents()) {
+        const double s = big.score(k), b = big.score(scanned);
+        if (s < b || (s == b && k < scanned)) { scanned = k; }
+    }
+    check(named == scanned, "a scan names the partial sort's first resident");
+    std::printf("budgeted LFRU step at 9,000 residents: %.2f us; one sort-based victim selection: %.2f us\n",
+                us / kSteps, us_sort / kSteps);
 }
 
 void test_frame_epochs() {
