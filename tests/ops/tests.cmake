@@ -187,10 +187,20 @@ endforeach()
 set_tests_properties(ninfer_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 set_tests_properties(ninfer_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
 
-add_test(NAME ninfer_gdn_replay_fold_wide_test
-  COMMAND ninfer_gdn_replay_fold_test --wide-only)
-set_tests_properties(ninfer_gdn_replay_fold_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+# The wide sweep, one entry per width and layer profile plus the batched cases: together they run
+# exactly the cases of --wide-only, and `ctest -j` runs them concurrently.
+foreach(width 33 48 64)
+  foreach(layers 48 30)
+    add_test(NAME ninfer_gdn_replay_fold_wide_w${width}_l${layers}_test
+      COMMAND ninfer_gdn_replay_fold_test --wide-only --width ${width} --layers ${layers})
+    set_tests_properties(ninfer_gdn_replay_fold_wide_w${width}_l${layers}_test
+      PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  endforeach()
+endforeach()
+add_test(NAME ninfer_gdn_replay_fold_wide_batched_test
+  COMMAND ninfer_gdn_replay_fold_test --wide-only --batched)
+set_tests_properties(ninfer_gdn_replay_fold_wide_batched_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 # hyper_connection_mix against the FP64 closed formula: fused Q8 route (T <= 16) and composed route.
 ninfer_add_op_test(ninfer_hyper_connection_test

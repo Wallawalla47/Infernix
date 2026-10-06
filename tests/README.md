@@ -79,6 +79,11 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 `--wide-only`), so `ctest -j` runs the KV types concurrently; together the entries run exactly the
 cases of one unsharded invocation.
 
+`ninfer_gdn_replay_fold_test --wide-only` likewise splits into one CTest entry per width and layer
+profile (`ninfer_gdn_replay_fold_wide_w<width>_l<layers>_test`, from `--width 33|48|64 --layers
+48|30`) plus `ninfer_gdn_replay_fold_wide_batched_test` (`--batched`). All seven together peak at
+about 17 GB of device memory on an RTX 5090.
+
 The vector-quantized `vq2` and `k4v2` caches have their own suites. `ninfer_kv_cache_vq_test`
 compares every stored code, row scale, exact-window slot and tag with independent host encoders
 (`kv_cache_vq_reference.h`), checks untouched bytes, and moves tree-compacted slots between state
