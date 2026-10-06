@@ -48,7 +48,15 @@ ninfer_add_op_test(ninfer_softmax_attention_test
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES ninfer_ops
+  ARGS --non-causal-only)
+# The causal cases, one entry per KV format: together they run exactly the cases of a run without
+# --kv-dtype, and `ctest -j` can run them concurrently.
+foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
+  add_test(NAME ninfer_softmax_attention_${kv_dtype}_test
+    COMMAND ninfer_softmax_attention_test --kv-dtype ${kv_dtype})
+  set_tests_properties(ninfer_softmax_attention_${kv_dtype}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 
 # Beyond the native 262,144 visible keys that --rope-yarn-factor opens (up to 1,048,576).
 add_test(NAME ninfer_softmax_attention_extended_test
@@ -157,10 +165,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
-add_test(NAME ninfer_softmax_attention_wide_test
-  COMMAND ninfer_softmax_attention_test --wide-only)
-set_tests_properties(ninfer_softmax_attention_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 RUN_SERIAL TRUE)
+foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
+  add_test(NAME ninfer_softmax_attention_wide_${kv_dtype}_test
+    COMMAND ninfer_softmax_attention_test --wide-only --kv-dtype ${kv_dtype})
+  set_tests_properties(ninfer_softmax_attention_wide_${kv_dtype}_test
+    PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+endforeach()
 
 add_test(NAME ninfer_sparse_moe_wide_test
   COMMAND ninfer_sparse_moe_test --wide-only)
