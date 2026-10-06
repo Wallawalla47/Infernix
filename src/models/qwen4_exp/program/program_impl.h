@@ -2542,12 +2542,17 @@ private:
     // traffic counts toward `lane`'s request.
     void stage_ngram(Lane& lane, const std::vector<std::int32_t>& history, std::int32_t begin, std::int32_t count,
                      std::size_t column) {
+        ngram_window(history, begin, count);
+        read_ngram(lane, count, column);
+    }
+
+    // window_ = the tokens of positions [begin - (n - 1), begin + count), EOS before the sequence.
+    void ngram_window(const std::vector<std::int32_t>& history, std::int32_t begin, std::int32_t count) {
         const std::int32_t context = static_cast<std::int32_t>(c_.ple.ngram.ngram_size) - 1;
         window_.clear();
         for (std::int32_t p = begin - context; p < begin + count; ++p) {
             window_.push_back(p < 0 ? static_cast<std::int32_t>(c_.eos_token_id) : history[static_cast<std::size_t>(p)]);
         }
-        read_ngram(lane, count, column);
     }
 
     // Verification row b's token at position q: its history up to the anchor (position p), then its
@@ -2572,13 +2577,17 @@ private:
     // Reads the rows of the `count` positions whose tokens (with their context) are in window_ into
     // io columns from `column`.
     void read_ngram(Lane& lane, std::int32_t count, std::size_t column) {
+        read_ngram_to(lane, count, host_io() + io_layout_.ngram + column * hash_.heads() * c_.ple.table.row_bytes);
+    }
+
+    // As read_ngram, into `out` (count * heads rows).
+    void read_ngram_to(Lane& lane, std::int32_t count, std::byte* out) {
         const std::size_t heads = hash_.heads();
         row_ids_.resize(static_cast<std::size_t>(count) * heads);
         hash_.row_ids(window_, static_cast<std::size_t>(count), row_ids_.data());
         const std::size_t row_bytes = c_.ple.table.row_bytes;
         const NgramVolume::Counters before = volume_.counters();
-        volume_.read_rows(row_ids_, std::span<std::byte>(host_io() + io_layout_.ngram + column * heads * row_bytes,
-                                                         static_cast<std::size_t>(count) * heads * row_bytes));
+        volume_.read_rows(row_ids_, std::span<std::byte>(out, static_cast<std::size_t>(count) * heads * row_bytes));
         const NgramVolume::Counters& after = volume_.counters();
         lane.ngram.rows += after.rows - before.rows;
         lane.ngram.hits += after.hits - before.hits;
@@ -2586,8 +2595,9 @@ private:
         lane.ngram.read_ns += after.read_ns - before.read_ns;
     }
 
+    // `rows`: also read the n-gram rows (a walk chunk whose rows were prefetched skips them).
     void stage_sequence(std::uint32_t lane, std::int32_t begin, std::int32_t width,
-                        const std::vector<std::int32_t>& history) {
+                        const std::vector<std::int32_t>& history, bool rows = true) {
         auto* ids       = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.ids);
         auto* positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         auto* columns   = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.columns);
@@ -2599,7 +2609,7 @@ private:
         stage_call_rope(lanes_[lane], static_cast<std::uint32_t>(begin), width, width, 0, 1, 0);
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.slots)[0] = static_cast<std::int32_t>(lane);
         reinterpret_cast<std::int32_t*>(host_io() + io_layout_.rows)[0]  = static_cast<std::int32_t>(lane);
-        stage_ngram(lanes_[lane], history, begin, width, 0);
+        if (rows) { stage_ngram(lanes_[lane], history, begin, width, 0); }
         host_lanes_[0] = static_cast<std::int32_t>(lane);
     }
 
@@ -2742,6 +2752,7 @@ private:
             stream_walk_bytes_ = walk ? static_cast<std::size_t>(walk_frames) * stride : 0;
             stream_at_lease_   = expert_stream_->stats();
             split_at_lease_    = forward_->split_stats();
+            prefetched_at_lease_ = walk_prefetched_chunks_;
         }
         return true;
     }
@@ -2828,15 +2839,17 @@ private:
         const auto streamed   = now.streamed - stream_at_lease_.streamed;
         const auto copies     = now.copies - stream_at_lease_.copies;
         const auto split      = forward_->split_stats();
-        char line[256];
+        char line[320];
         std::snprintf(line, sizeof(line),
                       "prefill expert stream: %llu experts (%.2f GiB) in %llu copies through %u lent frames; "
-                      "CPU split: %llu experts on the CPU, %llu gated copies",
+                      "CPU split: %llu experts on the CPU, %llu gated copies; n-gram rows of %llu walk chunks read "
+                      "during the previous span",
                       static_cast<unsigned long long>(streamed),
                       static_cast<double>(streamed) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
                       static_cast<unsigned long long>(copies), frames,
                       static_cast<unsigned long long>(split.cpu_experts - split_at_lease_.cpu_experts),
-                      static_cast<unsigned long long>(split.streamed_experts - split_at_lease_.streamed_experts));
+                      static_cast<unsigned long long>(split.streamed_experts - split_at_lease_.streamed_experts),
+                      static_cast<unsigned long long>(walk_prefetched_chunks_ - prefetched_at_lease_));
         diagnostic(line);
     }
 
@@ -3847,7 +3860,23 @@ private:
         std::uint64_t steps = 0;
     } walk_;
     PinnedHostBuffer walk_host_{1}; // every chunk's io image, uploaded once per span
+    // The next span's n-gram rows, read into walk_host_'s chunk slots while the current span's steps
+    // run on the device (prefill_walk.cpp): chunk k is call first_call + k, its rows stand at slot k's
+    // n-gram columns, and key is a hash of the tokens its rows hash.
+    struct WalkPrefetch {
+        bool valid = false;
+        std::uint32_t lane = 0;
+        std::size_t first_call = 0;
+        std::vector<std::int32_t> begins, widths;
+        std::vector<std::uint64_t> keys;
+        bool done = false; // no further chunk can join the next span
+    } walk_prefetch_;
+    void walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_t chunks);
+    [[nodiscard]] bool walk_prefetched(std::uint32_t index, std::size_t first_call, std::size_t c, std::int32_t begin,
+                                       std::int32_t width);
+    [[nodiscard]] std::uint64_t window_key() const noexcept;
     std::uint64_t walk_spans_ = 0, walk_calls_ = 0;
+    std::uint64_t walk_prefetched_chunks_ = 0, prefetched_at_lease_ = 0; // chunks whose rows were prefetched
     static constexpr std::uint32_t kWalkMaxTokens = 65536;
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;

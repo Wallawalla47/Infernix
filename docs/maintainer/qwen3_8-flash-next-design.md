@@ -8458,6 +8458,25 @@ on the host instead of 316-416 ms, at the same 27.5 GB/s.
 - **In the same rig the preemption and prefix-cache real tests failed.** The cause was round 1's
   width-dependent split rule (§19.3.15, correction), not these copies.
 
+**The next span's n-gram rows are read during the current span.** Before each chunk's embedding,
+the host reads its n-gram rows from the volume (IOPS-bound, ~30-70 ms per 4,096-token chunk) while
+the device waits: ~0.5 s per 64K span.
+- **How.** While a span's steps run, the host reads the following calls' rows (as `walk_span_end`
+  would group them) straight into `walk_host_`'s chunk slots, spread over the remaining steps. It
+  starts after the span's first device synchronization, once the span's own slots have uploaded.
+- **Use.** The next `walk_begin` takes a chunk's rows from its slot when lane, call, position, width
+  and an FNV hash of the hashed tokens all match; any other chunk reads as before. No memory is
+  added.
+- **Not covered.** The prompt's first span and chunk-major prefills are unchanged.
+- **Diagnostic.** The prefill stream line counts the chunks.
+
+**Prefetch results** (ABBAABBA, A = `b5bacdb15`):
+- pp128k: 17.14 → 16.71 s (−2.5 %).
+- pp32k, one span: 5.307 → 5.314 s (+0.1 %). A first ABBA showed +1.1 %; eight runs did not
+  reproduce it.
+- Greedy ids identical on a ~100K prompt (12 chunks prefetched) and a ~40K prompt.
+- Prefix-cache and preemption real tests pass.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
