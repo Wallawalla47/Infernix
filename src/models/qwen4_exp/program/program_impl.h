@@ -2804,7 +2804,9 @@ private:
         for (std::int32_t b = 0; b < batch; ++b) {
             const Lane& lane = lanes_[lanes[b]];
             const std::int32_t cell  = static_cast<std::int32_t>(lane.state_tokens) - 1;
-            const std::int32_t limit = static_cast<std::int32_t>(lane.pages.size()) * kPagedKVPageSize - 1;
+            // The lane's last mapped position: its shared prefix pages, then its private ones.
+            const std::int32_t limit =
+                static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize - 1;
             mtp_host(mtp_io_.ids)[b] = lane.history.back();
             for (std::int32_t j = 0; j < mtp_k_; ++j) {
                 const std::int32_t at = std::min(cell + j, limit);
