@@ -80,8 +80,9 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
         for (auto* p : chunks_) { options_.release(p); }
         throw;
     }
-    // A layer call reads each of its experts once, so a round demands every key at most once.
-    ticket_capacity_ = keys();
+    // A layer call reads each of its experts once, so a round demands at most its layer calls'
+    // experts (every key once when a round calls each layer once).
+    ticket_capacity_ = options_.layer_calls > 0 ? options_.layer_calls * store_.experts() : keys();
     tickets_         = std::make_unique<Ticket[]>(ticket_capacity_);
     {
         std::lock_guard<std::mutex> lock(mutex_);

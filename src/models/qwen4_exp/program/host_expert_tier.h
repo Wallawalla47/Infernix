@@ -52,6 +52,10 @@ public:
         // The device's fetch channel this tier answers (owned by the caller; null: CPU demands only).
         // The ring must exceed the CPU jobs of one call plus the largest pass's fetched records.
         ops::offloaded_moe::FetchChannel* fetch = nullptr;
+        // The most layer calls one round makes (0: one per layer). A layer call demands each of its
+        // experts once, so a round holds this many layers' worth of tickets; a layer walk's step
+        // calls its layers once per chunk of the span.
+        std::uint32_t layer_calls = 0;
     };
 
     struct Stats {

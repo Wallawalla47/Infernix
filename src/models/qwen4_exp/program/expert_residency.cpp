@@ -321,6 +321,19 @@ void ExpertResidency::upload_table(cudaStream_t compute) {
     table_dirty_ = false;
 }
 
+void ExpertResidency::tier_step(cudaStream_t compute) {
+    if (tier_ == nullptr) { return; }
+    tier_->end_round();
+    tier_->begin_round(0);
+    dirty_.clear();
+    tier_->take_dirty(dirty_);
+    if (!dirty_.empty()) {
+        auto* records = static_cast<const std::uint8_t**>(records_host_.data());
+        for (const std::uint32_t key : dirty_) { records[key] = tier_->record(key); }
+        upload_pinned(records_device_.p, records_host_.data(), records_device_.bytes, compute);
+    }
+}
+
 void ExpertResidency::before_round(cudaStream_t compute, bool landing) {
     publish_landed();
     if (tier_ != nullptr) {

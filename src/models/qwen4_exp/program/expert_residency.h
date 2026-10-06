@@ -156,6 +156,11 @@ public:
     // rounds) reserves min(kLandingSlots, free frames / layers) landing frames per layer while the
     // policy has room, uploading the landing table (frame or -1) and clearing the landed log.
     void before_round(cudaStream_t compute, bool landing = false);
+    // A layer walk's step boundary, with the device idle: the SSD tier closes its round and opens the
+    // next (landings admitted, no demotions while the walk holds lent frames) and the record pointers
+    // it changed are uploaded. A walk's span is one residency round, but a tier round's tickets cover
+    // about one pass of the experts: a step's layers once per chunk of the span.
+    void tier_step(cudaStream_t compute);
     // The landing table and landed log, device I32 [layers][kLandingSlots] at fixed addresses.
     [[nodiscard]] const std::int32_t* landing_table() const noexcept {
         return static_cast<const std::int32_t*>(landing_device_.p);
