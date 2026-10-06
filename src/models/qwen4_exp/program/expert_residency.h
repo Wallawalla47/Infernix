@@ -238,6 +238,8 @@ private:
     };
     std::vector<Batch> in_flight_;
     std::vector<cudaEvent_t> spare_events_;
+    // Promotions per completion event (~6 ms of link at x8): a large promotion publishes in steps.
+    static constexpr std::size_t kLoadsPerEvent = 64;
     Stats stats_;
 
     HostExpertTier* tier_ = nullptr;

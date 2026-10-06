@@ -2,6 +2,8 @@
 
 #include "models/qwen4_exp/program/host_expert_tier.h"
 
+#include "core/copy_batch.h"
+
 #include <algorithm>
 #include <limits>
 #include <cstring>
@@ -611,47 +613,55 @@ void ExpertResidency::give_back(FrameLease& lease, cudaStream_t compute) {
 }
 
 void ExpertResidency::issue_loads(cudaStream_t compute) {
-    Batch batch;
+    std::vector<Batch::Load> loads;
     for (const auto& command : commands_) {
         if (command.kind == CacheController::Command::Kind::kCopy) {
-            batch.loads.push_back({command.key, command.frame, command.serial});
+            loads.push_back({command.key, command.frame, command.serial});
         }
     }
-    if (batch.loads.empty()) { return; }
+    if (loads.empty()) { return; }
     CUDA_CHECK(cudaEventRecord(table_ready_, compute));
     CUDA_CHECK(cudaStreamWaitEvent(copy_stream_, table_ready_, 0));
     auto* base = const_cast<std::uint8_t*>(frame_base());
-    for (const auto& load : batch.loads) {
-        const std::uint32_t layer  = load.key / experts_;
-        const std::uint32_t expert = load.key % experts_;
-        const std::uint8_t* source = banks_[layer] + static_cast<std::size_t>(expert) * stride_;
-        if (tier_ != nullptr) {
-            // T1: the RAM slot is pinned until the copy completes (admission required a host copy,
-            // and the Queue pin kept it since).
-            source = tier_->record(load.key);
-            if (source == nullptr) { throw std::logic_error("expert residency: a promotion lost its host copy"); }
-            auto& host = tier_->controller();
-            if (copies_in_flight_[load.key]++ == 0) {
-                if (queue_pinned_[load.key] == 0) { host.queued(load.key); }
-                host.promotion_issued(load.key); // Queue -> H2D
-            } else if (queue_pinned_[load.key] != 0) {
-                host.unqueued(load.key); // an earlier copy of the key still holds the H2D pin
+    // A prefill promotes thousands of records (~1.2 s of link at x8): batched copies keep the host
+    // free, and an event per group publishes the group's experts as soon as it lands.
+    CopyBatch copies(copy_stream_);
+    for (std::size_t first = 0; first < loads.size(); first += kLoadsPerEvent) {
+        Batch batch;
+        batch.loads.assign(loads.begin() + static_cast<std::ptrdiff_t>(first),
+                           loads.begin() + static_cast<std::ptrdiff_t>(std::min(loads.size(), first + kLoadsPerEvent)));
+        for (const auto& load : batch.loads) {
+            const std::uint32_t layer  = load.key / experts_;
+            const std::uint32_t expert = load.key % experts_;
+            const std::uint8_t* source = banks_[layer] + static_cast<std::size_t>(expert) * stride_;
+            if (tier_ != nullptr) {
+                // T1: the RAM slot is pinned until the copy completes (admission required a host copy,
+                // and the Queue pin kept it since).
+                source = tier_->record(load.key);
+                if (source == nullptr) { throw std::logic_error("expert residency: a promotion lost its host copy"); }
+                auto& host = tier_->controller();
+                if (copies_in_flight_[load.key]++ == 0) {
+                    if (queue_pinned_[load.key] == 0) { host.queued(load.key); }
+                    host.promotion_issued(load.key); // Queue -> H2D
+                } else if (queue_pinned_[load.key] != 0) {
+                    host.unqueued(load.key); // an earlier copy of the key still holds the H2D pin
+                }
+                queue_pinned_[load.key] = 0;
             }
-            queue_pinned_[load.key] = 0;
+            copies.add(base + static_cast<std::size_t>(load.frame) * stride_, source, stride_);
         }
-        CUDA_CHECK(cudaMemcpyAsync(base + static_cast<std::size_t>(load.frame) * stride_, source, stride_,
-                                   cudaMemcpyHostToDevice, copy_stream_));
+        copies.flush();
+        stats_.promotions += batch.loads.size();
+        if (spare_events_.empty()) {
+            cudaEvent_t event = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+            spare_events_.push_back(event);
+        }
+        batch.done = spare_events_.back();
+        spare_events_.pop_back();
+        CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
+        in_flight_.push_back(std::move(batch));
     }
-    stats_.promotions += batch.loads.size();
-    if (spare_events_.empty()) {
-        cudaEvent_t event = nullptr;
-        CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-        spare_events_.push_back(event);
-    }
-    batch.done = spare_events_.back();
-    spare_events_.pop_back();
-    CUDA_CHECK(cudaEventRecord(batch.done, copy_stream_));
-    in_flight_.push_back(std::move(batch));
 }
 
 } // namespace ninfer::models::qwen4_exp
