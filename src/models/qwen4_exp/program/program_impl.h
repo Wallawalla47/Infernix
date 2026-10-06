@@ -734,7 +734,6 @@ public:
         allocate(staging_, plan_.staging, allocated);
         experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
         experts.staging_slots = kStagingSlots;
-        measure_link();
         // The expert cache's tables and route log; its frames come last (below).
         residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device);
         allocated += plan_.bytes.residency;
@@ -779,6 +778,9 @@ public:
             tier_          = std::make_unique<HostExpertTier>(*store, std::move(tier));
             residency_->attach_tier(tier_.get());
         }
+        // After the tier (whose pinned slots are the probe's source when the banks stay in the
+        // artifact), before the CPU service and the split take the measured rate.
+        measure_link();
         expert_error_ = PinnedHostBuffer(64);
         std::memset(expert_error_.data(), 0, 64);
         experts.error = static_cast<std::uint32_t*>(expert_error_.data());
@@ -3596,15 +3598,17 @@ private:
     // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
-    // Measures the link once, by copying expert records from the pinned banks into the staging
-    // slots before any call uses them (or takes ProgramOptions::link_bytes_per_second), and
+    // Measures the link once, by copying expert records from the pinned banks (the SSD tier's pinned
+    // slots when the banks stay in the artifact) into the staging slots before any call uses them
+    // (or takes ProgramOptions::link_bytes_per_second), and
     // rescales the link-bound costs: the prefix cost's restore rate and the walk-span cost (one pass
     // of the experts over the link).
     void measure_link() {
         double rate = options_.link_bytes_per_second;
-        if (rate <= 0.0 && staging_.p != nullptr && plan_.staging > 0) {
-            rate = measure_h2d_bytes_per_second(parameters_.layers.front().moe.bank->planes.records, staging_.p,
-                                                plan_.staging, 3);
+        const void* source = parameters_.layers.front().moe.bank->planes.records;
+        if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
+        if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
+            rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
         }
         if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
         link_bytes_per_second_ = rate;
