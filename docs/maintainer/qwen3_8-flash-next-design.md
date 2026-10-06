@@ -8336,6 +8336,59 @@ from the committed window.
   Measured on the CLI code prompt, whose output is identical in both builds: MTP decode +0.4 %
   (int8) and +0.8 % (bf16).
 
+### 19.3.16 Decode misses between the CPU and the link (2026-10-06)
+
+**Profile** (nsys, Gold `283613d8b`, int8 KV, 8K context, 128 tokens; `fn/rigs/prof/analyze_critical.py`
+and `analyze_misses.py`).
+- **The main stream is busy 89 % of decode.** `stage_kernel` takes 34 % of it and `cpu_wait_kernel`
+  14 %. At 128K these become 42 % and 11 %.
+- **A staged miss costs ~105-120 µs.** That is a 2.76 MB record at the x8 link rate.
+- **Plain decode, by staged misses per layer call:**
+
+  | Staged misses | Layer calls |
+  |---:|---:|
+  | 0 | 47 % |
+  | 1 | 30 % |
+  | 2 | 16 % |
+  | 3-4 | 6 % |
+
+  At 128K, 21 % of calls stage 3-4, since the larger KV leaves fewer frames.
+- **The CPU leg ends 30-50 µs after the PCIe leg** in every bucket. The CPU computes about two
+  thirds of the misses.
+- **MTP verification calls stage up to 30 records (3.5 ms).** Once a call has 12 or more misses, the
+  CPU cap of 8 jobs leaves the rest to the link.
+- **The first 4-6 decode rounds after a prefill are cold.**
+  - Plain rounds take 30-50 ms against ~19 ms in steady state.
+  - MTP rounds take 150, 100, 39 and 35 ms against ~20.
+  - This happens partly because the prefill stream's lent frames come back empty.
+
+**Cost-based split (rejected).** The plan kernel took the thinnest misses for the CPU while
+cpu_us + cpu_column_us × (columns − 1) stayed below pcie_us × (remaining misses). The constants were
+105 / 55 / 18 µs, set through a TEMP environment override in one build. Every variant gave identical
+ids. tg8k −0.65 % plain and −2.6 % MTP against the divisor rule (4 reps each). The CPU is faster
+than those constants: for one or two misses, the divisor rule's all-CPU choice beats staging one of
+them. The divisor rule stays.
+
+**CPU job cap** (`ProgramOptions::cpu_expert_jobs`; the §19.3.5 S3 sweep had never run). Caps
+8 / 16 / 32, three rotated reps each, using a TEMP override in one build. Every output was
+identical. Change against cap 8:
+
+| Workload | 16 | 32 |
+|---|---:|---:|
+| tg8k plain | +0.3 % | +0.3 % |
+| tg8k MTP | +0.6 % | +0.3 % |
+| tg128k plain | −0.1 % | −0.5 % |
+| cold CLI code, MTP | +2.8 % | +2.9 % |
+| serve C = 4 plain, fill | +7.2 % | +7.1 % |
+| serve C = 4 plain, warm | +1.3 % | +1.6 % |
+| serve C = 2 MTP, fill | −0.2 % | +0.1 % |
+| serve C = 2 MTP, warm | −0.1 % | −0.0 % |
+
+- **The default is now 16.** Calls with many misses gain, and every other workload is unchanged
+  within run-to-run spread.
+- **The tg128k −0.1 %** is inside its reps' spread: 61.2-61.8 against 61.4-61.6.
+- **Cap 32** gains nothing more and has the larger tg128k drop.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
