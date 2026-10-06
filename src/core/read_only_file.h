@@ -36,8 +36,9 @@ public:
 
     // Unbuffered reads of `block_bytes` at each offset (read_direct's alignment rules), at most
     // ring.size() / block_bytes in flight, each into a free block of `ring` (block-aligned), so
-    // their device latency overlaps on Windows. consume(i, bytes) runs on the calling thread as read
-    // i completes, in completion order; its ring block is reused once consume returns. Returns when
+    // their device latency overlaps (Windows: overlapped reads; Linux: kernel AIO; other POSIX
+    // systems read serially). consume(i, bytes) runs on the calling thread as read i completes, in
+    // completion order; its ring block is reused once consume returns. Returns when
     // every read has completed; a failed or short read stops issuing, waits for the reads in flight
     // and throws.
     void read_direct_blocks(std::span<const std::uint64_t> offsets, std::size_t block_bytes, std::span<std::byte> ring,
