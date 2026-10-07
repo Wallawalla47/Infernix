@@ -811,8 +811,14 @@ public:
                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;
                 };
             }
-            expert_stream_ = std::make_unique<execution::ExpertStream>(c_.num_hidden_layers, c_.moe.experts,
-                                                                       record_stride, std::move(record_of), !tier_);
+            execution::ExpertStream::Hold hold;
+            if (tier_) {
+                hold = [tier = tier_.get()](std::uint32_t layer, std::uint32_t expert) {
+                    tier->stream_pin(tier->key(layer, expert));
+                };
+            }
+            expert_stream_ = std::make_unique<execution::ExpertStream>(
+                c_.num_hidden_layers, c_.moe.experts, record_stride, std::move(record_of), !tier_, std::move(hold));
             experts.stream = expert_stream_.get();
         }
         // CPU-served misses for decode and verify calls, and for every call of at most

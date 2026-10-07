@@ -185,6 +185,25 @@ void HostTier::begin_round(std::uint32_t allowance) {
     for (const auto s : ring_) { slots_[s].serial = next_serial_++; }
 }
 
+void HostTier::stream_pin(std::uint32_t key) {
+    const std::int32_t s = slot_of_[key];
+    if (s < 0) { return; }
+    const auto slot = static_cast<std::uint32_t>(s);
+    if (!(slots_[slot].pins & kPinStream)) {
+        slots_[slot].pins |= kPinStream;
+        streamed_.push_back(slot);
+        push_victim(slot);
+    }
+}
+
+void HostTier::release_stream_pins() {
+    for (const auto s : streamed_) {
+        slots_[s].pins &= static_cast<std::uint8_t>(~kPinStream);
+        push_victim(s);
+    }
+    streamed_.clear();
+}
+
 void HostTier::record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
     lfu_.advance(dt);
     for (const auto k : keys) { lfu_.use(k, weight); }
@@ -370,6 +389,15 @@ void HostTier::check() const {
     for (std::uint32_t s = 0; s < slots_.size(); ++s) {
         if (!placed[s]) { fail("slot " + std::to_string(s) + " is nowhere"); }
     }
+    std::size_t stream_pins = 0;
+    for (const auto s : streamed_) {
+        const Slot& slot = slots_[s];
+        if (!(slot.pins & kPinStream) || (slot.state != SlotState::kResident && slot.state != SlotState::kShadow)) {
+            fail("stream pin");
+        }
+    }
+    for (const Slot& slot : slots_) { stream_pins += (slot.pins & kPinStream) ? 1 : 0; }
+    if (stream_pins != streamed_.size()) { fail("stream pins"); }
     if (residents != resident_count_ || shadows != shadow_count_) { fail("counts"); }
     for (std::uint32_t k = 0; k < slot_of_.size(); ++k) {
         const std::int32_t s = slot_of_[k];

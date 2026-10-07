@@ -335,12 +335,58 @@ void test_random() {
     check(admissions > 500 && checked_victims > 100 && demoted > 20, "the random run exercised the tier");
 }
 
+// ---- prefill expert stream pins: a record the stream planned to copy keeps its slot until release,
+// across the round boundaries of a layer walk's steps (the SSD-tier crash of 2026-10-07: an
+// admission evicted a planned record before its copy was enqueued).
+void test_stream_pins() {
+    HostTier tier(small_config());
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+        const std::uint32_t one[] = {k};
+        tier.record_uses(0, one, static_cast<double>(k + 1));
+    }
+    (void)dirty(tier);
+    // The stream plans keys 0 and 1, the two lowest-ranked residents, and an SSD-only key.
+    const std::int32_t slot0 = tier.slot_of(0), slot1 = tier.slot_of(1);
+    tier.stream_pin(0);
+    tier.stream_pin(1);
+    tier.stream_pin(60); // no host copy: not planned, ignored
+    check((tier.pins(static_cast<std::uint32_t>(slot0)) & kPinStream) != 0, "stream pin set");
+    tier.check();
+    // Two step boundaries, each admitting a strong landing: the victims skip the pinned keys.
+    for (const std::uint32_t key : {50U, 51U}) {
+        tier.begin_round(0);
+        const std::uint32_t used[] = {key};
+        tier.record_uses(1, used, 100.0);
+        const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), key};
+        check(tier.admit({&landing, 1}, false) == 1 && tier.host_copy(key), "a landing is admitted beside the pins");
+        tier.check();
+    }
+    check(tier.host_copy(0) && tier.host_copy(1) && tier.slot_of(0) == slot0 && tier.slot_of(1) == slot1,
+          "stream-pinned records keep their slots across boundaries");
+    check(!tier.host_copy(2) && !tier.host_copy(3), "the next-lowest residents were the victims");
+    check(dirty(tier) == std::vector<std::uint32_t>{2, 3, 50, 51}, "only the victims' and landings' pointers changed");
+    // Released (the next chunk's boundary): key 0 is again the lowest-ranked victim.
+    tier.release_stream_pins();
+    check(tier.pins(static_cast<std::uint32_t>(slot0)) == 0 && tier.pins(static_cast<std::uint32_t>(slot1)) == 0,
+          "stream pins released");
+    tier.check();
+    tier.begin_round(0);
+    const std::uint32_t used[] = {52};
+    tier.record_uses(1, used, 100.0);
+    const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), 52};
+    check(tier.admit({&landing, 1}, false) == 1 && !tier.host_copy(0), "after release the lowest key is a victim again");
+    tier.check();
+}
+
 } // namespace
 
 int main() {
     try {
         test_lfu();
         test_transitions();
+        test_stream_pins();
         test_random();
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << '\n';

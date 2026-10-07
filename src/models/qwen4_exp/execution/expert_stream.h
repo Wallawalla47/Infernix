@@ -39,11 +39,14 @@ public:
     // A non-resident expert's pinned host record, or null when it has none (SSD-only). Stable for
     // the chunk: begin() is called after the round's boundary.
     using RecordOf = std::function<const std::uint8_t*(std::uint32_t layer, std::uint32_t expert)>;
+    // Called for every record a chunk plans to copy, when it is planned: the SSD tier pins it, so the
+    // record stays in place until the copies of the chunk (or a layer walk's span) have landed.
+    using Hold = std::function<void(std::uint32_t layer, std::uint32_t expert)>;
 
     // `one_allocation`: a layer's records are one pinned allocation (the banks), so adjacent
     // records copy as one run; otherwise (the SSD tier's slots, pinned in chunks) one copy each.
     ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
-                 bool one_allocation);
+                 bool one_allocation, Hold hold = {});
     ~ExpertStream();
     ExpertStream(const ExpertStream&)            = delete;
     ExpertStream& operator=(const ExpertStream&) = delete;
@@ -90,6 +93,7 @@ private:
     std::uint32_t experts_ = 0, layers_ = 0;
     std::uint64_t stride_  = 0;
     RecordOf record_of_;
+    Hold hold_;
     bool one_allocation_ = true;
     cudaStream_t stream_ = nullptr;
     cudaEvent_t start_   = nullptr;

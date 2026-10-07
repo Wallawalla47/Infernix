@@ -90,6 +90,10 @@ public:
     }
     // The host copy of `key` (resident or shadow slot), or null for an SSD-only key.
     [[nodiscard]] const std::uint8_t* record(std::uint32_t key) const noexcept;
+    // The prefill expert stream's hold on the records it plans to copy (HostTier::stream_pin) and
+    // its release at a boundary after the copies landed.
+    void stream_pin(std::uint32_t key) { tier_.stream_pin(key); }
+    void release_stream_pins() { tier_.release_stream_pins(); }
     // Keys whose host pointer changed since the last call (the device table's dirty set).
     void take_dirty(std::vector<std::uint32_t>& keys) { tier_.take_dirty(keys); }
     [[nodiscard]] expert_cache::HostTier& controller() noexcept { return tier_; }

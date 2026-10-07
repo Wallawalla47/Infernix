@@ -16,9 +16,9 @@ std::size_t align_up(std::size_t bytes) { return (bytes + kAlign - 1) / kAlign *
 } // namespace
 
 ExpertStream::ExpertStream(std::uint32_t layers, std::uint32_t experts, std::uint64_t record_stride, RecordOf record_of,
-                           bool one_allocation)
+                           bool one_allocation, Hold hold)
     : experts_(experts), layers_(layers), stride_(record_stride), record_of_(std::move(record_of)),
-      one_allocation_(one_allocation) {
+      hold_(std::move(hold)), one_allocation_(one_allocation) {
     if (experts_ == 0 || layers_ == 0 || stride_ == 0 || stride_ % 16 != 0 || !record_of_) {
         throw std::invalid_argument("expert stream: empty geometry or unaligned records");
     }
@@ -80,6 +80,7 @@ void ExpertStream::begin(DeviceSpan ring, const std::int32_t* residency, cudaStr
         for (std::uint32_t e = 0; e < experts_; ++e) {
             const bool stream = frames[e] < 0 && taken < half_ && record_of_(l, e) != nullptr;
             row[e]            = stream ? static_cast<std::int32_t>((l % 2) * half_ + taken++) : -1;
+            if (stream && hold_) { hold_(l, e); }
         }
         streams_[l] = taken > 0 ? 1 : 0;
     }
@@ -108,6 +109,7 @@ std::uint32_t ExpertStream::plan_layer(std::uint32_t layer, std::span<const std:
         const bool copy = columns[e] > 0 && frames[e] < 0 && cpu[e] == 0 && taken < half_ &&
                           record_of_(layer, e) != nullptr;
         row[e]          = copy ? static_cast<std::int32_t>((layer % 2) * half_ + taken++) : -1;
+        if (copy && hold_) { hold_(layer, e); }
     }
     streams_[layer] = 1; // the MoE waits for the table upload even when nothing is copied
     // The half's previous readers (layer - 2's experts) release it first; the table rides ahead of
