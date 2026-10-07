@@ -6174,6 +6174,42 @@ near-ties acceptable if S7 wins (+20-30 % at C = 2, model)?
 Dense Q8 needs no separate concurrency-invariance task (§19.3.3): the gate keeps C ≤ 8 rounds at
 T ≤ 8. The prefix cache's C > 1 extras (P8, §19.3.1) follow this track.
 
+#### Two-row speculation (measured and adopted, 2026-10-07)
+
+The gate left two decoding requests with one token each per round: in the agentic replay against
+Strata (README) one request decoded 123 tok/s and two together 151. Measured on the RTX 5090
+(Gen5 x8), INT8 KV, MTP with the proposal head, AIME long-decode prompts sampled at temperature
+1.0, decode rate from the server's 5 s records in which all rows decoded (`fn/conc`):
+
+| Rows | Drafts per row (fixed, one length for both) | Combined tok/s | Acceptance |
+|---|---|---:|---:|
+| 1 | the row's own policy | 135-139 | 74 % |
+| 2 | 0 (the gate) | 143-144 | |
+| 2 | 1 | 163 | 64 % |
+| 2 | 2 | 160 | 59 % |
+| 2 | 3 (8 columns) | 120 | 54 % |
+| 4 | 0 | 197 | |
+| 4 | 1 | 155 | |
+
+Against a plain two-row round a round with K drafts per row took 1.44 (K = 1) and 1.95 (K = 2)
+times as long; K = 3 reached 8 columns, past the 7-column fork and CPU-job limits, and took 3.1.
+
+**Decided:** two-row rounds draft one length for both rows (`choose_pair_draft_length`): the K in
+[0, 2] maximizing both rows' expected tokens per round time at `kPairWidthCost = 0.47` per draft,
+probing one more every `kProbeInterval` rounds. Rounds of three or more rows stay plain. A pair
+round has at most 6 columns, inside the column-invariant dense routes, which answers the open
+question above without a compromise: greedy output at C = 2 was byte-identical to C = 1 on two
+prompts (3,474 and 12,086 characters). Gate build against the pair policy on the same workload:
+C = 1 139.2 / 138.6, C = 2 143.8 / **164.9 (+14.7 %)**.
+
+The C = 4 runs found a coalescing defect (§19.3.1), fixed with this change: a fresh request
+waiting for a sibling's in-flight capture at or before the sibling's state split the sibling's
+remaining calls at that position, so its next call ended where the lane already was ("the lane's
+prefill plan does not continue its state"), failing every running request. It needs a request
+that shares a prefix with a lane whose capture there has not landed; four requests over three
+prompts sent together (two identical) reproduced it on two of three fresh servers, and none of six
+after the fix.
+
 ### 19.3.6 Strata-derived options (2026-10-04)
 
 Strata was re-read at `6f32ec0` (§3.1, "Strata v0.1.39"). The review ran six area sweeps: expert
