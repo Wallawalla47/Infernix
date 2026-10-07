@@ -239,7 +239,7 @@ struct SpecLayout {
 // columns [B], catch-up cells [W, B]. Everything before `drafts` is uploaded per draft round.
 struct MtpIo {
     std::size_t ids = 0, cells = 0, rope_cells = 0, block_rope_cells = 0, drafts = 0, up_ids = 0, gather = 0,
-                up_cells = 0, words = 0;
+                up_cells = 0, logprobs = 0, words = 0;
 };
 
 // Every fixed device allocation of a Program and the layouts in it (design §19.3.7). One function
@@ -528,7 +528,8 @@ public:
             d.mtp_io.up_ids    = d.mtp_io.drafts + lanes * k;
             d.mtp_io.gather    = d.mtp_io.up_ids + static_cast<std::size_t>(lanes) * W;
             d.mtp_io.up_cells  = d.mtp_io.gather + lanes;
-            d.mtp_io.words     = d.mtp_io.up_cells + static_cast<std::size_t>(lanes) * W;
+            d.mtp_io.logprobs  = d.mtp_io.up_cells + static_cast<std::size_t>(lanes) * W;
+            d.mtp_io.words     = d.mtp_io.logprobs + lanes * k;
         }
 
         // Staging slots for each layer call's misses (design 8.6), one expert record each.
@@ -1727,6 +1728,15 @@ public:
                 if (!from_ngram_[b] && extents[b] > 0) {
                     drafts_[b].assign(mtp_drafts_[b].begin(), mtp_drafts_[b].begin() + extents[b]);
                 }
+            }
+            // A one-row round verifies only its confident drafts: those before the first whose
+            // draft-head probability is below 0.5 (kDraftMinLogprob). Its width may still shrink, as
+            // the drafter staged only column 0's n-gram rows; a pair round's columns are staged at
+            // their offsets, so it keeps its length.
+            if (batch == 1 && !from_ngram_[0] && extents[0] > 0) {
+                extents[0] = std::min(extents[0], mtp_confident_[0]);
+                drafts_[0].resize(static_cast<std::size_t>(extents[0]));
+                width = 1 + extents[0];
             }
         }
         if (width > 1) {
@@ -3464,10 +3474,15 @@ private:
                                .width        = 1,
                                .kv_only      = false,
                                .residual_out = chain,
-                               .drafts       = drafts});
+                               .drafts       = drafts,
+                               .draft_logprobs =
+                                   Tensor(mtp_device(mtp_io_.logprobs + static_cast<std::size_t>(j) * batch), DType::FP32,
+                                          {1, batch})});
         }
         });
         CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.drafts), mtp_device(mtp_io_.drafts), 4ULL * steps * batch,
+                                   cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(mtp_host(mtp_io_.logprobs), mtp_device(mtp_io_.logprobs), 4ULL * steps * batch,
                                    cudaMemcpyDeviceToHost, s));
         if (while_drafting) {
             device_.flush();
@@ -3479,6 +3494,15 @@ private:
             if (unwritten && lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
             for (std::int32_t j = 0; j < steps; ++j) {
                 mtp_drafts_[b][static_cast<std::size_t>(j)] = mtp_host(mtp_io_.drafts)[j * batch + b];
+            }
+            // The row's confident drafts: those before the first below kDraftMinLogprob.
+            mtp_confident_[b] = steps;
+            const auto* logprobs = reinterpret_cast<const float*>(mtp_host(mtp_io_.logprobs));
+            for (std::int32_t j = 0; j < steps; ++j) {
+                if (logprobs[j * batch + b] < kDraftMinLogprob) {
+                    mtp_confident_[b] = j;
+                    break;
+                }
             }
         }
     }
@@ -4020,6 +4044,7 @@ private:
     PinnedHostBuffer mtp_host_{1};
     MtpIo mtp_io_;
     std::array<std::vector<std::int32_t>, kMaximumConcurrency> mtp_drafts_;
+    std::array<std::int32_t, kMaximumConcurrency> mtp_confident_{}; // per row: drafts above kDraftMinLogprob
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
@@ -4033,6 +4058,10 @@ private:
     // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
     static constexpr std::int32_t kPairMaxDrafts = 2;
     static constexpr double kPairWidthCost       = 0.47;
+    // A one-row round verifies its drafts up to the first whose draft-head probability is below 0.5
+    // (Strata's --spec-min-p rule; C = 1 MTP, AIME prompts sampled on the 5090: 138.8 -> 147.2 tok/s,
+    // acceptance 75.6 -> 81.8 %, repeatable to the decimal; 0.7 gave 142.6; design 19.3.5).
+    static constexpr double kDraftMinLogprob = -0.6931471805599453; // log(0.5)
     std::uint64_t pair_policy_rounds_            = 0;
     bool plain_round_ = false;
 
