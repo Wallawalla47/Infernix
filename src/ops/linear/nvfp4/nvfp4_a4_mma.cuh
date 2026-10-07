@@ -295,13 +295,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     };
     static_assert(RowPolicy::kContiguous || collective,
                   "reordered rows require a collective epilogue");
+    // Scale with an explicit rounded multiply: the residual add after it must not contract into one
+    // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
+    // full (upstream Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
     if constexpr (collective) {
 #pragma unroll
         for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
 #pragma unroll
             for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
 #pragma unroll
-                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] *= alpha;
+                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] = __fmul_rn(accumulators[mt][mr][v], alpha);
         epilogue.template finish_tile<Schedule, FullTokens>(output, shared_raw, accumulators,
                                                             row_begin, token_begin, rows, tokens);
     } else {
@@ -317,8 +320,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                 const int local = warp_n * Schedule::kWarpRows + mr * 8 + ac;
                 const int r0    = row_policy.weight_row(row_begin, local, rows);
                 const int r1    = row_policy.weight_row(row_begin, local + 1, rows);
-                float a = accumulators[mt][mr][0] * alpha, b = accumulators[mt][mr][1] * alpha;
-                float c = accumulators[mt][mr][2] * alpha, d = accumulators[mt][mr][3] * alpha;
+                float a = __fmul_rn(accumulators[mt][mr][0], alpha), b = __fmul_rn(accumulators[mt][mr][1], alpha);
+                float c = __fmul_rn(accumulators[mt][mr][2], alpha), d = __fmul_rn(accumulators[mt][mr][3], alpha);
                 if (FullTokens || t0 < tokens) {
                     a = epilogue.apply(r0, t0, a);
                     b = epilogue.apply(r1, t0, b);

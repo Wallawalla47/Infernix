@@ -28,6 +28,10 @@ ninfer_add_op_test(ninfer_linear_add_fp8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_linear_add_residual_width_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_residual_width.cpp"
+  LIBRARIES ninfer_ops)
+
 add_test(NAME ninfer_linear_add_fp8_wide_test
   COMMAND ninfer_linear_add_fp8_test --wide-only)
 set_tests_properties(ninfer_linear_add_fp8_wide_test
