@@ -67,14 +67,21 @@ def nvfp4_matrix_words(store: SafetensorsSource, leaf: str, shape: tuple[int, in
 def fp8_block_matrix_words(
     store: SafetensorsSource, leaf: str, shape: tuple[int, int], block: int = 128
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read one block-FP8 matrix: E4M3FN codes ``[N, K]`` and FP32 tile multipliers."""
+    """Read one block-FP8 matrix: E4M3FN codes ``[N, K]`` and FP32 tile multipliers.
+
+    Qwen's FP8 checkpoints store the multipliers in FP32 and NVIDIA's MTP experts in BF16; a BF16
+    multiplier widens to FP32 exactly.
+    """
 
     n, k = shape
     rows, cols = -(-n // block), -(-k // block)
     _signature(store, leaf + ".weight", (n, k), "F8_E4M3")
-    _signature(store, leaf + ".weight_scale_inv", (rows, cols), "F32")
+    scale = leaf + ".weight_scale_inv"
+    info = store.describe(scale)
+    if tuple(info.shape) != (rows, cols) or info.dtype not in ("F32", "BF16"):
+        raise ValueError(f"{scale}: expected F32 or BF16{(rows, cols)}, got {info.dtype}{tuple(info.shape)}")
     codes = store.read_flat(leaf + ".weight").view(torch.uint8).reshape(n, k).clone()
-    scales = store.read_flat(leaf + ".weight_scale_inv").reshape(rows, cols).clone()
+    scales = store.read_flat(scale).reshape(rows, cols).to(torch.float32).clone()
     return codes, scales
 
 

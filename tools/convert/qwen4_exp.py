@@ -18,6 +18,7 @@ from typing import Mapping
 
 import torch
 
+from tools.artifact.codecs.fp8_block import dequantize_fp8_block128
 from tools.artifact.codecs.nvfp4_expert import encode_nvfp4_expert_bank
 from tools.artifact.layouts import expert_bank_geometry
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers
@@ -27,7 +28,7 @@ from .model import Model, Parameter
 from .qwen3_5 import _Builder, _f32, _fixed, _positive, _rope_source, vision_config
 from .resources import load_resources
 from .sources.logical import LogicalSource
-from .sources.modelopt import nvfp4_matrix_words
+from .sources.modelopt import fp8_block_matrix_words, nvfp4_matrix_words
 from .sources.safetensors import SafetensorsSource, tensor_source
 
 ARCHITECTURES = ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
@@ -273,6 +274,29 @@ def _expert_input_scales(store: SafetensorsSource, prefix: str, experts: int) ->
     return LogicalSource((experts, 3), f"{store.path}:{prefix}*.input_scale", read)
 
 
+def fp8_block_values(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> LogicalSource:
+    """The exact values of one block-FP8 matrix ``leaf`` (code x FP32 tile multiplier, binary64).
+
+    NVIDIA stores the MTP routed experts this way, per expert. Each read decodes only the rows it
+    covers, so a recipe's row-chunked quantizer never holds more than one matrix's codes.
+    """
+
+    n, k = shape
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.float64)
+        first, last = begin // k, -(-end // k)
+        codes, scales = fp8_block_matrix_words(store, leaf, shape)
+        lo, hi = first // 128 * 128, -(-last // 128) * 128
+        rows = dequantize_fp8_block128(codes[lo:min(hi, n)], scales[lo // 128 : -(-min(hi, n) // 128)])
+        flat = rows.reshape(-1)
+        start = begin - lo * k
+        return flat[start : start + end - begin]
+
+    return LogicalSource(shape, f"{store.path}:{leaf}", read)
+
+
 # ---------------------------------------------------------------------------- builder
 
 
@@ -282,6 +306,18 @@ class _Qwen4ExpBuilder(_Builder):
     def validate_source(self, selected, original, name):
         if selected is not original:
             raise ValueError(f"{name}: Qwen4Exp converts from its single NVIDIA source")
+
+    def add_fp8_block(self, name, store, leaf, shape, *, inputs=()):
+        """A parameter read through its exact block-FP8 values (recipes quantize or cast them)."""
+
+        def factory(selected, format=None):
+            self.validate_source(selected, store, name)
+            if format is not None:
+                raise ValueError(f"{name}: block-scaled FP8 is converted through its values")
+            return fp8_block_values(selected, leaf, shape)
+
+        self.model.add(Parameter(name, tuple(shape), factory(store), factory, tuple(inputs), "bf16",
+                                 residency=name.split("/", 1)[0]))
 
     def hyper_connection(self, prefix, source_prefix, store, config, *, combine=True):
         width = config["hc_count"] * config["hidden_size"]
@@ -343,18 +379,17 @@ class _Qwen4ExpBuilder(_Builder):
                  inputs=(p + "shared/product",))
         self.group(p + "shared/gate", p + "shared/up")
         if mtp:
-            # NVIDIA keeps the MTP experts BF16 and fused: gate rows [0, I) then up rows [I, 2I).
-            # Each expert's matrices become row ranges of two parents (gate and up interleaved per
-            # expert, then every down), so the drafter's resident-expert kernel selects them by id.
+            # NVIDIA stores the MTP experts per expert in Qwen's block-scaled FP8 (E4M3FN codes, one
+            # FP32 multiplier per 128 x 128 tile). Each expert's matrices become row ranges of two
+            # parents (gate and up interleaved per expert, then every down), so the drafter's
+            # resident-expert kernel selects them by id; their values are the exact products.
             gate_up, downs = [], []
             for expert in range(e):
-                ep = p + f"experts/{expert}/"
-                for role, half in (("gate", 0), ("up", 1)):
-                    self.add(ep + role, store, sp + "experts.gate_up_proj", (ir, h), source_shape=(e, 2 * ir, h),
-                             offset=(expert * 2 + half) * ir * h, inputs=(ffn_input,))
+                ep, leaf = p + f"experts/{expert}/", sp + f"experts.{expert}."
+                for role in ("gate", "up"):
+                    self.add_fp8_block(ep + role, store, leaf + role + "_proj", (ir, h), inputs=(ffn_input,))
                     gate_up.append(ep + role)
-                self.add(ep + "down", store, sp + "experts.down_proj", (h, ir), source_shape=(e, h, ir),
-                         offset=expert * h * ir, inputs=(ep + "product",))
+                self.add_fp8_block(ep + "down", store, leaf + "down_proj", (h, ir), inputs=(ep + "product",))
                 downs.append(ep + "down")
             self.group(*gate_up)
             self.group(*downs)
