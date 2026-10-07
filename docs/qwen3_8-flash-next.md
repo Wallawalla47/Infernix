@@ -97,11 +97,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
 - `--max-concurrency N` (1-8) runs up to N requests at once. Its main gain is a shorter wait for
   requests that would otherwise queue (time to first token): requests that decode together share
   each round's dense weight reads, but their routed experts barely overlap.
-  - Speculation (`--spec mtp`, `--ngram-draft-tokens`) runs only while a single request is
-    decoding. When two or more requests decode together, each round decodes one token per
-    request without drafts, so no request is padded to another's draft length. Such rounds stay
-    within 8 columns, where concurrent requests are meant to give the same greedy output as each
-    alone (design §19.3.5).
+  - Speculation (`--spec mtp`, `--ngram-draft-tokens`) depends on how many requests decode
+    together:
+    - one: the request picks its own draft length;
+    - two: both draft the same number of tokens, 0-2 chosen from their acceptance, so neither is
+      padded to the other's draft. Such a round has at most 6 columns, where concurrent requests
+      give the same greedy output as each alone (design §19.3.5). Measured on an RTX 5090 with
+      sampled AIME answers: 164.9 tok/s for the pair against 143.8 without drafts (+14.7 %);
+    - three or more: one token per request per round without drafts (one draft each measured
+      slower at four requests).
   - Each lane takes VRAM from the expert cache: its KV extent (14.6 KB per token of
     `--max-context` with INT8 KV, unless `--kv-capacity` fixes one pool for all lanes) and its
     recurrent state (113 MB), records and workspace. At startup the engine prints the cost per

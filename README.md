@@ -169,8 +169,10 @@ seeds):
 Infernix wrote more in both runs (39.8K and 48.5K output tokens against Strata's 35.8K and
 31.3K) and still finished in less than half the time. Strata's drafts are accepted more often
 (2.12 against 1.75 tokens per round); Infernix decodes faster because each round takes 43 % less
-time. With two requests decoding, Infernix drafts for neither, so the pair shares 151 tok/s (see
-the Flash-Next guide's `--max-concurrency`).
+time. In this run two requests decoding together drafted for neither, so the pair shared
+151 tok/s; Infernix now drafts for both (one draft length for the pair), which measured +14.7 %
+for two decoding requests with output unchanged (see the Flash-Next guide's `--max-concurrency`;
+the replay was not repeated).
 
 The agentic replay found two crashes, both fixed on the `Infernix` branch: `c9ee0445` (a long
 prompt's layer walk outlived the prefix-cache events it waited on) and `9061adb8` (with the SSD

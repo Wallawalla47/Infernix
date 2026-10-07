@@ -1665,20 +1665,23 @@ public:
             positions[b] = static_cast<std::int32_t>(lane.state_tokens);
         }
         // Proposals: a round verifies 1 + the longest row's drafts; a row may draft at most one token
-        // fewer than it may still emit, so every verified position lies in its reservation. Each
-        // row's MTP draft length maximizes its expected tokens per round time; a longer n-gram copy
-        // proposal replaces the drafts. Only one-row rounds speculate (design 11.3, 19.3.5 S1): at
-        // B >= 2 every row decodes plain, which shares the dense reads without padding rows to the
-        // longest draft and keeps the round's B <= 8 columns on the column-invariant dense routes,
-        // so greedy output at C > 1 is meant to equal C = 1. The plain round's W = 1 catch-up keeps
-        // each drafter current, and a row's draft-length policy advances only in its one-row rounds.
-        const bool speculate = batch == 1;
+        // fewer than it may still emit, so every verified position lies in its reservation. A longer
+        // n-gram copy proposal replaces a row's MTP drafts. By round size (design 11.3, 19.3.5):
+        // - one row: its own draft length, maximizing its expected tokens per round time;
+        // - two rows: one draft length for both (choose_pair_draft_length), so no row is padded to the
+        //   other's; its at most 2 x 3 = 6 columns stay on the column-invariant dense routes, so greedy
+        //   output equals C = 1, and below the 7-column fork and CPU-job limits;
+        // - three or more rows decode plain (one draft each measured slower at four rows).
+        // A plain round's W = 1 catch-up keeps each drafter current.
+        const std::int32_t pair_k =
+            batch == 2 && mtp_ ? choose_pair_draft_length(lanes_[lanes[0]], lanes_[lanes[1]]) : 0;
+        const bool speculate = batch == 1 || pair_k > 0;
         std::array<std::int32_t, kMaximumConcurrency> wanted{};
         std::int32_t steps = 0;
         if (mtp_) {
             for (std::int32_t b = 0; b < batch; ++b) {
                 Lane& lane = lanes_[lanes[b]];
-                wanted[b]  = speculate && lane.mtp_live ? choose_draft_length(lane) : 0;
+                wanted[b]  = speculate && lane.mtp_live ? (batch == 1 ? choose_draft_length(lane) : pair_k) : 0;
                 steps      = std::max(steps, wanted[b]);
             }
         }
@@ -1694,7 +1697,8 @@ public:
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
-            const auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
+            auto limit = std::min<std::uint32_t>(static_cast<std::uint32_t>(max_width_ - 1), remaining - 1U);
+            if (batch > 1) { limit = std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(pair_k)); }
             if (mtp_ && lane.mtp_live && wanted[b] > 0) {
                 extents[b] = static_cast<std::int32_t>(std::min<std::uint32_t>(limit, static_cast<std::uint32_t>(wanted[b])));
             }
@@ -3353,6 +3357,30 @@ private:
         return best;
     }
 
+    // Two-row rounds (design 19.3.5): the K in [0, kPairMaxDrafts] that maximizes both rows' expected
+    // tokens per round time, where a round of K drafts per row costs 1 + kPairWidthCost * K plain
+    // two-row rounds. Every kProbeInterval pair rounds it drafts one token more than its choice, so
+    // the rows' estimates of the next position stay current.
+    std::int32_t choose_pair_draft_length(const Lane& a, const Lane& b) {
+        if (!a.mtp_live || !b.mtp_live) { return 0; }
+        const std::int32_t most = std::min(kPairMaxDrafts, mtp_k_);
+        std::int32_t best = 0;
+        double best_score = 2.0;
+        double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
+        for (std::int32_t k = 1; k <= most; ++k) {
+            reach_a *= a.mtp_accept[static_cast<std::size_t>(k - 1)];
+            reach_b *= b.mtp_accept[static_cast<std::size_t>(k - 1)];
+            tokens += reach_a + reach_b;
+            const double score = tokens / (1.0 + kPairWidthCost * k);
+            if (score > best_score) {
+                best_score = score;
+                best       = k;
+            }
+        }
+        if (++pair_policy_rounds_ % kProbeInterval == 0) { best = std::min(best + 1, most); }
+        return best;
+    }
+
     // `while_drafting` runs on the host after the draft steps are submitted, before their wait
     // (only when draft steps run).
     void mtp_draft(std::span<const std::uint32_t> lanes, std::int32_t steps,
@@ -4000,6 +4028,12 @@ private:
     static constexpr double kAcceptanceWeight     = 0.1;
     static constexpr double kWidthCost            = 0.38;
     static constexpr std::uint64_t kProbeInterval = 8;
+    // Two-row rounds: at most 2 drafts per row, each costing kPairWidthCost plain two-row rounds
+    // (C = 2 decode on the 5090, AIME prompts sampled: K = 1 and 2 rounds took 1.44 and 1.95 plain
+    // two-row rounds; K = 3, 8 columns, took 3.1 and lost to plain decode; design 19.3.5).
+    static constexpr std::int32_t kPairMaxDrafts = 2;
+    static constexpr double kPairWidthCost       = 0.47;
+    std::uint64_t pair_policy_rounds_            = 0;
     bool plain_round_ = false;
 
     // Speculative verification (max_width_ > 1).
