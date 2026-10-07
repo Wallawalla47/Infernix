@@ -140,12 +140,35 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |
 | `AB_ALT_EXE` | the treatment executable; another build puts a second fork build in the alt arm |
-| `AB_ALT_LABEL` | none (the report calls the alt arm "This fork, original prefix cache") |
+| `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, original prefix cache") |
+| `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
+| `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | `E:\Strata\Strata` / its `strata-unsloth-ud-q4_k_xl.json` |
+| `AB_STRATA_EXTRA_ARGS` | none (engine arguments added to the Strata config's) |
+| `AB_REQUEST_TIMEOUT_S` | `1200` (per request; raise it for an engine that queues requests one at a time) |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |
 | `AB_OUT` | `profiles\bench\agentic_ab` in this checkout |
 | `AB_CORPUS_REPO` / `AB_CORPUS_COMMIT` | this checkout / `e48a0d28` |
 
-A run is marked invalid (non-zero exit, warning in the report) if any workload request fails.
+The launch bat's serve line may start `infernix-serve` or `ninfer-serve` (deploy folders from
+before the rename). A run is marked invalid (non-zero exit, warning in the report) if any
+workload request fails.
+
+### Strata as the control arm
+
+`AB_CONTROL_KIND=strata` compares Infernix with [Strata](https://github.com/Niko1221/Strata) on
+Qwen3.8-Flash-Next. The runner starts Strata's own server (`serve\server.py --engine strata`) with
+the Strata config plus `AB_STRATA_EXTRA_ARGS`, waits until it answers a request (it returns 503
+while its engine starts), and needs `--ctx` (no calibration). The treatment's launch line comes
+from `AB_LAUNCH_BAT` as usual.
+
+Strata writes no request log of this kind, so after its arm the runner writes `request_log.jsonl`
+from the client's rows: prompt and output tokens from each response's `usage`; cached tokens,
+prefill time, decode time and drafts from Strata's per-request `timings` (`cache_n`,
+`prompt_ms`, `predicted_ms`, `draft_n`, `draft_n_accepted`), with verify rounds = output tokens −
+accepted drafts; queue wait = TTFT − prefill time (Strata runs one request at a time); and one
+decode record per request (it never decodes two at once). TTFT comes from the client's clock, and
+in a run with a Strata arm the analyzer takes every arm's TTFT from the client's clock
+(`client_ttft` in `config.json`).
 The report also flags when the client's context guard had to clear old tool results to keep a
 prompt 24K tokens under `--max-context`.
 
