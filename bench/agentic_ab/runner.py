@@ -67,13 +67,22 @@ ALT_EXTRA_FLAGS = os.environ.get("AB_ALT_EXTRA_FLAGS", ORIGINAL_CACHE_FLAG).spli
 ALT_EXE = os.environ.get("AB_ALT_EXE") or TREATMENT_EXE
 # How the report names the alt arm.
 ALT_LABEL = os.environ.get("AB_ALT_LABEL", "")
+CONTROL_LABEL = os.environ.get("AB_CONTROL_LABEL", "")
+# AB_CONTROL_KIND=strata runs the control arm as a Strata server (StrataServe) instead of a serve build.
+CONTROL_KIND = os.environ.get("AB_CONTROL_KIND", "serve")
+STRATA_DIR = os.environ.get("AB_STRATA_DIR", r"E:\Strata\Strata")
+STRATA_CONFIG = os.environ.get("AB_STRATA_CONFIG",
+                               os.path.join(STRATA_DIR, "strata-unsloth-ud-q4_k_xl.json"))
+STRATA_EXTRA_ARGS = os.environ.get("AB_STRATA_EXTRA_ARGS", "").split()
+TREATMENT_LABEL = os.environ.get("AB_TREATMENT_LABEL", "")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
 OUT_ROOT = os.environ.get("AB_OUT", os.path.join(REPO, "profiles", "bench", "agentic_ab"))
 # Context candidates below the bat's own value, tried in order when the control cannot start.
 CTX_FALLBACKS = [200000, 180000, 170000, 160000]
 AGENT_MAX_TOKENS = 64000   # what the production clients request on every agent turn
-REQUEST_TIMEOUT_S = 1200
+# Per-request client timeout; a one-request-at-a-time engine queues the workload's concurrent requests.
+REQUEST_TIMEOUT_S = int(os.environ.get("AB_REQUEST_TIMEOUT_S", "1200"))
 CONTEXT_GUARD_TOKENS = 24000  # keep prompts this far below --max-context
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 # What 97 % of the production requests the workload is modelled on sent.
@@ -97,10 +106,12 @@ def log(msg):
 # ---------------------------------------------------------------------------------------
 
 def parse_bat(path):
-    """(model_path, [(flag, value|None), ...]) from the infernix-serve line of a launch bat."""
+    """(model_path, [(flag, value|None), ...]) from the serve line of a launch bat (deploy folders
+    from before the Infernix rename still start ninfer-serve)."""
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            if "infernix-serve" in line and not line.lstrip().lower().startswith("rem"):
+            if re.search(r"(?:infernix|ninfer)-serve", line) and \
+                    not line.lstrip().lower().startswith("rem"):
                 toks = [a if a else b for a, b in re.findall(r'"([^"]*)"|(\S+)', line)]
                 model = toks[1]
                 flags, i = [], 2
@@ -113,7 +124,7 @@ def parse_bat(path):
                     flags.append((name, val))
                     i += 1
                 return model, flags
-    raise SystemExit("no infernix-serve command line in %s" % path)
+    raise SystemExit("no serve command line in %s" % path)
 
 
 def help_flags(exe):
@@ -243,6 +254,113 @@ class Serve:
         wait_gpu_idle()
 
 
+class StrataServe:
+    """The control arm as a Strata server (AB_CONTROL_KIND=strata): Strata's Python front end with
+    its engine config (AB_STRATA_CONFIG) plus AB_STRATA_EXTRA_ARGS. Strata writes no request log of
+    this kind, so after the arm the client's own rows (usage, Strata's per-request `timings`, the
+    client clock) are written into request_log.jsonl in the serve's format (write_strata_log)."""
+
+    def __init__(self, arm_dir):
+        self.arm_dir = arm_dir
+        self.request_log = os.path.join(arm_dir, "request_log.jsonl")
+        self.serve_log = os.path.join(arm_dir, "serve.log")
+        self.proc = None
+
+    def start(self, load_timeout=1800):
+        if port_open():
+            raise SystemExit("port %d is already in use; stop the other server first" % PORT)
+        wait_gpu_idle()
+        with open(STRATA_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["args"] = list(cfg["args"]) + STRATA_EXTRA_ARGS
+        cfg["log"] = os.path.join(self.arm_dir, "strata_engine.log")
+        path = os.path.join(self.arm_dir, "strata_config.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=1)
+        self.flags = [(a, None) for a in cfg["args"]]
+        args = [os.path.join(STRATA_DIR, ".venv", "Scripts", "python.exe"),
+                os.path.join(STRATA_DIR, "serve", "server.py"), "--engine", "strata", "--config", path,
+                "--host", HOST, "--port", str(PORT)]
+        log("launch: %s" % subprocess.list2cmdline(args))
+        with open(self.serve_log, "w", encoding="utf-8") as sf:
+            self.proc = subprocess.Popen(args, cwd=STRATA_DIR, stdout=sf, stderr=subprocess.STDOUT,
+                                         creationflags=CREATE_NEW_PROCESS_GROUP)
+        # Strata answers HTTP while its engine starts (503 until it is ready): wait for a 200.
+        deadline = time.time() + load_timeout
+        probe = json.dumps({"model": "x", "messages": [{"role": "user", "content": "ok"}],
+                            "max_tokens": 1}).encode("utf-8")
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise RuntimeError("Strata exited during startup (rc=%s); see %s"
+                                   % (self.proc.returncode, self.serve_log))
+            try:
+                with urllib.request.urlopen("http://%s:%d/v1/models" % (HOST, PORT), timeout=5) as r:
+                    self.model_id = json.loads(r.read().decode("utf-8"))["data"][0]["id"]
+                req = urllib.request.Request("http://%s:%d/v1/chat/completions" % (HOST, PORT), probe,
+                                             {"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    if r.status == 200:
+                        log("Strata ready (pid %d, model %s)" % (self.proc.pid, self.model_id))
+                        return self
+            except Exception:
+                pass
+            time.sleep(5)
+        self.stop()
+        raise RuntimeError("Strata not ready within %ds; see %s" % (load_timeout, self.serve_log))
+
+    def stop(self):
+        Serve.stop(self)
+
+
+def write_strata_log(arm_dir):
+    """request_log.jsonl in the serve's format from the Strata arm's client rows: Strata's own
+    per-request counters (cache_n = prompt tokens it reused, prompt_n/prompt_ms its prefill,
+    predicted_n/predicted_ms its decode, draft_n/draft_n_accepted its MTP drafts) and the client
+    clock for TTFT. Strata runs one request at a time, so the wait before its prefill is queueing
+    (TTFT - prefill), and every request decodes alone: one decode record per request, with one
+    round per committed token less the accepted drafts."""
+    rows = []
+    with open(os.path.join(arm_dir, "client.jsonl"), encoding="utf-8") as f:
+        for ln in f:
+            o = json.loads(ln)
+            if "event" not in o and o.get("status") == "ok" and o.get("timings"):
+                rows.append(o)
+    out = [{"event": "server_start", "server": {}, "engine": {}, "memory": {},
+            "environment": {"gpu_name": None}, "source": "Strata client rows"}]
+    for o in rows:
+        t, u = o["timings"], o.get("usage") or {}
+        ttft = (o["t_first"] - o["t_send"]) if o.get("t_first") else None
+        prefill = (t.get("prompt_ms") or 0.0) / 1000.0
+        decode = (t.get("predicted_ms") or 0.0) / 1000.0
+        completion = u.get("completion_tokens") or t.get("predicted_n") or 0
+        accepted = t.get("draft_n_accepted") or 0
+        rounds = max(0, completion - accepted)
+        stamp = int(o["t_done"] * 1000)
+        out.append({"event": "request_done", "timestamp_unix_ms": stamp,
+                    "request": {"sampling": {"seed": o["seed"]}},
+                    "result": {"prompt_tokens": u.get("prompt_tokens") or 0,
+                               "prefix_cache_hit_tokens": t.get("cache_n") or 0,
+                               "computed_prefill_tokens": t.get("prompt_n") or 0,
+                               "completion_tokens": completion,
+                               "model_thinking_tokens": (u.get("completion_tokens_details") or {})
+                               .get("reasoning_tokens") or 0,
+                               "prefix_reuse_path": "strata", "finish_reason": o.get("finish")},
+                    "timings_seconds": {"ttft": ttft, "prefill": prefill, "decode": decode,
+                                        "total": o["t_done"] - o["t_send"]},
+                    "engine_timing": {"queue_wait_seconds": max(0.0, (ttft or 0.0) - prefill)},
+                    "speculative": {"accepted_tokens": accepted,
+                                    "drafted_tokens": t.get("draft_n") or 0, "rounds": rounds}})
+        if decode > 0 and rounds > 0:
+            out.append({"event": "throughput", "timestamp_unix_ms": stamp,
+                        "decode_batch": {"rounds": rounds, "row_rounds": rounds},
+                        "host_work": {"work_class_seconds": {"decode_device_wait": decode}},
+                        "tokens": {"committed_decode": completion}})
+    with open(os.path.join(arm_dir, "request_log.jsonl"), "w", encoding="utf-8") as f:
+        for o in out:
+            f.write(json.dumps(o) + "\n")
+    log("Strata request log: %d requests from the client rows" % len(rows))
+
+
 # ---------------------------------------------------------------------------------------
 # Client: one closed-loop agent per actor, as an agent client drives the API.
 # ---------------------------------------------------------------------------------------
@@ -321,6 +439,7 @@ class Result:
         self.tool_calls = []
         self.finish = None
         self.usage = None
+        self.timings = None  # llama.cpp-style per-request timings (Strata)
         self.error = None
         self.t_send = self.t_first = self.t_done = None
 
@@ -397,6 +516,8 @@ class ArmClient:
                 ev = json.loads(payload)
                 if ev.get("usage"):
                     r.usage = ev["usage"]
+                if ev.get("timings"):
+                    r.timings = ev["timings"]
                 for ch in ev.get("choices") or []:
                     d = ch.get("delta") or {}
                     if (d.get("content") or d.get("reasoning_content") or d.get("tool_calls")) \
@@ -429,7 +550,7 @@ class ArmClient:
         res = self.post(messages, tools, max_tokens, seed, abort_after)
         row = {"arm": self.arm, "actor": actor["name"], "tag": step.get("tag"), "cls": cls,
                "copy": bool(step.get("copy")), "seed": seed, "status": res.status,
-               "error": res.error, "finish": res.finish, "usage": res.usage,
+               "error": res.error, "finish": res.finish, "usage": res.usage, "timings": res.timings,
                "t_send": res.t_send, "t_first": res.t_first, "t_done": res.t_done,
                "messages": len(messages), "tool_calls": len(res.tool_calls),
                "content_chars": len(res.content), "reasoning_chars": len(res.reasoning),
@@ -639,9 +760,14 @@ def calibrate_ctx(model, ctrl_flags, bat_ctx, run_dir):
 def run_arm(name, exe, model, flags, plan, run_dir, ctx):
     arm_dir = os.path.join(run_dir, name)
     os.makedirs(arm_dir, exist_ok=True)
-    log("=== arm %s: %s" % (name, exe))
-    serve = Serve(exe, model, flags, os.path.join(arm_dir, "request_log.jsonl"),
-                  os.path.join(arm_dir, "serve.log")).start()
+    strata = name == "control" and CONTROL_KIND == "strata"
+    log("=== arm %s: %s" % (name, "Strata (%s)" % STRATA_CONFIG if strata else exe))
+    if strata:
+        serve = StrataServe(arm_dir).start()
+        flags, exe = serve.flags, "Strata " + STRATA_CONFIG
+    else:
+        serve = Serve(exe, model, flags, os.path.join(arm_dir, "request_log.jsonl"),
+                      os.path.join(arm_dir, "serve.log")).start()
     start = read_server_start(serve.request_log)
     wall, client = None, None
     try:
@@ -654,6 +780,8 @@ def run_arm(name, exe, model, flags, plan, run_dir, ctx):
             % (name, wall, len(client.failures)))
     finally:
         serve.stop()
+    if strata:
+        write_strata_log(arm_dir)
     with open(os.path.join(arm_dir, "arm.json"), "w", encoding="utf-8") as f:
         json.dump({"arm": name, "exe": exe, "flags": flags, "wall_seconds": wall,
                    "failures": client.failures if client else []}, f, indent=1)
@@ -734,9 +862,15 @@ def main():
     for extra in ALT_EXTRA_FLAGS:
         if extra not in dict(alt_flags):
             alt_flags.append((extra, None))
-    ctrl_supported = help_flags(CONTROL_EXE)
-    ctrl_flags = [f for f in base if f[0] in ctrl_supported]
-    dropped = [f[0] for f in treat_flags if f[0] not in ctrl_supported]
+    strata = CONTROL_KIND == "strata"
+    if strata:  # Strata takes its own engine config, not serve flags
+        ctrl_flags, dropped = [], []
+        if not args.ctx:
+            raise SystemExit("AB_CONTROL_KIND=strata needs --ctx (no calibration against Strata)")
+    else:
+        ctrl_supported = help_flags(CONTROL_EXE)
+        ctrl_flags = [f for f in base if f[0] in ctrl_supported]
+        dropped = [f[0] for f in treat_flags if f[0] not in ctrl_supported]
 
     plans = {seed: workload.build_plan(seed=seed, scale=args.scale) for seed in seeds}
     log("model: %s" % model)
@@ -744,6 +878,8 @@ def main():
     if "alt" in arms:
         log("alt flags: treatment + %s" % " ".join(ALT_EXTRA_FLAGS))
     log("control drops (not in its --help): %s" % ", ".join(dropped))
+    if strata:
+        log("control: Strata %s + %s" % (STRATA_CONFIG, " ".join(STRATA_EXTRA_ARGS)))
     if args.dry_run:
         for seed in seeds:
             print("seed %d:\n%s" % (seed, workload.summarize(plans[seed])))
@@ -751,9 +887,9 @@ def main():
         return
     for exe in ([TREATMENT_EXE] if "treatment" in arms else []) + \
                ([ALT_EXE] if "alt" in arms else []) + \
-               ([CONTROL_EXE] if "control" in arms else []):
+               ([(STRATA_CONFIG if strata else CONTROL_EXE)] if "control" in arms else []):
         if not os.path.exists(exe):
-            raise SystemExit("missing serve executable: %s" % exe)
+            raise SystemExit("missing serve executable or Strata config: %s" % exe)
 
     t0 = time.time()
     ctx = args.ctx or (calibrate_ctx(model, without(ctrl_flags, {"--max-context"}), bat_ctx, out_dir)
@@ -762,10 +898,15 @@ def main():
               "control_exe": CONTROL_EXE, "treatment_flags": treat_flags,
               "alt_extra_flags": ALT_EXTRA_FLAGS if "alt" in arms else None,
               "alt_exe": ALT_EXE if "alt" in arms else None,
-              "alt_label": ALT_LABEL or None,
+              "alt_label": ALT_LABEL or None, "control_label": CONTROL_LABEL or None,
+              "treatment_label": TREATMENT_LABEL or None,
               "control_flags_base": ctrl_flags, "dropped_for_control": dropped,
               "scale": args.scale, "agent_max_tokens": AGENT_MAX_TOKENS, "sampling": SAMPLING,
-              "bat_max_context": bat_ctx}
+              "bat_max_context": bat_ctx, "control_kind": CONTROL_KIND,
+              "strata_config": STRATA_CONFIG if strata else None,
+              "strata_extra_args": STRATA_EXTRA_ARGS if strata else None,
+              # Strata's TTFT can only come from the client clock, so every arm uses it.
+              "client_ttft": strata, "request_timeout_s": REQUEST_TIMEOUT_S}
     flags = {"treatment": treat_flags, "alt": alt_flags, "control": ctrl_flags}
     failures = []
     run_dirs = []

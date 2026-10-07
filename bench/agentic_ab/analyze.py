@@ -18,17 +18,19 @@ import statistics
 import sys
 
 # Every arm is compared with the control; `alt` is AB_ALT_EXE (default the treatment build) with
-# AB_ALT_EXTRA_FLAGS, named by AB_ALT_LABEL when the run set one.
+# AB_ALT_EXTRA_FLAGS; AB_CONTROL_LABEL, AB_TREATMENT_LABEL and AB_ALT_LABEL rename the arms.
 ARMS = ("control", "treatment", "alt")
-LABEL = {"control": "Upstream + Windows port", "treatment": "This fork",
-         "alt": "This fork, original prefix cache"}
-SHORT = {"control": "Upstream", "treatment": "Fork", "alt": "Fork original-cache"}
+LABEL = {"control": "NInfer + Windows port", "treatment": "Infernix",
+         "alt": "Infernix, original prefix cache"}
+SHORT = {"control": "NInfer", "treatment": "Infernix", "alt": "Infernix original-cache"}
 
 
-def use_alt_label(cfg):
-    if cfg.get("alt_label"):
-        LABEL["alt"] = cfg["alt_label"]
-        SHORT["alt"] = cfg["alt_label"]
+def use_labels(cfg):
+    """Arm names the run set (AB_CONTROL_LABEL, AB_TREATMENT_LABEL, AB_ALT_LABEL)."""
+    for arm in ARMS:
+        if cfg.get(arm + "_label"):
+            LABEL[arm] = cfg[arm + "_label"]
+            SHORT[arm] = cfg[arm + "_label"]
 
 
 CONTINUING = {"loop", "after_idle", "history_edit", "retry", "abort_retry", "subagent_loop"}
@@ -62,7 +64,7 @@ def load_jsonl(path):
     return rows
 
 
-def load_arm(run_dir, arm):
+def load_arm(run_dir, arm, client_ttft=False):
     d = os.path.join(run_dir, arm)
     client = load_jsonl(os.path.join(d, "client.jsonl"))
     server = load_jsonl(os.path.join(d, "request_log.jsonl"))
@@ -111,6 +113,8 @@ def load_arm(run_dir, arm):
                 "ngram_drafted": spec.get("ngram_drafted_tokens") or 0,
                 "rounds": spec.get("rounds") or 0,
             })
+            if client_ttft:  # a run with a Strata arm: TTFT from the client clock in every arm
+                r["ttft"] = (c["t_first"] - c["t_send"]) if c.get("t_first") else None
         reqs.append(r)
     build = "?"
     serve_log = os.path.join(d, "serve.log")
@@ -610,7 +614,7 @@ def aggregate(out_dir, run_dirs):
     for d in run_dirs:
         with open(os.path.join(d, "summary.json"), encoding="utf-8") as f:
             runs.append((d, json.load(f)))
-    use_alt_label(runs[0][1]["config"])
+    use_labels(runs[0][1]["config"])
     arms = [a for a in ARMS if all(a in s for _, s in runs)]
     if arms[:1] != ["control"] or len(arms) < 2:
         raise SystemExit("aggregate needs a control arm and one other arm in every run")
@@ -677,11 +681,11 @@ def main(argv):
     run_dir = argv[0]
     with open(os.path.join(run_dir, "config.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    use_alt_label(cfg)
+    use_labels(cfg)
     arms = [a for a in ARMS if os.path.exists(os.path.join(run_dir, a, "client.jsonl"))]
     if arms[:1] != ["control"] or len(arms) < 2:
         raise SystemExit("%s needs a control arm and at least one other arm" % run_dir)
-    A = {a: load_arm(run_dir, a) for a in arms}
+    A = {a: load_arm(run_dir, a, cfg.get("client_ttft", False)) for a in arms}
     # Matched cold set: requests with no cache hit in EVERY arm and a real prefill.
     served = [{r["seed"]: r for r in A[a]["requests"] if r.get("server")} for a in arms]
     cold = {s for s in served[0] if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096
