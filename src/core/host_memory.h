@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 
 namespace infernix {
 
@@ -27,8 +28,8 @@ struct HostMemorySnapshot {
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();
 
 // Keeps at least `bytes` of this process resident (Windows: a hard minimum working set), so a small
-// RAM reserve trims other programs before Infernix's own pageable memory. False when the OS refuses
-// or has no such control (non-fatal: the caller logs it).
-[[nodiscard]] bool reserve_process_working_set(std::uint64_t bytes) noexcept;
+// RAM reserve trims other programs before Infernix's own pageable memory. Empty on success and where
+// the OS has no such control (Linux); otherwise the OS's reason (non-fatal: the caller logs it).
+[[nodiscard]] std::string reserve_process_working_set(std::uint64_t bytes);
 
 } // namespace infernix

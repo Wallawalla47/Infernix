@@ -94,18 +94,27 @@ HostMemorySnapshot host_memory_snapshot() {
     return out;
 }
 
-bool reserve_process_working_set(std::uint64_t bytes) noexcept {
+std::string reserve_process_working_set(std::uint64_t bytes) {
 #ifdef _WIN32
     SIZE_T minimum = 0, maximum = 0;
     DWORD flags    = 0;
-    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) { return false; }
+    if (!::GetProcessWorkingSetSizeEx(::GetCurrentProcess(), &minimum, &maximum, &flags)) {
+        return "Windows error " + std::to_string(::GetLastError());
+    }
     const auto wanted = static_cast<SIZE_T>(bytes);
-    // Only the minimum is hard; the maximum stays soft so the process may grow past it.
-    return ::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted),
-                                        QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE) != 0;
+    // Only the minimum is hard; the maximum stays soft so the process may grow past it. Windows
+    // rejects a hard minimum equal to the maximum (ERROR_INVALID_PARAMETER), so the maximum is
+    // kept above it.
+    constexpr SIZE_T kMaximumAbove = SIZE_T{64} << 20;
+    if (!::SetProcessWorkingSetSizeEx(::GetCurrentProcess(), wanted, std::max(maximum, wanted + kMaximumAbove),
+                                      QUOTA_LIMITS_HARDWS_MIN_ENABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE)) {
+        return "Windows error " + std::to_string(::GetLastError());
+    }
+    return {};
 #else
+    // Linux has no per-process resident minimum short of locking pages.
     (void)bytes;
-    return false;
+    return {};
 #endif
 }
 
