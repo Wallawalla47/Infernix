@@ -44,7 +44,7 @@ table is read from an NVMe drive.
 | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00003-of-00003.infernix` | 12,867,265,280 | model, part 3 of 3 |
 | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | PLE n-gram volume (read in random 4 KiB blocks) |
 | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.conversion.json` | 905,990 | conversion report: sources, methods and formats per object |
-| `NOTICE`, `LICENSE` | | NVIDIA's attribution notice; the Qwen Community License 1.0 |
+| `NVIDIA-Open-Model-License.txt`, `NOTICE`, `LICENSE` | | the NVIDIA Open Model License; NVIDIA's attribution notice; the Qwen Community License 1.0 |
 
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
 n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
@@ -146,7 +146,8 @@ it. The n-gram volume was written from the same FP8 table (byte-identical to NVI
 
 Use of this model is governed by the
 [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/)
-("Licensed by NVIDIA Corporation under the NVIDIA Open Model License"; see `NOTICE`). The underlying
+(copy in `NVIDIA-Open-Model-License.txt`; "Licensed by NVIDIA Corporation under the NVIDIA Open
+Model License", see `NOTICE`). The underlying
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) is also subject to the
 [Qwen Community License 1.0](LICENSE), which among other conditions requires a separate license from
 Qwen for some commercial uses.
