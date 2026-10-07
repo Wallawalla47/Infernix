@@ -20,7 +20,7 @@
 #    include <sched.h>
 #endif
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 namespace {
 
 inline void cpu_relax() {
@@ -186,4 +186,4 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
     jobs_ = {};
 }
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

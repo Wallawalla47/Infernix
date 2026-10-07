@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 bool has_role(const CaptureGroup& group, runtime::CheckpointRole role) {
     return std::find(group.roles.begin(), group.roles.end(), role) != group.roles.end();
@@ -337,4 +337,4 @@ void ProgramImpl::publish_capture(ContextTransaction& tx) {
     skip_capture(sequence_handle(tx.lane));
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

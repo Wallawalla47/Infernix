@@ -11,7 +11,7 @@
 #include <string_view>
 #include <system_error>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 int parse_nonnegative_int(const char* text, const char* label) {
@@ -370,11 +370,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --greedy forces temperature 0 (exact argmax).\n";
 }
 
-const char* reasoning_loop_name(ninfer::ReasoningLoopAction action) noexcept {
+const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
     switch (action) {
-    case ninfer::ReasoningLoopAction::Stop: return "stop";
-    case ninfer::ReasoningLoopAction::Conclude: return "conclude";
-    case ninfer::ReasoningLoopAction::Off: break;
+    case infernix::ReasoningLoopAction::Stop: return "stop";
+    case infernix::ReasoningLoopAction::Conclude: return "conclude";
+    case infernix::ReasoningLoopAction::Off: break;
     }
     return "off";
 }
@@ -664,11 +664,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--reasoning-loop") {
             const std::string_view value = require_value("--reasoning-loop");
             if (value == "off") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Off;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Off;
             } else if (value == "stop") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Stop;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Stop;
             } else if (value == "conclude") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Conclude;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Conclude;
             } else {
                 throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
             }
@@ -847,4 +847,4 @@ std::string resolve_public_model_id(const ServeOptions& options,
     return std::string(artifact_model_name);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

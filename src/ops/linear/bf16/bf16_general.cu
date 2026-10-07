@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr std::int32_t kSkinnyMaxTokens = 8;
@@ -162,4 +162,4 @@ void bf16_general_small(const Tensor& x, const Weight& weight, Tensor& out, cuda
     return tokens <= kSkinnyMaxTokens ? &bf16_general_small : &bf16_general_gemm;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

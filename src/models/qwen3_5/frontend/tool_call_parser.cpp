@@ -7,7 +7,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 using Json                = nlohmann::json;
@@ -1041,4 +1041,4 @@ ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish() {
         .content = std::move(tail), .tool_calls = {}, .diagnostics = parsed.diagnostics};
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

@@ -1,4 +1,4 @@
-#include "ninfer/ops/sliding_window_attention.h"
+#include "infernix/ops/sliding_window_attention.h"
 
 #include "core/layout.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim = 128;
@@ -172,4 +172,4 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                                             out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::bench::context_cost {
+namespace infernix::bench::context_cost {
 namespace {
 
 double median_of(std::vector<double> values) {
@@ -436,4 +436,4 @@ std::string_view encoding_name(CoefficientEncoding encoding) noexcept {
     return "unknown";
 }
 
-} // namespace ninfer::bench::context_cost
+} // namespace infernix::bench::context_cost

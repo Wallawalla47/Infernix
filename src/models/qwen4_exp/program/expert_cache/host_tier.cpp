@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp::expert_cache {
 
 namespace {
 
@@ -377,4 +377,4 @@ void HostTier::check() const {
     }
 }
 
-} // namespace ninfer::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp::expert_cache

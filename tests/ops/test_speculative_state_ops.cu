@@ -6,9 +6,9 @@
 //     and no state changes; ple_conv_commit of n columns equals ple_conv_inject over those n;
 //   - qsa_pool_keys without tail updates: pooled keys equal the committing call's, and the tails
 //     do not change; qsa_commit_tails of n columns equals qsa_pool_keys over those n.
-#include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/ple.h"
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/ple.h"
+#include "infernix/ops/qsa.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -21,9 +21,9 @@
 #include <utility>
 #include <vector>
 
-using ninfer::DType;
-using ninfer::Tensor;
-using ninfer::test::cuda_check;
+using infernix::DType;
+using infernix::Tensor;
+using infernix::test::cuda_check;
 
 namespace {
 
@@ -85,8 +85,8 @@ void test_conv(std::int32_t C, std::int32_t W, std::int32_t B) {
     Tensor tro(ds_ro.p, DType::BF16, {C, 3, slots}), tsnap(ds_snap.p, DType::BF16, {C, 3, slots});
     Tensor to_ro(out_ro.p, DType::BF16, {C, W, B}), to_snap(out_snap.p, DType::BF16, {C, W, B});
     Tensor tinit(dinit.p, DType::I32, {B}), tbase(dbase.p, DType::I32, {B});
-    ninfer::ops::causal_conv1d_silu_from_states(tx, tw, tro, tinit, to_ro, nullptr);
-    ninfer::ops::causal_conv1d_silu_snapshot(tx, tw, tsnap, Tensor{}, tinit, tbase, to_snap, nullptr);
+    infernix::ops::causal_conv1d_silu_from_states(tx, tw, tro, tinit, to_ro, nullptr);
+    infernix::ops::causal_conv1d_silu_snapshot(tx, tw, tsnap, Tensor{}, tinit, tbase, to_snap, nullptr);
     cuda_check(cudaDeviceSynchronize(), "conv");
     const std::string tag = "conv C=" + std::to_string(C) + " W=" + std::to_string(W) + " B=" + std::to_string(B);
     check(out_ro.download() == out_snap.download(), tag + ": from-states outputs equal the snapshot form's");
@@ -118,13 +118,13 @@ void test_ple(std::int32_t C, std::int32_t W, std::int32_t B, std::int32_t taps,
     Buffer<std::uint16_t> s_verify(states), s_commit(states), r_verify(residual), r_commit(residual);
     Tensor tsv(s_verify.p, DType::BF16, {C, span, slots}), tsc(s_commit.p, DType::BF16, {C, span, slots});
     Tensor trv(r_verify.p, DType::BF16, {C, T}), trc(r_commit.p, DType::BF16, {C, T});
-    ninfer::ops::ple_conv_inject(tg, tn, tw, dilation, tsv, tslots, Tensor{}, trv, nullptr);
-    ninfer::ops::ple_conv_inject(tg, tn, tw, dilation, tsc, tslots, tslots, trc, nullptr);
+    infernix::ops::ple_conv_inject(tg, tn, tw, dilation, tsv, tslots, Tensor{}, trv, nullptr);
+    infernix::ops::ple_conv_inject(tg, tn, tw, dilation, tsc, tslots, tslots, trc, nullptr);
     cuda_check(cudaDeviceSynchronize(), "ple");
     check(r_verify.download() == r_commit.download(), tag + ": verification residual equals the committing call's");
     check(s_verify.download() == states, tag + ": verification leaves every history unchanged");
     // Commit of n columns against ple_conv_inject over those n columns of each row.
-    ninfer::ops::ple_conv_commit(tn.view({C, W, B}), Tensor(dcommit.p, DType::I32, {B}), tsv, tslots, nullptr);
+    infernix::ops::ple_conv_commit(tn.view({C, W, B}), Tensor(dcommit.p, DType::I32, {B}), tsv, tslots, nullptr);
     cuda_check(cudaDeviceSynchronize(), "ple commit");
     Buffer<std::uint16_t> s_ref(states);
     Tensor tsr(s_ref.p, DType::BF16, {C, span, slots});
@@ -134,7 +134,7 @@ void test_ple(std::int32_t C, std::int32_t W, std::int32_t B, std::int32_t taps,
         Tensor tscratch(scratch.p, DType::BF16, {C, commit[b]});
         const Tensor gb = tg.slice(1, b * W, commit[b]), nb = tn.slice(1, b * W, commit[b]);
         Tensor slot = tslots.slice(0, b, 1);
-        ninfer::ops::ple_conv_inject(gb, nb, tw, dilation, tsr, slot, slot, tscratch, nullptr);
+        infernix::ops::ple_conv_inject(gb, nb, tw, dilation, tsr, slot, slot, tscratch, nullptr);
     }
     cuda_check(cudaDeviceSynchronize(), "ple reference");
     check(s_verify.download() == s_ref.download(), tag + ": commit equals the committing call over the prefix");
@@ -144,7 +144,7 @@ void test_ple(std::int32_t C, std::int32_t W, std::int32_t B, std::int32_t taps,
 
 void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
     constexpr std::int32_t Di = 128, R = 4, kPage = 64;
-    const ninfer::ops::QsaGeometry geometry{.heads = 16, .kv_heads = 2, .head_dim = 256, .index_heads = 4,
+    const infernix::ops::QsaGeometry geometry{.heads = 16, .kv_heads = 2, .head_dim = 256, .index_heads = 4,
                                             .index_head_dim = Di, .rotary_dim = 64, .budget = 2048, .ratio = R,
                                             .theta = 1.0e7F, .eps = 1.0e-6F};
     std::mt19937 rng(static_cast<std::uint32_t>(W * 13 + B * 7 + first_position));
@@ -180,7 +180,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
     for (std::int32_t b = 0; b < B; ++b) { starts[b] = positions[b * W] / R * R; }
     Buffer<std::int32_t> drope(rope_of(positions)), dstarts(rope_of(starts));
     const auto batch_of = [&](bool update) {
-        return ninfer::ops::QsaBatch{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
+        return infernix::ops::QsaBatch{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
                                      .table_rows       = Tensor(drows.p, DType::I32, {B}),
                                      .positions        = Tensor(dpos.p, DType::I32, {T}),
                                      .tail_slots       = Tensor(dtail.p, DType::I32, {B}),
@@ -191,7 +191,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
                                      .update_tails     = update};
     };
     const auto layer_of = [&](Buffer<std::uint16_t>& pooled) {
-        ninfer::ops::QsaKVLayer layer;
+        infernix::ops::QsaKVLayer layer;
         layer.pooled_pages = Tensor(pooled.p, DType::BF16, {Di / R, kPage, 1, pages_per_row * B});
         return layer;
     };
@@ -200,9 +200,9 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
     {
         Tensor keys(draw.p, DType::BF16, {Di, T});
         Tensor tv(tails_verify.p, DType::BF16, {Di, R - 1, slots}), tc(tails_commit.p, DType::BF16, {Di, R - 1, slots});
-        ninfer::ops::qsa_pool_keys(keys, Tensor(dnorm.p, DType::BF16, {Di}), tv, layer_of(pooled_verify), batch_of(false),
+        infernix::ops::qsa_pool_keys(keys, Tensor(dnorm.p, DType::BF16, {Di}), tv, layer_of(pooled_verify), batch_of(false),
                                    geometry, nullptr);
-        ninfer::ops::qsa_pool_keys(keys, Tensor(dnorm.p, DType::BF16, {Di}), tc, layer_of(pooled_commit), batch_of(true),
+        infernix::ops::qsa_pool_keys(keys, Tensor(dnorm.p, DType::BF16, {Di}), tc, layer_of(pooled_commit), batch_of(true),
                                    geometry, nullptr);
         cuda_check(cudaDeviceSynchronize(), "pool");
         check(pooled_verify.download() == pooled_commit.download(), tag + ": verification pools the same keys");
@@ -210,7 +210,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
     }
     // Commit of n columns on both layers against qsa_pool_keys over each row's first n columns.
     Tensor all_tails(tails_verify.p, DType::BF16, {Di, R - 1, slots, layers});
-    ninfer::ops::qsa_commit_tails(Tensor(draw.p, DType::BF16, {Di, W, B, layers}), Tensor(dpos.p, DType::I32, {W, B}),
+    infernix::ops::qsa_commit_tails(Tensor(draw.p, DType::BF16, {Di, W, B, layers}), Tensor(dpos.p, DType::I32, {W, B}),
                                   Tensor(dcommit.p, DType::I32, {B}), all_tails, Tensor(dtail.p, DType::I32, {B}),
                                   geometry, nullptr);
     Buffer<std::uint16_t> tails_ref(tails), pooled_ref(std::vector<std::uint16_t>(pooled_count, 0));
@@ -221,7 +221,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
             Tensor tref(tails_ref.p + l * layer_tail, DType::BF16, {Di, R - 1, slots});
             const std::vector<std::int32_t> row(positions.begin() + b * W, positions.begin() + b * W + commit[b]);
             Buffer<std::int32_t> row_rope(rope_of(row)), row_start(rope_of({starts[b]}));
-            ninfer::ops::QsaBatch one{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
+            infernix::ops::QsaBatch one{.block_tables     = Tensor(dtables.p, DType::I32, {pages_per_row, B}),
                                       .table_rows       = Tensor(drows.p, DType::I32, {B}).slice(0, b, 1),
                                       .positions        = Tensor(dpos.p, DType::I32, {T}).slice(0, b * W, commit[b]),
                                       .tail_slots       = Tensor(dtail.p, DType::I32, {B}).slice(0, b, 1),
@@ -230,7 +230,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
                                       .batch            = 1,
                                       .width            = commit[b]};
             Tensor row_keys(draw.p + (static_cast<std::size_t>(l) * T + b * W) * Di, DType::BF16, {Di, commit[b]});
-            ninfer::ops::qsa_pool_keys(row_keys, Tensor(dnorm.p, DType::BF16, {Di}), tref, layer_of(pooled_ref), one,
+            infernix::ops::qsa_pool_keys(row_keys, Tensor(dnorm.p, DType::BF16, {Di}), tref, layer_of(pooled_ref), one,
                                        geometry, nullptr);
         }
     }
@@ -241,7 +241,7 @@ void test_qsa(std::int32_t W, std::int32_t B, std::int32_t first_position) {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }

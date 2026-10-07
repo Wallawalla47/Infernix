@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <charconv>
@@ -44,8 +44,8 @@ std::size_t first_source_difference(const std::string& source, const std::string
     return i;
 }
 
-ninfer::RequestOptions request(unsigned output, bool reuse) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions request(unsigned output, bool reuse) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens    = output;
     options.execution.sampling.temperature       = 0.0F;
     options.execution.sampling.presence_penalty  = 0.0F;
@@ -60,7 +60,7 @@ ninfer::RequestOptions request(unsigned output, bool reuse) {
 // turn is a near-tie inside this synthetic file, and which side wins moves with the rounding of the
 // verification width, so an early end of turn is a valid outcome. Free-form lanes keep generating
 // to their budget.
-ninfer::RequestOptions copy_request(unsigned output, bool reuse) {
+infernix::RequestOptions copy_request(unsigned output, bool reuse) {
     auto options                        = request(output, reuse);
     options.stop.include_model_defaults = true;
     return options;
@@ -69,7 +69,7 @@ ninfer::RequestOptions copy_request(unsigned output, bool reuse) {
 // The copied text must be an exact source prefix, and a copy that ended its turn early must still
 // have run long enough to exercise ngram rounds. Returns how the copy ended, for the log.
 std::string require_copy(const std::string& source, int seed,
-                         const ninfer::GenerationResult& result, std::size_t min_tokens,
+                         const infernix::GenerationResult& result, std::size_t min_tokens,
                          const std::string& lane) {
     const std::string produced = assistant_prefix(seed) + result.content;
     if (!source.starts_with(produced)) {
@@ -81,8 +81,8 @@ std::string require_copy(const std::string& source, int seed,
         throw std::runtime_error(lane + " is not an exact source prefix");
     }
     const std::string tokens = std::to_string(result.generated_token_ids.size());
-    if (result.finish_reason == ninfer::FinishReason::OutputLimit) { return "limit@" + tokens; }
-    require(result.finish_reason == ninfer::FinishReason::StopToken,
+    if (result.finish_reason == infernix::FinishReason::OutputLimit) { return "limit@" + tokens; }
+    require(result.finish_reason == infernix::FinishReason::StopToken,
             "copy lane ended for a reason other than its budget or end of turn");
     if (result.generated_token_ids.size() < min_tokens) {
         throw std::runtime_error(lane + " ended its turn after only " + tokens + " tokens");
@@ -94,12 +94,12 @@ std::string require_copy(const std::string& source, int seed,
 constexpr std::size_t kMinimumCopyTokens = 64;
 constexpr std::size_t kMinimumSoakTokens = 256;
 
-ninfer::PromptInput copy_prompt(const std::string& source, int seed) {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text,
+infernix::PromptInput copy_prompt(const std::string& source, int seed) {
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
+    user.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text,
         .text = "Repeat the following Python file exactly. Output only the file, with no "
                 "explanation or Markdown fences. Preserve every space and newline.\n\n" +
                 source,
@@ -107,63 +107,63 @@ ninfer::PromptInput copy_prompt(const std::string& source, int seed) {
     input.messages.push_back(std::move(user));
     input.options.enable_thinking   = false;
     input.options.preserve_thinking = true;
-    ninfer::ChatMessage assistant;
-    assistant.role = ninfer::ChatRole::Assistant;
-    assistant.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+    infernix::ChatMessage assistant;
+    assistant.role = infernix::ChatRole::Assistant;
+    assistant.parts.push_back(infernix::MessagePart{.kind  = infernix::MessagePartKind::Text,
                                                   .text  = assistant_prefix(seed),
                                                   .media = {}});
     input.messages.push_back(std::move(assistant));
-    input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    input.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     return input;
 }
 
-ninfer::PromptInput freeform_prompt(const std::string& text) {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
+infernix::PromptInput freeform_prompt(const std::string& text) {
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
     user.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = text, .media = {}});
     input.messages.push_back(std::move(user));
     input.options.enable_thinking   = false;
     input.options.preserve_thinking = true;
     return input;
 }
 
-ninfer::EngineOptions options_for(const char* artifact, const std::string& backend, unsigned width,
+infernix::EngineOptions options_for(const char* artifact, const std::string& backend, unsigned width,
                                   unsigned concurrency) {
-    ninfer::EngineOptions options;
+    infernix::EngineOptions options;
     options.artifact_path = artifact;
     // The context window is configurable so the test can run beside a live serve with reduced VRAM.
     unsigned max_context = 4096;
-    if (const auto* ctx_env = std::getenv("NINFER_NGRAM_TEST_MAX_CONTEXT")) {
+    if (const auto* ctx_env = std::getenv("INFERNIX_NGRAM_TEST_MAX_CONTEXT")) {
         max_context = std::max(512u, static_cast<unsigned>(std::strtoul(ctx_env, nullptr, 10)));
     }
     options.max_context         = max_context;
-    options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+    options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(max_context);
     options.max_concurrency     = concurrency;
     options.prefill_chunk       = 1024;
     options.enable_vision       = false;
     options.use_cuda_graph      = true;
-    if (std::getenv("NINFER_NGRAM_TEST_NO_GRAPH")) { options.use_cuda_graph = false; }
-    options.kv_cache            = ninfer::KvCacheStorage::Nvfp4Group16;
+    if (std::getenv("INFERNIX_NGRAM_TEST_NO_GRAPH")) { options.use_cuda_graph = false; }
+    options.kv_cache            = infernix::KvCacheStorage::Nvfp4Group16;
     if (backend == "mtp") {
-        options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.backend = infernix::SpeculativeBackend::Mtp;
     } else if (backend == "dflash") {
-        options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+        options.speculative.backend = infernix::SpeculativeBackend::DFlash;
     } else if (backend == "dflash2") {
-        options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
     } else {
         throw std::invalid_argument("unsupported backend");
     }
     options.speculative.draft_tokens       = backend == "mtp" ? 3 : 5;
     options.speculative.ngram_draft_tokens = width;
-    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
-    // NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid runs the same checks on the hybrid prefix cache.
-    if (const char* cache = std::getenv("NINFER_NGRAM_TEST_CONTEXT_CACHE");
+    options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
+    // INFERNIX_NGRAM_TEST_CONTEXT_CACHE=hybrid runs the same checks on the hybrid prefix cache.
+    if (const char* cache = std::getenv("INFERNIX_NGRAM_TEST_CONTEXT_CACHE");
         cache != nullptr && std::string_view(cache) == "hybrid") {
         options.kv_capacity =
-            ninfer::KvCapacityPolicy::explicit_capacity(max_context * concurrency);
-        options.context_cache.mode                = ninfer::ContextCacheMode::Hybrid;
+            infernix::KvCapacityPolicy::explicit_capacity(max_context * concurrency);
+        options.context_cache.mode                = infernix::ContextCacheMode::Hybrid;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
         return options;
     }
@@ -172,7 +172,7 @@ ninfer::EngineOptions options_for(const char* artifact, const std::string& backe
     return options;
 }
 
-std::size_t distinct_tokens(const std::vector<ninfer::TokenId>& ids) {
+std::size_t distinct_tokens(const std::vector<infernix::TokenId>& ids) {
     std::size_t distinct = 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
         bool seen = false;
@@ -183,7 +183,7 @@ std::size_t distinct_tokens(const std::vector<ninfer::TokenId>& ids) {
 }
 
 // Longest run of one repeated token — a degenerate loop ("gibberish") shows up here.
-std::size_t max_token_run(const std::vector<ninfer::TokenId>& ids) {
+std::size_t max_token_run(const std::vector<infernix::TokenId>& ids) {
     std::size_t best = 0, run = 0;
     for (std::size_t i = 0; i < ids.size(); ++i) {
         run = (i > 0 && ids[i] == ids[i - 1]) ? run + 1 : 1;
@@ -194,8 +194,8 @@ std::size_t max_token_run(const std::vector<ninfer::TokenId>& ids) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto* artifact = std::getenv("NINFER_NGRAM_TEST_WEIGHTS");
-    if (!artifact || !*artifact) { artifact = std::getenv("NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS"); }
+    const auto* artifact = std::getenv("INFERNIX_NGRAM_TEST_WEIGHTS");
+    if (!artifact || !*artifact) { artifact = std::getenv("INFERNIX_QWEN3_8_27B_DFLASH2_WEIGHTS"); }
     if (!artifact || !*artifact) { return 77; }
     try {
         const std::string backend         = argc > 1 ? argv[1] : "dflash2";
@@ -217,12 +217,12 @@ int main(int argc, char** argv) {
                     concurrency >= 2 && concurrency <= 8,
                 "concurrency must be an integer in 2..8");
 
-        ninfer::Engine engine(options_for(artifact, backend, width, concurrency));
+        infernix::Engine engine(options_for(artifact, backend, width, concurrency));
         const std::string source = make_source(0);
 
         if (!baseline) {
         // Part 1: single-lane reference on the shared engine.
-        std::vector<ninfer::TokenId> c1_tokens;
+        std::vector<infernix::TokenId> c1_tokens;
         {
             const auto result =
                 engine.generate(engine.prepare(copy_prompt(source, 0)), copy_request(256, true));

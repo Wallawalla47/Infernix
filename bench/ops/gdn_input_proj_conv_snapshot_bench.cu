@@ -4,10 +4,10 @@
 // Production dispatch, kernel topology, and workspace use remain behind that contract.
 
 #include "core/weight.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -28,7 +28,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -966,7 +966,7 @@ int main(int argc, char** argv) {
         write_csv(options.csv_out, results, options, context);
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_gdn_input_proj_conv_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_gdn_input_proj_conv_bench: %s\n", error.what());
         return 1;
     }
 }

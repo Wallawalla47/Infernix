@@ -8,7 +8,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/schedule.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class G>
 __device__ __forceinline__ std::int64_t bf16_kv_cache_index(int page, int head, int d, int offset) {
@@ -55,4 +55,4 @@ __device__ __forceinline__ void bf16_kv_stage_tile(Element* dst, const Element* 
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

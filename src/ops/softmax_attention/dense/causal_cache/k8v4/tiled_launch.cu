@@ -4,7 +4,7 @@
 #include "ops/softmax_attention/common/mxfp8_tiled_launch.cuh"
 #include "ops/softmax_attention/common/causal_tiled_merge.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView cache,
                              CausalKvPartition partition, bool pv8, WorkspaceArena& workspace,
                              cudaStream_t stream) {
@@ -22,4 +22,4 @@ void k8v4_kv_tiled_attention(const CausalAttentionOperands& p, K8V4KvReadView ca
     else
         invoke.template operator()<CausalD256H16Kv2>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

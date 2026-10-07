@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 enum class Fp8CodeCache : std::uint8_t {
     Default,
     Streaming,
@@ -311,4 +311,4 @@ struct Fp8IdentityRows {
 
     __device__ __forceinline__ int weight_row(int begin, int row, int) const { return begin + row; }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

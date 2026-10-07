@@ -1,15 +1,15 @@
 // Performance bench for the BF16 depthwise causal width-4 convolution + SiLU Op.
 //
 // Examples:
-//   ./ninfer_causal_conv1d_silu_bench --decode --channels 8192
-//   ./ninfer_causal_conv1d_silu_bench --prefill --channels 8192 --tokens 1024
-//   ./ninfer_causal_conv1d_silu_bench --distinct --channels 8192 --tokens 6
-//   ./ninfer_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
+//   ./infernix_causal_conv1d_silu_bench --decode --channels 8192
+//   ./infernix_causal_conv1d_silu_bench --prefill --channels 8192 --tokens 1024
+//   ./infernix_causal_conv1d_silu_bench --distinct --channels 8192 --tokens 6
+//   ./infernix_causal_conv1d_silu_bench --snapshot --channels 8192 --tokens 6 --slots 7
 // Printed logical GB/s is informational; NCU determines the applicable resource roofline.
-#include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/scatter.h"
+#include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/scatter.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,8 +19,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

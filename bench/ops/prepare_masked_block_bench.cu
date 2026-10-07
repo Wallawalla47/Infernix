@@ -1,9 +1,9 @@
 // Public-Op benchmark for the exact anchor-and-mask block transform.
 
-#include "ninfer/ops/prepare_masked_block.h"
+#include "infernix/ops/prepare_masked_block.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -52,7 +52,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_prepare_masked_block_bench [--block-sizes 2,...,16] "
+                 "usage: infernix_prepare_masked_block_bench [--block-sizes 2,...,16] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                  message);
@@ -307,7 +307,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_prepare_masked_block_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_prepare_masked_block_bench: %s\n", error.what());
         return 1;
     }
 }

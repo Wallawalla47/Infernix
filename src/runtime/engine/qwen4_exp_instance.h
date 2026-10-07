@@ -7,17 +7,17 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/program/program.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/resources.h"
 
 #include <filesystem>
 #include <memory>
 
-namespace ninfer {
+namespace infernix {
 struct DeviceContext;
 }
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 struct Qwen4ExpInstance {
     using ModelContract = models::qwen4_exp::RuntimeTypes;
@@ -47,4 +47,4 @@ struct ConstructedQwen4Exp {
 
 [[nodiscard]] ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device);
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

@@ -1,26 +1,26 @@
 #include "models/qwen4_exp/execution/forward.h"
 
-#include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/embedding.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gated_rmsnorm.h"
-#include "ninfer/ops/gdn_gating.h"
-#include "ninfer/ops/hyper_connection.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/ple.h"
-#include "ninfer/ops/projection_fp32.h"
-#include "ninfer/ops/argmax.h"
+#include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/embedding.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gated_rmsnorm.h"
+#include "infernix/ops/gdn_gating.h"
+#include "infernix/ops/hyper_connection.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/ple.h"
+#include "infernix/ops/projection_fp32.h"
+#include "infernix/ops/argmax.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
-#include "ninfer/ops/cast.h"
-#include "ninfer/ops/resident_moe.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/rows.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/sigmoid_mul.h"
-#include "ninfer/ops/silu_mul.h"
+#include "infernix/ops/cast.h"
+#include "infernix/ops/resident_moe.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
+#include "infernix/ops/rows.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/sigmoid_mul.h"
+#include "infernix/ops/silu_mul.h"
 
 #include <algorithm>
 #include <vector>
@@ -29,7 +29,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) { return static_cast<std::int32_t>(v); }
@@ -770,4 +770,4 @@ std::size_t Forward::mtp_workspace_bytes(const TextConfig& c, std::int32_t kv_co
            ops::resident_moe_workspace_bytes(dim(c.moe.top_k * d), dim(c.moe.intermediate));
 }
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

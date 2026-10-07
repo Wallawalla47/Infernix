@@ -1,10 +1,10 @@
-#include "ninfer/ops/cast.h"
+#include "infernix/ops/cast.h"
 
 #include "ops/launcher/cast.h"
 
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t stream) {
     if (source.dtype != DType::FP32 || destination.dtype != DType::BF16) {
@@ -25,4 +25,4 @@ void cast_fp32_to_bf16(const Tensor& source, Tensor& destination, cudaStream_t s
     detail::cast_fp32_to_bf16_launch(source, destination, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

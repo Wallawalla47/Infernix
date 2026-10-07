@@ -6,7 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer {
+namespace infernix {
 
 struct GdnReplayRecordSpec {
     std::int32_t layers          = 0;
@@ -68,4 +68,4 @@ struct GdnReplayRecords {
     [[nodiscard]] GdnReplayRecords narrowed(std::int32_t width) const;
 };
 
-} // namespace ninfer
+} // namespace infernix

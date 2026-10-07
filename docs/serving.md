@@ -1,14 +1,14 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`build/apps/infernix-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
+Anthropic-compatible HTTP endpoints over one resident Infernix Engine.
 
 ## Start the server
 
-See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `INFERNIX_CUDA_SYNC` setting.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/infernix-serve models/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
@@ -124,7 +124,7 @@ connections also use TCP keepalive and a 15-second retransmission limit (`TCP_US
 Linux, `TCP_MAXRTMS` on Windows); together with the heartbeat,
 a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
-cannot be distinguished from a reading application; proxies must close their upstream NInfer
+cannot be distinguished from a reading application; proxies must close their upstream Infernix
 connection when the downstream client disappears.
 
 ## Models
@@ -142,9 +142,9 @@ the model behind the alias and the running instance:
 | `n_embd` | model embedding width |
 | `n_params` | total logical weight elements over the loaded artifact's distinct weight tensors |
 | `size` | encoded weight payload bytes of the loaded artifact |
-| `ftype` | dominant loaded weights format (the NInfer quantization name, by payload bytes) |
+| `ftype` | dominant loaded weights format (the Infernix quantization name, by payload bytes) |
 
-`n_ctx` is a property of the running `ninfer-serve` instance, so it reflects the `--max-context`
+`n_ctx` is a property of the running `infernix-serve` instance, so it reflects the `--max-context`
 that this server was started with, not the model's native context. `n_ctx_train` reports the model's
 own trained context separately.
 
@@ -178,7 +178,7 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema"}`; the type is accepted so clients that always send one are not refused, but NInfer does not constrain generation to it);
+- `n:1`, text-only `modalities`, and `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema"}`; the type is accepted so clients that always send one are not refused, but Infernix does not constrain generation to it);
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
   parsers;
@@ -203,7 +203,7 @@ Options whose observable behavior the Engine cannot provide are rejected when th
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
 audio output, explicit low/high image detail, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
-Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
+Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
 Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
 `guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
 as unknown hints.
@@ -242,7 +242,7 @@ declared non-string parameter is omitted. Admitted JSON values retain their JSON
 case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
-supported explicit type retain untyped inference. NInfer does not apply defaults, enforce required
+supported explicit type retain untyped inference. Infernix does not apply defaults, enforce required
 properties, perform recursive JSON Schema validation, or use constrained decoding.
 
 String parameters preserve function/tool-call markers and balanced nested
@@ -275,7 +275,7 @@ explicitly disabled (top-level or `chat_template_kwargs` `enable_thinking`, or
 Prompt-bearing JSON objects retain their received member order through request parsing and prompt
 rendering, including tool schemas and historical tool inputs. Canonical model-origin tool arguments
 retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
-the same ordered tool call. NInfer does not canonicalize semantically equivalent JSON: if a client
+the same ordered tool call. Infernix does not canonicalize semantically equivalent JSON: if a client
 reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
 does not match the model-held endpoint and can reuse only an earlier exact checkpoint.
 
@@ -331,7 +331,7 @@ interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
 
 Templates accept different subsets of those values: the official Qwen3.8 template raises for
-anything but `low`, `medium` and `xhigh`. NInfer renders each value once when the template loads,
+anything but `low`, `medium` and `xhigh`. Infernix renders each value once when the template loads,
 and a request for a value the template rejects renders with the nearest accepted value, a tie
 rounding up: on Qwen3.8, `high` and `max` render as `xhigh` and `minimal` as `low`. This applies to
 every endpoint and to `--reasoning-effort`. The values are tried on a one-message chat; a template
@@ -481,12 +481,12 @@ request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
 rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
-Engine session key or prefix identity. Valid TTL/retention values are accepted, but NInfer does not
+Engine session key or prefix identity. Valid TTL/retention values are accepted, but Infernix does not
 promise their wall-clock residency; physical retention follows the resource scheduler.
 
 ## OpenAI Responses Core
 
-NInfer implements the typed-Item and semantic-event core of the OpenAI
+Infernix implements the typed-Item and semantic-event core of the OpenAI
 [Responses API](https://developers.openai.com/api/reference/resources/responses/overview). All
 supported model instances use this same adapter and Engine route. It is intentionally not
 advertised as full parity with OpenAI-hosted tools, durable cloud storage, background jobs,
@@ -526,7 +526,7 @@ wire response contains typed `output` Items.
 
 ### Create request fields
 
-| Field | NInfer Responses Core contract |
+| Field | Infernix Responses Core contract |
 |---|---|
 | `model` | required non-empty string; must equal the artifact-derived public model ID or explicit `--model-id` override |
 | `input` | string or typed Item array; it may be omitted or empty only when `previous_response_id` already supplies a user query |
@@ -547,7 +547,7 @@ wire response contains typed `output` Items.
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
 | `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
-| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
+| `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
@@ -573,7 +573,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
 | `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
-| `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
+| `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
@@ -633,12 +633,12 @@ They may also be grouped in a Responses namespace:
 }
 ```
 
-NInfer gives each namespace/function pair a distinct internal Engine identity and restores the
+Infernix gives each namespace/function pair a distinct internal Engine identity and restores the
 separate `namespace` and `name` fields in aggregate output, SSE events, and replayed Items. The same
 function name may therefore appear in different namespaces. Namespace members remain ordinary
 client-executed functions; this does not add a remote MCP executor.
 
-NInfer renders these definitions in the Qwen prompt and parses model output into separate
+Infernix renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Only functions in the current effective tool set can become structured calls;
@@ -646,7 +646,7 @@ undeclared model output remains ordinary text. `allowed_tools` with mode `auto` 
 without changing declaration order, while `tool_choice:"none"` disables structured tool output even
 when the history contains earlier calls.
 
-NInfer does not execute functions or enforce JSON Schema through constrained decoding, so
+Infernix does not execute functions or enforce JSON Schema through constrained decoding, so
 `strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
 tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
 invocation are also rejected because their semantics cannot be honored.
@@ -654,7 +654,7 @@ invocation are also rejected because their semantics cannot be honored.
 ### Response object and usage
 
 A terminal wire response has `object: "response"`, one of `completed`, `incomplete`, or
-`cancelled` in `status`, and a typed `output` array. NInfer may emit:
+`cancelled` in `status`, and a typed `output` array. Infernix may emit:
 
 - a `reasoning` item containing raw `reasoning_text`; it returns a placeholder summary if
   `reasoning.summary` is requested;
@@ -817,14 +817,14 @@ needs its `tool_result` in the next User message, so a trailing one is rejected 
 `invalid_tool_history`, as the Anthropic API rejects it.
 
 Claude Code may place its attribution metadata in the first block of a top-level System array. If
-that block is a text block beginning exactly with `x-anthropic-billing-header:`, NInfer consumes the
+that block is a text block beginning exactly with `x-anthropic-billing-header:`, Infernix consumes the
 whole block before token counting, prompt preparation, and cache identity construction. The rule is
 positional: a string-form System value, a later array block, or an inline System message with the
 same text remains ordinary prompt content. A `cache_control` marker attached to the consumed block
 is consumed with it rather than moved to adjacent content.
 
 `max_tokens` is optional for local clients and otherwise uses `--default-max-tokens`; a positive
-value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
+value is the complete output budget. `max_tokens:0` is rejected because Infernix does not expose a
 completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
 `stop_sequences` enter Engine execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
@@ -847,10 +847,10 @@ so the reasoning stays out of the visible transcript but comes back with the blo
 echoes. When a replayed Thinking block has empty `thinking` and such a signature, request lowering
 restores the reasoning from it, so the prompt (and its prefix-cache identity) is the one
 `summarized` display would give; non-empty `thinking` text takes precedence, any other signature
-stays non-semantic metadata, and a malformed NInfer signature fails with
+stays non-semantic metadata, and a malformed Infernix signature fails with
 `invalid_thinking_signature`. The signature is not encrypted or authenticated: this is a local
 trusted server, and the value is the same reasoning text `summarized` display shows. Count Tokens
-ignores `display`. `preserve_thinking` remains a NInfer extension for closed-turn reasoning
+ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
 history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
 
@@ -875,7 +875,7 @@ breakpoint at the same target and TTL, conflicts at the same target with a diffe
 an available fifth slot when four different explicit targets already exist. TTL must be `5m` or
 `1h`; it is a protocol hint, not a wall-clock residency guarantee.
 
-NInfer maps representable boundaries to exact prompt frontiers and ignores a legal but
+Infernix maps representable boundaries to exact prompt frontiers and ignores a legal but
 unrepresentable advisory boundary without changing the prompt. Reuse still requires exact rendered
 identity and can read an existing owner without another `cache_control`. Aggregate usage reports
 verified reused tokens in `cache_read_input_tokens` and leaves cache creation unknown. Streaming
@@ -1089,7 +1089,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
 | `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
-| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
+| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
 | `--device-state-slots N` | original: extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
@@ -1127,7 +1127,7 @@ context backing. `--no-prefix-reuse` disables cross-request history reads and wr
 original cache's manager disabled; pause/replay recovery remains available, and
 `--device-state-slots` and `--host-context-mib` may still be specified.
 
-Run `./build/apps/ninfer-serve --help` for the exact option contract.
+Run `./build/apps/infernix-serve --help` for the exact option contract.
 
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
@@ -1178,7 +1178,7 @@ call can be diagnosed from the console. The request JSONL records only the class
 `GET /metrics` serves Prometheus text format 0.0.4 on the same port. It follows the server's
 API-key authentication and works independently of `--request-log-jsonl` and
 `--log-stats-interval-ms`. Engine failure leaves the endpoint readable with
-`ninfer_engine_ready 0`. Counters start after startup warmup and reset when the server restarts.
+`infernix_engine_ready 0`. Counters start after startup warmup and reset when the server restarts.
 
 ```bash
 curl http://127.0.0.1:8080/metrics
@@ -1186,34 +1186,34 @@ curl http://127.0.0.1:8080/metrics
 
 | Metrics | Meaning |
 |---|---|
-| `ninfer_model_info`, `ninfer_max_concurrency`, `ninfer_max_context_tokens` | Model/backend identity and startup limits |
-| `ninfer_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
-| `ninfer_prompt_tokens_total`, `ninfer_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
-| `ninfer_prefill_tokens_total`, `ninfer_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
-| `ninfer_generation_tokens_total`, `ninfer_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
-| `ninfer_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
-| `ninfer_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
-| `ninfer_device_kv_{used,capacity}_pages`, `ninfer_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
-| `ninfer_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
-| `ninfer_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
-| `ninfer_host_work_seconds_total{phase}`, `ninfer_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
-| `ninfer_requests_total{outcome}`, `ninfer_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
-| `ninfer_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
-| `ninfer_request_duration_seconds`, `ninfer_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
+| `infernix_model_info`, `infernix_max_concurrency`, `infernix_max_context_tokens` | Model/backend identity and startup limits |
+| `infernix_requests_running`, `waiting`, `paused`, `prefilling`, `decode_ready`, `replaying`, `materializing` | Current Engine gauges; prefill/decode/replay are subsets of resident requests |
+| `infernix_prompt_tokens_total`, `infernix_prompt_tokens_cached_total` | Full input and reused tokens counted once on initial binding |
+| `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
+| `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
+| `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
+| `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
+| `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
+| `infernix_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
+| `infernix_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
+| `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
+| `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
+| `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
 Histograms expose `_bucket`, `_sum` and `_count`. Metrics have bounded labels; they do not retain
 request IDs or request text. Rates are calculated by the consumer, for example:
 
 ```promql
-rate(ninfer_generation_tokens_total[1m])
+rate(infernix_generation_tokens_total[1m])
 
-rate(ninfer_spec_decode_accepted_tokens_total[1m])
-/ rate(ninfer_spec_decode_draft_tokens_total[1m])
+rate(infernix_spec_decode_accepted_tokens_total[1m])
+/ rate(infernix_spec_decode_draft_tokens_total[1m])
 ```
 
 The handler copies published snapshots and formats them outside the Engine worker. Scraping does
 not reset counters or initiate device work. Detailed per-request records remain available through
-the JSONL log. Monitoring tools with engine-specific metric names need an NInfer adapter.
+the JSONL log. Monitoring tools with engine-specific metric names need an Infernix adapter.
 
 ## Structured request log
 
@@ -1234,7 +1234,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `ninfer_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v25 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1503,7 +1503,7 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. NInfer does not execute tools and does not enforce client JSON Schema through constrained
+responses. Infernix does not execute tools and does not enforce client JSON Schema through constrained
 decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes

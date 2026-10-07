@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <unordered_map>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 std::uint64_t fnv1a(std::string_view text) {
@@ -78,4 +78,4 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
     return static_cast<double>(covered) / static_cast<double>(kLoopWindowWords);
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -9,7 +9,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace infernix::serve;
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -17,7 +17,7 @@ int check(bool condition, const std::string& message) {
     return 1;
 }
 
-ChatTurn text_turn(ninfer::ChatRole role, std::string text) {
+ChatTurn text_turn(infernix::ChatRole role, std::string text) {
     ChatTurn turn;
     turn.role = role;
     ContentPart part;
@@ -41,11 +41,11 @@ StoredOpenAIResponse record(std::string id, OpenAIResponseContext context) {
 
 int test_context_dag() {
     const OpenAIResponseContext first =
-        append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "one"),
-                                            text_turn(ninfer::ChatRole::Assistant, "a")});
+        append_openai_response_context({}, {text_turn(infernix::ChatRole::User, "one"),
+                                            text_turn(infernix::ChatRole::Assistant, "a")});
     const OpenAIResponseContext second =
-        append_openai_response_context(first, {text_turn(ninfer::ChatRole::User, "two"),
-                                               text_turn(ninfer::ChatRole::Assistant, "b")});
+        append_openai_response_context(first, {text_turn(infernix::ChatRole::User, "two"),
+                                               text_turn(infernix::ChatRole::Assistant, "b")});
     const std::vector<ChatTurn> flattened = flatten_openai_response_context(second);
     int failures                          = 0;
     failures += check(flattened.size() == 4, "context chain flattened all turns");
@@ -58,14 +58,14 @@ int test_context_dag() {
 int test_lru_and_delete() {
     OpenAIResponsesStore store(2, 1ULL << 20);
     const OpenAIResponseContext root =
-        append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "root")});
+        append_openai_response_context({}, {text_turn(infernix::ChatRole::User, "root")});
     store.put(record("resp_1", root));
     const OpenAIResponseContext child =
-        append_openai_response_context(root, {text_turn(ninfer::ChatRole::Assistant, "child")});
+        append_openai_response_context(root, {text_turn(infernix::ChatRole::Assistant, "child")});
     store.put(record("resp_2", child));
     (void)store.get("resp_1"); // resp_2 becomes the least-recently used entry.
     store.put(record("resp_3", append_openai_response_context(
-                                   root, {text_turn(ninfer::ChatRole::User, "fork")})));
+                                   root, {text_turn(infernix::ChatRole::User, "fork")})));
 
     int failures = 0;
     failures += check(store.get("resp_1") != nullptr, "get refreshes LRU recency");
@@ -87,7 +87,7 @@ int test_oversized_record() {
     OpenAIResponsesStore store(4, 256);
     StoredOpenAIResponse large =
         record("resp_large", append_openai_response_context(
-                                 {}, {text_turn(ninfer::ChatRole::User, std::string(1024, 'x'))}));
+                                 {}, {text_turn(infernix::ChatRole::User, std::string(1024, 'x'))}));
     std::string code;
     try {
         store.put(std::move(large));

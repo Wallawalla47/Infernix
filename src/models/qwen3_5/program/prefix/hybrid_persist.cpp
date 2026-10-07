@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 namespace pc = runtime::prefix_cache;
 
@@ -421,4 +421,4 @@ HybridPersistResult HybridPrefixCache::load(const std::filesystem::path& path,
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

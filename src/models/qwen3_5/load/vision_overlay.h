@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 namespace loading {
 struct PendingWeight;
@@ -65,4 +65,4 @@ struct VisionOverlayAssets {
     const ModelWeights& weights, const std::vector<loading::PendingWeight>& pending,
     const artifact::MaterializationPlan& plan);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

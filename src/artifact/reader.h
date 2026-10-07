@@ -8,7 +8,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 struct ReadSegment {
     std::size_t file_index           = 0;
@@ -51,4 +51,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

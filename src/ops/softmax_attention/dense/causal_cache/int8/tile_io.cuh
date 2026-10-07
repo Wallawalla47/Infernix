@@ -8,7 +8,7 @@
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/int8/operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 __device__ __forceinline__ int4 int8_kv_dequant_f16x8(const std::int8_t* codes8, __half scale) {
     const int2 raw       = load_vec<int2>(codes8);
@@ -26,4 +26,4 @@ __device__ __forceinline__ int4 int8_kv_dequant_f16x8(const std::int8_t* codes8,
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

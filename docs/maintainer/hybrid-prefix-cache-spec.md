@@ -1,6 +1,6 @@
 # Hybrid prefix cache: design and decisions
 
-The hybrid prefix cache (HPC) is `ninfer-serve`'s default prefix-cache mode
+The hybrid prefix cache (HPC) is `infernix-serve`'s default prefix-cache mode
 (`ContextCacheOptions::mode = ContextCacheMode::Hybrid`). It reuses prompt prefixes through
 content-addressed 64-token KV blocks and sparse recurrent-state snapshots, kept on the Device and in
 one pinned Host tier. The original system
@@ -15,7 +15,7 @@ tests, configuration and risks; the [decision record](#16-decision-record) (§16
 taken while building and operating it, with the measurements behind them and the alternatives that
 were tried and reverted.
 
-Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
+Scope: an alternative to Infernix's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, K4V2,
 VQ2),
@@ -46,8 +46,8 @@ other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
-| §5 index, §9 eviction (device LRU, host superseded-first then GDSF, dead KV), §7.1 tap planner | implemented; host-only unit tests (`ninfer_prefix_cache_index_test`) |
-| §5.4 automatic Device sizing | implemented: in Hybrid mode the Main pool is not clamped to `C·L`, and `ninfer-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
+| §5 index, §9 eviction (device LRU, host superseded-first then GDSF, dead KV), §7.1 tap planner | implemented; host-only unit tests (`infernix_prefix_cache_index_test`) |
+| §5.4 automatic Device sizing | implemented: in Hybrid mode the Main pool is not clamped to `C·L`, and `infernix-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's binding transaction | implemented: staging reserves the first unit's Device pages and the state slot, Host restores run on a dedicated restore stream, and completion forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1). Later units reserve incrementally; preemption recovers by Replay (§9.5) |
 | §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
@@ -62,7 +62,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
-| §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
+| §13.3 real-artifact scenarios | `infernix_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `INFERNIX_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `infernix_ngram_concurrent_real` runs on Hybrid with `INFERNIX_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
 
 ## 0. Summary
 
@@ -146,7 +146,7 @@ addressable**.
 | LMCache | Layer-wise pipelined KV loading overlapped with compute. |
 | GreedyDual-Size-Frequency (Cherkasova, 1998) | Size- and cost-aware eviction with O(1) aging via an inflation value `L`. |
 
-NInfer-specific additions in the design (1 and 2 are not implemented, §7.2):
+Infernix-specific additions in the design (1 and 2 are not implemented, §7.2):
 
 1. The GDN **state tap**: chunked GDN already produces the state at every 64-token intra-chunk
    boundary, so exposing it costs one extra state write.
@@ -364,7 +364,7 @@ struct Snapshot {
   (transfer destination). `available = free + evictable_cached`.
 - **Main pool size**: automatic sizing keeps the capacity curve. In Hybrid mode the upper clamp
   `M_max = C·L` is removed (only the int32 token representation bounds it): pages beyond the active
-  leases are cache-only device capacity. `ninfer-serve` defaults `--kv-capacity` to `auto` in
+  leases are cache-only device capacity. `infernix-serve` defaults `--kv-capacity` to `auto` in
   Hybrid mode. Active admission still requires `M ≥ max(L, C)`.
 - **Device state pool**: `C` active slots plus `D = device_snapshot_slots` snapshot slots in the
   existing slot-indexed layout (`ssm_states [128,128,Hv,C+D]` per layer, and so on). Snapshot slots
@@ -386,18 +386,18 @@ struct Snapshot {
 
 ### 5.5 Persistence (opt-in)
 
-With `persistent_file` (`--prefix-cache-file`), the Host tier outlives the process. `ninfer-serve`
+With `persistent_file` (`--prefix-cache-file`), the Host tier outlives the process. `infernix-serve`
 resolves the path to an absolute one at launch. It rejects a directory, a missing parent
 directory, or `--host-cache-mib 0`, so an unusable location fails before any caching:
 
 - **Save**, in the worker's orderly stop, which `Engine::stop()` or the Engine's destruction
-  starts. `ninfer-serve` calls `stop()` on a confirmed Ctrl+C (a second press within 5 s,
+  starts. `infernix-serve` calls `stop()` on a confirmed Ctrl+C (a second press within 5 s,
   `serve/stop_control.h`), Ctrl+Break, `SIGTERM` or console close. Running and queued requests
   then fail as Unavailable at the next unit boundary instead of holding the stop until they
   finish; the worker answers them before the cleanup that saves, so no answer waits for the
   save. One more Ctrl+C exits at once without saving: through the shared
   `PrefixCacheSaveControl` (`HybridPrefixCacheOptions::persistent_save`) the save stops before
-  its next slab or before the rename, deletes its temporary file and ends, and `ninfer-serve`
+  its next slab or before the rename, deletes its temporary file and ends, and `infernix-serve`
   waits up to 2 s for that before exiting. A save not yet begun never begins, and one still in
   the Device drain is not waited for. The console-close handler blocks while `main` unwinds, but
   Windows ends the process about 5 s after a close, which leaves the temporary file until the
@@ -1103,8 +1103,8 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
 
 ## 13. Test specification
 
-The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache_index_test`,
-`ninfer_qwen3_5_hybrid_prefix_real_test`, see Status); §13.2 applies to the unimplemented Ops;
+The test design follows. §13.1 and §13.3 are implemented (`infernix_prefix_cache_index_test`,
+`infernix_qwen3_5_hybrid_prefix_real_test`, see Status); §13.2 applies to the unimplemented Ops;
 §13.4 was the acceptance plan, and §16 records what was measured.
 
 ### 13.1 Host-only unit tests (`tests/test_prefix_cache_index.cpp`)
@@ -1240,7 +1240,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
 
 struct ContextCacheOptions {
     bool enabled;
-    ContextCacheMode mode = ContextCacheMode::Original;   // ninfer-serve selects Hybrid by default
+    ContextCacheMode mode = ContextCacheMode::Original;   // infernix-serve selects Hybrid by default
     HybridPrefixCacheOptions hybrid;
     std::optional<std::uint32_t> device_state_slots;      // Original only (--device-state-slots)
     std::optional<std::size_t> host_capacity_bytes;       // --host-context-mib: Hybrid slab pool
@@ -1258,7 +1258,7 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | `max_new_taps` | 8 with a Host tier, 2 without | without Host, taps would evict other conversations' snapshots |
 | `tap_ladder_tokens` | `max(4096, 2·chunk)` | ladder taps land on chunk boundaries; a finer ladder only duplicates them |
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
-| KV capacity (`ninfer-serve`) | `--kv-capacity auto` unless given | free VRAM becomes Device block cache |
+| KV capacity (`infernix-serve`) | `--kv-capacity auto` unless given | free VRAM becomes Device block cache |
 
 `device_state_slots` is rejected in Hybrid mode: the extra Device StateImages are the snapshot
 slots.
@@ -1287,7 +1287,7 @@ that regressed another, was reverted and is recorded here with the reason.
 
 ### 16.1 Hybrid against Legacy
 
-`ninfer-serve --max-context 32768 --max-concurrency 2 --kv-dtype int8 --kv-capacity auto
+`infernix-serve --max-context 32768 --max-concurrency 2 --kv-dtype int8 --kv-capacity auto
 --prefill-chunk 2048 --host-cache-mib 12000`, plus `--use-original-prefix-caching` for Legacy, a
 fresh server per workload:
 
@@ -1307,7 +1307,7 @@ served 90.8% and 90.9% of prompt tokens from cache with no errors.
 
 1. **A second mode, not a replacement.** The owner asked for both systems to stay available, so
    Hybrid reuses the active-execution machinery and replaces only admission-source selection,
-   retention, capture and pressure (coexistence rules above). `ninfer-serve` defaults to Hybrid;
+   retention, capture and pressure (coexistence rules above). `infernix-serve` defaults to Hybrid;
    the Engine option default stays Legacy.
 2. **Snapshots copy the committed state at chunk boundaries; the zero-split GDN tap was not
    built.** A tap copies the lane's StateImage into a snapshot slot (about 0.25 ms D2D), so only
@@ -1446,7 +1446,7 @@ None of these were A/B tested; each is a correctness, behavior or log fix.
 | A Host tier that keeps none of the file's snapshots warns `prefix cache not restored` instead of `partly restored … the most valuable snapshots were kept` | §5.5 | A restore keeps only the blocks its snapshots resume through, so keeping no snapshot restores nothing, yet the line claimed the most valuable snapshots were kept; it now names the tier the file needs and that the save at shutdown replaces the file |
 | A Host restore's per-layer events are looked up immediately before the first prefill chunk, not before the MTP bridge | §6.5 | Reported by funguf (Wallawalla47/ninfer-custom pull request 2) with an AddressSanitizer trace and 9 production crashes in `cuStreamWaitEvent` in one day (`--spec mtp`, Host tier): the view was taken before the MTP bridge, whose KV commit polls the cache, and a batch that had landed meanwhile was freed under it, so the first chunk waited on whatever the freed memory held. The report's fix copied the handles into the prefill context; looking them up at the chunk instead never hands CUDA an event the cache has recycled, needs no allocation, and skips the waits once the copies are complete. DFlash2 and no-speculation lanes run no bridge and were not exposed |
 | The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
-| A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
+| A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `infernix-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
 | One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |
 | A cancellation, and a failed admission's rollback, wait for the Device before the lane's pages, state image and execution row return to the pools or move into the index (2026-10-01, upstream `75a89050`) | §7.7 | A non-final prefill step returns without waiting, so a cancel can arrive with the lane's next chunk still queued. The block-table shadow already waited for its own queued copies; the wait now covers everything the lane releases. Not reproduced as a failure. The `cancel-prefill` and `cancel-prefill-dflash2` real scenarios cancel after the first reported chunk (the cancel landed at 1,024 of 3,172 prompt tokens): the lane's next request matches a run without the cancellation, and a request extending the cancelled prompt resumes from its published prefix and matches an uncached run |
 

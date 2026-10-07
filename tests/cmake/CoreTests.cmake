@@ -1,87 +1,87 @@
 # This target deliberately receives no src/, CUDA, artifact, kernel, or target
 # include root. It proves that the public product headers stand alone.
-add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")
-target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_executable(infernix_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")
+target_include_directories(infernix_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 # It links the public Engine, as a consumer does, for the out-of-line definitions the options
-# own (PrefixCacheSaveControl); ninfer::engine exports only the include/ root.
-target_link_libraries(ninfer_public_api_test PRIVATE ninfer::engine)
-add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
+# own (PrefixCacheSaveControl); infernix::engine exports only the include/ root.
+target_link_libraries(infernix_public_api_test PRIVATE infernix::engine)
+add_test(NAME infernix_public_api_test COMMAND infernix_public_api_test)
 
-ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
+  LIBRARIES infernix_core)
 
 # Asynchronous unbuffered reads for the SSD expert tier (CPU and disk only).
-ninfer_add_test(ninfer_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_read_queue.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_direct_read_queue_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_direct_read_queue.cpp"
+  LIBRARIES infernix_core)
 
 # Unbuffered block reads through a ring (CPU and disk only).
-ninfer_add_test(ninfer_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_read_only_file_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_read_only_file.cpp"
+  LIBRARIES infernix_core)
 
-set_tests_properties(ninfer_device_test PROPERTIES
-  ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")
+set_tests_properties(infernix_device_test PROPERTIES
+  ENVIRONMENT_MODIFICATION "INFERNIX_CUDA_SYNC=unset:")
 set(sync_modes spin blocking yield auto)
 set(sync_flags 1 4 2 0)
 foreach(mode flags IN ZIP_LISTS sync_modes sync_flags)
-  add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test ${flags})
-  set_tests_properties(ninfer_device_sync_${mode}_test PROPERTIES
-    ENVIRONMENT "NINFER_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
+  add_test(NAME infernix_device_sync_${mode}_test COMMAND infernix_device_test ${flags})
+  set_tests_properties(infernix_device_sync_${mode}_test PROPERTIES
+    ENVIRONMENT "INFERNIX_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
 endforeach()
 foreach(mode IN ITEMS invalid empty)
-  add_test(NAME ninfer_device_sync_${mode}_test COMMAND ninfer_device_test --invalid-sync)
+  add_test(NAME infernix_device_sync_${mode}_test COMMAND infernix_device_test --invalid-sync)
 endforeach()
-set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
-  ENVIRONMENT "NINFER_CUDA_SYNC=invalid")
-set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
-  ENVIRONMENT "NINFER_CUDA_SYNC=")
+set_tests_properties(infernix_device_sync_invalid_test PROPERTIES
+  ENVIRONMENT "INFERNIX_CUDA_SYNC=invalid")
+set_tests_properties(infernix_device_sync_empty_test PROPERTIES
+  ENVIRONMENT "INFERNIX_CUDA_SYNC=")
 
-ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_tensor.cpp"
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
-  LIBRARIES ninfer_core)
+infernix_add_test(infernix_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_kv_cache_test
+infernix_add_test(infernix_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_copy_batch_test
+infernix_add_test(infernix_copy_batch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_copy_batch.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_host_context_arena_test
+infernix_add_test(infernix_host_context_arena_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_state_store_test
+infernix_add_test(infernix_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_gdn_replay_records_test
+infernix_add_test(infernix_gdn_replay_records_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
 set_tests_properties(
-  ninfer_device_test
-  ninfer_decode_graph_test
-  ninfer_arena_test
-  ninfer_copy_batch_test
-  ninfer_kv_cache_test
-  ninfer_host_context_arena_test
-  ninfer_state_store_test
+  infernix_device_test
+  infernix_decode_graph_test
+  infernix_arena_test
+  infernix_copy_batch_test
+  infernix_kv_cache_test
+  infernix_host_context_arena_test
+  infernix_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_test(ninfer_host_timing_test
+infernix_add_test(infernix_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
-  LIBRARIES ninfer_core)
+  LIBRARIES infernix_core)
 
-ninfer_add_test(ninfer_jinja_test
+infernix_add_test(infernix_jinja_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../text/test_jinja.cpp"
-  LIBRARIES ninfer_jinja ninfer::json)
+  LIBRARIES infernix_jinja infernix::json)
 
-add_test(NAME ninfer_chat_templates_test
+add_test(NAME infernix_chat_templates_test
   COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_chat_templates.py
-          $<TARGET_FILE:ninfer_jinja_test>)
+          $<TARGET_FILE:infernix_jinja_test>)

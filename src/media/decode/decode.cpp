@@ -32,7 +32,7 @@ extern "C" {
 #include <utility>
 #include <vector>
 
-namespace ninfer::media::decode {
+namespace infernix::media::decode {
 namespace {
 
 std::string av_error(int code) {
@@ -647,7 +647,7 @@ void forward_library_log(void* context, int level, const char* format, std::va_l
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-#ifdef NINFER_MEDIA_NATIVE_PNG
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
         return png_image_info(bytes, policy.max_decoded_pixels);
     }
@@ -695,7 +695,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (policy.checkpoint) { policy.checkpoint(); }
     // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
     // native path decodes png directly so those builds accept png images too.
-#ifdef NINFER_MEDIA_NATIVE_PNG
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
     if (is_png(bytes)) {
         return decode_png(bytes, policy.max_decoded_pixels);
     }
@@ -753,4 +753,4 @@ LibraryLogHandler set_library_log_handler(LibraryLogHandler handler) {
     return previous ? *previous : LibraryLogHandler{};
 }
 
-} // namespace ninfer::media::decode
+} // namespace infernix::media::decode

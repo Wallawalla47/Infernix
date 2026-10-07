@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int Tokens, int Warps, int Stages>
 using Nvfp4SlicedInstance =
     Nvfp4A16SlicedKMmaSchedule<Warps, Tokens,
@@ -11,4 +11,4 @@ using Nvfp4SlicedInstance =
                                     ? 2
                                     : 1),
                                Cache::ca, Cache::cg, Nvfp4ActivationStage::PaddedZero, Stages>;
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

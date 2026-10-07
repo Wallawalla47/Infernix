@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 constexpr std::int32_t kTileN         = 32;
 constexpr std::int32_t kTileT         = 32;
 constexpr std::int32_t kTileK         = 32;
@@ -91,4 +91,4 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

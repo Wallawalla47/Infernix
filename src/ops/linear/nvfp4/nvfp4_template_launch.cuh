@@ -9,7 +9,7 @@
 #include "ops/linear/nvfp4/nvfp4_a16_sliced_k_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_a4_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue epilogue,
                            cudaStream_t stream, Rows rows = {}) {
@@ -119,4 +119,4 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             launch.template operator()<false>();
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

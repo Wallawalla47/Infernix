@@ -1,12 +1,12 @@
 // Qwen4Exp forward on the real converted artifact, against the independent FP64 reference
-// (tools/flash_next/reference.py). Skips unless NINFER_QWEN4_ARTIFACT names a Qwen4Exp artifact.
+// (tools/flash_next/reference.py). Skips unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
-//   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram]
-//   ninfer_qwen4_exp_forward_real_test TOKENS [--kv KV] [--logits OUT.bin] [--residuals OUT.bin]
+//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram]
+//   infernix_qwen4_exp_forward_real_test TOKENS [--kv KV] [--logits OUT.bin] [--residuals OUT.bin]
 //       [--routes OUT.bin] [--blocks OUT.bin]
-//   ninfer_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV]
 //       [--dump-from P] [TOKENS --dump-logits OUT.bin [--chunk N] [--kv KV] [--dump-from P]]...
-//   ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
+//   infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns [--kv KV]
 //
 // KV is a KV-cache storage: bf16 (default), int8, fp8, nvfp4 or k8v4.
 //
@@ -69,8 +69,8 @@
 #include <psapi.h>
 #endif
 
-using namespace ninfer;
-namespace q4 = ninfer::models::qwen4_exp;
+using namespace infernix;
+namespace q4 = infernix::models::qwen4_exp;
 
 namespace {
 
@@ -364,7 +364,7 @@ std::vector<int> top(const std::vector<float>& v, std::size_t offset, std::size_
 bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContext& device,
                        const q4::NgramVolume& volume, const std::vector<std::int32_t>& tokens,
                        std::int32_t context, KvCacheStorage kv) {
-    namespace moe               = ninfer::ops::offloaded_moe;
+    namespace moe               = infernix::ops::offloaded_moe;
     const auto& c               = parameters.model.config().text;
     const auto n                = static_cast<std::int32_t>(tokens.size());
     const std::int32_t widths[] = {1, 2, 5, moe::kMaxCpuColumns, 24, 100};
@@ -453,9 +453,9 @@ bool check_cpu_columns(const q4::execution::Parameters& parameters, DeviceContex
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact_env = std::getenv("NINFER_QWEN4_ARTIFACT");
+    const char* artifact_env = std::getenv("INFERNIX_QWEN4_ARTIFACT");
     if (artifact_env == nullptr || argc < 2) {
-        std::printf("SKIP: set NINFER_QWEN4_ARTIFACT and pass a token list\n");
+        std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT and pass a token list\n");
         return 77;
     }
     // Each token list takes the options that follow it.
@@ -508,7 +508,7 @@ int main(int argc, char** argv) {
                 job.dump_from = std::stoi(value);
                 if (job.dump_from < 0) { throw std::invalid_argument("--dump-from must not be negative"); }
             } else if (arg == "--kv") {
-                job.kv = ninfer::test::parse_kv_cache_storage(value);
+                job.kv = infernix::test::parse_kv_cache_storage(value);
             } else {
                 throw std::invalid_argument("unknown option " + arg);
             }
@@ -536,7 +536,7 @@ int main(int argc, char** argv) {
         const q4::execution::Parameters parameters(*model);
         print_memory("parameters");
         const auto& c = model->config().text;
-        const char* ngram_env = std::getenv("NINFER_QWEN4_NGRAM");
+        const char* ngram_env = std::getenv("INFERNIX_QWEN4_NGRAM");
         const q4::NgramVolume volume(ngram_env != nullptr ? std::filesystem::path(ngram_env)
                                                           : q4::default_ngram_volume(artifact_env),
                                      c.ple.table);

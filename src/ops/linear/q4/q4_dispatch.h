@@ -1,12 +1,12 @@
 #pragma once
 
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 #include "ops/linear/q4/q4_launch.h"
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t);
 Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy);
@@ -14,4 +14,4 @@ Q4Launch select_q4_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

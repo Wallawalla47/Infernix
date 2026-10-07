@@ -9,7 +9,7 @@
 
 namespace {
 
-using namespace ninfer::models::qwen3_5;
+using namespace infernix::models::qwen3_5;
 
 int failures = 0;
 

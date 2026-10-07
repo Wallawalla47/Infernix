@@ -1,10 +1,10 @@
 #pragma once
 
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/instances.h"
 #include "ops/softmax_attention/dense/causal_cache/bf16/split_policy.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Bf16KvCausalPlan {
     Bf16KvInstance instance;
@@ -24,4 +24,4 @@ std::size_t bf16_kv_workspace_bytes(int query_heads, int batch, int min_width, i
                                     CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

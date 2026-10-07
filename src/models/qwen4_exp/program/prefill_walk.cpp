@@ -23,7 +23,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp::detail {
+namespace infernix::models::qwen4_exp::detail {
 
 namespace {
 
@@ -341,4 +341,4 @@ void ProgramImpl::walk_abandon() noexcept {
     walk_prefetch_ = WalkPrefetch{};
 }
 
-} // namespace ninfer::models::qwen4_exp::detail
+} // namespace infernix::models::qwen4_exp::detail

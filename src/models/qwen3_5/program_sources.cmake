@@ -1,4 +1,4 @@
-target_sources(ninfer_model_runtime PRIVATE
+target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ngram.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/decoder_state.cpp"

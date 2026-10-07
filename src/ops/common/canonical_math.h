@@ -13,16 +13,16 @@
 #include <cstring>
 
 #if defined(__CUDACC__)
-#    define NINFER_CANON_HD __host__ __device__ __forceinline__
+#    define INFERNIX_CANON_HD __host__ __device__ __forceinline__
 #else
-#    define NINFER_CANON_HD inline
+#    define INFERNIX_CANON_HD inline
 #endif
 
-namespace ninfer::ops::canon {
+namespace infernix::ops::canon {
 
 // ---------------------------------------------------------------------------- IEEE helpers
 
-NINFER_CANON_HD std::uint32_t f32_bits(float x) {
+INFERNIX_CANON_HD std::uint32_t f32_bits(float x) {
 #if defined(__CUDA_ARCH__)
     return __float_as_uint(x);
 #else
@@ -32,7 +32,7 @@ NINFER_CANON_HD std::uint32_t f32_bits(float x) {
 #endif
 }
 
-NINFER_CANON_HD float f32_from_bits(std::uint32_t u) {
+INFERNIX_CANON_HD float f32_from_bits(std::uint32_t u) {
 #if defined(__CUDA_ARCH__)
     return __uint_as_float(u);
 #else
@@ -42,7 +42,7 @@ NINFER_CANON_HD float f32_from_bits(std::uint32_t u) {
 #endif
 }
 
-NINFER_CANON_HD float mul_rn(float a, float b) {
+INFERNIX_CANON_HD float mul_rn(float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fmul_rn(a, b);
 #else
@@ -50,7 +50,7 @@ NINFER_CANON_HD float mul_rn(float a, float b) {
 #endif
 }
 
-NINFER_CANON_HD float add_rn(float a, float b) {
+INFERNIX_CANON_HD float add_rn(float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fadd_rn(a, b);
 #else
@@ -58,7 +58,7 @@ NINFER_CANON_HD float add_rn(float a, float b) {
 #endif
 }
 
-NINFER_CANON_HD float div_rn(float a, float b) {
+INFERNIX_CANON_HD float div_rn(float a, float b) {
 #if defined(__CUDA_ARCH__)
     return __fdiv_rn(a, b);
 #else
@@ -66,7 +66,7 @@ NINFER_CANON_HD float div_rn(float a, float b) {
 #endif
 }
 
-NINFER_CANON_HD float fma_rn(float a, float b, float c) {
+INFERNIX_CANON_HD float fma_rn(float a, float b, float c) {
 #if defined(__CUDA_ARCH__)
     return __fmaf_rn(a, b, c);
 #else
@@ -75,7 +75,7 @@ NINFER_CANON_HD float fma_rn(float a, float b, float c) {
 }
 
 // Round-to-nearest-even conversion of an int64 to binary32.
-NINFER_CANON_HD float i64_to_f32_rn(std::int64_t v) {
+INFERNIX_CANON_HD float i64_to_f32_rn(std::int64_t v) {
 #if defined(__CUDA_ARCH__)
     return __ll2float_rn(v);
 #else
@@ -84,16 +84,16 @@ NINFER_CANON_HD float i64_to_f32_rn(std::int64_t v) {
 }
 
 // Round-to-nearest-even integer of a binary32 with |x| < 2^22.
-NINFER_CANON_HD float rint_rn(float x) {
+INFERNIX_CANON_HD float rint_rn(float x) {
     const float magic = 12582912.0F; // 1.5 * 2^23
     return add_rn(add_rn(x, magic), -magic);
 }
 
-NINFER_CANON_HD float bf16_to_f32(std::uint16_t h) { return f32_from_bits(std::uint32_t{h} << 16); }
+INFERNIX_CANON_HD float bf16_to_f32(std::uint16_t h) { return f32_from_bits(std::uint32_t{h} << 16); }
 
 // Round-to-nearest-even binary32 -> bfloat16. Every NaN becomes the canonical quiet NaN 0x7FC0:
 // NaN payloads and signs differ between x86 and CUDA arithmetic, so they are not part of the bits.
-NINFER_CANON_HD std::uint16_t f32_to_bf16_rn(float x) {
+INFERNIX_CANON_HD std::uint16_t f32_to_bf16_rn(float x) {
     const std::uint32_t u = f32_bits(x);
     if ((u & 0x7FFFFFFFU) > 0x7F800000U) { return 0x7FC0U; }
     const std::uint32_t lsb = (u >> 16) & 1U;
@@ -106,7 +106,7 @@ NINFER_CANON_HD std::uint16_t f32_to_bf16_rn(float x) {
 // magnitudes are the bytes of a constant, selected by one byte permute on the device and a shift
 // on the host: an indexed array would live in local memory on the device and turn every lookup
 // into a stack store and load.
-NINFER_CANON_HD int e2m1_x2(unsigned code) {
+INFERNIX_CANON_HD int e2m1_x2(unsigned code) {
 #if defined(__CUDA_ARCH__)
     const int mag = static_cast<int>(__byte_perm(0x03020100U, 0x0C080604U, code & 7U));
 #else
@@ -131,21 +131,21 @@ __device__ __forceinline__ std::uint32_t e2m1_x2_quad(std::uint32_t codes) {
 
 // E4M3FN value times 2^9 for a non-negative scale word (sign bit ignored): an integer in
 // [0, 229376]. Words 0x7F (NaN) are rejected by the format validators and never reach here.
-NINFER_CANON_HD std::int32_t e4m3_scaled(unsigned word) {
+INFERNIX_CANON_HD std::int32_t e4m3_scaled(unsigned word) {
     const unsigned e = (word >> 3) & 15U;
     const unsigned m = word & 7U;
     return e == 0 ? static_cast<std::int32_t>(m) : static_cast<std::int32_t>((8U + m) << (e - 1U));
 }
 
 // Exact binary32 value of a non-negative E4M3FN word.
-NINFER_CANON_HD float e4m3_value(unsigned word) {
+INFERNIX_CANON_HD float e4m3_value(unsigned word) {
     // e4m3_scaled < 2^18 is exact in binary32, and the power-of-two scale is exact.
     return mul_rn(static_cast<float>(e4m3_scaled(word)), 1.0F / 512.0F);
 }
 
 // E4M3FN encode of a non-negative binary32 with round-to-nearest-even and saturation to 448
 // (the semantics of cvt.rn.satfinite.e4m3x2.f32). NaN encodes to 0x7F.
-NINFER_CANON_HD std::uint8_t e4m3_rn_satfinite(float x) {
+INFERNIX_CANON_HD std::uint8_t e4m3_rn_satfinite(float x) {
     const std::uint32_t u = f32_bits(x) & 0x7FFFFFFFU;
     if (u > 0x7F800000U) { return 0x7F; }
     if (u >= 0x43E00000U) { return 0x7E; } // >= 448 (and +inf)
@@ -176,7 +176,7 @@ NINFER_CANON_HD std::uint8_t e4m3_rn_satfinite(float x) {
 // E2M1 encode with round-to-nearest-even onto {0, 0.5, 1, 1.5, 2, 3, 4, 6} and saturation to 6
 // (the semantics of cvt.rn.satfinite.e2m1x2.f32). The sign of x, including -0, sets bit 3.
 // Callers never pass NaN: the quantizer divides finite BF16 activations by a positive scale.
-NINFER_CANON_HD std::uint8_t e2m1_rn_satfinite(float x) {
+INFERNIX_CANON_HD std::uint8_t e2m1_rn_satfinite(float x) {
     const std::uint32_t bits = f32_bits(x);
     const unsigned sign      = (bits >> 31) != 0 ? 8U : 0U;
     const float a            = f32_from_bits(bits & 0x7FFFFFFFU);
@@ -214,7 +214,7 @@ struct A4Block {
 
 // ModelOpt's NVFP4 activation rule in exact IEEE binary32 (design §16.2):
 //   s = e4m3_rn_satfinite(amax / fl(6 g));  d = fl(e4m3(s) g);  code_j = e2m1_rn_satfinite(v_j / d)
-NINFER_CANON_HD A4Block quantize_a4_block(const std::uint16_t* v_bf16, float input_scale) {
+INFERNIX_CANON_HD A4Block quantize_a4_block(const std::uint16_t* v_bf16, float input_scale) {
     A4Block out{};
     float amax = 0.0F;
     for (int j = 0; j < 16; ++j) {
@@ -239,7 +239,7 @@ NINFER_CANON_HD A4Block quantize_a4_block(const std::uint16_t* v_bf16, float inp
 // ---------------------------------------------------------------------------- epilogues
 
 // y = bf16_rn((fl32_rn(S) * 2^-20) * alpha); the scaling by 2^-20 is exact.
-NINFER_CANON_HD std::uint16_t a4_row_output(std::int64_t s, float alpha) {
+INFERNIX_CANON_HD std::uint16_t a4_row_output(std::int64_t s, float alpha) {
     return f32_to_bf16_rn(mul_rn(mul_rn(i64_to_f32_rn(s), 1.0F / 1048576.0F), alpha));
 }
 
@@ -249,7 +249,7 @@ inline constexpr std::uint32_t kCanonicalNan = 0x7FC00000U;
 
 // exp(x) with Cody-Waite reduction and a fixed degree-7 Taylor polynomial evaluated by explicit fma.
 // Overflow returns +inf, deep underflow +0, and NaN the canonical NaN.
-NINFER_CANON_HD float exp_c(float x) {
+INFERNIX_CANON_HD float exp_c(float x) {
     if (x != x) { return f32_from_bits(kCanonicalNan); }
     if (x > 88.72283935546875F) { return f32_from_bits(0x7F800000U); }
     if (x < -103.97208404541015625F) { return 0.0F; }
@@ -276,7 +276,7 @@ NINFER_CANON_HD float exp_c(float x) {
 // SiLU(g) on a binary32, in the form that never overflows exp:
 //   g >= 0: g / (1 + exp_c(-g));   g < 0: (g * e) / (1 + e), e = exp_c(g).
 // A NaN result (a NaN input, or -inf * 0 at g = -inf) is the canonical NaN.
-NINFER_CANON_HD float silu_c(float g) {
+INFERNIX_CANON_HD float silu_c(float g) {
     float r;
     if (g >= 0.0F) {
         r = div_rn(g, add_rn(1.0F, exp_c(-g)));
@@ -288,7 +288,7 @@ NINFER_CANON_HD float silu_c(float g) {
 }
 
 // SiLU(g) * u on BF16 inputs, rounded to BF16: bf16_rn(silu_c(g) * u).
-NINFER_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16_t up_bf16) {
+INFERNIX_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16_t up_bf16) {
     return f32_to_bf16_rn(mul_rn(silu_c(bf16_to_f32(gate_bf16)), bf16_to_f32(up_bf16)));
 }
 
@@ -298,12 +298,12 @@ NINFER_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16_t
 // words that the block-scaled tensor-core (wide) route consumes instead of their doubled values.
 // For every block, the scale word equals quantize_a4_block's and e2m1_x2(code[j]) equals its
 // c2[j]; a block whose scale encodes to zero has all-zero codes.
-NINFER_CANON_HD std::uint8_t a4_scale_word(float amax, float input_scale) {
+INFERNIX_CANON_HD std::uint8_t a4_scale_word(float amax, float input_scale) {
     return e4m3_rn_satfinite(div_rn(amax, mul_rn(6.0F, input_scale)));
 }
 
 // The code of one element v of a block with a nonzero scale word s.
-NINFER_CANON_HD std::uint8_t a4_code(float v, std::uint8_t scale_word, float input_scale) {
+INFERNIX_CANON_HD std::uint8_t a4_code(float v, std::uint8_t scale_word, float input_scale) {
     return e2m1_rn_satfinite(div_rn(v, mul_rn(e4m3_value(scale_word), input_scale)));
 }
 
@@ -312,7 +312,7 @@ struct A4Codes {
     std::uint8_t scale_word;
 };
 
-NINFER_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float input_scale) {
+INFERNIX_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float input_scale) {
     A4Codes out{};
     float amax = 0.0F;
     for (int j = 0; j < 16; ++j) {
@@ -325,6 +325,6 @@ NINFER_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float inp
     return out;
 }
 
-} // namespace ninfer::ops::canon
+} // namespace infernix::ops::canon
 
-#undef NINFER_CANON_HD
+#undef INFERNIX_CANON_HD

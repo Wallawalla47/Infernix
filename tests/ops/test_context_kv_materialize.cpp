@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/context_kv_materialize.h"
+#include "infernix/ops/context_kv_materialize.h"
 
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
@@ -17,8 +17,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

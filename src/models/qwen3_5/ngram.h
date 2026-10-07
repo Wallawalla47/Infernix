@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 // Per-request views, independent of the archive's retained per-session source limit.
 inline constexpr std::size_t kNgramRequestSourceCapacity = 1024;
@@ -101,4 +101,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

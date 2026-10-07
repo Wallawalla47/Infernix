@@ -2,7 +2,7 @@
 #include "ops/common/math.cuh"
 #include "ops/linear/common/output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule>
 struct SwiGluRowMajorMmaRows {
     static constexpr bool kPaired          = true;
@@ -128,4 +128,4 @@ struct SwiGluRowMajorMmaEpilogue {
         }
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

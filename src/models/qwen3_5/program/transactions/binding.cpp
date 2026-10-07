@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 void ProgramImpl::initialize_captures(std::uint32_t lane, std::uint32_t from,
                                       std::uint32_t through) {
@@ -637,4 +637,4 @@ void ProgramImpl::complete_binding(ContextTransaction& tx, ContextProgress& out)
     out.replaying           = requests[tx.lane].lifecycle == Lifecycle::Replaying;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

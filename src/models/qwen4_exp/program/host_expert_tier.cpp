@@ -12,7 +12,7 @@
 #    include <immintrin.h>
 #endif
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -447,4 +447,4 @@ void HostExpertTier::agent_main() {
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

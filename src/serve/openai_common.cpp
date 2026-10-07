@@ -11,7 +11,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 namespace {
 
@@ -157,17 +157,17 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
             explicit_boundaries[index]->reset();
         } else {
             explicit_boundaries[index]->value().kind =
-                ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+                infernix::PromptCacheMarkerKind::SharedStablePrefix;
             explicit_boundaries[index]->value().evidence =
-                ninfer::SharedCandidateEvidence::ExplicitBoundary;
+                infernix::SharedCandidateEvidence::ExplicitBoundary;
         }
     }
 
     if (automatic_enabled) {
-        const ninfer::SharedCandidateEvidence evidence =
+        const infernix::SharedCandidateEvidence evidence =
             policy.automatic == OpenAIPromptCacheAutomatic::Default
-                ? ninfer::SharedCandidateEvidence::DefaultAutomatic
-                : ninfer::SharedCandidateEvidence::RequestedAutomatic;
+                ? infernix::SharedCandidateEvidence::DefaultAutomatic
+                : infernix::SharedCandidateEvidence::RequestedAutomatic;
         if (*automatic_target) {
             automatic_target->value().evidence |= evidence;
         } else {
@@ -190,7 +190,7 @@ Json make_model_object_json(const std::string& model_id, std::int64_t created,
     return Json{{"id", model_id},
                 {"object", "model"},
                 {"created", created},
-                {"owned_by", "ninfer"},
+                {"owned_by", "infernix"},
                 {"max_model_len", max_model_len},
                 {"meta",
                  Json{{"n_vocab", metadata.vocab_size},
@@ -255,4 +255,4 @@ std::string new_openai_response_item_id(std::string_view prefix) {
     return responses_identifier(prefix);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

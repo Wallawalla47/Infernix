@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 
@@ -306,4 +306,4 @@ void linear_topk_fp8_m64_launch(const Tensor& hidden, const Weight& head, std::i
     }
     throw std::invalid_argument("invalid linear_topk MMA tile");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

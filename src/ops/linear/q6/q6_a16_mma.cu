@@ -2,7 +2,7 @@
 #include "ops/linear/q6/q6_mma_launch.cuh"
 #include "ops/linear/q6/q6_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void launch_q6_a16_mma_r64_t40_k128(const Tensor& x, const Weight& weight, Tensor& out,
                                     cudaStream_t stream) {
@@ -81,4 +81,4 @@ void launch_q6_a16_mma_r64_t112(const Tensor& x, const Weight& weight, Tensor& o
                                                            LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

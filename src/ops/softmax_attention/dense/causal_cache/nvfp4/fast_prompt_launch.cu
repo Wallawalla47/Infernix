@@ -4,7 +4,7 @@
 #include "ops/softmax_attention/common/nvfp4_tiled_values.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void nvfp4_kv_fast_prompt_attention(const CausalAttentionOperands& p, Nvfp4KvReadView cache,
                                     CausalAttentionExecutionEnvelope envelope,
                                     WorkspaceArena& workspace, DeviceExecutionView execution) {
@@ -27,4 +27,4 @@ void nvfp4_kv_fast_prompt_attention(const CausalAttentionOperands& p, Nvfp4KvRea
     else
         invoke.template operator()<CausalD256H16Kv2>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

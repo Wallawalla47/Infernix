@@ -5,14 +5,14 @@
 // the responder's half of the protocol. One responder thread (the tier's agent) calls every
 // method except channel(); the device publishes at most one request at a time.
 
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_request.h"
 
 #include <cstdint>
 #include <span>
 #include <vector>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 class FetchChannel {
 public:
@@ -58,4 +58,4 @@ private:
     std::vector<std::uint8_t> arrived_;
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

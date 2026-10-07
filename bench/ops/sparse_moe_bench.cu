@@ -2,13 +2,13 @@
 //
 // The benchmark deliberately knows nothing about decode, small-T, prefill,
 // private plans, or kernel candidates. Production dispatch remains entirely
-// behind ninfer::ops::sparse_moe().
+// behind infernix::ops::sparse_moe().
 
 #include "core/weight.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -850,7 +850,7 @@ int main(int argc, char** argv) {
         write_csv(options.csv_out, results, options, context);
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_sparse_moe_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_sparse_moe_bench: %s\n", error.what());
         return 1;
     }
 }

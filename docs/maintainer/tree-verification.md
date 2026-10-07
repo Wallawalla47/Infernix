@@ -38,7 +38,7 @@ token at position F); every other column c has `parent[c] < c` and
    columns c_i satisfy either `c_i = i` (main) or `c_i > K >= i`, so copying accepted side columns
    onto positions `i` never reads a slot the same copy writes ([Compaction](#compaction)).
 
-The builder publishes one `ops::SpeculativeTreeRow` per row (`include/ninfer/ops/speculative_tree.h`):
+The builder publishes one `ops::SpeculativeTreeRow` per row (`include/infernix/ops/speculative_tree.h`):
 parents, depths, children in draw order (`first_child`, `next_sibling`, `sibling_index`), the
 root-to-leaf paths in leaf column order with the first column each path owns (`owned_from`; a
 column belongs to the first path that contains it), the live column count and whether the row is
@@ -278,7 +278,7 @@ with the most tokens per second in each bucket (16 columns at short context, the
 columns cost more, 12 columns when it pays most) with the widest width explored every 32 rounds,
 and a single twentyfold timing spike does not change the choice.
 
-Real model (`NINFER_TEST_ARTIFACT`, see `tests/README.md`):
+Real model (`INFERNIX_TEST_ARTIFACT`, see `tests/README.md`):
 
 6. `test_engine_dflash2_real` with a tree table or `auto` runs the DFlash2 Engine fixture
    (budgets, stops inside a licensed block, penalties, same-seed replay for fixed tables, prefix
@@ -367,7 +367,7 @@ spread of the changes is the text.
 leaves, so 15 % of the rounds leave the main chain against 20-23 % with three or more. Eight paths
 cost no more per round than four, so the default is the maximum.
 
-**Where a round's time goes.** Nsight Systems (`--cuda-graph-trace node`) on `ninfer-serve`
+**Where a round's time goes.** Nsight Systems (`--cuda-graph-trace node`) on `infernix-serve`
 during the decode-saturation suite with one, two and four requests (DFlash2 K=7, INT8 KV, no
 n-gram so every round is a tree round, 2-4K tokens of context, 5 s windows of 140-320 rounds),
 wall time per round with overlapping kernels charged once, against chain rounds of the same build:
@@ -390,7 +390,7 @@ format), the builder, input preparation, acceptance and compaction (0.08-0.19 ms
 the walk), and at four requests the LM head over 48 columns (1.05 against 0.75 ms; 1.17 ms before
 its sliced-K route was extended to 64 columns).
 
-**Long context.** The suite above runs at 0-9K tokens of context. Greedy `ninfer_bench -pg P,512` on
+**Long context.** The suite above runs at 0-9K tokens of context. Greedy `infernix_bench -pg P,512` on
 the bench corpus (INT8 KV, neural rounds only, one request) gives the extra round time against the
 chain: 12 columns +6.6, +11.2 and +17.1 % at 16K, 64K and 128K, 16 columns +10.0, +14.7 and +20.3 %.
 The corpus is too predictable under greedy decoding (6.9-7.6 tokens per round) for a tree to add
@@ -427,7 +427,7 @@ verify trees in 95-99 % of the rounds instead of 14-56 %.
 
 **Automatic widths at long context.** One request, sampled (thinking on, the model's default
 sampling), 3072 output tokens after a 32K, 64K or 128K-token document (`long_niah` haystacks with a
-request for a long critical essay), INT8 KV, DFlash2 K=7 without n-gram, one fresh `ninfer`
+request for a long critical essay), INT8 KV, DFlash2 K=7 without n-gram, one fresh `infernix`
 process per run, two seeds. The text differs between runs, so each run is reported by its
 same-text estimate (its side-branch drafts against the chain's measured round time, the mean of
 its two runs):

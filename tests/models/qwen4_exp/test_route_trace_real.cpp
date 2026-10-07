@@ -3,10 +3,10 @@
 // token ids to equal a run with the trace off (the hook is bit-neutral), and checks the trace
 // against the requests. The trace feeds tools/expert_cache_replay/host_tier.py; its graph records
 // give the device memory of each CUDA graph executable (measurement RM0d). Skips (77) unless
-// NINFER_QWEN4_ARTIFACT names a Qwen4Exp artifact.
+// INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
-//   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram]
-//   ninfer_qwen4_exp_route_trace_real_test PROMPTS.json TRACE.bin [--max-context N] [--mtp K]
+//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram]
+//   infernix_qwen4_exp_route_trace_real_test PROMPTS.json TRACE.bin [--max-context N] [--mtp K]
 //       [--ngram N] [--concurrency C] [--single-pass] [--ids-out FILE] [--ids-expect FILE]
 //
 // PROMPTS.json is a list of {"name", "max_tokens", "thinking", "messages": [{"role", "content"}]}.
@@ -19,7 +19,7 @@
 // a request's ids do not depend on the rows it shares a round with.
 
 #include "models/qwen4_exp/program/route_trace.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <cuda_runtime.h>
 #include <nlohmann/json.hpp>
@@ -53,7 +53,7 @@ struct PromptSpec {
 
 struct Outcome {
     std::uint32_t prompt_tokens = 0;
-    std::vector<ninfer::TokenId> ids;
+    std::vector<infernix::TokenId> ids;
     double prefill_seconds = 0.0;
     double decode_seconds  = 0.0;
 };
@@ -88,58 +88,58 @@ std::vector<PromptSpec> read_prompts(const std::filesystem::path& path) {
     return out;
 }
 
-ninfer::ChatRole role_of(const std::string& role) {
-    if (role == "system") { return ninfer::ChatRole::System; }
-    if (role == "assistant") { return ninfer::ChatRole::Assistant; }
-    if (role == "user") { return ninfer::ChatRole::User; }
+infernix::ChatRole role_of(const std::string& role) {
+    if (role == "system") { return infernix::ChatRole::System; }
+    if (role == "assistant") { return infernix::ChatRole::Assistant; }
+    if (role == "user") { return infernix::ChatRole::User; }
     throw std::invalid_argument("unsupported role " + role);
 }
 
-ninfer::EngineOptions engine_options(const char* artifact, const char* ngram_volume, const RunConfig& config,
+infernix::EngineOptions engine_options(const char* artifact, const char* ngram_volume, const RunConfig& config,
                                      std::size_t prompts) {
-    ninfer::EngineOptions options;
+    infernix::EngineOptions options;
     options.artifact_path = artifact;
     options.context_cache.enabled = false; // no prefix cache (Qwen4Exp has no Legacy cache)
     if (ngram_volume != nullptr) { options.ngram_volume_path = ngram_volume; }
     options.max_context     = config.max_context;
-    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(config.max_context);
+    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(config.max_context);
     options.prefill_chunk   = 1024;
-    options.kv_cache        = ninfer::KvCacheStorage::Int8Group64;
+    options.kv_cache        = infernix::KvCacheStorage::Int8Group64;
     options.max_concurrency = config.concurrency;
     // Every prompt is queued at once at C > 1: none may be refused or time out while it waits.
     options.max_pending_requests = std::max<std::uint32_t>(options.max_pending_requests,
                                                            static_cast<std::uint32_t>(prompts));
     options.pending_timeout_ms   = 3'600'000;
     if (config.mtp > 0) {
-        options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens  = config.mtp;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     }
     options.speculative.ngram_draft_tokens = config.ngram;
     return options;
 }
 
-ninfer::PromptInput prompt_input(const PromptSpec& spec) {
-    ninfer::PromptInput input;
+infernix::PromptInput prompt_input(const PromptSpec& spec) {
+    infernix::PromptInput input;
     for (const auto& [role, content] : spec.messages) {
-        ninfer::ChatMessage message;
+        infernix::ChatMessage message;
         message.role = role_of(role);
-        message.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = content});
+        message.parts.push_back({.kind = infernix::MessagePartKind::Text, .text = content});
         input.messages.push_back(std::move(message));
     }
     input.options.enable_thinking = spec.thinking;
     return input;
 }
 
-ninfer::RequestOptions request_options(const PromptSpec& spec) {
-    ninfer::RequestOptions request;
+infernix::RequestOptions request_options(const PromptSpec& spec) {
+    infernix::RequestOptions request;
     request.execution.requested_output_tokens = spec.max_tokens;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
     return request;
 }
 
-Outcome outcome_of(const ninfer::GenerationResult& result) {
+Outcome outcome_of(const infernix::GenerationResult& result) {
     Outcome o;
     o.prompt_tokens   = result.prompt.prompt_tokens;
     o.ids             = result.generated_token_ids;
@@ -148,21 +148,21 @@ Outcome outcome_of(const ninfer::GenerationResult& result) {
     return o;
 }
 
-std::vector<Outcome> run_pass(const ninfer::EngineOptions& options, std::uint32_t concurrency,
+std::vector<Outcome> run_pass(const infernix::EngineOptions& options, std::uint32_t concurrency,
                               const std::vector<PromptSpec>& prompts, const std::filesystem::path& trace,
                               const char* label) {
-    ninfer::models::qwen4_exp::testing::set_route_trace(trace);
+    infernix::models::qwen4_exp::testing::set_route_trace(trace);
     std::vector<Outcome> out;
     {
-        ninfer::Engine engine(options);
-        ninfer::models::qwen4_exp::testing::set_route_trace({});
+        infernix::Engine engine(options);
+        infernix::models::qwen4_exp::testing::set_route_trace({});
         const std::size_t ready = free_vram();
         if (concurrency == 1) {
             for (const auto& spec : prompts) {
                 out.push_back(outcome_of(engine.generate(engine.prepare(prompt_input(spec)), request_options(spec))));
             }
         } else {
-            std::vector<ninfer::GenerationHandle> handles;
+            std::vector<infernix::GenerationHandle> handles;
             for (const auto& spec : prompts) {
                 handles.push_back(engine.submit(engine.prepare(prompt_input(spec)), request_options(spec)));
             }
@@ -185,17 +185,17 @@ std::vector<Outcome> run_pass(const ninfer::EngineOptions& options, std::uint32_
     return out;
 }
 
-std::map<std::string, std::vector<ninfer::TokenId>> read_ids(const std::filesystem::path& path) {
+std::map<std::string, std::vector<infernix::TokenId>> read_ids(const std::filesystem::path& path) {
     std::ifstream in(path);
     if (!in) { throw std::invalid_argument("cannot read " + path.string()); }
-    std::map<std::string, std::vector<ninfer::TokenId>> out;
+    std::map<std::string, std::vector<infernix::TokenId>> out;
     std::string line;
     while (std::getline(in, line)) {
         const auto colon = line.find(':');
         if (colon == std::string::npos) { continue; }
         std::stringstream stream(line.substr(colon + 1));
-        std::vector<ninfer::TokenId> ids;
-        ninfer::TokenId id = 0;
+        std::vector<infernix::TokenId> ids;
+        infernix::TokenId id = 0;
         while (stream >> id) { ids.push_back(id); }
         out[line.substr(0, colon)] = std::move(ids);
     }
@@ -393,12 +393,12 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
 
 int main(int argc, char** argv) {
     try {
-        const char* artifact = std::getenv("NINFER_QWEN4_ARTIFACT");
+        const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
         if (artifact == nullptr || argc < 3) {
-            std::cerr << "skipped: set NINFER_QWEN4_ARTIFACT and pass PROMPTS.json TRACE.bin\n";
+            std::cerr << "skipped: set INFERNIX_QWEN4_ARTIFACT and pass PROMPTS.json TRACE.bin\n";
             return 77;
         }
-        const char* ngram_volume = std::getenv("NINFER_QWEN4_NGRAM");
+        const char* ngram_volume = std::getenv("INFERNIX_QWEN4_NGRAM");
         const std::filesystem::path prompts_path = argv[1], trace = argv[2];
         RunConfig config;
         bool single_pass = false;
@@ -437,7 +437,7 @@ int main(int argc, char** argv) {
         const auto options = engine_options(artifact, ngram_volume, config, prompts.size());
         const auto start   = std::chrono::steady_clock::now();
 
-        std::vector<std::vector<ninfer::TokenId>> reference;
+        std::vector<std::vector<infernix::TokenId>> reference;
         if (!ids_expect.empty()) {
             const auto expected = read_ids(ids_expect);
             for (const auto& spec : prompts) {

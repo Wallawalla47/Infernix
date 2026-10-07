@@ -1,14 +1,14 @@
 // Public-Op benchmark for full and device-count-prefix KV cache append contracts.
 // Cache encoding, launch geometry, and route selection remain private to the public wrappers.
 
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/kv_cache_append.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/kv_cache_append.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -26,7 +26,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -98,7 +98,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
+                 "usage: infernix_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] "
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
@@ -843,7 +843,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_kv_cache_append_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_kv_cache_append_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -26,9 +26,9 @@ bool near(double lhs, double rhs) { return std::abs(lhs - rhs) <= 1.0e-20; }
 int main() {
     int failures = 0;
 
-    ninfer::runtime::ExecutionTiming sum{
+    infernix::runtime::ExecutionTiming sum{
         .submit_host_ns = 11, .device_wait_ns = 13, .post_host_ns = 17};
-    sum += ninfer::runtime::ExecutionTiming{
+    sum += infernix::runtime::ExecutionTiming{
         .submit_host_ns = 19,
         .device_wait_ns = 23,
         .post_host_ns   = 29,
@@ -37,24 +37,24 @@ int main() {
                           sum.post_host_ns == 46 && sum.host_ns() == 76 && sum.elapsed_ns() == 112,
                       "ExecutionTiming integer phase arithmetic is inconsistent");
 
-    ninfer::runtime::ExecutionTimingRecorder aggregate(
-        ninfer::runtime::ExecutionTimingPhase::Paused);
+    infernix::runtime::ExecutionTimingRecorder aggregate(
+        infernix::runtime::ExecutionTimingPhase::Paused);
     aggregate.include(sum);
-    const ninfer::runtime::ExecutionTiming observed = aggregate.finish();
+    const infernix::runtime::ExecutionTiming observed = aggregate.finish();
     failures += check(observed.submit_host_ns == sum.submit_host_ns &&
                           observed.device_wait_ns == sum.device_wait_ns &&
                           observed.post_host_ns == sum.post_host_ns,
                       "paused timing composition changed an included child observation");
 
-    ninfer::runtime::ExecutionTimingRecorder post_only(ninfer::runtime::ExecutionTimingPhase::Post);
-    const ninfer::runtime::ExecutionTiming post_observed = post_only.finish();
+    infernix::runtime::ExecutionTimingRecorder post_only(infernix::runtime::ExecutionTimingPhase::Post);
+    const infernix::runtime::ExecutionTiming post_observed = post_only.finish();
     failures += check(post_observed.submit_host_ns == 0 && post_observed.device_wait_ns == 0,
                       "post-only recorder attributed initialization to another phase");
 
-    ninfer::runtime::ExecutionTiming abandoned_observation;
+    infernix::runtime::ExecutionTiming abandoned_observation;
     {
-        ninfer::runtime::ExecutionTimingRecorder abandoned(
-            ninfer::runtime::ExecutionTimingPhase::Paused, &abandoned_observation);
+        infernix::runtime::ExecutionTimingRecorder abandoned(
+            infernix::runtime::ExecutionTimingPhase::Paused, &abandoned_observation);
         abandoned.include(sum);
     }
     failures += check(abandoned_observation.submit_host_ns == sum.submit_host_ns &&
@@ -62,7 +62,7 @@ int main() {
                           abandoned_observation.post_host_ns == sum.post_host_ns,
                       "abandoned Program timing was lost during exception unwinding");
 
-    ninfer::runtime::RequestHostTiming request{
+    infernix::runtime::RequestHostTiming request{
         .queue_wait_ns                   = 1,
         .engine_boundary_exposed_ns      = 2,
         .program_submit_exposed_ns       = 3,
@@ -76,7 +76,7 @@ int main() {
         .decode_rounds                   = 29,
         .control_units                   = 31,
     };
-    const ninfer::GenerationEngineTiming public_timing = request.public_snapshot();
+    const infernix::GenerationEngineTiming public_timing = request.public_snapshot();
     failures += check(near(public_timing.queue_wait_seconds, 1.0e-9) &&
                           near(public_timing.engine_boundary_exposed_seconds, 2.0e-9) &&
                           near(public_timing.program_submit_exposed_seconds, 3.0e-9) &&
@@ -90,15 +90,15 @@ int main() {
                           public_timing.control_units == 31,
                       "request timing publication changed integer observations");
 
-    ninfer::runtime::RequestHostTiming batch_row_a;
-    ninfer::runtime::RequestHostTiming batch_row_b;
-    const ninfer::runtime::ExecutionTiming shared_program{
+    infernix::runtime::RequestHostTiming batch_row_a;
+    infernix::runtime::RequestHostTiming batch_row_b;
+    const infernix::runtime::ExecutionTiming shared_program{
         .submit_host_ns = 10,
         .device_wait_ns = 20,
         .post_host_ns   = 30,
     };
-    for (ninfer::runtime::RequestHostTiming* row : {&batch_row_a, &batch_row_b}) {
-        row->expose_engine(ninfer::runtime::RequestEngineHostPhase::Boundary, 100, true);
+    for (infernix::runtime::RequestHostTiming* row : {&batch_row_a, &batch_row_b}) {
+        row->expose_engine(infernix::runtime::RequestEngineHostPhase::Boundary, 100, true);
         row->expose_program(shared_program, true);
     }
     failures += check(batch_row_a.engine_boundary_exposed_ns == 100 &&

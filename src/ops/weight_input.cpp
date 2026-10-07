@@ -1,4 +1,4 @@
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/weight_input.h"
 
 #include <algorithm>
 #include <array>
@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require(bool condition, const char* message) {
@@ -251,4 +251,4 @@ prepare_sparse_moe_weights(const WeightInput& router, const WeightInput& shared_
     return {router_bank.weight, gate_up_bank.weight, down_bank.weight, shared.weight, down.weight};
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kPackedAttentionHeadDim = 72;
 inline constexpr int kPackedAttentionHeads   = 16;
@@ -372,4 +372,4 @@ __launch_bounds__(Br * 2, 128 / Br) __global__ void packed_attention_flash_kerne
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

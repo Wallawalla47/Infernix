@@ -2,7 +2,7 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/program/program.h"
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 struct RuntimeTypes {
     using Frontend          = qwen3_5::Frontend;
     using PreparedPrompt    = qwen3_5::PreparedPrompt;
@@ -30,4 +30,4 @@ struct RuntimeTypes {
     using Program           = qwen3_5::Program;
     using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

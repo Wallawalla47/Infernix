@@ -5,7 +5,7 @@
 #include <iostream>
 
 int main() {
-    using namespace ninfer::test::linear_add;
+    using namespace infernix::test::linear_add;
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;

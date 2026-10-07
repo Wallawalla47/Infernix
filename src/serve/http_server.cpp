@@ -17,7 +17,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
@@ -44,8 +44,8 @@ void ensure_http_request_id(const httplib::Request& request, httplib::Response& 
     }
 }
 
-ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
-                                        const ninfer::RuntimeStats& current,
+ThroughputReport make_throughput_report(const infernix::RuntimeStats& previous,
+                                        const infernix::RuntimeStats& current,
                                         double interval_seconds) {
     return ThroughputReport{
         .interval_seconds = interval_seconds,
@@ -277,17 +277,17 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
     }
 }
 
-ninfer::GenerationFirstTokenObserver HttpServer::first_token_observer() {
-    return [this](const ninfer::GenerationFirstTokenObservation& observation) {
+infernix::GenerationFirstTokenObserver HttpServer::first_token_observer() {
+    return [this](const infernix::GenerationFirstTokenObservation& observation) {
         metrics_.first_token(observation);
     };
 }
 
-ninfer::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
+infernix::GenerationSchedulingObserver HttpServer::scheduling_observer(std::uint64_t request_id,
                                                                      std::string http_request_id) {
     if (!request_jsonl_.enabled()) { return {}; }
     return [this, request_id, http_request_id = std::move(http_request_id)](
-               const ninfer::GenerationSchedulingObservation& observation) {
+               const infernix::GenerationSchedulingObservation& observation) {
         request_jsonl_.write_request_scheduling(request_id, http_request_id, observation);
     };
 }
@@ -320,7 +320,7 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 
 void HttpServer::run_stats_reporter() {
     using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
+    infernix::RuntimeStats previous   = service_->runtime_stats();
     Clock::time_point previous_time = Clock::now();
     const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
     Clock::time_point next_deadline = previous_time + interval;
@@ -333,7 +333,7 @@ void HttpServer::run_stats_reporter() {
             }
         }
 
-        const ninfer::RuntimeStats current = service_->runtime_stats();
+        const infernix::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
         const ThroughputReport report      = make_throughput_report(
             previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -346,7 +346,7 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
-    const ninfer::RuntimeStats current = service_->runtime_stats();
+    const infernix::RuntimeStats current = service_->runtime_stats();
     const Clock::time_point now        = Clock::now();
     ThroughputReport tail              = make_throughput_report(
         previous, current, std::chrono::duration<double>(now - previous_time).count());
@@ -556,10 +556,10 @@ void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
     }
-    const ninfer::LoadSummary load = service.load_summary();
+    const infernix::LoadSummary load = service.load_summary();
     // memory_summary waits for the completed worker boundary, including warmup publication.
-    const ninfer::MemorySummary memory  = service.memory_summary();
-    const ninfer::RuntimeStats baseline = service.runtime_stats();
+    const infernix::MemorySummary memory  = service.memory_summary();
+    const infernix::RuntimeStats baseline = service.runtime_stats();
     public_model_id_                    = resolve_public_model_id(options_, load.model_name);
     model_metadata_                     = service.model_metadata();
     decide_labels_                      = build_decide_alphabet(
@@ -595,4 +595,4 @@ void HttpServer::stop() {
     if (service_ != nullptr) { service_->stop(); }
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

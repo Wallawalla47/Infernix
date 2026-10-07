@@ -1,8 +1,8 @@
 // Measures public RMSNorm and GatedRMSNorm calls with represented BF16 inputs.
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/gated_rmsnorm.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/gated_rmsnorm.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 struct Options {
@@ -54,7 +54,7 @@ Options parse(int argc, char** argv) {
             continue;
         }
         if (arg == "--help") {
-            std::puts("usage: ninfer_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
+            std::puts("usage: infernix_rmsnorm_bench [--kind dflash2_hidden|hidden27|target_q27|"
                       "target_k27|dflash_hidden|dflash_q|dflash_k|target_hidden35|target_q35|"
                       "target_k35|gated35|gated27] [--tokens T,...] [--execution eager|graph] "
                       "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "

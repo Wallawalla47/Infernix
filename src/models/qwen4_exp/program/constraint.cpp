@@ -6,13 +6,13 @@
 
 #include "models/qwen4_exp/program/program_impl.h"
 
-#include "ninfer/ops/target_logprobs.h"
-#include "ninfer/ops/top_logprobs.h"
+#include "infernix/ops/target_logprobs.h"
+#include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <iterator>
 
-namespace ninfer::models::qwen4_exp::detail {
+namespace infernix::models::qwen4_exp::detail {
 
 namespace {
 
@@ -171,4 +171,4 @@ PromptReadout ProgramImpl::read_prompt_frontier(const Lane& lane) {
     return readout;
 }
 
-} // namespace ninfer::models::qwen4_exp::detail
+} // namespace infernix::models::qwen4_exp::detail

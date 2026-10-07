@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 constexpr std::string_view kStart       = "<|im_start|>";
@@ -150,4 +150,4 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
     return result;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

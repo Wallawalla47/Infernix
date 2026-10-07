@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from tools.bench.ttft.execution import RequestHandle
-from tools.ninfer_serve.client import PreparedServeExchange, ProtocolRequest
+from tools.infernix_serve.client import PreparedServeExchange, ProtocolRequest
 from tools.streaming_http.client import PreparedExchange
 
 

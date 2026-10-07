@@ -3,7 +3,7 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_a16_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class RowPolicy = Q8MmaIdentityRows<Schedule>, class Output,
           class Epilogue>
 void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
@@ -36,4 +36,4 @@ void launch_q8_a16_mma(const Q8LinearOperands& operands, Output output, Epilogue
             launch.template operator()<false, false>();
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

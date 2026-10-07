@@ -1,15 +1,15 @@
-"""Compare NInfer's Qwen4Exp op-chain error with upstream Transformers' on identical inputs.
+"""Compare Infernix's Qwen4Exp op-chain error with upstream Transformers' on identical inputs.
 
     python -m tools.flash_next.upstream_check --model CHECKPOINT --blocks blocks.bin \\
         --residuals residuals.bin [--layers 0,3,7]
 
 Needs a Transformers build that has ``qwen4_exp`` (main as of 2026-10). For each selected layer it
 builds the upstream modules (both hyper-connection mixers, GatedDeltaNet or QSA attention) in
-BF16 with the checkpoint's weights, runs them on NInfer's own tapped inputs (see block_check.py)
+BF16 with the checkpoint's weights, runs them on Infernix's own tapped inputs (see block_check.py)
 and reports, per position, the relative error against the FP64 reference of
 
 - ``upstream``: Transformers in BF16, the precision of the major implementations;
-- ``ninfer``: NInfer's tapped output.
+- ``infernix``: Infernix's tapped output.
 
 The PLE layer's attention-side mixer is skipped: its input includes the PLE injection, which needs
 the n-gram table. Routed experts are NVFP4 and have no upstream BF16 module; block_check.py covers
@@ -82,7 +82,7 @@ def main() -> int:
                     hc = ckpt.load(upstream.Qwen4ExpTextGatedResidual(config), f"{prefix}{layer}.attn_hyper_connection.")
                     up, _, _ = hc(bf(R))
                     want, _ = ref.hc_mix(f"layers.{layer}.attn_hyper_connection.", R)
-                    row["attn_mix"] = {"upstream": relative(up[0].to(F64), want), "ninfer": relative(x, want)}
+                    row["attn_mix"] = {"upstream": relative(up[0].to(F64), want), "infernix": relative(x, want)}
             # The mixer.
             if ref.layer_types[layer] == "linear":
                 module = ckpt.load(upstream.Qwen4ExpTextGatedDeltaNet(config, layer), f"{prefix}{layer}.linear_attn.")
@@ -93,8 +93,8 @@ def main() -> int:
                 cos, sin = rotary(bf(x), positions[None, None].expand(3, 1, T))
                 up, _ = module(bf(x), (cos.to(torch.bfloat16), sin.to(torch.bfloat16)), mask)
                 want = ref.qsa(layer, x, positions)
-            row["mixer_error"] = {"upstream": relative(up[0].to(F64), want), "ninfer": relative(y, want)}
-            # MLP-side mixer: inject NInfer's mixer output into the reference's view of the residual.
+            row["mixer_error"] = {"upstream": relative(up[0].to(F64), want), "infernix": relative(y, want)}
+            # MLP-side mixer: inject Infernix's mixer output into the reference's view of the residual.
             if layer + 1 not in ref.ple_layers and layer:
                 R = residuals[layer - 1]
                 _, inject = ref.hc_mix(f"layers.{layer}.attn_hyper_connection.", R)
@@ -102,7 +102,7 @@ def main() -> int:
                 hc = ckpt.load(upstream.Qwen4ExpTextGatedResidual(config), f"{prefix}{layer}.mlp_hyper_connection.")
                 up, _, _ = hc(bf(Rm))
                 want, _ = ref.hc_mix(f"layers.{layer}.mlp_hyper_connection.", Rm)
-                row["mlp_mix"] = {"upstream": relative(up[0].to(F64), want), "ninfer": relative(xm, want)}
+                row["mlp_mix"] = {"upstream": relative(up[0].to(F64), want), "infernix": relative(xm, want)}
             print(json.dumps(row), flush=True)
     return 0
 

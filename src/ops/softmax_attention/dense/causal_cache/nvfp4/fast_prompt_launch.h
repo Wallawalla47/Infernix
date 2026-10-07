@@ -9,12 +9,12 @@
 
 #include "core/arena.h"
 #include "core/device.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Whether an NVFP4 prompt-route launch runs the fast kernel: over 768 visible keys. Forced at
 // every visible count (3 passes, H24 and H16 geometries, 256-3584 columns over 0-8192 keys) the
@@ -31,4 +31,4 @@ void nvfp4_kv_fast_prompt_attention(const CausalAttentionOperands&, Nvfp4KvReadV
                                     CausalAttentionExecutionEnvelope, WorkspaceArena&,
                                     DeviceExecutionView);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

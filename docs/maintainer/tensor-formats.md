@@ -1,4 +1,4 @@
-# NInfer Persistent Tensor Numeric Formats
+# Infernix Persistent Tensor Numeric Formats
 
 This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly eleven persistent numeric tensor formats in four categories.
+Infernix has exactly eleven persistent numeric tensor formats in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 

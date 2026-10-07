@@ -6,14 +6,14 @@
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen3_5/weights.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/weight_input.h"
 
 #include <memory>
 #include <optional>
 #include <span>
 #include <string>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 struct InstanceInfo {
     std::string name;
@@ -78,4 +78,4 @@ private:
     InstanceInfo info_;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

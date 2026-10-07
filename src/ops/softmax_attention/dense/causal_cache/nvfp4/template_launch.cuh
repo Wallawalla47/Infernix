@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/common/causal_merge.cuh"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class G, class S, bool MultiBatch, bool Masked, bool Writable, class Input,
           bool ParallelQueries = false>
@@ -58,4 +58,4 @@ void launch_nvfp4_kv_grouped_mma(const CausalAttentionOperands& p, Nvfp4KvCacheV
 
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

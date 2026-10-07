@@ -1,6 +1,6 @@
 #pragma once
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheAppendFullHeadDim = 256;
 
@@ -13,4 +13,4 @@ struct KVCacheAppendFullGeometry {
 using KVCacheAppendD256Kv4 = KVCacheAppendFullGeometry<4>;
 using KVCacheAppendD256Kv2 = KVCacheAppendFullGeometry<2>;
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

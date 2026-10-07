@@ -4,8 +4,8 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "core/startup.h"
 #include "core/device.h"
-#include "ninfer/ops/target_logprobs.h"
-#include "ninfer/ops/top_logprobs.h"
+#include "infernix/ops/target_logprobs.h"
+#include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
@@ -609,4 +609,4 @@ void ProgramImpl::reset_memory_peaks() noexcept {
 }
 
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

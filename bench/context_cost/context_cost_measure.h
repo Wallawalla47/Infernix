@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::bench::context_cost {
+namespace infernix::bench::context_cost {
 
 inline constexpr std::size_t kMaximumModelCoefficients = 5;
 inline constexpr std::uint64_t kQ32One                 = 1ULL << 32U;
@@ -91,4 +91,4 @@ struct FitResult {
 
 [[nodiscard]] std::string_view encoding_name(CoefficientEncoding encoding) noexcept;
 
-} // namespace ninfer::bench::context_cost
+} // namespace infernix::bench::context_cost

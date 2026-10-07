@@ -2,7 +2,7 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 [[nodiscard]] std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                                          std::int32_t first, std::int32_t last);
@@ -22,4 +22,4 @@ void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParamete
                                const AttentionConfig& config, Tensor& query, Tensor& gate,
                                WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

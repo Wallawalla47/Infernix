@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/dynamic_grouped_conv.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
 
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHidden          = 5120;
@@ -221,4 +221,4 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                                                         finish_delta, residual, workspace, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

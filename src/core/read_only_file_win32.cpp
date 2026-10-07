@@ -12,7 +12,7 @@
 #include <system_error>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 void close_handle(HANDLE& handle) noexcept {
@@ -230,4 +230,4 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
     return total;
 }
 
-} // namespace ninfer
+} // namespace infernix

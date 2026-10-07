@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -23,8 +23,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

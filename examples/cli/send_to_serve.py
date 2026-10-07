@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Send one NInfer CLI messages file to an already-running ninfer-serve instance."""
+"""Send one Infernix CLI messages file to an already-running infernix-serve instance."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from tools.ninfer_serve.client import NInferServeClient, ProtocolRequest, ServeProtocolError
+from tools.infernix_serve.client import InfernixServeClient, ProtocolRequest, ServeProtocolError
 from tools.streaming_http.client import HttpClientError
 
 
@@ -161,7 +161,7 @@ def normalize_base_url(base_url: str) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("messages", type=Path, help="NInfer CLI --messages JSON file")
+    parser.add_argument("messages", type=Path, help="Infernix CLI --messages JSON file")
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
     parser.add_argument("--model", required=True, help="public model ID configured by the server")
     parser.add_argument("--max-tokens", type=int, default=1024)
@@ -237,7 +237,7 @@ def main() -> int:
         stream=False,
     )
     try:
-        client = NInferServeClient(normalize_base_url(args.base_url), args.timeout, api_key)
+        client = InfernixServeClient(normalize_base_url(args.base_url), args.timeout, api_key)
         result = client.prepare(request).execute()
     except (HttpClientError, ServeProtocolError, OSError) as error:
         print(f"send_to_serve: request failed: {error}", file=sys.stderr)

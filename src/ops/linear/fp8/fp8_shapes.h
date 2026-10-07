@@ -2,7 +2,7 @@
 #include "ops/linear/fp8/fp8_launch.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct Fp8LinearShape {
     std::int32_t n, k;
     Fp8Launch a16;
@@ -17,4 +17,4 @@ extern const Fp8LinearShape kFp8N34816K5120;
 extern const Fp8LinearShape kFp8N5120K6144;
 extern const Fp8LinearShape kFp8N5120K17408;
 extern const Fp8LinearShape kFp8N248320K5120;
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

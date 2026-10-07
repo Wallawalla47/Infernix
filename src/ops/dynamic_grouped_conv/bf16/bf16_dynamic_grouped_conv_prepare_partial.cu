@@ -8,7 +8,7 @@
 #include <cuda_bf16.h>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 constexpr int kHidden = 5120, kCoefficientRows = 1280, kBlockK = 64, kStages = 2;
 
@@ -138,4 +138,4 @@ void bf16_dynamic_grouped_conv_prepare_partial_launch(DynamicConvPrepareRoute ro
     }
     throw std::logic_error("dynamic grouped conv prepare: invalid production tile");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

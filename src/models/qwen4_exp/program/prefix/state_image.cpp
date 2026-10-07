@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 namespace {
 
 constexpr std::uint64_t kHeaderMagic   = 0x31474D4934515751ULL; // "QWQ4IMG1"
@@ -369,4 +369,4 @@ PlaneRange kv_layer_planes(const KvPageGeometry& geometry, std::uint32_t kv_laye
     return PlaneRange{begin, begin + geometry.planes_per_layer};
 }
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

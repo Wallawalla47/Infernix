@@ -2,7 +2,7 @@
 // track's SSD tier (design §19.3.7; measurements RM0e and RM0g; memory-tiers.md §4.4-§4.10). Run
 // alone on an otherwise idle machine; it only reads the artifact and never writes a file.
 //
-//   ninfer_expert_read_probe ARTIFACT.ninfer [--seconds 5] [--depths 1,2,4,8] [--quarter-depths 1,2,4]
+//   infernix_expert_read_probe ARTIFACT.ninfer [--seconds 5] [--depths 1,2,4,8] [--quarter-depths 1,2,4]
 //       [--only reads,quarters,load,subread,straddlers,pin,pinlimit] [--pin-chunks 10]
 //       [--pin-limit-gib 0] [--seed 2026]
 //
@@ -138,7 +138,7 @@ public:
         };
         std::vector<Bank> banks;
         for (const auto& object : directory.objects) {
-            const auto* tensor = std::get_if<ninfer::artifact::TensorObject>(&object);
+            const auto* tensor = std::get_if<infernix::artifact::TensorObject>(&object);
             if (tensor == nullptr || tensor->layout != "nvfp4_expert_rg16_v1" || tensor->shape.empty()) { continue; }
             const std::uint64_t experts = tensor->shape[0];
             if (tensor->bytes < experts * kRecord || tensor->bytes - experts * kRecord >= kRecord ||
@@ -166,7 +166,7 @@ public:
     [[nodiscard]] const std::vector<std::filesystem::path>& paths() const { return paths_; }
     [[nodiscard]] std::size_t count() const { return offsets_.size(); }
     [[nodiscard]] const std::vector<std::size_t>& straddlers() const { return straddlers_; }
-    [[nodiscard]] const ninfer::artifact::Reader& reader() const { return reader_; }
+    [[nodiscard]] const infernix::artifact::Reader& reader() const { return reader_; }
 
     // The file pieces of bytes [begin, begin + bytes) of record `index`.
     void pieces(std::size_t index, std::uint64_t begin, std::uint64_t bytes, std::vector<Piece>& out) const {
@@ -180,7 +180,7 @@ public:
     [[nodiscard]] std::uint64_t logical(std::size_t index) const { return offsets_[index]; }
 
 private:
-    ninfer::artifact::Reader reader_;
+    infernix::artifact::Reader reader_;
     std::vector<std::filesystem::path> paths_;
     std::vector<std::uint64_t> offsets_;
     std::vector<std::size_t> straddlers_;
@@ -702,7 +702,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::fprintf(stderr,
-                         "usage: ninfer_expert_read_probe ARTIFACT.ninfer [--seconds S] [--depths 1,2,4,8] "
+                         "usage: infernix_expert_read_probe ARTIFACT.ninfer [--seconds S] [--depths 1,2,4,8] "
                          "[--quarter-depths 1,2,4] [--only reads,quarters,load,subread,straddlers,pin,pinlimit] "
                          "[--pin-chunks N] [--pin-limit-gib N] [--seed N]\n");
             return 2;

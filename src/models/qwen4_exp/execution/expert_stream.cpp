@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 constexpr std::size_t kAlign = 256;
@@ -161,4 +161,4 @@ void ExpertStream::after_experts(std::uint32_t layer, cudaStream_t compute) {
     if (!gated_ && layer + 2 < layers_) { enqueue(layer + 2); }
 }
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

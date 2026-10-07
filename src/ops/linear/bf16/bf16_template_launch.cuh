@@ -9,7 +9,7 @@
 #include "ops/linear/bf16/bf16_a16_sliced_k_mma.cuh"
 #include "ops/linear/bf16/bf16_a16_tma_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epilogue,
@@ -115,4 +115,4 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

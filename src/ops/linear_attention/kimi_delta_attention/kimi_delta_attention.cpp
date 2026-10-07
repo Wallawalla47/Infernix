@@ -1,4 +1,4 @@
-#include "ninfer/ops/kimi_delta_attention.h"
+#include "infernix/ops/kimi_delta_attention.h"
 
 #include "core/device.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using detail::kimi_delta_attention::kStateDim;
@@ -260,4 +260,4 @@ void kimi_delta_attention_batch_update(const Tensor& q, const Tensor& k, const T
         static_cast<const std::int32_t*>(slots.data), geometry.batch, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

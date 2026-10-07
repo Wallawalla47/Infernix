@@ -10,32 +10,32 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
-#include "ninfer/ops/argmax.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/causal_conv1d_silu.h"
-#include "ninfer/ops/embedding.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gated_rmsnorm.h"
-#include "ninfer/ops/gdn_gating.h"
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer/ops/gdn_input_proj.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/mtp_pack.h"
-#include "ninfer/ops/position.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/sparse_moe.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/scalar.h"
-#include "ninfer/ops/sigmoid_mul.h"
-#include "ninfer/ops/silu_mul.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/argmax.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/causal_conv1d_silu.h"
+#include "infernix/ops/embedding.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gated_rmsnorm.h"
+#include "infernix/ops/gdn_gating.h"
+#include "infernix/ops/gdn_gating_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_pair.h"
+#include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/mtp_pack.h"
+#include "infernix/ops/position.h"
+#include "infernix/ops/residual_add.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
+#include "infernix/ops/sparse_moe.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/scalar.h"
+#include "infernix/ops/sigmoid_mul.h"
+#include "infernix/ops/silu_mul.h"
+#include "infernix/ops/softmax_attention.h"
 
 #include <cuda_runtime.h>
 
@@ -49,7 +49,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 void project(const Tensor& x, const LinearParameters& parameters, Tensor& out,
@@ -1568,4 +1568,4 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
                         finalize_at_end);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

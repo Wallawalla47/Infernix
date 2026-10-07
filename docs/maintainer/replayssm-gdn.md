@@ -20,7 +20,7 @@ replay, the sources of floating-point drift, the conditions for a closed-loop bi
 causal-conv history, and the space and compute characteristics of the current Qwen3.5 model instances.
 
 The Record/Fold implementation and contract are in
-[`gdn_replay.h`](../../include/ninfer/ops/gdn_replay.h) and
+[`gdn_replay.h`](../../include/infernix/ops/gdn_replay.h) and
 [`replay.cpp`](../../src/ops/linear_attention/gated_delta_net/replay.cpp). The model config determines the
 layer/head counts, and the Program reserves record capacity for the enabled MTP, DFlash or DFlash2
 window.

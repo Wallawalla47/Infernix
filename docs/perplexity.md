@@ -1,6 +1,6 @@
 # Perplexity evaluation
 
-`ninfer-perplexity` measures the causal perplexity produced by a v3 `.ninfer` artifact.
+`infernix-perplexity` measures the causal perplexity produced by a v3 `.ninfer` artifact.
 It uses the artifact's tokenizer, Text model, selected Main KV representation, final normalization,
 and main output head. It is an offline evaluator, not a serving endpoint or a logits-export API.
 Only Text weights and resources are loaded; Vision and speculative components are not required.
@@ -8,11 +8,11 @@ Only Text weights and resources are loaded; Vision and speculative components ar
 ## Run the fixed corpus
 
 The repository includes `ninfer-ppl-1m-v1`, a fixed set of 16 independent UTF-8 streams covering
-English reference text, English long-form text, Chinese reference text, and NInfer C++/CUDA code.
+English reference text, English long-form text, Chinese reference text, and Infernix C++/CUDA code.
 `full` selects all streams; `--quick` selects one stream from each domain.
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/infernix-perplexity models/qwen3_8_27b_nvfp4.ninfer \
   --corpus eval/corpora/perplexity-1m/manifest.json \
   --quick \
   --kv-dtype fp8
@@ -34,24 +34,24 @@ between two NVFP4 builds or settings as noise unless it holds at several chunk s
 artifacts): saved with `--save-top-tokens`, it is the reference that `--kl-reference` measures
 other runs against. [Model-level numerical quality](maintainer/model-quality.md) has the method and
 the recorded results. The available Main
-KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `ninfer` and
-`ninfer-serve`, which default to `bf16`, `ninfer-perplexity` defaults to `fp8`. `int8` scores with the fast
+KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and
+`infernix-serve`, which default to `bf16`, `infernix-perplexity` defaults to `fp8`. `int8` scores with the fast
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as
-`ninfer-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
+`infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
-`--kv-dtype`. Prompt attention's P×V form follows `ninfer-serve`'s per-format default: the fast
+`--kv-dtype`. Prompt attention's P×V form follows `infernix-serve`'s per-format default: the fast
 NVFP4 kernel, `k8v4` and `vq2` use their 8-bit forms; INT8 and `k4v2` keep FP16. `--prefill-8bit-pv` and
 `--no-prefill-8bit-pv` force either form. `report.json` records them as
 `original_int8_prefill_kernel`, `prefill_8bit_pv` and `original_nvfp4_prefill_kernel`.
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+./build/apps/infernix-perplexity models/qwen3_8_27b.ninfer \
   --text notes.txt \
   --context 16384 --stride 8192 \
   --kv-dtype int8
 ```
 
-Run `./build/apps/ninfer-perplexity --help` for the complete command surface. The evaluator loads
+Run `./build/apps/infernix-perplexity --help` for the complete command surface. The evaluator loads
 the model once, reads and tokenizes every selected stream before scoring, and writes readable
 startup, corpus, scoring, and per-stream summaries to stderr. Interactive weight loading and
 scoring use one transient progress line; redirected scoring emits persistent progress every ten
@@ -69,7 +69,7 @@ direction, and a few streams can dominate the result. A KL divergence comparison
 each next-token distribution moved. First record a reference, normally with `--kv-dtype bf16`:
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+./build/apps/infernix-perplexity models/qwen3_8_27b.ninfer \
   --corpus eval/corpora/perplexity-1m/manifest.json --context 65536 --stride 32768 \
   --kv-dtype bf16 --save-top-tokens ref-bf16-64k.bin
 ```
@@ -79,7 +79,7 @@ log-probabilities (about 270 MB for the full corpus). Then score the setting und
 same corpus, mode, context and stride:
 
 ```bash
-./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+./build/apps/infernix-perplexity models/qwen3_8_27b.ninfer \
   --corpus eval/corpora/perplexity-1m/manifest.json --context 65536 --stride 32768 \
   --kv-dtype nvfp4 --kl-reference ref-bf16-64k.bin
 ```

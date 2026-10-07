@@ -3,14 +3,14 @@
 #include "context_cost_measure.h"
 
 #include "core/transfer_work.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
 
-namespace ninfer::bench::context_cost {
+namespace infernix::bench::context_cost {
 
 enum class TransferDirection : std::uint8_t {
     DeviceToHost,
@@ -73,4 +73,4 @@ struct PrefillSuiteResult {
 
 [[nodiscard]] const char* transfer_direction_name(TransferDirection direction) noexcept;
 
-} // namespace ninfer::bench::context_cost
+} // namespace infernix::bench::context_cost

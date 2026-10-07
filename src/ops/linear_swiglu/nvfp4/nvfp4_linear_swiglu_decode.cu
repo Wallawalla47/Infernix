@@ -2,7 +2,7 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_epilogue.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor& y,
                                        cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<
@@ -12,4 +12,4 @@ void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor&
                              LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},
                              Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluRows<1>{});
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

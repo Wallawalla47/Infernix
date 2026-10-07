@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_delta_net.h"
+#include "infernix/ops/gated_delta_net.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
@@ -20,8 +20,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 DeviceExecutionView execution(cudaStream_t stream = nullptr) {
@@ -234,7 +234,7 @@ std::vector<double> doubles(const std::vector<float>& values) {
 template <typename T>
 int verify_exact(const std::string& label, const std::vector<T>& got,
                  const std::vector<T>& expected) {
-    return ninfer::test::verify_exact(label.c_str(), got, expected);
+    return infernix::test::verify_exact(label.c_str(), got, expected);
 }
 
 struct WorstError {

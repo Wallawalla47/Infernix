@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 // A token's RoPE position: axes (temporal, height, width).
 using RopePosition = std::array<std::int32_t, 3>;
@@ -47,4 +47,4 @@ void stage_mtp_chunk_rope(const LaneRope& rope, std::uint32_t first, std::int32_
                           std::uint32_t ratio, std::span<std::int32_t> cells_words,
                           std::span<std::int32_t> block_words);
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

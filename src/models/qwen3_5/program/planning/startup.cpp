@@ -9,20 +9,20 @@
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/candidate_selector.h"
-#include "ninfer/ops/context_kv_materialize.h"
-#include "ninfer/ops/dynamic_grouped_conv.h"
-#include "ninfer/ops/linear_topk.h"
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer/ops/gdn_input_proj.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/candidate_selector.h"
+#include "infernix/ops/context_kv_materialize.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
+#include "infernix/ops/linear_topk.h"
+#include "infernix/ops/gdn_gating_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/sliding_window_attention.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 #include <algorithm>
 #include <initializer_list>
 #include <limits>
@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 using execution::dimension;
@@ -1245,4 +1245,4 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
     return plan;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

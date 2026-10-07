@@ -9,9 +9,9 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
-        "NINFER_BUILD_APPS": "ON",
+        "INFERNIX_BUILD_APPS": "ON",
         "BUILD_TESTING": "OFF",
-        "NINFER_BUILD_BENCHMARKS": "OFF"
+        "INFERNIX_BUILD_BENCHMARKS": "OFF"
       }
     },
     {
@@ -20,7 +20,7 @@
       "inherits": "release",
       "cacheVariables": {
         "BUILD_TESTING": "ON",
-        "NINFER_BUILD_BENCHMARKS": "ON"
+        "INFERNIX_BUILD_BENCHMARKS": "ON"
       }
     }
   ],

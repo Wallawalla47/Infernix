@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/registry.h"
@@ -15,7 +15,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 [[nodiscard]] ModelSamplingDefaults default_sampling(Architecture architecture);
 
@@ -103,4 +103,4 @@ private:
 
 [[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

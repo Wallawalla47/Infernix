@@ -13,7 +13,7 @@
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
 #include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline CUtensorMap fp8_a16_tma_activation_map(const __nv_bfloat16* pointer, int tokens, int k,
                                               int block_tokens, int block_k) {
@@ -210,4 +210,4 @@ void launch_fp8_a16_tma_mma(const Fp8A16Operands& p, Output output, Epilogue epi
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

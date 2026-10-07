@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Q8LinearSwiGluScheduleId {
     DecodePairR16,
@@ -52,4 +52,4 @@ void q8_linear_swiglu_execute_plan(const Q8LinearSwiGluPlan& plan, const Tensor&
                                    Tensor& out, cudaStream_t stream);
 void q8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

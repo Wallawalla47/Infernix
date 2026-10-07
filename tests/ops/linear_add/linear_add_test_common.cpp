@@ -2,7 +2,7 @@
 #include "core/device.h"
 #include "ops/linear_add/linear_add_test_common.h"
 
-#include "ninfer/ops/linear_add.h"
+#include "infernix/ops/linear_add.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -24,7 +24,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::test::linear_add {
+namespace infernix::test::linear_add {
 namespace {
 
 constexpr std::size_t kOutputScanWords = 1U << 20;
@@ -441,4 +441,4 @@ int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shap
     return failures;
 }
 
-} // namespace ninfer::test::linear_add
+} // namespace infernix::test::linear_add

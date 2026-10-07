@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // Vision fused QKV, T = raw patches. Routes per token interval from the V0 sweep on the RTX 5090 (the fastest
 // candidate within 2 % at each measured T, seams at the last measured T).
 Bf16Launch select_bf16_n3456_k1152(std::int32_t tokens) {
@@ -25,4 +25,4 @@ Bf16Launch select_bf16_n3456_k1152(std::int32_t tokens) {
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<64, 128, 64, 32, 32, 2>, 1152>>; // tma_r64t128k64s2
     return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaMmaSchedule<128, 128, 64, 64, 32, 3, 1, Bf16MmaRaster::RowFast>, 1152>>; // tma_r128t128k64s3_w64x32_rows
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -17,7 +17,7 @@ These are recorded experimental settings, not promises about current executable 
 |---|---|
 | GPU | One NVIDIA GeForce RTX 5090, 32 GiB |
 | CUDA compile/runtime | Qwen3.8: 13.4 / 13.4; Qwen3.6: 13.1 / 13.1 |
-| Route | Persistent `ninfer-serve`, loopback OpenAI Chat Completions, `stream=false` |
+| Route | Persistent `infernix-serve`, loopback OpenAI Chat Completions, `stream=false` |
 | Prefill chunk | 1,024 tokens |
 | KV cache | Qwen3.8: FP8 E4M3 row-256; Qwen3.6: INT8 group-64 |
 | CUDA Graph | Enabled |

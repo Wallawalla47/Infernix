@@ -14,7 +14,7 @@ from tools.artifact.writer import ArtifactWriter
 def main() -> int:
     executable = sys.argv[1]
     data = bytes((index * 37 + 11) % 251 for index in range(130 * 130 * 2))
-    with tempfile.TemporaryDirectory(prefix="ninfer-writer-interop-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="infernix-writer-interop-") as temporary:
         for label, limit in (("single", 1_000_000), ("sharded", 12288)):
             path = Path(temporary) / f"{label}.ninfer"
             with ArtifactWriter(

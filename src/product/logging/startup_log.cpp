@@ -21,7 +21,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::product {
+namespace infernix::product {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -347,4 +347,4 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     }
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

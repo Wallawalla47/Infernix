@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/common/output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // A vector is already the final BF16 result. Output views without a vector store
 // retain their scalar addressing, including strided or split destinations.
 template <class Output>
@@ -18,4 +18,4 @@ __device__ __forceinline__ void linear_store_bf16_vector(Output output, int row,
                              static_cast<unsigned short>(words[i / 2] >> ((i & 1) * 16)))));
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

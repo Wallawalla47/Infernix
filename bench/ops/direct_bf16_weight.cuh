@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -12,7 +12,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::bench {
+namespace infernix::bench {
 
 struct DirectBf16Weight {
     DeviceBuffer storage;
@@ -63,4 +63,4 @@ inline DirectBf16Weight make_direct_bf16_weight(std::int32_t n, std::int32_t k,
     return result;
 }
 
-} // namespace ninfer::bench
+} // namespace infernix::bench

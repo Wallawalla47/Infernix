@@ -19,7 +19,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 class VisionWeightStream;
 
@@ -122,4 +122,4 @@ private:
     std::uint32_t next_ = 0;
 };
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

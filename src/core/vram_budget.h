@@ -9,7 +9,7 @@
 #include <functional>
 #include <memory>
 
-namespace ninfer {
+namespace infernix {
 
 enum class DisplayState : std::uint8_t {
     Headless, // no output attached and no display reported
@@ -84,4 +84,4 @@ namespace testing {
 void set_vram_budget_source(std::function<VramSnapshot()> fake);
 } // namespace testing
 
-} // namespace ninfer
+} // namespace infernix

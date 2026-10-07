@@ -1,4 +1,4 @@
-#include "ninfer/ops/argmax.h"
+#include "infernix/ops/argmax.h"
 #include "core/device.h"
 #include <algorithm>
 #include "ops/op_tester.h"
@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

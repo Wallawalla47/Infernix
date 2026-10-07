@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::test::kda_ref {
+namespace infernix::test::kda_ref {
 
 struct Inputs {
     std::int64_t qk_heads    = 0;
@@ -153,4 +153,4 @@ inline Result evaluate(const Inputs& in, double lower_bound, double scale) {
     return result;
 }
 
-} // namespace ninfer::test::kda_ref
+} // namespace infernix::test::kda_ref

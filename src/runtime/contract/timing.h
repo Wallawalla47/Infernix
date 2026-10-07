@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // One Program execution may alternate between Host submission, a blocking Device completion
 // wait, and Host post-processing. The three monotonic components are returned to Engine as part of
@@ -141,4 +141,4 @@ private:
     bool finished_                     = false;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

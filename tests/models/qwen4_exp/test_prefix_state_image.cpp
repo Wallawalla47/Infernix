@@ -25,9 +25,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::models::qwen4_exp;
-using namespace ninfer::models::qwen4_exp::prefix;
+using namespace infernix;
+using namespace infernix::models::qwen4_exp;
+using namespace infernix::models::qwen4_exp::prefix;
 
 namespace {
 

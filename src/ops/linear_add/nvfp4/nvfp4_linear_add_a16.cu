@@ -2,7 +2,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <int K>
 void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -128,4 +128,4 @@ void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
     else
         launch_matrix<17408>(x, weight, residual, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

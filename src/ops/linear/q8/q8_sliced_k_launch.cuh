@@ -5,7 +5,7 @@
 #include "ops/common/token_slices.h"
 #include "ops/linear/q8/q8_a16_sliced_k_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class RowPolicy = Q8SlicedKIdentityRows, class Output, class Epilogue>
 void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                                 cudaStream_t stream, RowPolicy row_policy = {},
@@ -47,4 +47,4 @@ void launch_q8_a16_sliced_k_mma(const Q8LinearOperands& operands, Output output,
             launch.template operator()<false>();
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

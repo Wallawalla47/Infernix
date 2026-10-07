@@ -1,7 +1,7 @@
 #pragma once
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int Bytes>
 __device__ __forceinline__ unsigned char* fp8_shared_storage() {
     static_assert(Bytes > 0 && Bytes <= 99 * 1024);
@@ -37,4 +37,4 @@ inline constexpr int fp8_mma_shared_bytes = [] {
     }();
     return Schedule::kSharedBytes > extra ? Schedule::kSharedBytes : extra;
 }();
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

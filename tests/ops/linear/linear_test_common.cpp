@@ -24,7 +24,7 @@
 #include <thread>
 #include <utility>
 
-namespace ninfer::test::linear {
+namespace infernix::test::linear {
 namespace {
 
 constexpr std::size_t kOutputGuardBytes   = 256;
@@ -469,4 +469,4 @@ int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k) {
     return failures;
 }
 
-} // namespace ninfer::test::linear
+} // namespace infernix::test::linear

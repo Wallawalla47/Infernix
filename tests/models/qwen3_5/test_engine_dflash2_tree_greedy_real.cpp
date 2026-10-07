@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 #include "kv_cache_storage.h"
 
 #include <algorithm>
@@ -35,8 +35,8 @@ void require(bool condition, const std::string& message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-ninfer::RequestOptions greedy(std::uint32_t outputs) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions greedy(std::uint32_t outputs) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = false;
@@ -45,9 +45,9 @@ ninfer::RequestOptions greedy(std::uint32_t outputs) {
 }
 
 struct Disagreement {
-    std::vector<ninfer::TokenId> prefix;
-    ninfer::TokenId committed = 0;
-    ninfer::TokenId oracle    = 0;
+    std::vector<infernix::TokenId> prefix;
+    infernix::TokenId committed = 0;
+    infernix::TokenId oracle    = 0;
     std::size_t prompt        = 0;
     std::size_t position      = 0;
 };
@@ -55,28 +55,28 @@ struct Disagreement {
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
     try {
-        const auto kv           = ninfer::test::parse_kv_cache_storage(argc > 1 ? argv[1] : "int8");
+        const auto kv           = infernix::test::parse_kv_cache_storage(argc > 1 ? argv[1] : "int8");
         const std::string table = argc > 2 ? argv[2] : "16";
         const auto outputs      = argc > 3 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 160U;
         const auto drafts       = argc > 4 ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 7U;
         constexpr std::uint32_t kContext = 2048;
 
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path               = artifact;
         options.max_context                 = kContext;
-        options.kv_capacity                 = ninfer::KvCapacityPolicy::explicit_capacity(kContext);
+        options.kv_capacity                 = infernix::KvCapacityPolicy::explicit_capacity(kContext);
         options.prefill_chunk               = kContext;
         options.max_concurrency             = 1;
         options.kv_cache                    = kv;
-        options.speculative.backend         = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.backend         = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens    = drafts;
-        options.speculative.proposal_head   = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head   = infernix::ProposalHead::Optimized;
         options.speculative.draft_tree_auto = table == "auto";
         std::size_t entry                   = 0;
         for (std::size_t begin = 0;
@@ -103,7 +103,7 @@ int main(int argc, char** argv) {
         std::vector<Disagreement> disagreements;
         std::uint64_t rounds = 0, side_rounds = 0, side_drafts = 0, positions = 0;
         {
-            ninfer::Engine engine(options);
+            infernix::Engine engine(options);
             for (std::size_t p = 0; p < texts.size(); ++p) {
                 const auto prompt = engine.tokenize_text(texts[p]);
                 const auto result = engine.generate(engine.prepare_tokens(prompt), greedy(outputs));
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
                 for (std::size_t j = 0; j < outputs; ++j) {
                     const auto oracle = engine.generate(engine.prepare_tokens(prefix), greedy(1));
                     require(oracle.generated_token_ids.size() == 1, "oracle produced no token");
-                    const ninfer::TokenId committed = result.generated_token_ids[j];
+                    const infernix::TokenId committed = result.generated_token_ids[j];
                     if (oracle.generated_token_ids[0] != committed) {
                         disagreements.push_back(
                             {prefix, committed, oracle.generated_token_ids[0], p, j});
@@ -131,12 +131,12 @@ int main(int argc, char** argv) {
         float worst            = 0.0F;
         std::size_t above_half = 0, above_one = 0;
         if (!disagreements.empty()) {
-            ninfer::EngineOptions scoring;
+            infernix::EngineOptions scoring;
             scoring.artifact_path = artifact;
-            scoring.purpose       = ninfer::EnginePurpose::CausalScoring;
+            scoring.purpose       = infernix::EnginePurpose::CausalScoring;
             scoring.max_context   = kContext;
             scoring.kv_cache      = kv;
-            ninfer::Engine scorer(scoring);
+            infernix::Engine scorer(scoring);
             for (const Disagreement& d : disagreements) {
                 const auto first    = static_cast<std::uint32_t>(d.prefix.size());
                 auto with_committed = d.prefix;

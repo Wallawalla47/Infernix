@@ -1,7 +1,7 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_instance_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Geometry = Q8N248320K5120;
 using Access   = Q8ScaleAccess;
@@ -31,4 +31,4 @@ Q8Launch select_q8_n248320_k5120(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

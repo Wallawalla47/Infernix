@@ -1,4 +1,4 @@
-// ninfer::ops::detail - asymmetric FP8-K/NVFP4-V append launch ownership.
+// infernix::ops::detail - asymmetric FP8-K/NVFP4-V append launch ownership.
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
@@ -98,4 +98,4 @@ void kv_cache_append_k8v4_batch_launch(const Tensor& k, const Tensor& v, const T
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

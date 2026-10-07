@@ -6,29 +6,29 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
-#include "ninfer/ops/argmax.h"
-#include "ninfer/ops/dynamic_grouped_conv.h"
-#include "ninfer/ops/context_kv_materialize.h"
-#include "ninfer/ops/rmsnorm_rope.h"
-#include "ninfer/ops/rmsnorm_pack_tail.h"
-#include "ninfer/ops/linear_topk.h"
-#include "ninfer/ops/candidate_selector.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/embedding.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/prepare_masked_block.h"
-#include "ninfer/ops/prepare_ragged_prefix.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/scalar.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/speculative_round.h"
+#include "infernix/ops/argmax.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
+#include "infernix/ops/context_kv_materialize.h"
+#include "infernix/ops/rmsnorm_rope.h"
+#include "infernix/ops/rmsnorm_pack_tail.h"
+#include "infernix/ops/linear_topk.h"
+#include "infernix/ops/candidate_selector.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/embedding.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_pair.h"
+#include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/prepare_masked_block.h"
+#include "infernix/ops/prepare_ragged_prefix.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
+#include "infernix/ops/scalar.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/sliding_window_attention.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/speculative_round.h"
 
 #include <cuda_runtime.h>
 
@@ -36,7 +36,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 using detail::DFlashPersistentState;
@@ -838,4 +838,4 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

@@ -7,7 +7,7 @@
 #include "ops/linear/q4/q4_operands.h"
 #include "ops/linear/q4/q4_a16_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
 void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
@@ -36,4 +36,4 @@ void launch_q4_a16_mma(const Q4LinearOperands& operands, Output output, Epilogue
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

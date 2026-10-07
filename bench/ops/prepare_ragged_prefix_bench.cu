@@ -1,7 +1,7 @@
 // Measures one public prepare_ragged_prefix call, including values, positions and counts.
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "infernix/ops/prepare_ragged_prefix.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <algorithm>
@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 struct Options {
@@ -52,7 +52,7 @@ Options parse(int argc, char** argv) {
             continue;
         }
         if (arg == "--help") {
-            std::puts("usage: ninfer_prepare_ragged_prefix_bench [--rows D] [--widths W,...] "
+            std::puts("usage: infernix_prepare_ragged_prefix_bench [--rows D] [--widths W,...] "
                       "[--batches B,...] [--counts full|one|ragged|zero] [--execution eager|graph] "
                       "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                       "[--csv-out PATH] [--profile]");

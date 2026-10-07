@@ -4,7 +4,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::product {
+namespace infernix::product {
 
 [[nodiscard]] std::string format_pretty_bytes(std::uint64_t bytes);
 [[nodiscard]] std::string format_pretty_count(std::uint64_t count);
@@ -13,4 +13,4 @@ namespace ninfer::product {
 [[nodiscard]] std::string format_pretty_rate(double per_second, std::string_view unit);
 [[nodiscard]] std::string format_pretty_text(std::string_view value);
 
-} // namespace ninfer::product
+} // namespace infernix::product

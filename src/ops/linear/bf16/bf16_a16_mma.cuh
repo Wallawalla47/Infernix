@@ -2,7 +2,7 @@
 // BF16 operands remain represented exactly; the complete dot product accumulates in FP32.
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool FullTokens, class Output, class Epilogue, int Splits = 1>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_mma_kernel(
@@ -109,4 +109,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_m
     bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, shared_raw, accum, m0, n0, M,
                                                tokens, warp, lane);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

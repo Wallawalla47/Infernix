@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace infernix::ops::detail::gated_delta_net {
 
 inline constexpr std::int32_t kStateDim = 128;
 
@@ -11,4 +11,4 @@ inline constexpr std::int32_t kStateDim = 128;
     return qk_heads > 0 && value_heads >= qk_heads && (value_heads % qk_heads) == 0;
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace infernix::ops::detail::gated_delta_net

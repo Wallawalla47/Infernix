@@ -7,7 +7,7 @@
 #include "ops/common/token_slices.h"
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <class S>
 void run(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
@@ -32,4 +32,4 @@ void fp8_attn_input_a16_gemm_launch(const Tensor& x, const Weight& weight, Tenso
     else
         run<Fp8A16MmaSchedule<64, 128, 64, 32, 16, 2, 2>>(x, weight, q, gate, k, v, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -5,7 +5,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // XOR swizzle for a [rows][64] BF16 tile. The eight 16-byte column groups are
 // permuted by the low row bits so ldmatrix reads do not repeatedly hit the same
@@ -363,4 +363,4 @@ void q5_a16_mma_kernel(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -17,13 +17,13 @@
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
+namespace qwen = infernix::models::qwen3_5;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-void test_handoff_lifetime(ninfer::DeviceContext& device,
+void test_handoff_lifetime(infernix::DeviceContext& device,
                            const qwen::execution::Parameters& parameters) {
     const auto& config     = parameters.model.config().vision.value();
     const auto merge       = static_cast<std::int32_t>(config.spatial_merge_size);
@@ -68,8 +68,8 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
     plan.max_merged_count = 1;
     const auto workspace_plan =
         qwen::execution::VisionContext::plan_workspace(config, *parameters.vision, 1, 256);
-    ninfer::DeviceBuffer workspace(workspace_plan.capacity_bytes);
-    const ninfer::DeviceSpan backing{workspace.p, workspace.bytes};
+    infernix::DeviceBuffer workspace(workspace_plan.capacity_bytes);
+    const infernix::DeviceSpan backing{workspace.p, workspace.bytes};
     qwen::detail::VisionHandoffState handoff;
     std::size_t peak_bytes  = 0;
     const auto make_session = [&](const qwen::PreparedPromptData& prompt) {
@@ -126,10 +126,10 @@ void test_handoff_lifetime(ninfer::DeviceContext& device,
 } // namespace
 
 int main() {
-    namespace qwen       = ninfer::models::qwen3_5;
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    namespace qwen       = infernix::models::qwen3_5;
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) { return 77; }
-    static_assert(ninfer::models::qwen3_5::kMaximumVisionItemTokens == 16384);
+    static_assert(infernix::models::qwen3_5::kMaximumVisionItemTokens == 16384);
     // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
     // backing. The context growth check below protects the single-item lifetime bound.
     constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
@@ -141,22 +141,22 @@ int main() {
             return 77;
         }
         CUDA_CHECK(status);
-        ninfer::DeviceContext device;
-        ninfer::models::LoadOptions selected;
+        infernix::DeviceContext device;
+        infernix::models::LoadOptions selected;
         selected.vision        = true;
-        selected.speculative   = ninfer::SpeculativeBackend::Mtp;
-        selected.proposal_head = ninfer::ProposalHead::Optimized;
+        selected.speculative   = infernix::SpeculativeBackend::Mtp;
+        selected.proposal_head = infernix::ProposalHead::Optimized;
         auto model             = qwen::load_model(artifact, selected, device);
         const qwen::execution::Parameters parameters(*model);
         const auto capacity = [&](std::uint32_t max_context) {
-            ninfer::EngineOptions options;
+            infernix::EngineOptions options;
             options.max_context         = max_context;
-            options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+            options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(max_context);
             options.prefill_chunk       = 1024;
-            options.kv_cache            = ninfer::KvCacheStorage::Fp8E4M3Row256;
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            options.kv_cache            = infernix::KvCacheStorage::Fp8E4M3Row256;
+            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
             options.speculative.draft_tokens         = 3;
-            options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+            options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
             options.enable_vision                    = true;
             options.use_cuda_graph                   = false;
             options.context_cache.device_state_slots = 1;

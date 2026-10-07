@@ -1,6 +1,6 @@
-# NInfer Paged KV Context Store
+# Infernix Paged KV Context Store
 
-This document defines the physical storage and consumer contract of NInfer's growing KV. It is the
+This document defines the physical storage and consumer contract of Infernix's growing KV. It is the
 maintainer authority for typed KV pools, logical pages, Device/Host replicas, address spaces,
 reservations, block tables and GPU consumer views.
 
@@ -293,8 +293,8 @@ address=base+d\,nb_0+o\,nb_1+g\,nb_2+h\,nb_3
 \]
 
 Code and scale planes use the same \(g\) but their own Tensor's leading coordinate and strides.
-The exact persistent codec is defined by [`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h)
-and the consumer arithmetic by [`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h); the
+The exact persistent codec is defined by [`kv_cache_append.h`](../../include/infernix/ops/kv_cache_append.h)
+and the consumer arithmetic by [`softmax_attention.h`](../../include/infernix/ops/softmax_attention.h); the
 allocator interprets only plane bytes, order and page-group identity.
 
 The physical payload per token/head of the D256 Main/MTP profiles is:
@@ -681,7 +681,7 @@ window in each StateImage slot: 64 sink slots plus 1024 ring slots (the slot of 
 4 FP16 group scales and a tag. The tag is an FNV-1a hash of (position, the stored code words, the scale
 bits), forced to be odd; a zero tag never matches, so zeroing the tags clears the window.
 
-The read rule ([`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h)) depends only on
+The read rule ([`softmax_attention.h`](../../include/infernix/ops/softmax_attention.h)) depends only on
 position: a query at \(q\) reads the exact INT8-G64 row for sinks and for keys with \(j\ge q-768\) (keys
 appended by this call read the INT8-G64 of their input row; earlier keys read the slot when the tag
 matches the stored codes and otherwise read the codes), and reads codes for all other keys. So the same
@@ -870,7 +870,7 @@ a replay is in flight.
 | Unit permits and context transactions | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
 | Model pool layout and capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
 | Public paged consumer views | `src/core/paged_kv_cache.h` |
-| Growing-cache Ops | `include/ninfer/ops/`, `src/ops/` |
+| Growing-cache Ops | `include/infernix/ops/`, `src/ops/` |
 
 Exact model state and backend mathematics are in [Qwen3.5 model](qwen3_5-model.md) and
 [DFlash](dflash.md); the persistent KV codec and the causal consumer numerical contract are defined by

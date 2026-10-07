@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct OpenAIResponseContextNode {
     std::shared_ptr<const OpenAIResponseContextNode> parent;
@@ -74,4 +74,4 @@ private:
     std::size_t current_bytes_ = 0;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

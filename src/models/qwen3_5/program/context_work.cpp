@@ -11,7 +11,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 std::uint64_t elapsed_ns(Clock::time_point started) noexcept {
     const auto elapsed =
@@ -68,4 +68,4 @@ kv_transfer_requirement(runtime::ContextResourceClass resource,
     };
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

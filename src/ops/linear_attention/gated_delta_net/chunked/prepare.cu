@@ -3,7 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
-namespace ninfer::ops::detail::gated_delta_net::chunked {
+namespace infernix::ops::detail::gated_delta_net::chunked {
 namespace {
 
 struct PrepareShared {
@@ -157,4 +157,4 @@ void launch_prepare(const Arguments& args, QkChunk* qk, ControlChunk* control, b
         prepare_kernel<false><<<blocks, 256, 0, stream>>>(args, qk, control);
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail::gated_delta_net::chunked
+} // namespace infernix::ops::detail::gated_delta_net::chunked

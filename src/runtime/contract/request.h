@@ -1,11 +1,11 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include <atomic>
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Engine has already selected the model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
@@ -60,4 +60,4 @@ struct RequestPlanSummary {
     bool publish_continuation             = true;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

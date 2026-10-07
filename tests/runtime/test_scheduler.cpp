@@ -25,13 +25,13 @@ struct Request {
 
     struct Output {
         std::uint32_t model_tokens = 8;
-        std::vector<ninfer::TokenId> control;
+        std::vector<infernix::TokenId> control;
 
         [[nodiscard]] std::uint32_t model_token_budget_remaining(std::uint32_t total) const {
             return std::min(total, model_tokens);
         }
 
-        [[nodiscard]] std::span<const ninfer::TokenId> pending_control_tokens() const {
+        [[nodiscard]] std::span<const infernix::TokenId> pending_control_tokens() const {
             return control;
         }
     };
@@ -58,9 +58,9 @@ struct Request {
     Output output;
 };
 
-using Scheduler  = ninfer::runtime::Scheduler<Request>;
+using Scheduler  = infernix::runtime::Scheduler<Request>;
 using RequestPtr = std::shared_ptr<Request>;
-using Slots      = std::array<RequestPtr, ninfer::kMaximumConcurrency>;
+using Slots      = std::array<RequestPtr, infernix::kMaximumConcurrency>;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -329,7 +329,7 @@ void test_decode_and_control_membership() {
     slots[2]->output.control = {10, 11, 12};
     const auto control       = scheduler.build_control_membership(slots, 4);
     require(control.size == 2 && control.row_stride == 3 &&
-                control.tokens == std::vector<ninfer::TokenId>({7, 8, 9, 10, 11, 12}) &&
+                control.tokens == std::vector<infernix::TokenId>({7, 8, 9, 10, 11, 12}) &&
                 control.sequences[0] == 1 && control.sequences[1] == 2,
             "compact control membership changed committed control spans or request order");
 }

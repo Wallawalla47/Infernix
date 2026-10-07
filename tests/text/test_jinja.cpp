@@ -7,7 +7,7 @@
 
 namespace {
 using Json = nlohmann::ordered_json;
-using ninfer::text::JinjaTemplate;
+using infernix::text::JinjaTemplate;
 
 int check(bool condition, const char* message) {
     if (condition) return 0;
@@ -87,8 +87,8 @@ int origins_and_requests() {
     const JinjaTemplate compiled(
         "{% filter upper %}{{ text|trim }}{% endfilter %}|{{ tool|tojson }}", "shared-test");
     const Json context{{"text", " hello "}, {"tool", {{"name", "f"}}}};
-    const std::vector<ninfer::text::TemplateInputRegion> regions{{"/text", 7}, {"/tool", 9}};
-    ninfer::text::TemplateRenderOptions options{.timestamp = 0, .regions = regions};
+    const std::vector<infernix::text::TemplateInputRegion> regions{{"/text", 7}, {"/tool", 9}};
+    infernix::text::TemplateRenderOptions options{.timestamp = 0, .regions = regions};
     const auto result = compiled.render(context, options);
     int failures = check(result.text == "HELLO|{\"name\": \"f\"}" && result.regions.size() == 2 &&
                              result.regions[0].tag == 7 && result.regions[0].begin == 0 &&
@@ -154,7 +154,7 @@ int trim_semantics() {
                       .text == "[]|[]|[]",
               "default Unicode whitespace trim changed");
 
-    const std::vector<ninfer::text::TemplateInputRegion> regions{{"/text", 7}};
+    const std::vector<infernix::text::TemplateInputRegion> regions{{"/text", 7}};
     const auto clipped = JinjaTemplate("{{ ('　' ~ text ~ '　').strip() }}", "trim-origin")
                              .render({{"text", "　<|image_pad|>　"}}, {.regions = regions});
     failures +=
@@ -250,13 +250,13 @@ int literal_content() {
             ++failures;
         }
         failures +=
-            check(!ninfer::text::overlaps(output.literal_spans, 0, start.size()) &&
-                      !ninfer::text::overlaps(output.literal_spans, output.text.size() - end.size(),
+            check(!infernix::text::overlaps(output.literal_spans, 0, start.size()) &&
+                      !infernix::text::overlaps(output.literal_spans, output.text.size() - end.size(),
                                               output.text.size()),
                   "input content shielded surrounding template controls");
         for (auto pos = output.text.find(pad); pos != std::string::npos;
              pos      = output.text.find(pad, pos + pad.size())) {
-            if (!ninfer::text::overlaps(output.literal_spans, pos, pos + pad.size())) {
+            if (!infernix::text::overlaps(output.literal_spans, pos, pos + pad.size())) {
                 std::cerr << "literal-content marker lost through: " << item.source << '\n';
                 ++failures;
             }
@@ -285,8 +285,8 @@ int literal_content() {
                                .render({{"bos_token", "<|im_start|>"}, {"data", "<|im_start|>"}},
                                        {.control_variables = tokens});
     failures +=
-        check(!ninfer::text::overlaps(variables.literal_spans, 0, start.size()) &&
-                  ninfer::text::overlaps(variables.literal_spans, start.size(), 2 * start.size()),
+        check(!infernix::text::overlaps(variables.literal_spans, 0, start.size()) &&
+                  infernix::text::overlaps(variables.literal_spans, start.size(), 2 * start.size()),
               "engine token variables and ordinary kwargs were not distinguished");
     return failures;
 }

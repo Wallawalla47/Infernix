@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Q8PairScheduleId;
 
@@ -37,4 +37,4 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
                                const Weight& first_weight, const Weight& second_weight,
                                Tensor& first_out, Tensor& second_out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

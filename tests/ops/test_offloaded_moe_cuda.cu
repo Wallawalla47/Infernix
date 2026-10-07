@@ -25,10 +25,10 @@
 #include <random>
 #include <vector>
 
-namespace canon    = ninfer::ops::canon;
-namespace moe      = ninfer::ops::offloaded_moe;
-namespace fixtures = ninfer::test::offloaded_moe;
-using ninfer::test::cuda_check;
+namespace canon    = infernix::ops::canon;
+namespace moe      = infernix::ops::offloaded_moe;
+namespace fixtures = infernix::test::offloaded_moe;
+using infernix::test::cuda_check;
 
 namespace {
 
@@ -275,7 +275,7 @@ void test_e2m1_decode() {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }

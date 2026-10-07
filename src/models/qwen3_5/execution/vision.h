@@ -18,7 +18,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 using detail::VisionWorkspacePlan;
 using detail::VisionPrefillPlan;
@@ -125,4 +125,4 @@ private:
     std::optional<VisionOverlayWindowStats> overlay_stats_;
 };
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 class KVAddressSpaceStore;
 
@@ -1362,4 +1362,4 @@ inline KVPagePrefixForkReservation::~KVPagePrefixForkReservation() {
 inline KVActivePrefixViewReservation::~KVActivePrefixViewReservation() {
     if (owner_ != nullptr) { owner_->abort_active_prefix_view(*this); }
 }
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

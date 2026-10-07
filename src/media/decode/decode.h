@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::media::decode {
+namespace infernix::media::decode {
 
 enum class ErrorKind {
     BudgetExceeded,
@@ -102,4 +102,4 @@ using LibraryLogHandler = std::function<void(const LibraryLogLine& line)>;
 // output. Returns the handler it replaces, so a scoped owner can restore it.
 LibraryLogHandler set_library_log_handler(LibraryLogHandler handler);
 
-} // namespace ninfer::media::decode
+} // namespace infernix::media::decode

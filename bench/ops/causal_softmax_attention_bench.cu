@@ -4,13 +4,13 @@
 // contracts. Decode, small-T, prompt, split-KV, and kernel selection remain private production
 // implementation details and never enter this benchmark's dispatch or output schema.
 
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/kv_cache_append.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/kv_cache_append.h"
 
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -29,7 +29,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -116,7 +116,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_causal_softmax_attention_bench "
+                 "usage: infernix_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|all] "
                  "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2|all] [--batch B,...] [--tokens W,...] "
@@ -1071,7 +1071,7 @@ int main(int argc, char** argv) {
         write_csv(options, results);
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_causal_softmax_attention_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_causal_softmax_attention_bench: %s\n", error.what());
         return 1;
     }
 }

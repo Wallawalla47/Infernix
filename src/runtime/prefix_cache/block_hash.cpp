@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 namespace {
 
 constexpr std::uint64_t kMultiplier = 0x9e3779b97f4a7c15ULL;
@@ -57,4 +57,4 @@ std::vector<std::uint64_t> block_lookup_hashes(std::span<const TokenId> tokens,
     return hashes;
 }
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

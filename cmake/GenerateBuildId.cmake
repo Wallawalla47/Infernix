@@ -1,10 +1,10 @@
-# GenerateBuildId.cmake -- write the NInfer build id to a C header at BUILD time.
+# GenerateBuildId.cmake -- write the Infernix build id to a C header at BUILD time.
 #
 # Run as:  cmake -DSRC_DIR=<src> -DOUT=<out header> -P cmake/GenerateBuildId.cmake
 #
 # The id is `<base>[-dirty]`:
 #
-#   <base>   $NINFER_BUILD_ID if that env var is set (the one-off restamp build_*.bat
+#   <base>   $INFERNIX_BUILD_ID if that env var is set (the one-off restamp build_*.bat
 #            scripts use it), otherwise `git describe --always --tags` from the source
 #            tree.
 #   -dirty   appended when the product sources differ from HEAD -- see below.
@@ -24,14 +24,14 @@
 # So the dirty test asks the narrower question that the id is meant to answer: do the files that
 # are actually compiled into these binaries match HEAD? A tracked modification, or a newly added
 # file, under one of the product source roots below means they do not; anything elsewhere cannot
-# change the binary and must not taint its identity. Keep NINFER_PRODUCT_ROOTS in step with the
+# change the binary and must not taint its identity. Keep INFERNIX_PRODUCT_ROOTS in step with the
 # layout -- a new top-level directory whose sources get compiled in belongs in this list, or
 # changes to it would go unreported.
 
-set(NINFER_PRODUCT_ROOTS src include apps cmake third_party)
+set(INFERNIX_PRODUCT_ROOTS src include apps cmake third_party)
 
-if(ENV{NINFER_BUILD_ID})
-  set(_id "$ENV{NINFER_BUILD_ID}")
+if(ENV{INFERNIX_BUILD_ID})
+  set(_id "$ENV{INFERNIX_BUILD_ID}")
 else()
   set(_id "")
   set(_dirty "")
@@ -48,7 +48,7 @@ else()
       # files elsewhere (local logs, watchers, experiment output) are invisible here by design.
       execute_process(
         COMMAND "${_git_executable}" status --porcelain --untracked-files=normal --
-                ${NINFER_PRODUCT_ROOTS} CMakeLists.txt CMakePresets.json
+                ${INFERNIX_PRODUCT_ROOTS} CMakeLists.txt CMakePresets.json
         WORKING_DIRECTORY "${SRC_DIR}"
         OUTPUT_VARIABLE _product_status
         OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -59,10 +59,10 @@ else()
         # has not earned.
         set(_dirty "-dirty")
         message(WARNING "git status failed (${_status_result}); assuming the product sources "
-                        "are dirty for the NINFER build id.")
+                        "are dirty for the INFERNIX build id.")
       elseif(_product_status)
         set(_dirty "-dirty")
-        message(STATUS "NINFER build id will be marked dirty -- product sources differ "
+        message(STATUS "INFERNIX build id will be marked dirty -- product sources differ "
                        "from HEAD:\n${_product_status}")
       endif()
     endif()
@@ -71,9 +71,9 @@ else()
     set(_id "unknown")
     # A build that cannot record its real identity must not pass silently: the startup log would
     # otherwise show "build unknown" for a real binary.
-    message(WARNING "NINFER build id unavailable (git missing or not a repository) -- "
+    message(WARNING "INFERNIX build id unavailable (git missing or not a repository) -- "
                     "the startup log will record 'build unknown'. Rebuild from a git "
-                    "checkout (or set NINFER_BUILD_ID) to record the real id.")
+                    "checkout (or set INFERNIX_BUILD_ID) to record the real id.")
   else()
     set(_id "${_id}${_dirty}")
   endif()
@@ -81,7 +81,7 @@ endif()
 
 string(REPLACE "\"" "\\\"" _id_escaped "${_id}")
 # Single string (not a list) so file(WRITE) does not inject a ';' list separator.
-set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define NINFER_BUILD_ID \"${_id_escaped}\"\n")
+set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define INFERNIX_BUILD_ID \"${_id_escaped}\"\n")
 
 if(EXISTS "${OUT}")
   file(READ "${OUT}" _existing)
@@ -93,4 +93,4 @@ endif()
 get_filename_component(_out_dir "${OUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${_out_dir}")
 file(WRITE "${OUT}" "${_content}")
-message(STATUS "NINFER build id: ${_id}")
+message(STATUS "INFERNIX build id: ${_id}")

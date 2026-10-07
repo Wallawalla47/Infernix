@@ -5,8 +5,8 @@
 #include <thread>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::serve;
+using namespace infernix;
+using namespace infernix::serve;
 
 int main() {
     int failures     = 0;
@@ -36,20 +36,20 @@ int main() {
     running.host_context_reserved_bytes = 1024;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
-    check(live.find("ninfer_generation_tokens_total 5\n") != std::string::npos,
+    check(live.find("infernix_generation_tokens_total 5\n") != std::string::npos,
           "live generated count must exclude startup warmup");
-    check(live.find("ninfer_spec_decode_draft_tokens_total 6\n") != std::string::npos,
+    check(live.find("infernix_spec_decode_draft_tokens_total 6\n") != std::string::npos,
           "speculative work must be observable before request completion");
-    check(live.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos &&
-              live.find("ninfer_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
+    check(live.find("infernix_time_to_first_token_seconds_count 1\n") != std::string::npos &&
+              live.find("infernix_requests_total{outcome=\"completed\"} 0\n") != std::string::npos,
           "TTFT must be visible before completion");
     check(live.find("_bucket{le=\"0.25\"} 1\n") != std::string::npos &&
-              live.find("ninfer_time_to_first_token_seconds_sum 0.25\n") != std::string::npos,
+              live.find("infernix_time_to_first_token_seconds_sum 0.25\n") != std::string::npos,
           "TTFT must include preparation and use inclusive histogram buckets");
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
     check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
-    check(live.find("ninfer_host_context_used_bytes 4096\n") != std::string::npos,
+    check(live.find("infernix_host_context_used_bytes 4096\n") != std::string::npos,
           "reserved bytes must not be added to occupancy twice");
 
     GenerationOutcome outcome;
@@ -69,20 +69,20 @@ int main() {
     metrics.failed(false);
     metrics.rejected();
     const auto final = metrics.render(running, false);
-    check(final.find("ninfer_engine_ready 0\n") != std::string::npos,
+    check(final.find("infernix_engine_ready 0\n") != std::string::npos,
           "unavailable engine must remain observable");
-    check(final.find("ninfer_requests_total{outcome=\"completed\"} 400\n") != std::string::npos &&
-              final.find("ninfer_requests_total{outcome=\"cancelled\"} 2\n") != std::string::npos &&
-              final.find("ninfer_requests_total{outcome=\"failed\"} 1\n") != std::string::npos &&
-              final.find("ninfer_requests_total{outcome=\"rejected\"} 1\n") != std::string::npos,
+    check(final.find("infernix_requests_total{outcome=\"completed\"} 400\n") != std::string::npos &&
+              final.find("infernix_requests_total{outcome=\"cancelled\"} 2\n") != std::string::npos &&
+              final.find("infernix_requests_total{outcome=\"failed\"} 1\n") != std::string::npos &&
+              final.find("infernix_requests_total{outcome=\"rejected\"} 1\n") != std::string::npos,
           "concurrent settlements and terminal classifications must be preserved");
-    check(final.find("ninfer_request_duration_seconds_bucket{le=\"+Inf\"} 401\n") !=
+    check(final.find("infernix_request_duration_seconds_bucket{le=\"+Inf\"} 401\n") !=
                   std::string::npos &&
-              final.find("ninfer_request_duration_seconds_count 401\n") != std::string::npos &&
-              final.find("ninfer_request_duration_seconds_sum 802\n") != std::string::npos,
+              final.find("infernix_request_duration_seconds_count 401\n") != std::string::npos &&
+              final.find("infernix_request_duration_seconds_sum 802\n") != std::string::npos,
           "histogram counts and sums must include cancelled outcomes without fabricating failure "
           "durations");
-    check(final.find("ninfer_time_to_first_token_seconds_count 1\n") != std::string::npos,
+    check(final.find("infernix_time_to_first_token_seconds_count 1\n") != std::string::npos,
           "request settlement must not count the first token again");
     return failures == 0 ? 0 : 1;
 }

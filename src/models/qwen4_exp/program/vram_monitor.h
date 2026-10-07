@@ -14,7 +14,7 @@
 #include <mutex>
 #include <thread>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 class VramMonitor {
 public:
@@ -52,4 +52,4 @@ void set_vram_grow_delay(double seconds);
 [[nodiscard]] double vram_grow_delay();
 } // namespace testing
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

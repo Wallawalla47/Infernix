@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 // Qwen's tool syntax carries each argument as untyped text. This terminal contract records only
 // the supported top-level JSON Schema types needed to normalize that text. A type mismatch remains
@@ -98,4 +98,4 @@ private:
     bool finished_                    = false;
 };
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

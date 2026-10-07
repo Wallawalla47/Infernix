@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void q8_linear_add_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream);
@@ -70,4 +70,4 @@ void q8_linear_add_splitk_capacity_launch(const Tensor& x, const Weight& w, Tens
 void q8_linear_add_grouped_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                   cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace q4 = ninfer::models::qwen4_exp;
+namespace q4 = infernix::models::qwen4_exp;
 
 namespace {
 
@@ -100,7 +100,7 @@ std::uint64_t distinct_blocks(const std::vector<std::uint32_t>& rows) {
 } // namespace
 
 int main() {
-    const auto path = std::filesystem::temp_directory_path() / "ninfer_ngram_volume_test.ngram";
+    const auto path = std::filesystem::temp_directory_path() / "infernix_ngram_volume_test.ngram";
     try {
         const q4::NgramTableConfig table = make_volume(path);
         const q4::NgramVolume volume(path, table);

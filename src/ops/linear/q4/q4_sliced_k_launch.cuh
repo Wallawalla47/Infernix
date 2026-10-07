@@ -7,7 +7,7 @@
 #include "ops/linear/q4/q4_operands.h"
 #include "ops/linear/q4/q4_a16_sliced_k_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue,
           class RowPolicy = Q4IdentityRows<Schedule::kBlockRows>>
 void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
@@ -49,4 +49,4 @@ void launch_q4_a16_sliced_k_mma(const Q4LinearOperands& operands, Output output,
         CUDA_CHECK(cudaGetLastError());
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

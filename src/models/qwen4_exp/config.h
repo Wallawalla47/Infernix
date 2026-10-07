@@ -15,11 +15,11 @@
 #include <optional>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 struct Directory;
 }
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 enum class MixerKind : std::uint8_t { Attention, Gdn };
 enum class GateActivation : std::uint8_t { Sigmoid, Silu };
@@ -154,4 +154,4 @@ struct Config {
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

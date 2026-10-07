@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 
 // Hybrid prefix cache index (docs/maintainer/hybrid-prefix-cache-spec.md §5, §6, §9).
 //
@@ -556,4 +556,4 @@ struct HostRestorePlan {
                                                 std::uint64_t host_slabs,
                                                 const PrefixIndexConfig& config);
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

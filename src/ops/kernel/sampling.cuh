@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/sampling.h
+// Implements: include/infernix/ops/sampling.h
 // Match: contiguous BF16 logits, physical stride >= token domain, and at most
 // sixteen columns on the multi-block route.
 // Algorithm assumptions: 256-thread/2-item partial tiles feed bounded top-20
@@ -9,7 +9,7 @@
 
 #include "ops/kernel/sampling_device.cuh"
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __launch_bounds__(kSamplerBlock) __global__
     void sample_row_kernel(const __nv_bfloat16* logits, std::int32_t* out,
@@ -294,4 +294,4 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void sampling_group_finalize_sa
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

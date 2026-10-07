@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/template_launch.cuh"
 #include "ops/kv_cache/append/launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class G, int Tokens, class Input, bool Writable>
@@ -40,18 +40,18 @@ void grouped_instance(const CausalAttentionOperands& p, Int8KvCacheView<Writable
                       Input input, CausalKvPartition partition, CausalPartialView partial,
                       cudaStream_t stream) {
     switch (p.width) {
-#define NINFER_INT8_GROUPED(T)                                                                     \
+#define INFERNIX_INT8_GROUPED(T)                                                                     \
     case T:                                                                                        \
         return grouped<G, T>(p, cache, input, partition, partial, stream)
-        NINFER_INT8_GROUPED(1);
-        NINFER_INT8_GROUPED(2);
-        NINFER_INT8_GROUPED(3);
-        NINFER_INT8_GROUPED(4);
-        NINFER_INT8_GROUPED(5);
-        NINFER_INT8_GROUPED(6);
-        NINFER_INT8_GROUPED(7);
-        NINFER_INT8_GROUPED(8);
-#undef NINFER_INT8_GROUPED
+        INFERNIX_INT8_GROUPED(1);
+        INFERNIX_INT8_GROUPED(2);
+        INFERNIX_INT8_GROUPED(3);
+        INFERNIX_INT8_GROUPED(4);
+        INFERNIX_INT8_GROUPED(5);
+        INFERNIX_INT8_GROUPED(6);
+        INFERNIX_INT8_GROUPED(7);
+        INFERNIX_INT8_GROUPED(8);
+#undef INFERNIX_INT8_GROUPED
     }
     throw std::logic_error("INT8 grouped plan exceeds the selected token tile");
 }
@@ -184,4 +184,4 @@ void int8_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                         plan, workspace, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

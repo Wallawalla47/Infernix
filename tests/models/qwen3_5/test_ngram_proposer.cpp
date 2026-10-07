@@ -5,8 +5,8 @@
 #include <numeric>
 #include <random>
 
-using ninfer::models::qwen3_5::detail::NgramProposer;
-using ninfer::models::qwen3_5::frontend::ngram_numbered_sources;
+using infernix::models::qwen3_5::detail::NgramProposer;
+using infernix::models::qwen3_5::frontend::ngram_numbered_sources;
 
 static void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }

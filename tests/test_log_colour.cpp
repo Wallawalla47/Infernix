@@ -7,10 +7,10 @@
 
 namespace {
 
-using ninfer::product::log_colour::LogFamily;
-using ninfer::product::log_colour::colourise_stats_line;
-using ninfer::product::log_colour::family_colour_slot;
-using ninfer::product::log_colour::family_for;
+using infernix::product::log_colour::LogFamily;
+using infernix::product::log_colour::colourise_stats_line;
+using infernix::product::log_colour::family_colour_slot;
+using infernix::product::log_colour::family_for;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }

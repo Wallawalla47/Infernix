@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp::expert_cache {
 
 // ---------------------------------------------------------------------------- residency entries
 
@@ -549,4 +549,4 @@ void CacheController::give_back(std::uint32_t first, std::uint32_t count, std::v
     drain_queue(out);
 }
 
-} // namespace ninfer::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp::expert_cache

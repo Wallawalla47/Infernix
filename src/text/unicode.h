@@ -7,7 +7,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::text::unicode_internal {
+namespace infernix::text::unicode_internal {
 
 struct CodepointSpan {
     std::int32_t value = 0;
@@ -53,4 +53,4 @@ bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
 bool is_whitespace(std::int32_t codepoint) noexcept;
 
-} // namespace ninfer::text::unicode_internal
+} // namespace infernix::text::unicode_internal

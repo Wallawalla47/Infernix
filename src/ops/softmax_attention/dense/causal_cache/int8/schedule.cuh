@@ -2,7 +2,7 @@
 
 #include "ops/softmax_attention/common/causal_geometry.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int TokenTile, int Warps, int KeyTile, int MinBlocks = 1, bool DynamicArena = true>
 struct Int8KvGroupedMmaSchedule {
@@ -52,4 +52,4 @@ struct Int8KvMergeSchedule {
     static constexpr int kThreads = 256;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -3,7 +3,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 namespace {
 
@@ -117,4 +117,4 @@ StopConsoleLine StopControl::resting_line_locked() const {
                         : "Closing | Press Ctrl+C again to exit at once"};
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

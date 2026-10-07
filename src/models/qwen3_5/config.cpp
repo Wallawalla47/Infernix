@@ -2,7 +2,7 @@
 #include "models/qwen3_5/vision_config.h"
 
 #include "artifact/schema.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,7 +12,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 using artifact::ArtifactError;
@@ -382,4 +382,4 @@ VisionConfig parse_vision_config(const artifact::Json& value, std::span<const st
     return vision_config(value, model_types);
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

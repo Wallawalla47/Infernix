@@ -4,7 +4,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 const std::array kShapes{&kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
                          &kNvfp4N5120K6144, &kNvfp4N5120K17408};
@@ -42,4 +42,4 @@ void nvfp4_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     const auto scratch = allocate_nvfp4_a4_workspace(*workspace, x.ne[1], weight.k);
     shape.a4(x, weight, out, scratch, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

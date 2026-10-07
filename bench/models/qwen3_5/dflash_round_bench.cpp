@@ -24,7 +24,7 @@
 
 namespace {
 
-namespace qwen = ninfer::models::qwen3_5;
+namespace qwen = infernix::models::qwen3_5;
 using Clock    = std::chrono::steady_clock;
 
 struct Options {
@@ -35,7 +35,7 @@ struct Options {
     std::uint32_t context_tokens   = 128;
     std::uint32_t draft_tokens     = 15;
     std::uint32_t batch_size       = 1;
-    ninfer::ProposalHead proposal  = ninfer::ProposalHead::Optimized;
+    infernix::ProposalHead proposal  = infernix::ProposalHead::Optimized;
     bool use_cuda_graph            = true;
 };
 
@@ -83,16 +83,16 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--proposal-head") {
             const std::string_view head(value("--proposal-head"));
             if (head == "full") {
-                options.proposal = ninfer::ProposalHead::Full;
+                options.proposal = infernix::ProposalHead::Full;
             } else if (head == "optimized") {
-                options.proposal = ninfer::ProposalHead::Optimized;
+                options.proposal = infernix::ProposalHead::Optimized;
             } else {
                 throw std::invalid_argument("--proposal-head must be full or optimized");
             }
         } else if (argument == "--no-cuda-graph") {
             options.use_cuda_graph = false;
         } else if (argument == "-h" || argument == "--help") {
-            print_usage(argc > 0 ? argv[0] : "ninfer_qwen3_5_dflash_round_bench");
+            print_usage(argc > 0 ? argv[0] : "infernix_qwen3_5_dflash_round_bench");
             std::exit(0);
         } else {
             throw std::invalid_argument("unknown argument: " + std::string(argument));
@@ -109,14 +109,14 @@ Options parse_options(int argc, char** argv) {
     if (options.draft_tokens == 0 || options.draft_tokens > 15) {
         throw std::invalid_argument("--draft-tokens must be in [1,15]");
     }
-    if (options.batch_size == 0 || options.batch_size > ninfer::kMaximumConcurrency) {
+    if (options.batch_size == 0 || options.batch_size > infernix::kMaximumConcurrency) {
         throw std::invalid_argument("--batch must be in [1,8]");
     }
     return options;
 }
 
-std::vector<ninfer::TokenId> prompt_tokens(std::uint32_t count) {
-    std::vector<ninfer::TokenId> prompt{
+std::vector<infernix::TokenId> prompt_tokens(std::uint32_t count) {
+    std::vector<infernix::TokenId> prompt{
         248045, 846,    198, 109266, 3709,  96220, 117443, 97913,
         1710,   248046, 198, 248045, 74455, 198,   248068, 198,
     };
@@ -128,20 +128,20 @@ struct RoundMeasurement {
     float gpu_ms                  = 0.0F;
     double wall_ms                = 0.0;
     std::uint32_t licensed_tokens = 0;
-    std::array<ninfer::SpeculativeStats, ninfer::kMaximumConcurrency> stats{};
+    std::array<infernix::SpeculativeStats, infernix::kMaximumConcurrency> stats{};
 };
 
-RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& device,
+RoundMeasurement measure_round(qwen::Program& program, infernix::DeviceContext& device,
                                std::span<const qwen::SequenceHandle> sequences,
                                std::uint32_t batch_size, std::uint32_t draft_tokens) {
-    std::array<ninfer::runtime::RoundBudget, ninfer::kMaximumConcurrency> budgets{};
+    std::array<infernix::runtime::RoundBudget, infernix::kMaximumConcurrency> budgets{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         budgets[row] = {.generated_tokens_remaining = draft_tokens + 1};
     }
     const auto budget_span =
-        std::span<const ninfer::runtime::RoundBudget>(budgets.data(), batch_size);
+        std::span<const infernix::runtime::RoundBudget>(budgets.data(), batch_size);
     // Resource scheduling stays outside both the GPU and wall decode/commit intervals.
-    std::array<qwen::ExecutionUnit, ninfer::kMaximumConcurrency> units{};
+    std::array<qwen::ExecutionUnit, infernix::kMaximumConcurrency> units{};
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         units[row] = {.sequence = sequences[row],
                       .kind     = qwen::ExecutionUnitKind::Decode,
@@ -150,14 +150,14 @@ RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& de
     if (!program.reserve_units(std::span<const qwen::ExecutionUnit>(units.data(), batch_size))) {
         throw std::runtime_error("benchmark decode batch could not be reserved");
     }
-    ninfer::CudaEventTimer timer(device);
+    infernix::CudaEventTimer timer(device);
     const auto wall_start = Clock::now();
     timer.start();
     auto pending = program.decode(sequences, budget_span);
     if (pending.row_counts().size() != batch_size) {
         throw std::runtime_error("DFlash benchmark round returned invalid row counts");
     }
-    std::array<ninfer::runtime::CommitDecision, ninfer::kMaximumConcurrency> decisions{};
+    std::array<infernix::runtime::CommitDecision, infernix::kMaximumConcurrency> decisions{};
     std::uint32_t licensed = 0;
     for (std::uint32_t row = 0; row < batch_size; ++row) {
         const std::int32_t count = pending.row_counts()[row];
@@ -169,7 +169,7 @@ RoundMeasurement measure_round(qwen::Program& program, ninfer::DeviceContext& de
     }
     const auto committed = program.commit(
         std::move(pending),
-        std::span<const ninfer::runtime::CommitDecision>(decisions.data(), batch_size));
+        std::span<const infernix::runtime::CommitDecision>(decisions.data(), batch_size));
     const float gpu_ms = timer.stop_ms();
     const double wall_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - wall_start).count();
@@ -204,35 +204,35 @@ int run(const Options& options) {
         throw std::invalid_argument("context and measured rounds exceed native capacity");
     }
 
-    ninfer::EngineOptions engine;
+    infernix::EngineOptions engine;
     engine.artifact_path = options.artifact;
     engine.device        = options.device;
     engine.max_context   = static_cast<std::uint32_t>(per_request_capacity);
     engine.kv_capacity =
-        ninfer::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
+        infernix::KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(capacity));
     engine.prefill_chunk             = 128;
-    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend       = ninfer::SpeculativeBackend::DFlash;
+    engine.kv_cache                  = infernix::KvCacheStorage::BFloat16;
+    engine.speculative.backend       = infernix::SpeculativeBackend::DFlash;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
     engine.max_concurrency           = options.batch_size;
 
-    engine = ninfer::runtime::normalize_engine_options(std::move(engine));
-    ninfer::DeviceContext device(options.device);
-    auto constructed = ninfer::runtime::construct_model(engine, device);
+    engine = infernix::runtime::normalize_engine_options(std::move(engine));
+    infernix::DeviceContext device(options.device);
+    auto constructed = infernix::runtime::construct_model(engine, device);
     auto& frontend   = constructed.instance->frontend;
     auto& program    = constructed.instance->program;
-    ninfer::runtime::ResolvedExecutionOptions execution;
+    infernix::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    std::array<qwen::SequenceHandle, ninfer::kMaximumConcurrency> active_sequences{};
+    std::array<qwen::SequenceHandle, infernix::kMaximumConcurrency> active_sequences{};
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(std::move(prompt), execution);
         auto source       = program->inspect_source(request_base, std::nullopt);
         if (!source ||
-            !program->start_binding(request_base, ninfer::runtime::LaneId{lane}, *source)) {
+            !program->start_binding(request_base, infernix::runtime::LaneId{lane}, *source)) {
             throw std::runtime_error("benchmark root binding could not reserve its first unit");
         }
         std::optional<qwen::SequenceHandle> started;
@@ -264,8 +264,8 @@ int run(const Options& options) {
         if (!progress->pending || progress->pending->tokens().size() != 1) {
             throw std::runtime_error("benchmark seed prefill did not license exactly one token");
         }
-        const std::array<ninfer::runtime::CommitDecision, 1> begin_decision{
-            ninfer::runtime::CommitDecision{.accepted_tokens = 1}};
+        const std::array<infernix::runtime::CommitDecision, 1> begin_decision{
+            infernix::runtime::CommitDecision{.accepted_tokens = 1}};
         (void)program->commit(std::move(*progress->pending), begin_decision);
     }
 
@@ -315,7 +315,7 @@ int run(const Options& options) {
     }
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         const auto aborted = program->abort(active_sequences[lane]);
-        if (aborted.status != ninfer::runtime::ConsumeStatus::Consumed) {
+        if (aborted.status != infernix::runtime::ConsumeStatus::Consumed) {
             throw std::runtime_error("benchmark could not release an active sequence");
         }
     }
@@ -326,14 +326,14 @@ int run(const Options& options) {
     const double mean_licensed_per_request =
         mean_licensed_per_batch / static_cast<double>(options.batch_size);
 
-    std::cout << "format,ninfer_qwen3_5_dflash_round_bench_v3\n";
+    std::cout << "format,infernix_qwen3_5_dflash_round_bench_v3\n";
     std::cout << "artifact," << options.artifact.string() << '\n';
     std::cout << "device," << device.props.name << '\n';
     std::cout << "context_tokens," << options.context_tokens << '\n';
     std::cout << "draft_tokens," << options.draft_tokens << '\n';
     std::cout << "batch_size," << options.batch_size << '\n';
     std::cout << "proposal_head,"
-              << (options.proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full")
+              << (options.proposal == infernix::ProposalHead::Optimized ? "optimized" : "full")
               << '\n';
     std::cout << "cuda_graph," << (options.use_cuda_graph ? "true" : "false") << '\n';
     std::cout << "warmup," << options.warmup << '\n';
@@ -364,7 +364,7 @@ int main(int argc, char** argv) {
     try {
         return run(parse_options(argc, argv));
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_qwen3_5_dflash_round_bench: " << error.what() << '\n';
+        std::cerr << "infernix_qwen3_5_dflash_round_bench: " << error.what() << '\n';
         return 1;
     }
 }

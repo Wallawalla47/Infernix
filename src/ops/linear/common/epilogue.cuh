@@ -2,7 +2,7 @@
 
 #include "ops/linear/common/output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Thread-local operations over a fully reduced accumulator. The contraction
 // owns predicates and synchronization; epilogues only receive valid coordinates.
@@ -39,4 +39,4 @@ linear_finish_row(const Output& output, const Epilogue& epilogue, int row, int t
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue, class RowPolicy>
 __global__
@@ -249,4 +249,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

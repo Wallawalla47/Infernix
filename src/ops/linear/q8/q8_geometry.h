@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <std::int32_t OutputRows, std::int32_t InputRows>
 struct Q8LinearGeometry {
@@ -17,4 +17,4 @@ struct Q8LinearGeometry {
     static constexpr std::int32_t kScaleRowBytes = kGroupsPerRow * sizeof(std::uint16_t);
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

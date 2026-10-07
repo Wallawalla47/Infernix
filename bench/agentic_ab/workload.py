@@ -1,7 +1,7 @@
-"""Deterministic agentic coding workload for the NInfer serve A/B suite.
+"""Deterministic agentic coding workload for the Infernix serve A/B suite.
 
 The workload models what the production request logs in the deploy folder show a coding
-agent doing to one ninfer-serve (~3,300 logged requests): long multi-turn tool loops whose
+agent doing to one infernix-serve (~3,300 logged requests): long multi-turn tool loops whose
 turns add a few hundred to a few thousand tokens to a 30K-200K conversation, periodic
 context compaction, parallel subagent fan-outs that share a system-and-tools prefix,
 cold side calls over the whole history, client retries and aborted requests, a
@@ -116,7 +116,7 @@ def obs_read(c, rng, area, target_tok, path=None, whole=False):
         used += len(row) + 1
         i += 1
     head = "Showing lines %d-%d of %d total lines in %s\n" % (start + 1, i, len(lines), path)
-    return ("read_file", {"path": "/work/ninfer/" + path, "offset": start + 1, "limit": i - start},
+    return ("read_file", {"path": "/work/infernix/" + path, "offset": start + 1, "limit": i - start},
             head + "\n".join(out), rng.uniform(0.15, 0.5))
 
 
@@ -146,7 +146,7 @@ def obs_grep(c, rng, area, target_tok):
         if used >= budget * 0.6:
             break
     text = "\n".join(out) if out else "No matches found"
-    return ("grep", {"pattern": "|".join(pats), "path": "/work/ninfer"}, text,
+    return ("grep", {"pattern": "|".join(pats), "path": "/work/infernix"}, text,
             rng.uniform(0.2, 0.8))
 
 
@@ -154,7 +154,7 @@ def obs_glob(c, rng, area, target_tok):
     files = c.by_area[area]
     k = max(5, min(len(files), int(target_tok * CHARS_PER_TOKEN / 48)))
     start = rng.randrange(0, max(1, len(files) - k))
-    text = "\n".join("/work/ninfer/" + f for f in files[start:start + k])
+    text = "\n".join("/work/infernix/" + f for f in files[start:start + k])
     return ("glob", {"pattern": AREAS[area][1][0] + "/**/*"}, text, rng.uniform(0.1, 0.3))
 
 
@@ -174,9 +174,9 @@ def obs_edit_ack(c, rng, area, path=None):
     lines = c.lines(path)
     s = rng.randrange(0, max(1, len(lines) - 25))
     snippet = "\n".join("%6d\t%s" % (i + 1, lines[i]) for i in range(s, min(len(lines), s + 22)))
-    text = ("The file /work/ninfer/%s has been updated. Here's the result of running `cat -n` on "
+    text = ("The file /work/infernix/%s has been updated. Here's the result of running `cat -n` on "
             "a snippet of the edited file:\n%s" % (path, snippet))
-    return ("edit_file", {"path": "/work/ninfer/" + path, "old_string": lines[s][:80],
+    return ("edit_file", {"path": "/work/infernix/" + path, "old_string": lines[s][:80],
                           "new_string": lines[s][:80]}, text, rng.uniform(0.1, 0.3))
 
 
@@ -190,7 +190,7 @@ def obs_build(c, rng, area, target_tok, fail=None):
         out.append("$ python -m pytest -q eval/tests")
         out.append("============================= test session starts =============================")
         out.append("platform linux -- Python 3.11.9, pytest-8.3.2, pluggy-1.5.0")
-        out.append("rootdir: /work/ninfer")
+        out.append("rootdir: /work/infernix")
         tests = [f for f in files if "/tests/" in f] or files
         for i in range(10_000):
             f = tests[i % len(tests)]
@@ -200,7 +200,7 @@ def obs_build(c, rng, area, target_tok, fail=None):
             if sum(len(x) for x in out) > budget * 0.55:
                 break
     else:
-        out.append("$ cmake --build build -j --target ninfer_runtime_tests ninfer-serve && "
+        out.append("$ cmake --build build -j --target infernix_runtime_tests infernix-serve && "
                    "ctest --test-dir build -R context_cache --output-on-failure")
         cpp = [f for f in files if f.endswith((".cpp", ".cu"))] or files
         for i in range(10_000):
@@ -208,8 +208,8 @@ def obs_build(c, rng, area, target_tok, fail=None):
             out.append("[%3d%%] Building CXX object %s.o" % (min(99, i * 3), f.replace("src/", "src/CMakeFiles/")))
             if sum(len(x) for x in out) > budget * 0.45:
                 break
-        out.append("[100%] Linking CXX executable tests/ninfer_runtime_tests")
-        out.append("Test project /work/ninfer/build")
+        out.append("[100%] Linking CXX executable tests/infernix_runtime_tests")
+        out.append("Test project /work/infernix/build")
         for i in range(rng.randrange(8, 30)):
             out.append("      Start %2d: context_cache.case_%02d" % (i + 1, i))
             out.append("%2d/%2d Test #%2d: context_cache.case_%02d ..........   Passed    %.2f sec"
@@ -431,7 +431,7 @@ praise, apologies or filler.
 - Long builds may be run in the background and polled with bash_output.
 
 # Environment
-Working directory: /work/ninfer
+Working directory: /work/infernix
 Platform: linux (x86_64), CUDA 13.1, GCC 14
 Today's date: 2026-09-24
 Git: branch fix/context-cache-demotion, 3 files modified
@@ -466,7 +466,7 @@ instructions and utilizing your available tools.
 - Run independent searches in parallel.
 
 # Environment
-Working directory: /work/ninfer (Python 3.11 virtualenv active)
+Working directory: /work/infernix (Python 3.11 virtualenv active)
 Today's date: 2026-09-24
 """
 
@@ -612,7 +612,7 @@ def _loop(c, rng, area, n, start, copy_at=(), edit_at=(), extra=None):
             fn = rng.choice(_identifiers(c.text(path)) or ["the main function"])
             steps.append({"op": "request", "cls": "loop", "copy": True, "obs": text, "delay": delay,
                           "user": ("Looks right. Apply it now: call write_file with the COMPLETE "
-                                   "updated contents of /work/ninfer/%s. Keep every other line "
+                                   "updated contents of /work/infernix/%s. Keep every other line "
                                    "byte-identical; only add a short comment above the first use "
                                    "of %s explaining its ownership." % (path, fn)),
                           "user_delay": rng.uniform(6, 14)})
@@ -621,7 +621,7 @@ def _loop(c, rng, area, n, start, copy_at=(), edit_at=(), extra=None):
             path = c.pick_file(rng, area, min_lines=60, max_lines=400)
             _, _, text, delay = obs_read(c, rng, area, 2600, path=path)
             steps.append({"op": "request", "cls": "loop", "copy": True, "obs": text, "delay": delay,
-                          "user": ("Use edit_file on /work/ninfer/%s to wrap the body of the second "
+                          "user": ("Use edit_file on /work/infernix/%s to wrap the body of the second "
                                    "function shown above in a scope guard. old_string must contain "
                                    "that function's entire body exactly as shown." % path),
                           "user_delay": rng.uniform(5, 12)})
@@ -667,7 +667,7 @@ def _summary(c, rng, area, words=1400):
             "Fix the context-cache demotion path so a private owner evicted under device pressure "
             "keeps its host copy, add a regression test, and keep the context-cache tests green.",
             "", "## Files read or changed"]
-    body += ["- /work/ninfer/%s" % f for f in files]
+    body += ["- /work/infernix/%s" % f for f in files]
     body += ["", "## Key decisions"]
     idents = []
     for f in files:
@@ -740,7 +740,7 @@ def build_plan(seed=42, scale=1.0):
 
     for i, name in enumerate(fan1):
         actors.append(_subagent(c, rng, P, name, "sub", "engine",
-                                "Research question %d: in /work/ninfer, trace every path by which a "
+                                "Research question %d: in /work/infernix, trace every path by which a "
                                 "retained private checkpoint can lose its host copy (%s). Report the "
                                 "exact functions, their callers, and the tests that cover them."
                                 % (i + 1, ["eviction", "demotion", "lease extension",
@@ -790,7 +790,7 @@ def build_plan(seed=42, scale=1.0):
                    "steps": b_steps, "top": True})
     for i, name in enumerate(pair):
         actors.append(_subagent(c, rng, P, name, "sub", "python",
-                                "Research question %d: in /work/ninfer, find every place the eval "
+                                "Research question %d: in /work/infernix, find every place the eval "
                                 "tooling %s. Report the exact functions, the file formats involved, "
                                 "and what a resumed run would have to reconstruct."
                                 % (i + 1, ["writes per-item results", "tracks run progress"][i]),

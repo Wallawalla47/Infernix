@@ -1,5 +1,5 @@
-// ninfer::ops - argmax wrapper: public api validation and launcher dispatch.
-#include "ninfer/ops/argmax.h"
+// infernix::ops - argmax wrapper: public api validation and launcher dispatch.
+#include "infernix/ops/argmax.h"
 
 #include "ops/launcher/argmax.h" // detail::argmax_launch
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -78,4 +78,4 @@ void argmax(const Tensor& logits, const Tensor& row_ids, Tensor& out, std::int32
     detail::argmax_map_launch(row_ids, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

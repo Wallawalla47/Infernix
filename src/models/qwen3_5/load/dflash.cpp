@@ -1,6 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig& target,
                         const TextWeights& weights, const std::string& component) {
@@ -44,4 +44,4 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

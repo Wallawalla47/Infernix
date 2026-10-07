@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_pair_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_pair_gemm_concat.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_pair_gemm_mma.cu"

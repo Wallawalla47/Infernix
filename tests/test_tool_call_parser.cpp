@@ -14,7 +14,7 @@
 namespace {
 
 using Json   = nlohmann::json;
-namespace fi = ninfer::models::qwen3_5::frontend;
+namespace fi = infernix::models::qwen3_5::frontend;
 
 const fi::ToolCallOutputContract kLegacyContract;
 
@@ -69,7 +69,7 @@ tool_call(std::string_view tool_name,
 }
 
 int check_rejected(const std::string& text, const fi::ToolCallOutputContract& contract,
-                   ninfer::ToolCallParseFallbackReason reason, std::string_view message) {
+                   infernix::ToolCallParseFallbackReason reason, std::string_view message) {
     const auto parsed = fi::parse_qwen_tool_call_output(text, 64, contract);
     return check(!parsed.is_tool_call_response && parsed.content == text &&
                      parsed.tool_calls.empty() && parsed.diagnostics.marker_seen &&
@@ -90,7 +90,7 @@ int check_parameter_schema_mismatch(const fi::ToolCallOutputContract& contract,
             parsed.tool_calls.front().arguments_json == expected_arguments &&
             parsed.diagnostics.marker_seen && parsed.diagnostics.structured_call_count == 1 &&
             parsed.diagnostics.schema_mismatch_arguments == 1 &&
-            parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+            parsed.diagnostics.fallback_reason == infernix::ToolCallParseFallbackReason::None,
         std::string(message));
 }
 
@@ -215,7 +215,7 @@ int test_string_values_preserve_embedded_tool_markup() {
 }
 
 int test_parameter_delimiters_in_values() {
-    using Reason        = ninfer::ToolCallParseFallbackReason;
+    using Reason        = infernix::ToolCallParseFallbackReason;
     const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}},
                                                     {"timeout", Json{{"type", "integer"}}}});
     int failures        = 0;
@@ -472,7 +472,7 @@ int test_empty_declared_non_string_is_omitted() {
                   parsed.diagnostics.structured_call_count == 1 &&
                   parsed.diagnostics.empty_arguments_omitted == 1 &&
                   parsed.diagnostics.schema_mismatch_arguments == 0 &&
-                  parsed.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                  parsed.diagnostics.fallback_reason == infernix::ToolCallParseFallbackReason::None,
               "empty optional boolean demoted a complete Edit call to text");
     if (parsed.tool_calls.size() == 1) {
         const Json args = Json::parse(parsed.tool_calls.front().arguments_json);
@@ -590,29 +590,29 @@ int test_strict_structure_and_active_tool_set() {
 
     const std::string malformed = "<tool_call>\n<function=configure>\n";
     failures +=
-        check_rejected(malformed, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+        check_rejected(malformed, contract, infernix::ToolCallParseFallbackReason::MalformedStructure,
                        "missing structural tags were accepted");
 
     const std::string suffix = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
     failures +=
-        check_rejected(suffix, contract, ninfer::ToolCallParseFallbackReason::TrailingContent,
+        check_rejected(suffix, contract, infernix::ToolCallParseFallbackReason::TrailingContent,
                        "non-whitespace suffix was accepted");
 
     const std::string missing_parameter_close =
         "<tool_call>\n<function=configure>\n<parameter=value>\nx\n"
         "</function>\n</tool_call>";
     failures += check_rejected(missing_parameter_close, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "missing parameter close was repaired");
 
     const std::string unknown_tool = tool_call("other", {{"value", "x"}});
     failures +=
-        check_rejected(unknown_tool, contract, ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+        check_rejected(unknown_tool, contract, infernix::ToolCallParseFallbackReason::UndeclaredTool,
                        "undeclared tool name was accepted");
 
     const std::string invalid_name = tool_call("bad.name", {{"value", "x"}});
     failures += check_rejected(invalid_name, kLegacyContract,
-                               ninfer::ToolCallParseFallbackReason::InvalidToolName,
+                               infernix::ToolCallParseFallbackReason::InvalidToolName,
                                "invalid function-name character was accepted");
     return failures;
 }
@@ -675,7 +675,7 @@ int test_all_or_nothing_structural_commit() {
     const auto contract    = contract_for("configure", Json{{"flag", Json{{"type", "boolean"}}}});
     const std::string text = tool_call("configure", {{"flag", "true"}}) +
                              "\n<tool_call>\n<function=configure>\n<parameter=flag>\nfalse\n";
-    return check_rejected(text, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
+    return check_rejected(text, contract, infernix::ToolCallParseFallbackReason::MalformedStructure,
                           "partially valid tool-call region was partially committed");
 }
 
@@ -714,7 +714,7 @@ int test_later_candidate_must_consume_the_end() {
     failures += check(!parsed.is_tool_call_response && parsed.tool_calls.empty() &&
                           parsed.content == text && parsed.diagnostics.marker_seen &&
                           parsed.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                              infernix::ToolCallParseFallbackReason::MalformedStructure,
                       "a quoted marker before a non-terminal call was partially committed");
     return failures;
 }
@@ -742,7 +742,7 @@ int test_incremental_quoted_marker_preserves_bytes() {
                       "incremental quoted marker lost or duplicated bytes");
     failures +=
         check(terminal.diagnostics.marker_seen && terminal.diagnostics.structured_call_count == 1 &&
-                  terminal.diagnostics.fallback_reason == ninfer::ToolCallParseFallbackReason::None,
+                  terminal.diagnostics.fallback_reason == infernix::ToolCallParseFallbackReason::None,
               "incremental quoted marker changed terminal diagnostics");
     return failures;
 }
@@ -803,7 +803,7 @@ int test_incremental_fallback_preserves_bytes() {
     int failures = 0;
     failures += check(restored == original && malformed_terminal.diagnostics.marker_seen &&
                           malformed_terminal.diagnostics.fallback_reason ==
-                              ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                              infernix::ToolCallParseFallbackReason::MalformedStructure,
                       "malformed incremental call lost raw bytes or fallback diagnostics");
     failures += check(ordinary_text == "ordinary text  ",
                       "ordinary incremental output lost trailing whitespace");
@@ -959,28 +959,28 @@ int test_mismatched_closing_tags_rejected() {
         "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
         "Value\n</parameter>\n</invoke>\n</tool_call>";
     failures += check_rejected(fn_invoke_mismatch, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "function opening with invoke closing tag was accepted");
 
     const std::string invoke_fn_mismatch =
         "<tool_call>\n<invoke name=\"TaskCreate\">\n<parameter name=\"description\">\n"
         "Value\n</parameter>\n</function>\n</tool_call>";
     failures += check_rejected(invoke_fn_mismatch, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "invoke opening with function closing tag was accepted");
 
     const std::string param_mismatch =
         "<tool_call>\n<function name=\"TaskCreate\">\n<parameter name=\"description\">\n"
         "Value\n</param>\n</function>\n</tool_call>";
     failures += check_rejected(param_mismatch, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "parameter opening with param closing tag was accepted");
 
     const std::string param_open_mismatch =
         "<tool_call>\n<function name=\"TaskCreate\">\n<param name=\"description\">\n"
         "Value\n</parameter>\n</function>\n</tool_call>";
     failures += check_rejected(param_open_mismatch, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure,
+                               infernix::ToolCallParseFallbackReason::MalformedStructure,
                                "param opening with parameter closing tag was accepted");
 
     return failures;
@@ -1056,7 +1056,7 @@ int test_duplicate_parameter_keeps_last_value() {
                           "duplicate parameter did not keep the last value");
     }
     failures += check(parsed.diagnostics.fallback_reason ==
-                          ninfer::ToolCallParseFallbackReason::None,
+                          infernix::ToolCallParseFallbackReason::None,
                       "duplicate parameter still reported a fallback reason");
     failures += check(parsed.diagnostics.duplicate_parameters_repaired == 1,
                       "duplicate parameter repair was not recorded in diagnostics");
@@ -1064,7 +1064,7 @@ int test_duplicate_parameter_keeps_last_value() {
 }
 
 int test_tolerant_recovery() {
-    using Reason = ninfer::ToolCallParseFallbackReason;
+    using Reason = infernix::ToolCallParseFallbackReason;
     int failures = 0;
     const std::string suffixed = tool_call("configure", {{"value", "x"}}) + "\nextra answer";
     const auto contract = contract_for("configure", Json{{"value", Json{{"type", "string"}}}});
@@ -1118,7 +1118,7 @@ int test_tolerant_recovery() {
 }
 
 int test_tolerant_truncated_final_call() {
-    using Reason = ninfer::ToolCallParseFallbackReason;
+    using Reason = infernix::ToolCallParseFallbackReason;
     const auto contract =
         output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
     const std::string open_tag = std::string("<") + "parameter=filePath>\n";
@@ -1161,7 +1161,7 @@ int test_tolerant_truncated_final_call() {
 }
 
 int test_tolerant_missing_function_close_bracket() {
-    using Reason = ninfer::ToolCallParseFallbackReason;
+    using Reason = infernix::ToolCallParseFallbackReason;
     const auto contract = output_contract_for(
         "memory",
         Json{{"command", Json{{"type", "string"}}}, {"path", Json{{"type", "string"}}}});
@@ -1203,7 +1203,7 @@ int test_tolerant_missing_function_close_bracket() {
 }
 
 int test_tolerant_undeclared_and_value_cut() {
-    using Reason = ninfer::ToolCallParseFallbackReason;
+    using Reason = infernix::ToolCallParseFallbackReason;
     const auto contract =
         output_contract_for("delete_file", Json{{"filePath", Json{{"type", "string"}}}});
     int failures = 0;

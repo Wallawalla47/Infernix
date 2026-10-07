@@ -1,6 +1,6 @@
 # tools/bench
 
-Maintainer orchestration for the public `ninfer_bench` throughput tool, serving corpus/concurrency
+Maintainer orchestration for the public `infernix_bench` throughput tool, serving corpus/concurrency
 runners, and the external Serve TTFT client. Correctness is owned by the affected suites under
 [`tests/`](../../tests/README.md).
 
@@ -22,7 +22,7 @@ are documented in the dedicated README.
 
 ## Corpus baker
 
-`ninfer_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
+`infernix_bench` benchmarks prefill at an exact length by slicing the first `P` token ids of a
 committed corpus, so the corpus must be real, in-distribution text (not random tokens) and at
 least as long as the largest prefill you want to run. `make_bench_corpus.py` bakes that corpus
 offline with a local Hugging Face Qwen3.6 tokenizer.
@@ -56,7 +56,7 @@ pip install -r tools/bench/requirements.txt
 ```
 
 The tokenizer is loaded locally only; the tool never downloads from the network. Pass
-`--tokenizer-path` or set `NINFER_TOKENIZER_PATH`.
+`--tokenizer-path` or set `INFERNIX_TOKENIZER_PATH`.
 
 ## Regenerate / check
 
@@ -78,14 +78,14 @@ python3 tools/bench/make_bench_corpus.py --check
 `--tokens` is the exact committed corpus size and the ceiling on prefill length; increase it (and
 optionally use `--source-text`) to benchmark longer prefills, memory permitting.
 
-## NInfer performance matrix
+## Infernix performance matrix
 
-`run_ninfer_bench_matrix.py` runs the layered public-Engine `ninfer_bench` matrix against the native
+`run_infernix_bench_matrix.py` runs the layered public-Engine `infernix_bench` matrix against the native
 `.ninfer` artifact and stores its local reports under `profiles/bench/`. Its defaults are:
 
 ```text
 artifact: out/qwen3_6_27b.ninfer
-binary:   build/bench/ninfer_bench
+binary:   build/bench/infernix_bench
 corpus:   bench/fixtures/bench_corpus.ids
 ```
 
@@ -95,25 +95,25 @@ cover CUDA Graph and eager execution; prefill-only cases vary prompt length and 
 
 ```bash
 # Configure the benchmark targets once; they are off in the default public build.
-cmake -S . -B build -DNINFER_BUILD_BENCHMARKS=ON
+cmake -S . -B build -DINFERNIX_BUILD_BENCHMARKS=ON
 
 # Inspect commands without running the model.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
+python3 tools/bench/run_infernix_bench_matrix.py --preset core --dry-run
 
-# Main run. Builds build/bench/ninfer_bench first, then writes JSON and summary.csv.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core
+# Main run. Builds build/bench/infernix_bench first, then writes JSON and summary.csv.
+python3 tools/bench/run_infernix_bench_matrix.py --preset core
 
 # Longer run that adds 32k/64k prompt and context-decode points.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full
+python3 tools/bench/run_infernix_bench_matrix.py --preset full
 
 # Run only the MTP draft-window sweep.
-python3 tools/bench/run_ninfer_bench_matrix.py --preset full --suite mtp_sweep
+python3 tools/bench/run_infernix_bench_matrix.py --preset full --suite mtp_sweep
 ```
 
 Default outputs:
 
 ```text
-profiles/bench/ninfer-<preset>-<timestamp>/
+profiles/bench/infernix-<preset>-<timestamp>/
   commands.sh
   manifest.json
   json/<suite>/<case>.json
@@ -126,7 +126,7 @@ Use `--resume` to skip completed JSON reports in an existing `--output-dir`, and
 for a minimal script/runner check. `--no-build` uses the binary supplied by `--bench` without
 building it.
 
-Each raw report must be `ninfer_bench_report` schema v16. The flattened summary and schema-v5 matrix
+Each raw report must be `infernix_bench_report` schema v16. The flattened summary and schema-v5 matrix
 manifest carry native facts from the report: architecture, public name, actual formats, prefill signature, artifact,
 load/read/upload/staging values, Engine memory arenas including the non-additive Vision layout
 inside the unified workspace and CUDA Graph allowance, per-test planned logical and

@@ -1,6 +1,6 @@
 #include "artifact/views.h"
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 WeightView bind_view(const ParameterReference& reference,
                      const MaterializedArtifact& materialized) {
@@ -33,4 +33,4 @@ WeightView bind_view(const ParameterReference& reference,
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/token_constraint.h
+// Implements: include/infernix/ops/token_constraint.h
 // Match: wrapper-validated contiguous tensors and valid vocabulary rows.
 // Algorithm assumptions: one independent CTA per column; no global workspace.
 #include "ops/launcher/token_constraint.h"
@@ -6,7 +6,7 @@
 #include "core/device.h"
 #include "ops/kernel/token_constraint.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void constrain_logits_launch(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
                              const Tensor& choices, const Tensor& choice_counts,
@@ -22,4 +22,4 @@ void constrain_logits_launch(Tensor& logits, Tensor* argmax, const Tensor& descr
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

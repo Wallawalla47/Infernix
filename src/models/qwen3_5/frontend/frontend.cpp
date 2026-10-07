@@ -32,7 +32,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 using Json   = nlohmann::json;
@@ -386,7 +386,7 @@ StopPolicy merge_stop_policy(const fi::Tokenizer& tokenizer, const StopPolicy& c
     result.strings.reserve(caller.strings.size());
     for (const StopString& stop : caller.strings) {
         if (stop.text.empty()) { throw std::invalid_argument("stop string must not be empty"); }
-        (void)ninfer::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
+        (void)infernix::text::unicode_internal::utf8_codepoints(stop.text, "stop string");
         const auto duplicate = std::find_if(
             result.strings.begin(), result.strings.end(), [&](const StopString& existing) {
                 return existing.text == stop.text && existing.channel == stop.channel &&
@@ -1100,4 +1100,4 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

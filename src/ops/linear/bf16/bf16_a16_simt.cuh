@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Values>
 struct Bf16SimtFloatPack {
@@ -273,4 +273,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

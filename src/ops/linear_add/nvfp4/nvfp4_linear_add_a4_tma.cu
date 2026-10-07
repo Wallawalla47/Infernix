@@ -1,7 +1,7 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <int K>
 void launch(const Nvfp4A4Operands& p, __nv_bfloat16* y, cudaStream_t stream) {
@@ -20,4 +20,4 @@ void launch_nvfp4_a4_tma_linear_add(const Nvfp4A4Operands& p, __nv_bfloat16* res
     else
         throw std::invalid_argument("NVFP4 TMA linear_add: unsupported K");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

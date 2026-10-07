@@ -7,7 +7,7 @@
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Geometry>
 __device__ __forceinline__ float
@@ -128,4 +128,4 @@ void launch_causal_natural_merge(const CausalAttentionOperands& p,
         p.visible_capacity, partition, p.out));
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

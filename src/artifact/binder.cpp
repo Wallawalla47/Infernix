@@ -8,7 +8,7 @@
 #include <cstring>
 #include <limits>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 float HostValues::scalar_f32() const {
     if (format != QType::FP32 || elements != 1 || data.size() != 4) {
@@ -265,4 +265,4 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     return plan;
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

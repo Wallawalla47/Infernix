@@ -11,13 +11,13 @@
 //            (the cold-layer case, bound by the staging copy).
 // The FLOP figure counts the wide entries' gate/up and down products only.
 //
-//   ninfer_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
+//   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
 //                                   [--warmup 3] [--repeat 10] [--seed N]
 
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
 
@@ -34,8 +34,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-namespace moe = ninfer::ops::offloaded_moe;
+using namespace infernix;
+namespace moe = infernix::ops::offloaded_moe;
 
 namespace {
 
@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, context.stream); }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_offloaded_moe_wide_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_offloaded_moe_wide_bench: %s\n", error.what());
         return 1;
     }
 }

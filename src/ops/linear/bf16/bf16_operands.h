@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Bf16A16Operands {
     const __nv_bfloat16* x;
@@ -33,4 +33,4 @@ void validate_bf16_operands(const Bf16A16Operands& p) {
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

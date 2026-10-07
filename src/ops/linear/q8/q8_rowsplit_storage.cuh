@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Q8RowSplitStorage {
     static constexpr int kGroupK             = 32;
@@ -33,4 +33,4 @@ struct Q8ScalarDecodeAtom {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 inline constexpr int kMergeThreads        = 256;
@@ -144,4 +144,4 @@ void linear_topk_merge_launch(const LinearTopKWorkspace& workspace, Tensor& cand
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

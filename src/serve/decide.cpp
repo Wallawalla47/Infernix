@@ -12,7 +12,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = RequestJson;
@@ -314,7 +314,7 @@ std::vector<double> restricted_probabilities(std::span<const float> logprobs) {
 } // namespace
 
 std::vector<DecideLabel>
-build_decide_alphabet(const std::function<std::vector<ninfer::TokenId>(std::string_view)>& encode) {
+build_decide_alphabet(const std::function<std::vector<infernix::TokenId>(std::string_view)>& encode) {
     std::vector<std::string> candidates;
     for (char c = 'A'; c <= 'Z'; ++c) { candidates.emplace_back(1, c); }
     for (char c = 'a'; c <= 'z'; ++c) { candidates.emplace_back(1, c); }
@@ -323,9 +323,9 @@ build_decide_alphabet(const std::function<std::vector<ninfer::TokenId>(std::stri
         for (char b = 'A'; b <= 'Z'; ++b) { candidates.push_back(std::string{a, b}); }
     }
     std::vector<DecideLabel> labels;
-    std::set<ninfer::TokenId> seen;
+    std::set<infernix::TokenId> seen;
     for (std::string& label : candidates) {
-        const std::vector<ninfer::TokenId> ids = encode(label);
+        const std::vector<infernix::TokenId> ids = encode(label);
         if (ids.size() != 1 || !seen.insert(ids.front()).second) { continue; }
         labels.push_back(DecideLabel{.text = std::move(label), .token = ids.front()});
     }
@@ -489,8 +489,8 @@ double decide_answer_mass(std::span<const float> logprobs) {
 
 namespace {
 
-ninfer::TokenId single_token(const DecideEncoder& encode, std::string_view text) {
-    const std::vector<ninfer::TokenId> ids = encode(text);
+infernix::TokenId single_token(const DecideEncoder& encode, std::string_view text) {
+    const std::vector<infernix::TokenId> ids = encode(text);
     if (ids.size() != 1) {
         throw ApiException(ApiError{
             .status  = 500,
@@ -518,7 +518,7 @@ struct AxisReading {
     Json digits         = Json::array();
 };
 
-int digit_of(const DecideSchedule& schedule, ninfer::TokenId token) {
+int digit_of(const DecideSchedule& schedule, infernix::TokenId token) {
     const auto found = std::find(schedule.digit_tokens.begin(), schedule.digit_tokens.end(), token);
     return found == schedule.digit_tokens.end()
                ? -1
@@ -534,7 +534,7 @@ Json digit_draw(int digit, double probability) {
 
 // The digit's own probability: digit steps permit the ten digits in digit order (and a scalar's
 // steps append its structural tokens after them), so the digit's slot is its value.
-double draw_probability(const ninfer::ConstrainedDraw& draw, int digit) {
+double draw_probability(const infernix::ConstrainedDraw& draw, int digit) {
     return digit >= 0 && static_cast<std::size_t>(digit) < draw.probabilities.size()
                ? static_cast<double>(draw.probabilities[static_cast<std::size_t>(digit)])
                : 0.0;
@@ -543,7 +543,7 @@ double draw_probability(const ninfer::ConstrainedDraw& draw, int digit) {
 // sigma = sum((1 - p_k) * 10^place): ignis's self-declared uncertainty in units of the value. A
 // left-padded field (number) skips its padding zeros, which the model fills rather than chooses.
 std::optional<AxisReading> read_axis(const DecideSchedule& schedule, const DecideAxis& axis,
-                                     std::span<const ninfer::ConstrainedDraw> run,
+                                     std::span<const infernix::ConstrainedDraw> run,
                                      bool left_padded) {
     AxisReading reading;
     const std::size_t width = axis.end - axis.begin;
@@ -558,7 +558,7 @@ std::optional<AxisReading> read_axis(const DecideSchedule& schedule, const Decid
         }
     }
     for (std::size_t place = 0; place < width; ++place) {
-        const ninfer::ConstrainedDraw& draw = run[axis.begin + place];
+        const infernix::ConstrainedDraw& draw = run[axis.begin + place];
         const int digit                     = digit_of(schedule, draw.token);
         if (digit < 0) { return std::nullopt; }
         const double probability = draw_probability(draw, digit);
@@ -596,19 +596,19 @@ DecideSchedule decide_schedule(const DecideQuestion& question, const DecideEncod
         schedule.digit_tokens[static_cast<std::size_t>(digit)] =
             single_token(encode, std::to_string(digit));
     }
-    const std::vector<ninfer::TokenId> digits(schedule.digit_tokens.begin(),
+    const std::vector<infernix::TokenId> digits(schedule.digit_tokens.begin(),
                                               schedule.digit_tokens.end());
-    std::vector<std::vector<ninfer::TokenId>>& steps = schedule.constraint.steps;
+    std::vector<std::vector<infernix::TokenId>>& steps = schedule.constraint.steps;
     // Literals are encoded standalone, as ignis appends them, and forced one token per step.
     const auto force = [&](std::string_view literal) {
-        const std::vector<ninfer::TokenId> ids = encode(literal);
+        const std::vector<infernix::TokenId> ids = encode(literal);
         if (ids.empty()) {
             throw ApiException(ApiError{.status  = 500,
                                         .type    = "internal_error",
                                         .message = "this model's tokenizer cannot encode a literal",
                                         .code    = "tokenizer_unsupported"});
         }
-        for (const ninfer::TokenId id : ids) { steps.push_back({id}); }
+        for (const infernix::TokenId id : ids) { steps.push_back({id}); }
     };
     const auto axis = [&](std::string name, std::string_view literal) {
         force(literal);
@@ -641,7 +641,7 @@ DecideSchedule decide_schedule(const DecideQuestion& question, const DecideEncod
         schedule.terminator    = single_token(encode, "}");
         schedule.colon         = single_token(encode, "\":");
         schedule.colon_negated = single_token(encode, "\":-");
-        std::vector<ninfer::TokenId> rest = digits;
+        std::vector<infernix::TokenId> rest = digits;
         rest.push_back(schedule.point);
         rest.push_back(schedule.terminator);
         const std::size_t begin = steps.size();
@@ -656,7 +656,7 @@ DecideSchedule decide_schedule(const DecideQuestion& question, const DecideEncod
     default:
         break;
     }
-    if (steps.size() > ninfer::kMaximumConstraintSteps) {
+    if (steps.size() > infernix::kMaximumConstraintSteps) {
         throw ApiException(ApiError{.status  = 400,
                                     .message = "question " + question.id +
                                                " needs more generated steps than are served",
@@ -666,8 +666,8 @@ DecideSchedule decide_schedule(const DecideQuestion& question, const DecideEncod
 }
 
 RequestJson decide_generated_answer(const DecideQuestion& question, const DecideSchedule& schedule,
-                                    std::span<const ninfer::ConstrainedDraw> run,
-                                    std::span<const ninfer::MediaGeometry> media) {
+                                    std::span<const infernix::ConstrainedDraw> run,
+                                    std::span<const infernix::MediaGeometry> media) {
     const std::size_t steps = schedule.constraint.steps.size();
     if (run.size() > steps) {
         return run_error("off_schedule", "the run is longer than its schedule");
@@ -688,7 +688,7 @@ RequestJson decide_generated_answer(const DecideQuestion& question, const Decide
         std::vector<double> probabilities;
         bool terminated = false;
         for (std::size_t index = axis.begin; index < run.size(); ++index) {
-            const ninfer::ConstrainedDraw& draw = run[index];
+            const infernix::ConstrainedDraw& draw = run[index];
             if (draw.token == schedule.terminator) {
                 terminated = true;
                 break;
@@ -797,4 +797,4 @@ RequestJson decide_generated_answer(const DecideQuestion& question, const Decide
     return answer;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

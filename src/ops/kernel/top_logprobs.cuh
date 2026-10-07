@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/top_logprobs.h
+// Implements: include/infernix/ops/top_logprobs.h
 // Match: contiguous BF16 [physical_rows,C], I32 [K,C], and FP32 [K,C].
 // Algorithm assumptions: one 256-thread CTA per column computes the column's logsumexp, then each
 // of K passes selects the largest (value, -row) key below the previous pass's.
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kTopLogprobsBlock = 256;
 
@@ -81,4 +81,4 @@ __launch_bounds__(BlockSize) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

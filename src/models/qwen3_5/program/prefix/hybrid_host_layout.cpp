@@ -4,7 +4,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 // Slab records start on page boundaries so every DMA run begins aligned.
@@ -60,4 +60,4 @@ std::uint32_t hybrid_host_slabs(const HybridHostLayout& layout, std::uint64_t bu
     return static_cast<std::uint32_t>(slabs);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

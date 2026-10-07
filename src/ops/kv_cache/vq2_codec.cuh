@@ -27,7 +27,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheVq2HeadDim   = 256;
 inline constexpr int kKVCacheVq2Words     = 32;
@@ -156,4 +156,4 @@ __device__ __forceinline__ std::uint32_t kv_cache_vq2_word_code(const float (&A)
     return static_cast<std::uint32_t>(p) | ((sign & 0x7fu) << kKVCacheVq2SignShift);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

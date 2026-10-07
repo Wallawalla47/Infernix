@@ -1,4 +1,4 @@
-#include "ninfer/ops/rmsnorm_pack_tail.h"
+#include "infernix/ops/rmsnorm_pack_tail.h"
 #include "core/decode_graph.h"
 
 #include "ops/norm_test_common.h"
@@ -12,9 +12,9 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::norm;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::norm;
 
 constexpr std::int32_t kRows = 5120;
 constexpr ReductionCriterion kCriterion{/*relative_l2*/ 1.85e-3,
@@ -106,7 +106,7 @@ int run_case(std::int32_t width, std::int32_t batch, std::uint32_t seed, bool gr
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

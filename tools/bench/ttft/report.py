@@ -543,7 +543,7 @@ def load_campaign(path: Path) -> CampaignData:
     if not isinstance(manifest, dict):
         raise ReportError(f"{manifest_path} does not contain a JSON object")
     if (
-        manifest.get("artifact_type") != "ninfer_serve_ttft_campaign"
+        manifest.get("artifact_type") != "infernix_serve_ttft_campaign"
         or manifest.get("schema_version") != 2
     ):
         raise ReportError(f"{manifest_path} is not a Serve TTFT campaign manifest")
@@ -622,10 +622,10 @@ def load_campaign(path: Path) -> CampaignData:
             if not isinstance(value, dict):
                 raise ReportError("artifact is not a JSON object")
             if (
-                value.get("artifact_type") != "ninfer_serve_ttft_run"
+                value.get("artifact_type") != "infernix_serve_ttft_run"
                 or value.get("schema_version") != 1
             ):
-                raise ReportError("artifact type/schema is not ninfer_serve_ttft_run v1")
+                raise ReportError("artifact type/schema is not infernix_serve_ttft_run v1")
             if value.get("case") != plan.case or value.get("profile_label") != plan.profile:
                 raise ReportError("artifact case/profile does not match its campaign plan")
             _validate_run_artifact(value, plan)
@@ -1477,7 +1477,7 @@ def summarize_campaign(
     )
 
     result: dict[str, Any] = {
-        "artifact_type": "ninfer_serve_ttft_summary",
+        "artifact_type": "infernix_serve_ttft_summary",
         "schema_version": 2,
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "campaign": {

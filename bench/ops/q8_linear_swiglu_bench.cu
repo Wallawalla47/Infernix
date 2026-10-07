@@ -1,10 +1,10 @@
 // Complete public-Op benchmark for the registered Q8 LinearSwiGLU profiles.
 
 #include "core/weight.h"
-#include "ninfer/ops/linear_swiglu.h"
+#include "infernix/ops/linear_swiglu.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
         write_csv(options, results);
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_q8_linear_swiglu_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_q8_linear_swiglu_bench: %s\n", error.what());
         return 1;
     }
 }

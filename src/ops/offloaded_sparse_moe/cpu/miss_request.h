@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 inline constexpr int kMaxCpuJobs        = 512;  // CPU-served experts per layer call (a prefill call's CPU share: up to every expert)
 inline constexpr int kMaxCpuColumns     = 8;    // columns per CPU-served expert (the narrow route's n)
@@ -29,4 +29,4 @@ struct alignas(64) MissRequest {
     std::int32_t column[kMaxCpuJobs][kMaxCpuColumns]; // x column of each of the job's columns
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

@@ -10,7 +10,7 @@ import pytest
 from tools.bench.ttft import cases
 from tools.bench.ttft.cases import _BackgroundResponseLoops
 from tools.bench.ttft.execution import CaseContext, CaseExecutionError, RequestHandle
-from tools.ninfer_serve.client import (
+from tools.infernix_serve.client import (
     PreparedServeExchange,
     ProtocolEvent,
     ProtocolRequest,

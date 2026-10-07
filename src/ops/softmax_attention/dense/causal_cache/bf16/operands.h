@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <bool Writable>
 struct Bf16KvCacheView {
     static constexpr bool kWritable = Writable;
@@ -37,4 +37,4 @@ Bf16KvCacheView<Writable> bf16_kv_cache_view(const PagedKVBatchLayerView& cache,
             cache.num_kv_heads};
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

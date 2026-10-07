@@ -2,10 +2,10 @@
 // Production dispatch is owned exclusively by gdn_input_proj().
 
 #include "core/weight.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -69,7 +69,7 @@ struct Measurement {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_gdn_input_proj_bench "
+                 "usage: infernix_gdn_input_proj_bench "
                  "[--format q4q5|q8|nvfp4|fp8|all] [--nvfp4-policy a16|a4] "
                  "[--fp8-policy a16|a8] "
                  "[--tokens T,...] [--cache cold|warm|both] [--execution eager|graph] "
@@ -471,7 +471,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_gdn_input_proj_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_gdn_input_proj_bench: %s\n", error.what());
         return 1;
     }
 }

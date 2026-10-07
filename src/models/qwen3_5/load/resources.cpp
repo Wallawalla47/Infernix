@@ -1,7 +1,7 @@
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/frontend/resources.h"
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 FrontendResources bind_resources(artifact::Binder& binder, const Config& config) {
     const auto resource = [&](std::string_view component, std::string_view role) {
@@ -21,4 +21,4 @@ FrontendResources bind_resources(artifact::Binder& binder, const Config& config)
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

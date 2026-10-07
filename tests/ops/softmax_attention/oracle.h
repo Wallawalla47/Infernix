@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/ops/attention_geometry.h"
+#include "infernix/ops/attention_geometry.h"
 #include "ops/host_parallel.h"
 
 #include <algorithm>
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::test {
+namespace infernix::test {
 
 // Independent logical Softmax Attention oracle. Callbacks expose represented public values and
 // the entry-specific visible set; no production staging cast, tile, cache address, or reduction
@@ -93,4 +93,4 @@ void naive_dense_softmax_attention(ops::AttentionHeadGeometry geometry, int quer
     run_rows(0, rows / workers);
 }
 
-} // namespace ninfer::test
+} // namespace infernix::test

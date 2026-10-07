@@ -2,12 +2,12 @@
 
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
@@ -40,9 +40,9 @@ struct PromptAttention {
     return phase == TextPhase::Verify && first > 16 && first <= last && last <= 64;
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 struct ContractAccess {
     static SequenceHandle make_sequence(const void* owner, runtime::LaneId lane,
                                         std::uint64_t epoch) noexcept {
@@ -105,4 +105,4 @@ struct ContractAccess {
     return backend == SpeculativeBackend::DFlash ? main_frontier : 0U;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

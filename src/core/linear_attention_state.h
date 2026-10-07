@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 struct LinearAttentionStatePoolSpec {
     std::uint32_t layers        = 0;
@@ -90,4 +90,4 @@ private:
     LinearAttentionStatePoolSpec spec_;
 };
 
-} // namespace ninfer
+} // namespace infernix

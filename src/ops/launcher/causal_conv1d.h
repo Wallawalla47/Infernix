@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototypes for causal_conv1d.
+// infernix::ops::detail - private launch prototypes for causal_conv1d.
 
 #include "core/tensor.h"
 
@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Registered split partitions, named by their row profile. The wrapper resolves one of these from
 // the destination row counts and refuses anything else.
@@ -42,4 +42,4 @@ void causal_conv1d_from_states_launch(const Tensor& x, const Tensor& weight,
                                       const Tensor& conv_states, const Tensor& initial_state_slots,
                                       Tensor& out, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

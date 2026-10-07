@@ -1,4 +1,4 @@
-#include "ninfer/ops/hyper_connection.h"
+#include "infernix/ops/hyper_connection.h"
 
 #include "ops/hyper_connection/hyper_connection_mix_q8.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -274,4 +274,4 @@ void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& resi
     check_launch("expand");
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -3,9 +3,9 @@
 // token, a stop token among the permitted tokens ends the run, an unconstrained request sharing
 // the rounds generates what it generates alone, and each step's reported distribution matches the
 // CausalScoring oracle (score_tokens over prompt + output with the step's tokens as candidates).
-// Requires NINFER_TEST_ARTIFACT (an artifact with a DFlash2 drafter).
+// Requires INFERNIX_TEST_ARTIFACT (an artifact with a DFlash2 drafter).
 
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -31,15 +31,15 @@ void check(bool condition, const std::string& message) {
     ++failures;
 }
 
-std::vector<ninfer::TokenId> single(ninfer::Engine& engine, const std::string& text) {
-    const std::vector<ninfer::TokenId> ids = engine.tokenize_text(text);
+std::vector<infernix::TokenId> single(infernix::Engine& engine, const std::string& text) {
+    const std::vector<infernix::TokenId> ids = engine.tokenize_text(text);
     if (ids.size() != 1) { throw std::runtime_error("fixture text is not one token: " + text); }
     return ids;
 }
 
-ninfer::RequestOptions constrained(ninfer::TokenConstraint constraint, float temperature,
+infernix::RequestOptions constrained(infernix::TokenConstraint constraint, float temperature,
                                    std::uint64_t seed) {
-    ninfer::RequestOptions options;
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens =
         static_cast<std::uint32_t>(constraint.steps.size());
     options.execution.sampling.temperature = temperature;
@@ -49,30 +49,30 @@ ninfer::RequestOptions constrained(ninfer::TokenConstraint constraint, float tem
     return options;
 }
 
-ninfer::EngineOptions engine_options(const char* artifact, ninfer::SpeculativeBackend backend) {
-    ninfer::EngineOptions options;
+infernix::EngineOptions engine_options(const char* artifact, infernix::SpeculativeBackend backend) {
+    infernix::EngineOptions options;
     options.artifact_path   = artifact;
     options.max_context     = kMaxContext;
-    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
-    options.kv_cache        = ninfer::KvCacheStorage::BFloat16;
+    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4 * kMaxContext);
+    options.kv_cache        = infernix::KvCacheStorage::BFloat16;
     options.max_concurrency = 2;
-    // /v1/decide runs on ninfer-serve's default cache, whose capacity may exceed the lanes' sum.
-    options.context_cache.mode  = ninfer::ContextCacheMode::Hybrid;
+    // /v1/decide runs on infernix-serve's default cache, whose capacity may exceed the lanes' sum.
+    options.context_cache.mode  = infernix::ContextCacheMode::Hybrid;
     options.speculative.backend = backend;
-    if (backend == ninfer::SpeculativeBackend::DFlash2) { options.speculative.draft_tokens = 7; }
+    if (backend == infernix::SpeculativeBackend::DFlash2) { options.speculative.draft_tokens = 7; }
     return options;
 }
 
-std::vector<ninfer::TokenId> prompt_tokens(ninfer::Engine& engine) {
+std::vector<infernix::TokenId> prompt_tokens(infernix::Engine& engine) {
     return engine.tokenize_text(
         "The warehouse shipped 4417 parcels on Monday, 3920 on Tuesday and 5102 on Wednesday. "
         "Answer as JSON. The number of parcels shipped on Tuesday was {\"value\":");
 }
 
 struct Run {
-    std::vector<ninfer::TokenId> prompt;
-    ninfer::TokenConstraint constraint;
-    ninfer::GenerationResult result;
+    std::vector<infernix::TokenId> prompt;
+    infernix::TokenConstraint constraint;
+    infernix::GenerationResult result;
 };
 
 void check_run(const std::string& label, const Run& run) {
@@ -98,25 +98,25 @@ void check_run(const std::string& label, const Run& run) {
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "SKIP: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "SKIP: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
     try {
         std::vector<Run> greedy_runs;
         for (const auto backend :
-             {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::DFlash2}) {
+             {infernix::SpeculativeBackend::None, infernix::SpeculativeBackend::DFlash2}) {
             const std::string name =
-                backend == ninfer::SpeculativeBackend::None ? "plain" : "dflash2";
-            ninfer::Engine engine(engine_options(artifact, backend));
-            std::vector<ninfer::TokenId> digits;
+                backend == infernix::SpeculativeBackend::None ? "plain" : "dflash2";
+            infernix::Engine engine(engine_options(artifact, backend));
+            std::vector<infernix::TokenId> digits;
             for (char c = '0'; c <= '9'; ++c) { digits.push_back(single(engine, std::string(1, c)).front()); }
-            const ninfer::TokenId brace = single(engine, "}").front();
-            const std::vector<ninfer::TokenId> prompt = prompt_tokens(engine);
+            const infernix::TokenId brace = single(engine, "}").front();
+            const std::vector<infernix::TokenId> prompt = prompt_tokens(engine);
 
             // Four digit steps, then a forced brace.
-            ninfer::TokenConstraint field;
+            infernix::TokenConstraint field;
             field.steps.assign(4, digits);
             field.steps.push_back({brace});
             Run greedy{prompt, field,
@@ -144,38 +144,38 @@ int main() {
             }
 
             // A stop token among the permitted tokens ends the run where it is drawn.
-            std::vector<ninfer::TokenId> closing = digits;
+            std::vector<infernix::TokenId> closing = digits;
             closing.push_back(brace);
-            ninfer::TokenConstraint open;
+            infernix::TokenConstraint open;
             open.steps.assign(8, closing);
-            ninfer::RequestOptions stop = constrained(open, 0.0F, 1);
+            infernix::RequestOptions stop = constrained(open, 0.0F, 1);
             stop.stop.token_ids         = {brace};
-            const ninfer::GenerationResult stopped =
+            const infernix::GenerationResult stopped =
                 engine.generate(engine.prepare_tokens(prompt), std::move(stop));
-            check(stopped.finish_reason == ninfer::FinishReason::StopToken &&
+            check(stopped.finish_reason == infernix::FinishReason::StopToken &&
                       !stopped.generated_token_ids.empty() &&
                       stopped.generated_token_ids.back() == brace &&
                       stopped.constrained_draws.size() == stopped.generated_token_ids.size(),
                   name + ": a permitted stop token ends the run and keeps its draw");
 
             // An unconstrained request sharing the rounds is unaffected by its neighbour's masks.
-            ninfer::RequestOptions free;
+            infernix::RequestOptions free;
             free.execution.requested_output_tokens = 24;
             free.execution.sampling.temperature    = 0.0F;
             free.stop.include_model_defaults       = false;
             // (Batched rounds may round differently from solo ones, so the checks are about the
             // masks: the neighbour keeps writing non-digits, the constrained run keeps its steps.)
-            const std::vector<ninfer::TokenId> other =
+            const std::vector<infernix::TokenId> other =
                 engine.tokenize_text("List the first ten prime numbers separated by commas:");
-            ninfer::GenerationHandle masked =
+            infernix::GenerationHandle masked =
                 engine.submit(engine.prepare_tokens(prompt), constrained(field, 0.0F, 1));
-            ninfer::GenerationHandle beside = engine.submit(engine.prepare_tokens(other), free);
+            infernix::GenerationHandle beside = engine.submit(engine.prepare_tokens(other), free);
             Run masked_run{prompt, field, masked.wait()};
-            const ninfer::GenerationResult beside_result = beside.wait();
+            const infernix::GenerationResult beside_result = beside.wait();
             check_run(name + " beside a neighbour", masked_run);
             check(std::any_of(beside_result.generated_token_ids.begin(),
                               beside_result.generated_token_ids.end(),
-                              [&](ninfer::TokenId id) {
+                              [&](infernix::TokenId id) {
                                   return std::find(digits.begin(), digits.end(), id) ==
                                          digits.end();
                               }) &&
@@ -184,25 +184,25 @@ int main() {
         }
 
         // The oracle: CausalScoring scores each output position with the step's tokens.
-        ninfer::EngineOptions scoring;
+        infernix::EngineOptions scoring;
         scoring.artifact_path = artifact;
-        scoring.purpose       = ninfer::EnginePurpose::CausalScoring;
+        scoring.purpose       = infernix::EnginePurpose::CausalScoring;
         scoring.max_context   = kMaxContext;
-        scoring.kv_cache      = ninfer::KvCacheStorage::BFloat16;
-        ninfer::Engine oracle(scoring);
+        scoring.kv_cache      = infernix::KvCacheStorage::BFloat16;
+        infernix::Engine oracle(scoring);
         double worst = 0.0;
         for (const Run& run : greedy_runs) {
-            std::vector<ninfer::TokenId> tokens = run.prompt;
+            std::vector<infernix::TokenId> tokens = run.prompt;
             const auto digit_steps              = run.result.generated_token_ids.size() - 1;
             tokens.insert(tokens.end(), run.result.generated_token_ids.begin(),
                           run.result.generated_token_ids.begin() +
                               static_cast<std::ptrdiff_t>(digit_steps));
-            ninfer::ScoreOptions options{.candidates_per_position = 10};
+            infernix::ScoreOptions options{.candidates_per_position = 10};
             for (std::size_t i = 0; i < digit_steps; ++i) {
                 options.candidates.insert(options.candidates.end(), run.constraint.steps[i].begin(),
                                           run.constraint.steps[i].end());
             }
-            const ninfer::ScoreResult expected = oracle.score_tokens(
+            const infernix::ScoreResult expected = oracle.score_tokens(
                 tokens, static_cast<std::uint32_t>(run.prompt.size()), std::move(options));
             for (std::size_t i = 0; i < digit_steps; ++i) {
                 double total = 0.0;

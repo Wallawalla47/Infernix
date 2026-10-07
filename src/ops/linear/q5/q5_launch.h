@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 using Q5Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_direct_r1_t1_w4_k17408(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_direct_r1_t1_w4_k5120(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -34,4 +34,4 @@ void launch_q5_a16_sliced_r32_t32_w4_s1(const Tensor&, const Weight&, Tensor&, c
 void launch_q5_a16_sliced_r32_t32_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r32_t64_w2_s1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q5_a16_sliced_r32_t64_w2_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

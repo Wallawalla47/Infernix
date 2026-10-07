@@ -4,7 +4,7 @@
 #include "ops/linear/q4/q4_a16_gemv.cuh"
 #include "ops/linear/q4/q4_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
           class Output, class Epilogue>
 void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
@@ -37,4 +37,4 @@ void launch_q4_a16_gemv(const Q4LinearOperands& operands, Output output, Epilogu
         CUDA_CHECK(cudaGetLastError());
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

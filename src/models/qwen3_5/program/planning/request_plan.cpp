@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <tuple>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 void validate_sampling(const ResolvedSamplingParameters& sampling) {
@@ -453,4 +453,4 @@ void ProgramImpl::settle_unit(std::uint32_t lane) noexcept {
     }
     request.permit.reset();
 }
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -1,15 +1,15 @@
-#include "ninfer/ops/speculative_round.h"
+#include "infernix/ops/speculative_round.h"
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/nvtx.h"
-#include "ninfer/ops/mtp_round.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/scalar.h"
+#include "infernix/ops/mtp_round.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/scalar.h"
 #include <cuda_runtime.h>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
                             const Tensor& previous_hidden, std::int32_t position,
                             std::span<const std::int32_t> rope_position, bool build_proposal,
@@ -216,4 +216,4 @@ void mtp_decode_batch(MtpBatchContext& state, std::int32_t batch_size, std::uint
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

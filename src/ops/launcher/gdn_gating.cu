@@ -1,4 +1,4 @@
-// ninfer::ops - gdn_gating launcher: grid/block/stream configuration + kernel launch.
+// infernix::ops - gdn_gating launcher: grid/block/stream configuration + kernel launch.
 #include "ops/launcher/gdn_gating.h"
 
 #include "ops/common/math.h"
@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, const Tensor& dt_bias,
                        Tensor& g, Tensor& beta, cudaStream_t stream) {
@@ -24,4 +24,4 @@ void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, co
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

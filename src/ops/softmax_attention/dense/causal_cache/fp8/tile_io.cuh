@@ -8,7 +8,7 @@
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/fp8/operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 __device__ __forceinline__ int4 fp8_kv_dequant_f16x8(const std::uint8_t* codes, __half scale) {
     const int2 raw         = load_vec<int2>(codes);
@@ -47,4 +47,4 @@ struct Fp8KvTiledValues {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/decode/sparse_moe_decode_kernels.cu"
   "${CMAKE_CURRENT_LIST_DIR}/decode/sparse_moe_decode_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/prefill/sparse_moe_prefill_kernels.cu"

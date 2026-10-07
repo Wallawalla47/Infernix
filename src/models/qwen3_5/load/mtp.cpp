@@ -1,6 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 MtpWeights bind_mtp(Bindings& b, const TextConfig& config, const TextWeights& target) {
     const auto h = config.hidden_size;
@@ -15,4 +15,4 @@ MtpWeights bind_mtp(Bindings& b, const TextConfig& config, const TextWeights& ta
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

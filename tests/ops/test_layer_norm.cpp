@@ -1,4 +1,4 @@
-#include "ninfer/ops/layer_norm.h"
+#include "infernix/ops/layer_norm.h"
 #include "ops/norm_test_common.h"
 
 #include <algorithm>
@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

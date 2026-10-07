@@ -3,7 +3,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // NVFP4-G16 V (K8V4 and NVFP4 KV) for the MXFP8 tiled kernel: packed E2M1 codes and one UE4M3
 // scale per 16 dimensions.
 struct Nvfp4G16TiledValues {
@@ -105,4 +105,4 @@ struct Nvfp4G16TiledValues {
                          static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

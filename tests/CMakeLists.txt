@@ -1,6 +1,6 @@
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-include(cmake/NinferTests.cmake)
+include(cmake/InfernixTests.cmake)
 include(cmake/CoreTests.cmake)
 include(artifact/tests.cmake)
 include(cmake/RuntimeTests.cmake)
@@ -15,4 +15,4 @@ include(${PROJECT_SOURCE_DIR}/tools/flash_next_probe/probes.cmake)
 # All test executables share one per-config runtime directory; stage the shared
 # FFMPEG/curl DLL closure there once so fully-linked tests resolve their imports
 # (the Windows loader only searches the exe's own dir, system dirs and PATH).
-ninfer_stage_test_runtime_dlls(ninfer_device_test)
+infernix_stage_test_runtime_dlls(infernix_device_test)

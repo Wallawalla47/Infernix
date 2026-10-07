@@ -6,7 +6,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // A unit of execution failed in a way that leaves the engine usable (an expert record that could
 // not be read, a host service that stopped answering): the engine fails the requests the unit
@@ -83,4 +83,4 @@ struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

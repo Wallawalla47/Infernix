@@ -19,7 +19,7 @@
 #include "core/paged_kv_cache.h"
 #include "core/startup.h"
 #include "models/qwen4_exp/program/prefix/state_image.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 
@@ -36,7 +36,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 struct PrefixCacheCounters {
     std::uint64_t admissions                  = 0;
@@ -281,4 +281,4 @@ private:
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
 };
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
@@ -499,4 +499,4 @@ private:
     std::vector<RowFence> row_fences_;
 };
 
-} // namespace ninfer
+} // namespace infernix

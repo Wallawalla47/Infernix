@@ -6,7 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       const Tensor& conv_weight, Tensor& conv_states,
@@ -27,4 +27,4 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
         Nvfp4GdnConvEpilogue<1>{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -3,7 +3,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_a16_gemv.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue>
 void launch_q8_a16_gemv(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
                         cudaStream_t stream) {
@@ -26,4 +26,4 @@ void launch_q8_a16_gemv(const Q8LinearOperands& operands, Output output, Epilogu
     else
         launch.template operator()<false>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

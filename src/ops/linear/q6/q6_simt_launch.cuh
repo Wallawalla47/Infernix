@@ -7,7 +7,7 @@
 #include "ops/linear/q6/q6_operands.h"
 #include "ops/linear/q6/q6_a16_simt.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
 void launch_q6_a16_simt(const Q6LinearOperands& operands, Output output, Epilogue epilogue,
@@ -32,4 +32,4 @@ void launch_q6_a16_gemv(const Q6LinearOperands& operands, Output output, Epilogu
     launch_q6_a16_simt<Schedule>(operands, output, epilogue, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

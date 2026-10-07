@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 namespace {
 
 void cuda_require(cudaError_t error, const char* what) {
@@ -99,4 +99,4 @@ std::uint32_t FetchChannel::consumed() const noexcept {
 
 void FetchChannel::beat() noexcept { *reinterpret_cast<volatile std::uint32_t*>(heartbeat_) = ++beat_; }
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

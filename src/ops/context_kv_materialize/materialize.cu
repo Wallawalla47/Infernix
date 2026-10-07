@@ -9,7 +9,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 constexpr int kLayers  = static_cast<int>(kContextKVMaterializeLayers);
 constexpr int kRows    = 1024;
@@ -487,4 +487,4 @@ void context_kv_materialize_launch(
         envelope.min_count, envelope.max_count));
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

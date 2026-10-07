@@ -1,7 +1,7 @@
 // VRAM facts for the memory track (design §19.3.7, measurements RM0a and the read half of RM0c;
 // memory-tiers.md §3). Run alone on an otherwise idle GPU:
 //
-//   ninfer_vram_probe [--parity-gib N] [--chunks N] [--only malloc,vmm,query,unmap,parity]
+//   infernix_vram_probe [--parity-gib N] [--chunks N] [--only malloc,vmm,query,unmap,parity]
 //
 // It prints, for the CUDA device 0:
 //   1. a snapshot of every VRAM source: cudaMemGetInfo; on Windows DXGI LOCAL/NON_LOCAL budget and
@@ -772,7 +772,7 @@ int main(int argc, char** argv) {
                 only = "," + std::string(argv[++i]) + ",";
             } else {
                 std::fprintf(stderr,
-                             "usage: ninfer_vram_probe [--parity-gib N] [--chunks N] "
+                             "usage: infernix_vram_probe [--parity-gib N] [--chunks N] "
                              "[--only malloc,vmm,query,unmap,parity]\n");
                 return 2;
             }

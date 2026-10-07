@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/softmax_attention/common/causal_geometry.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int Tokens, int Warps, int Keys, int MinBlocks, bool Compact, bool Dynamic = true>
 struct Nvfp4KvGroupedMmaSchedule {
     static_assert(Tokens > 0 && Warps > 0 && Warps <= 16 && MinBlocks > 0);
@@ -54,4 +54,4 @@ struct Nvfp4KvArenaTiledSchedule {
 struct Nvfp4KvMergeSchedule {
     static constexpr int kDChunk = 256, kThreads = 256;
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

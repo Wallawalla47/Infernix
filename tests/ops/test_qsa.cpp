@@ -1,4 +1,4 @@
-// QSA (include/ninfer/ops/qsa.h; docs/maintainer/qwen3_8-flash-next-design.md §8.10) against
+// QSA (include/infernix/ops/qsa.h; docs/maintainer/qwen3_8-flash-next-design.md §8.10) against
 // independent oracles (docs/maintainer/op-development.md §6), at the real Qwen3.8-Flash-Next
 // geometry (24 query heads, 2 KV heads of 256, a 4 x 128 indexer, 64 rotary dimensions, budget
 // 2048 in blocks of 4):
@@ -30,8 +30,8 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer/ops/attention_geometry.h"
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/attention_geometry.h"
+#include "infernix/ops/qsa.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
@@ -55,12 +55,12 @@
 
 namespace {
 
-namespace ops = ninfer::ops;
-namespace t   = ninfer::test;
-using ninfer::DeviceBuffer;
-using ninfer::DType;
-using ninfer::KvCacheStorage;
-using ninfer::Tensor;
+namespace ops = infernix::ops;
+namespace t   = infernix::test;
+using infernix::DeviceBuffer;
+using infernix::DType;
+using infernix::KvCacheStorage;
+using infernix::Tensor;
 
 constexpr int kDi               = 128; // index head dimension
 constexpr int kR                = 4;   // tokens per pooled block
@@ -723,18 +723,18 @@ double from_e2m1(unsigned code) {
 // [leading bytes, 64 tokens, heads, pages] (paged_kv_storage_layout), with random codes whose
 // decoded values are O(1), and its exact FP64 decode.
 struct StoredVector {
-    ninfer::PagedKVVectorLayout layout;
+    infernix::PagedKVVectorLayout layout;
     std::vector<std::uint8_t> data, scales;
     enum class Kind { Bf16, Fp16, Int8, Fp8, Nvfp4 } kind;
 
     [[nodiscard]] int data_bytes() const {
-        return layout.data_leading_extent * static_cast<int>(ninfer::dtype_size(layout.data_dtype));
+        return layout.data_leading_extent * static_cast<int>(infernix::dtype_size(layout.data_dtype));
     }
     [[nodiscard]] int scale_bytes() const {
-        return layout.scale_leading_extent * static_cast<int>(ninfer::dtype_size(layout.scale_dtype));
+        return layout.scale_leading_extent * static_cast<int>(infernix::dtype_size(layout.scale_dtype));
     }
 
-    StoredVector(ninfer::PagedKVVectorLayout l, int pages, std::mt19937& rng) : layout(l) {
+    StoredVector(infernix::PagedKVVectorLayout l, int pages, std::mt19937& rng) : layout(l) {
         const std::size_t rows = static_cast<std::size_t>(kPage) * kKvHeads * pages;
         data.resize(rows * data_bytes());
         scales.resize(rows * scale_bytes());
@@ -870,9 +870,9 @@ std::uint32_t window_tag(int position, const std::uint8_t* codes, int code_bytes
 }
 
 int window_slot(int position) {
-    return position < ninfer::kKVWindowSinkTokens
+    return position < infernix::kKVWindowSinkTokens
                ? position
-               : ninfer::kKVWindowSinkTokens + (position & (ninfer::kKVWindowRingTokens - 1));
+               : infernix::kKVWindowSinkTokens + (position & (infernix::kKVWindowRingTokens - 1));
 }
 
 // Coordinate i of a stored code row, as the signed integer the codec multiplies by the row scale:
@@ -907,7 +907,7 @@ struct VqCase {
 void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t seed) {
     std::mt19937 rng(seed);
     const bool q4    = storage == KvCacheStorage::Q4KeyVq2Value;
-    const auto layout = ninfer::paged_kv_storage_layout(storage, kD);
+    const auto layout = infernix::paged_kv_storage_layout(storage, kD);
     const int kb = layout.key.data_leading_extent, vb = layout.value.data_leading_extent; // code bytes
     const int rows = static_cast<int>(c.starts.size()), width = c.width, columns = rows * width;
     int context = 0;
@@ -934,13 +934,13 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
     for (auto& x : vs) { x = to_fp16(scale(rng)); }
 
     // The window before the call: [256, slots, Hkv, rows] codes, [4, ...] scales, [2, ...] tags.
-    const std::size_t slot_rows = static_cast<std::size_t>(ninfer::kKVWindowSlots) * kKvHeads * rows;
+    const std::size_t slot_rows = static_cast<std::size_t>(infernix::kKVWindowSlots) * kKvHeads * rows;
     std::vector<std::int8_t> wk(slot_rows * kD), wv(slot_rows * kD);
     std::vector<std::uint16_t> wks(slot_rows * 4), wvs(slot_rows * 4);
     std::vector<std::int32_t> wtags(slot_rows * 2, 0);
     std::vector<char> stale(static_cast<std::size_t>(rows) * kKvHeads * context, 0);
     const auto slot_row = [&](int r, int head, int slot) {
-        return (static_cast<std::size_t>(r) * kKvHeads + head) * ninfer::kKVWindowSlots + slot;
+        return (static_cast<std::size_t>(r) * kKvHeads + head) * infernix::kKVWindowSlots + slot;
     };
     if (c.window) {
         std::uniform_int_distribution<int> code(-127, 127);
@@ -952,7 +952,7 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
         for (int r = 0; r < rows; ++r) {
             const int start = c.starts[r];
             for (int key = 0; key < start; ++key) {
-                if (key >= ninfer::kKVWindowSinkTokens && key < start - ninfer::kKVWindowRingTokens) { continue; }
+                if (key >= infernix::kKVWindowSinkTokens && key < start - infernix::kKVWindowRingTokens) { continue; }
                 for (int head = 0; head < kKvHeads; ++head) {
                     const std::size_t prow = row_of(page_of(r, key), head, key);
                     const std::size_t srow = slot_row(r, head, window_slot(key));
@@ -995,8 +995,8 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
     layer.kv.k_scale_pages = Tensor(dks.p, DType::FP16, {1, kPage, kKvHeads, pages});
     layer.kv.v_scale_pages = Tensor(dvs.p, DType::FP16, {1, kPage, kKvHeads, pages});
     if (c.window) {
-        const int slots = ninfer::kKVWindowSlots;
-        layer.kv.window = ninfer::PagedKVWindowView{
+        const int slots = infernix::kKVWindowSlots;
+        layer.kv.window = infernix::PagedKVWindowView{
             .k_codes  = Tensor(dwk.p, DType::I8, {kD, slots, kKvHeads, rows}),
             .v_codes  = Tensor(dwv.p, DType::I8, {kD, slots, kKvHeads, rows}),
             .k_scales = Tensor(dwks.p, DType::FP16, {4, slots, kKvHeads, rows}),
@@ -1062,7 +1062,7 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
                 for (int head = 0; head < kKvHeads; ++head) {
                     const std::size_t prow = row_of(page_of(r, token), head, token);
                     const bool exact_rule =
-                        c.window && (token < ninfer::kKVWindowSinkTokens || token >= p - ninfer::kKVWindowRecentTokens);
+                        c.window && (token < infernix::kKVWindowSinkTokens || token >= p - infernix::kKVWindowRecentTokens);
                     const bool in_call = token >= start;
                     const bool exact =
                         exact_rule &&
@@ -1110,7 +1110,7 @@ void test_vq_attention(KvCacheStorage storage, const VqCase& c, std::uint32_t se
 
 void test_attention(KvCacheStorage storage, const AttentionCase& c, std::uint32_t seed) {
     std::mt19937 rng(seed);
-    const auto layout        = ninfer::paged_kv_storage_layout(storage, kD);
+    const auto layout        = infernix::paged_kv_storage_layout(storage, kD);
     const bool rotated_keys   = storage != KvCacheStorage::BFloat16;
     const bool rotated_values = storage == KvCacheStorage::Nvfp4Group16 ||
                                 storage == KvCacheStorage::Fp8KeyNvfp4Value;

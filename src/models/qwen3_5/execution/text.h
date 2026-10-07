@@ -8,10 +8,10 @@
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/speculative_tree.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/speculative_tree.h"
+#include "infernix/ops/sparse_moe.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -24,7 +24,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 using Phase = qwen3_5::TextPhase;
 
@@ -297,4 +297,4 @@ private:
     const MtpParameters* mtp_                   = nullptr;
 };
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

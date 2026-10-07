@@ -2,7 +2,7 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // This Op admits dense, even-width BF16 residuals. Adjacent MMA rows share one load.
 struct Fp8ResidualAddEpilogue : LinearResidualAddEpilogue {
@@ -86,4 +86,4 @@ void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& res
     else
         launch_problem<17408>(x, weight, residual, scratch, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -9,7 +9,7 @@
 #include <map>
 #include <unordered_map>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 struct StateDemotion {
@@ -1138,9 +1138,9 @@ bool ProgramImpl::start_demote(const ContextDemotion& quote) {
     return true;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 ContextDemotionBatch::ContextDemotionBatch(std::unique_ptr<detail::DemotionBatch> impl)
     : impl_(std::move(impl)) {}
@@ -1173,4 +1173,4 @@ std::uint64_t ContextReclaimPlan::recovery_loss(std::span<const CheckpointHandle
                                  [&](auto a, auto b) { return impl_->prefix(a, b); });
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -3,7 +3,7 @@
 #include <cstdint>
 #include "core/pdl.cuh"
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __global__ void prepare_masked_block_kernel(const std::int32_t* anchors,
                                             const std::int32_t* lengths,
@@ -20,4 +20,4 @@ __global__ void prepare_masked_block_kernel(const std::int32_t* anchors,
     positions[offset] = lengths[b] + min(i, valid - 1);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

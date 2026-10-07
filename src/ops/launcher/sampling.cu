@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/sampling.h
+// Implements: include/infernix/ops/sampling.h
 // Match: validated contiguous BF16/I32 tensors and a shared-layout workspace.
 // Algorithm assumptions: launcher and kernels use sampler_multiblock_ok() from
 // the same layout authority, so exactly one finite route owns each shape.
@@ -8,7 +8,7 @@
 #include "ops/kernel/sampling.cuh"
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std::int32_t count,
                                               std::int32_t* token_counts) {
@@ -60,4 +60,4 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

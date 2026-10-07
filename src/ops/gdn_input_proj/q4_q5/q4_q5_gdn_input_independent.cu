@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr std::int32_t kValueRows = 6144;
@@ -241,4 +241,4 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
     launch_q5(x, value_z_weight, value, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

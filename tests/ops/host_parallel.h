@@ -6,7 +6,7 @@
 #include <thread>
 #include <vector>
 
-namespace ninfer::test {
+namespace infernix::test {
 
 inline std::int64_t host_thread_count() {
     return std::max<std::int64_t>(1, std::thread::hardware_concurrency());
@@ -44,4 +44,4 @@ inline std::int64_t threads_for_rows(std::int64_t rows, std::int64_t minimum_row
     return rows < minimum_rows ? 1 : host_thread_count();
 }
 
-} // namespace ninfer::test
+} // namespace infernix::test

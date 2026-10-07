@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -425,4 +425,4 @@ MediaCacheStats MediaPreprocessCache::stats() const {
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

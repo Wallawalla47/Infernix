@@ -4,7 +4,7 @@
 #include <functional>
 #include <stdexcept>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 namespace {
 
 constexpr std::uint8_t kBacked   = 0;
@@ -1710,4 +1710,4 @@ void PrefixCacheIndex::check_invariants() const {
     }
 }
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

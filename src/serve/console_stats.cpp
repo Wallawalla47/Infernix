@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 constexpr std::string_view kBold  = "\x1b[1m";
@@ -259,7 +259,7 @@ void ConsoleStatsPanel::request_rejected(const RequestFailure& failure) {
     publish_locked();
 }
 
-void ConsoleStatsPanel::runtime(const ninfer::RuntimeStats& current) {
+void ConsoleStatsPanel::runtime(const infernix::RuntimeStats& current) {
     std::lock_guard lock(mutex_);
     if (state_.running == current.running_requests && state_.waiting == current.waiting_requests) {
         return;
@@ -284,4 +284,4 @@ void ConsoleStatsPanel::publish_locked() {
     panel_->update(render_console_stats_panel(state_));
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

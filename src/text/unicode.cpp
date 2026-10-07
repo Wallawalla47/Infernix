@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
-namespace ninfer::text::unicode_internal {
+namespace infernix::text::unicode_internal {
 namespace {
 
 bool is_ascii_whitespace(std::int32_t codepoint) noexcept {
@@ -134,4 +134,4 @@ bool is_whitespace(std::int32_t codepoint) noexcept {
     }
 }
 
-} // namespace ninfer::text::unicode_internal
+} // namespace infernix::text::unicode_internal

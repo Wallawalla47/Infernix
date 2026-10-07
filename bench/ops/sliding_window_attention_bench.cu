@@ -2,11 +2,11 @@
 // Every measured eager launch and captured graph is produced by one public
 // sliding_window_attention() call.
 
-#include "ninfer/ops/sliding_window_attention.h"
+#include "infernix/ops/sliding_window_attention.h"
 
 #include "core/device.h"
 #include "core/cyclic_kv_cache.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "ops/softmax_attention/sliding_window/launch.h"
 
 #include <cuda_profiler_api.h>
@@ -27,7 +27,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -82,7 +82,7 @@ struct Result {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_sliding_window_attention_bench "
+                 "usage: infernix_sliding_window_attention_bench "
                  "[--window 2048|4096] [--tokens 1,...,16] [--batches 1,...,8] "
                  "[--context 0,...,262144] [--envelope-max N] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -499,7 +499,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_sliding_window_attention_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_sliding_window_attention_bench: %s\n", error.what());
         return 1;
     }
 }

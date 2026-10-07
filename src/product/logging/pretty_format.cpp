@@ -5,7 +5,7 @@
 #include <iomanip>
 #include <sstream>
 
-namespace ninfer::product {
+namespace infernix::product {
 namespace {
 
 int scaled_precision(double value) noexcept {
@@ -100,4 +100,4 @@ std::string format_pretty_text(std::string_view value) {
     return out;
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

@@ -1,4 +1,4 @@
-#include "ninfer/ops/vision_pos_embed.h"
+#include "infernix/ops/vision_pos_embed.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

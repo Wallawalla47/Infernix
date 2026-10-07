@@ -17,7 +17,7 @@
 #include <unistd.h>
 #endif
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 namespace {
 
 #ifndef _WIN32
@@ -160,4 +160,4 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
 #endif
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

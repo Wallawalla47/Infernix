@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
+// infernix::ops - RMSNorm kernels over contiguous BF16 rows.
 
 #include "ops/common/math.cuh"
 #include "core/pdl.cuh"
@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 enum class RmsEpilogue {
     Offset,
@@ -99,7 +99,7 @@ __launch_bounds__(Block) __global__
     }
 }
 
-// Implements: include/ninfer/ops/rmsnorm.h
+// Implements: include/infernix/ops/rmsnorm.h
 // Match: aligned contiguous BF16, plain epilogue, D=128, sm_120a.
 // Algorithm assumptions: exactly two BF16x2 values per lane; one warp owns one logical row.
 template <RmsEpilogue Epilogue, int Block>
@@ -213,7 +213,7 @@ __launch_bounds__(Block) __global__
     }
 }
 
-// Implements: include/ninfer/ops/rmsnorm.h
+// Implements: include/infernix/ops/rmsnorm.h
 // Match: aligned contiguous BF16, plain epilogue, D=2048, sm_120a.
 // Algorithm assumptions: exactly two BF16x2 values per thread; one 512-thread CTA owns one row.
 template <RmsEpilogue Epilogue>
@@ -341,4 +341,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

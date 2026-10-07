@@ -14,7 +14,7 @@ extern "C" {
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::media::decode {
+namespace infernix::media::decode {
 namespace {
 
 constexpr std::array<std::uint8_t, 8> kSignature = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
@@ -346,4 +346,4 @@ Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_
     return out;
 }
 
-} // namespace ninfer::media::decode
+} // namespace infernix::media::decode

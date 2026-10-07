@@ -1,11 +1,11 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
-namespace ninfer::test {
+namespace infernix::test {
 
 inline KvCacheStorage parse_kv_cache_storage(std::string_view name) {
     if (name == "bf16") return KvCacheStorage::BFloat16;
@@ -18,4 +18,4 @@ inline KvCacheStorage parse_kv_cache_storage(std::string_view name) {
     throw std::invalid_argument("unknown KV dtype: " + std::string(name));
 }
 
-} // namespace ninfer::test
+} // namespace infernix::test

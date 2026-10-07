@@ -7,7 +7,7 @@ add_subdirectory(ops)
 add_subdirectory(models)
 add_subdirectory(runtime)
 
-if(NINFER_BUILD_PRODUCT_SUPPORT)
+if(INFERNIX_BUILD_PRODUCT_SUPPORT)
   add_subdirectory(product)
   add_subdirectory(serve)
 endif()

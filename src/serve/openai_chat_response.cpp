@@ -12,7 +12,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -99,7 +99,7 @@ CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
 }
 
 CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
-                                      const ninfer::GenerationTimingObservation& observation) {
+                                      const infernix::GenerationTimingObservation& observation) {
     constexpr double kNanosecondsToMilliseconds = 1.0e-6;
     return make_completion_timings(
         prompt_tokens, cached_tokens, observation.generated_tokens,
@@ -115,25 +115,25 @@ Json prompt_progress_json(std::uint32_t total, std::uint32_t cached, std::uint32
                 {"time_ms", elapsed_ns / 1000000ULL}};
 }
 
-const char* finish_reason(ninfer::FinishReason reason) {
+const char* finish_reason(infernix::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::OutputLimit:
+    case infernix::FinishReason::ContextCapacity:
         return "length";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::None:
+    case infernix::FinishReason::StopToken:
+    case infernix::FinishReason::StopString:
+    case infernix::FinishReason::Cancelled:
         return "stop";
     }
     return "stop";
 }
 
 std::vector<ToolCall>
-materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) {
+materialize_tool_calls(const std::vector<infernix::GeneratedToolCall>& generated) {
     std::vector<ToolCall> calls;
     calls.reserve(generated.size());
-    for (const ninfer::GeneratedToolCall& call : generated) {
+    for (const infernix::GeneratedToolCall& call : generated) {
         calls.push_back(ToolCall{.id             = new_openai_chat_tool_call_id(),
                                  .name           = call.name,
                                  .arguments_json = call.arguments_json});
@@ -238,8 +238,8 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
 
     // A truncated answer reports "length" even when it also emitted a tool call: the call can be
     // cut mid-argument, and "tool_calls" would tell the client to act on it.
-    const bool output_limited = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
-                                outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
+    const bool output_limited = outcome.finish_reason == infernix::FinishReason::OutputLimit ||
+                                outcome.finish_reason == infernix::FinishReason::ContextCapacity;
     const char* reason_str =
         output_limited ? "length"
                        : (has_tool_calls ? "tool_calls" : finish_reason(outcome.finish_reason));
@@ -268,7 +268,7 @@ std::string OpenAIChatStream::start() {
     return chunk(identity_, Json{{"role", "assistant"}, {"content", ""}}, nullptr, include_usage_);
 }
 
-void OpenAIChatStream::note_start(const ninfer::GenerationStart& start) {
+void OpenAIChatStream::note_start(const infernix::GenerationStart& start) {
     if (!started_ || admitted_ || finished_ ||
         start.reused_prompt_tokens > start.prompt.prompt_tokens) {
         throw std::logic_error("invalid OpenAI Chat generation-start state");
@@ -293,7 +293,7 @@ std::string OpenAIChatStream::initial_prompt_progress() {
     return event(std::move(payload));
 }
 
-std::string OpenAIChatStream::prompt_progress(const ninfer::PromptProgress& progress) {
+std::string OpenAIChatStream::prompt_progress(const infernix::PromptProgress& progress) {
     if (!return_progress_ || !started_ || !admitted_ || !progress_started_ || finished_ ||
         progress.total_prompt_tokens != prompt_tokens_ ||
         progress.reused_prompt_tokens != cached_tokens_ ||
@@ -313,7 +313,7 @@ std::string OpenAIChatStream::prompt_progress(const ninfer::PromptProgress& prog
     return event(std::move(payload));
 }
 
-void OpenAIChatStream::note_timing(const ninfer::GenerationTimingObservation& timing) {
+void OpenAIChatStream::note_timing(const infernix::GenerationTimingObservation& timing) {
     if (!timings_per_token_ || !started_ || !admitted_ || finished_ ||
         timing.generated_tokens == 0) {
         throw std::logic_error("invalid OpenAI Chat live-timing state");
@@ -377,8 +377,8 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
                                include_usage_, output_timings));
     }
 
-    const bool output_limited = outcome.finish_reason == ninfer::FinishReason::OutputLimit ||
-                                outcome.finish_reason == ninfer::FinishReason::ContextCapacity;
+    const bool output_limited = outcome.finish_reason == infernix::FinishReason::OutputLimit ||
+                                outcome.finish_reason == infernix::FinishReason::ContextCapacity;
     if (!outcome.tool_calls.empty() && !output_limited) {
         const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
@@ -404,4 +404,4 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
     return events;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

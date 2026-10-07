@@ -26,9 +26,9 @@ from tools.bench.ttft.report import ReportError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SERVE = REPO_ROOT / "build/apps/ninfer-serve"
+SERVE = REPO_ROOT / "build/apps/infernix-serve"
 WEIGHTS = REPO_ROOT / "out/qwen3_8_27b_nvfp4.ninfer"
-RAM_WEIGHTS_ROOT = Path("/dev/shm/ninfer-artifacts")
+RAM_WEIGHTS_ROOT = Path("/dev/shm/infernix-artifacts")
 RUNNER = REPO_ROOT / "tools/bench/run_serve_ttft.py"
 OUTPUT_ROOT = REPO_ROOT / "profiles/bench/ttft/qwen3_8_27b_nvfp4-fp8"
 HOST = "127.0.0.1"
@@ -251,7 +251,7 @@ class RunningServe:
 
     def _wait_ready(self) -> None:
         if self.process is None:
-            raise CampaignError("ninfer-serve was not started")
+            raise CampaignError("infernix-serve was not started")
         started = time.monotonic()
         next_notice = started + 5.0
         deadline = started + self.startup_timeout
@@ -260,7 +260,7 @@ class RunningServe:
             if returncode is not None:
                 detail = _tail(self.log_path)
                 raise CampaignError(
-                    f"ninfer-serve exited during startup with status {returncode}"
+                    f"infernix-serve exited during startup with status {returncode}"
                     + (f"\n{detail}" if detail else "")
                 )
 
@@ -288,7 +288,7 @@ class RunningServe:
             now = time.monotonic()
             if now >= deadline:
                 raise CampaignError(
-                    f"timed out waiting for ninfer-serve after {self.startup_timeout:.1f}s"
+                    f"timed out waiting for infernix-serve after {self.startup_timeout:.1f}s"
                 )
             if now >= next_notice:
                 print(f"  loading serve: {now - started:.0f}s", flush=True)
@@ -440,7 +440,7 @@ def _read_run(path: Path) -> dict[str, Any]:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise CampaignError(f"cannot read run artifact {path}: {error}") from error
-    if not isinstance(value, dict) or value.get("artifact_type") != "ninfer_serve_ttft_run":
+    if not isinstance(value, dict) or value.get("artifact_type") != "infernix_serve_ttft_run":
         raise CampaignError(f"runner produced an invalid artifact: {path}")
     return value
 
@@ -579,7 +579,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     }
     kv_dtypes = set(profile_kv_dtypes.values())
     manifest: dict[str, Any] = {
-        "artifact_type": "ninfer_serve_ttft_campaign",
+        "artifact_type": "infernix_serve_ttft_campaign",
         "schema_version": 2,
         "status": "running",
         "created_at": dt.datetime.now().astimezone().isoformat(),

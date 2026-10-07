@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 // Rebases a pointer inside a group's pinned bytes into the group's staged slot, through the
@@ -165,4 +165,4 @@ void VisionWeightStream::upload_next_layer() {
     }
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

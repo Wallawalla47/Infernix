@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 // Streamed: located but never materialized; the runtime reads the object in place from the
 // artifact's files (MaterializedArtifact::stream_source, design §19.3.7 SSD tier).
@@ -77,4 +77,4 @@ private:
     std::uint64_t owned_value_bytes_ = 0;
 };
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

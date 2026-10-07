@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/residual_add.h
+// Implements: include/infernix/ops/residual_add.h
 // Match: contiguous BF16 inputs. Registered aligned/eight-element domains use
 // one 16-byte pack per thread; BF16x2 and scalar routes preserve correctness for
 // smaller alignments and odd tails.
@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kResidualAddPairsPerThread = 4;
 
@@ -82,4 +82,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

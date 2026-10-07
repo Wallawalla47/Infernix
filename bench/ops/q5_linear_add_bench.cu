@@ -6,11 +6,11 @@
 // captured per graph, and the reported node count is the captured graph's real node count.
 
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_add.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -25,7 +25,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_q5_linear_add_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_q5_linear_add_bench: %s\n", error.what());
         return 1;
     }
 }

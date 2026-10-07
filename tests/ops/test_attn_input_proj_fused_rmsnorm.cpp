@@ -1,7 +1,7 @@
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/rmsnorm.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/rmsnorm.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/input_projection_test_common.h"
 
@@ -16,9 +16,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::input_projection;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::input_projection;
 
 namespace {
 
@@ -242,7 +242,7 @@ int main() {
             return 1;
         }
         int failures       = 0;
-        const bool measure = std::getenv("NINFER_MEASURE_FUSED_STAGE") != nullptr;
+        const bool measure = std::getenv("INFERNIX_MEASURE_FUSED_STAGE") != nullptr;
         // 512 and 700 read the 128-token scale tiles (700 a ragged last tile); from 1024 the tiles
         // are 256 tokens. 3584 is the production prefill chunk under the fast prefill kernel.
         for (const int tokens : {512, 700, 1024, 1500, 2048, 3584, 4096}) {

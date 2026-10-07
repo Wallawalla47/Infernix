@@ -1,4 +1,4 @@
-// ninfer::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
+// infernix::ops - RMSNorm launcher: finite semantic dispatch over general row geometries.
 #include "ops/launcher/rmsnorm.h"
 
 #include "ops/kernel/rmsnorm.cuh"
@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 // Above one CTA per SM, another CTA supplies overlap without the gated epilogue's extra
@@ -177,4 +177,4 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

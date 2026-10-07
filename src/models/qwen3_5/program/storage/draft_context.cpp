@@ -1,7 +1,7 @@
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout,
@@ -27,4 +27,4 @@ void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t source_slot,
     local.copy_slot_from(local, source_slot, destination_slot, stream);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

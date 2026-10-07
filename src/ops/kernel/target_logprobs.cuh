@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/target_logprobs.h
+// Implements: include/infernix/ops/target_logprobs.h
 // Match: contiguous BF16 [physical_rows,C], I32 [T,C], and FP32 [T,C].
 // Algorithm assumptions: one 256-thread CTA performs a single-pass online logsumexp per column.
 
@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kTargetLogprobsBlock = 256;
 
@@ -85,4 +85,4 @@ __launch_bounds__(BlockSize) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

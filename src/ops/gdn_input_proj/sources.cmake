@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_matrix.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_gdn_input_a8.cu"
@@ -26,6 +26,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/gdn_input_proj.cpp"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+target_sources(infernix_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4_tma.cu"
 )

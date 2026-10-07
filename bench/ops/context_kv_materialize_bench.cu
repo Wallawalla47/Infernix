@@ -1,9 +1,9 @@
 // Cold-cache benchmark for the complete DFlash2 five-layer context state transition.
 
 #include "core/weight.h"
-#include "ninfer/ops/context_kv_materialize.h"
+#include "infernix/ops/context_kv_materialize.h"
 
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_context_kv_materialize_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_context_kv_materialize_bench: %s\n", error.what());
         return 1;
     }
 }

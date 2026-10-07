@@ -1,8 +1,8 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/silu_mul.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/silu_mul.h"
 #include "core/layout.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
@@ -11,7 +11,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -183,4 +183,4 @@ void q4_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, Wo
     q4_linear_swiglu_execute_plan(plan, x, w, out, ws, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

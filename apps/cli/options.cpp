@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace ninfer::cli {
+namespace infernix::cli {
 namespace {
 
 std::uint64_t parse_u64(const char* text, std::string_view label) {
@@ -325,11 +325,11 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--reasoning-loop") {
             const std::string mode = value(arg);
             if (mode == "off") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Off;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Off;
             } else if (mode == "stop") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Stop;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Stop;
             } else if (mode == "conclude") {
-                options.reasoning_loop = ninfer::ReasoningLoopAction::Conclude;
+                options.reasoning_loop = infernix::ReasoningLoopAction::Conclude;
             } else {
                 throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
             }
@@ -441,4 +441,4 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-} // namespace ninfer::cli
+} // namespace infernix::cli

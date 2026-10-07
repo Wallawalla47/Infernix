@@ -6,7 +6,7 @@
 #include <bit>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 namespace pc = runtime::prefix_cache;
@@ -116,4 +116,4 @@ std::uint32_t media_agreed_prefix(const PreparedPromptData& waiting,
     return shared;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

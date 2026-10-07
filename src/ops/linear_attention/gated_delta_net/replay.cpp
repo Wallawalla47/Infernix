@@ -1,5 +1,5 @@
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gdn_replay.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gdn_replay.h"
 
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kStateDim    = detail::gated_delta_net::kStateDim;
@@ -339,4 +339,4 @@ void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows, cudaStre
                                                 static_cast<std::int32_t>(rows.size()), stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

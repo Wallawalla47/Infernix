@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/causal_softmax_attention.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/bf16/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/bf16/plan.cpp"
@@ -22,6 +22,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/sliding_window/launch.cu"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+target_sources(infernix_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/dense/causal_cache/nvfp4/tiled_launch.cu"
 )

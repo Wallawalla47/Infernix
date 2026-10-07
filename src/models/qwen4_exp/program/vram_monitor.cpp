@@ -11,7 +11,7 @@
 #include <windows.h>
 #endif
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 namespace testing {
 namespace {
@@ -93,4 +93,4 @@ void VramMonitor::run() {
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

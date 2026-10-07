@@ -1,8 +1,8 @@
 #include "core/weight.h"
 #include "ops/linear_pair/linear_pair_test_common.h"
 
-#include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/linear_pair.h"
+#include "infernix/ops/weight_input.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::test::linear_pair {
+namespace infernix::test::linear_pair {
 namespace {
 
 constexpr std::int32_t kOutputRows       = 1024;
@@ -349,4 +349,4 @@ int run_q8_a16_shape(std::string_view label, const ShapeCase& shape) {
     return failures;
 }
 
-} // namespace ninfer::test::linear_pair
+} // namespace infernix::test::linear_pair

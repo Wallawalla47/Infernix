@@ -8,15 +8,15 @@
 #include "core/tensor.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen4_exp/model.h"
-#include "ninfer/ops/offloaded_sparse_moe.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/weight_input.h"
 
 #include <memory>
 #include <optional>
 #include <variant>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 
 using LinearParameters = ops::SingleProjectionWeight;
 
@@ -106,4 +106,4 @@ private:
     DeviceBuffer scales_;
 };
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

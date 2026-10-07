@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_template_launch.cuh"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, cudaStream_t stream) {
     const LinearBf16SegmentedOutput<6144, 1024, 6144, 1024> output{
@@ -34,4 +34,4 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
     else
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,7 +1,7 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_stream_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next MTP attention group: the register-streamed route up to 8 columns (4-28 % faster than
 // SIMT), the MMA tiles beyond (M1 sweep). K1: 2 row(s) per warp, x staged in shared memory per pass.
@@ -17,4 +17,4 @@ Q8Launch select_q8_n13952_k2560(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

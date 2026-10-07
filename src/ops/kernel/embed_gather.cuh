@@ -3,7 +3,7 @@
 #include "ops/common/math.h"
 #include "core/pdl.cuh"
 
-// ninfer::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
+// infernix::ops - embedding kernels. Dense copies BF16 rows; quantized variants decode only the
 // selected rows into contiguous BF16 output columns.
 
 #include <cuda_bf16.h>
@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr std::int32_t kEmbedGatherQ6Group          = 64;
 inline constexpr std::int32_t kEmbedGatherQ6NibbleBpr      = 32;
@@ -250,4 +250,4 @@ __launch_bounds__(256) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

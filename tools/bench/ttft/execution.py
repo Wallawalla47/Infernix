@@ -8,8 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from tools.ninfer_serve.client import (
-    NInferServeClient,
+from tools.infernix_serve.client import (
+    InfernixServeClient,
     PreparedServeExchange,
     ProtocolEvent,
     ProtocolRequest,
@@ -527,7 +527,7 @@ class RequestHandle:
 class CaseContext:
     def __init__(
         self,
-        client: NInferServeClient,
+        client: InfernixServeClient,
         model: str,
         timeout_seconds: float,
         on_progress: ProgressCallback | None = None,

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/weight_view.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 struct WeightId {
     std::size_t index                          = std::numeric_limits<std::size_t>::max();
@@ -138,4 +138,4 @@ struct ModelWeights {
     std::optional<ProposalWeights> proposal;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

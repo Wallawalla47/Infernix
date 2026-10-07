@@ -15,8 +15,8 @@
 // tokens per second in each context bucket, and its bounded response to timing spikes.
 namespace {
 
-using ninfer::kMaximumConcurrency;
-using ninfer::models::qwen3_5::detail::TreeWidthController;
+using infernix::kMaximumConcurrency;
+using infernix::models::qwen3_5::detail::TreeWidthController;
 using Trees = std::array<std::vector<std::uint32_t>, kMaximumConcurrency>;
 
 constexpr std::uint32_t kChain = 8; // draft_tokens 7

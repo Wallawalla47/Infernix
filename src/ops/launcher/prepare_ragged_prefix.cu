@@ -6,7 +6,7 @@
 
 #include <algorithm>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                                   const Tensor& ends, Tensor& destination, Tensor& positions,
@@ -27,4 +27,4 @@ void prepare_ragged_prefix_launch(const Tensor& source, const Tensor& lanes, con
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

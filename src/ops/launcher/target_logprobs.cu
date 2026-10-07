@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/target_logprobs.h
+// Implements: include/infernix/ops/target_logprobs.h
 // Match: wrapper-validated contiguous tensors and valid vocabulary rows.
 // Algorithm assumptions: one independent CTA per column; no global workspace.
 #include "ops/launcher/target_logprobs.h"
@@ -6,7 +6,7 @@
 #include "core/device.h"
 #include "ops/kernel/target_logprobs.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
                             Tensor& output, cudaStream_t stream) {
@@ -18,4 +18,4 @@ void target_logprobs_launch(const Tensor& logits, const Tensor& target_ids, std:
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

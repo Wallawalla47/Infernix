@@ -14,7 +14,7 @@
 #include <memory>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 // One vision item's merged embeddings, parked in pinned host memory by an overlay window and
 // re-uploaded into the request transient when prefill consumes the item.
@@ -52,4 +52,4 @@ void encode_overlay_suffix(DeviceContext& device, const Parameters& parameters,
                            const detail::VisionPrefillPlan& plan, std::uint32_t reused,
                            VisionPrefillSession& session);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

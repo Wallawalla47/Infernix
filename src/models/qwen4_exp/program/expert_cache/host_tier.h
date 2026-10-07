@@ -12,7 +12,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp::expert_cache {
 
 // ---------------------------------------------------------------------------- decayed LFU
 
@@ -203,4 +203,4 @@ private:
     std::size_t resident_count_ = 0, shadow_count_ = 0;
 };
 
-} // namespace ninfer::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp::expert_cache

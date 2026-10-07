@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 class RecordProvider {
 public:
@@ -24,4 +24,4 @@ public:
     virtual void done(std::uint32_t ticket) noexcept = 0;
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

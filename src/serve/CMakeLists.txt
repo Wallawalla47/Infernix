@@ -1,4 +1,4 @@
-add_library(ninfer_serve STATIC
+add_library(infernix_serve STATIC
   http_transport.cpp
   request_validation.cpp
   openai_chat_request.cpp
@@ -26,7 +26,7 @@ add_library(ninfer_serve STATIC
   serve_options.cpp
   stop_control.cpp
 )
-ninfer_internal_includes(ninfer_serve)
-target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
-  PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_cuda_runtime)
+infernix_internal_includes(infernix_serve)
+target_link_libraries(infernix_serve
+  PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
+  PRIVATE infernix_media_acquire infernix_product_logging infernix_cuda_runtime)

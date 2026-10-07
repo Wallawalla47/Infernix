@@ -1,6 +1,6 @@
 #include "ops/linear_add/linear_add_test_common.h"
 
-#include "ninfer/ops/linear_add.h"
+#include "infernix/ops/linear_add.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -13,11 +13,11 @@
 
 namespace {
 
-using ninfer::test::linear_add::ShapeCase;
-using ninfer::test::linear_add::WeightFormat;
+using infernix::test::linear_add::ShapeCase;
+using infernix::test::linear_add::WeightFormat;
 
 int cancellation_conformance() {
-    using namespace ninfer;
+    using namespace infernix;
     namespace qw    = test::quantized_weight;
     int failures    = 0;
     constexpr int t = 129;
@@ -69,7 +69,7 @@ int q8_a16_conformance() {
 
     constexpr std::array<std::int32_t, 4> kK4096RouteStarts{2, 49, 129, 641};
     constexpr std::array<std::int32_t, 5> kK4096RouteInteriors{1, 24, 96, 256, 1024};
-    failures += ninfer::test::linear_add::run_shape(
+    failures += infernix::test::linear_add::run_shape(
         "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
         ShapeCase{2048, 4096, 419U, kK4096RouteStarts, kK4096RouteInteriors});
 
@@ -83,7 +83,7 @@ int q8_a16_conformance() {
         464,  560,  656,  688,  744,  840,  928,  992,  1024, 1072, 1200,
         1312, 1376, 1544, 1736, 1792, 1856, 1920, 1968, 2032, 2048, 4096,
     };
-    failures += ninfer::test::linear_add::run_shape(
+    failures += infernix::test::linear_add::run_shape(
         "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
         ShapeCase{2048, 6144, 421U, kK6144RouteStarts, kK6144RouteInteriors});
     constexpr std::array<std::int32_t, 10> large_route_starts{5,  9,  17, 25, 33,
@@ -92,10 +92,10 @@ int q8_a16_conformance() {
     constexpr std::array<std::int32_t, 6> graph_tokens{1, 8, 64, 65, 129, 512};
     constexpr std::array<std::int32_t, 3> full_tokens{1, 4, 8};
     for (const auto k : {6144, 17408}) {
-        failures += ninfer::test::linear_add::run_shape(
+        failures += infernix::test::linear_add::run_shape(
             "Q8_A16 LinearAdd", WeightFormat::Q8G32F16S,
             ShapeCase{5120, k, 423U, large_route_starts, large_interiors, graph_tokens});
-        failures += ninfer::test::linear_add::run_shape(
+        failures += infernix::test::linear_add::run_shape(
             "Q8_A16 LinearAdd full", WeightFormat::Q8G32F16S,
             ShapeCase{5120, k, 425U, {}, full_tokens, {}, true});
     }
@@ -105,7 +105,7 @@ int q8_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear_add::cuda_available()) {
+    if (!infernix::test::linear_add::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

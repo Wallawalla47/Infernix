@@ -11,7 +11,7 @@
 #include <map>
 #include <utility>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 using artifact::ArtifactError;
@@ -533,4 +533,4 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions
     return materialize_model(plan_load(reader, options), device, observer);
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

@@ -6,7 +6,7 @@
 #include <optional>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Compressed edges refer to a surviving native checkpoint's semantic digest path. The model
 // verifies exact token/position/media identity before a returned checkpoint can be used.
@@ -116,4 +116,4 @@ private:
 
     Node root_;
 };
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

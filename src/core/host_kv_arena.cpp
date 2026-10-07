@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 constexpr std::size_t kHostKVAlignment = 256;
@@ -324,4 +324,4 @@ std::byte* HostKVArena::allocation_data(const Descriptor& descriptor) const noex
     return descriptor.storage.data();
 }
 
-} // namespace ninfer
+} // namespace infernix

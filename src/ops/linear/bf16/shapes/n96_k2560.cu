@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // Qwen3.8-Flash-Next GDN a/b projections, T = a call's columns. Routes per token interval from the
 // tile sweep on the RTX 5090 (the fastest candidate within 2 % at each measured T, seams at the last
 // measured T); T <= 8 keeps the runtime-shape fallback's skinny GEMV, so decode and verification
@@ -23,4 +23,4 @@ Bf16Launch select_bf16_n96_k2560(std::int32_t tokens) {
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2>, 2560>>; // tail_r64t128s2
     return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaTailMmaSchedule<128, 128, 32, 64, 3, 1, Bf16MmaRaster::RowFast>, 2560>>; // tail_r128t128s3_w32x64_rows
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

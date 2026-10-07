@@ -1,6 +1,6 @@
 # Build system
 
-NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
+Infernix builds from its source tree with CMake 3.28+ and C++/CUDA 20.
 The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
 Product commands and prerequisites are in the
 [README](../../README.md#quick-start); test and measurement workflows live in
@@ -11,13 +11,13 @@ Product commands and prerequisites are in the
 The root `CMakeLists.txt` owns language/toolchain constraints, build options and top-level
 composition. Architecture selection and validation happen before `project()` detects CUDA.
 The default configuration is Release. Ninja links and archives share the single-slot
-`ninfer_link` pool; compilation uses the build command's parallelism.
+`infernix_link` pool; compilation uses the build command's parallelism.
 
 | Cache option | Default | Scope |
 |---|---|---|
-| `NINFER_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator |
+| `INFERNIX_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
-| `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+| `INFERNIX_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
@@ -68,7 +68,7 @@ package export or configure-time dependency download.
 
 `cmake/Dependencies.cmake` discovers system CUDA, Threads, FFmpeg and conditional curl, and
 exposes the repository-pinned JSON/HTTP headers and conditional spdlog library. External include
-requirements follow their consuming targets. `cmake/NinferTargets.cmake` provides private
+requirements follow their consuming targets. `cmake/InfernixTargets.cmake` provides private
 project includes and the two CUDA archive policies.
 
 `src/CMakeLists.txt` explicitly enters the component directories. Each component's
@@ -76,15 +76,15 @@ project includes and the two CUDA archive policies.
 
 | Component | Targets |
 |---|---|
-| `core/` | `ninfer_core` |
-| `artifact/` | `ninfer_artifact` |
-| `text/` | `ninfer_text`, including bundled utf8proc C source |
-| `media/` | `ninfer_media_decode` |
-| `ops/` | `ninfer_ops`, `ninfer_nvfp4_non_rdc` |
-| `models/` | `ninfer_model_loading`, `ninfer_model_runtime` |
-| `runtime/` | `ninfer_runtime_support`, `ninfer_engine` and its `ninfer::engine` alias |
+| `core/` | `infernix_core` |
+| `artifact/` | `infernix_artifact` |
+| `text/` | `infernix_text`, including bundled utf8proc C source |
+| `media/` | `infernix_media_decode` |
+| `ops/` | `infernix_ops`, `infernix_nvfp4_non_rdc` |
+| `models/` | `infernix_model_loading`, `infernix_model_runtime` |
+| `runtime/` | `infernix_runtime_support`, `infernix_engine` and its `infernix::engine` alias |
 | `product/` | media acquisition, prompt input and logging libraries |
-| `serve/` | `ninfer_serve` |
+| `serve/` | `infernix_serve` |
 
 Component declaration order is not the execution dependency graph: CMake resolves named target
 links during generation. Model runtime can refer to the runtime support target declared later;
@@ -114,10 +114,10 @@ dispatch remain in C++; CMake only selects translation units.
 
 ## CUDA compilation boundaries
 
-`ninfer_core` and `ninfer_ops` enable separable compilation (RDC) and resolve device symbols in
+`infernix_core` and `infernix_ops` enable separable compilation (RDC) and resolve device symbols in
 the static archive build. Keep this device-link boundary explicit.
 
-`ninfer_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
+`infernix_nvfp4_non_rdc` disables separable compilation and device-symbol resolution. It contains
 the warp-specialized Linear, LinearSwiGLU and causal-attention NVFP4 sources that depend on
 `setmaxnreg` register transfer. Their owning family manifests register these sources into the
 non-RDC target; host launchers connect them to the normal Ops. All three CUDA archive targets

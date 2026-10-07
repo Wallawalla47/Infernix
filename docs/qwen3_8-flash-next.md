@@ -1,14 +1,14 @@
 # Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`)
 
-NInfer runs NVIDIA's NVFP4 checkpoint of Qwen3.8-Flash-Next on one RTX 5090 (32 GB). The 24,576
+Infernix runs NVIDIA's NVFP4 checkpoint of Qwen3.8-Flash-Next on one RTX 5090 (32 GB). The 24,576
 routed experts (63 GiB) live in pinned host RAM. A VRAM expert cache holds the hot ones, and the
 CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an NVMe volume. The
 design, measurements and open work are in the
 [design document](maintainer/qwen3_8-flash-next-design.md) (§16.5, §19.2).
 
-Generation works through `ninfer`, `ninfer-serve` and `ninfer_bench`, with the model's MTP
+Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with the model's MTP
 drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
-`ninfer-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity).
+`infernix-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity).
 
 ## Requirements
 
@@ -17,7 +17,7 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
   `nvidia-smi --query-gpu=pcie.link.width.current --format=csv`.
 - **RAM.** About 96 GB for full speed. A run pins ~64.5 GiB. At startup a RAM ledger plans every
   allocation and keeps `--ram-headroom-mib` (default 2048) free for the system; with the defaults
-  about 69.3 GiB must be available, and 73.3 GiB for `ninfer-serve` with its prefix cache (see
+  about 69.3 GiB must be available, and 73.3 GiB for `infernix-serve` with its prefix cache (see
   [Prefix cache](#prefix-cache)). With less, the [SSD expert tier](#ssd-expert-tier) keeps the
   experts that fit in RAM and reads the others from the artifact; the ledger line names every term.
 - **VRAM.** All of it: the expert cache takes what the dense weights, the KV cache, the
@@ -56,13 +56,13 @@ python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_
 ## Run
 
 ```text
-ninfer <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
+infernix <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
   --prompt "..."
-ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
+infernix-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
   --prefill-chunk 4096
 ```
 
-- `--kv-dtype` accepts every NInfer KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
+- `--kv-dtype` accepts every Infernix KV format: `int8` (recommended), `bf16`, `fp8`, `nvfp4`,
   `k8v4`, `vq2` and `k4v2`.
   - `fp8`, `nvfp4` and `k8v4` measured within noise of `int8` in teacher-forced quality. `nvfp4`
     holds a context in 55 % of `int8`'s KV memory, which leaves more VRAM to the expert cache.
@@ -138,10 +138,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 
 ## Prefix cache
 
-`ninfer-serve` reuses prompt prefixes with the hybrid prefix cache (its default;
+`infernix-serve` reuses prompt prefixes with the hybrid prefix cache (its default;
 [spec](maintainer/hybrid-prefix-cache-spec.md#17-qwen4exp-binding-qwen38-flash-next)). A
 conversation's next turn resumes from a snapshot of the model state and prefills only the new
-tokens; KV blocks are shared across requests. `ninfer` (one request) runs without it.
+tokens; KV blocks are shared across requests. `infernix` (one request) runs without it.
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
   `--host-context-mib` (default 4096, must be positive). It is pinned at startup and counted in the
@@ -157,7 +157,7 @@ tokens; KV blocks are shared across requests. `ninfer` (one request) runs withou
   uncached runs.
 - `--prefix-cache-file PATH` saves the Host tier when the server stops and restores it at the next
   start, as for Qwen3.5 ([serving](serving.md)); a file from another artifact, KV format, drafter
-  or `ninfer-serve` build is ignored and replaced.
+  or `infernix-serve` build is ignored and replaced.
 - Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`.
 
 ## SSD expert tier
@@ -198,7 +198,7 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
   startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
-  NInfer executables makes such an allocation fail instead (optional).
+  Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the
   desktop) takes memory and free VRAM falls below half the headroom, the cache gives back the
   least valuable experts at the next round boundary, or at once when idle, and logs it; it grows
@@ -235,8 +235,8 @@ warms up over the first few hundred tokens of a session.
 
 | Workload | tok/s |
 |---|---:|
-| `ninfer_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~134 |
-| `ninfer_bench` tg512, plain decode (warm cache) | ~87 |
+| `infernix_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~134 |
+| `infernix_bench` tg512, plain decode (warm cache) | ~87 |
 | Single CLI request, cold cache, plain: code rewrite / prose story | ~66 / ~65 |
 | Single CLI request, cold cache, MTP: code rewrite / prose story | ~84 / ~67 |
 | Prompt, 4,096 tokens, `--prefill-chunk 4096` | ~670-690 |

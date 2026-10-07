@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 namespace {
 
 template <class Function>
@@ -225,4 +225,4 @@ Parameters::Parameters(const Model& source) : model(source) {
 
 Parameters::~Parameters() = default;
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

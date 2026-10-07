@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 std::int64_t stride_elements(const Tensor& tensor, int dim) {
@@ -99,4 +99,4 @@ void packed_attention_uniform_launch(const Tensor& q, const Tensor& k, const Ten
         q, k, v, segment_length, packed_attention_uniform_tile(segment_length), out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

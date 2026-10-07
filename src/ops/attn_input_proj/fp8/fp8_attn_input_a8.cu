@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
@@ -41,4 +41,4 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
     if (x.ne[1] <= 288) return launch.template operator()<Tma96x256>();
     launch.template operator()<Bulk>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

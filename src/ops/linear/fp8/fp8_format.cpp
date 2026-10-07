@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -72,4 +72,4 @@ Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operatio
     return geometry;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

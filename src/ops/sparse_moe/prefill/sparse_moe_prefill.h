@@ -3,14 +3,14 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // RTX 5090 codec frontiers balance trace-like and independent expert distributions. The public
 // workspace query starts at the earliest codec-specific prefill route.
@@ -118,4 +118,4 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                const SparseMoePrefillWorkspace& workspace,
                                DeviceExecutionView execution);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

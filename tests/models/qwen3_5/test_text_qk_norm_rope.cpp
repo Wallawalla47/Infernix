@@ -3,16 +3,16 @@
 // has to take the three-call route even at the fused Op's decode widths.
 #include "ops/op_tester.h"
 #include "models/qwen3_5/execution/attention.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
 
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/dynamic_grouped_conv.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
 #include "core/decode_graph.h"
 
 #include "ops/input_projection_test_common.h"
@@ -16,8 +16,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

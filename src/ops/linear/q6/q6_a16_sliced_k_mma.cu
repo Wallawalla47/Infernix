@@ -2,7 +2,7 @@
 #include "ops/linear/q6/q6_sliced_k_launch.cuh"
 #include "ops/linear/q6/q6_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void launch_q6_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
                                        cudaStream_t stream) {
@@ -60,4 +60,4 @@ void launch_q6_a16_sliced_r32_t32_w4_s2(const Tensor& x, const Weight& weight, T
         stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

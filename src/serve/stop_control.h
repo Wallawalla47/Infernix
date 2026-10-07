@@ -1,6 +1,6 @@
 #pragma once
 
-// ninfer-serve's stop policy. Ctrl+C (SIGINT) asks for a confirming second press within
+// infernix-serve's stop policy. Ctrl+C (SIGINT) asks for a confirming second press within
 // kConfirmWindow, shown on the console's transient bottom line, so one stray press never cancels
 // running requests. Ctrl+Break, closing the console window and SIGTERM stop at once. The stop
 // closes the listener and fails running and queued requests; the Engine then saves the prefix
@@ -10,7 +10,7 @@
 // This is the state machine only: platform code delivers events with the current time, calls
 // expire() when the pending deadline passes, and supplies the console and process actions.
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "serve/operational_log.h"
 
 #include <chrono>
@@ -20,7 +20,7 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 enum class StopEvent : std::uint8_t {
     Interrupt, // Ctrl+C / SIGINT: needs a confirming second press
@@ -84,4 +84,4 @@ private:
     std::optional<Clock::time_point> confirm_until_;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

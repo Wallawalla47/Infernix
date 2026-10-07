@@ -1,5 +1,5 @@
 // End-to-end decode quality, judge half. Scores the greedy continuations that
-// ninfer_decode_quality_gen wrote, for any number of builds, with one reference: a CausalScoring
+// infernix_decode_quality_gen wrote, for any number of builds, with one reference: a CausalScoring
 // Engine with 16-bit activations in every linear (EngineOptions::a16_activations), BF16 KV, and
 // each sequence in one prefill pass. Each build is judged on its own prefixes, so builds whose
 // continuations diverge are still compared fairly. Per build it reports how often the generated
@@ -7,9 +7,9 @@
 // generated tokens, and the mean regret (top log-probability minus the generated token's); per
 // pair of builds, the generated prefix they share exactly.
 //
-// Usage: ninfer_decode_quality_judge <artifact> <corpus.txt> <gen_file>...
+// Usage: infernix_decode_quality_judge <artifact> <corpus.txt> <gen_file>...
 
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -26,7 +26,7 @@ namespace {
 struct Segment {
     std::size_t offset          = 0;
     std::uint32_t prompt_tokens = 0;
-    std::vector<ninfer::TokenId> generated;
+    std::vector<infernix::TokenId> generated;
 };
 
 std::vector<Segment> read_generation(const std::string& path) {
@@ -38,7 +38,7 @@ std::vector<Segment> read_generation(const std::string& path) {
         std::istringstream fields(line);
         Segment segment;
         if (!(fields >> segment.offset >> segment.prompt_tokens)) { continue; }
-        ninfer::TokenId id = 0;
+        infernix::TokenId id = 0;
         while (fields >> id) { segment.generated.push_back(id); }
         segments.push_back(std::move(segment));
     }
@@ -49,7 +49,7 @@ std::vector<Segment> read_generation(const std::string& path) {
 
 int main(int argc, char** argv) {
     if (argc < 4) {
-        std::cerr << "usage: ninfer_decode_quality_judge <artifact> <corpus.txt> <gen_file>...\n";
+        std::cerr << "usage: infernix_decode_quality_judge <artifact> <corpus.txt> <gen_file>...\n";
         return 2;
     }
     try {
@@ -65,20 +65,20 @@ int main(int argc, char** argv) {
         }
         const std::uint32_t context = (longest + 127) / 128 * 128;
 
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path   = argv[1];
-        options.purpose         = ninfer::EnginePurpose::CausalScoring;
+        options.purpose         = infernix::EnginePurpose::CausalScoring;
         options.max_context     = context;
         options.prefill_chunk   = context;
-        options.kv_cache        = ninfer::KvCacheStorage::BFloat16;
+        options.kv_cache        = infernix::KvCacheStorage::BFloat16;
         options.a16_activations = true;
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
 
         std::ifstream corpus(argv[2], std::ios::binary);
         if (!corpus) { throw std::runtime_error(std::string("cannot read ") + argv[2]); }
         std::stringstream text;
         text << corpus.rdbuf();
-        const std::vector<ninfer::TokenId> tokens = engine.tokenize_text(text.str());
+        const std::vector<infernix::TokenId> tokens = engine.tokenize_text(text.str());
 
         std::cout << std::fixed << std::setprecision(4);
         for (std::size_t run = 0; run < runs.size(); ++run) {
@@ -92,12 +92,12 @@ int main(int argc, char** argv) {
                     throw std::runtime_error("a segment lies outside the corpus: was it the same "
                                              "corpus and artifact tokenizer?");
                 }
-                std::vector<ninfer::TokenId> sequence(
+                std::vector<infernix::TokenId> sequence(
                     tokens.begin() + static_cast<std::ptrdiff_t>(segment.offset),
                     tokens.begin() +
                         static_cast<std::ptrdiff_t>(segment.offset + segment.prompt_tokens));
                 sequence.insert(sequence.end(), segment.generated.begin(), segment.generated.end());
-                const ninfer::ScoreResult scored =
+                const infernix::ScoreResult scored =
                     engine.score_tokens(std::move(sequence), segment.prompt_tokens, {.top_k = 1});
                 auto first = static_cast<std::uint32_t>(segment.generated.size());
                 for (std::size_t i = 0; i < segment.generated.size(); ++i) {
@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
         }
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_decode_quality_judge: " << error.what() << '\n';
+        std::cerr << "infernix_decode_quality_judge: " << error.what() << '\n';
         return 1;
     }
 }

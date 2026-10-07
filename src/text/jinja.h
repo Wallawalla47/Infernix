@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::text {
+namespace infernix::text {
 
 struct TemplateInputRegion {
     std::string pointer;
@@ -65,4 +65,4 @@ private:
     std::shared_ptr<const Impl> impl_;
 };
 
-} // namespace ninfer::text
+} // namespace infernix::text

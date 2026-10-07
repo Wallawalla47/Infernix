@@ -1,4 +1,4 @@
-#include "ninfer/ops/kv_cache_append.h"
+#include "infernix/ops/kv_cache_append.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -18,8 +18,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 
@@ -1400,7 +1400,7 @@ int main(int argc, char** argv) {
     const bool nvfp4_only = argc == 2 && std::string_view(argv[1]) == "--nvfp4-only";
     const bool k8v4_only  = argc == 2 && std::string_view(argv[1]) == "--k8v4-only";
     if (argc != 1 && !nvfp4_only && !k8v4_only) {
-        std::cerr << "usage: ninfer_kv_cache_append_test [--nvfp4-only|--k8v4-only]\n";
+        std::cerr << "usage: infernix_kv_cache_append_test [--nvfp4-only|--k8v4-only]\n";
         return 2;
     }
 

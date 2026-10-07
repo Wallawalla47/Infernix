@@ -1,11 +1,11 @@
-#include "ninfer/ops/scalar.h"
+#include "infernix/ops/scalar.h"
 
 #include "ops/launcher/scalar.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require_scalar(const Tensor& tensor, DType dtype, const char* name) {
@@ -52,4 +52,4 @@ void increment_i64_scalar(Tensor& scalar, cudaStream_t stream) {
     detail::increment_i64_scalar_launch(scalar, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

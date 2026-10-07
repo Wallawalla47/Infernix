@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, int StaticWidth, class Publish>
@@ -262,4 +262,4 @@ void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& c
              value, NoHistoryPublish{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 [[nodiscard]] FrontendResources bind_resources(artifact::Binder& binder, const Config& config);
 
@@ -71,4 +71,4 @@ void bind_dflash2(Bindings& bindings, DraftWeights& weights, const DraftConfig& 
 resolve_weights(std::vector<PendingWeight>&& pending,
                 const artifact::MaterializedArtifact& materialized);
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

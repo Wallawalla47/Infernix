@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/context_kv_materialize.h"
+#include "infernix/ops/context_kv_materialize.h"
 
 #include "core/layout.h"
 #include "ops/context_kv_materialize/launch.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHidden     = 5120;
@@ -161,4 +161,4 @@ void context_kv_materialize(
                                           route, key_scratch, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

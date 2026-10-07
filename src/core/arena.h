@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <initializer_list>
 
-namespace ninfer {
+namespace infernix {
 
 struct DeviceSpan {
     void* data        = nullptr;
@@ -114,4 +114,4 @@ private:
 
 using WorkspaceArena = DeviceArena;
 
-} // namespace ninfer
+} // namespace infernix

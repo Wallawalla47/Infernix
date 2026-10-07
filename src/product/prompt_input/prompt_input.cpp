@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::product {
+namespace infernix::product {
 namespace {
 
 using Json = nlohmann::ordered_json;
@@ -273,4 +273,4 @@ PromptInput prompt_from_messages(const std::filesystem::path& path,
     return input;
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

@@ -10,7 +10,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 struct HostKVPlaneLayout {
     std::size_t offset             = 0;
@@ -200,4 +200,4 @@ private:
     std::vector<std::uint32_t> free_descriptors_;
 };
 
-} // namespace ninfer
+} // namespace infernix

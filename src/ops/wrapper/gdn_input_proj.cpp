@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 
 #include "core/layout.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
@@ -22,7 +22,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -1054,4 +1054,4 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                   value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

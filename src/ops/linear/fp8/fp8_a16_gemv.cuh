@@ -18,7 +18,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Values>
 struct alignas(Values) Fp8CodePack {
@@ -184,4 +184,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <string_view>
 
-namespace ninfer::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp::expert_cache {
 
 struct ExpertStateLoad {
     std::optional<SavedState> state;
@@ -28,4 +28,4 @@ struct ExpertStateLoad {
 [[nodiscard]] ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string_view identity,
                                                 std::uint32_t keys);
 
-} // namespace ninfer::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp::expert_cache

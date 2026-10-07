@@ -6,7 +6,7 @@
 #include "ops/linear/common/vector_output.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Epilogues may consume adjacent aligned rows together; the scalar contract remains valid.
 template <class Epilogue>
@@ -251,4 +251,4 @@ fp8_finish_mma_tile(Output output, Epilogue epilogue, RowPolicy row_policy,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

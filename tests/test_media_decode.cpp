@@ -1,6 +1,6 @@
 #include "media/decode/decode.h"
 
-#ifdef NINFER_MEDIA_NATIVE_PNG
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
 #include "media/decode/png_decode.h"
 #include "png_fixtures_generated.h"
 #endif
@@ -106,7 +106,7 @@ std::vector<std::uint8_t> decode_base64(std::string_view encoded) {
     return out;
 }
 
-void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
+void expect_pixel(const infernix::media::decode::Image& image, int x, int y,
                   std::array<int, 3> expected, int tolerance) {
     const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 3;
     for (int channel = 0; channel < 3; ++channel) {
@@ -120,8 +120,8 @@ void expect_pixel(const ninfer::media::decode::Image& image, int x, int y,
 
 void test_issue_20_unaligned_jpeg() {
     const std::vector<std::uint8_t> encoded     = decode_base64(issue_20_jpeg_base64);
-    const ninfer::media::decode::ImageInfo info = ninfer::media::decode::inspect_image(encoded, {});
-    const ninfer::media::decode::Image image    = ninfer::media::decode::decode_image(encoded, {});
+    const infernix::media::decode::ImageInfo info = infernix::media::decode::inspect_image(encoded, {});
+    const infernix::media::decode::Image image    = infernix::media::decode::decode_image(encoded, {});
     if (info.width != image.width || info.height != image.height || image.width != 300 ||
         image.height != 200 || image.rgb.size() != 300U * 200U * 3U) {
         throw std::runtime_error("decoded JPEG dimensions mismatch");
@@ -135,10 +135,10 @@ void test_issue_20_unaligned_jpeg() {
     expect_pixel(image, 299, 199, blue, 3);
     expect_pixel(image, 150, 100, yellow, 4);
 
-    const ninfer::media::decode::VideoInfo video_info =
-        ninfer::media::decode::inspect_video(encoded, {}, 2.0, 4, 16);
-    const ninfer::media::decode::Video video =
-        ninfer::media::decode::decode_video(encoded, {}, 2.0, 4, 16);
+    const infernix::media::decode::VideoInfo video_info =
+        infernix::media::decode::inspect_video(encoded, {}, 2.0, 4, 16);
+    const infernix::media::decode::Video video =
+        infernix::media::decode::decode_video(encoded, {}, 2.0, 4, 16);
     if (video_info.width != video.width || video_info.height != video.height ||
         video_info.sampled_frames != static_cast<int>(video.frames.size()) ||
         video_info.indices != video.indices) {
@@ -150,7 +150,7 @@ void test_issue_20_unaligned_jpeg() {
 // line reaches it whole, without FFmpeg's "[name @ address]" prefix or line break, instead of
 // stderr; clearing the handler hands back the one installed.
 void test_library_log_routing() {
-    namespace decode = ninfer::media::decode;
+    namespace decode = infernix::media::decode;
 
     struct CapturedLine {
         decode::LibraryLogSeverity severity;
@@ -195,7 +195,7 @@ void test_library_log_routing() {
     }
 }
 
-#ifdef NINFER_MEDIA_NATIVE_PNG
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
 
 // span over a generated C array fixture.
 std::span<const std::uint8_t> sp(const std::uint8_t* arr, std::size_t n) {
@@ -203,7 +203,7 @@ std::span<const std::uint8_t> sp(const std::uint8_t* arr, std::size_t n) {
 }
 
 // Exact RGB check (tolerance 0) against a decoded image.
-void expect_exact(const ninfer::media::decode::Image& image, int x, int y,
+void expect_exact(const infernix::media::decode::Image& image, int x, int y,
                   std::array<int, 3> expected) {
     expect_pixel(image, x, y, expected, 0);
 }
@@ -220,7 +220,7 @@ void expect_throws_invalid(std::function<void()> fn, const char* what) {
 }
 
 void test_png_decoders() {
-    using namespace ninfer::media::decode;
+    using namespace infernix::media::decode;
 
     // 8-bit RGB, 4x2.
     {
@@ -362,7 +362,7 @@ void test_png_decoders() {
 // 64-bit guard. CRCs are not validated by parse_chunks and the guard fires before
 // inflate, so the IDAT payload is irrelevant.
 void test_png_row_width_guard() {
-    using namespace ninfer::media::decode;
+    using namespace infernix::media::decode;
     std::vector<std::uint8_t> png = {
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // signature
         0x00, 0x00, 0x00, 0x0d, // IHDR length = 13
@@ -393,7 +393,7 @@ void test_png_row_width_guard() {
     }
 }
 
-#endif // NINFER_MEDIA_NATIVE_PNG
+#endif // INFERNIX_MEDIA_NATIVE_PNG
 
 } // namespace
 
@@ -401,7 +401,7 @@ int main() {
     try {
         test_issue_20_unaligned_jpeg();
         test_library_log_routing();
-#ifdef NINFER_MEDIA_NATIVE_PNG
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
         test_png_decoders();
         test_png_row_width_guard();
 #endif

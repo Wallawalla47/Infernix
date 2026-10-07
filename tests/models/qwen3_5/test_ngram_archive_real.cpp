@@ -1,4 +1,4 @@
-#include <ninfer/engine.h>
+#include <infernix/engine.h>
 
 #include <algorithm>
 #include <atomic>
@@ -15,12 +15,12 @@ void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
 }
 
-ninfer::PromptInput prompt() {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
+infernix::PromptInput prompt() {
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
     user.parts.push_back(
-        {.kind  = ninfer::MessagePartKind::Text,
+        {.kind  = infernix::MessagePartKind::Text,
          .text  = "Output Python code assigning SQUARES a dictionary literal mapping every integer "
                   "key 0 through 31 to its square. Use one key/value pair per line. Include all 32 "
                   "entries explicitly, no comprehension or helper functions. Only code, no prose "
@@ -31,7 +31,7 @@ ninfer::PromptInput prompt() {
     return input;
 }
 
-void check_file(const ninfer::GenerationResult& result) {
+void check_file(const infernix::GenerationResult& result) {
     auto code = result.content;
     std::erase_if(code, [](unsigned char c) { return std::isspace(c); });
     std::string expected = "SQUARES={";
@@ -45,12 +45,12 @@ void check_file(const ninfer::GenerationResult& result) {
 
 // A second, distinct regenerated file so a concurrent lane cannot silently emit another lane's
 // retained source.
-ninfer::PromptInput cubes_prompt() {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
+infernix::PromptInput cubes_prompt() {
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
     user.parts.push_back(
-        {.kind  = ninfer::MessagePartKind::Text,
+        {.kind  = infernix::MessagePartKind::Text,
          .text  = "Output Python code assigning CUBES a dictionary literal mapping every integer "
                   "key 0 through 31 to its cube. Use one key/value pair per line. Include all 32 "
                   "entries explicitly, no comprehension or helper functions. Only code, no prose "
@@ -61,7 +61,7 @@ ninfer::PromptInput cubes_prompt() {
     return input;
 }
 
-void check_cubes(const ninfer::GenerationResult& result) {
+void check_cubes(const infernix::GenerationResult& result) {
     auto code = result.content;
     std::erase_if(code, [](unsigned char c) { return std::isspace(c); });
     std::string expected = "CUBES={";
@@ -73,22 +73,22 @@ void check_cubes(const ninfer::GenerationResult& result) {
     require(code == expected || code == trailing, "incorrect regenerated cube dictionary");
 }
 
-struct Sink : ninfer::OutputSink {
+struct Sink : infernix::OutputSink {
     std::atomic<std::size_t> bytes{0};
 
-    void start(ninfer::GenerationStart) override {}
+    void start(infernix::GenerationStart) override {}
 
-    void progress(ninfer::PromptProgress) override {}
+    void progress(infernix::PromptProgress) override {}
 
-    void timing(ninfer::GenerationTimingObservation) override {}
+    void timing(infernix::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override { bytes += delta.text.size(); }
+    void publish(infernix::OutputDelta delta) override { bytes += delta.text.size(); }
 };
 
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto* artifact = std::getenv("NINFER_NGRAM_TEST_WEIGHTS");
+    const auto* artifact = std::getenv("INFERNIX_NGRAM_TEST_WEIGHTS");
     if (!artifact || !*artifact) { return 77; }
     try {
         const std::string backend = argc > 1 ? argv[1] : "mtp";
@@ -97,35 +97,35 @@ int main(int argc, char** argv) {
                 "graph mode must be 0 or 1");
         const unsigned concurrency = argc > 3 ? static_cast<unsigned>(std::stoul(argv[3])) : 1U;
         require(concurrency >= 1 && concurrency <= 8, "concurrency must be in 1..8");
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 4096;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+        options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4096);
         options.enable_vision   = false;
         options.max_concurrency = concurrency;
         options.prefill_chunk   = 1024;
-        options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
+        options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
         options.use_cuda_graph  = argc < 3 || std::stoi(argv[2]) != 0;
         if (concurrency > 1) {
             options.context_cache.device_state_slots        = 2;
             options.context_cache.host_capacity_bytes = 1ULL << 30;
         }
         if (backend == "mtp") {
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
         } else if (backend == "dflash") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash;
         } else if (backend == "dflash2") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
         } else {
             throw std::invalid_argument("unsupported backend");
         }
         options.speculative.draft_tokens        = 5;
         options.speculative.ngram_draft_tokens  = 63;
-        options.speculative.proposal_head       = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head       = infernix::ProposalHead::Optimized;
         options.speculative.ngram_archive_bytes = 16ULL << 20;
         options.speculative.ngram_session_bytes = 4ULL << 20;
-        ninfer::Engine engine(options);
-        ninfer::RequestOptions request;
+        infernix::Engine engine(options);
+        infernix::RequestOptions request;
         request.execution.requested_output_tokens    = 1024;
         request.execution.sampling.temperature       = 0;
         request.execution.sampling.presence_penalty  = 0;
@@ -166,8 +166,8 @@ int main(int argc, char** argv) {
         Sink sink;
         const auto cancelled =
             engine.generate(engine.prepare(prompt()), request, &sink,
-                            ninfer::CancellationView([&] { return sink.bytes.load() >= 128; }));
-        require(cancelled.finish_reason == ninfer::FinishReason::Cancelled &&
+                            infernix::CancellationView([&] { return sink.bytes.load() >= 128; }));
+        require(cancelled.finish_reason == infernix::FinishReason::Cancelled &&
                     cancelled.ngram_archive.bound && !cancelled.ngram_archive.published &&
                     cancelled.ngram_archive.generation == child.ngram_archive.generation,
                 "cancelled request published or altered the completed generation");
@@ -180,7 +180,7 @@ int main(int argc, char** argv) {
             // Seed independent sessions sequentially, then exercise the archive with concurrent
             // requests. Each lane's immutable snapshot is taken at its own admission, so lanes
             // must never observe another session's retained sources.
-            auto seed = [&](const std::string& key, ninfer::PromptInput input,
+            auto seed = [&](const std::string& key, infernix::PromptInput input,
                             const auto& check) {
                 request.ngram_session = {.key = key};
                 auto result           = engine.generate(engine.prepare(std::move(input)), request);

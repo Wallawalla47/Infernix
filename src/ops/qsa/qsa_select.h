@@ -35,14 +35,14 @@
 // Every launch is stream-ordered (programmatic dependents when captured) and keeps no state
 // between calls, so it captures into CUDA Graphs and replays with new positions.
 
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/qsa.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 /// Columns whose scores share one scratch pass (prefill chunks run several groups).
 inline constexpr std::int32_t kQsaSelectGroupColumns = 128;
@@ -73,4 +73,4 @@ struct QsaSelectScores {
 [[nodiscard]] QsaSelectScores qsa_select_scores(const void* scratch, const QsaGeometry& geometry,
                                                 std::int32_t max_context);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

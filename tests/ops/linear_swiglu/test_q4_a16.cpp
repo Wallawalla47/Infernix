@@ -6,8 +6,8 @@
 #include <iostream>
 
 int main() {
-    using namespace ninfer;
-    using namespace ninfer::test::linear_swiglu;
+    using namespace infernix;
+    using namespace infernix::test::linear_swiglu;
 
     try {
         // Public numerical cases straddle each registered Q4 implementation interval. They make

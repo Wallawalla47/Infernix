@@ -9,7 +9,7 @@
 
 namespace jinja::unicode {
 namespace {
-namespace utf8 = ninfer::text::unicode_internal;
+namespace utf8 = infernix::text::unicode_internal;
 
 template <std::size_t N>
 bool contains(const data::Range (&ranges)[N], std::int32_t cp) {

@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::models::qwen3_5::execution::workspace {
+namespace infernix::models::qwen3_5::execution::workspace {
 
 template <class Allocator>
 Tensor matrix(Allocator& allocator, DType dtype, std::int32_t rows, std::int32_t tokens) {
@@ -310,4 +310,4 @@ DFlashMlpRoots dflash_mlp(Allocator& allocator, const TextConfig& target, const 
     };
 }
 
-} // namespace ninfer::models::qwen3_5::execution::workspace
+} // namespace infernix::models::qwen3_5::execution::workspace

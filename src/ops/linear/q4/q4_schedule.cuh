@@ -3,7 +3,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpStage, int Stages,
           Cache CodeCache, int MinBlocksPerSm, bool Predicated = false>
@@ -235,4 +235,4 @@ struct Q4A16GemvSchedule {
                   "Q4 GEMV transfer and scale schedules must select an implemented path");
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

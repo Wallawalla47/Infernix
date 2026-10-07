@@ -1,6 +1,6 @@
 #include "models/qwen3_5/load/bindings.h"
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
                   const TextConfig& target) {
@@ -28,4 +28,4 @@ void bind_dflash2(Bindings& b, DraftWeights& weights, const DraftConfig& config,
                                  {target.vocab_size, extra.selector_rank})};
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

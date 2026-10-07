@@ -3,7 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/linear/common/vector_output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // Matching gate/up fragments belong to the same warp. The persistent weight
 // planes are unchanged; only the CTA's logical load rows are reordered.
 template <class Schedule>
@@ -78,4 +78,4 @@ struct SwiGluTokenMajorMmaEpilogue {
         }
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

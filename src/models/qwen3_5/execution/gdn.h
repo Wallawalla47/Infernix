@@ -3,7 +3,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "core/device.h"
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 [[nodiscard]] std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters,
                                                          std::int32_t first, std::int32_t last);
@@ -36,4 +36,4 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                            Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                            const Tensor* tree_rows = nullptr);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

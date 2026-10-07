@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Coordinates are logical output rows and tokens of the complete call, including
 // when a launcher splits the CUDA grid into several launches.
@@ -131,4 +131,4 @@ __device__ __forceinline__ auto linear_output_tile(Output output, int row_begin)
         return output;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kRmsnormPackTailRows        = 5120;
 inline constexpr int kRmsnormPackTailPairsPerRow = kRmsnormPackTailRows / 2;
@@ -75,4 +75,4 @@ __global__ __launch_bounds__(kBlock) void rmsnorm_pack_tail_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 class LogicalKVPageStore;
 class HostKVExtentStore;
@@ -653,4 +653,4 @@ private:
     std::vector<DeviceKVPageLease> materialization_scratch_;
     std::uint32_t free_count_ = 0;
 };
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

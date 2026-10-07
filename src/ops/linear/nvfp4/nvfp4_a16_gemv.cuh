@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Values>
 struct alignas(Values / 2) Nvfp4CodePack {
@@ -286,4 +286,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

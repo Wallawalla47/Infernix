@@ -56,7 +56,7 @@ def test_campaign_records_and_runs_explicit_baseline_commands(
         raw = Path(command[command.index("--output") + 1])
         raw.parent.mkdir(parents=True, exist_ok=True)
         raw.write_text(json.dumps({
-            "artifact_type": "ninfer_serve_ttft_run",
+            "artifact_type": "infernix_serve_ttft_run",
             "server": {"model": "custom"},
             "constructed": True,
             "requests": [],

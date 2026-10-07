@@ -8,7 +8,7 @@
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/softmax_attention/common/causal_tree.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Native INT8 QK accumulates each G64 group in INT32, then applies Q/K scales in FP32.
 // PV dequantizes represented V to FP16 and accumulates in FP32. Tree instances also apply the
@@ -290,8 +290,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                infernix::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
+                infernix::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
@@ -307,20 +307,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                infernix::ops::cp_async<16>(dst, &cache_k_i8[off]);
+                infernix::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
             } else {
                 std::int8_t* dst = &k_i8[key_l * D + causal_swizzle(key_l, dc * 8) * 2];
                 store_vec(dst, make_int4(0, 0, 0, 0));
                 store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     int physical_page = block_table[first_tile >> kPagedKVPageShift];
     issue_kv_tile(first_tile, physical_page);
-    ninfer::ops::cp_wait<0>();
+    infernix::ops::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -554,7 +554,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { infernix::ops::cp_wait<0>(); }
         __syncthreads();
     }
     // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
@@ -610,4 +610,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

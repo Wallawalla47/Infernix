@@ -1,16 +1,16 @@
 #pragma once
 
-// Page-id translation of QsaPageSpaces (ninfer/ops/qsa.h; design §19.3.11) for QSA's kernels: a
+// Page-id translation of QsaPageSpaces (infernix/ops/qsa.h; design §19.3.11) for QSA's kernels: a
 // block-table page id names a pool page, a host page or a lent page, and each space has its own
 // planes of the pool's geometry.
 
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/qsa.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // The plane of `page`'s space (`pool`, `host` or `lent`), with the page's index inside that space.
 __device__ __forceinline__ const void* qsa_space_plane(const QsaPageSpaces& spaces, const void* pool, const void* host,
@@ -39,4 +39,4 @@ __device__ __forceinline__ T* qsa_pooled_plane(const QsaPageSpaces& spaces, T* p
     return static_cast<T*>(spaces.pooled);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

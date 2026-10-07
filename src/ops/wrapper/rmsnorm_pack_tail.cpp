@@ -1,4 +1,4 @@
-#include "ninfer/ops/rmsnorm_pack_tail.h"
+#include "infernix/ops/rmsnorm_pack_tail.h"
 
 #include "ops/launcher/rmsnorm_pack_tail.h"
 
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require_bf16_contiguous_aligned(const Tensor& tensor, const char* name) {
@@ -52,4 +52,4 @@ void rmsnorm_pack_tail(const Tensor& input, const Tensor& weight, Tensor& output
     detail::rmsnorm_pack_tail_launch(input, weight, output, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

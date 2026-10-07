@@ -5,7 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Output   = LinearBf16SegmentedOutput<8192, 4096>;
@@ -19,4 +19,4 @@ void q8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Ten
     launch_q8_a16_mma<Schedule>(q8_linear_operands(x, weight), output, LinearIdentityEpilogue{},
                                 stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

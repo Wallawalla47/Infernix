@@ -8,7 +8,7 @@
 #include <limits>
 #include <string>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 using artifact::ArtifactError;
@@ -277,4 +277,4 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

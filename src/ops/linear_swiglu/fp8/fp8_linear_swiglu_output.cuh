@@ -3,7 +3,7 @@
 #include "ops/linear/common/output.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int RowsPerBranch, int IntermediateRows>
 struct Fp8SwiGluRows {
     static_assert(RowsPerBranch > 0 && (RowsPerBranch & (RowsPerBranch - 1)) == 0);
@@ -21,4 +21,4 @@ struct Fp8SwiGluEpilogue {
         output.store(row, token, silu(gate) * up);
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

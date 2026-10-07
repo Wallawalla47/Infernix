@@ -1,4 +1,4 @@
-#include "ninfer/ops/rows.h"
+#include "infernix/ops/rows.h"
 
 #include <cuda_bf16.h>
 
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr int kMaxOutputs = 8;
@@ -102,4 +102,4 @@ void gather_columns(const Tensor& in, const Tensor& columns, Tensor& out, cudaSt
     if (error != cudaSuccess) { throw std::runtime_error(std::string("gather_columns: ") + cudaGetErrorString(error)); }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

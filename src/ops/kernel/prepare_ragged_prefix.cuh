@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kRaggedPrefixVectorsPerBlock = 128;
 
@@ -35,4 +35,4 @@ __global__ void prepare_ragged_prefix_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

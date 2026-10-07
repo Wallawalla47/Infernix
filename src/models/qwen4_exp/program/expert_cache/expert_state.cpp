@@ -7,7 +7,7 @@
 #include <system_error>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::expert_cache {
+namespace infernix::models::qwen4_exp::expert_cache {
 namespace {
 
 // Layout (version 1): magic, version, identity length and bytes, key count, counts[keys], ranked
@@ -115,4 +115,4 @@ ExpertStateLoad load_expert_state(const std::filesystem::path& path, std::string
     return out;
 }
 
-} // namespace ninfer::models::qwen4_exp::expert_cache
+} // namespace infernix::models::qwen4_exp::expert_cache

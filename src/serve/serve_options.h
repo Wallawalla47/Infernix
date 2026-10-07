@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "product/logging/logging.h"
 
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 // Protocol default when the client omits max_tokens. Engine independently
 // clamps the request to its effective context capacity.
@@ -83,7 +83,7 @@ struct ServeOptions {
     std::string thinking_budget_message;
     // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
     // token constraint (off by default).
-    ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
+    infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool log_colours       = false; // --log-colours on|off: colour the console stats lines
@@ -106,9 +106,9 @@ struct ServeOptions {
 
 ServeOptions parse_serve_options(int argc, char** argv);
 // "off", "stop" or "conclude".
-const char* reasoning_loop_name(ninfer::ReasoningLoopAction action) noexcept;
+const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

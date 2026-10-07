@@ -4,7 +4,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, Q4GemvScaleAccess ScaleAccess = Schedule::kScaleAccess>
 struct Q4GemvTileStorage;
@@ -388,4 +388,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

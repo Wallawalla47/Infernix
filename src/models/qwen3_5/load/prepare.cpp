@@ -4,7 +4,7 @@
 
 #include <cmath>
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 WeightUseId Bindings::use(WeightId id, std::string_view input) const {
     const auto& parameter = at(id);
@@ -83,4 +83,4 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

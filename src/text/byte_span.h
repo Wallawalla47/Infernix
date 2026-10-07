@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <span>
 
-namespace ninfer::text {
+namespace infernix::text {
 
 struct ByteSpan {
     std::size_t begin = 0;
@@ -19,4 +19,4 @@ inline bool overlaps(std::span<const ByteSpan> spans, std::size_t begin, std::si
     return begin < end && it != spans.end() && it->begin < end;
 }
 
-} // namespace ninfer::text
+} // namespace infernix::text

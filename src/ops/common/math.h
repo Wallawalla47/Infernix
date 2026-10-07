@@ -3,29 +3,29 @@
 #include <type_traits>
 
 #if defined(__CUDACC__)
-#    define NINFER_KERNEL_HD __host__ __device__
+#    define INFERNIX_KERNEL_HD __host__ __device__
 #else
-#    define NINFER_KERNEL_HD
+#    define INFERNIX_KERNEL_HD
 #endif
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr float kLog2E = 1.4426950408889634F;
 
 template <class T>
-NINFER_KERNEL_HD constexpr T div_up(T x, T d) {
+INFERNIX_KERNEL_HD constexpr T div_up(T x, T d) {
     static_assert(std::is_integral_v<T>, "div_up requires an integral type");
     return x / d + static_cast<T>(x % d != 0);
 }
 
 template <class T>
-NINFER_KERNEL_HD constexpr T round_up(T x, T multiple) {
+INFERNIX_KERNEL_HD constexpr T round_up(T x, T multiple) {
     static_assert(std::is_integral_v<T>, "round_up requires an integral type");
     return div_up(x, multiple) * multiple;
 }
 
 template <auto Alignment, class T>
-NINFER_KERNEL_HD constexpr T align_up(T x) {
+INFERNIX_KERNEL_HD constexpr T align_up(T x) {
     static_assert(std::is_integral_v<T>, "align_up requires an integral type");
     static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
                   "align_up requires a power-of-two alignment");
@@ -34,12 +34,12 @@ NINFER_KERNEL_HD constexpr T align_up(T x) {
 }
 
 template <int Bits>
-NINFER_KERNEL_HD constexpr int sign_extend(int x) {
+INFERNIX_KERNEL_HD constexpr int sign_extend(int x) {
     static_assert(Bits > 0 && Bits < 32, "sign_extend supports bit widths in [1, 31]");
     constexpr int sign = 1 << (Bits - 1);
     return (x ^ sign) - sign;
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops
 
-#undef NINFER_KERNEL_HD
+#undef INFERNIX_KERNEL_HD

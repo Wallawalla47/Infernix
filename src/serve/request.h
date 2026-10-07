@@ -2,7 +2,7 @@
 
 #include "product/media_acquire/source.h"
 
-#include <ninfer/types.h>
+#include <infernix/types.h>
 
 // Internal, wire-format-independent representation of a generation request.
 //
@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 // A structured API error mapped onto an error object + HTTP status. Wire-format
 // independent: each protocol layer renders it into its own error body shape.
@@ -60,8 +60,8 @@ struct CacheBoundary {
         OneHour,
     };
 
-    ninfer::PromptCacheMarkerKind kind       = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
-    ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary;
+    infernix::PromptCacheMarkerKind kind       = infernix::PromptCacheMarkerKind::SharedStablePrefix;
+    infernix::SharedCandidateEvidence evidence = infernix::SharedCandidateEvidence::ExplicitBoundary;
     Ttl ttl                                  = Ttl::Default;
 
     [[nodiscard]] friend constexpr bool operator==(CacheBoundary, CacheBoundary) noexcept = default;
@@ -71,8 +71,8 @@ struct ContentPart {
     ContentKind kind = ContentKind::Text;
     std::string text;     // populated for Text
     std::string type_raw; // original wire "type" string for diagnostics
-    ninfer::product::media_acquire::Source source;
-    ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
+    infernix::product::media_acquire::Source source;
+    infernix::ImageResizePolicy image_resize_policy = infernix::ImageResizePolicy::Downsize;
     std::optional<CacheBoundary> cache_boundary_after;
 };
 
@@ -196,16 +196,16 @@ struct GenerationRequest {
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
-    ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+    infernix::PromptContinuationMode continuation = infernix::PromptContinuationMode::NewAssistantTurn;
     bool allow_engine_automatic_shared_prefixes = true;
     SamplingParams sampling;
     // Tokens whose log-probabilities at the prompt's next position the outcome reports
     // (/v1/decide). Empty for every ordinary generation.
-    std::vector<ninfer::TokenId> readout_tokens;
+    std::vector<infernix::TokenId> readout_tokens;
     // Restricts each output token to its step's set (/v1/decide's generated primitives).
-    ninfer::TokenConstraint constraint;
+    infernix::TokenConstraint constraint;
     // Tokens that end generation once committed (a scalar's closing brace).
-    std::vector<ninfer::TokenId> stop_token_ids;
+    std::vector<infernix::TokenId> stop_token_ids;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
@@ -229,4 +229,4 @@ struct GenerationRequest {
     }
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

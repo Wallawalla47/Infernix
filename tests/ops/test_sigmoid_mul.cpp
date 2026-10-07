@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "ninfer/ops/sigmoid_mul.h"
+#include "infernix/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
 
 #include <cmath>
@@ -7,8 +7,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

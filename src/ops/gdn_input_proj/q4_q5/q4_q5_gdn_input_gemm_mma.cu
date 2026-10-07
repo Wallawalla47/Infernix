@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_offset,
@@ -102,4 +102,4 @@ void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight
     throw std::logic_error("Q4/Q5 GDN input: grouped MMA schedule is unknown");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

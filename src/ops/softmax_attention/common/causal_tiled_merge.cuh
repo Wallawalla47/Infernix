@@ -7,7 +7,7 @@
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include <math_constants.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Prefill has many output rows and at most eight KV partitions. A warp owns
 // the complete D256 row, including K8V4's inverse rotation in FP32.
@@ -61,4 +61,4 @@ void launch_causal_tiled_merge(const CausalAttentionOperands& p, const std::int3
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

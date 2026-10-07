@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 std::int32_t prefill_min_tokens(QType routed_gate_up, QType routed_down) noexcept {
@@ -52,4 +52,4 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType 
     return {tokens, slice_tokens, sparse_moe_prefill_workspace_bytes(tokens)};
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

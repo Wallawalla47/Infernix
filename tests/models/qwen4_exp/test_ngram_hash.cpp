@@ -10,14 +10,14 @@
 #include <string>
 #include <vector>
 
-#ifndef NINFER_SOURCE_DIR
-#    define NINFER_SOURCE_DIR "."
+#ifndef INFERNIX_SOURCE_DIR
+#    define INFERNIX_SOURCE_DIR "."
 #endif
 
-using namespace ninfer::models::qwen4_exp;
+using namespace infernix::models::qwen4_exp;
 
 int main() {
-    std::ifstream in(std::string(NINFER_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ngram_rows.txt");
+    std::ifstream in(std::string(INFERNIX_SOURCE_DIR) + "/tests/fixtures/qwen4_exp/ngram_rows.txt");
     if (!in) {
         std::fprintf(stderr, "FAIL: fixture unreadable\n");
         return 1;

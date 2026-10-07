@@ -4,13 +4,13 @@
 #include "core/pdl.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <cuda_bf16.h>
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace infernix::ops::detail::gated_delta_net {
 
 inline constexpr int kDvPerWarp = 4;
 inline constexpr int kNumWarps  = 4;
@@ -889,4 +889,4 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     access.publish_final_conv_history(coord, valid);
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace infernix::ops::detail::gated_delta_net

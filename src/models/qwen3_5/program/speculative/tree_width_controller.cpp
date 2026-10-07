@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 namespace {
 
@@ -134,4 +134,4 @@ void TreeWidthController::observe_round(std::uint32_t batch_size, std::uint32_t 
     timing.measured = cell.rounds;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
     cudaStream_t stream{};
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-    CUDA_CHECK(ninfer::bench::fixture::fill_bytes(source.get(), bytes, 101U, stream));
+    CUDA_CHECK(infernix::bench::fixture::fill_bytes(source.get(), bytes, 101U, stream));
 
     // Long preconditioning phase: make the first reported method independent
     // of idle P-state ramp-up.

@@ -19,8 +19,8 @@
 
 namespace {
 
-using ninfer::serve::ClientDisconnected;
-using ninfer::serve::SseTransport;
+using infernix::serve::ClientDisconnected;
+using infernix::serve::SseTransport;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -105,7 +105,7 @@ int test_sse_transport() {
 }
 
 int test_ngram_identity() {
-    using namespace ninfer::serve;
+    using namespace infernix::serve;
     int failures = 0;
     ServeOptions options;
     httplib::Request request;
@@ -119,7 +119,7 @@ int test_ngram_identity() {
     options.ngram_native_sessions = true;
     failures += check(resolve_ngram_session(request, empty, options).key == "kilo:conversation-a",
                       "native affinity was not bound");
-    request.set_header("x-ninfer-draft-reset", "1");
+    request.set_header("x-infernix-draft-reset", "1");
     failures +=
         check(resolve_ngram_session(request, empty, options).reset, "native reset was ignored");
     request.headers.clear();
@@ -146,34 +146,34 @@ int test_ngram_identity() {
                           "non-conversation metadata authorized retention");
     }
     options.ngram_native_sessions = false;
-    request.set_header("x-ninfer-draft-session", "fork");
-    request.set_header("x-ninfer-draft-parent", "root");
-    request.set_header("x-ninfer-draft-generation", "3");
+    request.set_header("x-infernix-draft-session", "fork");
+    request.set_header("x-infernix-draft-parent", "root");
+    request.set_header("x-infernix-draft-generation", "3");
     auto hints = resolve_ngram_session(request, empty, options);
     failures += check(hints.key == "explicit:fork" && hints.parent == "explicit:root" &&
                           hints.parent_generation == 3,
                       "explicit ancestor snapshot was not preserved");
-    request.set_header("x-ninfer-draft-session", "different");
+    request.set_header("x-infernix-draft-session", "different");
     failures += check(resolve_ngram_session(request, empty, options).key.empty(),
                       "duplicate session header accepted");
     request.headers.clear();
-    request.set_header("x-ninfer-draft-session", std::string(241, 'x'));
+    request.set_header("x-infernix-draft-session", std::string(241, 'x'));
     failures += check(resolve_ngram_session(request, empty, options).key.empty(),
                       "unbounded session header accepted");
     return failures;
 }
 
 int test_ngram_generation() {
-    using namespace ninfer;
-    using namespace ninfer::serve;
+    using namespace infernix;
+    using namespace infernix::serve;
     int failures = 0;
     const NgramArchiveStats complete{
         .enabled = true, .bound = true, .published = true, .generation = 9};
     httplib::Response response;
     set_ngram_generation_header(response, complete);
-    failures += check(response.get_header_value("X-NInfer-Draft-Generation") == "9",
+    failures += check(response.get_header_value("X-Infernix-Draft-Generation") == "9",
                       "completed archive generation header absent");
-    failures += check(ngram_generation_comment(complete) == ": ninfer-draft-generation: 9\n\n",
+    failures += check(ngram_generation_comment(complete) == ": infernix-draft-generation: 9\n\n",
                       "stream generation is not a standard SSE comment");
     for (int missing = 0; missing < 4; ++missing) {
         auto stats = complete;
@@ -183,7 +183,7 @@ int test_ngram_generation() {
         if (missing == 3) { stats.generation = 0; }
         httplib::Response absent;
         set_ngram_generation_header(absent, stats);
-        failures += check(!absent.has_header("X-NInfer-Draft-Generation") &&
+        failures += check(!absent.has_header("X-Infernix-Draft-Generation") &&
                               ngram_generation_comment(stats).empty(),
                           "unpublished archive advertised a completed generation");
     }
@@ -192,7 +192,7 @@ int test_ngram_generation() {
 
 int test_sse_response_headers() {
     httplib::Response response;
-    ninfer::serve::prepare_sse_response(response);
+    infernix::serve::prepare_sse_response(response);
     return check(response.get_header_value("Cache-Control") == "no-cache" &&
                      response.get_header_value("X-Accel-Buffering") == "no",
                  "SSE response lost its no-cache or anti-buffering header");
@@ -203,7 +203,7 @@ int test_prompt_json_member_order() {
     request.body =
         R"({"model":"claude-local","tools":[{"name":"probe","input_schema":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}}}}],"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"probe","input":{"zeta":"last","alpha":{"yankee":2,"bravo":true}}}]}],"max_tokens":32})";
 
-    const auto parsed = ninfer::serve::parse_json_body(request);
+    const auto parsed = infernix::serve::parse_json_body(request);
     return check(
         parsed.at("tools").at(0).at("input_schema").at("properties").dump() ==
                 R"({"zeta":{"type":"string"},"alpha":{"type":"object","properties":{"yankee":{"type":"integer"},"bravo":{"type":"boolean"}}}})" &&
@@ -264,7 +264,7 @@ int test_inherited_socket_liveness() {
 #    endif
     Socket listener(::socket(AF_INET, SOCK_STREAM, 0));
     if (!listener.valid()) { return check(false, "failed to create HTTP listener test socket"); }
-    ninfer::serve::configure_http_server_socket(listener.get());
+    infernix::serve::configure_http_server_socket(listener.get());
 
     sockaddr_in address{};
     address.sin_family      = AF_INET;

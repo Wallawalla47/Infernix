@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_rmsnorm.h"
+#include "infernix/ops/gated_rmsnorm.h"
 #include "core/device.h"
 #include "ops/norm_test_common.h"
 
@@ -8,9 +8,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::norm;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::norm;
 
 namespace {
 

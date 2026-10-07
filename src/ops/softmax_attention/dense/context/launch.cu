@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int Tokens, class Launch>
@@ -19,27 +19,27 @@ void dispatch_token_case(Launch&& launch) {
 template <class Launch>
 void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
     switch (tokens) {
-#define NINFER_CONTEXT_ATTENTION_TOKEN_CASE(TOKENS)                                                \
+#define INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(TOKENS)                                                \
     case TOKENS:                                                                                   \
         dispatch_token_case<TOKENS>(launch);                                                       \
         return
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(1);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(2);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(3);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(4);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(5);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(6);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(7);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(8);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(9);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(10);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(11);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(12);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(13);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(14);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(15);
-        NINFER_CONTEXT_ATTENTION_TOKEN_CASE(16);
-#undef NINFER_CONTEXT_ATTENTION_TOKEN_CASE
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(1);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(2);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(3);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(4);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(5);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(6);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(7);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(8);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(9);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(10);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(11);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(12);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(13);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(14);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(15);
+        INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE(16);
+#undef INFERNIX_CONTEXT_ATTENTION_TOKEN_CASE
     default:
         throw std::invalid_argument("context_softmax_attention: unsupported T");
     }
@@ -182,4 +182,4 @@ void context_attention_launch(const Tensor& q, const Tensor& query_k, const Tens
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

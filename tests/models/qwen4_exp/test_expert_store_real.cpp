@@ -2,7 +2,7 @@
 // banks bound Streamed give an ExpertStore whose every record is one or two 4 KiB-aligned file
 // segments; records read through DirectReadQueue from those segments equal the bytes the pinned
 // load reads, and so do the multipliers read from the scale tails, for the first and last layers and
-// every layer holding a record that straddles part files. Skips (77) without NINFER_QWEN4_ARTIFACT.
+// every layer holding a record that straddles part files. Skips (77) without INFERNIX_QWEN4_ARTIFACT.
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
@@ -24,7 +24,7 @@
 
 namespace {
 
-using namespace ninfer;
+using namespace infernix;
 using models::qwen4_exp::ExpertStore;
 
 int failures = 0;
@@ -48,9 +48,9 @@ artifact::ParameterReference bind_bank(artifact::Binder& binder, const artifact:
 } // namespace
 
 int main() {
-    const char* path = std::getenv("NINFER_QWEN4_ARTIFACT");
+    const char* path = std::getenv("INFERNIX_QWEN4_ARTIFACT");
     if (path == nullptr || !std::filesystem::exists(path)) {
-        std::cout << "SKIP: NINFER_QWEN4_ARTIFACT is not set\n";
+        std::cout << "SKIP: INFERNIX_QWEN4_ARTIFACT is not set\n";
         return 77;
     }
     try {

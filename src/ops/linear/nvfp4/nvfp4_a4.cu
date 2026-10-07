@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class ActivationGeometry>
@@ -102,4 +102,4 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

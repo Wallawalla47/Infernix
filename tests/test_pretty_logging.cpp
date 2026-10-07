@@ -113,10 +113,10 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer-serve",
-                 .color        = ninfer::product::LogColorMode::Auto,
-                 .presentation = ninfer::product::LogPresentation::Service});
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix-serve",
+                 .color        = infernix::product::LogColorMode::Auto,
+                 .presentation = infernix::product::LogPresentation::Service});
             logging.logger()->info("throughput | sample");
             logging.flush();
         }
@@ -128,7 +128,7 @@ int main() {
             std::regex(
                 R"(^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}  INFO  throughput \| sample\n$)")),
         "service pretty prefix mismatch");
-    failures += check(service_output.find("ninfer-serve") == std::string::npos,
+    failures += check(service_output.find("infernix-serve") == std::string::npos,
                       "service pretty output repeated the executable name");
     failures += check(service_output.find("\x1b[") == std::string::npos,
                       "redirected service output contains ANSI escapes");
@@ -140,10 +140,10 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer-serve",
-                 .color        = ninfer::product::LogColorMode::Always,
-                 .presentation = ninfer::product::LogPresentation::Service});
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix-serve",
+                 .color        = infernix::product::LogColorMode::Always,
+                 .presentation = infernix::product::LogPresentation::Service});
             logging.logger()->info("throughput | sample");
             logging.flush();
         }
@@ -162,41 +162,41 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer-serve",
-                 .color        = ninfer::product::LogColorMode::Never,
-                 .presentation = ninfer::product::LogPresentation::Service});
-            ninfer::product::StartupLogRenderer startup(logging);
-            ninfer::StartupObserver observer = startup.observer();
-            observer.callback({.phase  = ninfer::StartupPhase::EngineStartup,
-                               .status = ninfer::StartupStatus::Begin});
-            observer.callback({.phase  = ninfer::StartupPhase::CudaInitialize,
-                               .status = ninfer::StartupStatus::Begin});
-            observer.callback({.phase      = ninfer::StartupPhase::CudaInitialize,
-                               .status     = ninfer::StartupStatus::Complete,
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix-serve",
+                 .color        = infernix::product::LogColorMode::Never,
+                 .presentation = infernix::product::LogPresentation::Service});
+            infernix::product::StartupLogRenderer startup(logging);
+            infernix::StartupObserver observer = startup.observer();
+            observer.callback({.phase  = infernix::StartupPhase::EngineStartup,
+                               .status = infernix::StartupStatus::Begin});
+            observer.callback({.phase  = infernix::StartupPhase::CudaInitialize,
+                               .status = infernix::StartupStatus::Begin});
+            observer.callback({.phase      = infernix::StartupPhase::CudaInitialize,
+                               .status     = infernix::StartupStatus::Complete,
                                .elapsed_ns = 1'000'000'000});
-            observer.callback({.phase         = ninfer::StartupPhase::WeightsMaterialize,
-                               .status        = ninfer::StartupStatus::Begin,
-                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+            observer.callback({.phase         = infernix::StartupPhase::WeightsMaterialize,
+                               .status        = infernix::StartupStatus::Begin,
+                               .progress_unit = infernix::StartupProgressUnit::Bytes,
                                .total         = 16ULL << 30});
-            observer.callback({.phase         = ninfer::StartupPhase::WeightsMaterialize,
-                               .status        = ninfer::StartupStatus::Complete,
-                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+            observer.callback({.phase         = infernix::StartupPhase::WeightsMaterialize,
+                               .status        = infernix::StartupStatus::Complete,
+                               .progress_unit = infernix::StartupProgressUnit::Bytes,
                                .current       = 16ULL << 30,
                                .total         = 16ULL << 30,
                                .elapsed_ns    = 2'000'000'000});
-            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
-                               .status        = ninfer::StartupStatus::Begin,
-                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+            observer.callback({.phase         = infernix::StartupPhase::PrefixCacheLoad,
+                               .status        = infernix::StartupStatus::Begin,
+                               .progress_unit = infernix::StartupProgressUnit::Bytes,
                                .total         = 24ULL << 30});
-            observer.callback({.phase         = ninfer::StartupPhase::PrefixCacheLoad,
-                               .status        = ninfer::StartupStatus::Complete,
-                               .progress_unit = ninfer::StartupProgressUnit::Bytes,
+            observer.callback({.phase         = infernix::StartupPhase::PrefixCacheLoad,
+                               .status        = infernix::StartupStatus::Complete,
+                               .progress_unit = infernix::StartupProgressUnit::Bytes,
                                .current       = 24ULL << 30,
                                .total         = 24ULL << 30,
                                .elapsed_ns    = 4'000'000'000});
-            observer.callback({.phase      = ninfer::StartupPhase::EngineStartup,
-                               .status     = ninfer::StartupStatus::Complete,
+            observer.callback({.phase      = infernix::StartupPhase::EngineStartup,
+                               .status     = infernix::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
             startup.engine_ready({.model_name           = "qwen3.6-27b",
                                   .cuda_sync_mode       = "blocking",
@@ -226,12 +226,12 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer-serve",
-                 .color        = ninfer::product::LogColorMode::Never,
-                 .presentation = ninfer::product::LogPresentation::Service});
-            ninfer::product::StartupLogRenderer startup(logging);
-            ninfer::LoadSummary load;
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix-serve",
+                 .color        = infernix::product::LogColorMode::Never,
+                 .presentation = infernix::product::LogPresentation::Service});
+            infernix::product::StartupLogRenderer startup(logging);
+            infernix::LoadSummary load;
             load.model_name     = "qwen3.6-27b";
             load.cuda_sync_mode = "blocking";
             load.prefix_cache   = {.attempted           = true,
@@ -262,12 +262,12 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer-serve",
-                 .color        = ninfer::product::LogColorMode::Never,
-                 .presentation = ninfer::product::LogPresentation::Service});
-            ninfer::product::StartupLogRenderer startup(logging);
-            ninfer::LoadSummary load;
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix-serve",
+                 .color        = infernix::product::LogColorMode::Never,
+                 .presentation = infernix::product::LogPresentation::Service});
+            infernix::product::StartupLogRenderer startup(logging);
+            infernix::LoadSummary load;
             load.model_name     = "qwen3.6-27b";
             load.cuda_sync_mode = "blocking";
             load.prefix_cache   = {.attempted           = true,
@@ -298,10 +298,10 @@ int main() {
     {
         StderrCapture capture;
         {
-            ninfer::product::LoggingRuntime logging(
-                {.logger_name  = "ninfer",
-                 .color        = ninfer::product::LogColorMode::Never,
-                 .presentation = ninfer::product::LogPresentation::Tool});
+            infernix::product::LoggingRuntime logging(
+                {.logger_name  = "infernix",
+                 .color        = infernix::product::LogColorMode::Never,
+                 .presentation = infernix::product::LogPresentation::Tool});
             logging.logger()->info("engine ready");
             logging.logger()->error("failed");
             logging.flush();
@@ -313,22 +313,22 @@ int main() {
 
     // Engine diagnostics are ordinary records at the level the Engine assigned: a lease extension
     // is debug, shown only when the verbosity is raised, and a truncating lease is a warning.
-    for (const ninfer::product::LogLevel level :
-         {ninfer::product::LogLevel::Info, ninfer::product::LogLevel::Debug}) {
+    for (const infernix::product::LogLevel level :
+         {infernix::product::LogLevel::Info, infernix::product::LogLevel::Debug}) {
         std::string output;
         {
             StderrCapture capture;
             {
-                ninfer::product::LoggingRuntime logging(
-                    {.logger_name  = "ninfer",
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix",
                      .level        = level,
-                     .color        = ninfer::product::LogColorMode::Never,
-                     .presentation = ninfer::product::LogPresentation::Tool});
-                const ninfer::DiagnosticObserver observer =
-                    ninfer::product::engine_diagnostic_observer(logging.logger());
-                ninfer::runtime::publish_diagnostic(observer, ninfer::DiagnosticLevel::Debug,
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Tool});
+                const infernix::DiagnosticObserver observer =
+                    infernix::product::engine_diagnostic_observer(logging.logger());
+                infernix::runtime::publish_diagnostic(observer, infernix::DiagnosticLevel::Debug,
                                                     "Device KV lease of lane %u extended", 0U);
-                ninfer::runtime::publish_diagnostic(observer, ninfer::DiagnosticLevel::Warning,
+                infernix::runtime::publish_diagnostic(observer, infernix::DiagnosticLevel::Warning,
                                                     "Device KV lease of lane %u cannot grow", 1U);
                 logging.flush();
             }
@@ -336,7 +336,7 @@ int main() {
         }
         const bool debug_shown =
             output.find("engine | Device KV lease of lane 0 extended") != std::string::npos;
-        failures += check(debug_shown == (level == ninfer::product::LogLevel::Debug),
+        failures += check(debug_shown == (level == infernix::product::LogLevel::Debug),
                           "a debug Engine diagnostic must follow the log level");
         failures += check(output.find("engine | Device KV lease of lane 1 cannot grow") !=
                               std::string::npos,
@@ -346,19 +346,19 @@ int main() {
     // FFmpeg's media-decoding lines are records of the runtime's logger rather than direct stderr
     // writes that would land inside a terminal footer: an FFmpeg error is a warning and its
     // warnings are debug detail. The runtime restores FFmpeg's previous route when it ends.
-    namespace decode = ninfer::media::decode;
-    for (const ninfer::product::LogLevel level :
-         {ninfer::product::LogLevel::Info, ninfer::product::LogLevel::Debug}) {
+    namespace decode = infernix::media::decode;
+    for (const infernix::product::LogLevel level :
+         {infernix::product::LogLevel::Info, infernix::product::LogLevel::Debug}) {
         std::string output;
         bool routed = false;
         {
             StderrCapture capture;
             {
-                ninfer::product::LoggingRuntime logging(
-                    {.logger_name  = "ninfer",
+                infernix::product::LoggingRuntime logging(
+                    {.logger_name  = "infernix",
                      .level        = level,
-                     .color        = ninfer::product::LogColorMode::Never,
-                     .presentation = ninfer::product::LogPresentation::Tool});
+                     .color        = infernix::product::LogColorMode::Never,
+                     .presentation = infernix::product::LogPresentation::Tool});
                 const decode::LibraryLogHandler route = decode::set_library_log_handler({});
                 (void)decode::set_library_log_handler(route);
                 routed = static_cast<bool>(route);
@@ -381,7 +381,7 @@ int main() {
         const bool debug_shown =
             output.find("debug: media | swscaler: deprecated pixel format used\n") !=
             std::string::npos;
-        failures += check(debug_shown == (level == ninfer::product::LogLevel::Debug),
+        failures += check(debug_shown == (level == infernix::product::LogLevel::Debug),
                           "an FFmpeg warning must be a debug record");
     }
     failures += check(!decode::set_library_log_handler({}),

@@ -1,9 +1,9 @@
 // Public embedding benchmark: normal IDs and mask-heavy draft blocks at explicit matrix extents.
 #include "core/weight.h"
-#include "ninfer/ops/embedding.h"
+#include "infernix/ops/embedding.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -21,8 +21,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 
@@ -235,7 +235,7 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--help") {
             std::puts(
-                "usage: ninfer_embedding_bench [--format q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
+                "usage: infernix_embedding_bench [--format q6-d5120|q8-d5120|q8-d2048|fp8-d5120] "
                 "[--tokens T,...] [--id-pattern normal|masked] [--block-width 2..16] [--execution "
                 "eager|graph] [--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                 "[--csv-out PATH] [--profile]");

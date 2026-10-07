@@ -1,4 +1,4 @@
-#include "ninfer/ops/add_bias.h"
+#include "infernix/ops/add_bias.h"
 
 #include "ops/launcher/add_bias.h"
 
@@ -6,7 +6,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t checked_numel(const Tensor& t) {
@@ -43,4 +43,4 @@ void add_bias(const Tensor& bias, Tensor& x, cudaStream_t stream) {
     detail::add_bias_launch(bias, x, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

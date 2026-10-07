@@ -1,13 +1,13 @@
 #pragma once
 
 #include "core/dtype.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer {
+namespace infernix {
 
 inline constexpr std::int32_t kD256KVCacheHeadDim = 256;
 
@@ -125,4 +125,4 @@ struct PagedKVStorageLayout {
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }
 
-} // namespace ninfer
+} // namespace infernix

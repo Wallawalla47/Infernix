@@ -1,4 +1,4 @@
-#include "ninfer/ops/kimi_delta_attention.h"
+#include "infernix/ops/kimi_delta_attention.h"
 
 #include "ops/kda_ref.h"
 #include "ops/op_tester.h"
@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

@@ -31,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 namespace pc = runtime::prefix_cache;
 
@@ -1313,4 +1313,4 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

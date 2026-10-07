@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/common/context_query.cuh"
 #include "core/pdl.cuh"
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 struct SlidingWindowAttentionPolicy {
     static constexpr bool PageMapped = false;
@@ -134,4 +134,4 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attentio
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

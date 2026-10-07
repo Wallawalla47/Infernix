@@ -4,7 +4,7 @@
 
 #include <stdexcept>
 
-namespace ninfer {
+namespace infernix {
 
 VmmArena::VmmArena(int device, std::size_t reserve_bytes, std::size_t chunk_bytes)
     : device_(device), chunk_(chunk_bytes) {
@@ -116,4 +116,4 @@ void VmmArena::unmap_chunk() {
     chunks_.pop_back();
 }
 
-} // namespace ninfer
+} // namespace infernix

@@ -24,7 +24,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -969,4 +969,4 @@ void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBat
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -4,7 +4,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 double vision_seconds(std::span<const std::uint32_t> patches, std::uint32_t hidden) {
     double seconds = 0;
@@ -68,4 +68,4 @@ VisualSlice visual_slice(std::span<const std::uint32_t> visual, std::uint32_t a,
     return out;
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

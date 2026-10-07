@@ -5,7 +5,7 @@
 #include "ops/linear/q8/q8_a16_simt.cuh"
 #include "ops/linear/q8/q8_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, bool Dependent,
           class Output, class Epilogue>
 void launch_q8_a16_simt_slice(const Q8LinearOperands& operands, Output output, Epilogue epilogue,
@@ -56,4 +56,4 @@ void launch_q8_a16_simt(const Q8LinearOperands& operands, Output output, Epilogu
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

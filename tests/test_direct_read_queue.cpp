@@ -21,7 +21,7 @@
 
 namespace {
 
-using ninfer::DirectReadQueue;
+using infernix::DirectReadQueue;
 using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kBlock     = DirectReadQueue::kAlignment;
@@ -65,7 +65,7 @@ std::vector<DirectReadQueue::Completion> drain(DirectReadQueue& queue, std::size
 }
 
 std::filesystem::path make_file() {
-    const auto path = std::filesystem::temp_directory_path() / "ninfer_direct_read_queue_test.bin";
+    const auto path = std::filesystem::temp_directory_path() / "infernix_direct_read_queue_test.bin";
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     std::vector<char> chunk(1 << 20);
     for (std::uint64_t at = 0; at < kFileBytes; at += chunk.size()) {

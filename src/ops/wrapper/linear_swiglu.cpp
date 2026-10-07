@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/linear_swiglu.h"
+#include "infernix/ops/linear_swiglu.h"
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -140,4 +140,4 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

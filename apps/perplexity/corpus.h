@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 
 struct CorpusStream {
     std::string id;
@@ -24,4 +24,4 @@ struct CorpusSelection {
 [[nodiscard]] CorpusSelection load_corpus(const std::filesystem::path& manifest, bool quick);
 [[nodiscard]] CorpusSelection load_custom_text(const std::filesystem::path& path);
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

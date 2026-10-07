@@ -10,7 +10,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 constexpr std::size_t kStateImageAlignment = 256;
@@ -699,4 +699,4 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
         });
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

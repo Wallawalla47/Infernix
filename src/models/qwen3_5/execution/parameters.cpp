@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 template <class Function>
@@ -316,4 +316,4 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

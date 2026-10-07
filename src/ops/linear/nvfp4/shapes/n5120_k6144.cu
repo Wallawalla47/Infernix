@@ -2,7 +2,7 @@
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<5120, 6144>;
 using Gemv =
@@ -48,4 +48,4 @@ bool uses_a4(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 
 const Nvfp4LinearShape kNvfp4N5120K6144{5120, 6144, launch_a16, launch_nvfp4_a4<select_a4>,
                                         uses_a4};
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

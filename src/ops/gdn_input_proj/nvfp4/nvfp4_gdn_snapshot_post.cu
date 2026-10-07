@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int WarpsPerCta, int TokenTile, class Publish>
@@ -151,4 +151,4 @@ void nvfp4_gdn_record_post_launch(const Tensor& conv_record, const Tensor& conv_
            NoHistoryPublish{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

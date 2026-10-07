@@ -6,7 +6,7 @@
 #include "ops/linear/q5/q5_a16_direct_simt.cuh"
 #include "ops/linear/q5/q5_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, bool Dependent,
           class Output, class Epilogue>
 void launch_q5_a16_simt_slice(const Q5LinearOperands& operands, Output output, Epilogue epilogue,
@@ -108,4 +108,4 @@ void launch_q5_a16_direct_simt(const Q5LinearOperands& operands, Output output, 
             select_tokens.template operator()<false>();
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

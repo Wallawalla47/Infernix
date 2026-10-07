@@ -2,7 +2,7 @@
 #include "models/qwen3_5/execution/vision_overlay.h"
 #include "models/qwen3_5/program/execution_context.h"
 #include "core/device.h"
-#include "ninfer/ops/sampling.h"
+#include "infernix/ops/sampling.h"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const SequenceState& sequence) {
@@ -367,4 +367,4 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
     }
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

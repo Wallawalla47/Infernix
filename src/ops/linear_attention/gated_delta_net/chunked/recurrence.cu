@@ -2,7 +2,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 
-namespace ninfer::ops::detail::gated_delta_net::chunked {
+namespace infernix::ops::detail::gated_delta_net::chunked {
 namespace {
 
 template <int DV>
@@ -402,4 +402,4 @@ void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlCh
     }
 }
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked
+} // namespace infernix::ops::detail::gated_delta_net::chunked

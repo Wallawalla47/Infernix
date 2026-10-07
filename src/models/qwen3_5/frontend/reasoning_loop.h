@@ -15,7 +15,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 inline constexpr std::uint32_t kLoopCheckTokens   = 512;   // reasoning tokens between two checks
 inline constexpr std::size_t kLoopPassageWords    = 12;    // words in one passage
@@ -35,4 +35,4 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
 // most). Zero while fewer than kLoopWindowWords words exist.
 [[nodiscard]] double repeated_passage_coverage(std::span<const std::uint64_t> words);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <cstdlib>
 #include <iomanip>
@@ -13,20 +13,20 @@ void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
 }
 
-ninfer::PromptInput copy_prompt(const std::string& source) {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage system;
-    system.role = ninfer::ChatRole::System;
-    system.parts.push_back(ninfer::MessagePart{
-        .kind  = ninfer::MessagePartKind::Text,
+infernix::PromptInput copy_prompt(const std::string& source) {
+    infernix::PromptInput input;
+    infernix::ChatMessage system;
+    system.role = infernix::ChatRole::System;
+    system.parts.push_back(infernix::MessagePart{
+        .kind  = infernix::MessagePartKind::Text,
         .text  = "The final answer must contain only the requested file, with no explanation or "
                  "Markdown fences. Keep any reasoning in the thinking section.",
         .media = {}});
     input.messages.push_back(std::move(system));
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text,
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
+    user.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text,
         .text = "Return an exact, byte-for-byte copy of the Python file below. Preserve all "
                 "whitespace and do not add text before or after it.\n\n" +
                 source,
@@ -40,7 +40,7 @@ ninfer::PromptInput copy_prompt(const std::string& source) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto* artifact = std::getenv("NINFER_NGRAM_TEST_WEIGHTS");
+    const auto* artifact = std::getenv("INFERNIX_NGRAM_TEST_WEIGHTS");
     if (!artifact || !*artifact) { return 77; }
     try {
         const std::string backend = argc > 1 ? argv[1] : "mtp";
@@ -48,30 +48,30 @@ int main(int argc, char** argv) {
         const unsigned ngram      = argc > 3 ? std::stoul(argv[3]) : 15U;
         const bool strict_fresh   = argc == 5 && std::string(argv[4]) == "--strict-fresh";
         require(argc <= 5 && (argc != 5 || strict_fresh), "unsupported fixture arguments");
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 8192;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+        options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(8192);
         options.max_concurrency = 1;
         options.prefill_chunk   = 1024;
         options.enable_vision   = false;
-        options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
+        options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
         options.use_cuda_graph  = true;
         if (backend == "mtp") {
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
         } else if (backend == "dflash") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash;
         } else if (backend == "dflash2") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
         } else {
             throw std::invalid_argument("unsupported fixture backend");
         }
         options.speculative.draft_tokens                        = neural;
         options.speculative.ngram_draft_tokens                  = ngram;
-        options.speculative.proposal_head                       = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head                       = infernix::ProposalHead::Optimized;
         options.context_cache.device_state_slots                = 1;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         std::string source;
         for (unsigned i = 0; i < 20; ++i) {
             source += "def transform_" + std::to_string(i) +
@@ -81,7 +81,7 @@ int main(int argc, char** argv) {
         unsigned forced     = 0;
         bool fresh_identity = true;
         for (const unsigned budget : {1U, 4U, 15U, 16U, 31U, 32U, 63U}) {
-            ninfer::RequestOptions request;
+            infernix::RequestOptions request;
             request.execution.requested_output_tokens    = 512;
             request.execution.sampling.temperature       = 0;
             request.execution.sampling.presence_penalty  = 0;

@@ -15,7 +15,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct alignas(128) Fp8TmaDescriptors {
     CUtensorMap activation;
@@ -368,4 +368,4 @@ void launch_fp8_a8_tma_mma(const Fp8A8Operands& p, Output output, Epilogue epilo
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

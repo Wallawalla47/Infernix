@@ -10,7 +10,7 @@ On this page: [run records](#scope-and-run-records), [context profile](#no-specu
 ## Scope and run records
 
 Measured on September 28–29, 2026 (Asia/Shanghai), using one RTX 5090, NVIDIA driver 617.14,
-CUDA 13.4 compile/runtime/driver API, and NInfer revision
+CUDA 13.4 compile/runtime/driver API, and Infernix revision
 `7f6aafedb5f20200def820cfe51ab81c09c20eeb`. The serving binary was fixed for the entire campaign.
 All runs use FP8 E4M3 row-256 KV, a 1,024-token prefill chunk, CUDA Graphs, disabled prefix reuse,
 and the [common stochastic sampling profile](methodology.md#common-serving-profile).
@@ -248,41 +248,41 @@ C=1 corpus responses and phase summaries are in `corpus/<point>/`.
 | GD / ND | `groupwise-int/dflash2-corpus/`, `nvfp4/dflash2-corpus/` |
 | GS / NS | `groupwise-int/mtp3-saturation/c{1,2,4,8}/`, `nvfp4/mtp3-saturation/c{1,2,4,8}/` |
 
-Build `ninfer-serve`, then run from the repository root with Python 3.11 and a fresh output directory:
+Build `infernix-serve`, then run from the repository root with Python 3.11 and a fresh output directory:
 
 ```bash
-export NINFER_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
-export NINFER_PERF_OUTPUT=profiles/bench/qwen3_8_27b_fp8kv_rerun
+export INFERNIX_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
+export INFERNIX_PERF_OUTPUT=profiles/bench/qwen3_8_27b_fp8kv_rerun
 
 for perf_profile in nvfp4 groupwise-int; do
   case "$perf_profile" in
     nvfp4) perf_artifact=out/qwen3_8_27b_nvfp4.ninfer ;;
     groupwise-int) perf_artifact=out/qwen3_8_27b.ninfer ;;
   esac
-  perf_common=(--serve build/apps/ninfer-serve
+  perf_common=(--serve build/apps/infernix-serve
     --artifact "qwen3_8_27b=$perf_artifact"
     --kv-dtype fp8 --sampling stochastic --port 18080)
 
-  "$NINFER_BENCH_PYTHON" tools/bench/run_serve_corpus.py "${perf_common[@]}" \
-    --mode mtp0 --output "$NINFER_PERF_OUTPUT/$perf_profile/mtp0"
+  "$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_corpus.py "${perf_common[@]}" \
+    --mode mtp0 --output "$INFERNIX_PERF_OUTPUT/$perf_profile/mtp0"
 
   for perf_c in 1 2 4 8; do
-    "$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
+    "$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
       --mode mtp3 --suite decode-saturation --concurrency "$perf_c" \
       --decode-tokens 8192 --max-context 16384 --kv-capacity auto --prefill-chunk 1024 \
-      --output "$NINFER_PERF_OUTPUT/$perf_profile/mtp3-saturation/c$perf_c"
+      --output "$INFERNIX_PERF_OUTPUT/$perf_profile/mtp3-saturation/c$perf_c"
   done
 
   for perf_c in 1 2 4 8; do
-    "$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
+    "$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
       --mode mtp3 --suite corpus-makespan --concurrency "$perf_c" \
       --max-context 131072 --kv-capacity auto --prefill-chunk 1024 \
-      --output "$NINFER_PERF_OUTPUT/$perf_profile/mtp3-corpus/c$perf_c"
+      --output "$INFERNIX_PERF_OUTPUT/$perf_profile/mtp3-corpus/c$perf_c"
   done
 
-  "$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
+  "$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py "${perf_common[@]}" \
     --mode dflash2_7 --suite corpus-makespan --concurrency 1 \
     --max-context 131072 --kv-capacity auto --prefill-chunk 1024 \
-    --output "$NINFER_PERF_OUTPUT/$perf_profile/dflash2-corpus"
+    --output "$INFERNIX_PERF_OUTPUT/$perf_profile/dflash2-corpus"
 done
 ```

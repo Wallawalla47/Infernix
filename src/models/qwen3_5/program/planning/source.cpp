@@ -6,7 +6,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 bool ProgramImpl::checkpoint_matches(CheckpointHandle handle, const RequestBasePlan& base) const {
     if (!valid_checkpoint(handle) || !base.impl_ || !base.impl_->allow_prefix_reuse) {
@@ -169,4 +169,4 @@ ProgramImpl::inspect_source(const RequestBasePlan& base, std::optional<Checkpoin
     }
     return candidate;
 }
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

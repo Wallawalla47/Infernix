@@ -4,7 +4,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 bool supported_shape(const Q4Q5AttnInputProblem& problem) noexcept {
@@ -101,4 +101,4 @@ void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
                                   stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

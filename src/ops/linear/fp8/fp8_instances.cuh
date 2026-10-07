@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/fp8/fp8_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 using Fp8A8T64R128K128 =
     Fp8A8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
@@ -33,4 +33,4 @@ template <int Tokens, int Warps, int Stages>
 using Fp8SlicedInstance = Fp8A16SlicedKMmaSchedule<
     Warps, Tokens, (Stages * (16 * Warps * 64 + Warps * Tokens * 128) > 48 * 1024 ? 1 : 2),
     Cache::ca, Cache::cg, Fp8ActivationStage::PaddedZero, Stages>;
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

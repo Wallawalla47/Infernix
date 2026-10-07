@@ -2,8 +2,8 @@
 // (docs/maintainer/qwen3_8-flash-next-design.md §8.10). KV storages: bf16 and int8 (INT8-G64 with
 // Hadamard-rotated keys, as written by kv_cache_append).
 
-#include "ninfer/ops/qsa.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/qsa.h"
+#include "infernix/ops/rope.h"
 
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
@@ -28,7 +28,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -1227,4 +1227,4 @@ void qsa_attention(const Tensor& q, const Tensor& index_q, const QsaKVLayer& lay
     commit();
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

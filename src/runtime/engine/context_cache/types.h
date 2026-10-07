@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 using ContinuationOwnerToken = std::uint64_t;
 
@@ -13,4 +13,4 @@ struct CacheRetentionPriority {
 
 enum class ReclaimProgress : std::uint8_t { Blocked, Changed, Transferring };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

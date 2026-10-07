@@ -6,7 +6,7 @@
 #include <string_view>
 #include <system_error>
 
-namespace ninfer::product {
+namespace infernix::product {
 
 inline float parse_rope_yarn_factor(std::string_view text) {
     double value = 0.0;
@@ -18,4 +18,4 @@ inline float parse_rope_yarn_factor(std::string_view text) {
     return static_cast<float>(value);
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

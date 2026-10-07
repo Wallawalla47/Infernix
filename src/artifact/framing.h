@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 inline constexpr std::array<std::byte, 8> kEntryMagic = {
     std::byte{'N'}, std::byte{'I'}, std::byte{'N'}, std::byte{'F'},
@@ -34,4 +34,4 @@ inline std::uint32_t read_u32_le(const std::byte* bytes) noexcept {
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

@@ -12,7 +12,7 @@
 #include <utility>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 constexpr int kRows = 5120, kGroups = 320;
 
@@ -104,4 +104,4 @@ void q8_dynamic_grouped_conv_add_materialized_launch(Q8DynamicConvAddSchedule sc
                                                      cudaStream_t stream) {
     materialized(schedule, x, weight, base, delta, residual, projected, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

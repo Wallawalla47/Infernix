@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 // What a call costs beyond its tokens (their per-token and attention terms are equal with and
 // without a split, so admission compares fixed costs only).
@@ -50,4 +50,4 @@ struct CallPlan {
 [[nodiscard]] bool inside_exclusion(std::uint32_t frontier,
                                     std::span<const runtime::prefix_cache::TapExclusion> exclusions) noexcept;
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

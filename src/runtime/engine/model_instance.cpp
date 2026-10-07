@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
 } // namespace
@@ -25,7 +25,7 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
     if (options.artifact_path.extension() != ".ninfer") {
-        throw std::invalid_argument("NInfer accepts only .ninfer artifacts");
+        throw std::invalid_argument("Infernix accepts only .ninfer artifacts");
     }
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
@@ -393,4 +393,4 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             std::move(context_cost.model)};
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

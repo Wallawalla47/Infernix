@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Query rows pack token/head pairs. KV warps cooperate on disjoint key columns.
 template <int QueryRows, int KeyRows = 32, int KVWarps = 1, int MinBlocks = 2, int FixedWidth = 0>
@@ -70,4 +70,4 @@ inline constexpr int bf16_kv_tiled_shared_bytes =
     (Schedule::kQueryRows + 2 * Schedule::kKeyRows) * Geometry::kHeadDim * 2;
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

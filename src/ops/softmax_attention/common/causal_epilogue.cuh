@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 __device__ __forceinline__ void causal_store_partial_pair(float* target, float a, float b) {
     *reinterpret_cast<float2*>(target) = make_float2(a, b);
@@ -34,4 +34,4 @@ causal_store_inverse_rotated_row(const float* row, __nv_bfloat16* out, int head,
         causal_store_output(out + causal_q_index<G>(head, lane + 32 * r, token), values[r]);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,8 +1,8 @@
 #include "core/weight.h"
-#include "ninfer/ops/dynamic_grouped_conv.h"
+#include "infernix/ops/dynamic_grouped_conv.h"
 
 #include "direct_bf16_weight.cuh"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -15,8 +15,8 @@
 #include <stdexcept>
 #include <string>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 
@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_dynamic_grouped_conv_prepare_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_dynamic_grouped_conv_prepare_bench: %s\n", error.what());
         return 1;
     }
 }

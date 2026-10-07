@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int Cols, int Stride>
@@ -36,15 +36,15 @@ void dispatch_shape(const Tensor& x, const Weight& w, Tensor& residual_out, cuda
 template <class Launch>
 void dispatch_cols(std::int32_t cols, Launch&& launch) {
     switch (cols) {
-#define NINFER_Q5_LINEAR_ADD_EXACT(COLS)                                                           \
+#define INFERNIX_Q5_LINEAR_ADD_EXACT(COLS)                                                           \
     case COLS:                                                                                     \
         launch.template operator()<COLS>();                                                        \
         return
-        NINFER_Q5_LINEAR_ADD_EXACT(1);
-        NINFER_Q5_LINEAR_ADD_EXACT(2);
-        NINFER_Q5_LINEAR_ADD_EXACT(3);
-        NINFER_Q5_LINEAR_ADD_EXACT(4);
-#undef NINFER_Q5_LINEAR_ADD_EXACT
+        INFERNIX_Q5_LINEAR_ADD_EXACT(1);
+        INFERNIX_Q5_LINEAR_ADD_EXACT(2);
+        INFERNIX_Q5_LINEAR_ADD_EXACT(3);
+        INFERNIX_Q5_LINEAR_ADD_EXACT(4);
+#undef INFERNIX_Q5_LINEAR_ADD_EXACT
     default:
         throw std::invalid_argument("q5 linear_add split2: T must be in [1,4]");
     }
@@ -58,4 +58,4 @@ void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

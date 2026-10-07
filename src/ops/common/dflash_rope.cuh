@@ -5,7 +5,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 // D128 full-head 1-D RoPE frequencies for theta=1e7.
 static __device__ __constant__ double kDflashRopeInvFrequency[64] = {
@@ -43,4 +43,4 @@ __device__ __forceinline__ void dflash_rope_sincos(const std::int32_t* positions
     sincosf(reduced, sine, cosine);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

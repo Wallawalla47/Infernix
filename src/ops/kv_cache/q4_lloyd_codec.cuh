@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheQ4CodeBytes = 128;
 
@@ -59,4 +59,4 @@ __device__ __forceinline__ uint2 kv_cache_q4_decode_word(std::uint32_t word) {
     return make_uint2(__vsub4(lo_mag ^ lo_neg, lo_neg), __vsub4(hi_mag ^ hi_neg, hi_neg));
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

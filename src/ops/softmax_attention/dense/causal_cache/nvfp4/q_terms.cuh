@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 // The NVFP4 Q row factor maps the row's largest magnitude to E2M1 6 at UE4M3 448.
 inline constexpr float kCausalNvfp4QTop = 6.0F * 448.0F;
@@ -50,4 +50,4 @@ __device__ __forceinline__ float causal_nvfp4_q_term(float x, int lane, int row,
     return (odd ? pair.y : pair.x) * scale;
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

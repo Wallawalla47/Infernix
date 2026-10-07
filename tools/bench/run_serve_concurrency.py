@@ -49,8 +49,8 @@ SEED_SET_STRIDE = 0x9E3779B97F4A7C15
 def saturation_seed(index: int, seed_set: int) -> int:
     """Seed of saturation request `index` in seed set `seed_set` (set 0 is the published set)."""
     return (SATURATION_SEEDS[index] + seed_set * SEED_SET_STRIDE) % (1 << 63)
-POINT_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_point"
-SUMMARY_ARTIFACT_TYPE = "ninfer_serve_concurrency_bench_summary"
+POINT_ARTIFACT_TYPE = "infernix_serve_concurrency_bench_point"
+SUMMARY_ARTIFACT_TYPE = "infernix_serve_concurrency_bench_summary"
 SCHEMA_VERSION = 4
 
 
@@ -103,8 +103,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
-        help="ninfer-serve executable",
+        default=REPO_ROOT / "build/apps/infernix-serve",
+        help="infernix-serve executable",
     )
     parser.add_argument(
         "--artifact",
@@ -151,7 +151,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--kv-capacity",
         default="262144",
         metavar="N|auto",
-        help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
+        help="shared Main KV capacity passed to infernix-serve (default: 262144)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
     parser.add_argument("--kv-dtype", choices=tuple(corpus.KV_CACHE_NAMES), default="int8")
@@ -168,7 +168,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="ARG",
-        help="extra ninfer-serve argument appended to every point's command; repeat for each "
+        help="extra infernix-serve argument appended to every point's command; repeat for each "
         "token (e.g. --serve-arg=--ngram-draft-tokens --serve-arg=15)",
     )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
@@ -1164,9 +1164,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve = args.serve.expanduser().resolve()
     if not args.dry_run:
         if not serve.is_file():
-            raise corpus.CampaignError(f"ninfer-serve executable not found: {serve}")
+            raise corpus.CampaignError(f"infernix-serve executable not found: {serve}")
         if not os.access(serve, os.X_OK):
-            raise corpus.CampaignError(f"ninfer-serve is not executable: {serve}")
+            raise corpus.CampaignError(f"infernix-serve is not executable: {serve}")
         (output_dir / "server").mkdir(parents=True, exist_ok=True)
         (output_dir / "points").mkdir(parents=True, exist_ok=True)
 

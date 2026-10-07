@@ -1,4 +1,4 @@
-#include "ninfer/ops/causal_conv1d_silu.h"
+#include "infernix/ops/causal_conv1d_silu.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

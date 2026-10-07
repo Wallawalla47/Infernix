@@ -1,11 +1,11 @@
 #pragma once
 
 #include "core/tensor.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& conv_weight,
                                         Tensor& conv_states, const Tensor& valid_columns,
@@ -27,4 +27,4 @@ void gdn_projected_conv_record_tree_launch(const Tensor& conv_record, const Tens
                                            const Tensor& tree_rows, Tensor& query, Tensor& key,
                                            Tensor& value, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

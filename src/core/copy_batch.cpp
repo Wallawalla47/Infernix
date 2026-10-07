@@ -4,7 +4,7 @@
 
 #include <iterator>
 
-namespace ninfer {
+namespace infernix {
 
 void CopyBatch::add(void* destination, const void* source, std::size_t bytes) {
     if (bytes == 0) { return; }
@@ -34,4 +34,4 @@ void CopyBatch::flush() {
     ranges_.clear();
 }
 
-} // namespace ninfer
+} // namespace infernix

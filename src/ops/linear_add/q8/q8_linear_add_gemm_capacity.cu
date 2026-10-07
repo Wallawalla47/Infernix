@@ -3,7 +3,7 @@
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 #include "ops/linear/q8/q8_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -65,4 +65,4 @@ void q8_linear_add_splitk_capacity_launch(const Tensor& x, const Weight& w, Tens
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

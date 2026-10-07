@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 // The routed experts read in place from the artifact (design §19.3.7, the SSD tier; plan
 // memory-tiers.md §4.4): for every (layer, expert) record, its file segments (one, or two for a
@@ -58,4 +58,4 @@ private:
     std::vector<std::vector<float>> multipliers_;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

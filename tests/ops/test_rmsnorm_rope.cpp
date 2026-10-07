@@ -1,8 +1,8 @@
-#include "ninfer/ops/rmsnorm_rope.h"
+#include "infernix/ops/rmsnorm_rope.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -16,8 +16,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

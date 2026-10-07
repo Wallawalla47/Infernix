@@ -2,7 +2,7 @@
 // the exactly decoded Q4_G64_FP16 and Q8_G32_FP16 banks, at the Qwen4Exp drafter's shapes
 // (H = 2560, I = 640, top-10). Criterion: the BF16 output rounding plus the FP32 accumulation of
 // both projections (h is FP32), sum |D h| * (I + H) * 2^-23 for the accumulation part.
-#include "ninfer/ops/resident_moe.h"
+#include "infernix/ops/resident_moe.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <cuda_bf16.h>
@@ -19,11 +19,11 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::test::linear;
-namespace qw = ninfer::test::quantized_weight;
-using ninfer::DType;
-using ninfer::QType;
-using ninfer::Tensor;
+using namespace infernix::test::linear;
+namespace qw = infernix::test::quantized_weight;
+using infernix::DType;
+using infernix::QType;
+using infernix::Tensor;
 
 int g_failures = 0;
 
@@ -90,8 +90,8 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     cudaMalloc(&dn_payload, down.payload.size());
     cudaMemcpy(gu_payload, gate_up.payload.data(), gate_up.payload.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dn_payload, down.payload.data(), down.payload.size(), cudaMemcpyHostToDevice);
-    const ninfer::Weight gu_weight = gate_up.device_weight(gu_payload);
-    const ninfer::Weight dn_weight = down.device_weight(dn_payload);
+    const infernix::Weight gu_weight = gate_up.device_weight(gu_payload);
+    const infernix::Weight dn_weight = down.device_weight(dn_payload);
 
     std::mt19937 rng(seed);
     std::normal_distribution<float> n(0.0F, 1.0F);
@@ -109,12 +109,12 @@ void run_case(QType qtype, std::int32_t experts, std::int32_t columns, std::uint
     auto* dids = device(ids);
     void* dout = nullptr;
     cudaMalloc(&dout, sizeof(std::uint16_t) * H * K * columns);
-    const std::size_t ws_bytes = ninfer::ops::resident_moe_workspace_bytes(K * columns, I);
+    const std::size_t ws_bytes = infernix::ops::resident_moe_workspace_bytes(K * columns, I);
     void* ws = nullptr;
     cudaMalloc(&ws, ws_bytes);
     Tensor tx(dx, DType::BF16, {H, columns}), tids(dids, DType::I32, {K, columns});
     Tensor tout(dout, DType::BF16, {H, K * columns});
-    ninfer::ops::resident_moe_experts(tx, tids, gu_weight, dn_weight, experts, I, ws, ws_bytes, tout, nullptr);
+    infernix::ops::resident_moe_experts(tx, tids, gu_weight, dn_weight, experts, I, ws, ws_bytes, tout, nullptr);
     if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("resident_moe_experts failed"); }
     std::vector<std::uint16_t> out(static_cast<std::size_t>(H) * K * columns);
     cudaMemcpy(out.data(), dout, out.size() * 2, cudaMemcpyDeviceToHost);

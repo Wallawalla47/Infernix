@@ -1,4 +1,4 @@
-# NInfer tools
+# Infernix tools
 
 `tools/` contains artifact conversion and inspection, benchmark orchestration, and serving smoke
 checks. To download and run an existing artifact, start with the [project README](../README.md).
@@ -7,7 +7,7 @@ To build your own weights, use the [weight conversion guide](../docs/weight-conv
 Run commands from the repository root with a Python environment containing the dependencies
 for the selected tool. The maintained environment uses Python 3.11.
 
-Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
+Python tools are independent of CMake; there is no `INFERNIX_BUILD_TOOLS` option.
 
 ## Task index
 
@@ -22,8 +22,8 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
 | Replay Qwen3.8-Flash-Next routing traces through VRAM expert-cache policies (needs numpy) | `python -m tools.expert_cache_replay.replay TRACE_DIR`; [`expert_cache_replay/`](expert_cache_replay/replay.py) |
-| Replay engine-captured route traces through the VRAM / RAM / SSD expert tiers: RAM policies, modes, priors, demotion allowance, prefill reserve (needs numpy) | `python tools/expert_cache_replay/host_tier.py TRACE [--validate]`; [`expert_cache_replay/host_tier.py`](expert_cache_replay/host_tier.py); traces from `ninfer_qwen4_exp_route_trace_real_test` |
-| Measure the Flash-Next memory-track facts: DXGI/NVML/D3DKMT VRAM sources, VMM map/unmap cost and stalls, query cost; expert-record reads from the artifact in place, pinned-allocation time | CMake targets `ninfer_vram_probe` and `ninfer_expert_read_probe ARTIFACT` (built with the tests); [`flash_next_probe/`](flash_next_probe/) |
+| Replay engine-captured route traces through the VRAM / RAM / SSD expert tiers: RAM policies, modes, priors, demotion allowance, prefill reserve (needs numpy) | `python tools/expert_cache_replay/host_tier.py TRACE [--validate]`; [`expert_cache_replay/host_tier.py`](expert_cache_replay/host_tier.py); traces from `infernix_qwen4_exp_route_trace_real_test` |
+| Measure the Flash-Next memory-track facts: DXGI/NVML/D3DKMT VRAM sources, VMM map/unmap cost and stalls, query cost; expert-record reads from the artifact in place, pinned-allocation time | CMake targets `infernix_vram_probe` and `infernix_expert_read_probe ARTIFACT` (built with the tests); [`flash_next_probe/`](flash_next_probe/) |
 | Record Qwen3.8-Flash-Next checkpoint facts for design M0 (scale shapes, gate/up `input_scale` sharing, MTP and n-gram forms, bytes per class) | `python -m tools.flash_next.inspect_checkpoint CHECKPOINT [--json FILE]`; [`flash_next/`](flash_next/inspect_checkpoint.py) |
 | Compare the Flash-Next A4 activation quantizer with ModelOpt's (runs ModelOpt's kernel when CUDA and `nvidia-modelopt` are present) | `python -m tools.flash_next.a4_reference [--activations FILE...]`; [`flash_next/`](flash_next/a4_reference.py) |
 | Measure the Flash-Next M0 machine facts: copy engines, PCIe, PDL chains, mapped-memory mailbox, DRAM contention, CPU expert kernel rates, NVMe random reads | `tools/flash_next_probe/run_m0.sh CHECKPOINT NVME_FILE`; [`flash_next_probe/`](flash_next_probe/) (build commands in each source header) |
@@ -84,12 +84,12 @@ by the references linked from the [documentation map](../docs/README.md).
 
 ## Benchmark orchestration
 
-`tools/bench/run_ninfer_bench_matrix.py` builds and runs the public-Engine benchmark matrix and
+`tools/bench/run_infernix_bench_matrix.py` builds and runs the public-Engine benchmark matrix and
 writes ignored local reports below `profiles/bench/`:
 
 ```bash
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core --dry-run
-python3 tools/bench/run_ninfer_bench_matrix.py --preset core
+python3 tools/bench/run_infernix_bench_matrix.py --preset core --dry-run
+python3 tools/bench/run_infernix_bench_matrix.py --preset core
 ```
 
 See [`tools/bench/README.md`](bench/README.md) and [`bench/README.md`](../bench/README.md) for the
@@ -101,7 +101,7 @@ artifacts. See [`tools/bench/ttft/README.md`](bench/ttft/README.md).
 
 ## Serving smoke
 
-After starting `ninfer-serve` in another terminal:
+After starting `infernix-serve` in another terminal:
 
 ```bash
 python3 -m tools.smoke.serve_contract \

@@ -1,10 +1,10 @@
-// ninfer::ops - speculative verification tree shape and tree-row validation.
-#include "ninfer/ops/speculative_tree.h"
+// infernix::ops - speculative verification tree shape and tree-row validation.
+#include "infernix/ops/speculative_tree.h"
 
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 void validate_speculative_tree_shape(SpeculativeTreeShape shape) {
     if (shape.main_depth < 1 || shape.main_depth > kSpeculativeTreeMaxPathLength - 1) {
@@ -28,4 +28,4 @@ void validate_speculative_tree_rows(const Tensor& tree_rows, std::int32_t batch,
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

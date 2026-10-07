@@ -8,7 +8,7 @@
 
 #include <algorithm>
 
-namespace ninfer::models::qwen4_exp::detail {
+namespace infernix::models::qwen4_exp::detail {
 
 namespace pc = runtime::prefix_cache;
 
@@ -828,4 +828,4 @@ std::array<std::span<const cudaEvent_t>, 2> ProgramImpl::prefix_waits(const Lane
             prefix_->capture_events(lane.prefix.capture)};
 }
 
-} // namespace ninfer::models::qwen4_exp::detail
+} // namespace infernix::models::qwen4_exp::detail

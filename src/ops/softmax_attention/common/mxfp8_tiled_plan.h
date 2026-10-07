@@ -5,7 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr int kMxfp8TiledQueryRows = 128;
 inline constexpr int kMxfp8TiledMaxSplits = 8;
@@ -84,4 +84,4 @@ inline std::size_t mxfp8_tiled_workspace_bytes(int heads, int min_width, int max
     return maximum;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::test::quantized_weight {
+namespace infernix::test::quantized_weight {
 namespace detail {
 
 inline std::int32_t align_up(std::int32_t x, std::int32_t m) { return ((x + m - 1) / m) * m; }
@@ -885,4 +885,4 @@ inline PackedWeight pack_q8_g32_row_split(const std::vector<float>& source, std:
     return pack_row_split_lowbit(source, n, k, QType::Q8_G32_FP16);
 }
 
-} // namespace ninfer::test::quantized_weight
+} // namespace infernix::test::quantized_weight

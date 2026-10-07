@@ -19,7 +19,7 @@
 #    include <unistd.h>
 #endif
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 const std::array<ContextTransferCost, 3>& generic_context_transfer_cost();
 const ContextPrefillCost& generic_context_prefill_cost();
@@ -567,4 +567,4 @@ void upsert_context_prefill_cost_atomic(const std::filesystem::path& path,
     write_document_atomic(path, document);
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

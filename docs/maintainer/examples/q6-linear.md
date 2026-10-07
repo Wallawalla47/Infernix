@@ -12,11 +12,11 @@ tuning.
 | Mathematical shape | `W[34816,5120] × X[5120,T] → Y[34816,T]` |
 | Input, output and policy | BF16 input, BF16 output, `A16Only` |
 | GPU / toolchain | NVIDIA GeForce RTX 5090; CUDA 13.4, Release, `sm_120a` |
-| Timing entry point | `ninfer::ops::linear`; each CUDA Graph contains one complete Op call |
+| Timing entry point | `infernix::ops::linear`; each CUDA Graph contains one complete Op call |
 | Cache / sampling | 256 MiB L2 flush before each sample; 5 warmups, 50 measurements, median reported |
 | Input fixture | The public bench's Q6 packed-weight and BF16 activation fixtures |
 | Coverage | Every integer T=1–128; two large-T anchors at 512 and 1024 |
-| Concurrent conditions | During measurement an idle resident NInfer service on the same machine held device memory; the bench flushed 256 MiB of L2 per sample |
+| Concurrent conditions | During measurement an idle resident Infernix service on the same machine held device memory; the bench flushed 256 MiB of L2 per sample |
 
 Every currently measured call has exactly one Graph kernel node and zero external workspace. The
 measurement scope is the pure Linear Op.
@@ -123,7 +123,7 @@ GEMV, `k128` small-block MMA and fixed-column-width MMA capacities:
   **1868.510µs, 195.38 TFLOP/s, TC utilization 93.26%**.
   The two are measured separately so that an average cannot hide a regression in one of them.
 
-`ninfer_linear_q6_a16_test` passed. The new `N=34816, K=5120` case covers every boundary the ladder
+`infernix_linear_q6_a16_test` passed. The new `N=34816, K=5120` case covers every boundary the ladder
 distinguishes (1, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33, 48, 49, 50, 128, 129), and compares against an
 FP64 oracle over independently decoded packed codes and FP16 scales using the existing A16 error
 criteria.
@@ -132,14 +132,14 @@ The test was rerun after every ladder change during tuning, and passed every tim
 ## Reproduction
 
 ```bash
-cmake --build build -j --target ninfer_linear_bench ninfer_linear_q6_a16_test
-./build/tests/ninfer_linear_q6_a16_test
+cmake --build build -j --target infernix_linear_bench infernix_linear_q6_a16_test
+./build/tests/infernix_linear_q6_a16_test
 
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q6 --policy a16 --n 34816 --k 5120 \
   --sweep 1:128 --execution graph --warmup 5 --repeat 50 --flush-mib 256 \
   --csv-out profiles/bench/q6_n34816_k5120/final_t1_128.csv
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q6 --policy a16 --n 34816 --k 5120 \
   --sweep 512:1024:512 --execution graph --warmup 5 --repeat 50 --flush-mib 256 \
   --csv-out profiles/bench/q6_n34816_k5120/final_bulk.csv

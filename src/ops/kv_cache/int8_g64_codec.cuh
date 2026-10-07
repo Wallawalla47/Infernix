@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheInt8HeadDim = 256;
 inline constexpr int kKVCacheInt8Group   = 64;
@@ -81,4 +81,4 @@ __device__ __forceinline__ int4 kv_cache_int8_dequant_i8x8_from(const std::int8_
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

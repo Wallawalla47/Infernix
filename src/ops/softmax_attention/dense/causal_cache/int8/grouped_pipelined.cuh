@@ -9,7 +9,7 @@
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/softmax_attention/common/causal_tree.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // INT8 grouped attention for rows of two or more columns (W = 1 keeps the staged kernel).
 //
@@ -153,8 +153,8 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
             if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
+                infernix::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
+                infernix::ops::cp_async<8>(&v_scale_s[key_l * Groups], &cache_v_scale[off]);
             } else {
                 store_vec(&k_scale_s[key_l * Groups], make_int2(0, 0));
                 store_vec(&v_scale_s[key_l * Groups], make_int2(0, 0));
@@ -171,14 +171,14 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
             if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<16>(k_dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(v_dst, &cache_v_i8[off]);
+                infernix::ops::cp_async<16>(k_dst, &cache_k_i8[off]);
+                infernix::ops::cp_async<16>(v_dst, &cache_v_i8[off]);
             } else {
                 store_vec(k_dst, make_int4(0, 0, 0, 0));
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     // A split that holds none of this call's appended positions reads only settled cache rows,
@@ -348,7 +348,7 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0    = first_tile + kb * Bc;
         const int stage = kb & 1;
-        ninfer::ops::cp_wait<0>();
+        infernix::ops::cp_wait<0>();
         __syncthreads();
         if (kb + 1 < key_blocks) issue_kv_tile(stage ^ 1, k0 + Bc);
 
@@ -622,4 +622,4 @@ __launch_bounds__(256, 2) __global__ void int8_kv_grouped_pipelined_kernel(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

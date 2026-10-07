@@ -8,11 +8,11 @@
 #include <memory>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 class VisionPrefillSession;
 }
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 // One state per Program workspace. Only Vision encoding can replace the handoff;
 // Text and decode use the disjoint general workspace and preserve its owner.
@@ -37,4 +37,4 @@ struct VisionPrefillPlan {
     std::size_t max_merged_count = 0;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

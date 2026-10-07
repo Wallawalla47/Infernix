@@ -27,13 +27,13 @@ bool cuda_unavailable(cudaError_t err) {
 
 int expect_throws_device(int device_id) {
     try {
-        ninfer::DeviceContext invalid(device_id);
+        infernix::DeviceContext invalid(device_id);
     } catch (const std::runtime_error&) { return 0; }
     std::cerr << "DeviceContext(" << device_id << ") did not throw\n";
     return 1;
 }
 
-int check_context(const ninfer::DeviceContext& ctx, const char* label) {
+int check_context(const infernix::DeviceContext& ctx, const char* label) {
     int failures = 0;
     if (ctx.stream == nullptr) {
         std::cerr << label << " compute stream is null\n";
@@ -57,7 +57,7 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
 // upload_pinned_when: the copy waits for the published word, reads the data written after the
 // launch (not the poison before it), counts its waits, and a graph replay with a new expected
 // word rejects the word an earlier round left in place.
-int check_pinned_gate(const ninfer::DeviceContext& ctx) {
+int check_pinned_gate(const infernix::DeviceContext& ctx) {
     int failures = 0;
     constexpr std::size_t kMaxBytes = 327680;
     std::byte* src             = nullptr;
@@ -73,7 +73,7 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
     CUDA_CHECK(cudaMalloc(&expected, sizeof(std::uint32_t)));
     CUDA_CHECK(cudaMalloc(&stats, 2 * sizeof(std::uint64_t)));
     std::uint32_t word = 0;
-    ninfer::publish_pinned_word(ready, 0);
+    infernix::publish_pinned_word(ready, 0);
     std::vector<std::byte> host(kMaxBytes);
     const auto fill = [&](std::size_t bytes, std::uint32_t round) {
         for (std::size_t i = 0; i < bytes; ++i) { host[i] = static_cast<std::byte>((i * 131 + round * 7 + 3) & 0xff); }
@@ -88,7 +88,7 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
         fill(bytes, round);
         std::memcpy(src, host.data(), bytes);
-        ninfer::publish_pinned_word(ready, word);
+        infernix::publish_pinned_word(ready, word);
         ctx.synchronize();
         std::vector<std::byte> out(bytes);
         CUDA_CHECK(cudaMemcpy(out.data(), dst, bytes, cudaMemcpyDeviceToHost));
@@ -101,7 +101,7 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
     for (const std::size_t bytes : {std::size_t{2560}, std::size_t{12800}, kMaxBytes}) {
         CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
         if (!produce(bytes, ++round, [&] {
-                ninfer::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+                infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
             })) {
             ++failures;
             std::cerr << "gated copy of " << bytes << " bytes does not hold the published data\n";
@@ -121,8 +121,8 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
         CUDA_CHECK(cudaMemcpyAsync(expected, expected_h, sizeof(std::uint32_t), cudaMemcpyHostToDevice, ctx.stream));
         fill(2560, ++round);
         std::memcpy(src, host.data(), 2560);
-        ninfer::publish_pinned_word(ready, word);
-        ninfer::upload_pinned_when(dst, src, 2560, ready, expected, stats, nullptr, ctx.stream);
+        infernix::publish_pinned_word(ready, word);
+        infernix::upload_pinned_when(dst, src, 2560, ready, expected, stats, nullptr, ctx.stream);
         ctx.synchronize();
         std::uint64_t waited[2] = {};
         read_stats(waited);
@@ -138,7 +138,7 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
         cudaGraph_t graph       = nullptr;
         cudaGraphExec_t exec    = nullptr;
         CUDA_CHECK(cudaStreamBeginCapture(ctx.stream, cudaStreamCaptureModeThreadLocal));
-        ninfer::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
+        infernix::upload_pinned_when(dst, src, bytes, ready, expected, stats, nullptr, ctx.stream);
         CUDA_CHECK(cudaStreamEndCapture(ctx.stream, &graph));
         CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
         CUDA_CHECK(cudaMemset(stats, 0, 2 * sizeof(std::uint64_t)));
@@ -158,7 +158,7 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
         CUDA_CHECK(cudaGraphDestroy(graph));
     }
     try {
-        ninfer::upload_pinned_when(dst, src, 2561, ready, expected, nullptr, nullptr, ctx.stream);
+        infernix::upload_pinned_when(dst, src, 2561, ready, expected, nullptr, nullptr, ctx.stream);
         ++failures;
         std::cerr << "a gated copy of a size that is not a 16-byte multiple did not throw\n";
     } catch (const std::invalid_argument&) {}
@@ -176,9 +176,9 @@ int check_pinned_gate(const ninfer::DeviceContext& ctx) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--invalid-sync") {
         try {
-            ninfer::DeviceContext ctx(0);
+            infernix::DeviceContext ctx(0);
         } catch (const std::invalid_argument& error) {
-            return std::string_view(error.what()).find("NINFER_CUDA_SYNC") != std::string_view::npos
+            return std::string_view(error.what()).find("INFERNIX_CUDA_SYNC") != std::string_view::npos
                        ? 0
                        : fail("invalid sync setting has no configuration diagnostic");
         }
@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
 
     int failures = 0;
 
-    ninfer::DeviceContext ctx(0);
+    infernix::DeviceContext ctx(0);
     unsigned int actual_flags = 0;
     CUDA_CHECK(cudaGetDeviceFlags(&actual_flags));
     if ((actual_flags & cudaDeviceScheduleMask) != expected_flags) {
@@ -232,7 +232,7 @@ int main(int argc, char** argv) {
     }
 
     const cudaStream_t original_stream = ctx.stream;
-    ninfer::DeviceContext moved(std::move(ctx));
+    infernix::DeviceContext moved(std::move(ctx));
     if (ctx.stream != nullptr || ctx.transfer_stream != nullptr) {
         ++failures;
         std::cerr << "move construction did not null source streams\n";
@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
 
     failures += expect_throws_device(count);
 
-    ninfer::CudaEventTimer timer(moved);
+    infernix::CudaEventTimer timer(moved);
     timer.start();
     moved.synchronize();
     const float elapsed_ms = timer.stop_ms();

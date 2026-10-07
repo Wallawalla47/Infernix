@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <KVCacheVqKeyCodec KeyCodec>
 inline constexpr int kVqKeyCodeBytes = kKVCacheVqKeyCodeBytes<KeyCodec>;
@@ -122,4 +122,4 @@ __device__ __forceinline__ VqTilePass vq_tile_pass(int v, int band_first, int ba
     return {v - band_blocks, false};
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

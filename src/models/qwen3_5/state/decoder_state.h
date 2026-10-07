@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
@@ -114,4 +114,4 @@ struct DecoderState {
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

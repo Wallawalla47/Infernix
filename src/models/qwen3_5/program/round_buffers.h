@@ -2,10 +2,10 @@
 
 #include "core/layout.h"
 #include "core/tensor.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/token_constraint.h"
-#include "ninfer/types.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/token_constraint.h"
+#include "infernix/types.h"
 
 #include <algorithm>
 #include <array>
@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 inline constexpr std::uint32_t kMtpDecodeMaximumDrafts    = 5;
 inline constexpr std::uint32_t kMtpDecodeMaximumWidth     = kMtpDecodeMaximumDrafts + 1;
@@ -404,4 +404,4 @@ struct RoundState {
 void constrain_round_logits(const RoundState& io, const Tensor& logits, const Tensor* argmax,
                             std::int32_t token_domain, cudaStream_t stream);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 void ProgramImpl::bind_constraint_sets(std::uint32_t lane, const RequestConstraintPlan* plan) {
     if (!io.constraint || lane >= max_concurrency) {
@@ -123,4 +123,4 @@ std::uint32_t ProgramImpl::constraint_first_step(std::uint32_t lane) const {
     return static_cast<std::uint32_t>(sequence.ledger.size() - prompt);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

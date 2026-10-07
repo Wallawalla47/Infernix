@@ -127,11 +127,11 @@ README marks the patches as reconstructions and lists which trial-build artifact
 The two entries below were measured on the RTX 5090 with the NVIDIA ModelOpt Qwen3.8-27B artifact
 (`qwen3_8_27b_nvfp4-nvidia.ninfer`: NVFP4 MLP, FP8 attention/GDN projections), DFlash2 K=7 with the
 optimized proposal head, INT8 KV, CUDA 13.4, Windows WDDM. The **controlled** numbers are
-`ninfer_bench -pg 16384,256` and `-pg 60000,256` with greedy decoding, so every arm decodes the same
+`infernix_bench -pg 16384,256` and `-pg 60000,256` with greedy decoding, so every arm decodes the same
 token stream (identical round and acceptance counts in every run); each value is the mean of 6-9
 repetitions from arms interleaved in one window, standard deviation below 0.02 ms. The candidates were
 selected per process from one binary (commit `f2c991d0` on branch `perf/decode-round-overheads`, not
-merged; it holds every candidate below behind `NINFER_AB_ITEMS`) so arms differ only in the item. Kernel
+merged; it holds every candidate below behind `INFERNIX_AB_ITEMS`) so arms differ only in the item. Kernel
 attributions come from Nsight Systems `--cuda-graph-trace=node` captures of one 128-token decode at
 16K context, compared kernel by kernel as the interval between consecutive kernel end times.
 
@@ -227,7 +227,7 @@ and slower above, while the A16 down projection was far slower from 5 columns:
 Only the gate/up projection was therefore tried with A16 at up to 8 columns (every C=1 neural
 round). In the decode graph it was slower, not faster: the A4 MMA kernel stages its weights before
 its PDL wait and was charged 60.3 us per call, the A16 kernel 63.6 us (Nsight, 16K context). Greedy
-`ninfer_bench -pg 16384,512`, three interleaved passes: 14.957 against 14.764 ms per round (+1.3 %).
+`infernix_bench -pg 16384,512`, three interleaved passes: 14.957 against 14.764 ms per round (+1.3 %).
 Sampled acceptance (`acc_ab.py`: 24 prompts x 2 seed sets x 1536 tokens, temperature 1.0, top_p
 0.95, top_k 20, thinking on, about 66K tokens per arm): 3.468 against 3.443 tokens per round
 (+0.7 %, within the spread of this test) and 15.13 against 14.90 ms per round (+1.5 %); output
@@ -271,10 +271,10 @@ INT32 sums in FP32. SageAttention2 quantizes P to FP8 E4M3 instead; that needs V
 the INT8-G64 V codes are not exact in E4M3 above 16, so integer codes were chosen to keep V exact.
 
 RTX 5090, CUDA 13.4, `qwen3_8_27b_nvfp4-nvidia.ninfer`, INT8 KV. Per attention layer
-(`ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4 --tokens 3584
+(`infernix_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4 --tokens 3584
 --execution graph --cache cold`, two passes, medians): 584/564 µs at an empty context (-3.5 %),
 4990→4455 (-10.7 %), 9346→8332 (-10.8 %), 18263→16207 (-11.3 %) and 37064→34082 µs (-8.0 %) at
-16K/32K/64K/128K. End to end (`ninfer_bench -p 16384,65536 --prefill-chunk 4096`, two passes):
+16K/32K/64K/128K. End to end (`infernix_bench -p 16384,65536 --prefill-chunk 4096`, two passes):
 prefill +1.5 % at 16K and +3.9 % at 64K. Perplexity on `ninfer-ppl-1m-v1` (full corpus):
 4.90771 → 4.90551 with 4096/2048 windows and 4.904120 → 4.851635 with 65536/32768
 (english_reference 7.42 → 7.26, code 1.849 → 1.810, Chinese and long-form within 0.03 %).
@@ -349,7 +349,7 @@ accumulation in the INT8 verification kernel" below).
 The [248320,5120] FP8 LM head took the 64-column MMA schedule from 42 columns (1145-1150 us at
 42-64 against 818-820 us at 40), which tree rounds of 12 columns at four requests and 16-column n-gram
 or tree rounds at three or four requests hit. The sliced-K route now runs to 64 columns. RTX 5090,
-`ninfer_linear_bench --qtype FP8 --n 248320 --k 5120`, graph execution, cold cache, median us;
+`infernix_linear_bench --qtype FP8 --n 248320 --k 5120`, graph execution, cold cache, median us;
 variants are (K warps, minimum blocks per SM, stages, row tiles) of `Fp8A16SlicedKMmaSchedule`.
 The variants were measured in two sweeps; 4,2,1,2 and 2,2,1,2, measured in both, moved by up to
 5 % between them, and the table shows the second sweep, which also measured 2,2,2,2:
@@ -372,8 +372,8 @@ columns the 96- and 128-column MMA schedules are unchanged.
 At 8-32 tokens the NVFP4 A4 down projection ([5120,17408]) takes about 37.5 us and the fused
 gate/up + SwiGLU ([34816,5120]) about 66 us, 1.34 and 1.52 TB/s of weight streaming. The down
 projection's 32x64 tiles give only 80 CTAs on 170 SMs, so smaller tiles looked like a gain. RTX
-5090, `ninfer_nvfp4_linear_add_bench --n 5120 --k 17408 --policy a4` and
-`ninfer_nvfp4_linear_swiglu_bench --policy a4`, cold weights (256 MiB flush), median of 30
+5090, `infernix_nvfp4_linear_add_bench --n 5120 --k 17408 --policy a4` and
+`infernix_nvfp4_linear_swiglu_bench --policy a4`, cold weights (256 MiB flush), median of 30
 repeats, mean of two passes in opposite variant order, us. Variants are (block tokens, block rows,
 block K, token warps, row warps, stages, minimum blocks per SM) of `Nvfp4A4MmaSchedule`; every
 variant keeps each output's K order, so all are bit-identical. The bench's medians move in steps of
@@ -446,7 +446,7 @@ MMAs.
 ## Where a full INT8 prompt chunk's attention time goes (no change made)
 
 Nsight Compute on the fast INT8 prompt kernel for one 3584-column chunk over 32K cached keys
-(RTX 5090, `ninfer_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4
+(RTX 5090, `infernix_causal_softmax_attention_bench --entry append --geometry d256-h24-kv4
 --kv-dtype int8 --tokens 3584 --context 32768 --fast-prompt`, eager, cold cache; 10.1 ms at the
 profiler's 2.36 GHz): the Tensor pipe is active in 55.6 % of cycles (FP16 HMMA for P×V 37.1 %,
 INT8 IMMA for QK 18.5 %) and issue slots are busy 50 % of the time. One eight-warp CTA fits an SM
@@ -675,7 +675,7 @@ did not pay (above).
 
 Perplexity sees one token's probability, so it cannot tell a small systematic shift from corpus
 noise: the bundled `ninfer-ppl-1m-v1` moves by up to 0.36 nats per token on single streams for any
-small numeric change. `ninfer-perplexity --save-top-tokens` and `--kl-reference` measure the
+small numeric change. `infernix-perplexity --save-top-tokens` and `--kl-reference` measure the
 distribution shift directly: the reference run (BF16 KV) records each scored position's 32 most
 probable tokens and their log-probabilities, and a test run scores exactly those candidates plus its
 own top-1 and reports KL(reference || test) over them and one bucket for all other tokens, by

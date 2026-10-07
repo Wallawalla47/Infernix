@@ -2,7 +2,7 @@
 
 #include "ops/common/memory.cuh"
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
@@ -130,4 +130,4 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                    "h"(kScaleThreadId));
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

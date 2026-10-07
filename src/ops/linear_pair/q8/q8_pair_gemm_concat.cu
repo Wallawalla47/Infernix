@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kRows   = 1024;
@@ -124,4 +124,4 @@ void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, const Tensor& x,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

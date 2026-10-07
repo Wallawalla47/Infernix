@@ -1,11 +1,11 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 
 #include "core/device.h"
-#include "ninfer/ops/scatter.h"
+#include "infernix/ops/scatter.h"
 
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
@@ -33,4 +33,4 @@ void scatter_shifted_visual_embeddings(Tensor& input_embeddings, const Tensor& v
     ops::scatter(embeddings, destination_indices, input_embeddings, stream);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

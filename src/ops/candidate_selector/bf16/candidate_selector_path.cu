@@ -4,11 +4,11 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/sampling_device.cuh"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_tree.h"
 #include <cuda_bf16.h>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 constexpr int kCandidates = 16, kRank = 256;
 
@@ -522,4 +522,4 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
     }
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

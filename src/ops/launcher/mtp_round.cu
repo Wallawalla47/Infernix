@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/mtp_round.h
+// Implements: include/infernix/ops/mtp_round.h
 // Match: K=1..63 verified drafts, followed by N=1..5 MTP drafts.
 #include "ops/launcher/mtp_round.h"
 
@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_anchors,
                                    const Tensor& accepted, const Tensor& updated_frontiers,
@@ -40,4 +40,4 @@ void mtp_prepare_next_round_launch(const Tensor& verify_ids, const Tensor& next_
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

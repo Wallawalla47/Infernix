@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
@@ -97,4 +97,4 @@ void kv_cache_append_nvfp4_batch_launch(const Tensor& k, const Tensor& v, const 
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

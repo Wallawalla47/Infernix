@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail::kimi_delta_attention {
+namespace infernix::ops::detail::kimi_delta_attention {
 
 inline constexpr int kStateDim         = 128;
 inline constexpr int kChunkSize        = 16;
@@ -69,4 +69,4 @@ void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace,
                              DeviceExecutionView execution);
 int chunk_value_tile(int value_heads, int multiprocessor_count);
 
-} // namespace ninfer::ops::detail::kimi_delta_attention
+} // namespace infernix::ops::detail::kimi_delta_attention

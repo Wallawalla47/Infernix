@@ -6,7 +6,7 @@
 #include <limits>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 [[noreturn]] void bad_request(std::string message, std::string param, std::string code) {
     ApiError error;
@@ -97,4 +97,4 @@ std::string ascii_preview(std::string_view value, std::size_t limit) {
     return out;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

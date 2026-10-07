@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one audited TTFT request graph against an already-running ninfer-serve."""
+"""Run one audited TTFT request graph against an already-running infernix-serve."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from tools.bench.ttft.cases import CASES, get_case, run_case
 from tools.bench.ttft.corpus import DEFAULT_MANIFEST, Corpus
 from tools.bench.ttft.diagnostics import attach_generation_diagnostics
 from tools.bench.ttft.execution import CaseContext
-from tools.ninfer_serve.client import NInferServeClient
+from tools.infernix_serve.client import InfernixServeClient
 
 
 _PROGRESS_STOP = object()
@@ -164,7 +164,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--case", required=True, choices=sorted(CASES))
     parser.add_argument("--profile-label", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=600.0)
-    parser.add_argument("--api-key-env", default="NINFER_API_KEY")
+    parser.add_argument("--api-key-env", default="INFERNIX_API_KEY")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
         "--request-log-jsonl", type=Path,
@@ -176,7 +176,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     definition = get_case(args.case)
     api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
-    client = NInferServeClient(args.base_url.rstrip("/"), args.timeout_seconds, api_key)
+    client = InfernixServeClient(args.base_url.rstrip("/"), args.timeout_seconds, api_key)
     started = dt.datetime.now(dt.timezone.utc).isoformat()
     progress = StderrProgress()
     progress.event(
@@ -214,7 +214,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 error=f"{type(error).__name__}: {error}",
             )
             result = {
-                "artifact_type": "ninfer_serve_ttft_run",
+                "artifact_type": "infernix_serve_ttft_run",
                 "schema_version": 1,
                 "case": definition.name,
                 "protocol": definition.protocol,

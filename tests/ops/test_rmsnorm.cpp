@@ -1,4 +1,4 @@
-#include "ninfer/ops/rmsnorm.h"
+#include "infernix/ops/rmsnorm.h"
 #include "ops/norm_test_common.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -9,9 +9,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::norm;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::norm;
 
 namespace {
 

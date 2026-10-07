@@ -14,8 +14,8 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_swiglu.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_swiglu.h"
 #include "ops/quantized_weight.h"
 #include "ops/op_tester.h"
 
@@ -31,8 +31,8 @@
 #include <vector>
 
 namespace {
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 quantized_weight::PackedWeight make_nvfp4(std::int32_t n, std::int32_t k, std::uint32_t seed) {
     quantized_weight::PatternedWeightOptions options;

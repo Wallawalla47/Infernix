@@ -1,4 +1,4 @@
-"""Convert explicitly selected local weights into a NInfer v3 artifact."""
+"""Convert explicitly selected local weights into a Infernix v3 artifact."""
 
 from __future__ import annotations
 
@@ -85,7 +85,7 @@ def _function(value: str):
         return RECIPES[value]
     filename, function = _recipe_parts(value)
     path = Path(filename).resolve()
-    spec = importlib.util.spec_from_file_location("ninfer_user_recipe", path)
+    spec = importlib.util.spec_from_file_location("infernix_user_recipe", path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot load recipe file {path}")
     module = importlib.util.module_from_spec(spec)
@@ -218,7 +218,7 @@ def main(argv=None):
             )
 
         provenance = {
-            "converter": "ninfer-v3",
+            "converter": "infernix-v3",
             "recipe": args.recipe,
             "sources": sources.provenance(),
         }

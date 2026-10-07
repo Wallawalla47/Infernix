@@ -15,7 +15,7 @@ ACTIVATION_POLICIES = frozenset(("A16Only", "AllowA8", "AllowA4"))
 
 
 class ArtifactError(ValueError):
-    """A directory or file does not satisfy the NInfer v3 contract."""
+    """A directory or file does not satisfy the Infernix v3 contract."""
 
 
 def integer(value: object, label: str, *, positive: bool = False) -> int:

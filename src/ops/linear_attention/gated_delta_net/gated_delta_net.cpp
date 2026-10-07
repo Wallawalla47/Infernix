@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_delta_net.h"
+#include "infernix/ops/gated_delta_net.h"
 
 #include "core/device.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 struct Geometry {
@@ -239,4 +239,4 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
     chunked::launch_recurrence(args, qk, control, execution);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

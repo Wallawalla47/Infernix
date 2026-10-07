@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/execution.h"
 
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Membership and fairness only. Native stores own every physical reservation.
 template <class Request>
@@ -269,4 +269,4 @@ private:
     bool restoration_event_        = false;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

@@ -9,7 +9,7 @@
 #include "ops/softmax_attention/common/causal_tree.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
           bool ParallelQueries = false, bool Tree = false>
@@ -293,12 +293,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 store_vec(&v_fp8[key_l * D + d], make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     int physical_page = block_table[first_page];
     issue_kv_tile(first_tile, physical_page);
-    ninfer::ops::cp_wait<0>();
+    infernix::ops::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -497,7 +497,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 }
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { infernix::ops::cp_wait<0>(); }
         __syncthreads();
     }
     // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
@@ -554,4 +554,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 }
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

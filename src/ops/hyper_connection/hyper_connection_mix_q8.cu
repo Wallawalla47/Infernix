@@ -30,7 +30,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -343,4 +343,4 @@ void hc_mix_q8(const Tensor& residual, const Tensor& norm_weight, const Weight& 
     check_launch("up collapse");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

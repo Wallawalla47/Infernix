@@ -16,7 +16,7 @@ any `--max-concurrency`; `--max-concurrency 1` is the simplest starting point:
 For example, an MTP artifact can use:
 
 ```sh
-build/apps/ninfer-serve /path/to/model.ninfer \
+build/apps/infernix-serve /path/to/model.ninfer \
   --max-concurrency 1 --spec mtp --draft-tokens 3 --lm-head-draft \
   --ngram-draft-tokens 15 --ngram-min-match 12
 ```
@@ -138,7 +138,7 @@ For a local single-owner server, opt in to a RAM-only archive:
 `--ngram-session-mib` (default 128) caps one conversation's share of the archive; without
 `--ngram-archive-mib` there is no archive and it has no effect.
 
-Requests identify a conversation with `X-NInfer-Draft-Session`. Without an identity,
+Requests identify a conversation with `X-Infernix-Draft-Session`. Without an identity,
 drafting remains request-local. Add `--ngram-native-sessions` to recognize Kilo's
 `x-session-affinity`, Codex's `client_metadata.thread_id`, and Claude's JSON-encoded
 `metadata.user_id.session_id`. This separate local opt-in permits draft retention
@@ -159,10 +159,10 @@ A single session admits one binding at a time: if two requests name the same con
 concurrently, one binds and the other falls back to request-local drafting; both still generate
 correctly.
 
-`X-NInfer-Draft-Reset: 1` clears the identified archive before a request and revokes
+`X-Infernix-Draft-Reset: 1` clears the identified archive before a request and revokes
 its old views/cursors. Restarting the Engine clears all archives. A new identity starts
 empty. Explicit-header clients can fork the parent's latest completed generation using
-`X-NInfer-Draft-Parent` and `X-NInfer-Draft-Generation`; a missing/stale parent or an
+`X-Infernix-Draft-Parent` and `X-Infernix-Draft-Generation`; a missing/stale parent or an
 already existing destination does not merge histories. Native client forks receive
 their own identity; inheritance is not guessed from similar prompts. Deleting a stored
 Responses object is separate from clearing a draft session.
@@ -171,8 +171,8 @@ counts. Clearing or evicting a session never recycles its number; clients must
 discard generation references when the server restarts.
 
 A successful publication reports its completed generation in the non-streaming
-`X-NInfer-Draft-Generation` response header. Streaming responses put the standard SSE
-comment `: ninfer-draft-generation: N` before their terminal event. Ordinary SSE
+`X-Infernix-Draft-Generation` response header. Streaming responses put the standard SSE
+comment `: infernix-draft-generation: N` before their terminal event. Ordinary SSE
 clients ignore this comment; explicit-fork clients can read it without access to
 server logs. No generation is advertised for unbound or unpublished requests.
 
@@ -209,7 +209,7 @@ Reasoning, novel code and short matches can leave little reusable text.
 Request statistics include `ngram_rounds`, `ngram_drafted_tokens` and
 `ngram_accepted_tokens` in addition to aggregate speculative statistics. A useful performance
 test must demonstrate accepted ngram proposals, not just successfully enabling an option.
-The product `ninfer_bench` accepts the same ngram flags and preserves these
+The product `infernix_bench` accepts the same ngram flags and preserves these
 counters in table, CSV and JSON reports. Its ordinary one-token decode seed is
 not a copy workload; see [benchmark guidance](../bench/README.md).
 
@@ -222,7 +222,7 @@ gain to another revision or configuration.
 
 ## Real-Artifact Checks
 
-`ninfer_ngram_lifecycle_real` uses `NINFER_NGRAM_TEST_WEIGHTS`. For example,
+`infernix_ngram_lifecycle_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS`. For example,
 `63 5 1 1 nvfp4 12 0 mtp` selects NG63, neural K5, CUDA Graphs, optimized proposal
 head, NVFP4 KV, minimum match 12, no additional soak and MTP. It checks retained
 device versus host-restored state, cancellation, queued isolation, output budgets,
@@ -231,7 +231,7 @@ bit-identical fresh-prefill and cached output. That separate diagnostic may retu
 2 on quantized paths, including upstream without ngram; all retained-state checks
 remain mandatory. It skips without the artifact environment variable.
 
-`ninfer_ngram_archive_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and takes the backend
+`infernix_ngram_archive_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS` and takes the backend
 (`mtp`, `dflash` or `dflash2`), optional graph mode (`0` or `1`) and optional
 concurrency (`1..8`). It exercises NG63/K5 source-absent regeneration, isolated and
 explicitly forked sessions, reset, cancellation/retry and publication generations with
@@ -241,7 +241,7 @@ distinct sessions, two concurrent forks of one source, a same-identity concurren
 on every lane. This greedy, thinking-disabled contract fixture is not an
 agent-performance benchmark. It skips without the artifact environment variable.
 
-`ninfer_ngram_thinking_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and accepts a backend,
+`infernix_ngram_thinking_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS` and accepts a backend,
 neural draft size and ngram draft size, for example `mtp 5 15`. It checks output and
 thinking budgets, forced control-token transitions, exact source-prefix answers,
 positive ngram acceptance, and token-identical consecutive cached repeats.
@@ -253,7 +253,7 @@ prefill/cache paths can already differ on upstream without ngram, including in
 reasoning text; this is distinct from cached-repeat determinism and budget correctness.
 Keep that diagnostic separate when comparing upstream and patched engines.
 
-`ninfer_ngram_stop_chat_real` uses the same artifact environment variable and accepts
+`infernix_ngram_stop_chat_real` uses the same artifact environment variable and accepts
 a backend and ngram draft size, for example `dflash2 15`. Neural draft size is five.
 It uses canonical assistant-prefilled copy requests, stops inside speculative rounds,
 and compares repeated retained continuations with equivalent output-limited ones.
@@ -263,7 +263,7 @@ the separate fresh-prefill identity diagnostic; natural stop tokens are allowed 
 end an answer before its maximum output budget. `--no-cuda-graph` selects eager
 execution. This test also skips without an artifact.
 
-`ninfer_ngram_concurrent_real` uses `NINFER_NGRAM_TEST_WEIGHTS` and takes a backend
+`infernix_ngram_concurrent_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS` and takes a backend
 (`mtp`, `dflash` or `dflash2`), an ngram draft width, and a concurrency. For example,
 `dflash2 15 5` matches the shipped DFlash2 serving configuration. It checks that a
 single-lane run on a concurrency>1 engine is token-identical to a graph-mode
@@ -278,5 +278,5 @@ mismatch. Passing width `0` runs the free-form pair with ngram disabled as a bas
 Cross-lane token identity is deliberately not required: batched lanes are prefetched
 independently and need not share every round, so a batch-size change alone can move a
 greedy near-tie (the ngram-disabled baseline diverges the same way).
-`NINFER_NGRAM_TEST_MAX_CONTEXT` (default 4096) and `NINFER_NGRAM_TEST_NO_GRAPH` adjust
+`INFERNIX_NGRAM_TEST_MAX_CONTEXT` (default 4096) and `INFERNIX_NGRAM_TEST_NO_GRAPH` adjust
 the shared-GPU footprint and graph mode.

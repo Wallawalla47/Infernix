@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 struct EncodeOptions {
     bool parse_added_tokens = true;
@@ -164,4 +164,4 @@ private:
     std::vector<int> default_stop_token_ids_;
 };
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

@@ -6,7 +6,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class Schedule>
@@ -109,4 +109,4 @@ void q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Wei
     launch_route<Schedule>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

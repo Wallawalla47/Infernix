@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 std::uint64_t random_seed() {
@@ -35,9 +35,9 @@ std::uint64_t random_seed() {
     throw ApiException(std::move(error));
 }
 
-ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
+infernix::SamplingOverrides resolve_sampling_overrides(const SamplingParams& request,
                                                      const ServeOptions& server) {
-    ninfer::SamplingOverrides sampling = server.sampling_overrides;
+    infernix::SamplingOverrides sampling = server.sampling_overrides;
     if (request.temperature) { sampling.temperature = static_cast<float>(*request.temperature); }
     if (request.top_p) { sampling.top_p = static_cast<float>(*request.top_p); }
     if (request.min_p) { sampling.min_p = static_cast<float>(*request.min_p); }
@@ -170,49 +170,49 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         result.enable_thinking = enables;
         switch (*effort) {
         case RequestedReasoningEffort::None:
-            result.reasoning_effort = ninfer::ReasoningEffort::None;
+            result.reasoning_effort = infernix::ReasoningEffort::None;
             break;
         case RequestedReasoningEffort::Minimal:
-            result.reasoning_effort = ninfer::ReasoningEffort::Minimal;
+            result.reasoning_effort = infernix::ReasoningEffort::Minimal;
             break;
         case RequestedReasoningEffort::Low:
-            result.reasoning_effort = ninfer::ReasoningEffort::Low;
+            result.reasoning_effort = infernix::ReasoningEffort::Low;
             break;
         case RequestedReasoningEffort::Medium:
-            result.reasoning_effort = ninfer::ReasoningEffort::Medium;
+            result.reasoning_effort = infernix::ReasoningEffort::Medium;
             break;
         case RequestedReasoningEffort::High:
-            result.reasoning_effort = ninfer::ReasoningEffort::High;
+            result.reasoning_effort = infernix::ReasoningEffort::High;
             break;
         case RequestedReasoningEffort::XHigh:
-            result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
+            result.reasoning_effort = infernix::ReasoningEffort::XHigh;
             break;
         case RequestedReasoningEffort::Max:
-            result.reasoning_effort = ninfer::ReasoningEffort::Max;
+            result.reasoning_effort = infernix::ReasoningEffort::Max;
             break;
         }
     }
     return result;
 }
 
-ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
+infernix::PromptInput to_prompt_input(const GenerationRequest& request,
                                     const ResolvedPromptSemantics& semantics,
                                     const MediaAcquirer& acquire_media) {
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.reserve(request.messages.size());
     for (std::size_t turn_index = 0; turn_index < request.messages.size(); ++turn_index) {
         const ChatTurn& turn = request.messages[turn_index];
-        ninfer::ChatMessage message;
+        infernix::ChatMessage message;
         message.role              = turn.role;
         message.reasoning_content = turn.reasoning_content;
         message.tool_call_id      = turn.tool_call_id;
         message.tool_calls.reserve(turn.tool_calls.size());
         for (const ToolCall& call : turn.tool_calls) {
-            message.tool_calls.push_back(ninfer::ToolCall{call.id, call.name, call.arguments_json});
+            message.tool_calls.push_back(infernix::ToolCall{call.id, call.name, call.arguments_json});
         }
 
         if (turn.role == ChatRole::Tool && turn.tool_result_is_error) {
-            ninfer::MessagePart error;
+            infernix::MessagePart error;
             error.text = "[tool_error]\n";
             message.parts.push_back(std::move(error));
         }
@@ -221,7 +221,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
         for (std::size_t part_index = 0; part_index < turn.content.size(); ++part_index) {
             const ContentPart& part = turn.content[part_index];
             if (part.kind == ContentKind::Text) {
-                ninfer::MessagePart text;
+                infernix::MessagePart text;
                 text.text = part.text;
                 message.parts.push_back(std::move(text));
                 if (part.text.size() > std::numeric_limits<std::uint32_t>::max() - text_bytes) {
@@ -232,8 +232,8 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                 if (!acquire_media) {
                     throw std::logic_error("media acquisition callback is not configured");
                 }
-                ninfer::MessagePart media;
-                media.kind  = ninfer::MessagePartKind::Media;
+                infernix::MessagePart media;
+                media.kind  = infernix::MessagePartKind::Media;
                 media.media = acquire_media(part);
                 message.parts.push_back(std::move(media));
             } else {
@@ -253,18 +253,18 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
                     (turn.role == ChatRole::System || turn.role == ChatRole::Developer) &&
                     part.kind == ContentKind::Text;
                 if (leading_instruction) {
-                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                    input.context_cache.markers.push_back(infernix::PromptCacheMarker{
                         .kind     = part.cache_boundary_after->kind,
                         .evidence = part.cache_boundary_after->evidence,
-                        .location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+                        .location = infernix::PromptCacheMarkerLocation::LeadingInstructionBoundary,
                         .leading_instruction_bytes = static_cast<std::uint32_t>(text_bytes),
                     });
                 } else {
-                    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+                    input.context_cache.markers.push_back(infernix::PromptCacheMarker{
                         .after_message_count = static_cast<std::uint32_t>(turn_index + 1U),
                         .kind                = part.cache_boundary_after->kind,
                         .evidence            = part.cache_boundary_after->evidence,
-                        .location = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                        .location = infernix::PromptCacheMarkerLocation::MessagePartBoundary,
                         .after_message_part_count =
                             static_cast<std::uint32_t>(message.parts.size()),
                     });
@@ -276,11 +276,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
             if (input.messages.size() > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::overflow_error("conversation cache boundary exceeds uint32");
             }
-            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            input.context_cache.markers.push_back(infernix::PromptCacheMarker{
                 .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
                 .kind                = turn.cache_boundary_after->kind,
                 .evidence            = turn.cache_boundary_after->evidence,
-                .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+                .location            = infernix::PromptCacheMarkerLocation::MessageBoundary,
             });
         }
     }
@@ -296,10 +296,10 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     for (std::size_t index = 0; index < tools.size(); ++index) {
         input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
         if (tools[index]->cache_boundary_after) {
-            input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            input.context_cache.markers.push_back(infernix::PromptCacheMarker{
                 .kind             = tools[index]->cache_boundary_after->kind,
                 .evidence         = tools[index]->cache_boundary_after->evidence,
-                .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                .location         = infernix::PromptCacheMarkerLocation::ToolBoundary,
                 .after_tool_count = static_cast<std::uint32_t>(index + 1U),
             });
         }
@@ -309,11 +309,11 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     return input;
 }
 
-ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+infernix::RequestOptions to_request_options(const GenerationRequest& request,
                                           const ServeOptions& server,
                                           const ResolvedPromptSemantics& semantics,
                                           bool allow_prefix_reuse) {
-    ninfer::RequestOptions options;
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = static_cast<std::uint32_t>(request.max_tokens);
     options.execution.allow_prefix_reuse      = allow_prefix_reuse;
     options.execution.readout_tokens          = request.readout_tokens;
@@ -336,13 +336,13 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     for (const std::string& stop : request.stop_strings) {
         if (!stop.empty()) {
             options.stop.strings.push_back(
-                ninfer::StopString{.text              = stop,
-                                   .channel           = ninfer::OutputChannel::Content,
+                infernix::StopString{.text              = stop,
+                                   .channel           = infernix::OutputChannel::Content,
                                    .include_in_output = false});
             if (request.stop_strings_apply_to_reasoning) {
                 options.stop.strings.push_back(
-                    ninfer::StopString{.text              = stop,
-                                       .channel           = ninfer::OutputChannel::Reasoning,
+                    infernix::StopString{.text              = stop,
+                                       .channel           = infernix::OutputChannel::Reasoning,
                                        .include_in_output = false});
             }
         }
@@ -350,4 +350,4 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     return options;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Bf16GdnGatingScheduleId {
     GemvPairedRows,
@@ -83,4 +83,4 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
                                    const Tensor& A_log, const Tensor& dt_bias, WorkspaceArena& ws,
                                    Tensor& g, Tensor& beta, DeviceExecutionView execution);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

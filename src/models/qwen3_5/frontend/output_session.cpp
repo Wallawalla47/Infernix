@@ -12,7 +12,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 namespace fi                                = frontend;
 constexpr std::string_view kThinkClose      = "</think>";
@@ -800,4 +800,4 @@ std::optional<std::string> OutputSession::matched_stop_string() const {
     return impl_->policy.strings[index].text;
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

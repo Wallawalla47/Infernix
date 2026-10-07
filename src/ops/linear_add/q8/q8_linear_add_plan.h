@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Q8LinearAddScheduleId {
     DecodeR16,
@@ -52,4 +52,4 @@ void q8_linear_add_execute_plan(const Q8LinearAddPlan& plan, const Tensor& x, co
 void q8_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_out,
                             cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

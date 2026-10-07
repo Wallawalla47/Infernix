@@ -4,7 +4,7 @@
 // (tools/convert/qwen4_exp.py); handles index the frozen Model's bound weights.
 
 #include "core/weight_view.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 
 #include <cstddef>
 #include <limits>
@@ -13,7 +13,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 struct WeightId {
     std::size_t index                          = std::numeric_limits<std::size_t>::max();
@@ -114,4 +114,4 @@ struct TextWeights {
     std::optional<VisionWeights> vision;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

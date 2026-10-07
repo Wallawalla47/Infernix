@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 RequestJson error_answer(const std::string& code, const std::string& message) {
@@ -84,7 +84,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
 
     struct QuestionRun {
         GenerationRequest generation;
-        std::vector<ninfer::MediaGeometry> media;
+        std::vector<infernix::MediaGeometry> media;
         std::optional<PreparedRequest> prepared;
         std::shared_ptr<RequestLifecycle> lifecycle;
         std::optional<RequestJson> answer;
@@ -112,7 +112,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
         try {
             run.prepared.emplace(service_->prepare(
                 run.generation, GenerationConsumerMode::Aggregate,
-                ninfer::GenerationObservationOptions{.phase_timings = true}, disconnected));
+                infernix::GenerationObservationOptions{.phase_timings = true}, disconnected));
             run.media = run.prepared->media;
             run.lifecycle = begin_request(make_request_log_context(
                 req_id, "decide", run.generation, metadata, *run.prepared));
@@ -138,7 +138,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             run.output_tokens   = schedule ? outcome.completion_tokens : 0;
             run.computed_tokens = outcome.metrics.computed_prefill_tokens;
             run.cached_tokens   = outcome.metrics.prefix_cache_hit_tokens;
-            if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+            if (outcome.finish_reason == infernix::FinishReason::Cancelled) {
                 run.error = ApiError{.status  = 499,
                                      .type    = "cancelled",
                                      .message = "the decision was cancelled",
@@ -222,4 +222,4 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
                     "application/json");
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

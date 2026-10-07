@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::vmm {
+namespace infernix::vmm {
 
 inline void check(CUresult result, const char* expr) {
     if (result == CUDA_SUCCESS) { return; }
@@ -62,4 +62,4 @@ inline void set_access(CUdeviceptr va, std::size_t bytes, int device) {
     check(cuMemSetAccess(va, bytes, &access, 1), "cuMemSetAccess");
 }
 
-} // namespace ninfer::vmm
+} // namespace infernix::vmm

@@ -1,6 +1,6 @@
 # Serve TTFT and scheduling benchmark
 
-The runner sends public HTTP requests to an already-running `ninfer-serve`. It records the whole
+The runner sends public HTTP requests to an already-running `infernix-serve`. It records the whole
 stream: first output, subsequent output events, completion, errors and cancellation. Optional
 structured Serve logs explain cache and scheduling actions. A separate campaign controller starts
 a fresh server for each sample and records its effective configuration.
@@ -140,7 +140,7 @@ and state; when comparing a baseline with separate pools, match its actual aggre
 `--device-state-slots` remains extra state capacity beyond active lanes.
 
 Before loading servers, the controller stages the selected immutable artifact once under
-`/dev/shm/ninfer-artifacts/`. It reuses that copy while the source identity is unchanged; insufficient
+`/dev/shm/infernix-artifacts/`. It reuses that copy while the source identity is unchanged; insufficient
 tmpfs space is an explicit error. Server warmup completes before measurement and does not populate
 the logical prefix cache.
 

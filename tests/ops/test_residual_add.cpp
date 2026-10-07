@@ -1,12 +1,12 @@
-#include "ninfer/ops/residual_add.h"
+#include "infernix/ops/residual_add.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

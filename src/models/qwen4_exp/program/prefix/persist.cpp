@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 namespace pc = runtime::prefix_cache;
 
@@ -412,4 +412,4 @@ PersistResult PrefixCache::load(const std::filesystem::path& path, std::string_v
     return out;
 }
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

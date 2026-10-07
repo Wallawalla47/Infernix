@@ -5,8 +5,8 @@
 
 #include "core/paged_kv_cache.h"
 #include "kv_cache_vq_reference.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -20,8 +20,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 
@@ -67,7 +67,7 @@ double best_word_distance(const std::array<double, 8>& u) {
         double flip_cost = 1e300;
         int flip         = -1;
         for (int j = 0; j < 8; ++j) {
-            const int v = ninfer::ops::kKVCacheVq2Codebook[8 * p + j];
+            const int v = infernix::ops::kKVCacheVq2Codebook[8 * p + j];
             levels[j]   = u[j] < 0.0 ? -v : v;
             const double cost = std::abs(u[j]) * v;
             if (cost < flip_cost) {

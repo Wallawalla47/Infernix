@@ -23,7 +23,7 @@
 
 #include <cerrno>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 namespace {
 
 void cuda_require(cudaError_t error, const char* what) {
@@ -203,4 +203,4 @@ void CpuMissService::serve() {
     }
 }
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

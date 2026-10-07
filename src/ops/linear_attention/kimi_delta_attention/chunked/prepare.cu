@@ -3,7 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 
-namespace ninfer::ops::detail::kimi_delta_attention {
+namespace infernix::ops::detail::kimi_delta_attention {
 namespace {
 
 struct PrepareShared {
@@ -182,4 +182,4 @@ void launch_prepare(const Arguments& args, Chunk* workspace, cudaStream_t stream
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail::kimi_delta_attention
+} // namespace infernix::ops::detail::kimi_delta_attention

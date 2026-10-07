@@ -107,7 +107,7 @@ cudaError_t CUDARTAPI __wrap_cudaStreamSynchronize(cudaStream_t stream) {
 }
 #endif // _WIN32
 
-namespace ninfer::test {
+namespace infernix::test {
 
 #ifdef _WIN32
 // Without the linker's --wrap rewriting the CUDA calls cannot be intercepted, so the fault
@@ -155,4 +155,4 @@ void materialization_cuda_errors(DeviceContext& device) {
 }
 #endif // _WIN32
 
-} // namespace ninfer::test
+} // namespace infernix::test

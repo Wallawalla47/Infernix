@@ -626,7 +626,7 @@ def render_markdown(summary: dict[str, Any]) -> str:
     campaign = summary["campaign"]
     coverage = summary["coverage"]
     lines = [
-        "# NInfer Serve TTFT campaign summary",
+        "# Infernix Serve TTFT campaign summary",
         "",
         "This report summarizes externally observed HTTP time-to-first-token. Case names describe",
         "the constructed workload; the report does not infer private cache actions from latency.",

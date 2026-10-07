@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 [[nodiscard]] NgramSessionHints resolve_ngram_session(const httplib::Request& request,
                                                       const RequestJson& body,
@@ -81,4 +81,4 @@ void configure_http_server_socket(socket_t socket) noexcept;
 void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

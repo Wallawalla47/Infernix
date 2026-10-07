@@ -1,4 +1,4 @@
-# NInfer Persistent Storage Layouts
+# Infernix Persistent Storage Layouts
 
 This reference records the persistent tensor layouts and resource encoding used by current
 `.ninfer` artifacts, including alignment, byte order, padding, encoded-size rules, and logical

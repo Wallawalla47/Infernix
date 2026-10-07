@@ -1,6 +1,6 @@
 # Weight conversion
 
-NInfer's converter creates `.ninfer` artifacts from local weights and a Python recipe. A recipe
+Infernix's converter creates `.ninfer` artifacts from local weights and a Python recipe. A recipe
 can reuse an official conversion, change selected layers or projections, combine sources, or call
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
 logical bindings and frontend resources.
@@ -11,7 +11,7 @@ Run the commands below from the repository root.
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
 and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
-[rebuild NInfer](../README.md#quick-start), then run with Python 3.11:
+[rebuild Infernix](../README.md#quick-start), then run with Python 3.11:
 
 ```bash
 python3 tools/upgrade_ninfer_v2_to_v3.py \
@@ -84,7 +84,7 @@ python3 -m tools.convert \
   --out models/qwen3_8_27b_q6.ninfer
 ```
 
-Measured with `ninfer-perplexity` over a 47,917-token corpus at `--context 4096 --stride 2048`
+Measured with `infernix-perplexity` over a 47,917-token corpus at `--context 4096 --stride 2048`
 with `--kv-dtype int8`, this artifact scores 1.520765 against 1.524538 for `qwen3_8_27b` and
 1.530857 for `qwen3_8_27b_nvfp4`.
 
@@ -516,7 +516,7 @@ and explicit application/request settings.
 The default maximum file size is 32,000,000,000 bytes, including framing. Smaller artifacts remain
 one file. Larger artifacts use an entry such as `models/my_qwen.ninfer` plus
 `my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on in the same directory. Pass only the
-entry path to NInfer and keep all its recorded parts together. `--max-file-bytes` changes the limit.
+entry path to Infernix and keep all its recorded parts together. `--max-file-bytes` changes the limit.
 
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.

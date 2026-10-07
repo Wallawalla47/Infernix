@@ -12,9 +12,9 @@
 
 namespace {
 
-using Usage = ninfer::runtime::ContextResourceUsage;
+using Usage = infernix::runtime::ContextResourceUsage;
 using Key   = std::vector<std::uint32_t>;
-using Role  = ninfer::runtime::CheckpointRole;
+using Role  = infernix::runtime::CheckpointRole;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -55,8 +55,8 @@ struct Base {
 struct Source {
     std::optional<Handle> checkpoint;
     std::uint32_t reused_tokens = 0;
-    ninfer::runtime::PrefillWork remaining_work;
-    std::vector<ninfer::runtime::ContextTransferRequirement> transfers;
+    infernix::runtime::PrefillWork remaining_work;
+    std::vector<infernix::runtime::ContextTransferRequirement> transfers;
     bool consume_private = false;
     std::vector<Handle> private_points;
 };
@@ -242,7 +242,7 @@ struct Program {
             const auto footprint = checkpoint_footprint({&*handle, 1});
             if (footprint.host_bytes) {
                 source.transfers.push_back({
-                    .direction = ninfer::runtime::ContextTransferDirection::HostToDevice,
+                    .direction = infernix::runtime::ContextTransferDirection::HostToDevice,
                     .work      = {.payload_bytes = footprint.host_bytes},
                 });
             }
@@ -524,7 +524,7 @@ struct Model {
 };
 
 struct Fixture {
-    using Cache = ninfer::runtime::ResourceManager<Model>;
+    using Cache = infernix::runtime::ResourceManager<Model>;
     using Token = Cache::OwnerToken;
     Program program;
     Cache cache;
@@ -532,7 +532,7 @@ struct Fixture {
 
     explicit Fixture(std::size_t capacity)
         : program{.host_capacity = capacity},
-          cache(true, {.prefill = {.token_ns_q32 = ninfer::runtime::kContextCostQ32One}}) {}
+          cache(true, {.prefill = {.token_ns_q32 = infernix::runtime::kContextCostQ32One}}) {}
 
     Cache::SourceChoice source(const Base& base, std::optional<Handle> desired,
                                std::optional<Token> resume = {}) {
@@ -812,7 +812,7 @@ void test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity() {
     f.publish(first);
     f.publish(second);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{first} &&
                 f.program.demoted == std::vector<Handle>{source} &&
                 f.program.valid_checkpoint(second),
@@ -825,10 +825,10 @@ void test_reclaim_respects_native_lease_and_stops_host_eviction_at_capacity() {
     pinned.publish(available);
     pinned.program.contents[leased.index].evictable = false;
     require(pinned.cache.reclaim(pinned.program, {.state_slots = 1}, {&available, 1}) ==
-                ninfer::runtime::ReclaimProgress::Blocked,
+                infernix::runtime::ReclaimProgress::Blocked,
             "reclaim removed an excluded or pinned Native checkpoint");
     require(pinned.cache.reclaim(pinned.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 pinned.program.released == std::vector<Handle>{available},
             "reclaim failed to release the available unpinned history");
 }
@@ -961,7 +961,7 @@ void test_one_off_fanout_competes_with_repeated_continuation() {
     const auto released_before = f.program.released.size();
     require(
         f.cache.reclaim(f.program, {.host_bytes = 16}, {}, cursor) ==
-                ninfer::runtime::ReclaimProgress::Changed &&
+                infernix::runtime::ReclaimProgress::Changed &&
             f.program.released.size() == released_before + 1 && f.program.released.back() == slow &&
             f.program.physical_usage().occupied.host_bytes == 48 &&
             f.program.valid_checkpoint(parent) && f.program.valid_checkpoint(fast) &&
@@ -979,13 +979,13 @@ void test_reclaim_cursor_keeps_order_across_hits_and_transfers() {
     auto cursor                    = f.cache.begin_reclaim(f.program);
     f.program.transfer_in_progress = true;
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Transferring &&
+                    infernix::runtime::ReclaimProgress::Transferring &&
                 f.program.released.empty(),
             "an in-flight transfer restarted or consumed the fixed reclaim decision");
     f.program.transfer_in_progress = false;
     f.use_shared(first);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{first} &&
                 f.program.valid_checkpoint(second),
             "a hit during the decision reordered its fixed victim list");
@@ -999,15 +999,15 @@ void test_reclaim_cursor_reconsiders_a_previously_excluded_source() {
     f.publish(other);
     auto cursor = f.cache.begin_reclaim(f.program);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {&source, 1}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{other},
             "reclaim deleted its current source");
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>({other, source}),
             "root fallback could not reclaim the preceding candidate's excluded source");
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                ninfer::runtime::ReclaimProgress::Blocked,
+                infernix::runtime::ReclaimProgress::Blocked,
             "completed physical reclamation manufactured further progress");
 }
 
@@ -1022,15 +1022,15 @@ void test_reclaim_cursor_filters_retired_handles_and_defers_new_history() {
     const auto later = f.program.add({3});
     f.publish(later);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>({retired, retained}),
             "fixed reclaim decision dereferenced a retired native handle");
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Blocked &&
+                    infernix::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(later),
             "fixed reclaim decision silently expanded to newly published history");
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(later),
             "a new necessary-execution decision omitted newly available history");
 }
@@ -1045,15 +1045,15 @@ void test_reclaim_cursor_can_demote_remaining_pages_of_the_same_history() {
     f.publish(history);
     auto cursor = f.cache.begin_reclaim(f.program);
     require(f.cache.reclaim(f.program, {.main_kv_pages = 2}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 3,
             "first finite demotion did not release only its required pages");
     require(f.cache.reclaim(f.program, {.main_kv_pages = 3}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 content.main_pages == 0 && f.program.physical_usage().occupied.host_bytes == 20,
             "later shortage could not demote the remaining pages of the same history");
     require(f.cache.reclaim(f.program, {.main_kv_pages = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Blocked &&
+                    infernix::runtime::ReclaimProgress::Blocked &&
                 content.alive && f.program.demoted.size() == 2,
             "already migrated physical content was copied or deleted again");
 }
@@ -1074,7 +1074,7 @@ void test_reclaim_cursor_keeps_host_writeback_permissions() {
     auto cursor = f.cache.begin_reclaim(f.program);
     f.use_shared(donor);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demoted == std::vector<Handle>{incoming} &&
                 f.program.released == std::vector<Handle>{donor} &&
                 f.program.valid_checkpoint(protected_host),
@@ -1091,7 +1091,7 @@ void test_reclaim_cursor_keeps_host_writeback_permissions() {
     auto cold_cursor = cold.cache.begin_reclaim(cold.program);
     cold.use_shared(source);
     require(cold.cache.reclaim(cold.program, {.state_slots = 1}, {}, cold_cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 cold.program.demoted.empty() &&
                 cold.program.released == std::vector<Handle>{source} &&
                 cold.program.valid_checkpoint(hot),
@@ -1109,7 +1109,7 @@ void test_failed_demotion_keeps_scanning_independent_history() {
     f.program.contents[blocked.index].release_blocked  = true;
     f.program.contents[blocked.index].demotion_blocked = true;
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demoted == std::vector<Handle>{next} &&
                 f.program.contents[blocked.index].alive && f.program.released.empty(),
             "one blocked demotion prevented independent writeback or discarded its history");
@@ -1127,12 +1127,12 @@ void test_failed_demotion_reports_prior_host_release() {
     f.program.contents[incoming.index].release_blocked  = true;
     f.program.contents[incoming.index].demotion_blocked = true;
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.released == std::vector<Handle>{victim} &&
                 f.program.contents[incoming.index].alive && f.program.demoted.empty(),
             "failed destination allocation hid a completed Host capacity release");
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                ninfer::runtime::ReclaimProgress::Blocked,
+                infernix::runtime::ReclaimProgress::Blocked,
             "unchanged failed demotion manufactured another capacity event");
 }
 
@@ -1155,12 +1155,12 @@ void test_necessary_execution_preserves_long_recovery_across_one_off_requests() 
     f.publish(short_history);
     require(
         f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                ninfer::runtime::ReclaimProgress::Changed &&
+                infernix::runtime::ReclaimProgress::Changed &&
             !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(input),
         "necessary execution discarded the long input instead of its one-token endpoint extension");
     for (std::uint32_t request = 0; request < 4; ++request) {
         require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                        ninfer::runtime::ReclaimProgress::Changed &&
+                        infernix::runtime::ReclaimProgress::Changed &&
                     !f.program.valid_checkpoint(short_history) && f.program.valid_checkpoint(input),
                 "one-off short requests displaced the last long recovery point");
         short_history = f.program.add(tokens(3, 2000 + 10 * request));
@@ -1168,7 +1168,7 @@ void test_necessary_execution_preserves_long_recovery_across_one_off_requests() 
     }
     require(f.cache.erase(f.program, short_history), "could not retire final interference history");
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(input),
             "ordinary recovery value became a pin against necessary execution");
 }
@@ -1206,12 +1206,12 @@ void test_optional_capture_does_not_inherit_required_eviction_rights() {
     const auto admission = f.cache.capture_admission(f.program, 0, shorter, 3);
     auto cursor          = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Blocked &&
+                    infernix::runtime::ReclaimProgress::Blocked &&
                 !f.cache.host_victims(f.program, 64, {}, {}, {}, admission) &&
                 f.program.valid_checkpoint(long_history),
             "optional short capture erased more recovery work than it added");
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                ninfer::runtime::ReclaimProgress::Changed,
+                infernix::runtime::ReclaimProgress::Changed,
             "necessary execution accidentally inherited optional admission restrictions");
 }
 
@@ -1249,7 +1249,7 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     require(admission.priority.reused, "two completed requests failed to qualify new demand");
     auto cursor = f.cache.begin_reclaim(f.program, admission);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cursor) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(old),
             "old long history permanently excluded the repeated short working set");
     const Base old_input{.tokens = tokens(100)};
@@ -1261,7 +1261,7 @@ void test_committed_repeated_demand_admits_a_new_short_working_set() {
     auto cold =
         f.cache.begin_reclaim(f.program, f.cache.capture_admission(f.program, 0, unrelated, 1));
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, cold) ==
-                ninfer::runtime::ReclaimProgress::Blocked,
+                infernix::runtime::ReclaimProgress::Blocked,
             "publishing the newly learned Shared point lost its actual demand evidence");
 }
 
@@ -1280,7 +1280,7 @@ void test_optional_capture_budget_spans_host_and_device_actions() {
             "first Host action did not fit optional capture's recovery budget");
     f.cache.commit_host_victims(f.program, *host_victims, decision);
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, decision) ==
-                    ninfer::runtime::ReclaimProgress::Blocked &&
+                    infernix::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(device),
             "optional capture spent its full recovery benefit again on a second resource pool");
 }
@@ -1384,7 +1384,7 @@ void test_demotion_competes_with_its_actual_host_recovery_loss() {
     f.publish(device);
     f.publish(host);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(device) && f.program.valid_checkpoint(host) &&
                 f.program.valid_checkpoint(movable) && f.program.demoted.empty(),
             "zero-loss Device quote hid a more expensive Host history deletion");
@@ -1401,7 +1401,7 @@ void test_adjacent_kv_demotions_share_one_submission() {
     f.publish(first);
     f.publish(second);
     require(f.cache.reclaim(f.program, {.main_kv_pages = 4}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions ==
                     std::vector<std::vector<Handle>>{{first, second}} &&
                 f.program.contents[first.index].main_pages == 0 &&
@@ -1424,7 +1424,7 @@ void test_kv_demotion_batch_stops_at_an_intervening_delete() {
     f.publish(later);
     f.publish(survivor);
     require(f.cache.reclaim(f.program, {.main_kv_pages = 3}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[later.index].main_pages == 1 && f.program.released.empty(),
             "KV transfer batching skipped an intervening lower-ranked delete");
@@ -1444,7 +1444,7 @@ void test_redundant_delete_does_not_split_a_kv_batch_and_remains_a_fallback() {
         f.publish(second);
         f.publish(survivor);
         require(f.cache.reclaim(f.program, {.main_kv_pages = 2}) ==
-                    ninfer::runtime::ReclaimProgress::Changed,
+                    infernix::runtime::ReclaimProgress::Changed,
                 "redundant-delete fixture failed to make legitimate reclamation progress");
         if (!reject_transfer) {
             require(f.program.demotion_submissions ==
@@ -1477,7 +1477,7 @@ void test_partially_covered_delete_still_stops_a_kv_batch() {
     f.publish(second);
     f.publish(survivor);
     require(f.cache.reclaim(f.program, {.main_kv_pages = 3}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[first.index].main_pages == 1 &&
                 f.program.contents[second.index].main_pages == 1 && f.program.released.empty(),
@@ -1494,7 +1494,7 @@ void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
         bounded.publish(handle);
     }
     require(bounded.cache.reclaim(bounded.program, {.main_kv_pages = 4}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 bounded.program.demotion_submissions ==
                     std::vector<std::vector<Handle>>{{first, second}} &&
                 bounded.program.contents[first.index].main_pages == 0 &&
@@ -1524,7 +1524,7 @@ void test_kv_demotion_batch_preserves_host_and_outer_permission_limits() {
         protected_owner.cache.capture_admission(protected_owner.program, 0, incoming, 1000, false);
     auto cursor = protected_owner.cache.begin_reclaim(protected_owner.program, admission);
     require(protected_owner.cache.reclaim(protected_owner.program, {.main_kv_pages = 2}, {},
-                                          cursor) == ninfer::runtime::ReclaimProgress::Changed &&
+                                          cursor) == infernix::runtime::ReclaimProgress::Changed &&
                 protected_owner.program.demotion_submissions.size() == 1 &&
                 protected_owner.program.demotion_submissions.front().size() == 1 &&
                 protected_owner.program.contents[replay.index].main_pages +
@@ -1548,7 +1548,7 @@ void test_failed_kv_demotion_batch_falls_back_without_host_deletion() {
     f.publish(second);
     f.publish(host);
     require(f.cache.reclaim(f.program, {.main_kv_pages = 2}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demotion_submissions == std::vector<std::vector<Handle>>{{first}} &&
                 f.program.contents[second.index].main_pages == 1 &&
                 f.program.valid_checkpoint(host) && f.program.released.empty() &&
@@ -1583,7 +1583,7 @@ void test_optional_capture_cannot_borrow_a_demotion_sources_heat() {
     // Deleting source costs 2000 tokens and exceeds this capture's gain. Moving source
     // would cost only the Host victim's 100 tokens, but must not borrow its hotter demand.
     require(f.cache.reclaim(f.program, {.state_slots = 1}, {}, decision) ==
-                    ninfer::runtime::ReclaimProgress::Blocked &&
+                    infernix::runtime::ReclaimProgress::Blocked &&
                 f.program.valid_checkpoint(host) && f.program.valid_checkpoint(source) &&
                 f.program.valid_checkpoint(newer) && f.program.released.empty() &&
                 f.program.demoted.empty(),
@@ -1604,7 +1604,7 @@ void test_unproven_suffix_can_retreat_without_losing_a_new_dialogue() {
     const auto newcomer = f.program.add(tokens(2079, 10000), {}, Role::Continuation);
     f.publish(newcomer);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(replay) &&
                 f.program.valid_checkpoint(newcomer),
             "an unproven suffix inherited absolute protection over another complete dialogue");
@@ -1626,7 +1626,7 @@ void test_free_host_preserves_an_unproven_suffix_instead_of_deleting_it() {
     f.publish(newcomer);
     const auto released_before = f.program.released.size();
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 f.program.demoted == std::vector<Handle>{endpoint} &&
                 f.program.released.size() == released_before &&
                 f.program.valid_checkpoint(newcomer),
@@ -1651,7 +1651,7 @@ void test_proven_deep_progress_survives_a_shallow_fallback_and_fork() {
     const auto cold = f.program.add(tokens(55000, 10000));
     f.publish(cold);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(cold) && f.program.valid_checkpoint(endpoint),
             "a shallow R32 was treated as coverage of actually adopted E4000 progress");
     const Base fork{.tokens = tokens(64),
@@ -1664,7 +1664,7 @@ void test_proven_deep_progress_survives_a_shallow_fallback_and_fork() {
     const auto another = f.program.add(tokens(55000, 70000));
     f.publish(another);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(another) && f.program.valid_checkpoint(endpoint),
             "a shallow Fork reset its unchanged donor's proven deep progress");
     const Base deep_fork{.tokens = tokens(4200),
@@ -1700,7 +1700,7 @@ void test_consuming_rewind_resets_proven_progress_to_the_adopted_prefix() {
     const auto other = f.program.add(tokens(1000, 10000));
     f.publish(other);
     require(f.cache.reclaim(f.program, {.state_slots = 1}) ==
-                    ninfer::runtime::ReclaimProgress::Changed &&
+                    infernix::runtime::ReclaimProgress::Changed &&
                 !f.program.valid_checkpoint(endpoint) && f.program.valid_checkpoint(other),
             "an abandoned deep branch remained the proof after a consuming rewind");
 }

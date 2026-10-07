@@ -42,7 +42,7 @@ class Corpus:
             self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as error:
             raise CorpusError(f"cannot read TTFT corpus manifest: {error}") from error
-        if self.manifest.get("artifact_type") != "ninfer_serve_ttft_corpus":
+        if self.manifest.get("artifact_type") != "infernix_serve_ttft_corpus":
             raise CorpusError("TTFT corpus has the wrong artifact_type")
         if self.manifest.get("schema_version") != 1:
             raise CorpusError("unsupported TTFT corpus schema_version")

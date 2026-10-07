@@ -1,7 +1,7 @@
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/softmax_attention.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
@@ -27,8 +27,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

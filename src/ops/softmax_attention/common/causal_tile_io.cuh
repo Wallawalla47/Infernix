@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class G>
 __device__ __forceinline__ std::int64_t causal_q_index(int head, int d, int token = 0) {
     return d + static_cast<std::int64_t>(G::kHeadDim) *
@@ -77,4 +77,4 @@ __device__ __forceinline__ int causal_probability_swizzle(int row, int col) {
     return causal_swizzle(row, col);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

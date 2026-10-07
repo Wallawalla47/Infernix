@@ -4,7 +4,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
@@ -37,7 +37,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // `Manager` selects the prefix-cache implementation: ResourceManager (the original
 // continuation/checkpoint cache) or HybridResourceManager
@@ -2399,6 +2399,6 @@ private:
     std::thread worker_;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime
 
 #include "runtime/engine/engine_metrics.inl"

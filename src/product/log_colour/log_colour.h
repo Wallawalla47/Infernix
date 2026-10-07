@@ -28,7 +28,7 @@
 #    include <unistd.h>
 #endif
 
-namespace ninfer::product::log_colour {
+namespace infernix::product::log_colour {
 
 // Rich 256-colour palette: 48 cube colours, ordered in three blocks of 16 so
 // each colourable family owns a whole block of one hue group and the three line
@@ -298,4 +298,4 @@ inline constexpr std::size_t kFamilySize        = kPalette.size() / kColorableFa
     return out;
 }
 
-} // namespace ninfer::product::log_colour
+} // namespace infernix::product::log_colour

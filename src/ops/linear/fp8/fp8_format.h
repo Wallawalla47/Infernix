@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Fp8WeightGeometry {
     std::uint64_t code_plane_bytes;
@@ -16,4 +16,4 @@ struct Fp8WeightGeometry {
 
 Fp8WeightGeometry validate_fp8_weight(const Weight& weight, const char* operation);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

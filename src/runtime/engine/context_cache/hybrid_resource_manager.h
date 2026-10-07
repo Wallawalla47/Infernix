@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/resource_manager.h"
@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Engine-side driver of the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md §8).
 // It presents the ResourceManager surface the Engine core uses, so scheduling, binding,
@@ -165,4 +165,4 @@ private:
     std::uint32_t prefetch_room_  = 0;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // How a query at position `query` of a call starting at `first` reads key `key`: 0 from its codes,
 // 1 from its window slot (when the slot's tag matches the stored codes), 2 from the call's staged
@@ -30,4 +30,4 @@ __device__ __forceinline__ std::int64_t vq_staged_row(const QsaVqWindow& w, int 
     return static_cast<std::int64_t>(kv_head) * w.staged_width + column;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

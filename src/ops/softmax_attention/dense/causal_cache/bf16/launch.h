@@ -1,9 +1,9 @@
 #pragma once
 
 #include "ops/softmax_attention/dense/causal_cache/bf16/operands.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // tree_masks is empty for causal rows or I32 [W,B] per-row ancestor masks (see
 // causal_softmax_attention).
@@ -18,4 +18,4 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, DeviceExecutionView execution);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr int kCausalPromptHeadDim = 256;
 
@@ -80,4 +80,4 @@ __global__ __launch_bounds__(kCausalPromptHeadDim) void causal_attention_prompt_
     out[index] = __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

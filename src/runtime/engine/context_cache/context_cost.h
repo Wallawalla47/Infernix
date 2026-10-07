@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/transfer_work.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/resources.h"
 
 #include <array>
@@ -13,7 +13,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 inline constexpr std::uint64_t kContextCostQ32One = 1ULL << 32U;
 
@@ -101,4 +101,4 @@ void upsert_context_prefill_cost_atomic(const std::filesystem::path& path,
                                         const ContextPrefillCost& prefill,
                                         std::string_view provenance_json);
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

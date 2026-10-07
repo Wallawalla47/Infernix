@@ -11,7 +11,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 constexpr std::array kBuckets{0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1,   0.25,  0.5,   1.0,
@@ -101,23 +101,23 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     out.imbue(std::locale::classic());
     out << std::setprecision(17);
     const auto header = [&](std::string_view name, std::string_view type, std::string_view help) {
-        out << "# HELP ninfer_" << name << ' ' << help << '\n'
-            << "# TYPE ninfer_" << name << ' ' << type << '\n';
+        out << "# HELP infernix_" << name << ' ' << help << '\n'
+            << "# TYPE infernix_" << name << ' ' << type << '\n';
     };
     const auto gauge = [&](std::string_view name, auto value, std::string_view help) {
         header(name, "gauge", help);
-        out << "ninfer_" << name << ' ' << value << '\n';
+        out << "infernix_" << name << ' ' << value << '\n';
     };
     const auto counter = [&](std::string_view name, auto current, auto baseline,
                              std::string_view help) {
         header(name, "counter", help);
-        out << "ninfer_" << name << ' ' << current - baseline << '\n';
+        out << "infernix_" << name << ' ' << current - baseline << '\n';
     };
     gauge("engine_ready", ready ? 1 : 0, "Whether Engine can accept work.");
     gauge("server_start_time_seconds", start_seconds_,
           "Unix time at service attachment after warmup.");
     header("model_info", "gauge", "Resident model and speculative backend.");
-    out << "ninfer_model_info{model_name=\"" << escape_label(model_) << "\",speculative_backend=\""
+    out << "infernix_model_info{model_name=\"" << escape_label(model_) << "\",speculative_backend=\""
         << product::speculative_backend_name(options_.speculative.backend) << "\"} 1\n";
     gauge("max_concurrency", options_.max_concurrency, "Maximum resident execution lanes.");
     gauge("max_context_tokens", options_.max_context, "Per-request logical context limit.");
@@ -192,7 +192,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     header("context_transfer_bytes_total", "counter", "Completed context payload transfers.");
     const auto transfer_bytes = [&](const char* resource, const char* direction, auto current,
                                     auto baseline) {
-        out << "ninfer_context_transfer_bytes_total{resource=\"" << resource << "\",direction=\""
+        out << "infernix_context_transfer_bytes_total{resource=\"" << resource << "\",direction=\""
             << direction << "\"} " << current - baseline << '\n';
     };
 #define TRANSFER(resource, prefix, direction)                                                      \
@@ -214,7 +214,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     header("host_work_seconds_total", "counter",
            "Exclusive Engine Host phases, excluding device waits.");
     const auto host = [&](std::string_view phase, std::uint64_t value, std::uint64_t baseline) {
-        out << "ninfer_host_work_seconds_total{phase=\"" << phase << "\"} "
+        out << "infernix_host_work_seconds_total{phase=\"" << phase << "\"} "
             << static_cast<double>(value - baseline) * 1e-9 << '\n';
     };
 #define HOST(field) host(#field, stats.host_work.field##_ns, baseline_.host_work.field##_ns)
@@ -232,7 +232,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     for (const auto& [outcome, count] : std::array{
              std::pair{"completed", requests.completed}, std::pair{"cancelled", requests.cancelled},
              std::pair{"failed", requests.failed}, std::pair{"rejected", requests.rejected}}) {
-        out << "ninfer_requests_total{outcome=\"" << outcome << "\"} " << count << '\n';
+        out << "infernix_requests_total{outcome=\"" << outcome << "\"} " << count << '\n';
     }
     counter("response_failures_total", requests.response_failures, 0U,
             "Response rendering, storage or transport failures after generation settlement.");
@@ -242,7 +242,7 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
         std::uint64_t count = 0;
         for (std::size_t i = 0; i < value.bins.size(); ++i) {
             count += value.bins[i];
-            out << "ninfer_" << name << "_bucket{le=\"";
+            out << "infernix_" << name << "_bucket{le=\"";
             if (i == kBuckets.size()) {
                 out << "+Inf";
             } else {
@@ -250,8 +250,8 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
             }
             out << "\"} " << count << '\n';
         }
-        out << "ninfer_" << name << "_sum " << value.sum << '\n'
-            << "ninfer_" << name << "_count " << count << '\n';
+        out << "infernix_" << name << "_sum " << value.sum << '\n'
+            << "infernix_" << name << "_count " << count << '\n';
     };
     histogram("time_to_first_token_seconds", requests.ttft,
               "Preparation through first committed token; observed once, before completion.");
@@ -262,4 +262,4 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     return out.str();
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

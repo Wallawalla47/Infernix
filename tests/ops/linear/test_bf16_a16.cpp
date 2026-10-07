@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -19,9 +19,9 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::direct_bf16_weight;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::direct_bf16_weight;
 
 constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 
@@ -491,7 +491,7 @@ int run_bf16_linear() {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

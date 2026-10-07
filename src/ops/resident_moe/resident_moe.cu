@@ -1,8 +1,8 @@
-// Resident routed experts (include/ninfer/ops/resident_moe.h). One CTA per (row tile, entry):
+// Resident routed experts (include/infernix/ops/resident_moe.h). One CTA per (row tile, entry):
 // each warp streams whole weight rows in 16-byte chunks against the entry's activation staged in
 // shared memory as FP32, applies each chunk's FP16 group scale once, and reduces by a fixed
 // butterfly, so an output's bits depend only on the shapes, never on the batch or placement.
-#include "ninfer/ops/resident_moe.h"
+#include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
 
@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -185,4 +185,4 @@ void resident_moe_experts(const Tensor& x, const Tensor& ids, const Weight& gate
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

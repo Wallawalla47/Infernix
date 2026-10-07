@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-namespace cost = ninfer::bench::context_cost;
+namespace cost = infernix::bench::context_cost;
 
 namespace {
 

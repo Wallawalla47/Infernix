@@ -12,7 +12,7 @@
 #include <mutex>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 // Stages an over-aligned (alignas(128)) CUtensorMap descriptor struct into device global memory
 // for a kernel launch on Windows, where MSVC cannot pass the struct by value as a
@@ -137,4 +137,4 @@ class TmaDescriptorStaging {
     std::size_t used_ = 0;
 };
 
-} // namespace ninfer
+} // namespace infernix

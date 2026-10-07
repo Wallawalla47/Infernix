@@ -11,7 +11,7 @@ import unittest
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 ROOT = Path(__file__).resolve().parents[2]
-RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
+RENDERER = ROOT / "build" / "tests" / "infernix_jinja_test"
 SOURCES = {
     version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
     for version in ("qwen3_6", "qwen3_8")

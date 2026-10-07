@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <std::int32_t OutputRows, std::int32_t InputRows>
 struct Fp8Geometry {
     static_assert(OutputRows > 0 && (OutputRows % 16) == 0);
@@ -60,4 +60,4 @@ inline Fp8GeometryId resolve_fp8_geometry(std::int32_t output_rows, std::int32_t
     throw std::invalid_argument("unsupported FP8 problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

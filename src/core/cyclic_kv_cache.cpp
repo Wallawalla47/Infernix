@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -173,4 +173,4 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
     }
 }
 
-} // namespace ninfer
+} // namespace infernix

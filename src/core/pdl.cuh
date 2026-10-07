@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::pdl {
+namespace infernix::pdl {
 
 struct LaunchConfig {
     dim3 grid;
@@ -118,4 +118,4 @@ __device__ __forceinline__ void enter() {
 // its CTAs exit.
 __device__ __forceinline__ void enter_streaming() { wait_for_dependencies(); }
 
-} // namespace ninfer::pdl
+} // namespace infernix::pdl

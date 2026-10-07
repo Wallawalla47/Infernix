@@ -7,7 +7,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 // A CTA owns eight heads of one token. Pair form uses four Q CTAs and one K CTA;
 // the single-K form uses one CTA. Each warp evaluates one complete head.
 template <bool Pair, class Coefficients = NativeRopeCoefficients>
@@ -93,4 +93,4 @@ __global__ __launch_bounds__(HeadsPerBlock * 32) void rmsnorm_rope_d256_text_ker
         detail::rmsnorm_rope_d256_rotate(normalized.pair[0], c0, c1, s0, s1, lane);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

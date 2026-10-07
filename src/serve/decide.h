@@ -22,7 +22,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 inline constexpr std::string_view kDecideSystemInstruction =
     "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. "
@@ -34,14 +34,14 @@ inline constexpr std::size_t kDecideMaximumOptions = 256;
 
 struct DecideLabel {
     std::string text;
-    ninfer::TokenId token = 0;
+    infernix::TokenId token = 0;
 };
 
 // Candidate labels A-Z, a-z, 0-9, then the uppercase bigrams AA-ZZ, in that order. A label is
 // admitted only when it encodes to exactly one token that no earlier label encodes to: a label
 // that splits (BQ is B then Q) would read another option's logit.
 [[nodiscard]] std::vector<DecideLabel>
-build_decide_alphabet(const std::function<std::vector<ninfer::TokenId>(std::string_view)>& encode);
+build_decide_alphabet(const std::function<std::vector<infernix::TokenId>(std::string_view)>& encode);
 
 enum class DecideKind : std::uint8_t {
     // Read at one position (nothing generated):
@@ -123,7 +123,7 @@ struct DecideRequest {
 // exp(logsumexp(logprobs)): the declared options' share of the whole next-token distribution.
 [[nodiscard]] double decide_answer_mass(std::span<const float> logprobs);
 
-using DecideEncoder = std::function<std::vector<ninfer::TokenId>(std::string_view)>;
+using DecideEncoder = std::function<std::vector<infernix::TokenId>(std::string_view)>;
 
 // One axis of a generated primitive: its name and the output steps holding its digits.
 struct DecideAxis {
@@ -135,16 +135,16 @@ struct DecideAxis {
 // The token schedule a generated question runs under and how its output is read. The opening
 // literal ({"x": and the like) is forced output, so the model sees the text ignis prefilled.
 struct DecideSchedule {
-    ninfer::TokenConstraint constraint;
+    infernix::TokenConstraint constraint;
     std::vector<DecideAxis> axes;
-    std::array<ninfer::TokenId, 10> digit_tokens{};
+    std::array<infernix::TokenId, 10> digit_tokens{};
     // Scalar only: the decimal point, the closing brace that ends the run, and the two openers
     // of the value: `":` before a positive number and `":-`, the one token the tokenizer writes
     // for a colon followed by a sign.
-    ninfer::TokenId point         = -1;
-    ninfer::TokenId terminator    = -1;
-    ninfer::TokenId colon         = -1;
-    ninfer::TokenId colon_negated = -1;
+    infernix::TokenId point         = -1;
+    infernix::TokenId terminator    = -1;
+    infernix::TokenId colon         = -1;
+    infernix::TokenId colon_negated = -1;
 };
 
 // The schedule for a generated question, from the loaded tokenizer. Every digit and structural
@@ -156,7 +156,7 @@ struct DecideSchedule {
 // `media` is the submitted media's display sizes, for point and box pixels.
 [[nodiscard]] RequestJson decide_generated_answer(const DecideQuestion& question,
                                                   const DecideSchedule& schedule,
-                                                  std::span<const ninfer::ConstrainedDraw> run,
-                                                  std::span<const ninfer::MediaGeometry> media);
+                                                  std::span<const infernix::ConstrainedDraw> run,
+                                                  std::span<const infernix::MediaGeometry> media);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

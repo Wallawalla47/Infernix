@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/gdn_replay_records.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_tree.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
 
@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net {
+namespace infernix::ops::detail::gated_delta_net {
 
 struct alignas(16) GdnReplayFoldKernelRow {
     std::int32_t source_state_slot;
@@ -56,4 +56,4 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
                         cudaStream_t stream);
 
-} // namespace ninfer::ops::detail::gated_delta_net
+} // namespace infernix::ops::detail::gated_delta_net

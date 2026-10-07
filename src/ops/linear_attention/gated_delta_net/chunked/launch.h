@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail::gated_delta_net::chunked {
+namespace infernix::ops::detail::gated_delta_net::chunked {
 
 inline constexpr int kChunkSize = 16;
 inline constexpr int kMinTokens = 16;
@@ -78,4 +78,4 @@ void launch_recurrence(const Arguments& args, const QkChunk* qk, const ControlCh
                        DeviceExecutionView execution);
 int value_tile(int value_heads, int multiprocessor_count);
 
-} // namespace ninfer::ops::detail::gated_delta_net::chunked
+} // namespace infernix::ops::detail::gated_delta_net::chunked

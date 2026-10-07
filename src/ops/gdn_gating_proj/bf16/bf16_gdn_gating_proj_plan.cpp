@@ -1,14 +1,14 @@
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
-#include "ninfer/ops/rmsnorm.h"
+#include "infernix/ops/rmsnorm.h"
 
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 inline constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -469,4 +469,4 @@ void bf16_gdn_norm_gating_dispatch(const Tensor& x, const Tensor& norm_weight, f
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

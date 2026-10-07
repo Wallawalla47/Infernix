@@ -5,7 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_simt_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kTargetRows    = 9216;
@@ -44,4 +44,4 @@ void q8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tens
     launch_route<kCompanionRows>(x, weight, output, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

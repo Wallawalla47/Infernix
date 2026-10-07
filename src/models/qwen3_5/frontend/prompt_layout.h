@@ -2,7 +2,7 @@
 
 #include "models/qwen3_5/frontend/chat_template.h"
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 struct MessageLayout {
     ChatRole role             = ChatRole::User;
@@ -27,4 +27,4 @@ unique_output_region(const text::TemplateOutput& rendered, std::uint32_t tag);
 [[nodiscard]] std::optional<std::size_t> source_boundary(const text::TemplateOutput& rendered,
                                                          std::uint32_t tag, std::size_t offset);
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

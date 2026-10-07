@@ -1,7 +1,7 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_instance_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // The Q8 MTP row-split projection. Same K as the 14336-row input projection, and the same
 // token ladder and schedules the fork measured for it on the old K-split templates.
@@ -40,4 +40,4 @@ Q8Launch select_q8_n17408_k5120(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

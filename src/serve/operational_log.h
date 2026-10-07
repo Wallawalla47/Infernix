@@ -12,7 +12,7 @@ namespace spdlog {
 class logger;
 }
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 enum class OperationalSeverity : std::uint8_t {
     Info,
@@ -72,4 +72,4 @@ private:
     std::shared_ptr<spdlog::logger> logger_;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

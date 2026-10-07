@@ -23,18 +23,18 @@
 namespace {
 
 struct PlannedCache {
-    ninfer::DeviceKVPagePoolLayout pages;
-    ninfer::KVExecutionTableLayout tables;
+    infernix::DeviceKVPagePoolLayout pages;
+    infernix::KVExecutionTableLayout tables;
     std::size_t bytes = 0;
 };
 
 PlannedCache plan_cache(std::uint32_t physical_pages, std::uint32_t logical_pages,
-                        std::int32_t rows, ninfer::KVPageGeometry geometry) {
-    ninfer::LayoutBuilder builder;
+                        std::int32_t rows, infernix::KVPageGeometry geometry) {
+    infernix::LayoutBuilder builder;
     PlannedCache out;
-    out.pages = ninfer::plan_device_kv_page_pool(
+    out.pages = infernix::plan_device_kv_page_pool(
         builder, {.page_group_count = physical_pages, .geometry = std::move(geometry)});
-    out.tables = ninfer::plan_kv_execution_tables(
+    out.tables = infernix::plan_kv_execution_tables(
         builder, {.logical_page_capacity = logical_pages, .table_rows = rows});
     out.bytes = builder.finish(256);
     return out;
@@ -55,24 +55,24 @@ int expect_size(std::size_t actual, std::size_t expected, const std::string& lab
                                           std::to_string(actual));
 }
 
-std::vector<ninfer::DeviceKVPageLease> materialize(ninfer::DeviceKVPagePool& pool,
+std::vector<infernix::DeviceKVPageLease> materialize(infernix::DeviceKVPagePool& pool,
                                                    std::uint32_t pages) {
-    std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(pages);
+    std::optional<infernix::DeviceKVPageReservation> reservation = pool.reserve(pages);
     if (!reservation) { throw std::bad_alloc(); }
-    std::vector<ninfer::DeviceKVPageLease> out;
+    std::vector<infernix::DeviceKVPageLease> out;
     out.reserve(pages);
     pool.materialize(*reservation, pages, out);
     return out;
 }
 
-std::vector<ninfer::DeviceKVPageHandle> handles(std::span<const ninfer::DeviceKVPageLease> pages) {
-    std::vector<ninfer::DeviceKVPageHandle> out;
+std::vector<infernix::DeviceKVPageHandle> handles(std::span<const infernix::DeviceKVPageLease> pages) {
+    std::vector<infernix::DeviceKVPageHandle> out;
     out.reserve(pages.size());
-    for (const ninfer::DeviceKVPageLease& page : pages) { out.push_back(page.handle()); }
+    for (const infernix::DeviceKVPageLease& page : pages) { out.push_back(page.handle()); }
     return out;
 }
 
-std::vector<std::int32_t> read_mapping(const ninfer::Tensor& row, std::size_t count) {
+std::vector<std::int32_t> read_mapping(const infernix::Tensor& row, std::size_t count) {
     std::vector<std::int32_t> out(count);
     const cudaError_t err =
         cudaMemcpy(out.data(), row.data, out.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost);
@@ -84,11 +84,11 @@ std::vector<std::int32_t> read_mapping(const ninfer::Tensor& row, std::size_t co
 }
 
 std::vector<std::vector<unsigned char>>
-fill_device_pool(ninfer::DeviceKVPagePool& pool, cudaStream_t stream, unsigned char seed = 0) {
+fill_device_pool(infernix::DeviceKVPagePool& pool, cudaStream_t stream, unsigned char seed = 0) {
     std::vector<std::vector<unsigned char>> bytes;
     bytes.reserve(pool.plane_count());
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
-        const ninfer::Tensor& plane = pool.plane(plane_index);
+        const infernix::Tensor& plane = pool.plane(plane_index);
         std::vector<unsigned char> host(plane.bytes());
         for (std::size_t index = 0; index < host.size(); ++index) {
             host[index] =
@@ -108,19 +108,19 @@ fill_device_pool(ninfer::DeviceKVPagePool& pool, cudaStream_t stream, unsigned c
 }
 
 std::vector<std::byte>
-expected_host_records(const ninfer::DeviceKVPagePool& pool,
+expected_host_records(const infernix::DeviceKVPagePool& pool,
                       std::span<const std::int32_t> physical_pages,
-                      const ninfer::HostKVPageLayout& host_layout,
+                      const infernix::HostKVPageLayout& host_layout,
                       const std::vector<std::vector<unsigned char>>& device_planes) {
     std::vector<std::byte> out(host_layout.page_stride * physical_pages.size(), std::byte{0});
     for (std::size_t logical = 0; logical < physical_pages.size(); ++logical) {
         const std::int32_t physical = physical_pages[logical];
         for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
-            const ninfer::Tensor& plane                 = pool.plane(plane_index);
-            const ninfer::HostKVPlaneLayout& host_plane = host_layout.planes[plane_index];
+            const infernix::Tensor& plane                 = pool.plane(plane_index);
+            const infernix::HostKVPlaneLayout& host_plane = host_layout.planes[plane_index];
             std::byte* destination =
                 out.data() + logical * host_layout.page_stride + host_plane.offset;
-            if (pool.geometry().device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor) {
+            if (pool.geometry().device_plane_order == infernix::PagedKVPlaneOrder::PageMajor) {
                 const unsigned char* source = device_planes[plane_index].data() +
                                               static_cast<std::size_t>(physical) * plane.nb[3];
                 std::memcpy(destination, source, host_plane.page_payload_bytes);
@@ -139,11 +139,11 @@ expected_host_records(const ninfer::DeviceKVPagePool& pool,
     return out;
 }
 
-bool page_payload_equal(ninfer::HostKVAllocationConstView left_view, std::uint32_t left,
-                        ninfer::HostKVAllocationConstView right_view, std::uint32_t right) {
-    const ninfer::HostKVPageLayout& layout = left_view.layout();
+bool page_payload_equal(infernix::HostKVAllocationConstView left_view, std::uint32_t left,
+                        infernix::HostKVAllocationConstView right_view, std::uint32_t right) {
+    const infernix::HostKVPageLayout& layout = left_view.layout();
     if (right_view.layout() != layout) { return false; }
-    for (const ninfer::HostKVPlaneLayout& plane : layout.planes) {
+    for (const infernix::HostKVPlaneLayout& plane : layout.planes) {
         const std::byte* a =
             left_view.data() + static_cast<std::size_t>(left) * layout.page_stride + plane.offset;
         const std::byte* b =
@@ -153,9 +153,9 @@ bool page_payload_equal(ninfer::HostKVAllocationConstView left_view, std::uint32
     return true;
 }
 
-bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t page) {
-    const ninfer::HostKVPageLayout& layout = view.layout();
-    for (const ninfer::HostKVPlaneLayout& plane : layout.planes) {
+bool page_payload_zero(infernix::HostKVAllocationConstView view, std::uint32_t page) {
+    const infernix::HostKVPageLayout& layout = view.layout();
+    for (const infernix::HostKVPlaneLayout& plane : layout.planes) {
         const std::byte* data =
             view.data() + static_cast<std::size_t>(page) * layout.page_stride + plane.offset;
         for (std::size_t index = 0; index < plane.page_payload_bytes; ++index) {
@@ -165,22 +165,22 @@ bool page_payload_zero(ninfer::HostKVAllocationConstView view, std::uint32_t pag
     return true;
 }
 
-int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
+int exercise_reservation_and_mapping(infernix::DeviceContext& context) {
     int failures = 0;
-    ninfer::KVPageGeometry geometry{
-        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    infernix::KVPageGeometry geometry{
+        .planes = {{infernix::DType::I8, 8, 2, 256}},
     };
     PlannedCache plan = plan_cache(4, 4, 1, geometry);
-    ninfer::DeviceArena arena(plan.bytes);
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    infernix::DeviceArena arena(plan.bytes);
+    infernix::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    infernix::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
 
-    std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(3);
+    std::optional<infernix::DeviceKVPageReservation> reservation = pool.reserve(3);
     failures += expect(reservation.has_value(), "three-page reservation failed");
     failures += expect_size(pool.reserved_pages(), 3, "reserved pages");
     failures += expect_size(pool.available_pages(), 1, "available after reserve");
 
-    std::vector<ninfer::DeviceKVPageLease> pages;
+    std::vector<infernix::DeviceKVPageLease> pages;
     pages.reserve(3);
     pool.materialize(*reservation, 2, pages);
     failures += expect_size(pool.allocated_pages(), 2, "allocated after materialize");
@@ -194,7 +194,7 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
         expect_size(pool.available_pages(), 1, "available capacity changed after dematerialize");
     pool.materialize(*reservation, 2, pages);
 
-    ninfer::KVExecutionRowLease row = tables.acquire(0);
+    infernix::KVExecutionRowLease row = tables.acquire(0);
     tables.publish(row.handle(), 0, pages, context.stream);
     context.synchronize();
     const std::vector<std::int32_t> mapping = read_mapping(tables.row(row.handle()), pages.size());
@@ -205,25 +205,25 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
 
     reservation->clear();
     failures += expect_size(pool.reserved_pages(), 0, "reservation clear");
-    const ninfer::DeviceKVPageHandle stale = pages.back().handle();
+    const infernix::DeviceKVPageHandle stale = pages.back().handle();
     pages.back().release();
     bool stale_rejected = false;
     try {
-        pool.zero_pages(std::span<const ninfer::DeviceKVPageHandle>(&stale, 1), context.stream);
+        pool.zero_pages(std::span<const infernix::DeviceKVPageHandle>(&stale, 1), context.stream);
     } catch (const std::invalid_argument&) { stale_rejected = true; }
     failures += expect(stale_rejected, "released page capability remained usable");
 
     PlannedCache other_plan = plan_cache(1, 1, 1, geometry);
-    ninfer::DeviceArena other_arena(other_plan.bytes);
-    ninfer::DeviceKVPagePool other({other_arena.base(), other_arena.capacity()}, other_plan.pages);
+    infernix::DeviceArena other_arena(other_plan.bytes);
+    infernix::DeviceKVPagePool other({other_arena.base(), other_arena.capacity()}, other_plan.pages);
     const std::uint32_t before                                = pool.reserved_pages();
-    const ninfer::DeviceKVPageReservationRequest impossible[] = {
+    const infernix::DeviceKVPageReservationRequest impossible[] = {
         {.pool = &pool, .pages = 2},
         {.pool = &other, .pages = 2},
     };
     bool bundle_failed = false;
     try {
-        auto unused = ninfer::reserve_device_kv_page_bundle(impossible);
+        auto unused = infernix::reserve_device_kv_page_bundle(impossible);
         (void)unused;
     } catch (const std::bad_alloc&) { bundle_failed = true; }
     failures += expect(bundle_failed, "impossible multi-pool reservation succeeded");
@@ -233,23 +233,23 @@ int exercise_reservation_and_mapping(ninfer::DeviceContext& context) {
 
 // An elastic pool (design §19.3.11): only pages below the backed limit are handed out, first fit keeps
 // them low, the limit rises freely and falls only over free pages.
-int exercise_backed_limit(ninfer::DeviceContext& context) {
+int exercise_backed_limit(infernix::DeviceContext& context) {
     int failures = 0;
-    ninfer::KVPageGeometry geometry{
-        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    infernix::KVPageGeometry geometry{
+        .planes = {{infernix::DType::I8, 8, 2, 256}},
     };
     PlannedCache plan = plan_cache(8, 8, 1, geometry);
-    ninfer::DeviceArena arena(plan.bytes);
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    infernix::DeviceArena arena(plan.bytes);
+    infernix::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    infernix::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
     failures += expect_size(pool.backed_pages(), 8, "a new pool backs its capacity");
 
     pool.set_backed_pages(3);
     failures += expect_size(pool.available_pages(), 3, "available under the limit");
     failures += expect(!pool.reserve(4).has_value(), "reservation past the backed limit succeeded");
-    std::optional<ninfer::DeviceKVPageReservation> first = pool.reserve(3);
+    std::optional<infernix::DeviceKVPageReservation> first = pool.reserve(3);
     failures += expect(first.has_value(), "reservation within the limit failed");
-    std::vector<ninfer::DeviceKVPageLease> low;
+    std::vector<infernix::DeviceKVPageLease> low;
     low.reserve(3);
     pool.materialize(*first, 3, low); // pages 0..2
     failures += expect(pool.can_back(3) && !pool.can_back(2), "can_back ignored pages in use");
@@ -261,15 +261,15 @@ int exercise_backed_limit(ninfer::DeviceContext& context) {
 
     pool.set_backed_pages(8);
     failures += expect_size(pool.available_pages(), 5, "available after growth");
-    std::optional<ninfer::DeviceKVPageReservation> second = pool.reserve(5);
+    std::optional<infernix::DeviceKVPageReservation> second = pool.reserve(5);
     failures += expect(second.has_value(), "reservation of the grown pages failed");
-    std::vector<ninfer::DeviceKVPageLease> high;
+    std::vector<infernix::DeviceKVPageLease> high;
     high.reserve(5);
     pool.materialize(*second, 5, high); // pages 3..7
 
-    ninfer::KVExecutionRowLease row = tables.acquire(0);
-    tables.publish(row.handle(), 0, std::span<const ninfer::DeviceKVPageLease>(low), context.stream);
-    tables.publish(row.handle(), 3, std::span<const ninfer::DeviceKVPageLease>(high), context.stream);
+    infernix::KVExecutionRowLease row = tables.acquire(0);
+    tables.publish(row.handle(), 0, std::span<const infernix::DeviceKVPageLease>(low), context.stream);
+    tables.publish(row.handle(), 3, std::span<const infernix::DeviceKVPageLease>(high), context.stream);
     context.synchronize();
     failures += expect(read_mapping(tables.row(row.handle()), 8) == std::vector<std::int32_t>({0, 1, 2, 3, 4, 5, 6, 7}),
                        "pages were not handed out lowest first across growth");
@@ -285,8 +285,8 @@ int exercise_backed_limit(ninfer::DeviceContext& context) {
     // A free page below a used one does not let the limit fall past the used one.
     pool.set_backed_pages(8);
     low.pop_back(); // frees page 2
-    std::optional<ninfer::DeviceKVPageReservation> third = pool.reserve(2);
-    std::vector<ninfer::DeviceKVPageLease> mid;
+    std::optional<infernix::DeviceKVPageReservation> third = pool.reserve(2);
+    std::vector<infernix::DeviceKVPageLease> mid;
     mid.reserve(2);
     pool.materialize(*third, 2, mid); // pages 2 and 3
     low.clear();                      // frees 0 and 1
@@ -301,10 +301,10 @@ int exercise_backed_limit(ninfer::DeviceContext& context) {
 
 // Chunks map and unmap individually anywhere in the reserved range and keep their addresses.
 int exercise_vmm_range() {
-    if (!ninfer::VmmArena::supported(0)) { return 0; }
+    if (!infernix::VmmArena::supported(0)) { return 0; }
     int failures            = 0;
     const std::size_t chunk = 2ULL << 20;
-    ninfer::VmmRange range(0, 4 * chunk, chunk);
+    infernix::VmmRange range(0, 4 * chunk, chunk);
     failures += expect_size(range.chunk_count(), 4, "VMM range chunk count");
     failures += expect_size(range.mapped_bytes(), 0, "a new VMM range maps nothing");
     auto* base = static_cast<std::byte*>(range.base());
@@ -331,28 +331,28 @@ void CUDART_CB hold_stream(void* milliseconds) {
 // A publication's copy reads the row's pinned shadow when the stream reaches it. Work queued
 // behind it must see that publication even when the row is released and republished by its next
 // owner before the stream gets there (an abort mid-prefill followed by the next admission).
-int exercise_republish_while_copy_queued(ninfer::DeviceContext& context) {
+int exercise_republish_while_copy_queued(infernix::DeviceContext& context) {
     int failures = 0;
-    ninfer::KVPageGeometry geometry{
-        .planes = {{ninfer::DType::I8, 8, 2, 256}},
+    infernix::KVPageGeometry geometry{
+        .planes = {{infernix::DType::I8, 8, 2, 256}},
     };
     PlannedCache plan = plan_cache(4, 4, 1, geometry);
-    ninfer::DeviceArena arena(plan.bytes);
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
-    std::optional<ninfer::DeviceKVPageReservation> reservation = pool.reserve(3);
-    std::vector<ninfer::DeviceKVPageLease> pages;
+    infernix::DeviceArena arena(plan.bytes);
+    infernix::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    infernix::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    std::optional<infernix::DeviceKVPageReservation> reservation = pool.reserve(3);
+    std::vector<infernix::DeviceKVPageLease> pages;
     pages.reserve(3);
     pool.materialize(*reservation, 3, pages);
-    const std::vector<ninfer::DeviceKVPageHandle> first{pages[0].handle(), pages[1].handle()};
-    const std::vector<ninfer::DeviceKVPageHandle> second{pages[2].handle(), pages[0].handle()};
+    const std::vector<infernix::DeviceKVPageHandle> first{pages[0].handle(), pages[1].handle()};
+    const std::vector<infernix::DeviceKVPageHandle> second{pages[2].handle(), pages[0].handle()};
 
     std::int32_t* observed = nullptr;
     if (cudaMalloc(&observed, 2 * sizeof(std::int32_t)) != cudaSuccess) {
         throw std::runtime_error("observation buffer allocation failed");
     }
-    ninfer::KVExecutionRowLease owner = tables.acquire(0);
-    const ninfer::Tensor device_row   = tables.row(owner.handle());
+    infernix::KVExecutionRowLease owner = tables.acquire(0);
+    const infernix::Tensor device_row   = tables.row(owner.handle());
     int hold_ms                       = 300;
     if (cudaLaunchHostFunc(context.stream, hold_stream, &hold_ms) != cudaSuccess) {
         throw std::runtime_error("stream hold failed");
@@ -364,7 +364,7 @@ int exercise_republish_while_copy_queued(ninfer::DeviceContext& context) {
         throw std::runtime_error("table observation failed");
     }
     owner.release();
-    ninfer::KVExecutionRowLease next = tables.acquire(0);
+    infernix::KVExecutionRowLease next = tables.acquire(0);
     tables.publish(next.handle(), 0, second, context.stream);
     context.synchronize();
 
@@ -383,7 +383,7 @@ int exercise_republish_while_copy_queued(ninfer::DeviceContext& context) {
     }
     tables.publish(next.handle(), 0, second, context.stream);
     const auto started = std::chrono::steady_clock::now();
-    tables.publish(next.handle(), 2, std::span<const ninfer::DeviceKVPageHandle>(first.data(), 1),
+    tables.publish(next.handle(), 2, std::span<const infernix::DeviceKVPageHandle>(first.data(), 1),
                    context.stream);
     const auto waited = std::chrono::steady_clock::now() - started;
     context.synchronize();
@@ -395,24 +395,24 @@ int exercise_republish_while_copy_queued(ninfer::DeviceContext& context) {
     return failures;
 }
 
-int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageGeometry geometry,
+int exercise_layout_and_transfer(infernix::DeviceContext& context, infernix::KVPageGeometry geometry,
                                  const std::string& label,
                                  const std::array<std::uint32_t, 4>& run_operations) {
     int failures                  = 0;
     PlannedCache source_plan      = plan_cache(10, 8, 2, geometry);
     PlannedCache destination_plan = plan_cache(10, 8, 1, geometry);
-    ninfer::DeviceArena source_arena(source_plan.bytes);
-    ninfer::DeviceArena destination_arena(destination_plan.bytes);
-    ninfer::DeviceKVPagePool source({source_arena.base(), source_arena.capacity()},
+    infernix::DeviceArena source_arena(source_plan.bytes);
+    infernix::DeviceArena destination_arena(destination_plan.bytes);
+    infernix::DeviceKVPagePool source({source_arena.base(), source_arena.capacity()},
                                     source_plan.pages);
-    ninfer::KVExecutionTablePool tables({source_arena.base(), source_arena.capacity()},
+    infernix::KVExecutionTablePool tables({source_arena.base(), source_arena.capacity()},
                                         source_plan.tables, source);
-    ninfer::DeviceKVPagePool destination({destination_arena.base(), destination_arena.capacity()},
+    infernix::DeviceKVPagePool destination({destination_arena.base(), destination_arena.capacity()},
                                          destination_plan.pages);
 
     failures += expect_size(source.plane_count(), geometry.planes.size(), label + " plane count");
-    const ninfer::Tensor& first_plane = source.plane(0);
-    if (geometry.device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor) {
+    const infernix::Tensor& first_plane = source.plane(0);
+    if (geometry.device_plane_order == infernix::PagedKVPlaneOrder::PageMajor) {
         failures += expect_size(first_plane.ne[2], geometry.planes[0].head_extent,
                                 label + " PageMajor heads");
         failures += expect_size(first_plane.ne[3], 10, label + " PageMajor pages");
@@ -422,12 +422,12 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                                 label + " HeadMajor heads");
     }
 
-    std::vector<ninfer::DeviceKVPageLease> prefix   = materialize(source, 3);
-    std::vector<ninfer::DeviceKVPageLease> blockers = materialize(source, 3);
+    std::vector<infernix::DeviceKVPageLease> prefix   = materialize(source, 3);
+    std::vector<infernix::DeviceKVPageLease> blockers = materialize(source, 3);
     prefix.clear();
-    std::vector<ninfer::DeviceKVPageLease> fragmented            = materialize(source, 5);
-    const std::vector<ninfer::DeviceKVPageHandle> source_handles = handles(fragmented);
-    ninfer::KVExecutionRowLease row                              = tables.acquire(1);
+    std::vector<infernix::DeviceKVPageLease> fragmented            = materialize(source, 5);
+    const std::vector<infernix::DeviceKVPageHandle> source_handles = handles(fragmented);
+    infernix::KVExecutionRowLease row                              = tables.acquire(1);
     tables.publish(row.handle(), 0, source_handles, context.stream);
     context.synchronize();
     const std::vector<std::int32_t> physical_mapping =
@@ -443,31 +443,31 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         fill_device_pool(source, context.stream);
     context.synchronize();
 
-    const ninfer::HostKVPageLayout host_layout =
-        ninfer::plan_host_kv_page_layout(source.geometry());
-    const ninfer::HostKVPageLayout layouts[] = {host_layout};
-    ninfer::HostContextArena host_backing(host_layout.page_stride * 24, host_layout.page_stride);
-    ninfer::HostKVArena host_arena(host_backing,
-                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+    const infernix::HostKVPageLayout host_layout =
+        infernix::plan_host_kv_page_layout(source.geometry());
+    const infernix::HostKVPageLayout layouts[] = {host_layout};
+    infernix::HostContextArena host_backing(host_layout.page_stride * 24, host_layout.page_stride);
+    infernix::HostKVArena host_arena(host_backing,
+                                   std::span<const infernix::HostKVPageLayout>(layouts));
     failures += expect(!host_arena.can_allocate(host_layout, 25),
                        label + " oversized Host extent was reported allocatable");
-    std::optional<ninfer::HostKVAllocation> host =
+    std::optional<infernix::HostKVAllocation> host =
         host_arena.allocate(host_layout, static_cast<std::uint32_t>(source_handles.size()));
     failures += expect(host.has_value(), label + " Host allocation failed");
-    ninfer::HostKVAllocationView host_view = host_arena.writable_view(*host);
+    infernix::HostKVAllocationView host_view = host_arena.writable_view(*host);
     std::memset(host_view.data(), 0, host_layout.page_stride * host_view.page_count());
     std::uint64_t page_payload = 0;
     for (const auto& plane : host_layout.planes) { page_payload += plane.page_payload_bytes; }
-    failures += expect(source.host_transfer_run_work(0) == ninfer::TransferWork{},
+    failures += expect(source.host_transfer_run_work(0) == infernix::TransferWork{},
                        label + " empty run has transfer work");
     for (std::uint32_t pages = 1; pages <= run_operations.size(); ++pages) {
         failures +=
             expect(source.host_transfer_run_work(pages) ==
-                       ninfer::TransferWork{page_payload * pages, run_operations[pages - 1]},
+                       infernix::TransferWork{page_payload * pages, run_operations[pages - 1]},
                    label + " contiguous-run quote differs from its physical copy work");
     }
     const auto export_work = source.copy_to_host(source_handles, host_view, context.stream);
-    failures += expect(export_work == ninfer::TransferWork{5 * page_payload,
+    failures += expect(export_work == infernix::TransferWork{5 * page_payload,
                                                            run_operations[2] + run_operations[1]},
                        label + " D2H work missed fragmentation or counts Host padding");
     context.synchronize();
@@ -477,13 +477,13 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     failures += expect(std::memcmp(host_view.data(), expected.data(), expected.size()) == 0,
                        label + " D2H canonical page records differ from Device payload");
 
-    std::vector<ninfer::DeviceKVPageLease> restored                = materialize(destination, 5);
-    const std::vector<ninfer::DeviceKVPageHandle> restored_handles = handles(restored);
+    std::vector<infernix::DeviceKVPageLease> restored                = materialize(destination, 5);
+    const std::vector<infernix::DeviceKVPageHandle> restored_handles = handles(restored);
     destination.zero_pages(restored_handles, context.stream);
     const auto restore_work =
         destination.copy_from_host(host_arena.view(*host), restored_handles, context.stream);
     failures +=
-        expect(restore_work == ninfer::TransferWork{5 * page_payload, run_operations.back()},
+        expect(restore_work == infernix::TransferWork{5 * page_payload, run_operations.back()},
                label + " H2D work differs from the submitted contiguous run");
 
     const std::array duplicate_destinations{restored[0].handle(), restored[0].handle()};
@@ -499,9 +499,9 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     } catch (const std::invalid_argument&) { duplicate_restore_rejected = true; }
     failures += expect(duplicate_restore_rejected, label + " duplicate H2D destination accepted");
 
-    std::optional<ninfer::HostKVAllocation> roundtrip = host_arena.allocate(host_layout, 5);
+    std::optional<infernix::HostKVAllocation> roundtrip = host_arena.allocate(host_layout, 5);
     failures += expect(roundtrip.has_value(), label + " roundtrip Host allocation failed");
-    ninfer::HostKVAllocationView roundtrip_view = host_arena.writable_view(*roundtrip);
+    infernix::HostKVAllocationView roundtrip_view = host_arena.writable_view(*roundtrip);
     std::memset(roundtrip_view.data(), 0, host_layout.page_stride * roundtrip_view.page_count());
     destination.copy_to_host(restored_handles, roundtrip_view, context.stream);
     context.synchronize();
@@ -510,21 +510,21 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
 
     const auto local_work =
         destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream);
-    const ninfer::TransferWork expected_local{page_payload,
+    const infernix::TransferWork expected_local{page_payload,
                                               static_cast<std::uint32_t>(geometry.planes.size())};
     failures +=
         expect(local_work == expected_local && destination.device_copy_work(1) == expected_local &&
-                   destination.device_copy_work(0) == ninfer::TransferWork{},
+                   destination.device_copy_work(0) == infernix::TransferWork{},
                label + " D2D work differs from one full page-group copy");
     failures += expect(destination.copy_page(restored[0].handle(), restored[0].handle(),
-                                             context.stream) == ninfer::TransferWork{},
+                                             context.stream) == infernix::TransferWork{},
                        label + " D2D self-copy must submit no work");
     // Record-addressed copies into caller-owned slabs (the hybrid prefix cache Host tier): records
     // 3, 4, 5 advance by one constant pitch larger than a page record and coalesce into one
     // strided run over consecutive physical pages; the rest are scattered and descending.
     {
         const std::size_t pitch = host_layout.page_stride + 4096;
-        ninfer::PinnedHostBuffer slabs(pitch * 10);
+        infernix::PinnedHostBuffer slabs(pitch * 10);
         std::memset(slabs.data(), 0xa5, pitch * 10);
         auto* base = static_cast<std::byte*>(slabs.data());
         const std::array<std::size_t, 5> slab_of{3, 4, 5, 9, 0};
@@ -536,7 +536,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         // their 0xa5 fill there), as in every other Host record.
         bool records_match = true;
         for (std::size_t page = 0; page < records.size(); ++page) {
-            for (const ninfer::HostKVPlaneLayout& plane : host_layout.planes) {
+            for (const infernix::HostKVPlaneLayout& plane : host_layout.planes) {
                 records_match = records_match &&
                                 std::memcmp(records[page] + plane.offset,
                                             expected.data() + page * host_layout.page_stride +
@@ -548,15 +548,15 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         failures += expect(std::to_integer<unsigned>(*(base + 1 * pitch)) == 0xa5U,
                            label + " D2H records wrote an unselected slab");
 
-        std::vector<ninfer::DeviceKVPageLease> from_records          = materialize(destination, 5);
-        const std::vector<ninfer::DeviceKVPageHandle> record_handles = handles(from_records);
+        std::vector<infernix::DeviceKVPageLease> from_records          = materialize(destination, 5);
+        const std::vector<infernix::DeviceKVPageHandle> record_handles = handles(from_records);
         destination.zero_pages(record_handles, context.stream);
         std::vector<const std::byte*> const_records(records.begin(), records.end());
         destination.copy_from_host_records(const_records, {}, record_handles, host_layout,
                                            context.stream);
-        std::optional<ninfer::HostKVAllocation> record_roundtrip =
+        std::optional<infernix::HostKVAllocation> record_roundtrip =
             host_arena.allocate(host_layout, 5);
-        ninfer::HostKVAllocationView record_view = host_arena.writable_view(*record_roundtrip);
+        infernix::HostKVAllocationView record_view = host_arena.writable_view(*record_roundtrip);
         std::memset(record_view.data(), 0, host_layout.page_stride * 5);
         destination.copy_to_host(record_handles, record_view, context.stream);
         context.synchronize();
@@ -592,8 +592,8 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         // Records in two separate pinned allocations (the hybrid Host tier pins its slabs in
         // chunks): consecutive pages whose records lie in different groups must not form one
         // strided transfer across both allocations, whatever the distance between them.
-        ninfer::PinnedHostBuffer first_chunk(host_layout.page_stride * 3);
-        ninfer::PinnedHostBuffer second_chunk(host_layout.page_stride * 2);
+        infernix::PinnedHostBuffer first_chunk(host_layout.page_stride * 3);
+        infernix::PinnedHostBuffer second_chunk(host_layout.page_stride * 2);
         auto* first_base  = static_cast<std::byte*>(first_chunk.data());
         auto* second_base = static_cast<std::byte*>(second_chunk.data());
         std::vector<std::byte*> split{first_base, first_base + host_layout.page_stride,
@@ -622,35 +622,35 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     }
 
     destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream);
-    const ninfer::DeviceKVPageHandle copied[] = {restored[0].handle(), restored[4].handle()};
-    std::optional<ninfer::HostKVAllocation> copied_host = host_arena.allocate(host_layout, 2);
-    ninfer::HostKVAllocationView copied_view            = host_arena.writable_view(*copied_host);
+    const infernix::DeviceKVPageHandle copied[] = {restored[0].handle(), restored[4].handle()};
+    std::optional<infernix::HostKVAllocation> copied_host = host_arena.allocate(host_layout, 2);
+    infernix::HostKVAllocationView copied_view            = host_arena.writable_view(*copied_host);
     std::memset(copied_view.data(), 0, host_layout.page_stride * 2);
     destination.copy_to_host(copied, copied_view, context.stream);
     context.synchronize();
-    const ninfer::HostKVAllocationConstView copied_contents = host_arena.view(*copied_host);
+    const infernix::HostKVAllocationConstView copied_contents = host_arena.view(*copied_host);
     failures += expect(page_payload_equal(copied_contents, 0, copied_contents, 1),
                        label + " D2D copy did not cover the complete page-group");
     failures += expect(page_payload_equal(copied_contents, 0, host_arena.view(*host), 0),
                        label + " D2D copy changed its source page");
 
-    const ninfer::DeviceKVPageHandle zeroed[] = {restored[1].handle()};
+    const infernix::DeviceKVPageHandle zeroed[] = {restored[1].handle()};
     destination.zero_pages(zeroed, context.stream);
-    const ninfer::DeviceKVPageHandle zero_observation[] = {restored[0].handle(),
+    const infernix::DeviceKVPageHandle zero_observation[] = {restored[0].handle(),
                                                            restored[1].handle()};
-    std::optional<ninfer::HostKVAllocation> zero_host   = host_arena.allocate(host_layout, 2);
-    ninfer::HostKVAllocationView zero_view              = host_arena.writable_view(*zero_host);
+    std::optional<infernix::HostKVAllocation> zero_host   = host_arena.allocate(host_layout, 2);
+    infernix::HostKVAllocationView zero_view              = host_arena.writable_view(*zero_host);
     std::memset(zero_view.data(), 0x5a, host_layout.page_stride * 2);
     destination.copy_to_host(zero_observation, zero_view, context.stream);
     context.synchronize();
-    const ninfer::HostKVAllocationConstView zero_contents = host_arena.view(*zero_host);
+    const infernix::HostKVAllocationConstView zero_contents = host_arena.view(*zero_host);
     failures += expect(page_payload_equal(zero_contents, 0, host_arena.view(*host), 0),
                        label + " selective zero changed an unselected page");
     failures += expect(page_payload_zero(zero_contents, 1),
                        label + " selective zero left page payload bytes");
 
     {
-        ninfer::KVExecutionTablePool destination_tables(
+        infernix::KVExecutionTablePool destination_tables(
             {destination_arena.base(), destination_arena.capacity()}, destination_plan.tables,
             destination);
         auto destination_row = destination_tables.acquire(0);
@@ -675,7 +675,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         const auto scattered_work = destination.copy_from_host(
             host_arena.view(*ordered_host).subview(1, 5), scattered, context.stream);
         failures += expect(scattered_work ==
-                               ninfer::TransferWork{5 * page_payload, 5 * run_operations.front()},
+                               infernix::TransferWork{5 * page_payload, 5 * run_operations.front()},
                            label + " scattered H2D work missed the single-page lowering");
         std::vector<std::vector<unsigned char>> observed_device(destination.plane_count());
         for (std::size_t index = 0; index < destination.plane_count(); ++index) {
@@ -695,7 +695,7 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                 const auto& plane          = destination.plane(index);
                 const auto& plane_geometry = geometry.planes[index];
                 const auto& host_plane     = host_layout.planes[index];
-                const auto element_bytes   = ninfer::dtype_size(plane_geometry.dtype);
+                const auto element_bytes   = infernix::dtype_size(plane_geometry.dtype);
                 const auto* canonical =
                     ordered_expected.data() + logical * host_layout.page_stride + host_plane.offset;
                 failures +=
@@ -705,10 +705,10 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            label + " stream-ordered D2H payload differs from its producer");
                 for (std::int32_t head = 0; head < plane_geometry.head_extent; ++head) {
                     const auto device_head =
-                        geometry.device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor
+                        geometry.device_plane_order == infernix::PagedKVPlaneOrder::PageMajor
                             ? head * plane.nb[2] + physical * plane.nb[3]
                             : physical * plane.nb[2] + head * plane.nb[3];
-                    for (std::int32_t token = 0; token < ninfer::kPagedKVPageSize; ++token) {
+                    for (std::int32_t token = 0; token < infernix::kPagedKVPageSize; ++token) {
                         for (std::int32_t element = 0; element < plane_geometry.leading_extent;
                              ++element) {
                             for (std::size_t byte = 0; byte < element_bytes; ++byte) {
@@ -738,16 +738,16 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
                            label + " Host transfer overwrote a page outside its subview");
     }
 
-    std::optional<ninfer::HostKVAllocation> split_source = host_arena.allocate(host_layout, 4);
+    std::optional<infernix::HostKVAllocation> split_source = host_arena.allocate(host_layout, 4);
     failures += expect(split_source.has_value(), label + " split source allocation failed");
-    ninfer::HostKVAllocationView stale_view = host_arena.writable_view(*split_source);
+    infernix::HostKVAllocationView stale_view = host_arena.writable_view(*split_source);
     auto [left, right]                      = host_arena.split(std::move(*split_source), 1);
     failures += expect(!stale_view.valid(), label + " split did not invalidate the old capability");
     failures += expect_size(left.page_count(), 1, label + " split left pages");
     failures += expect_size(right.page_count(), 3, label + " split right pages");
     auto [middle, tail] = host_arena.split(std::move(right), 1);
     middle.release();
-    std::optional<ninfer::HostKVAllocation> reused = host_arena.allocate(host_layout, 1);
+    std::optional<infernix::HostKVAllocation> reused = host_arena.allocate(host_layout, 1);
     failures += expect(reused.has_value(), label + " released Host subextent was not reusable");
 
     (void)left;
@@ -771,69 +771,69 @@ int main() {
     }
 
     try {
-        ninfer::DeviceContext context(0);
+        infernix::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
         failures += exercise_backed_limit(context);
         failures += exercise_vmm_range();
         failures += exercise_republish_while_copy_queued(context);
         failures += exercise_layout_and_transfer(
             context,
-            ninfer::KVPageGeometry{
-                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+            infernix::KVPageGeometry{
+                .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
                 .planes =
                     {
-                        {ninfer::DType::I8, 8, 2, 256},
-                        {ninfer::DType::FP16, 1, 2, 256},
+                        {infernix::DType::I8, 8, 2, 256},
+                        {infernix::DType::FP16, 1, 2, 256},
                     },
             },
             "PageMajor", {2, 2, 2, 2});
         failures += exercise_layout_and_transfer(
             context,
-            ninfer::KVPageGeometry{
-                .device_plane_order = ninfer::PagedKVPlaneOrder::HeadMajor,
+            infernix::KVPageGeometry{
+                .device_plane_order = infernix::PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
-                        {ninfer::DType::BF16, 8, 3, 256},
-                        {ninfer::DType::FP16, 2, 3, 256},
+                        {infernix::DType::BF16, 8, 3, 256},
+                        {infernix::DType::FP16, 2, 3, 256},
                     },
             },
             "HeadMajor", {2, 4, 6, 6});
         failures += exercise_layout_and_transfer(
             context,
-            ninfer::KVPageGeometry{
-                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+            infernix::KVPageGeometry{
+                .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
                 .planes =
                     {
-                        {ninfer::DType::FP8_E4M3FN, 256, 2, 256},
-                        {ninfer::DType::U8, 128, 2, 256},
-                        {ninfer::DType::FP16, 1, 2, 256},
-                        {ninfer::DType::U8, 16, 2, 256},
+                        {infernix::DType::FP8_E4M3FN, 256, 2, 256},
+                        {infernix::DType::U8, 128, 2, 256},
+                        {infernix::DType::FP16, 1, 2, 256},
+                        {infernix::DType::U8, 16, 2, 256},
                     },
             },
             "K8V4 asymmetric PageMajor", {4, 4, 4, 4});
         failures += exercise_layout_and_transfer(
             context,
-            ninfer::KVPageGeometry{
-                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+            infernix::KVPageGeometry{
+                .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
                 .planes =
                     {
-                        {ninfer::DType::I8, 8, 2, 256},
-                        {ninfer::DType::I8, 8, 2, 256},
-                        {ninfer::DType::FP16, 1, 2, 256},
-                        {ninfer::DType::FP16, 1, 2, 256},
+                        {infernix::DType::I8, 8, 2, 256},
+                        {infernix::DType::I8, 8, 2, 256},
+                        {infernix::DType::FP16, 1, 2, 256},
+                        {infernix::DType::FP16, 1, 2, 256},
                     },
             },
             "Grouped PageMajor", {2, 4, 4, 4});
         failures += exercise_layout_and_transfer(
             context,
-            ninfer::KVPageGeometry{
-                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+            infernix::KVPageGeometry{
+                .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
                 .planes =
                     {
-                        {ninfer::DType::I8, 1, 3, 256},
-                        {ninfer::DType::I8, 1, 3, 256},
-                        {ninfer::DType::I8, 1, 3, 256},
-                        {ninfer::DType::I8, 1, 3, 256},
+                        {infernix::DType::I8, 1, 3, 256},
+                        {infernix::DType::I8, 1, 3, 256},
+                        {infernix::DType::I8, 1, 3, 256},
+                        {infernix::DType::I8, 1, 3, 256},
                     },
             },
             "Grouped padded PageMajor", {1, 2, 3, 4});

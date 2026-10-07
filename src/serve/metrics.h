@@ -7,7 +7,7 @@
 #include <mutex>
 #include <string>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 // Fixed-size request aggregates. Runtime counters remain owned and published by Engine.
 class Metrics {
@@ -49,4 +49,4 @@ private:
     Requests requests_;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

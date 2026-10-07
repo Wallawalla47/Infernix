@@ -4,7 +4,7 @@
 #include "ops/linear/bf16/bf16_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Bytes, auto Kernel>
 int bf16_prepare_shared() {
@@ -187,4 +187,4 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -26,7 +26,7 @@
 namespace {
 
 using Json     = nlohmann::json;
-namespace cost = ninfer::bench::context_cost;
+namespace cost = infernix::bench::context_cost;
 
 constexpr double kMaximumTransferP95   = 0.35;
 constexpr double kMaximumPrefillP95    = 0.15;
@@ -300,22 +300,22 @@ cost::FitResult fit_prefill(const cost::PrefillSuiteResult& samples) {
         kMaximumPrefillP95, kOrderingSignificance);
 }
 
-std::array<ninfer::runtime::ContextTransferCost, 3>
+std::array<infernix::runtime::ContextTransferCost, 3>
 runtime_transfer_cost(const std::array<cost::FitResult, 3>& fits) {
-    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+    std::array<infernix::runtime::ContextTransferCost, 3> result;
     for (std::size_t index = 0; index < fits.size(); ++index) {
         const auto& values = fits[index].quantized_coefficients;
         if (values.size() != 3) { throw std::logic_error("incomplete transfer roofline fit"); }
-        result[index] = ninfer::runtime::ContextTransferCost{
+        result[index] = infernix::runtime::ContextTransferCost{
             .batch_ns = values[0], .operation_ns = values[1], .ns_per_byte_q32 = values[2]};
     }
     return result;
 }
 
-ninfer::runtime::ContextPrefillCost runtime_prefill_cost(const cost::FitResult& fit) {
+infernix::runtime::ContextPrefillCost runtime_prefill_cost(const cost::FitResult& fit) {
     const auto& values = fit.quantized_coefficients;
     if (values.size() != 5) { throw std::logic_error("incomplete prefill fit"); }
-    return ninfer::runtime::ContextPrefillCost{
+    return infernix::runtime::ContextPrefillCost{
         .chunk_ns              = values[0],
         .token_ns_q32          = values[1],
         .attention_pair_ns_q32 = values[2],
@@ -344,17 +344,17 @@ int main(int argc, char** argv) {
     try {
         options = parse_options(argc, argv);
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_context_cost_bench: " << error.what() << '\n';
+        std::cerr << "infernix_context_cost_bench: " << error.what() << '\n';
         return 2;
     }
     if (options.help_requested) {
-        std::cout << usage(argc > 0 ? argv[0] : "ninfer_context_cost_bench");
+        std::cout << usage(argc > 0 ? argv[0] : "infernix_context_cost_bench");
         return 0;
     }
 
     try {
         const Hardware hardware          = inspect_hardware(options.measurement.device);
-        const std::string hardware_class = ninfer::runtime::context_cost_hardware_class(
+        const std::string hardware_class = infernix::runtime::context_cost_hardware_class(
             hardware.gpu, hardware.major, hardware.minor);
         std::optional<cost::ArtifactProfile> artifact;
         if (options.suite != Suite::Transfer) {
@@ -380,7 +380,7 @@ int main(int argc, char** argv) {
 
         Json report{
             {"schema_version", 3},
-            {"artifact_type", "ninfer_context_cost_calibration"},
+            {"artifact_type", "infernix_context_cost_calibration"},
             {"accepted", accepted},
             {"hardware", Json{{"gpu", hardware.gpu},
                               {"hardware_class", hardware_class},
@@ -471,7 +471,7 @@ int main(int argc, char** argv) {
                 provenance["suite"]                = "transfer";
                 provenance["transfer_warmup"]      = options.measurement.transfer_warmup;
                 provenance["transfer_repetitions"] = options.measurement.transfer_repetitions;
-                ninfer::runtime::upsert_context_transfer_cost_atomic(
+                infernix::runtime::upsert_context_transfer_cost_atomic(
                     options.preset_output, hardware_class, runtime_transfer_cost(*transfer_fits),
                     provenance.dump());
             }
@@ -484,9 +484,9 @@ int main(int argc, char** argv) {
                 provenance["prefill_chunk"]       = options.measurement.prefill_chunk;
                 provenance["max_context"]         = options.measurement.max_context;
                 provenance["prefill_repetitions"] = options.measurement.prefill_repetitions;
-                ninfer::runtime::upsert_context_prefill_cost_atomic(
+                infernix::runtime::upsert_context_prefill_cost_atomic(
                     options.preset_output,
-                    ninfer::runtime::ContextCostIdentity{
+                    infernix::runtime::ContextCostIdentity{
                         .hardware_class    = hardware_class,
                         .prefill_signature = prefill_samples->load.prefill_signature},
                     runtime_prefill_cost(*prefill_fit), provenance.dump());
@@ -496,7 +496,7 @@ int main(int argc, char** argv) {
         std::cerr << "context-cost calibration accepted\n";
         return 0;
     } catch (const std::exception& error) {
-        std::cerr << "ninfer_context_cost_bench: " << error.what() << '\n';
+        std::cerr << "infernix_context_cost_bench: " << error.what() << '\n';
         return 1;
     }
 }

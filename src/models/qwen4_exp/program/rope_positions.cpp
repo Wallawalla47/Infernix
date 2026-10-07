@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 RopePosition rope_of(const LaneRope& rope, std::uint32_t index) noexcept {
     if (index < rope.prompt_tokens && !rope.prompt.empty()) {
@@ -52,4 +52,4 @@ void stage_mtp_chunk_rope(const LaneRope& rope, std::uint32_t first, std::int32_
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

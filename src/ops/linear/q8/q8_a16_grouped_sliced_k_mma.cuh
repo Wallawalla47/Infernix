@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, bool FullWeights, class Output, class Epilogue>
 __global__ __launch_bounds__(
@@ -289,4 +289,4 @@ __global__ __launch_bounds__(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

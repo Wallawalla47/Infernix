@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 inline constexpr int kMaxFetch = 512; // fetch-served experts per layer call (a layer's experts)
 
@@ -44,4 +44,4 @@ struct alignas(64) FetchResponse {
     std::uint64_t record[kMaxFetch]; // host addresses the device can read (mapped pinned memory)
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

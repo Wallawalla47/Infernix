@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 using LinearTopKPairSort = cub::WarpMergeSort<std::uint64_t, 1, 32>;
 
@@ -65,4 +65,4 @@ grouped_ksplit_topk_publish(const GroupedKSplitTopKStorage<Capacity, Warps>& sto
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

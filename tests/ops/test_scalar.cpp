@@ -1,15 +1,15 @@
 // Bit-exact public-contract qualification for the finite typed scalar state
 // transitions.  Expected values are computed directly from the logical input
 // state; no launcher or kernel implementation is used as an oracle.
-#include "ninfer/ops/scalar.h"
+#include "infernix/ops/scalar.h"
 #include "ops/op_tester.h"
 
 #include <cstdint>
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

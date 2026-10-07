@@ -5,7 +5,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_mma_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kTargetRows    = 9216;
@@ -122,4 +122,4 @@ void q8_companion_attn_input_mma_r128_c80_launch(const Tensor& x, const Weight& 
     launch_route<Schedule, kCompanionRows>(x, weight, output, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -450,7 +450,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 }
 
                 lifecycle->done(outcome);
-                if (outcome.finish_reason == ninfer::FinishReason::Cancelled ||
+                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
                     stream->cancelled.load(std::memory_order_acquire)) {
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -596,7 +596,7 @@ void HttpServer::handle_response_cancel(const httplib::Request& req, httplib::Re
     error.status  = 400;
     error.type    = "invalid_request_error";
     error.code    = "background_not_supported";
-    error.message = "only background responses can be cancelled; NInfer does not support "
+    error.message = "only background responses can be cancelled; Infernix does not support "
                     "background execution";
     write_openai_error(res, error);
 }
@@ -611,4 +611,4 @@ void HttpServer::handle_response_compact(const httplib::Request&, httplib::Respo
     write_openai_error(res, error);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

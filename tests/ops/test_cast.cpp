@@ -1,4 +1,4 @@
-#include "ninfer/ops/cast.h"
+#include "infernix/ops/cast.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -8,8 +8,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

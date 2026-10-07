@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHidden         = 2048;
@@ -275,4 +275,4 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

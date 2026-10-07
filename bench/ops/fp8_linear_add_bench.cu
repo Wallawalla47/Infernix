@@ -1,10 +1,10 @@
 // Cold-cache public Op benchmark for the registered row-scaled FP8 LinearAdd profiles.
 
 #include "core/weight.h"
-#include "ninfer/ops/linear_add.h"
+#include "infernix/ops/linear_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_profiler_api.h>
@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -231,7 +231,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_fp8_linear_add_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_fp8_linear_add_bench: %s\n", error.what());
         return 1;
     }
 }

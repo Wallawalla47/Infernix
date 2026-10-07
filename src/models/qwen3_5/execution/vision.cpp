@@ -7,7 +7,7 @@
 #include "core/layout.h"
 #include "core/nvtx.h"
 #include "models/qwen3_5/program/vision_control.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 
 #include <algorithm>
 #include <cmath>
@@ -18,7 +18,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
@@ -516,4 +516,4 @@ double VisionPrefillSession::elapsed_seconds() const {
     return milliseconds / 1000.0 + (overlay_stats_ ? overlay_stats_->window_seconds : 0.0);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

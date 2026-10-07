@@ -1,6 +1,6 @@
-// ninfer::ops - rmsnorm wrapper: public api validation and launcher dispatch.
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/gated_rmsnorm.h"
+// infernix::ops - rmsnorm wrapper: public api validation and launcher dispatch.
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/gated_rmsnorm.h"
 
 #include "ops/launcher/rmsnorm.h" // detail::rmsnorm_launch
 
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -108,4 +108,4 @@ void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, RmsGa
                  execution.stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

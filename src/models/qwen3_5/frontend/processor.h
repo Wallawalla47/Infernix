@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 class MediaPreprocessCache;
 
@@ -171,4 +171,4 @@ private:
     std::shared_ptr<MediaPreprocessCache> media_cache_;
 };
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

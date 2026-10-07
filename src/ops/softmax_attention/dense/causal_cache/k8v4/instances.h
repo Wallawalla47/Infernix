@@ -2,7 +2,7 @@
 
 #include "ops/softmax_attention/dense/causal_cache/k8v4/schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class G, int Tokens>
 struct K8V4KvGroupedInstance {
@@ -18,4 +18,4 @@ struct K8V4KvGroupedInstance {
 
 using K8V4KvTiledInstance = K8V4KvTiledMmaSchedule<kMxfp8TiledQueryRows, 64>;
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

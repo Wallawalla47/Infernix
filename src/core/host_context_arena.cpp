@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer {
+namespace infernix {
 
 HostContextAllocation::~HostContextAllocation() { (void)release(); }
 
@@ -147,4 +147,4 @@ void HostContextArena::insert_free_extent(FreeExtent extent) noexcept {
     }
 }
 
-} // namespace ninfer
+} // namespace infernix

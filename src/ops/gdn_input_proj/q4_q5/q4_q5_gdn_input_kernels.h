@@ -6,7 +6,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
@@ -31,4 +31,4 @@ void q4_q5_gdn_input_conv_record_launch(const Tensor& x, const Weight& qk_weight
                                         Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                         cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

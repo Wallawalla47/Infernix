@@ -3,21 +3,21 @@
 #include "core/layout.h"
 #include "core/nvtx.h"
 #include "models/qwen3_5/execution/vision_weight_stream.h"
-#include "ninfer/ops/add_bias.h"
-#include "ninfer/ops/gelu.h"
-#include "ninfer/ops/layer_norm.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/softmax_attention.h"
-#include "ninfer/ops/vision_pos_embed.h"
+#include "infernix/ops/add_bias.h"
+#include "infernix/ops/gelu.h"
+#include "infernix/ops/layer_norm.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/residual_add.h"
+#include "infernix/ops/rope.h"
+#include "infernix/ops/softmax_attention.h"
+#include "infernix/ops/vision_pos_embed.h"
 
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 std::int32_t dim(std::uint64_t v) {
@@ -284,4 +284,4 @@ void VisionTowerPass::advance(std::uint32_t end_stage) {
     }
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

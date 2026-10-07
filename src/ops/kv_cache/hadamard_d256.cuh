@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 // Apply the five lane dimensions of a Sylvester transform to independent columns. Keeping the
 // column loop inside each stage exposes their independent shuffle instructions while preserving
@@ -64,4 +64,4 @@ __device__ __forceinline__ void normalized_hadamard_d256_inplace(float (&values)
     for (float& value : values) { value = __fmul_rn(value, 0x1p-4f); }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

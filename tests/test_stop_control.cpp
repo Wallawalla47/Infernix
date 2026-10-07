@@ -1,6 +1,6 @@
 #include "serve/stop_control.h"
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <atomic>
 #include <chrono>
@@ -12,9 +12,9 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace infernix::serve;
 using Clock   = StopControl::Clock;
-using Abandon = ninfer::PrefixCacheSaveControl::Abandon;
+using Abandon = infernix::PrefixCacheSaveControl::Abandon;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -184,7 +184,7 @@ int main() {
     {
         // The handshake the exit relies on: abandon() returns once a save in progress has noticed,
         // removed its file and ended, and a save it precedes never begins.
-        const ninfer::PrefixCacheSaveControl control;
+        const infernix::PrefixCacheSaveControl control;
         failures += check(control.begin(), "a save must begin while nothing abandoned it");
         std::atomic<bool> removed{false};
         std::thread writer([&] {
@@ -201,26 +201,26 @@ int main() {
                           "abandon() must wait until the save has let go of its file");
         failures += check(!control.begin(), "a save must not begin once abandoned");
 
-        const ninfer::PrefixCacheSaveControl stuck;
+        const infernix::PrefixCacheSaveControl stuck;
         (void)stuck.begin();
         failures += check(stuck.abandon(std::chrono::milliseconds(10)) == Abandon::StillWriting,
                           "abandon() must give up on a save that does not stop");
         stuck.end(false);
 
-        const ninfer::PrefixCacheSaveControl saved;
+        const infernix::PrefixCacheSaveControl saved;
         (void)saved.begin();
         saved.end(true);
         failures += check(saved.abandon(std::chrono::milliseconds(0)) == Abandon::Saved,
                           "abandon() after a completed save must report it saved");
 
-        const ninfer::PrefixCacheSaveControl idle;
+        const infernix::PrefixCacheSaveControl idle;
         failures +=
             check(idle.abandon(std::chrono::milliseconds(0)) == Abandon::Unsaved && !idle.begin(),
                   "abandon() before any save must keep one from starting");
 
         // Copies share one state, as the product's copy and the Engine's options do.
-        const ninfer::PrefixCacheSaveControl original;
-        const ninfer::PrefixCacheSaveControl copy =
+        const infernix::PrefixCacheSaveControl original;
+        const infernix::PrefixCacheSaveControl copy =
             original; // NOLINT(performance-unnecessary-copy-initialization)
         (void)copy.abandon(std::chrono::milliseconds(0));
         failures += check(original.abandoned(), "copies of a save control must share its state");

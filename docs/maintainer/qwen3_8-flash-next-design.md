@@ -8,18 +8,18 @@ removed.
 
 **Revision 2026-10-03.** This version was revised after an expert review for implementability and
 peak performance on the target hardware, and after three requirement changes: NVIDIA's quantized
-tensors stay bit-exact with NVIDIA's activation formats, QSA supports every NInfer KV profile, and
+tensors stay bit-exact with NVIDIA's activation formats, QSA supports every Infernix KV profile, and
 BF16 tensors may move to 8 bits only where that helps significantly.
 [Appendix A](#appendix-a-review-findings-and-changes) lists every finding and what changed.
 
-This design adds `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, about 180B parameters) to NInfer.
+This design adds `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, about 180B parameters) to Infernix.
 The target system is:
 
 - one RTX 5090 (32 GB);
 - 96 GB of DDR5 host RAM;
 - one NVMe SSD.
 
-It adds three mechanisms that NInfer does not have today:
+It adds three mechanisms that Infernix does not have today:
 
 1. routed experts held in pinned host RAM, with misses served by the CPU in place and by
    copy-engine prefetch over PCIe;
@@ -40,7 +40,7 @@ UD-Q4_K_XL, a 4-bit model comparable to NVFP4, at **72-80 tok/s decode** on the 
 4. [Performance model](#4-performance-model)
 5. [Design overview](#5-design-overview)
 6. [Artifact and conversion](#6-artifact-and-conversion)
-7. [Ownership in NInfer](#7-ownership-in-ninfer)
+7. [Ownership in Infernix](#7-ownership-in-infernix)
 8. [Decode pipeline](#8-decode-pipeline)
 9. [Expert cache and the shared VRAM frame pool](#9-expert-cache-and-the-shared-vram-frame-pool)
 10. [CPU expert engine](#10-cpu-expert-engine)
@@ -64,12 +64,12 @@ UD-Q4_K_XL, a 4-bit model comparable to NVFP4, at **72-80 tok/s decode** on the 
 
 ### 1.1 Deliverable
 
-The product supports `Qwen4ExpForCausalLM` through the public Engine, CLI, `ninfer-serve`, and
+The product supports `Qwen4ExpForCausalLM` through the public Engine, CLI, `infernix-serve`, and
 offline CausalScoring. It includes:
 
 - the Text model;
 - the MTP layer;
-- QSA with **every NInfer KV profile** (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
+- QSA with **every Infernix KV profile** (`bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`;
   §8.10);
 - Vision, which can be selected at startup.
 
@@ -349,7 +349,7 @@ ninfer-ext is a fork of NInfer.
 
 | Mechanism | Detail | Consequence |
 |---|---|---|
-| Recipe | Expert codes and block scales imported as NVFP4, but `weight_scale_2` is stored as NInfer's FP32 **divisor**, a rounded reciprocal of NVIDIA's multiplier, and each layer quantizes activations with **one** input scale, the minimum over its experts' `input_scale`. **Dense layers re-quantized to Q8** (attention, GDN, HC, shared expert, PLE projections). `lm_head` Q6, embedding Q8, router BF16. MTP experts **requantized** from block FP8 to NVFP4. The n-gram table is FP8 with the global scale copied onto every row. | 5.3 GB of device weights, about 3.9 GB of dense reads per token. Neither the represented expert weights nor their activations are NVIDIA's exactly, and the MTP experts lose precision. The per-row scale plane doubles the PLE I/O ranges. |
+| Recipe | Expert codes and block scales imported as NVFP4, but `weight_scale_2` is stored as Infernix's FP32 **divisor**, a rounded reciprocal of NVIDIA's multiplier, and each layer quantizes activations with **one** input scale, the minimum over its experts' `input_scale`. **Dense layers re-quantized to Q8** (attention, GDN, HC, shared expert, PLE projections). `lm_head` Q6, embedding Q8, router BF16. MTP experts **requantized** from block FP8 to NVFP4. The n-gram table is FP8 with the global scale copied onto every row. | 5.3 GB of device weights, about 3.9 GB of dense reads per token. Neither the represented expert weights nor their activations are NVIDIA's exactly, and the MTP experts lose precision. The per-row scale plane doubles the PLE I/O ranges. |
 | Cache | A global LRU stamped per layer call, with no frequency term. A 1024-thread single-CTA resolve kernel radix-selects over all slots for every layer that has misses. | Measured 0.805 hits at C=1 with 6,347 slots (26% of experts), MTP K=3. |
 | Miss service | **PCIe only.** A 64-CTA SM copy kernel reads zero-copy at ~36 GB/s after router → top-k → resolve. Hit GEMVs overlap the fetch, but those GEMVs take ~15 µs while one miss takes ~77 µs. | Every layer with a miss stalls. There is no CPU compute and no cross-layer prediction. |
 | Host sync | `device.synchronize()` every round, followed by a host PLE gather (one column per call) and ingress build | GPU idle between rounds |
@@ -611,7 +611,7 @@ exact decode oracle:
 
 - **`nvfp4_mul`**: the words of `nvfp4` (E2M1 codes, one E4M3FN scale per 16) with an FP32
   **multiplier** `m_w` per matrix: `W[n,k] = e2m1(c[n,k]) · e4m3fn(s[n,⌊k/16⌋]) · m_w`.
-  - NInfer's `nvfp4` divides by `d_w`. Its ModelOpt importer stores `fl(1 / weight_scale_2)` as
+  - Infernix's `nvfp4` divides by `d_w`. Its ModelOpt importer stores `fl(1 / weight_scale_2)` as
     `d_w`, which equals NVIDIA's weight only when the scale is a power of two. ninfer-ext inherited
     the same rounding (§3.2).
   - By the rule of [tensor formats §3.4](tensor-formats.md#34-fp8_e4m3fn_row_bf16), a multiplier
@@ -638,7 +638,7 @@ gate as Q8, it would fail as block FP8.
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 
 The pinned host bank is read by the GPU (DMA into a frame, then the expert kernels) and by the CPU
-(in-place computation). Only one copy fits in 96 GB, and NInfer forbids runtime repacking. The
+(in-place computation). Only one copy fits in 96 GB, and Infernix forbids runtime repacking. The
 artifact therefore stores each expert as one contiguous record of 2,764,800 B (= 675 × 4 KiB)
 that both processors use directly.
 
@@ -695,7 +695,7 @@ guaranteed.
 
 ---
 
-## 7. Ownership in NInfer
+## 7. Ownership in Infernix
 
 This is an **explicit product change**: a new model architecture. It follows the existing
 boundaries ([engine architecture](engine-architecture.md)).
@@ -708,14 +708,14 @@ boundaries ([engine architecture](engine-architecture.md)).
 | Pinned huge-page host arena; unbuffered batched file reads (`ReadOnlyFile`); `upload_pinned`, and the planned `upload_pinned_when` gate and `publish_pinned_word` (§12.3); mapped mailbox and ring primitives; spin-worker pool with barriers; planned `download_pinned` (prefix, only if M0 confirms D2H FIFO stalls) and the `Weight` L2 class `Stream`/`Reuse` (`src/core/weight.h`, Q8 Phase 2) | Core (model-independent physical and transfer primitives) | `src/core/arena.*` (pinned buffers), `read_only_file*`, `device.*`; as built the mailbox and spin-worker team live in the Op (`src/ops/offloaded_sparse_moe/cpu/miss_service.*`, `expert_team.*`) |
 | Frame pool, residency table, staging, loans and frame leases (§9.2), epochs; transfer agent (policy, DMA, residency writes); n-gram row cache, reads and gate state (`NgramVolume`, §12.3); prefix-cache binding (§19.3.1); vision window and lane RoPE state (§19.3.2); CPU-engine lifetime | **Program** (mutable state, placement, agents; all allocated at startup) | `src/models/qwen4_exp/program/` |
 | Cache policy algorithms (LFRU, shadow replay) | Program, behind a policy interface conformance-tested against `tools/expert_cache_replay` | `src/models/qwen4_exp/program/expert_cache/` |
-| Router + top-k + residency classification + prediction; narrow-route expert kernels (GPU and CPU); wide-route grouped GEMM; combine; the MTP drafter's masked routing | **Op family** `offloaded_sparse_moe` (closed contract: output = MoE(x) independent of residency; residency, agents and mailboxes are execution resources). The drafter's routing mask is a semantic input, because it changes the result. | `include/ninfer/ops/offloaded_sparse_moe.h`, `src/ops/offloaded_sparse_moe/{route,gpu,cpu,wide}/` |
-| HC mixer and HC inject | Op `hyper_connection` | `include/ninfer/ops/hyper_connection.h` |
-| QSA prep, index-key pooling, block select, sparse attention over every KV profile | Ops `qsa_prep`, `qsa_select`; extended `softmax_attention` consumer with the existing VQ2/K4V2 window read rule | `include/ninfer/ops/qsa.h` |
-| PLE gather, projections, gate and dilated conv (stateful) | Op `ple_ngram_injection` | `include/ninfer/ops/ple.h` |
-| N-gram row ids | Model frontend `NgramHash::row_ids`, called by the Program on the host (§12.3); exact integer oracle in `ninfer_qwen4_exp_ngram_hash_test` | `src/models/qwen4_exp/frontend/ngram_hash.*` |
+| Router + top-k + residency classification + prediction; narrow-route expert kernels (GPU and CPU); wide-route grouped GEMM; combine; the MTP drafter's masked routing | **Op family** `offloaded_sparse_moe` (closed contract: output = MoE(x) independent of residency; residency, agents and mailboxes are execution resources). The drafter's routing mask is a semantic input, because it changes the result. | `include/infernix/ops/offloaded_sparse_moe.h`, `src/ops/offloaded_sparse_moe/{route,gpu,cpu,wide}/` |
+| HC mixer and HC inject | Op `hyper_connection` | `include/infernix/ops/hyper_connection.h` |
+| QSA prep, index-key pooling, block select, sparse attention over every KV profile | Ops `qsa_prep`, `qsa_select`; extended `softmax_attention` consumer with the existing VQ2/K4V2 window read rule | `include/infernix/ops/qsa.h` |
+| PLE gather, projections, gate and dilated conv (stateful) | Op `ple_ngram_injection` | `include/infernix/ops/ple.h` |
+| N-gram row ids | Model frontend `NgramHash::row_ids`, called by the Program on the host (§12.3); exact integer oracle in `infernix_qwen4_exp_ngram_hash_test` | `src/models/qwen4_exp/frontend/ngram_hash.*` |
 | Canonical routed-expert arithmetic: A4 quantizer, E2M1/E4M3 integer decode, int64 block accumulation, `exp_c` (one header compiled for CPU and GPU) | Op common code | `src/ops/common/canonical_math.h` |
 | Draft-length policy with miss cost; joint policy at B ≥ 2 (concurrency S7) | Program | `program/program_impl.h` (`choose_draft_length`); planned `src/models/qwen4_exp/program/draft_policy.{h,cpp}` |
-| Calibration | Runtime (profile schema), Core (probes), product (`ninfer-calibrate`) | §14.7 |
+| Calibration | Runtime (profile schema), Core (probes), product (`infernix-calibrate`) | §14.7 |
 
 Residency is an **execution resource** for `offloaded_sparse_moe`, like a stream or a workspace.
 By the [Op rules](op-development.md#2-op-admission-and-semantic-boundary), it may choose the
@@ -1093,7 +1093,7 @@ QSA reads its cache in two separate ways:
 - **Attention (K3b)** reads the K and V rows of the ≤ 2,051 selected tokens from the paged KV
   store, in the profile the Engine selected.
 
-Every NInfer profile (`--kv-dtype`) is supported, and the Main Text and MTP layers use the same
+Every Infernix profile (`--kv-dtype`) is supported, and the Main Text and MTP layers use the same
 profile. **`int8` at a 262,144-token context is the primary configuration** (§18): it is what users
 of this machine run, and it is optimized first. The other profiles follow in this order: `fp8` and
 `k8v4`, then `bf16`, then `nvfp4`, then `vq2` and `k4v2`.
@@ -1172,7 +1172,7 @@ calibration), with their own LFRU in the transfer agent. The drafter never waits
 
 ### 9.2 Lending reserved memory, the key to sharing VRAM with KV
 
-NInfer's admission invariant requires an Active request to hold its **complete** KV growth
+Infernix's admission invariant requires an Active request to hold its **complete** KV growth
 reservation ([engine architecture §1](engine-architecture.md#1-产品执行模型)). In other engines, a
 long-context reservation removes expert slots even while those KV pages are empty. ninfer-ext lost
 19% at C=8 that way.
@@ -1447,7 +1447,7 @@ QSA attends to at most 2,051 selected tokens per query. All other KV is only sca
 32,768 cells per layer in VRAM over an authoritative host copy, with 96-99.4% block hits on a
 5090. That is why its expert cache survives a 262K context.
 
-This design adopts the same idea in NInfer's paged-KV terms, for every KV profile:
+This design adopts the same idea in Infernix's paged-KV terms, for every KV profile:
 
 - **Index-key plane: always fully device-resident.** At 256K it is 0.22 GB (BF16, §8.10).
 - **K/V pages:**
@@ -1792,8 +1792,8 @@ layer 1, is the only reader.
   NVMe reads 108,468 → 86,388 (−20 %), read time ~1.84 → ~1.46 s, prefill 507.1 → 518.5 tok/s
   (+2.2 %; runs 494.5-513.7 against 503.8-526.2), ids identical. Decode looked −0.8 % on those
   1.6 s windows; a 512-token ABBA settled it: 80.1 / 80.2 against 80.3 / 79.9 tok/s (−0.06 %,
-  inside the spread), ids identical. Tests: `ninfer_read_only_file_test` (ring wrap, offsets,
-  errors) and `ninfer_qwen4_exp_ngram_volume_test` (closed-form row oracle: dedup, ring wrap,
+  inside the spread), ids identical. Tests: `infernix_read_only_file_test` (ring wrap, offsets,
+  errors) and `infernix_qwen4_exp_ngram_volume_test` (closed-form row oracle: dedup, ring wrap,
   cache hits, slot collisions, bounds, wrong-size volume).
 - **S2, gated verification.** A Core gate, `upload_pinned_when`, copies the rows in the verify graph
   before `ple_embed` once a pinned ready word equals the round's device word (strictly increasing,
@@ -1918,7 +1918,7 @@ configurations that give the same numerical results: it changes speed, never out
 | Layer | When | Budget | Decides |
 |---|---|---|---|
 | **Startup probe** | Every start | ≤ 3 s | Validates the loaded calibration profile against the hardware and seeds the online cost models with today's measurements. Without a profile it gives safe model-based defaults. |
-| **`ninfer-calibrate`** | Once per machine and artifact, and again when hardware, driver or BIOS changes (the startup probe says when) | `--quick` ~2 min; `--full` ~15-25 min | Host capability measurements, CPU kernel variant and worker set, page backing, NVMe I/O mode, and structural choices that need a restart or reallocation. Verified end to end. |
+| **`infernix-calibrate`** | Once per machine and artifact, and again when hardware, driver or BIOS changes (the startup probe says when) | `--quick` ~2 min; `--full` ~15-25 min | Host capability measurements, CPU kernel variant and worker set, page backing, NVMe I/O mode, and structural choices that need a restart or reallocation. Verified end to end. |
 | **Online adaptation** | Continuously while serving | Off the critical path | Continuous, workload-dependent parameters: miss arbiter split (§8.6), prefetch budget and k′ (§8.7), cache parameters (§9.3 shadow replay), draft length (§11.3), prefill CPU share (§13). These start from the calibrated values instead of generic defaults. |
 
 **Why both an explicit calibration and online adaptation.**
@@ -1932,7 +1932,7 @@ configurations that give the same numerical results: it changes speed, never out
 - A calibrated starting point also means the first requests run at full speed. Online estimators
   would otherwise have to converge from generic defaults.
 
-### 14.2 What `ninfer-calibrate` measures and decides
+### 14.2 What `infernix-calibrate` measures and decides
 
 **Stage 0: inventory.** Instant, nothing timed. It reads:
 
@@ -2040,7 +2040,7 @@ At start, the engine behaves as follows:
      a recommendation to recalibrate. Typical causes are a downtrained link, a changed memory
      profile, or a thermally limited CPU.
 2. **Fingerprint differs** (hardware, driver or artifact changed). It ignores the profile, uses the
-   probe plus model-based defaults, and recommends `ninfer-calibrate`.
+   probe plus model-based defaults, and recommends `infernix-calibrate`.
 
 Explicit command-line options always override profile values. `--calibration off` ignores the
 profile, which is needed for reproducible benchmarking. `--calibration PATH` selects one.
@@ -2048,7 +2048,7 @@ profile, which is needed for reproducible benchmarking. `--calibration PATH` sel
 ### 14.4 What stays fixed for the RTX 5090
 
 These choices depend only on the GPU and the model, and are made once at development time with
-NInfer's route-development evidence ([op development](op-development.md)). They are never
+Infernix's route-development evidence ([op development](op-development.md)). They are never
 calibrated per machine:
 
 - kernel variants, tiles and fused-route gating;
@@ -2092,7 +2092,7 @@ A different GPU is outside the product scope (§1.4).
 | Probe primitives: copy timing, DRAM streams, mailbox round trip, NVMe I/O | Core (model-independent) |
 | Calibration profile schema, fingerprint, drift check | Runtime (common execution contract) |
 | Consuming the profile when planning frames, workers, I/O, prefetch and cost models | The Qwen4Exp Program at startup |
-| `ninfer-calibrate` (CLI, corpus, Stage 3 orchestration through the public Engine, report) | Product (`apps/`) |
+| `infernix-calibrate` (CLI, corpus, Stage 3 orchestration through the public Engine, report) | Product (`apps/`) |
 | Trace replay for Stage 4 | `tools/expert_cache_replay` |
 
 ---
@@ -2159,7 +2159,7 @@ host-RAM cost in §15.2.
 | Vision offload: pinned tower 0.90 (856 MiB) + live media ≥ 0.4 (§19.3.2) | 0-1.3 |
 | QSA KV host tier (§9.6) at 262K: **3.6 (`int8`, primary)**; 0.9 (`vq2`), 3.5 (`fp8`), 7.0 (`bf16`) | 0-7.0 |
 | Process: tokenizer, server, frontend | ~1.5 |
-| **Total NInfer** | **~79 in the primary configuration at 262K** (~80.3 with Vision); ~75.4 below the tier threshold; ~82.4 with a `bf16` tier |
+| **Total Infernix** | **~79 in the primary configuration at 262K** (~80.3 with Vision); ~75.4 below the tier threshold; ~82.4 with a `bf16` tier |
 | OS, desktop, page cache headroom (of 102.8 GB = 95.8 GiB visible) | ~24 in the primary configuration (~22.5 with Vision); ~27.5 or ~20.5 |
 
 Additional rules:
@@ -2204,7 +2204,7 @@ Every new Op is qualified against a naive FP32/FP64 oracle at the real shapes, u
 | `ngram_row_ids` | **Exact integer** | Signed 64-bit products, primes 20,000,003-20,000,171, offsets; EOS and sequence start |
 
 The fork's FP64 Python reference may be consulted as a cross-check of the published mathematics.
-NInfer's oracle is written from the upstream definitions, consistent with [§1.4](#14-non-goals).
+Infernix's oracle is written from the upstream definitions, consistent with [§1.4](#14-non-goals).
 
 ### 16.2 The canonical routed-expert arithmetic
 
@@ -2372,7 +2372,7 @@ same metrics against BF16 reference logits, where its outputs can be obtained.
 - **Exactness.**
   - Every narrow-route expert's output is bit-identical across batch shapes (T = 1 to verify
     windows, C = 1-8) for the same inputs, because the canonical arithmetic is per column.
-  - Speculative and prefill agreement follow NInfer's existing criterion. Dense layers select
+  - Speculative and prefill agreement follow Infernix's existing criterion. Dense layers select
     different tiles at different widths, so greedy decode is compared with a fresh one-token
     prefill of the committed prefix. The disagreement rate and its largest margins are reported, as
     in [tree verification](tree-verification.md).
@@ -2419,16 +2419,16 @@ and kept only if it did not hurt.
 of C++ (`src/core/layout.cpp`), 1,023 of a document (`README.md`) and 1,023 of a chat transcript
 in the model's chat template. Perplexity is taken over the actual next tokens. Differences are
 paired per position, as the mean ΔNLL ± its standard error. Tools:
-`ninfer_qwen4_exp_forward_real_test --dump-logits` and `tools/flash_next/strata_compare.py`.
+`infernix_qwen4_exp_forward_real_test --dump-logits` and `tools/flash_next/strata_compare.py`.
 Strata runs the user's own `strata-unsloth-ud-q4_k_xl.json` (UD-Q4_K_XL, INT8 KV) plus
 `--short-read 4096` and `STRATA_LOGPOS`, as in its `docs/UNSLOTH_Q4.md`. Per-op error is checked
-separately on NInfer's own taps with `tools/flash_next/block_check.py` (FP64 oracle) and
+separately on Infernix's own taps with `tools/flash_next/block_check.py` (FP64 oracle) and
 `upstream_check.py` (Transformers modules in BF16 with the real weights).
 
-| Boundary | Transformers / SGLang | Strata | NInfer | Evidence and decision |
+| Boundary | Transformers / SGLang | Strata | Infernix | Evidence and decision |
 |---|---|---|---|---|
-| Dense weights | BF16 | Q4_K-Q8_0 mixes | BF16, word-exact | The main reason NInfer beats Strata on chat (below) |
-| Routed experts | NVFP4 W4A4 | Q4_K/Q5_K gate-up, Q5_1/Q8_0 down, Q8_1 activations | NVFP4 W4A4, canonical arithmetic | No 8- or 16-bit activation path is needed: NInfer's overall quality is already better than Strata's |
+| Dense weights | BF16 | Q4_K-Q8_0 mixes | BF16, word-exact | The main reason Infernix beats Strata on chat (below) |
+| Routed experts | NVFP4 W4A4 | Q4_K/Q5_K gate-up, Q5_1/Q8_0 down, Q8_1 activations | NVFP4 W4A4, canonical arithmetic | No 8- or 16-bit activation path is needed: Infernix's overall quality is already better than Strata's |
 | Residual stream (4 × 2,560) | BF16 | FP32 | **BF16** | FP32 tried. All op chains stayed exact (median residual error 0.105 % → 0.03 %), but perplexity got **worse**: +0.030 ± 0.009 nats overall, +0.051 ± 0.015 on chat. The model expects the BF16 rounding it was trained and calibrated with. Rejected |
 | Router logits | BF16 Linear output, FP32 softmax | FP32 | **FP32** (`projection_fp32`) | BF16 logits make experts within one BF16 step (0.03 at logit ≈ −4.3) tie, and the lower id always wins. Measured BF16 − FP32: +0.008 ± 0.008 nats (code +0.022 ± 0.010). No cost. Kept |
 | LM-head logits | BF16 | FP32 | **FP32** (`projection_fp32`) | Perplexity unchanged (BF16 − FP32 = −0.0002 ± 0.0004 nats). BF16 logits create exact ties that flip greedy top-1 at 1.3 % of positions. The 1 MB output row is free next to the 1.27 GB weight read. Kept, subject to its decode kernel matching the BF16 GEMV's bandwidth (M6) |
@@ -2438,17 +2438,17 @@ separately on NInfer's own taps with `tools/flash_next/block_check.py` (FP64 ora
 | QSA indexer pooled key, scores | FP32 mean → BF16, FP32 scores | – | Same | – |
 | KV cache | BF16 | INT8 | INT8-G64 with Hadamard keys (primary), BF16 | INT8 costs +0.005 perplexity overall against BF16 KV (4.542 → 4.564) |
 
-**Result against Strata** (NInfer recipe A with INT8 KV, Strata UD-Q4_K_XL with INT8 KV):
+**Result against Strata** (Infernix recipe A with INT8 KV, Strata UD-Q4_K_XL with INT8 KV):
 
-| Text | Positions | Perplexity NInfer | Perplexity Strata | ΔNLL (NInfer − Strata) | Top-1 = next: NInfer / Strata | Top-1 agreement | KL(Strata ‖ NInfer) mean / p99 |
+| Text | Positions | Perplexity Infernix | Perplexity Strata | ΔNLL (Infernix − Strata) | Top-1 = next: Infernix / Strata | Top-1 agreement | KL(Strata ‖ Infernix) mean / p99 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Code | 511 | 1.9052 | 1.9051 | +0.000 ± 0.016 | 84.0 % / 84.5 % | 95.1 % | 0.043 / 0.55 |
 | Document | 1,023 | 9.5874 | 9.7671 | −0.019 ± 0.017 | 51.7 % / 52.4 % | 84.1 % | 0.074 / 0.84 |
 | Chat | 1,023 | 3.3611 | 3.8692 | **−0.141 ± 0.024** | 71.0 % / 70.6 % | 90.7 % | 0.109 / 1.67 |
 | All | 2,557 | 4.564 | 4.864 | **−0.064 ± 0.012** | | | |
 
-NInfer ties Strata on code and the document, and is significantly better on chat. KL is taken over
-Strata's top 20 plus a bucket for the rest. With BF16 KV, NInfer's overall perplexity is 4.542.
+Infernix ties Strata on code and the document, and is significantly better on chat. KL is taken over
+Strata's top 20 plus a bucket for the rest. With BF16 KV, Infernix's overall perplexity is 4.542.
 These texts are short (≤ 1,024 tokens); long-context quality is measured with M8.
 
 ---
@@ -2520,7 +2520,7 @@ guide, is `--kv-dtype int8 --max-context 262144` at C=1, with the recipe-B artif
 | `--cache-state PATH\|off` | state dir | Load and save the LFRU state and ranking |
 | `--record-routing PATH` | off | Opt-in route log, expert ids only, for calibration Stage 4 and M1 |
 | `--ngram-volume FILE` | `<artifact>.ngram` | N-gram table volume, which may sit on another NVMe drive (§12.3) |
-| `--no-prefix-reuse` | existing (reuse on in `ninfer-serve`; `ninfer` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
+| `--no-prefix-reuse` | existing (reuse on in `infernix-serve`; `infernix` keeps the cache off) | Disables prefix reuse, for strict run-to-run reproducibility. **Reuse changes output at near-ties:** a resume equals its capturing lineage, not an uncached run (§19.3.1) |
 | `--host-context-mib N`, `--device-snapshot-slots N` | 4096 and 0 for this model | Prefix Host tier (§15.2); Device snapshot slots, 41.8 frames each; 0 MiB needs ≥ 1 slot |
 | `--prefix-cache-file PATH` | existing (off) | Prefix-cache persistence; for this model blocks also store `mtp_next` and snapshots their meta. Decided (default, 2026-10-04): built after P6, since any rebuild invalidates it (§19.3.1) |
 | `--kv-capacity N\|auto` | existing | Plus one copy-on-write page per lane (0.34 frames each) for prefix resumes (§19.3.1) |
@@ -2534,7 +2534,7 @@ The recipe is chosen at conversion, not at startup: `qwen3_8_flash_next_nvfp4` (
 `qwen3_8_flash_next_nvfp4_dense8` (B, 8-bit dense). It is recorded in the artifact and **changes
 output**.
 
-Command: `ninfer-calibrate ARTIFACT [--quick|--full] [--corpus DIR] [--out PATH]` (§14.2).
+Command: `infernix-calibrate ARTIFACT [--quick|--full] [--corpus DIR] [--out PATH]` (§14.2).
 
 ---
 
@@ -2555,7 +2555,7 @@ findings. Such changes, and the evidence for them, are recorded here rather than
 | **M6** | Decode performance | §8.3 kernels with PDL, pre-dependency prefetch and stall-time warming; K7a/K7b; device-driven PLE; nsys/ncu attribution of one token | Per-kernel times vs the §8.3 budget published; plain decode ≥ 120 tok/s (Must); H1, H6 and H12 gates evaluated |
 | **M7** | Speculation | Residency-bounded drafter, miss-aware draft length, n-gram copy; tree option H9 and H13 evaluated | Speculative decode ≥ 160 tok/s (Must); speculation never slower than plain beyond noise on any corpus category |
 | **M8** | Prefill and long context | Layer-streamed prefill with host-issued DMA, CPU thin-expert assist, equal chunk planning, QSA pooled-key plane, QSA prompt kernels (`int8` first), KV host tier | Prefill Must target; short-prompt (512-2K) prefill reported; decode at 128K and 256K actual context ≥ 85% of 4K; the other KV profiles reported |
-| **M9** | Calibration | §14: startup probe, `ninfer-calibrate --quick/--full`, profile and drift check, Stage 2 fit, Stage 3 A/B | On at least two different hosts, calibrated ≥ uncalibrated (or tie within noise) on the calibration **and** held-out corpora; every candidate reported; recalibration reproduces the choices |
+| **M9** | Calibration | §14: startup probe, `infernix-calibrate --quick/--full`, profile and drift check, Stage 2 fit, Stage 3 A/B | On at least two different hosts, calibrated ≥ uncalibrated (or tie within noise) on the calibration **and** held-out corpora; every candidate reported; recalibration reproduces the choices |
 | **M10** | Head-to-head | Campaign vs Strata UD-Q4_K_XL at 262K context with 8-bit KV (the user's Strata configuration) and vs ninfer-ext, on the target machine; serving C = 1-8; 4K/32K/128K/256K actual context; every KV profile; quality report | §1.3 table filled with every result, favorable or not |
 
 The milestones on the critical path to the decode targets are M2 → M3 → M5 → M6. M1 runs in
@@ -2574,12 +2574,12 @@ host tests pass there. Nothing has run on the RTX 5090 or touched the real check
 | Piece | Where | Verified on the VM | Remaining on the target machine |
 |---|---|---|---|
 | Canonical W4A4 arithmetic (§16.2): E4M3/E2M1 encoders, A4 quantizer, `exp_c`, `silu_c`, epilogues | `src/ops/common/canonical_math.h` | Encoders against grid enumeration; BF16 rounding; `exp_c`/SiLU exhaustively over BF16 against FP64; exact int64 against FP64 | GPU build of the same header; exhaustive CPU-GPU equality (M3) |
-| CPU narrow expert engine: scalar, AVX2, AVX-VNNI, AVX-512 VNNI | `src/ops/offloaded_sparse_moe/cpu/`; test `ninfer_offloaded_moe_cpu_test` | Bit equality across ISAs, batch and split invariance, golden output hashes (`kGolden1`, `kGolden4`) with GCC, Clang and -O0 | Throughput on the target (`host_probe`); the multi-column optimization of §10.2; the worker team and handshake (§10.3); AVX-VNNI-INT8 |
-| GPU narrow route, first version: quantize, gate/up + SwiGLU + A4(h), and down kernels using `dp4a` and the canonical header | `src/ops/offloaded_sparse_moe/cuda/narrow_expert.*`; test `ninfer_offloaded_moe_cuda_test` | Compiled for `sm_120a` inside the project's CMake build (nvcc 13.4); the canonical header has no contractible float expressions | Run the test: it must reproduce `kGolden1`/`kGolden4`, equal the CPU engine bit for bit (device and mapped-host records), and match the canonical scalar functions exhaustively over BF16 and around every encoder boundary. Then the optimized K7a/K7b of §8.5 (tickets, PDL, TMA ring, persistent items, IMMA for n ≥ 3), qualified against this version |
-| Formats `nvfp4_mul`, `fp8_e4m3fn_block128_f32`; layouts `nvfp4_expert_rg16_v1`, `block128_scale_v1`; codecs; ModelOpt source readers | `tools/artifact/`, `tools/convert/sources/modelopt.py`; tests in `tests/artifact/`, `tests/convert/` | Word-exact round trips; C++ and Python agree on rg16 row sums | The recipes A and B themselves (M2). C++ registration is done: `QType::NVFP4_MUL` and `FP8_E4M3FN_BLOCK128_F32`, layouts `ExpertRg16` and `Block128Scale`, `expert_bank_planes` and `block128_planes`. The reader test and `ninfer_artifact_flash_next_interop_test` (Python writer to C++ reader) pass. [Tensor formats](tensor-formats.md) §3.5-3.6 and [storage layouts](storage-layouts.md) §6-7 define them |
-| CPU worker team (§10.3): static ownership, Phase A/B barrier, caller as worker 0, spin-then-park; allocation-free miss path | `src/ops/offloaded_sparse_moe/cpu/expert_team.*`; test `ninfer_offloaded_moe_team_test`; latency section in `host_probe` | Output equals `expert_forward` bit for bit for 1-40 workers and mixed jobs; 60 rounds with parking; ThreadSanitizer clean in `--quick` mode (1, 3 and 4 workers, 12 rounds) | Pinning to physical cores and CCD split; the mailbox handshake with the GPU (`miss_req`, `done_seq`, §8.2); latency of 1-2 cold misses on the target (`host_probe` team section) |
-| Host expert cache: LFRU, residency words, frame epochs, deferred-load controller | `src/models/qwen4_exp/program/expert_cache/`; test `ninfer_qwen4_exp_expert_cache_test` | Victims identical to `tools/expert_cache_replay` on a 1,200-group fixture; device/agent simulation with no frame reused early | The transfer agent around it: copy stream, `cuStreamWriteValue32`, route log, loans (M5) |
-| PLE n-gram row ids (§12): exact multipliers, per-head primes, EOS-closed windows | `tools/flash_next/ngram.py`; `src/models/qwen4_exp/frontend/ngram_hash.*`; tests `test_flash_next_ngram.py`, `ninfer_qwen4_exp_ngram_hash_test` | Python loop specification equals an independent tensor formulation, and its primes equal `sympy.nextprime`. C++ equals the Python fixture on 800 positions across two layers | Real config values from `inspect_checkpoint` (`ngram_size`, `heads_per_ngram`, base, divisor, seed, EOS); the device kernel (§12.3) qualified against this |
+| CPU narrow expert engine: scalar, AVX2, AVX-VNNI, AVX-512 VNNI | `src/ops/offloaded_sparse_moe/cpu/`; test `infernix_offloaded_moe_cpu_test` | Bit equality across ISAs, batch and split invariance, golden output hashes (`kGolden1`, `kGolden4`) with GCC, Clang and -O0 | Throughput on the target (`host_probe`); the multi-column optimization of §10.2; the worker team and handshake (§10.3); AVX-VNNI-INT8 |
+| GPU narrow route, first version: quantize, gate/up + SwiGLU + A4(h), and down kernels using `dp4a` and the canonical header | `src/ops/offloaded_sparse_moe/cuda/narrow_expert.*`; test `infernix_offloaded_moe_cuda_test` | Compiled for `sm_120a` inside the project's CMake build (nvcc 13.4); the canonical header has no contractible float expressions | Run the test: it must reproduce `kGolden1`/`kGolden4`, equal the CPU engine bit for bit (device and mapped-host records), and match the canonical scalar functions exhaustively over BF16 and around every encoder boundary. Then the optimized K7a/K7b of §8.5 (tickets, PDL, TMA ring, persistent items, IMMA for n ≥ 3), qualified against this version |
+| Formats `nvfp4_mul`, `fp8_e4m3fn_block128_f32`; layouts `nvfp4_expert_rg16_v1`, `block128_scale_v1`; codecs; ModelOpt source readers | `tools/artifact/`, `tools/convert/sources/modelopt.py`; tests in `tests/artifact/`, `tests/convert/` | Word-exact round trips; C++ and Python agree on rg16 row sums | The recipes A and B themselves (M2). C++ registration is done: `QType::NVFP4_MUL` and `FP8_E4M3FN_BLOCK128_F32`, layouts `ExpertRg16` and `Block128Scale`, `expert_bank_planes` and `block128_planes`. The reader test and `infernix_artifact_flash_next_interop_test` (Python writer to C++ reader) pass. [Tensor formats](tensor-formats.md) §3.5-3.6 and [storage layouts](storage-layouts.md) §6-7 define them |
+| CPU worker team (§10.3): static ownership, Phase A/B barrier, caller as worker 0, spin-then-park; allocation-free miss path | `src/ops/offloaded_sparse_moe/cpu/expert_team.*`; test `infernix_offloaded_moe_team_test`; latency section in `host_probe` | Output equals `expert_forward` bit for bit for 1-40 workers and mixed jobs; 60 rounds with parking; ThreadSanitizer clean in `--quick` mode (1, 3 and 4 workers, 12 rounds) | Pinning to physical cores and CCD split; the mailbox handshake with the GPU (`miss_req`, `done_seq`, §8.2); latency of 1-2 cold misses on the target (`host_probe` team section) |
+| Host expert cache: LFRU, residency words, frame epochs, deferred-load controller | `src/models/qwen4_exp/program/expert_cache/`; test `infernix_qwen4_exp_expert_cache_test` | Victims identical to `tools/expert_cache_replay` on a 1,200-group fixture; device/agent simulation with no frame reused early | The transfer agent around it: copy stream, `cuStreamWriteValue32`, route log, loans (M5) |
+| PLE n-gram row ids (§12): exact multipliers, per-head primes, EOS-closed windows | `tools/flash_next/ngram.py`; `src/models/qwen4_exp/frontend/ngram_hash.*`; tests `test_flash_next_ngram.py`, `infernix_qwen4_exp_ngram_hash_test` | Python loop specification equals an independent tensor formulation, and its primes equal `sympy.nextprime`. C++ equals the Python fixture on 800 positions across two layers | Real config values from `inspect_checkpoint` (`ngram_size`, `heads_per_ngram`, base, divisor, seed, EOS); the device kernel (§12.3) qualified against this |
 | M0 source facts | `tools/flash_next/inspect_checkpoint.py` | Synthetic checkpoints | Run on the real checkpoint and record the facts in §6.1 |
 | A4 rule against ModelOpt | `tools/flash_next/a4_reference.py` | ModelOpt's rule ported from its source: one guard differs (§16.2) | Compare with ModelOpt's kernel on the GPU; guard frequency on real activations |
 | M0 machine facts | `tools/flash_next_probe/` (`run_m0.sh`) | Host and NVMe probes run; GPU probe compiled for `sm_120a` | Run everything; revise §4, §8.3, §8.6 and §12 from the results |
@@ -2600,7 +2600,7 @@ host tests pass there. Nothing has run on the RTX 5090 or touched the real check
    VM number in this document is replaced by the target's: DRAM bandwidth and contention, CPU
    kernel and team rates, prefetch distance, NVMe latency, PCIe and copy-engine behavior.
 2. C++ format registration, then recipe A conversion (M2).
-3. Run `ninfer_offloaded_moe_cuda_test`. It must reproduce `kGolden1` and `kGolden4` bit for bit. Then optimize K7a/K7b against it (M3).
+3. Run `infernix_offloaded_moe_cuda_test`. It must reproduce `kGolden1` and `kGolden4` bit for bit. Then optimize K7a/K7b against it (M3).
 4. Optimize the CPU kernel's multi-column path and re-measure it.
 
 ### 19.2 Status on the RTX 5090 (2026-10-04)
@@ -2614,12 +2614,12 @@ the user asked, not part of the Qwen3.5 family.
 | M2 recipe B | Done (`qwen3_8_flash_next_nvfp4_dense8`): recipe A with the dense projection classes in `q8_g32_fp16`, passing the quality gate (ΔNLL +0.008 ± 0.010 nats) at +22 % decode (below). |
 | M2 recipe A | Done. Converted from `nvidia/Qwen3.8-Flash-Next-NVFP4` with no requantization: 24,576 experts, 1,638 tensors, every input scale and all 320,001,536 n-gram rows word-exact. Loads in 25 s with unbuffered reads straight into 64.47 GiB of pinned memory (8.03 GiB device). The loader refuses a pinned block that would leave less than 8 GiB of RAM. |
 | M3 ops | Forward ops in place and checked per op chain against the FP64 reference on the model's own activations (§16.5): `hyper_connection`, `ple`, `qsa` (BF16 and INT8 KV), `offloaded_sparse_moe` layer kernels, `projection_fp32`, `rows`. Standalone oracle tests per op are still to be written. |
-| M4 functional | Done for text generation through the public Engine (`ninfer`, `ninfer-serve`, `ninfer_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. MTP drafter (`--spec mtp`) since the third session. Not yet: CausalScoring, vision, prefix cache. |
+| M4 functional | Done for text generation through the public Engine (`infernix`, `infernix-serve`, `infernix_bench`): `EngineCore` over the hybrid-manager surface, whole-extent KV reservation at admission, `--ngram-volume`. MTP drafter (`--spec mtp`) since the third session. Not yet: CausalScoring, vision, prefix cache. |
 | M5 expert cache | Free VRAM (less a 384 MiB reserve and 64 staging slots) as frames (9,443 on the 5090 with recipe B), LFRU via `expert_cache::CacheController` with no slack frames, promotions on a copy stream: one per layer call per generated token until the frames fill, then one every fourth token; 16 per layer call in prefill. Misses are shared between the CPU expert engine (six workers) and a PCIe stage through device slots (below). No prefetch, loans, warm list or saved profile yet. |
 | M6 decode | CUDA graphs per decode batch size; skinny BF16 GEMV for every unregistered dense shape; expert kernels stage their weight slices with `cp.async`. |
 | M7 speculation | Verify rounds with GDN replay records and fold, PLE/QSA commit-after-acceptance, on-device acceptance and graphs per (B, W); MTP drafter (resident q4 experts, own QSA KV layer, catch-up after commit, chained draft graph, proposal head) with an acceptance-driven draft length, and n-gram copy proposals. Greedy output equals plain decode. tg512 133.5 tok/s with MTP against 88.7 plain (C = 1). |
 
-**Measured** (`ninfer_bench`, INT8 KV, C = 1, greedy, warm cache, recipe A): prefill 167-180 tok/s
+**Measured** (`infernix_bench`, INT8 KV, C = 1, greedy, warm cache, recipe A): prefill 167-180 tok/s
 at 512 tokens; decode 42.8 tok/s for 128 tokens and 32.5 tok/s for 512 tokens. Progression of
 plain decode in this session: 2.9 tok/s (zero-copy experts, generic dense GEMM) → 4.8 (skinny
 GEMV) → 15.1 (expert cache) → 23.1 (staged expert slices) → 26.4 (graphs, cold cache) → 32-43
@@ -2676,13 +2676,13 @@ A 16-CTA stage kernel copies the pass's non-resident records into 64 device slot
 by every layer) with interleaved 16 KiB chunks. The expert kernels then read VRAM, so every miss
 crosses PCIe once at ~24 GB/s. Placement does not change a bit: the new layer-route test checks
 0, 1, 3 and 64 slots against the CPU engine, and greedy token ids are unchanged. Same build,
-`NINFER_Q4_NOSTAGE` A/B, identical cache decisions:
+`INFERNIX_Q4_NOSTAGE` A/B, identical cache decisions:
 
 | Workload | Zero-copy misses | Staged misses |
 |---|---:|---:|
-| `ninfer_bench` tg512 | 31.39 tok/s | 35.25 (+12.3 %) |
-| `ninfer_bench` tg128 | 45.49 | 47.14 (+3.6 %) |
-| `ninfer` code-rewrite prompt, cold cache | 25.2 | 29.9 (+19 %) |
+| `infernix_bench` tg512 | 31.39 tok/s | 35.25 (+12.3 %) |
+| `infernix_bench` tg128 | 45.49 | 47.14 (+3.6 %) |
+| `infernix` code-rewrite prompt, cold cache | 25.2 | 29.9 (+19 %) |
 
 **Promotion interval (adopted: 4 once the frames are full).** Promotions are about 30 % of
 PCIe bytes per token. Promoting every N decode rounds, tg512 after staging:
@@ -2715,7 +2715,7 @@ Acceptance is `speculative_accept_greedy_drafts` on the device, so greedy and sa
 both handled. Experts routed only by rejected columns are not credited to the cache. The n-gram
 proposer is Qwen3.5's (`--ngram-draft-tokens`, `--ngram-min-match`); for this model it may run
 without a neural drafter. Each state Op is checked bit for bit against its committing form
-(`ninfer_speculative_state_ops_test`).
+(`infernix_speculative_state_ops_test`).
 
 End to end, greedy token ids with K = 7 at min-match 12 or 4 equal plain decode across 24-32
 verify rounds, with full and partial acceptance. Results:
@@ -2947,7 +2947,7 @@ the same DDR5, the two paths share DRAM bandwidth, and extra spinning threads on
 contention. Six workers stay the default; their low total CPU load is the measured optimum, not
 idle capacity.
 
-**Measurement caveat.** `ninfer_bench` decodes greedily from a fixed corpus prompt, so any change
+**Measurement caveat.** `infernix_bench` decodes greedily from a fixed corpus prompt, so any change
 in rounding (a dense kernel's reduction order, an 8-bit head) changes the generated text. That
 changes routing and the hit rate with it. The same `dense8` artifact and frame count measured
 90.2 % hits in one build and 85.7 % in another. Kernel changes are therefore judged by per-round
@@ -2969,7 +2969,7 @@ As built, which differs from §11.2 where noted:
 - **Experts all resident instead of a pool.** The 512 routed experts are `q4_g64_fp16` (1.34 GB)
   and always in VRAM, so routing is exact and no residency-bounded approximation exists. A new
   Op, `resident_moe_experts`, streams each selected expert's rows (Q4 or Q8 row-split codecs,
-  FP32 accumulation, FP32 SwiGLU); FP64-oracle test `ninfer_resident_moe_test`.
+  FP32 accumulation, FP32 SwiGLU); FP64-oracle test `infernix_resident_moe_test`.
 - **Real QSA attention**, not Strata's dense window: the drafter's KV layer is a 13th layer of
   every page group, read through the same block tables; its tails are a 13th slab.
 - **Cells.** Prefill chunks write the drafter's K/V for every cell whose next token is known, from
@@ -3048,7 +3048,7 @@ measured. (The 70.29 baseline is higher than the 62-63 tok/s dense8h figures abo
 reverted skinny GEMV changed the greedy text, and with it the hit rate; see the measurement
 caveat.)
 
-**MTP sweep** (same build, tg512 on the bench corpus, warm cache, `ninfer_bench -n 512 -r 2`).
+**MTP sweep** (same build, tg512 on the bench corpus, warm cache, `infernix_bench -n 512 -r 2`).
 Greedy output equals plain decode:
 
 | Mode | tok/s | Draft acceptance | Hits | Frames |
@@ -3212,7 +3212,7 @@ selects), max-context 16384, chunk 4096, cold cache, 200 tokens:
   pp4096 664.7 against 665.5 tok/s.
 - **Frames:** 8,194 with the drafter against 8,912 at this context.
 
-**Serving at the recommended settings (final build, ecaf50e16).** `ninfer-serve --max-concurrency 1
+**Serving at the recommended settings (final build, ecaf50e16).** `infernix-serve --max-concurrency 1
 --spec mtp --draft-tokens 4 --lm-head-draft`, temperature 0, 200 tokens. The code and story requests
 were sent together, so they queued, and then again each alone:
 
@@ -3220,7 +3220,7 @@ were sent together, so they queued, and then again each alone:
 - **Decode:** first requests on a fresh server 70.6 tok/s (code) and 61.8 (story). Repeated on the
   warm cache: **147.2** and **97.5**. MTP acceptance 92.6 % and 61.6 %.
 
-**Two lanes (sanity check only).** `ninfer-serve --max-concurrency 2 --spec mtp --draft-tokens 3
+**Two lanes (sanity check only).** `infernix-serve --max-concurrency 2 --spec mtp --draft-tokens 3
 --lm-head-draft`, temperature 0, 200 tokens, code and story requests sent together on a cold
 server, then each alone.
 
@@ -3295,7 +3295,7 @@ and VM1-VM8, kernels Phase 0-3 and M0-M4, n-gram S0-S4 and W1-W7, concurrency S1
 ragged layout P6), not the milestones of §19; outside their own section they are qualified with the
 track name.
 
-**Can Qwen4Exp use NInfer's existing prefix cache?** Yes, with no new system but not as-is: a
+**Can Qwen4Exp use Infernix's existing prefix cache?** Yes, with no new system but not as-is: a
 Qwen4Exp binding plus four generic index and cost extensions, estimated to bring a 32K chat turn's
 first token from 50-75 s to ~2.4-2.8 s with decode unchanged (§19.3.1, Answer).
 
@@ -3352,7 +3352,7 @@ steps to the kernels, n-gram, concurrency and prefix tracks and proposed three i
 - **Volume probe.** n-gram S1b (CPU only, saturates `G:` for a few minutes) runs while holding
   `gpu.lock` and `fn\locks\quiet.lock`, so no model run reads the volume meanwhile (§19.3.4).
 - **Artifacts.** `E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer`, volume
-  `G:\ninfer\qwen3_8_flash_next_nvfp4.ninfer.ngram`, INT8 KV, unless a plan says otherwise.
+  `G:\infernix\qwen3_8_flash_next_nvfp4.ninfer.ngram`, INT8 KV, unless a plan says otherwise.
 
 #### Merge order and documentation
 
@@ -3461,7 +3461,7 @@ chunk 4096 unless stated.
 
 #### Answer
 
-**Qwen4Exp reuses NInfer's Hybrid prefix cache**: no new system, but a Qwen4Exp physical binding
+**Qwen4Exp reuses Infernix's Hybrid prefix cache**: no new system, but a Qwen4Exp physical binding
 (as Qwen3.5 has) and four small generic extensions to the index and cost model.
 
 | Layer | Verdict | Evidence |
@@ -3712,7 +3712,7 @@ today, `engine.cpp:181`) ranks choices and values snapshots, never decides feasi
 | `transfer_batch_seconds` | 20e-6 |
 | `prefix_span_seconds` (Qwen4Exp `CallCost::span_seconds`) | 1.67 |
 
-Refitted 2026-10-05 on the Gold port (RTX 5090, INT8 KV, `ninfer_bench` pp, `fn/rigs/port/gate3.bat`).
+Refitted 2026-10-05 on the Gold port (RTX 5090, INT8 KV, `infernix_bench` pp, `fn/rigs/port/gate3.bat`).
 After the layer walk and expert streaming (§19.3.8 F2-F6), a prompt costs about 1.67 s per walk
 span to stream the experts, 0.16 s per further call, 22 us per token and 1.06 ns per attention pair.
 Measured against modelled: pp4096 in 4 and 8 calls 2.55 s and 3.03 s (model -4.8 % and +1.7 %),
@@ -3765,7 +3765,7 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 - **Tests.** Layer test: an assist service (cap 256 from 9 columns) with the count oracle by width.
   `forward_real --cpu-columns` adds 24- and 100-column calls through a service configured as the
   Program's: 2,980 and 5,495 experts CPU-served, logits bitwise equal to the GPU route.
-- **Measured** (2026-10-05, ABBA in one build with a temporary toggle, `ninfer_bench`, chunk 1024,
+- **Measured** (2026-10-05, ABBA in one build with a temporary toggle, `infernix_bench`, chunk 1024,
   three repetitions): pp64 82.7 → 167.0 tok/s (+102 %), pp128 126.7 → 246.4 (+94 %), pp200 158.8 →
   287.9 (+81 %); the code prompt at `--prefill-chunk 128` prefills 62.9 → 88.5 tok/s plain and
   62.6 → 96.5 MTP with identical greedy ids; tg512 101.14 → 101.07 (noise). M6's suffix gate after
@@ -3787,7 +3787,7 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 default and rejects 0 (`model_instance.cpp:180, 188, 199`); these move to per-model resolution in
 `construct_model` (Qwen3.5 unchanged) and `construct_qwen4_exp`, returned to `Engine::options()`.
 `persists_prefix_cache` and `report_prefix_cache_save` handle the Qwen4Exp core
-(`engine.cpp:228-266`); `shutdown_cleanup` saves before clearing; `ninfer` (one request, Engine
+(`engine.cpp:228-266`); `shutdown_cleanup` saves before clearing; `infernix` (one request, Engine
 default Legacy) keeps the cache off. **Vision.** Block extras compare exactly; no tap lands strictly
 inside a span (`TapExclusion`) and resumes inside spans are rejected at quote; activation drops
 payloads of items ending ≤ F (`hybrid_program.cpp:937-974`), so only the rest is encoded; suffix
@@ -3804,7 +3804,7 @@ the GPU lock and run as hidden console jobs. Effort (estimated): P0-P6 ≈ 12 en
 | Phase | Work | Exit |
 |---|---|---|
 | **P0** prep (0.75 d) | (1) done on the base branch: `ProgramImpl` moved into `program/program_impl.h` (`54deaa2bc`, §19.3.0); (2) `mtp_cells` (MR1) with debug invariant checks at commit and finish, MR2 repair; (3) `max_columns = max(8, lanes × max_width_)`; (4) QSA tails fix (MR7) with an oracle case for blocks completed inside a call or commit | tg512 and code-prompt greedy ids unchanged at C = 1, plain and MTP; acceptance ≥ before; a ≤ 8-column forced call bit-identical with the CPU on and off; QSA op test passes |
-| **P1** generic extensions (1.25 d) | `prefix_index.{h,cpp}`, `cost.h`, Qwen3.5's `insert_block` caller: extensions 1-4, reserved slabs in the invariants | U1, U4; `ninfer_prefix_cache_index_test` and Qwen3.5 unit tests unchanged |
+| **P1** generic extensions (1.25 d) | `prefix_index.{h,cpp}`, `cost.h`, Qwen3.5's `insert_block` caller: extensions 1-4, reserved slabs in the invariants | U1, U4; `infernix_prefix_cache_index_test` and Qwen3.5 unit tests unchanged |
 | **P2** state image, page records (1 d) | `prefix/state_image.{h,cpp}`; slots allocated before the frames: layout, per-part D2H/H2D with per-layer events and the MTP group, page records into any page by plane range, optional Device slots | X8 |
 | **P3** binding and orchestration, unpipelined (3.5 d) | `prefix/prefix_cache.{h,cpp}`, `prefix_program.cpp`; `program.cpp` (`plan_request`, `quote`, `reserve`, `progress`, `advance_prefill`, `commit*`, `append_forced`, `finish`, `abort`, `release`, `fail_all_cleanup`, `usage`, `memory`); `ProgramOptions` (enable, host bytes, slots, taps, cost). Spare pages; chunked pinning and the Host guard; quote; reserve/activate (whole-batch wait); publication (MR4, MR5); Host-born flexible taps; finish/abort. Stats: `admissions`, `free_device_snapshot_slots`, `host_tail_restores`, `mtp_continuation_mismatches`, `mtp_branch_mismatches`, `endpoint_skipped_mtp`, `endpoint_mismatch_fallbacks`, `taps_skipped`. Test hooks: `force_call_boundaries`, `defer_mtp_cell_at`, `delay_streams(restore_ms, transfer_ms)` (a `cudaLaunchHostFunc` sleep heading each batch), `drafter_state(lane)` | X1, X2, X4, X10, X11, X13, X15-X18, D1 |
 | **P4** pipelining, copy-engine discipline (2.5 d) | M0 first; `ForwardBatch::layer_waits`, ticketed events; restore after the first call's inputs; copy-outs in `layer_waits[1]`; io prefix uploads; `download_pinned` or write-through pacing; failure cleanup | X7, X9, X14; `compute-sanitizer memcheck` on X9 and X14; M3 shows per-layer overlap |
@@ -3838,14 +3838,14 @@ measurements):
   inside one call or commit change, and pooled keys matter only once selection starts (more than
   2,051 visible tokens). Short contexts therefore keep their MTP drafts exactly; long ones may
   change acceptance.
-- **Tests.** `ninfer_qsa_test` (`tests/ops/test_qsa.cpp`) is the QSA FP64 oracle test of the
+- **Tests.** `infernix_qsa_test` (`tests/ops/test_qsa.cpp`) is the QSA FP64 oracle test of the
   shared-code rule (§19.3.0): index queries; pooled keys from the paged plane; the tails exactly
   after every call and commit; rewriting the last position of a block completed inside a call,
   across calls or in a commit (draft step 0 without tail update, prepend with) re-pools the same
   key; single-call invariance; attention per KV profile. Its selection fixture uses an exact value
   grid, so the selected set, including the lower-id tie rule, is decided exactly instead of being
   guarded against near ties. The CPU on/off exit check is Forward-level
-  (`ninfer_qwen4_exp_forward_real_test TOKENS --cpu-columns`: 1, 2, 5 and 8-column calls after a
+  (`infernix_qwen4_exp_forward_real_test TOKENS --cpu-columns`: 1, 2, 5 and 8-column calls after a
   prefix, logits bitwise with the Program's CPU service and without), since the Program has no
   CPU on/off switch and a test-only one would sit in the shared `program_impl.h`.
 
@@ -3858,7 +3858,7 @@ evicted while outstanding; `check_invariants` counts them), zero Device slots le
 and without a tail, duplicates, refused publications, claims, reservations under eviction, the
 Device tail of a Host-born endpoint evicted and planned as a slab restore, `attach = false`, zero
 slots) and U4 (closed form, saturation, subadditivity, ρ = 0 identity) in
-`ninfer_prefix_cache_index_test`.
+`infernix_prefix_cache_index_test`.
 
 **P2 as built**: `prefix/state_image.{h,cpp}`. The layout follows the forward pass: the header
 (256 B: magic, version, a fingerprint of every part, frontier, `mtp_written`, `mtp_next`,
@@ -3867,7 +3867,7 @@ tail, the PLE history in the group of the layer it precedes, then the MTP group 
 MTP tail); 115,673,088 bytes for the real geometry with MTP. `LaneStateImage` copies a lane to a
 segmented Host image (by group or whole), to and from a packed Device buffer, and restores by
 group. `kv_page_geometry` / `kv_layer_planes` are now the Program's single definition of the page
-group's plane order. Test X8 (`ninfer_qwen4_exp_prefix_state_test`, synthetic pools of the real
+group's plane order. Test X8 (`infernix_qwen4_exp_prefix_state_test`, synthetic pools of the real
 geometry, no model): Host, packed and write-through round trips byte-exact without touching other
 lanes, header validation, and per-KV-layer page moves byte-exact (931,840-byte INT8 records).
 Packed Device slots are not allocated by the Program (Device snapshot slots stay 0, below).
@@ -3902,7 +3902,7 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   generated output) chain their lookup hash from the previous block's
   (`block_lookup_hash(previous, tokens, extra)`) and carry the prompt's trailing Vision key, as
   Qwen3.5's `hybrid_publish_blocks` does; the lane's hash list grows with them. (Found by the real-artifact
-  test `ninfer_qwen4_exp_prefix_cache_real_test`: the first version published only the prompt's blocks, so a finish never had the
+  test `infernix_qwen4_exp_prefix_cache_real_test`: the first version published only the prompt's blocks, so a finish never had the
   path an endpoint needs and turn 2 resumed from the last tap.) Taps are realized at prefill
   call boundaries only (flexible): exact taps, and the opener, wait for P5's call planner.
 - **Finish / consistent abort.** The MR3 flush (one kv-only MTP cell from the saved residual), the
@@ -3946,7 +3946,7 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
   check uses the re-planned window.
 - **Not built:** consecutive ≤ 8-column calls sharing one Engine step. Taps keep ≥ 64 tokens apart
   (except Explicit), so two consecutive small calls do not arise in practice.
-- **Tests:** U2 `ninfer_qwen4_exp_call_plan_test` (grids, coverage, Δ admission and demotion against
+- **Tests:** U2 `infernix_qwen4_exp_call_plan_test` (grids, coverage, Δ admission and demotion against
   an independent enumeration over 4,000 random plans, refused inputs, span membership). The real
   test adds X5 (chat turn 2 without the reasoning block resumes at ≥ turn 1's opener), X6 (two
   sessions sharing only the system block resume at the same structural frontier) and X3 in its
@@ -3962,13 +3962,13 @@ binding) and `prefix/prefix_program.cpp` (the Program side).
 `normalize_engine_options(options, Architecture)`; the Engine reads the artifact's architecture
 first (an unreadable artifact falls back to the Qwen3.5 rules and fails in construction). Qwen4Exp:
 Host tier default 4 GiB (`kDefaultQwen4ExpHybridHostCacheBytes`), 0 refused; no Device snapshot
-slots (refused if given); Legacy enabled refused (`ninfer` and `ninfer_bench` already disable the
+slots (refused if given); Legacy enabled refused (`infernix` and `infernix_bench` already disable the
 cache; the two real tests that used the default now disable it); `--prefix-cache-file` refused
 until persistence. The RAM ledger gained a `prefix cache` term: the Host tier is planned with the
-experts (with the default, ~73.3 GiB must be available for `ninfer-serve`). `hybrid_stats` and the
+experts (with the default, ~73.3 GiB must be available for `infernix-serve`). `hybrid_stats` and the
 materialization diagnostics (`cached_prefix_tokens`, `restored_host_bytes`) are filled. Docs: Hybrid
 spec §17 (the binding's contract), `docs/qwen3_8-flash-next.md` "Prefix cache", `docs/serving.md`
-flag rows, `ninfer-serve --help`. Qwen4Exp-only counters (`endpoint_mismatch_fallbacks`, MTP
+flag rows, `infernix-serve --help`. Qwen4Exp-only counters (`endpoint_mismatch_fallbacks`, MTP
 continuation and branch mismatches) are not in `RuntimeStats` yet.
 
 **Persistence as built** (same branch, 2026-10-05): `prefix/persist.cpp` mirrors Qwen3.5's file
@@ -3983,8 +3983,8 @@ the file and resumes turn 2 at its opener with Engine 1's ids.
 
 #### Tests
 
-`ninfer_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)
-takes `NINFER_QWEN4_ARTIFACT` and a scenario selector, like the Qwen3.5 hybrid real test; Engines
+`infernix_qwen4_exp_prefix_cache_real_test` (`tests/models/qwen4_exp/test_prefix_cache_real.cpp`)
+takes `INFERNIX_QWEN4_ARTIFACT` and a scenario selector, like the Qwen3.5 hybrid real test; Engines
 are built sequentially (64.5 GiB pinned each); prompts are raw tokens unless the template is
 needed. **D1, the drafter oracle** ("+D1"; E5 hides drafter errors at C = 1 greedy): after a
 resume's first suffix call, compare bitwise with a cold Program run whose `force_call_boundaries`
@@ -4026,8 +4026,8 @@ changes have no toggle, so it compares the pre-cache build, alternating the two 
 identical-id workloads. Base command:
 
 ```text
-build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer ^
-  --ngram-volume G:\ninfer\qwen3_8_flash_next_nvfp4.ninfer.ngram --kv-dtype int8 --max-context 65536 ^
+build-windows\bin\infernix-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_next_nvfp4_dense8m.ninfer ^
+  --ngram-volume G:\infernix\qwen3_8_flash_next_nvfp4.ninfer.ngram --kv-dtype int8 --max-context 65536 ^
   --prefill-chunk 4096 --max-concurrency 1 --spec mtp --draft-tokens 4 --lm-head-draft ^
   --host-context-mib 4096 --request-log-jsonl profiles\bench\fn_prefix\<arm>\request_log.jsonl
 ```
@@ -4036,7 +4036,7 @@ build-windows\bin\ninfer-serve.exe E:\NInfer-V3\out\flash-next\qwen3_8_flash_nex
 |---|---|---|---|
 | M0 | Copy-engine behaviour (before P4) | ~100-line `local\workdirs\fn\prefix\m0_copy_engines.cu`: `asyncEngineCount`; 4-byte D2H latency on one stream during a 116 MB D2H on another; the same for H2D; `upload_pinned` under bulk H2D; D2H during H2D | Latencies, FIFO yes/no per direction → copy-engine rule 3 |
 | M1 | Multi-turn TTFT, 8K and 32K | `local\workdirs\fn\prefix\multiturn_ttft.py` (stdlib HTTP + SSE): one conversation grown to ~8K then ~32K, frozen texts; 6 turns × 4 types: OpenAI without reasoning echo, Anthropic with thinking echoed, 50-token and 3K-token tool results; greedy, 300 output tokens; zero think time (quote step 2) | TTFT both arms and ratio, reused tokens, prefill s, restored bytes, `endpoint_mismatch_fallbacks`; worst cases |
-| M2 | Decode impact | (a) `ninfer_bench` tg512 (§19.2 command) and the cold code-prompt CLI vs the pre-cache build, then `--device-snapshot-slots 1` vs 0; (b) M1 logs, cached vs uncached turns; (c) restore speed (Strata's #528 check, with interference held fixed): two alternating 32K conversations with the same unrelated request between turns, lane-resident or Device resume against a forced Host restore (X1's two-Engine setup with long outputs), ≥ 256 decode tokens after each resume, ABBA | tok/s, hit rate, frames, compared only on identical-id workloads; per-turn decode tok/s and hit rate; (c) ids equal (E1), decode tok/s and hit rate per arm |
+| M2 | Decode impact | (a) `infernix_bench` tg512 (§19.2 command) and the cold code-prompt CLI vs the pre-cache build, then `--device-snapshot-slots 1` vs 0; (b) M1 logs, cached vs uncached turns; (c) restore speed (Strata's #528 check, with interference held fixed): two alternating 32K conversations with the same unrelated request between turns, lane-resident or Device resume against a forced Host restore (X1's two-Engine setup with long outputs), ≥ 256 decode tokens after each resume, ABBA | tok/s, hit rate, frames, compared only on identical-id workloads; per-turn decode tok/s and hit rate; (c) ids equal (E1), decode tok/s and hit rate per arm |
 | M3 | Attribution | `nsys profile -t cuda,nvtx`: one Host-restore turn at 32K, one tap-heavy cold 32K prompt | Restore ms, layer waits, copy-out overlap, call times |
 | M4 | Copy-outs vs decode, C = 2 | One lane decodes while the other finishes a 32K turn (write-through + image), before and after the rule-3 change | Round-time distribution during vs outside the copy |
 | M5 | Tap overhead | Cold 16K with taps vs `--cache-taps-per-request 0` | Prefill s (target < 0.5 %) |
@@ -4137,7 +4137,7 @@ Qwen4Exp already aliases the Qwen3.5 frontend (`using Frontend = qwen3_5::Fronte
 `program/program.h:50-54`). After renaming, transformers' Qwen4Exp vision classes
 (`modeling_qwen4_exp.py:1688-2015`) equal Qwen3.5's: rotary, MLP, patch embedding, merger,
 attention (scale 72^-0.5, `cu_seqlens` segments), block, forward, `get_rope_index`, processors.
-Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
+Only `out_hidden_size` differs, and Infernix reads it from `merger_fc2.weight.n`.
 
 | Item | Flash-Next (checkpoint, code and artifact reports) |
 |---|---|
@@ -4148,7 +4148,7 @@ Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
 | Weights | 333 BF16 tensors (excluded from quantization), **897,862,112 B**: prelude (patch [1152,1536] + bias, position table [2304,1152]) 8,849,664; per layer (qkv [3456,1152], proj [1152,1152], fc1 [4304,1152], fc2 [1152,4304], biases, 2 LN) 30,479,008; merger (LN, fc1 [4608,4608], fc2 [2560,4608], biases) 66,079,232 |
 | Artifacts | Both deployed reports (`qwen3_8_flash_next_nvfp4{,_dense8m}.ninfer.conversion.json`) contain `vision`: 333 objects `('bf16','cast_direct','contiguous_le_v1')` and both preprocessor resources, built by `tools/convert/qwen4_exp.py` through the Qwen3.5 builder. The Flash-Next recipes assign no vision format (§6.1; never below upstream precision). Qwen3.5's official recipes quantize vision through `_optional` (patch Q6, merger Q8, QKV/fc1 Q4, proj/fc2 Q5), which is why only Q-formats have specialised vision shapes. |
 
-| NInfer Qwen3.5 piece | As built (the baseline) |
+| Infernix Qwen3.5 piece | As built (the baseline) |
 |---|---|
 | Frontend | Media acquisition and `MediaPreprocessCache` (`--media-cache-mib`, `--media-live-mib`). The processor smart-resizes and packs BF16 `[raw_patches, 1536]` as **pageable** payloads (`prepared_prompt.h:35-47`). `--vision-max-merged N` caps an item at N × 1024 px; hard caps are 32,768 merged tokens per prompt and 16,384 per item. `assign_positions` (`processor.cpp:634-708`) stores M-RoPE positions axis-major `[3,n]` with `rope_delta`: text has equal axes, an image run `(cur, cur+y, cur+x)` then `cur += max(gh,gw)`, a text-only prompt the index on every axis. `block_hashes` / `block_extras` hold a cumulative vision key per 64-token block. |
 | Vision control (`vision_control.cpp:37-211`) | 2-D RoPE ids; 4-tap bilinear indices and weights into the 48 × 48 table; scatter indices; segments (`segment_length = h·w`, `segment_count = t`) |
@@ -4158,14 +4158,14 @@ Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
 
 **How features enter Qwen4Exp** (transformers reference):
 
-- **Scatter before the stream expand** (`masked_scatter` precedes `repeat(1,1,hc)`): in NInfer
+- **Scatter before the stream expand** (`masked_scatter` precedes `repeat(1,1,hc)`): in Infernix
   between `ops::embedding` and `ops::hyper_connection_expand` (`execution/forward.cpp:108-111`).
 - **PLE** hashes `input_ids`, so placeholders are hashed; `stage_ngram` hashes `lane.history`,
   which holds them. No change.
 - **Positions.** Prompt: 3-D `get_rope_index`; decode: `index + rope_deltas`. The indexer query
   rotates by the current token's M-RoPE, a pooled block key by its **first token's**. Visibility,
   blocks and selection stay in KV-index order.
-- **MTP** is not defined by transformers. Following vLLM and NInfer's Qwen3.5 convention, cell c
+- **MTP** is not defined by transformers. Following vLLM and Infernix's Qwen3.5 convention, cell c
   uses the target's RoPE at c and the input embedding of token c+1, visual where c+1 is an image
   token. Only acceptance depends on this.
 
@@ -4176,10 +4176,10 @@ Only `out_hidden_size` differs, and NInfer reads it from `merger_fc2.weight.n`.
 | Engine refuses `--vision` (frontend `vision_enabled = false`); config refuses vision; Program refuses media | `runtime/engine/qwen4_exp_instance.cpp:22, 46-55`; `config.cpp:234`; `program.cpp:375` |
 | No vision resources, weights or parameters bound | `load.cpp:209-224`, `weights.h`, `config.h`, `execution/parameters.h` |
 | One `positions` array is KV index and RoPE position in io, sequence, decode, verify, MTP and catch-up staging; main RoPE is 1-D, though `ops::rope` already has Text M-RoPE `[T,3]` (D256/R64; 24/2 heads take the generic route) | `program.cpp:243-251, 940-972, 1112-1146, 1337-1505`; `forward.cpp:374` |
-| The QSA indexer rotates by KV index; QSA equals causal attention below 2,051 visible tokens (B 2048, R 4), so wiring errors are invisible there | `src/ops/qsa/qsa.cu:62-67, 87, 112-133`; `include/ninfer/ops/qsa.h:20, 29-30` |
+| The QSA indexer rotates by KV index; QSA equals causal attention below 2,051 visible tokens (B 2048, R 4), so wiring errors are invisible there | `src/ops/qsa/qsa.cu:62-67, 87, 112-133`; `include/infernix/ops/qsa.h:20, 29-30` |
 | MTP input is a token gather; `reserve()` keeps only token ids and the `PreparedPrompt` dies at return | `forward.cpp:510-511`; `program.cpp:423-476` |
 | Decode and verify upload only the io prefix before `ngram`, MTP drafts only the words before `drafts`; MTP sub-chunks slice `positions` along dim 0 (`kMtpChunkColumns = 512`) and check `numel`; `ops::rope` needs contiguous positions | `program.cpp:863-865, 991, 1146, 1417`; `forward.cpp:34, 176-178, 195`; `src/ops/wrapper/rope.cpp:75-78` |
-| Every vision projection runs `bf16_general_gemm`, a scalar 32×32-tile `fmaf` kernel without MMA; `include/ninfer/ops/linear.h:79` lists only 3 BF16 problems | `src/ops/linear/bf16/bf16_dispatch.cpp:13-28`, `bf16_general.cuh:15-75` |
+| Every vision projection runs `bf16_general_gemm`, a scalar 32×32-tile `fmaf` kernel without MMA; `include/infernix/ops/linear.h:79` lists only 3 BF16 problems | `src/ops/linear/bf16/bf16_dispatch.cpp:13-28`, `bf16_general.cuh:15-75` |
 | Load publication ignores the generation (ABA); `FramePool::acquire` is LIFO; entries go `Ready` at issue | `expert_residency.cpp:84-89`; `expert_cache.cpp:144-149, 193-199` |
 | Only compute is synchronized at round ends: up to 16 promotions per layer × 48 = 768 × 2,764,800 B ≈ 2.1 GB ≈ 77 ms of DMA stay in flight after a prefill chunk | `device.cu:175`; `program.cpp:509-510, 523, 822` |
 | PLE row reads have no in-call de-duplication | `program/ngram_volume.cpp:47-95` |
@@ -4219,7 +4219,7 @@ host's publication test does not use it.
   Qwen3.8-27B-Quasar (the published Qwen3.5-architecture artifact whose BF16 vision also runs the
   fallback, `tests/ops/linear/test_bf16_a16.cpp:278-297`; its other six shapes change route anyway,
   so registering the seventh moves its whole tower off the fallback). Registered for every positive
-  T as the BF16 contract requires (`include/ninfer/ops/linear.h:79` updated):
+  T as the BF16 contract requires (`include/infernix/ops/linear.h:79` updated):
   `src/ops/linear/bf16/shapes/n1152_k1536.cu` … `n5120_k4608.cu`, `bf16_shapes.h`,
   `bf16_dispatch.cpp` (`kShapes`), `sources.cmake`.
 - **Kernels.** All N and K except 4304 are multiples of 64, so the existing `Bf16A16MmaSchedule` /
@@ -4231,7 +4231,7 @@ host's publication test does not use it.
   cold CUDA-graph measurements, as for the Q-format vision shapes.
 - **Qualification.** `run_bf16_linear_case` against the FP64 Linear oracle at T ∈ {1, 2, 8, 9, 63,
   64, 65, 255, 256, 1024, 1025, 4096, 4100, 16384}, plus 65,536 sampled; the vision shapes leave
-  `run_general_bf16_linear` for registered cases. Bench `ninfer_linear_bench --qtype bf16 --policy
+  `run_general_bf16_linear` for registered cases. Bench `infernix_linear_bench --qtype bf16 --policy
   a16`; curves in `docs/maintainer/linear-tuning.md`. Expected 100-150 TFLOP/s (estimated).
   Flash-Next's text BF16 shapes are untouched, so text stays bit-identical.
 - **Implementation decisions (V0, 2026-10-04).** No new kernel: every route is an instance of an
@@ -4344,7 +4344,7 @@ with offload (`R_gemm`, `R_attn` measured in VM2, documented in code). Two place
 | `progress(cancellation)` | (1) Nothing to encode: `Published`. (2) Cancellation: abort path, `release(lane)`, `Aborted`. (3) First call: lend the handoff (W) or the run (L) through `ExpertResidency::lend`, whose waits apply to compute and, under L, to `transfer_stream`; construct `VisionWeightStream` (offload) with the lease's wait events; take `stream.window_weights(params)`; start a CUDA event timer. (4) `pass.advance(next end stage)`. (5) When done: `stream.finish(compute)`, return the non-handoff lease (L) stream-ordered, release payloads, record timings, `Published`; else `InProgress`. (6) Abort and failure (RAII `WindowGuard`): compute waits on the stream's final event, every lease goes back stream-ordered, the vision state is cleared. |
 | Stream ordering | The first upload waits for a compute fence recorded at window start, which also covers MTP catch-up kernels still queued from `commit()` that use `work_`; under L it also waits for the lease's in-flight promotion events. Compute waits on every prelude, layer and merger upload and on the final event in `finish`. Later promotions into returned frames wait on `table_ready_`, recorded on compute after `give_back`. No host sync is needed. |
 | Patch upload | Stays pageable (`copy_host`, `cudaMemcpyAsync`), so it can queue behind the shared H2D FIFO when another lane has just issued promotions (VM4). Pinned payloads would change Qwen3.5's frontend and the media-cache budget: not taken. |
-| Telemetry (`GenerationTimings`, `include/ninfer/types.h:879-898`) | `vision_seconds` and `vision_offload_window_seconds` (GPU event time), `vision_offload_evict_seconds` (lend bookkeeping), `restore_seconds` = 0, `evicted_bytes` = frames lent × stride, `staged_bytes`. The request log line adds placement, frames lent, experts evicted and step count. |
+| Telemetry (`GenerationTimings`, `include/infernix/types.h:879-898`) | `vision_seconds` and `vision_offload_window_seconds` (GPU event time), `vision_offload_evict_seconds` (lend bookkeeping), `restore_seconds` = 0, `evicted_bytes` = frames lent × stride, `staged_bytes`. The request log line adds placement, frames lent, experts evicted and step count. |
 | Admission | `plan_request` replaces the media rejection: builds the `VisionControlPlan`, requires vision enabled, computes placement and frames, adds `service_work_quanta += steps` (the Qwen3.5 hybrid adds one per item). `feasible()`: frames needed ≤ frames − floor (25 %), else `PermanentlyInfeasible`. `quote()`: `residency_->lendable() ≥ needed`, else `TemporarilyBlocked` (other lanes may hold handoff leases). |
 
 #### Frame lending and the two expert-cache fixes
@@ -4418,7 +4418,7 @@ other rates are estimates.
   to 16,384; the guide documents TTFT per 1K merged tokens), `--media-cache-mib`,
   `--media-live-mib` (≥ 131,072 patches × 3,072 B = 402 MB for the prompt cap),
   `--media-preprocess-threads`. New `--vision-offload auto|on|off` (§18):
-  `include/ninfer/types.h:375` becomes an enum, `src/models/load_options.h:10-20` resolves `auto`
+  `include/infernix/types.h:375` becomes an enum, `src/models/load_options.h:10-20` resolves `auto`
   per architecture, parsing in `src/serve/serve_options.cpp:626-643, 786-787` and
   `apps/cli/options.cpp:99, 185`, tests `test_cli_options.cpp` and `test_serve_options.cpp`, no
   shim. **Protocol** unchanged (`image_url`, `input_image`, `video_url`, `input_video`,
@@ -4426,7 +4426,7 @@ other rates are estimates.
 - **Docs.** `docs/qwen3_8-flash-next.md:10` ("Not yet supported: vision") becomes usage notes (TTFT
   per image token, offload default, frames lent, steps for huge items, video token cost: 2 fps, up
   to 768 frames); `docs/cli.md:231-233`; the README Flash-Next section;
-  `docs/maintainer/linear-tuning.md`; the `include/ninfer/ops/linear.h` and `qsa.h` contracts; at
+  `docs/maintainer/linear-tuning.md`; the `include/infernix/ops/linear.h` and `qsa.h` contracts; at
   merge time on the base branch (§19.3.0): §9.1-§9.2 (vision frame role, lending, ABA fix) and
   §19.2 (status and a summary of VM1-VM8).
 - **Video** takes the same paths (per-frame spans and timestamps in the frontend, `segment_count =
@@ -4443,7 +4443,7 @@ other rates are estimates.
 - **V2.** `program/rope_positions.{h,cpp}` (`LaneRope`, `rope_of`, `block_start_rope`, `stage_rope`,
   `stage_mtp_chunk_rope`); io gains `rope` and `block_rope` before `ngram` (a constructor check),
   `mtp_rope` and `mtp_block_rope` after the MTP cells; `mtp_io_` gains the draft steps' RoPE words
-  before `drafts`. `kMtpChunkColumns` lives in `forward.h`. VT3 (`ninfer_qwen4_exp_rope_positions_test`,
+  before `drafts`. `kMtpChunkColumns` lives in `forward.h`. VT3 (`infernix_qwen4_exp_rope_positions_test`,
   host, against an independent port of the frontend's position rule) passes. **Text gate:** greedy
   ids of code / story / long, plain and MTP, are identical to the base build (6 of 6).
 - **V3.** `CacheController::complete_load(key, frame, serial)`; `Command::serial` on copies; the
@@ -4463,7 +4463,7 @@ other rates are estimates.
   Qwen3.5's parameter names and keeps `VisionOverlayAssets{pool = nullptr}`.
   `--vision-offload auto|on|off` (`auto`: on for Qwen4Exp, off for Qwen3.5) with option tests.
 - **V6.** `program/vision_window.{h,cpp}` (pure planning: placement W/L, frames, steps,
-  `visual_slice`; host test `ninfer_qwen4_exp_vision_window_test`) and `program/vision_program.cpp`
+  `visual_slice`; host test `infernix_qwen4_exp_vision_window_test`) and `program/vision_program.cpp`
   (plan, reserve, stepped encode, release, staging). `ForwardBatch::vision` and `MtpCall::vision`
   scatter visual embeddings after the token embedding. First GPU smoke (Flash-Next, dense8m, INT8
   KV): the chart answer equals Quasar's ("NIFER VISION 731；3；左侧"), the natural image answers
@@ -4483,7 +4483,7 @@ that lends during the fill phase with landing reservations outstanding.
 
 | Step | Work | Main files | Effort, GPU | Exit criteria |
 |---|---|---|---|---|
-| **V0** | BF16 TC routes for the 8 shapes, 4304 tail TMA variant, tests, bench, contract, tuning doc | `src/ops/linear/bf16/{shapes/*.cu, bf16_a16_tma_mma.cuh, bf16_mma_common.cuh, bf16_dispatch.cpp, bf16_shapes.h, sources.cmake}`, `include/ninfer/ops/linear.h`, `test_bf16_a16.cpp`, `linear-tuning.md` | 1.5-2 d, yes | VT1; VM1 ≥ 5× fallback at T ≥ 1,024 |
+| **V0** | BF16 TC routes for the 8 shapes, 4304 tail TMA variant, tests, bench, contract, tuning doc | `src/ops/linear/bf16/{shapes/*.cu, bf16_a16_tma_mma.cuh, bf16_mma_common.cuh, bf16_dispatch.cpp, bf16_shapes.h, sources.cmake}`, `include/infernix/ops/linear.h`, `test_bf16_a16.cpp`, `linear-tuning.md` | 1.5-2 d, yes | VT1; VM1 ≥ 5× fallback at T ≥ 1,024 |
 | **V1** | QSA M-RoPE op and its FP64 cases | `qsa.h`, `qsa.cu`, the QSA oracle test from prefix P0 (§19.3.0), `tests/ops/*.cmake` | 1 d, yes | VT2 |
 | **V2** | RoPE plumbing: uniform `[T,3]`, `LaneRope`/`rope_of`, io and `mtp_io_` placement, block starts, MTP sub-chunks, Forward/MtpCall/AttentionCall/QsaBatch wiring, ForwardTap index queries | `program.cpp`, `program/rope_positions.{h,cpp}`, `execution/forward.{h,cpp}`, `test_rope_positions.cpp` | 1.5 d, gate | VT3; VM3 (ids and teacher-forced logits bitwise equal HEAD) |
 | **V3** | Load serial (ABA fix), independent of vision | `expert_cache.{h,cpp}`, `expert_residency.{h,cpp}`, `test_expert_cache.cpp` | 0.5 d, no | VT4 ABA cases; LFRU-equals-replay unchanged |
@@ -4501,7 +4501,7 @@ that lends during the fill phase with landing reservations outstanding.
 | VT2 | QSA M-RoPE (cases added to the FP64 QSA oracle test that prefix P0 creates with its tails case, §19.3.0; QSA has no standalone oracle test at HEAD, §19.2 M3) | Naive FP64 oracle for `qsa_index_query` and `qsa_pool_keys`: distinct axes (an image grid inside a sequence); a block start before the call (start ≡ 1, 2, 3 mod 4); prefill width 1,024, decode W = 1, verify W ∈ {5, 8}, B ∈ {1, 2}; pooled planes read back from the paged plane; the prefix P0 tails fix (`tail_kernel`, `commit_tail_kernel`), which lands first, stays checked against the same oracle (§19.3.0) |
 | VT3 | RoPE staging (`tests/models/qwen4_exp/test_rope_positions.cpp`, new, host) | Over a synthetic image prompt from the real `assign_positions`: `rope_of` for prompt tokens, forced tokens past the prompt, decode, verify and draft cells; MTP sub-chunk blocks (prepend; `first` not a multiple of 4 or 512) and block starts; visual columns for chunks and MTP cells, including an image starting exactly at a chunk boundary and a last MTP cell whose token is the next chunk's first image token; io invariants (`rope`, `block_rope` before `ngram`; draft RoPE before `drafts`) |
 | VT4 | Expert cache (`test_expert_cache.cpp`, host) | LFRU-equals-replay unchanged; the first revision's "victims equal replay at changed capacity" check is dropped (`replay.py:565` runs one fixed capacity). `choose_run` picks the minimum-score run, skips loaned and avoids busy frames; `lend` evicts every held key in the run (entries `Absent`, no `frame_key_` into it) and shrinks capacity; `set_capacity` evicts the excess; `give_back` restores capacity and drains; **ABA**: load K→f (serial s1), lend f, give back, re-admit K→f (s2), then `complete_load(K, f, s1)` false and `(K, f, s2)` true; the no-lending variant K→K2→K; `loaned_count() == 0` after every release path |
-| VT5 | Tower oracle (`reference.py` gains CPU FP64 `vision_tower(store, patches, grid)` over `model.visual.*`, BF16 rounding at block boundaries as for text, checked once against transformers `Qwen4ExpVisionModel` in FP32); `test_vision_real.cpp` (skips without `NINFER_QWEN4_ARTIFACT`) | 256 × 256 (P = 256) and 448 × 320 (odd grid) by relative RMS; offload against resident **bit-identical**; an item alone against the same item in a 2-item pass **bit-identical**; placement W against L bit-identical |
+| VT5 | Tower oracle (`reference.py` gains CPU FP64 `vision_tower(store, patches, grid)` over `model.visual.*`, BF16 rounding at block boundaries as for text, checked once against transformers `Qwen4ExpVisionModel` in FP32); `test_vision_real.cpp` (skips without `INFERNIX_QWEN4_ARTIFACT`) | 256 × 256 (P = 256) and 448 × 320 (odd grid) by relative RMS; offload against resident **bit-identical**; an item alone against the same item in a 2-item pass **bit-identical**; placement W against L bit-identical |
 | VT6 | Multimodal model oracle (`test_forward_real.cpp`; `reference.py --patches npz --grid t,h,w` with an independent `get_rope_index` port, scatter before expand, 3-axis RoPE for main q/k, indexer query and pooled keys) | (a) ~150-token prompt with a 64-token image: per-layer residuals and last logits, plus the wiring check selection cannot hide: rotated index queries (new tap) and the pooled-key plane read from the KV pool against the reference's M-RoPE values. (b) Teacher-forced continuation of (a): W = 1 decode steps until ≥ 2 pooled blocks complete, the first starting inside the prompt, then one W = 5 verify-shaped call; logits there (`block_start_rope`, `index + delta`, verify widths). (c) **Mandatory** > 2,051 tokens: ~200 text, a 32 × 32 merged-grid image (1,024 tokens), ~900 text (~2,130 in all); last-position logits and residual RMS, so selection runs over M-RoPE pooled keys. CPU FP64 run 15-40 min (estimated), only while the engine holds no host RAM. |
 | VT7 | Engine end to end (GPU, gpu.lock) | Text gate: tg512, code and story greedy ids equal HEAD, teacher-forced logits bitwise equal (`--dump-logits`, three frozen texts). Image chart question, greedy: sensible answer; ids equal with offload on and off, and plain against `--spec mtp` (C = 1). Image at a chunk boundary with `--prefill-chunk 128`: no error, MTP acceptance close to chunk 1024. **C = 2:** lane B decodes greedily while lane A (an image, `max_tokens 1`) is admitted right after B's prefill chunk with the promotion backlog live; B's ids equal B alone (B is at batch 1, so exactly). **Stress:** 10 back-to-back image admissions, each right after another lane's prefill chunk; each image's ids equal its C = 1 resident run. **Lease accounting:** cancel a large image after its first `InProgress`; run abort, discard, finish and `fail_all`; after each, frames lent = 0 and capacity restored (idle log line). Serve `image_url` and `input_image`; one 4-frame video. After §19.3.1: a second turn on the same image whose `cached_tokens` cover it and whose answer equals a cold run. |
 | VT8 | Qwen3.5 regression | `test_vision_workspace` and the vision op tests; a Qwen3.5 image embedding bit-identical before and after the refactor; a Qwen3.5 image smoke if an artifact is available; a Quasar vision smoke (its BF16 tower changes route; within oracle tolerance) |
@@ -4511,7 +4511,7 @@ that lends during the fill phase with landing reservations outstanding.
 
 | # | Measurement | Decides |
 |---|---|---|
-| VM1 | `ninfer_linear_bench --qtype bf16 --policy a16`, 8 shapes, T ∈ {64, 256, 1024, 4096, 16384, 65536}, fallback against registered, TFLOP/s | V0 acceptance: ≥ 5× the fallback at T ≥ 1,024 (target) |
+| VM1 | `infernix_linear_bench --qtype bf16 --policy a16`, 8 shapes, T ∈ {64, 256, 1024, 4096, 16384, 65536}, fallback against registered, TFLOP/s | V0 acceptance: ≥ 5× the fallback at T ≥ 1,024 (target) |
 | VM2 | nsys of the tower at P = 1,024 / 4,096 / 16,384 | `R_gemm`, `R_attn` |
 | VM3 | Text gate: tg512 plain and MTP, pp4096; per-round nsys time of the rope, index-query and pool kernels | Same ids and logits as HEAD; kernels within ±1 % |
 | VM4 | Window at P ∈ {256, 1,024, 4,096, 8,160, 16,384, 65,536} and 4 × 1,024 in one prompt: resident against offload, W against L, step durations, start delay behind the promotion FIFO at C = 2, pageable patch copy | W/L threshold; the FIFO risk |
@@ -4716,7 +4716,7 @@ further −0.06 to −0.08 ms); `split_rows` after GDN/QSA projections
 `cpu_plan_kernel`; `route_kernel` (already a warp per column: a 10-step top-k latency, withdrawn).
 
 **Phase 0 as implemented (step K0, branch `claude/fn-kernels`; built, not yet measured).** Rule
-(user, 2026-10-04): reuse NInfer's existing kernels, templates and instances before adding a
+(user, 2026-10-04): reuse Infernix's existing kernels, templates and instances before adding a
 kernel. Every item is a change to, or a new instance of, the kernel that serves the call today, so
 Phase 0 adds no parallel kernel except the one-CTA dispatch, which shares the scan of the existing
 route.
@@ -4731,7 +4731,7 @@ route.
 | QSA decode attention | `attention_kernel<Storage, Group>` with Group ∈ {4, 8, 12, 16} (Qwen4Exp: 12); the head sums reduce-scatter in `warp_sum`'s xor order; the next token's key loads issue before the current token's sums; value loads issue in batches of 8 cells (the plan said 4; a scheduling choice) and fold in token order | — (the existing kernel, templated) |
 
 A temporary toggle patch (`fn/rigs/kernels/k0-base-toggle-temporary.patch`, never committed)
-restores each pre-K0 route under `NINFER_K0_BASE` for M0's same-binary A/B.
+restores each pre-K0 route under `INFERNIX_K0_BASE` for M0's same-binary A/B.
 
 #### Phase 1a: kernel K1, `q8_a16_stream_kernel`
 
@@ -4849,7 +4849,7 @@ HC downs (to 64), the shared expert gate/up (to 48) and down (to 16); the MMA ti
 K1 and the SIMT routes reduce a column identically, so mixing them by width changes no bits;
 column invariance now holds to 8 on every shape and to 64 / 48 / 16 where K1 runs beyond 8.
 With the final routes no shape and width is more than 2 % slower than its previous route (second
-sweep, two runs within 1.3 %). End to end (ninfer_bench tg512 ABBA, frozen binaries, K0 against
+sweep, two runs within 1.3 %). End to end (infernix_bench tg512 ABBA, frozen binaries, K0 against
 K0 + K1, 2026-10-05): plain 97.29 → 99.80 tok/s (+2.6 %), MTP 149.62 → 151.44 (+1.2 %); generated
 ids identical in both modes.
 
@@ -4994,7 +4994,7 @@ and the §19.2 "Next" list change on the base branch at merge time (§19.3.0).
 
 Other files: `q8_schedule.cuh` (`Q8A16StreamSchedule`), `q8_instances.cuh` (`SimtR1T*W8`
 removed), `q8_launch.h`, `q8_shapes.h`, `q8_dispatch.cpp`, `q8_simt.cu` (the r1_w8 launchers go)
-and `sources.cmake` in `src/ops/linear/q8/`; `include/ninfer/ops/linear.h`, `linear_swiglu.h`,
+and `sources.cmake` in `src/ops/linear/q8/`; `include/infernix/ops/linear.h`, `linear_swiglu.h`,
 `hyper_connection.h` (norm/gates/collapse leave the contract) and `offloaded_sparse_moe.h`
 (`moe_combine` inject form, `moe_dispatch` route-log output, `cpu_wait` `L2Warm`);
 `src/ops/hyper_connection/hyper_connection.cu`, new `hyper_connection_mix_q8.cu` and
@@ -5184,7 +5184,7 @@ adds no second version.
   strictly increasing, so a stale word never matches; wraps after ~1.3 years at 100 rounds/s).
 - **S3 Op** `speculative_assemble_verify_tokens(anchors [B], step_drafts [B,S], copy_drafts [K,B],
   extents [B], from_device [B], verify_ids [W,B], drafts [K,B], stream)`, all I32, in
-  `include/ninfer/ops/speculative_round.h`: drafts are `step_drafts[j*B + b]` (step-major,
+  `include/infernix/ops/speculative_round.h`: drafts are `step_drafts[j*B + b]` (step-major,
   1441-1453) when `from_device[b]`, else `copy_drafts[b*K + j]`; K = W - 1; one CTA per row; exact
   oracle; wrapper, launcher and kernel in `src/ops/*/speculative_round.*`. Qwen3.5's
   `speculative_prepare_verify_inputs` takes drafts by row with anchor fillers, so it does not fit.
@@ -5263,9 +5263,9 @@ a round later. A D2H bubble > 15 µs (events) would become an SM-write kernel li
 | 2 | `NgramVolume`, CPU: new `tests/models/qwen4_exp/test_ngram_volume.cpp` | Synthetic volume (60-byte header, row r byte k = f(r, k)), oracle f. Random rows; duplicates and two rows of one block make one read (counters); > 64 blocks wrap the ring; hit after miss; two ids on one cache slot; id ≥ rows throws `out_of_range`; size mismatch throws at open |
 | 3 | Gate primitive, GPU (`tests/test_device.cpp`) | 2,560, 12,800, 327,680 B; a host producer writes poison, waits 2 ms, writes data, publishes; copy equals data, wait count > 0 and wait ≥ the delay; eager, and a graph replayed with three sequences and new data, the old word left in place (stale-word rejection). The trap is not tested (it destroys the context). Once, with the GPU otherwise idle (a TDR resets the display GPU): a 3-5 s producer delay, to confirm WDDM preemption for the 120 s trap |
 | 4 | Assemble op, GPU (`tests/ops/test_speculative_round.cpp`) | B = 1-8, W = 2-16, extents 0..K, mixed `from_device`, S ≥ the largest device extent; oracle a host loop of `verify()`'s rule (1122-1135); exact |
-| 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `NINFER_QWEN4_ARTIFACT`; volume from `NINFER_QWEN4_NGRAM` (default `<artifact>.ngram`), as in `ninfer_qwen4_exp_forward_real_test`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
+| 5 | Engine, real artifact, GPU: new `tests/models/qwen4_exp/test_engine_ngram_gate_real.cpp`, skip 77 without `INFERNIX_QWEN4_ARTIFACT`; volume from `INFERNIX_QWEN4_NGRAM` (default `<artifact>.ngram`), as in `infernix_qwen4_exp_forward_real_test`; one Engine, MTP, C = 2 | Internal seam `qwen4_exp::testing::set_ngram_faults({delay_us, poison, fail_round})`, process-wide, read per gated round, never set by product code. (a) Delay 5 ms + poison (constant FP8 fill, `sfence`, wait, real rows): ids equal faults-off, gate waits > 0 every gated round. (b) A second request admitted mid-decode puts a prefill gather between gated rounds: ids equal faults-off. (c) `system_error` at gated round N: the request fails with it, no hang (test timeout), no sticky CUDA error; runs last since the worker ends |
 | 6 | Product checks, CLI | `--print-token-ids` equal to the baseline build: code and story at C = 1, plain and `--spec mtp`; the MTP pair at C = 2; MTP ids still equal plain at C = 1 |
-| 7 | Existing | `ninfer_qwen4_exp_forward_real_test` calls `read_rows` with the same signature; `ninfer_qwen4_exp_ngram_hash_test` unchanged |
+| 7 | Existing | `infernix_qwen4_exp_forward_real_test` calls `read_rows` with the same signature; `infernix_qwen4_exp_ngram_hash_test` unchanged |
 
 Tests 1 and 2 land with S1, tests 3 and 5 with S2, and test 4 with S3; tests 6 and 7 run at every
 step.
@@ -5285,7 +5285,7 @@ waits, expert hit rate, greedy ids.
 | W2 | W1 with the cold toggle | cold | S2, S3 |
 | W3 | tg512 plain, warm and cold | both | S0b; no regression |
 | W4 | cold CLI code and story, 400 tokens, plain and MTP, new process each | cold, expert-cold | first use |
-| W5 | ninfer-serve C = 1: unrelated warm-up, then code and story first time, then repeats | cold, then warm | serving |
+| W5 | infernix-serve C = 1: unrelated warm-up, then code and story first time, then repeats | cold, then warm | serving |
 | W6 | C = 2 MTP pair | mixed | ids vs baseline C = 2 |
 | W7 | pp4096, cold n-gram cache | cold | S1 |
 
@@ -5343,7 +5343,7 @@ unmeasured on G:) would hit a request's first gated round, and the slow-read war
   threads, 32 KiB each; every CTA's thread 0 polls with `__nanosleep(200)`, then
   `__threadfence_system()`, then `__ldcv` loads in batches of eight 16-byte vectors; a wait records
   its ns and a count in `wait_stats[2 * *wait_row]` (CTA 0); trap after 120 s. Test cases in
-  `ninfer_device_test`: 2,560 / 12,800 / 327,680 B with a 2 ms producer delay over poison, a
+  `infernix_device_test`: 2,560 / 12,800 / 327,680 B with a 2 ms producer delay over poison, a
   pre-published word (no wait), three graph replays with the old word left published, and a
   misaligned size. The 3-5 s producer-delay TDR probe was not run.
 - **Program.** `IoLayout::gate` (a U32 before the rows); `gate_host_` (pinned ready word),
@@ -5415,18 +5415,18 @@ reads the environment once, at construction:
 
 | Variable | Effect |
 |---|---|
-| `NINFER_TMP_ARMS=a,b,...` | Arm per admission, cycled. Letters: `v` flush after the verify graph launch; `d` flush after the plain graph launch; `c` flush in `commit_verified` before `settle_round` (A11); `C` n-gram cold (`NgramVolume::invalidate()` at admission); `K` MTP draft length fixed at `--draft-tokens`. `-` is the baseline |
-| `NINFER_TMP_ARMS_FROM=n` | The first n admissions (bench priming, warm-up) run arm `pre` |
-| `NINFER_TMP_PHASES=1` | Host clock and CUDA timing events at fixed points of each round |
-| `NINFER_TMP_DRAFT_LOG=path` | The A12 draft-probability log (TSV, appended) |
-| `NINFER_TMP_FIXED_K=k` | MTP draft length fixed at k for every arm |
+| `INFERNIX_TMP_ARMS=a,b,...` | Arm per admission, cycled. Letters: `v` flush after the verify graph launch; `d` flush after the plain graph launch; `c` flush in `commit_verified` before `settle_round` (A11); `C` n-gram cold (`NgramVolume::invalidate()` at admission); `K` MTP draft length fixed at `--draft-tokens`. `-` is the baseline |
+| `INFERNIX_TMP_ARMS_FROM=n` | The first n admissions (bench priming, warm-up) run arm `pre` |
+| `INFERNIX_TMP_PHASES=1` | Host clock and CUDA timing events at fixed points of each round |
+| `INFERNIX_TMP_DRAFT_LOG=path` | The A12 draft-probability log (TSV, appended) |
+| `INFERNIX_TMP_FIXED_K=k` | MTP draft length fixed at k for every arm |
 
 - **Per-request line** (`S0 req=...`, printed at finish). It gives the arm, the MTP and plain round
   counts, the n-gram rows and reads per round, and a **wall-clock decode rate**: decode tokens over
-  the time from the first `decode()` entry to the last commit return. `ninfer_bench`'s decode rate
+  the time from the first `decode()` entry to the last commit return. `infernix_bench`'s decode rate
   divides by the time inside `decode()` only, so it omits commit and scheduler time, where the
   commit-site flush acts.
-- **Phases.** With `NINFER_TMP_PHASES=1`, the line adds the mean µs and count of every consecutive
+- **Phases.** With `INFERNIX_TMP_PHASES=1`, the line adds the mean µs and count of every consecutive
   host-point and GPU-event pair.
   - Host points: decode entry, drafts enqueued, draft sync return, verify staged, verify launched,
     tail enqueued, verify sync return, plain staged, plain launched, sample enqueued, sample sync
@@ -5454,7 +5454,7 @@ reads the environment once, at construction:
 - **Scope.** The probe is one per Program, not one per lane, so the S0 runs use C = 1.
 
 **Method and decision rules, fixed before measuring.**
-- **Arms.** They alternate per request inside one `ninfer_bench` process, in mirrored order
+- **Arms.** They alternate per request inside one `infernix_bench` process, in mirrored order
   (A B C … C B A), after the priming request and one warm-up. All arms therefore share one model
   load, one expert-cache history and the same greedy text.
 - **Repetitions.** 10 reps per arm for the flush A/B runs, which leave the phase timers off. The
@@ -5473,7 +5473,7 @@ reads the environment once, at construction:
   - W1, W2: tg512 MTP 4, arms `-`, `C`, `v`, `c`.
   - W3: tg512 plain, arms `-`, `C`, `d`, `Cd`.
   - W4: CLI code and story, 400 tokens, plain and MTP, one process each, phases on.
-  - W5: ninfer-serve C = 1 with phases on: an unrelated warm-up, then code and story for the first
+  - W5: infernix-serve C = 1 with phases on: an unrelated warm-up, then code and story for the first
     time, then repeated.
   - W7 baseline for S1: pp4096 at chunk 4096, cold against warm.
   - A12 logs: tg512, and CLI code and story, greedy and sampled (T = 0.7, top-p 0.8, top-k 20),
@@ -5696,7 +5696,7 @@ reads without padding; the W = 1 catch-up keeps the drafter current. `mtp_draft`
 unwritten pending cells (a lane fresh from prefill). S1 moves its early `return`
 (`program.cpp:1413`) ahead of the per-row chain copies (`program.cpp:1410-1411`) when `steps == 0 &&
 !unwritten`, since those copies only serve drafting. `mtp_policy_rounds` advances only in B = 1
-rounds. A local build reads an environment override (as the `NINFER_Q4_*` sweeps did), not
+rounds. A local build reads an environment override (as the `INFERNIX_Q4_*` sweeps did), not
 committed. **Numerics** unchanged: B ≥ 2 rounds are plain with T = B ≤ 8 on SIMT dense routes,
 column-invariant for 1-8 columns (§19.2); experts are batch-invariant; MTP equals plain at C = 1
 (measured). So C ≤ 8 greedy output equals C = 1 (**inference**, checked in campaign step 1).
@@ -5721,7 +5721,7 @@ catch-up per round) ~68-72 fill and ~120-135 warm, against ~40-55 at HEAD. User 
   byte-identity check against each request alone at C = 1 and its per-(B, W) round counts cover
   it.
 - **Measurement build, never committed** (`fn/rigs/conc/s1-meas-temporary.patch`). The override
-  `NINFER_Q4_CONC_UNGATED` (any value) lets B ≥ 2 rounds speculate as before S1. A temporary
+  `INFERNIX_Q4_CONC_UNGATED` (any value) lets B ≥ 2 rounds speculate as before S1. A temporary
   per-(B, W) round table is printed with each request's cache line: rounds, submit time, and S2's
   period (one `decode()` entry to the next, dropping intervals with a prefill or forced-token
   call) with the tokens those rounds committed. S2 replaces it with the permanent table.
@@ -5799,7 +5799,7 @@ rounds must be in it; the single winner is committed.
   CPU-served experts (min(want, eligible misses)); shapes with more misses than the largest cap
   (E 96, T 10: ten published columns of 10) and with more than 256 jobs (E 400, T 64).
 - **Sweep tooling (never committed).** `fn/rigs/conc/s3_sweep_patch.py` adds TEMP-S3 environment
-  overrides (`NINFER_Q4_CPU_JOBS`, `_DIVISOR`, `_WORKERS`, `_JOB_COLUMNS`) to a measurement
+  overrides (`INFERNIX_Q4_CPU_JOBS`, `_DIVISOR`, `_WORKERS`, `_JOB_COLUMNS`) to a measurement
   build; `s3_sweep.bat` (stage 1, cap × divisor, the 8/3 default three times as drift control)
   and `analyze_s3.py`.
 
@@ -5855,7 +5855,7 @@ CPU-served misses are still promoted within the budget.
 - **Measured** (2026-10-05, cold CLI code prompt, `--expert-state off`, ABBA in one build with a
   temporary toggle): plain 74.6/74.7 → 81.3/80.8 tok/s (+8.6 %), MTP 89.8/89.2 → 133.1/133.1
   (+48.7 %); ~5.7-6.3 K landed experts replace ~55-60 % of the promotions. The 7,448-token prompt's
-  MTP decode 60.6 → 91.0 tok/s (one run per arm). C = 4 plain fill through `ninfer-serve` 57.8 →
+  MTP decode 60.6 → 91.0 tok/s (one run per arm). C = 4 plain fill through `infernix-serve` 57.8 →
   73.5 tok/s aggregate (one run per arm), outputs identical. Greedy ids of code and story, plain
   and MTP, equal the pre-S4 build. **Open:** the long prompt's ids varied between runs in both
   arms; the same variation appears without S4 and is traced to the wide prefill route (§19.3.8,
@@ -5914,7 +5914,7 @@ shipped profile. It published no gain.
   a seeded cache left the fill phase at once and replaced the irrelevant seeded experts only at the
   steady-state rate. Since 2026-10-05 seeded frames do not end the fill phase (`promotions + landed <
   frames`): promotions only follow misses, so a matching workload promotes little either way.
-- **Interface.** `EngineOptions::expert_state_path` (empty: off; `ninfer_bench` leaves it empty).
+- **Interface.** `EngineOptions::expert_state_path` (empty: off; `infernix_bench` leaves it empty).
   CLI and serve: `--expert-state FILE|off`, default `<artifact>.expert-state`.
 - **Tests.** `test_expert_cache.cpp`: seed fills the policy's capacity, skips duplicates, residents
   and out-of-range keys, copies each key into its own frame; the state file round-trips and is
@@ -6059,7 +6059,7 @@ choose_joint(rows b: a_{b,1..Kmax}, limit_b; g_B, c_B; probe flags) -> (W, K_b)
 | S6 | `test_offloaded_moe_cuda.cu`: the mask writes −1, dispatch excludes it. Layer (B = 2, W = 4, extents {3, 0}; B = 3, W = 5): no job for masked-only experts; valid columns exact with and without the mask; masked columns equal the FP64 shared-only formula. `test_forward_real.cpp`, the actual claim: bit-identical logits for every valid column with and without the mask at B = 2, W = 4 (T = 8, SIMT) and W = 5 (T = 10, MMA); masked logits finite |
 | S7 | `test_draft_policy.cpp` (host): B = 1 equals `choose_draft_length` over an acceptance grid; B ≤ 4, Kmax ≤ 4 equals brute force over (W, K) on random inputs; K monotone in acceptance; limits respected; probes never widen W |
 
-**Files.** `include/ninfer/ops/offloaded_sparse_moe.h` (`MoeExpertSource` counters and landing
+**Files.** `include/infernix/ops/offloaded_sparse_moe.h` (`MoeExpertSource` counters and landing
 fields, `MoeCpuChannel::max_job_columns`, `MoeColumnMask`, documentation);
 `src/ops/offloaded_sparse_moe/cuda/moe_layer.cu`; `src/ops/offloaded_sparse_moe/cpu/miss_request.h`
 (`kMaxCpuJobs`, `static_assert`) and `miss_service.{h,cpp}`;
@@ -6206,7 +6206,7 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
    - Strata on sm_90+ scores on many CTAs and selects with an 8-CTA cluster; `cce52db` adds a
      per-warp-histogram top-k (9-12× at 262K-524K cells).
    - Steps:
-     - Q0: nsys at 8K / 32K / 128K (~1 h). Method: one `ninfer_bench -r 1 --warmup 0 -pg P,128`
+     - Q0: nsys at 8K / 32K / 128K (~1 h). Method: one `infernix_bench -r 1 --warmup 0 -pg P,128`
        process per context and mode (plain; `--spec mtp --draft-tokens 4 --lm-head-draft`), dense8m,
        INT8 KV, the serving chunk 4096 and one `--max-ctx 132096` for every context (equal frames).
        Prompts are the first P ids of an untiled corpus of the repository's docs
@@ -6253,7 +6253,7 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
        global state), was built and measured against this one behind a temporary toggle, then
        deleted. nsys, per layer call (8K / 32K / 128K, plain): decode select 12.3 / 13.8 / 23.7 µs
        global against 16.1 / 17.2 / 23.8 µs cluster; prompt select 0.20 / 0.45 / 1.74 against
-       0.54 / 0.82 / 2.15 µs per prompt token. ninfer_bench decode (pg N,256, int8 KV, two runs
+       0.54 / 0.82 / 2.15 µs per prompt token. infernix_bench decode (pg N,256, int8 KV, two runs
        each): 4K 90.23 / 89.86 tok/s, 8K 90.87 / 90.29, 32K 80.64 / 80.48. Greedy ids of both
        equal the Q0 kernel's (8K and 32K, plain and MTP, 256 tokens). Against Q0 the decode rate
        rises 4.9 / 10.6 / 34.6 % at 4K / 8K / 32K and prefill 0.5 / 1.2 / 3.9 %; 32K decode is
@@ -6280,7 +6280,7 @@ baselines: tg512 88.7-90.0 plain and 133.5-138.7 MTP; serve warm 147.2 / 97.5; c
        lane l would) and adds them in the butterfly's tree, leaves in bit-reversed lane order so
        that a six-entry stack per dot holds every open subtree. FP32 addition is commutative, so
        every sum is bitwise the butterfly's. 188 registers, no local memory.
-     - Bits: `ninfer_qsa_select_test` compares scores and ids bit for bit with the original
+     - Bits: `infernix_qsa_select_test` compares scores and ids bit for bit with the original
        kernel on wide cases (partial tiles, two rows, zero-heavy and tied keys, 1 and 3 index
        heads, ratio 8, a 4,096-column chunk at 27K blocks); all pass. The ~40K prompt's greedy
        ids are identical with and without it.
@@ -6468,7 +6468,7 @@ measured results are under "Status" at the end of this section.
   sits on CUDA virtual memory (64 MiB chunks under one fixed virtual address, so kernels and
   graphs are unchanged); a monitor thread shrinks it at the next round boundary (or at once when
   idle) when device-wide free VRAM falls below half the display headroom, and regrows it after 30 s
-  of slack. No frame floor: NInfer never keeps VRAM the display needs.
+  of slack. No frame floor: Infernix never keeps VRAM the display needs.
 - **Feature 2, SSD tier.** A startup RAM ledger computes the RAM for routed experts as available
   RAM − a reserve (`--ram-headroom-mib`, default 2 GiB, replacing the loader's fixed 8 GiB for every
   pinned allocation) − every other planned host allocation. **Full mode** (all 24,576 experts fit
@@ -6510,7 +6510,7 @@ measured results are under "Status" at the end of this section.
   source), H_d the display headroom and R the internal reserve still unspent. The display headroom
   applies to device free only, so a budget below free is not stacked on it. R_total =
   max(256 MiB, 128 MiB + g × min(graph bound, 32)) for the elastic pool (no cap in warning-only
-  mode), g = 4 MiB per graph executable until RM0d calibrates it; R_used tracks NInfer's growth after
+  mode), g = 4 MiB per graph executable until RM0d calibrates it; R_used tracks Infernix's growth after
   sizing, so a runtime grow never spends the reserve.
 - **Fail fast.** `construct_qwen4_exp` evaluates the function with the dense arena and
   `ProgramImpl::device_plan(options).fixed_bytes` (the single place that computes the constructor's
@@ -6547,7 +6547,7 @@ measured results are under "Status" at the end of this section.
   silently lands in shared system memory; the pre-check and the spill guard turn that into a
   startup error, and a runtime grow stops at the spill. Pressure from other processes is met by
   shrinking before VidMm contention (device free is the primary signal; budget and `Demoted` are
-  secondary). NInfer never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
+  secondary). Infernix never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
   optional.
 
 #### Feature 2: the SSD expert tier
@@ -6563,7 +6563,7 @@ measured results are under "Status" at the end of this section.
   growth until RM7 measures it, and 0.25 % lock overhead. `--expert-ram-mib N` caps the result (to
   keep RAM for other programs or simulate a smaller machine). The commit limit is honoured, pinning
   re-checks available RAM before each 1.32 GiB chunk, a failed full-mode pin falls back to tier mode
-  before any read, and a hard minimum working set keeps NInfer's own pageable pages resident.
+  before any read, and a hard minimum working set keeps Infernix's own pageable pages resident.
   Explicit and default sizes of the prefix tier and vision are honoured first (Q6).
 - **Residency** (§4.3): exclusive with shadows (a VRAM resident keeps its RAM copy only as a shadow;
   shadows are the first RAM victims). Slots carry pins (`H2D`, `Queue`, `D2H`, `Use`, `Prefetch`)
@@ -6621,9 +6621,9 @@ measured results are under "Status" at the end of this section.
 | `--ram-headroom-mib N` | 2048 | Physical RAM left available after every pinned allocation, all models; replaces the fixed 8 GiB |
 | `--expert-ram-mib N\|auto` | auto | RAM for routed experts; N caps it (N ≥ 65,825 gives full mode if the ledger allows; more than the ledger allows is an error) |
 | `--expert-state FILE\|off` | S4b's path next to the artifact | Saved expert state (VRAM residents; in tier mode also the RAM ranking) |
-| `--expert-mirror DIR` | none | R14 only: a second copy of the parts for split reads, made once by the user (U3: NInfer never writes it) |
+| `--expert-mirror DIR` | none | R14 only: a second copy of the parts for split reads, made once by the user (U3: Infernix never writes it) |
 
-All are parsed by `ninfer`, `ninfer-serve` and `ninfer_bench` and carried in `EngineOptions`.
+All are parsed by `infernix`, `infernix-serve` and `infernix_bench` and carried in `EngineOptions`.
 Internal `ProgramOptions` for tests and A/B only: `vram_monitor`, `tier_exclusive`,
 `tier_cpu_ssd_jobs`, `tier_prefetch`, `tier_reserve`, `tier_lookahead`, `route_trace` and the fault,
 budget and sequence seams.
@@ -6710,7 +6710,7 @@ Main risks: VMM release on WDDM unproven or VMM frames slower (warning-only fall
 excluding CUDA allocations (spill guard by device free); long device spins during NVMe stalls under
 WDDM (heartbeat waits and a host I/O bound below the TDR bound unless preemption is verified,
 shared with n-gram S2); the hit model resting on one short trace (long-trace replay, NRS, labelled
-uncertainty); the 2 GiB reserve paging NInfer or the desktop (hard minimum working set, RM7);
+uncertainty); the 2 GiB reserve paging Infernix or the desktop (hard minimum working set, RM7);
 `E:`'s ~2,100 reads/s at C > 1 or in prefill; slot protocol bugs (pins, serials, audits); code
 conflicts with concurrency S3-S5/S4b, vision V3/V4, prefix P6 and n-gram S2 (merge order below);
 host RAM bit flips on this machine (triage rule).
@@ -6751,7 +6751,7 @@ change at merge time.
   device free before its capture and after its instantiation and first launch), which is RM0d's
   measurement; the family and shape follow from the graph's slot, so no call site changes. Both
   are bit-neutral: host reads after the round's synchronize, and `cudaMemGetInfo` outside capture.
-- **Capture** (`ninfer_qwen4_exp_route_trace_real_test`): the public Engine over a prompt list,
+- **Capture** (`infernix_qwen4_exp_route_trace_real_test`): the public Engine over a prompt list,
   trace off then on with identical ids required; `--mtp`, `--ngram`, `--concurrency` (prompts
   submitted together in FIFO order) and `--single-pass` (graph measurements); the trace is
   re-read and checked per lane against each request's prompt and generated tokens.
@@ -6836,7 +6836,7 @@ change at merge time.
   after-weights and after-startup free memory, the headroom (`vram_headroom_bytes`, renamed from
   `kv_capacity_headroom_bytes`) and the slack for Qwen4Exp.
 - **Flag.** `--vram-headroom-mib N|auto` sets `EngineOptions::vram_headroom_bytes` (empty = auto)
-  in `ninfer`, `ninfer-serve` and `ninfer_bench`; `KvCapacityPolicy` no longer carries a headroom.
+  in `infernix`, `infernix-serve` and `infernix_bench`; `KvCapacityPolicy` no longer carries a headroom.
   Qwen3.5 reads the same option for `--kv-capacity auto` and refuses it with an explicit capacity
   (moved from the parsers into its Engine validation). The fixed 384 MiB
   `expert_cache_reserve_bytes` is gone.
@@ -6896,8 +6896,8 @@ change at merge time.
 R0 implemented on `claude/fn-memory` (base `1dae6914c`) and run: the probes, both traces and both
 graph captures pass (above). The replay (RM0f) runs after the timing work, which it would disturb.
 
-R4 implemented on `claude/fn-memory` (`a3713f5f6`): `--ram-headroom-mib` in `ninfer`,
-`ninfer-serve` and `ninfer_bench`; RT1 in `ninfer_qwen4_exp_memory_plan_test` passes.
+R4 implemented on `claude/fn-memory` (`a3713f5f6`): `--ram-headroom-mib` in `infernix`,
+`infernix-serve` and `infernix_bench`; RT1 in `infernix_qwen4_exp_memory_plan_test` passes.
 
 R1 implemented on `claude/fn-memory` (`d79ad7172`): startup VRAM sizing, pre-check, spill guard,
 ledger and `--vram-headroom-mib N|auto`; RT7 and the engine smoke pass.
@@ -6911,12 +6911,12 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   cannot be cancelled, so the timeout is not enforced there and `cancel_all` waits). Two depth caps
   plus a common one, 256 KiB prefetch sub-reads, transient backoff within `transient_bound`, one
   retry for other errors and for a timeout (after `CancelIoEx`), short reads fail at once. RT3b
-  (`ninfer_direct_read_queue_test`) passes; the POSIX path is compiled only, not run.
+  (`infernix_direct_read_queue_test`) passes; the POSIX path is compiled only, not run.
 - **R8** `program/expert_cache/host_tier` as planned, with these choices: a ring or prefetch slot
   stays `Free` while the agent writes it (the engine thread knows a landing only through its
   serial at the boundary; `Landing` marks a demotion target during its D2H); a free resident slot
   is used before any victim; the demotion list is refilled from free slots first. RT2
-  (`ninfer_qwen4_exp_host_tier_test`) checks the LFU against the naive sum (< 1e-9 relative), every
+  (`infernix_qwen4_exp_host_tier_test`) checks the LFU against the naive sum (< 1e-9 relative), every
   transition and a 2,000-round randomized run against a naive victim scan with the audit after
   every round. **Deviation:** no Python reference fixtures; the C++ naive oracles decide the same
   victims.
@@ -6928,7 +6928,7 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   records, and the Model owns an `ExpertStore`: each record's one or two 4 KiB-aligned segments
   (the constructor rejects any other). The product never sets the option until R10, and the
   Program has no tier yet, so it is reachable only from tests. RT4
-  (`ninfer_qwen4_exp_expert_store_real_test`): every record of the first, last and straddling
+  (`infernix_qwen4_exp_expert_store_real_test`): every record of the first, last and straddling
   layers read through R7 from the store's segments equals the pinned load's bytes.
 - **R5** (part): `MoeExpertSource::host_table` (device array of host record pointers; null keeps
   today's `host_records + e x stride`), read by `record_of`, the stage kernel's zero-copy and
@@ -6963,7 +6963,7 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   CPU host, each against the CPU engine's bits or the expected error word. **Not done:** the
   tier's agent as responder (R10).
 - **R10.1** (2026-10-05, tier mode end to end without demotions): the ledger's tier placement (or
-  `--expert-ram-mib N`, new in `ninfer`, `ninfer-serve` and `ninfer_bench`; a cap above what is free is an
+  `--expert-ram-mib N`, new in `infernix`, `infernix-serve` and `infernix_bench`; a cap above what is free is an
   error) loads the banks streamed and gives the Program the expert RAM less its lock overhead. The
   Program pins the tier (refused below 1,024 slots), its ring max(128, CPU cap + 2 x 64 staging
   slots) so one call's CPU jobs and a pass's fetched records always fit, and owns the
@@ -7008,14 +7008,14 @@ this section records the design decisions of F0 and F1. Results are recorded by 
 #### F0: attribution of a multi-chunk prefill
 
 - **Instrumentation.** Qwen4Exp's prefill had no NVTX ranges, so a timeline could not say what the
-  host did while the GPU idled. `advance_prefill` now opens permanent ranges in the ninfer domain
+  host did while the GPU idled. `advance_prefill` now opens permanent ranges in the infernix domain
   (`core/nvtx.h`, as Qwen3.5 does): `prefill.chunk` (payload: width), `prefill.ple_rows`
   (`stage_sequence`: n-gram hashing and row reads), `device.wait` (the sync after a non-last
   chunk) and `prefill.residency` (`after_round`: host LFRU policy and promotion issue). They are
   chunk-granular, cost nothing without a tool attached, and stay outside the files other tracks own
   (`ngram_volume.cpp`, `expert_residency.cpp`). An earlier ad-hoc patch with formatted range names in
   those files was replaced.
-- **Rig.** nsys (`--trace=cuda,nvtx`) of `ninfer_bench -p 16384 --prefill-chunk 4096 -r 2
+- **Rig.** nsys (`--trace=cuda,nvtx`) of `infernix_bench -p 16384 --prefill-chunk 4096 -r 2
   --warmup 0`: four cold chunks in a fresh process (empty expert cache, cold n-gram rows), then the
   same prompt warm; once per arm of the F1 toggle, plus profiler-free runs of the same workload.
 - **Attribution.** `f0_attribution.py` reads the SQLite export. Per chunk window (from a chunk's
@@ -7119,9 +7119,9 @@ this section records the design decisions of F0 and F1. Results are recorded by 
   it the stack limit and free memory are unchanged across the first launch. Other `CALL.ABS`
   sites in the binary (e.g. the INT8 and VQ prompt-attention kernels) are float-division slow
   paths and do not raise the stack.
-- **Op** (`ninfer_offloaded_moe_wide_bench`, frames placement, per layer call): T = 4096 79.2 →
+- **Op** (`infernix_offloaded_moe_wide_bench`, frames placement, per layer call): T = 4096 79.2 →
   1.86 ms, T = 1024 20.5 → 3.27 ms, T = 256 6.32 → 4.68 ms, T = 64 2.87 → 2.89 ms (equal).
-- **End to end** (`ninfer_bench`, two runs per arm, means): pp4096 at chunk 4096 674.1 → 982.6
+- **End to end** (`infernix_bench`, two runs per arm, means): pp4096 at chunk 4096 674.1 → 982.6
   tok/s (+45.8 %), pp16384 at chunk 4096 646.8 → 1081.9 (+67.3 %), pp4096 at chunk 1024 420.8 →
   474.7 (+12.8 %); tg512 decode 88.14 → 87.91 tok/s (−0.26 %, within the arms' spread: A 88.06 and
   88.22, B 88.03 and 87.79; decode does not use the wide route). VRAM free after a request
@@ -7170,7 +7170,7 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   resize waits while frames are lent. The startup frame count and decode are unchanged; the lent
   experts refill through promotions after the prompt.
 - **Options.** `ProgramOptions::prefill_stream` (default on). Chunks below 256 columns keep the
-  staging path. A temporary toggle (`NINFER_Q4_PREFILL_STREAM_OFF`, never committed) gives the
+  staging path. A temporary toggle (`INFERNIX_Q4_PREFILL_STREAM_OFF`, never committed) gives the
   A/B in one binary.
 - **Tests.** The layer test adds a streamed placement (every second non-resident expert in a slot
   buffer, reverse order) on the serial, pass and fork routes, bitwise against the CPU engine.
@@ -7179,7 +7179,7 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
 
 #### F2 results and the F1 nondeterminism (2026-10-05)
 
-- **Speed** (`ninfer_bench`, ABBA in one build with a temporary toggle, three repetitions each):
+- **Speed** (`infernix_bench`, ABBA in one build with a temporary toggle, three repetitions each):
   pp4096 at chunk 4096 1,128.8 → 1,567.3 tok/s (+38.8 %), pp16384 at chunk 4096 1,408.3 → 2,053.5
   (+45.8 %), pp4096 at chunk 1024 508.9 → 526.7 (+3.5 %); tg512 100.3 → 100.1 (−0.25 %, within
   noise). The ring was 769 lent frames and every half filled (384 experts per layer per chunk: a
@@ -7194,7 +7194,7 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   build. The layer test's streamed placements are bitwise exact.
 - **F1 nondeterminism (open, blocks merging F2):** with the wide route on, the same prompt's ids with
   the stream on differ from the stream-off run and between repeated runs. The prefix-cache test
-  (`ninfer_qwen4_exp_prefix_cache_real_test`) fails its tap-resume and Host-restore exactness checks
+  (`infernix_qwen4_exp_prefix_cache_real_test`) fails its tap-resume and Host-restore exactness checks
   with the wide route on and passes with it off, already on dev (5df90b1ce onward); cold prompts in
   fresh processes are reproducible, and the wide route's arithmetic equals the narrow route's on
   this artifact. So the wide route's results depend on timing or placement inside a running
@@ -7229,7 +7229,7 @@ router, so the link idles during each layer's ~19 ms of dense and attention work
   1. F4: link once per span instead of once per call.
   2. F5, F6: then cut the compute that becomes the bound.
 
-- **128K measured** (2026-10-05, dev aa6a85985 + pipelined decode (decode only), `ninfer_bench
+- **128K measured** (2026-10-05, dev aa6a85985 + pipelined decode (decode only), `infernix_bench
   -pg 131072,32`, chunk 4096, INT8 KV, docs corpus, nsys `fn/prof/pf128k`):
   - Prefill took 81.9 s (1,600 tok/s; 82.5 s under nsys).
   - Each 4,096-token call takes 2.3-2.5 s of wall time, of which the GPU is busy ~0.83 s; the
@@ -7332,7 +7332,7 @@ the drive's knee) remains open.
   - A Vision window cannot take the lease back from a walk.
   - The LFRU state is credited once per span (from the last chunk's routes) instead of once per
     call; every chunk routes nearly every expert, so the credited set is about the same.
-- **Toggle.** A temporary environment variable (`NINFER_TMP_WALK_OFF`) gave the A/B in one
+- **Toggle.** A temporary environment variable (`INFERNIX_TMP_WALK_OFF`) gave the A/B in one
   binary; it was removed before the commit.
 
 #### F5: QSA prompt attention on Tensor Cores
@@ -7346,7 +7346,7 @@ the drive's knee) remains open.
     that captured the state.
   - The prompt kernel is width-independent too, so the class keeps the property.
   - **Measured failure that set this rule.** A first version used a 256-column threshold inside the
-    class. `ninfer_qwen4_exp_prefix_cache_real_test` X12 (a restored Host-tier resume against the
+    class. `infernix_qwen4_exp_prefix_cache_real_test` X12 (a restored Host-tier resume against the
     capturing Engine's turn) then failed deterministically: the first token difference came at 30,
     in 2 of 2 runs with the route on and 0 of 2 with it off.
   - `test_qsa.cpp` now also checks that a 100-column call reproduces the same columns of a wider
@@ -7385,7 +7385,7 @@ a thread now copies 16 bytes. The copy is exact; `test_rows.cpp` checks both rou
   - OLD = dev aa6a85985.
   - OFF = the new binary with the walk and the F5 route toggled off (F6 and F7 stay on).
   - ON = the new binary.
-- **Workload:** `ninfer_bench` over the long-docs corpus, one process per arm and pass, passes in
+- **Workload:** `infernix_bench` over the long-docs corpus, one process per arm and pass, passes in
   ABC CBA order.
 - **Configurations:**
   - "long": `--max-ctx 132096`, chunk 4096.
@@ -7526,7 +7526,7 @@ every MMA tile launcher on the seven prefill shapes at 128-4096 columns.
 
 **Change.** The shapes' selectors (`src/ops/linear/q8/shapes/*.cu`) use these tiles above 96
 columns. Widths of 96 and below, where decode and verification run, are unchanged.
-`ninfer_linear_q8_a16_test` passes.
+`infernix_linear_q8_a16_test` passes.
 
 **Expected.** ~30 ms per 4096-token chunk, ~1 s per 128K prompt.
 
@@ -7579,7 +7579,7 @@ end-to-end effect is not measured yet.
   - the stream lease (after the ring);
   - a frame lease of its own;
   - a `DeviceBuffer` fallback.
-- A temporary toggle (`NINFER_TMP_WIDE_WORK_OFF`, removed before the commit) restored the static
+- A temporary toggle (`INFERNIX_TMP_WIDE_WORK_OFF`, removed before the commit) restored the static
   arena for the A/B.
 
 **Results** (`post.bat`, `--max-context 49152`, chunk 4096):
@@ -7608,7 +7608,7 @@ gave these readings:
 | `CUDA_MODULE_LOADING`: lazy (the default) or `LAZY` | 1,588 MiB |
 | `CUDA_MODULE_LOADING=EAGER` | 1,814 MiB |
 
-**The cost is not NInfer's.** It is the WDDM context (~432 MiB), the driver's reserve (420 MiB),
+**The cost is not Infernix's.** It is the WDDM context (~432 MiB), the driver's reserve (420 MiB),
 and ~736 MiB that `cudaMemGetInfo` reports as unavailable.
 
 **The unavailable part is usable.**
@@ -7759,8 +7759,8 @@ tokens per query, so most of that KV is cold at any moment.
   `max_context × concurrency` KV exceeds the device budget.
 
 **Gate K0, measured before migration code.** Decode selections at 64K and 128K context
-(a temporary trace, `NINFER_TMP_QSA_TRACE`, kept as a patch on branch
-`backup/fn-layer-prefill-wip-20261005`; traces in `G:\ninfer\qsa_trace_*.bin`; `fn/rigs/layer/k0_sim.py`) give LRU hit rates for 4-token blocks against
+(a temporary trace, `INFERNIX_TMP_QSA_TRACE`, kept as a patch on branch
+`backup/fn-layer-prefill-wip-20261005`; traces in `G:\infernix\qsa_trace_*.bin`; `fn/rigs/layer/k0_sim.py`) give LRU hit rates for 4-token blocks against
 64-token pages at 16K/32K/64K tokens of device cache per lane. Pages are the unit if they reach ≥ 90 %
 at a 32K budget. Otherwise a block cache inside space-1 pages is added (designed then).
 
@@ -7794,7 +7794,7 @@ elastic pool does the same job with no kernel change:
       then shrinks. The delay spares a follow-up turn a restore plus an expert reload.
   - **The control law.** `VramControl::account_fixed` moves its sizing baseline by each grow or
     shrink, so the KV is never read as the reserve's use.
-  - **Toggle.** A temporary `NINFER_TMP_KV_ELASTIC_OFF` restored the fixed pool for the A/B; it
+  - **Toggle.** A temporary `INFERNIX_TMP_KV_ELASTIC_OFF` restored the fixed pool for the A/B; it
     was removed before the commit.
 - **Known costs.**
   - A growth synchronizes the device and evicts experts at admission: a few ms plus refills.
@@ -7803,12 +7803,12 @@ elastic pool does the same job with no kernel change:
   - A long conversation that pauses for more than 60 s restores its prefix from the Host tier
     (~90 ms for 128K INT8) and reloads the evicted experts.
 - **Gate.**
-  - `ninfer_kv_cache_test` covers the backed limit and the `VmmRange`.
+  - `infernix_kv_cache_test` covers the backed limit and the `VmmRange`.
   - The ~40K prompt at `--max-context 262144` must give the same ids elastic and fixed, and the
     same ids as at 49152.
   - tg512 at `--max-ctx 262144`: elastic against fixed, frames and tok/s.
 - **Results** (2026-10-05, `fn/rigs/layer/post.bat`, INT8 KV, one run each):
-  - `ninfer_kv_cache_test` passes.
+  - `infernix_kv_cache_test` passes.
   - The ~40K prompt gives identical greedy ids in every arm: 49152 and 262144, elastic and fixed.
   - At `--max-context 262144`:
 
@@ -7836,7 +7836,7 @@ elastic pool does the same job with no kernel change:
 
 ### 19.3.12 Short prompts: the link, and a CPU share of the experts (2026-10-06)
 
-**Diagnosis** (Gold port, `ninfer_bench`, chunk 4096, INT8 KV, `fn/rigs/short`).
+**Diagnosis** (Gold port, `infernix_bench`, chunk 4096, INT8 KV, `fn/rigs/short`).
 
 - Prompts of 512, 2,048, 4,096 and 16,384 tokens prefill in 2.57, 2.37, 2.28 and 2.48 s. The cost is
   nearly constant across lengths.
@@ -7911,7 +7911,7 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 - Greedy ids identical off and on for chat prompts of ~600, ~2,000 (prose, code) and ~4,000 tokens,
   plain and MTP. The prefix-cache and `/v1/decide` real tests pass with the split on. tg512 110.2
   tok/s (decode does not use it).
-- `ninfer_bench`, warm expert cache, chunk 4096, ABBA (two runs per arm, mean of 3):
+- `infernix_bench`, warm expert cache, chunk 4096, ABBA (two runs per arm, mean of 3):
 
   | Prompt | Off | On | Change |
   |---:|---:|---:|---:|
@@ -7981,7 +7981,7 @@ unwritten.
 - The MTP drafter clamps its cells to the lane's mapped positions: the shared prefix pages plus the
   private ones (`prefix.page_base + pages`). Before this change the clamp counted only the private
   pages, which with a long reused prefix put every draft cell on one position inside a shared cached
-  page (fixed in its own commit). Measured with `ninfer-serve` (MTP, 4 drafts): a 44,783-token chat,
+  page (fixed in its own commit). Measured with `infernix-serve` (MTP, 4 drafts): a 44,783-token chat,
   then its continuation resuming 44,942 cached tokens. The continuation took 98 rounds for 176 tokens
   before the fix (accepted per draft position 63 / 13 / 0 / 0) and 76 after (65 / 32 / 3 / 0), 22 %
   fewer, with identical tokens; the first, uncached request was the same in both builds.
@@ -8018,7 +8018,7 @@ lane held, so greedy output equals an unpaused run. A replay recomputes the repl
 prefill arithmetic, which may round differently from the decode rounds that produced them, so the
 tokens after a replay may differ from an unpaused run (as on Qwen3.5).
 
-**Test.** `ninfer_qwen4_exp_preemption_real_test` (two lanes, a 48-page pool, prompts of 1,024
+**Test.** `infernix_qwen4_exp_preemption_real_test` (two lanes, a 48-page pool, prompts of 1,024
 tokens and 1,200 outputs each, plain and MTP): the exact path's outputs equal the solo runs; the
 replay path keeps every token committed before the pause, completes at full length and reports
 the tokens that still equal the solo run.
@@ -8073,7 +8073,7 @@ round-trip latencies. The softmax was serial: 12 threads made 63 `expf` calls ea
   kernel.
 
 **Verification.** A temporary check ran the previous kernel beside the new one in
-`ninfer_qsa_test`. All 12 calls matched bit for bit: bf16 and int8; W = 1, 5 and 40, the last with 8
+`infernix_qsa_test`. All 12 calls matched bit for bit: bf16 and int8; W = 1, 5 and 40, the last with 8
 tiles per split; pool pages and host/lent page spaces. The FP64-oracle cases pass.
 
 **Measured** (RTX 5090, dense8m, `int8` KV, 2026-10-06, A = Gold `283613d8b`):
@@ -8137,7 +8137,7 @@ Results:
   GPU clocks locked near 2.4 GHz (an interrupted ncu session). Same-rig A/B comparisons hold, but
   absolute rates are about 13 % low.
 
-### 19.3.15 Every NInfer KV profile on Flash-Next (2026-10-06)
+### 19.3.15 Every Infernix KV profile on Flash-Next (2026-10-06)
 
 Until now QSA served only `bf16` and `int8`. Its kernels now take the other five profiles:
 - `fp8` (E4M3-row256, K rotated);
@@ -8168,16 +8168,16 @@ with planes `[K rows | V rows | K scales | V scales]` in the paged planes' own b
   V. At W = 256 that made the int8 prompt kernel 436 → 612 µs and bf16 1,093 → 1,829 µs; it was
   fixed before landing (results below).
 
-**Qualification.** `ninfer_qsa_test` is storage-generic and covers every profile:
+**Qualification.** `infernix_qsa_test` is storage-generic and covers every profile:
 - the FP64 oracle over decoded K/V, with rotations;
 - decode, verify and prefill widths, and the prompt route;
 - width invariance;
 - host and lent page spaces.
 
-`ninfer_qsa_attention_bench` (new) times the Op and the selection alone, for any storage, context
+`infernix_qsa_attention_bench` (new) times the Op and the selection alone, for any storage, context
 and width.
 
-**Quality** (teacher-forced, `ninfer_qwen4_exp_forward_real_test --dump-logits`, chunk 256,
+**Quality** (teacher-forced, `infernix_qwen4_exp_forward_real_test --dump-logits`, chunk 256,
 dense8m; 3,580 positions over code/doc/chat in the dense regime and the last 1,024 positions of a
 16K text in the sparse regime). Measured against bf16 KV:
 
@@ -8249,7 +8249,7 @@ matches the stored codes; otherwise its codes are read. As built, mirroring Qwen
 
   The prompt kernel runs three warps per CTA to fit two stages, the codes and the codebook.
 
-**vq2/k4v2 qualification.** `ninfer_qsa_test` covers:
+**vq2/k4v2 qualification.** `infernix_qsa_test` covers:
 - the Op's own append;
 - a pre-call window in which every fourth slot is stale (its keys must read their codes);
 - decode, verify, two-sequence and prompt-route calls;
@@ -8281,7 +8281,7 @@ from the committed window.
   - k4v2 pays for its Q4 key encoding and decoding.
 - **Op bench, decode W = 1** (including the Op's append): vq2 22.5 µs, k4v2 24.6 µs, int8 15.8 µs.
   At W = 256 they are 621 / 866 µs against 227 µs; the append's VQ encoding dominates.
-- **Real tests with `NINFER_QWEN4_KV=vq2` and `=k4v2`,** plain and MTP: every prefix-cache scenario
+- **Real tests with `INFERNIX_QWEN4_KV=vq2` and `=k4v2`,** plain and MTP: every prefix-cache scenario
   passes, including tap and Host-block resumes identical to the cold run. Preemption passes too:
   - The exact path equals the solo runs.
   - Replay completes every token. MTP replay diverges after 607 tokens with vq2 (replay
@@ -8301,7 +8301,7 @@ from the committed window.
     sequential warp merge whose bits do not depend on the stage count.
   - **Per-format kernel changes.** NVFP4 values decode in half tiles, k8v4 runs three warps, and the
     q load is vectorized.
-- **Op bench** (`ninfer_qsa_attention_bench`, attention time, cold L2, before → after):
+- **Op bench** (`infernix_qsa_attention_bench`, attention time, cold L2, before → after):
   - W = 1-2: equal.
   - W = 3-8: 5-18 % faster.
   - 43-85 columns: 42-73 % faster, now on the prompt route.
@@ -8431,7 +8431,7 @@ on the host instead of 316-416 ms, at the same 27.5 GB/s.
 **Changes.**
 - **`core/copy_batch.h`.** `CopyBatch` enqueues copies through `cudaMemcpyBatchAsync`. A copy whose
   destination overlaps a pending one first flushes the pending batch, so the stream-order result
-  (the later copy wins) is kept. `ninfer_copy_batch_test` checks disjoint, repeated and
+  (the later copy wins) is kept. `infernix_copy_batch_test` checks disjoint, repeated and
   partially overlapping destinations.
 - **`ExpertResidency::issue_loads`** enqueues the promotions in groups of 64 records, each with its
   own completion event, so decode rounds publish them as they land rather than all at once at the end.
@@ -8522,7 +8522,7 @@ keeps one rule.
 ### 19.3.18 Text YaRN beyond 262,144 positions (2026-10-06)
 
 The reference model has one shared rotary embedding. A YaRN `rope_scaling` changes every rotation
-it makes: attention Q/K, the QSA indexer's queries, the pooled index keys and the MTP layer. NInfer
+it makes: attention Q/K, the QSA indexer's queries, the pooled index keys and the MTP layer. Infernix
 used to refuse `rope_yarn_factor` for Qwen4Exp. Now the startup option drives all of those
 rotations.
 
@@ -8545,13 +8545,13 @@ rotations.
 - At factor 1 they keep the FP32 `powf` path unchanged.
 
 **Tests.**
-- `ninfer_qsa_test` gains YaRN index rotations (factor 4, original 4,096), checked against an
+- `infernix_qsa_test` gains YaRN index rotations (factor 4, original 4,096), checked against an
   independent YaRN formula in its FP64 oracle.
-- `ninfer_rope_test` gains Flash-Next YaRN cases: 24 Q / 2 KV heads at 1, 5 and 4,096 tokens, and a
+- `infernix_rope_test` gains Flash-Next YaRN cases: 24 Q / 2 KV heads at 1, 5 and 4,096 tokens, and a
   factor-1 case at position 0.
   - A factor-1 case at position 262,137 failed at first. The FP32 default route is not qualified
     that far, so the case moved to position 0.
-- `ninfer_qwen4_exp_forward_real_test` takes `--rope-yarn-factor` for teacher-forced scoring.
+- `infernix_qwen4_exp_forward_real_test` takes `--rope-yarn-factor` for teacher-forced scoring.
 
 **Gate** (RTX 5090, int8 KV, `qwen3_8_flash_next_nvfp4_dense8m`; rig `fn/rigs/qsaattn` yarn/yarn2).
 - **Factor 1 is unchanged.** Greedy ids are identical to Gold `b454cd836` for prose2k, code MTP and
@@ -8575,7 +8575,7 @@ rotations.
     length is needed.
   - Beyond the native span, YaRN works. At 320K with factor 2, the extra 80K tokens of context score
     the same tail as native 240K. Factor 4 at 320K is within noise of factor 2.
-- **Speed** (`ninfer_bench -pg 311296,128 --max-ctx 327680 --rope-yarn-factor 2 --prefill-chunk
+- **Speed** (`infernix_bench -pg 311296,128 --max-ctx 327680 --rope-yarn-factor 2 --prefill-chunk
   4096`, one rep):
   - prefill: 7,955 tok/s (39.1 s);
   - decode: 66.4 tok/s plain, 76.0 tok/s with MTP K4 and the draft head.
@@ -8642,7 +8642,7 @@ Upstream dev (`35e9b5c85..070fa61a3`) tuned Q8 and BF16 routes for the Flash-Nex
 **Exactness** (full outputs per width): upstream's routes are not Gold's bits, and upstream itself
 runs a GEMV at T = 1 and split-K kernels from T = 2, so its T = 1 column differs from the same
 column at T = 2-8 (Gold's classes are {1..8} and {9..}). Two variants were built on Gold's
-schedules (TEMP `NINFER_TMP_UP7`):
+schedules (TEMP `INFERNIX_TMP_UP7`):
 - **a**: one upstream family over T = 1..8, Gold above; Gold's width classes kept; bits differ at
   T ≤ 8 in a few outputs per thousand (at most 5 BF16 steps);
 - **b**: upstream's selector to T = 128 (T = 1 on its T = 2 kernel).
@@ -8743,7 +8743,7 @@ ignored, which exposed these:
   finish"), which crashed `/v1/decide` with MTP. The flush now stages the cell's RoPE position and
   block start. `finish` and `abort` report a failure through the diagnostic channel.
 - **Engine admission without a cache.** Qwen4Exp always runs on the hybrid resource manager, which
-  refused to work with the context cache off. That broke the CLI and `ninfer_bench`.
+  refused to work with the context cache off. That broke the CLI and `infernix_bench`.
 - **Prefill interleaving.** A second lane's prefill could be scheduled during another lane's layer
   walk. `context_blocks` now reports such a lane, and the Engine's prefill turn skips blocked lanes.
 - **Options validated after the artifact is read.** The Qwen4Exp route skipped the Engine's common
@@ -8778,7 +8778,7 @@ When the implementation lands:
 - [Artifact container](artifact-container.md): residency classes, the expert records, and the
   n-gram volume.
 - [Weight conversion](../weight-conversion.md), [CLI](../cli.md), [serving](../serving.md): recipes A
-  and B, the primary configuration, the options of §18, and `ninfer-calibrate`.
+  and B, the primary configuration, the options of §18, and `infernix-calibrate`.
 - `docs/performance/qwen3.8-flash-next.md` and a model card.
 - [Hybrid prefix cache spec](hybrid-prefix-cache-spec.md): a "Qwen4Exp binding" section, the
   authority for §19.3.1 (Host-born snapshots, zero Device slots, `insert_block(attach)`, saturating
@@ -8946,7 +8946,7 @@ severity, and each points to the section that now resolves it.
 | # | Requirement | What changed |
 |---|---|---|
 | R1 | NVIDIA's quantized tensors stay bit-exact, and activations use NVIDIA's formats | The previous recipe moved BF16 dense tensors to NVFP4 and FP8 and requantized the MTP experts to NVFP4; it is withdrawn. Recipe A imports everything exactly (§6.1), with two new formats, `nvfp4_mul` and `fp8_e4m3fn_block128_f32`. Routed experts now compute NVIDIA's W4A4 with each expert's own activation scale, exactly (§16.2), replacing the A16 arithmetic. The A8 CPU route and the reduced-precision miss copies (old H10) are removed. MTP experts keep FP8 in their own pool (§9.1). |
-| R2 | QSA supports every NInfer KV profile | §8.10: per-profile tile loaders, profile-independent BF16 index keys, the VQ2/K4V2 window rule, and the host tier for every profile (§9.6) |
+| R2 | QSA supports every Infernix KV profile | §8.10: per-profile tile loaders, profile-independent BF16 index keys, the VQ2/K4V2 window rule, and the host tier for every profile (§9.6) |
 | R3 | BF16 tensors may move to 8 bits only where that helps significantly; 8-bit-or-lower tensors stay as NVIDIA stores them | Recipe B (§6.1): W8A16 for the large BF16 matrices, FP8-row then Q8 per class, under a quality gate fixed before measurement (§16.3). It is projected at 1.35-1.6× recipe A for plain decode. |
 | R4 | Optimize first for a 262K context with INT8 KV, then the other profiles | The primary configuration (§18) anchors the targets (§1.3), the memory plan (§15.1), the replay and projections (§4.2) and the QSA development order (§8.10) |
 
@@ -8962,8 +8962,8 @@ severity, and each points to the section that now resolves it.
 | E6 | Device-side "recency updates" contradicted the requirement that policy bookkeeping stay off the critical path | The device only reads residency. LFRU, shadow replay and all decisions run in the transfer agent from the route log (§9.4). |
 | E7 | The residency states had no `LOADING`, no generation and no reuse rule, which allowed use-after-reuse races | State machine with generations, landing tickets and epoch-based retirement (§9.4, §9.5) |
 | E8 | Prefill's wide route defaulted to A16 tensor cores | A4 is NVIDIA's activation format for the experts, so it is the model's semantics on every route (§13) |
-| E9 | NInfer's ModelOpt importer stores `fl(1 / weight_scale_2)` as the NVFP4 divisor, which is not NVIDIA's weight unless the scale is a power of two | `nvfp4_mul` keeps the multiplier (§6.1) |
-| E10 | "Speculative output equals plain output" and "incremental decode equals prefill" overclaimed. NInfer's dense kernels change tiles with width, and its established criterion is a reported disagreement rate. | Bit-exactness is claimed only for expert outputs across placements and batch shapes; the rest uses the existing criterion (§16.4) |
+| E9 | Infernix's ModelOpt importer stores `fl(1 / weight_scale_2)` as the NVFP4 divisor, which is not NVIDIA's weight unless the scale is a power of two | `nvfp4_mul` keeps the multiplier (§6.1) |
+| E10 | "Speculative output equals plain output" and "incremental decode equals prefill" overclaimed. Infernix's dense kernels change tiles with width, and its established criterion is a reported disagreement rate. | Bit-exactness is claimed only for expert outputs across placements and batch shapes; the rest uses the existing criterion (§16.4) |
 | E11 | The HC mixers used device-wide barriers, which measured 1.4-2.0 µs on this card, more than a PDL boundary | Two PDL-chained kernels per mixer; the cooperative form is the fallback (§8.3 rule 2) |
 
 ### A.3 Performance gaps (the design left speed on the table)

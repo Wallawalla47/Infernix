@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 std::size_t bf16_dynamic_grouped_conv_prepare_workspace_capacity_bytes(std::int32_t min_width,
                                                                        std::int32_t max_width,
@@ -22,4 +22,4 @@ void bf16_dynamic_grouped_conv_prepare_dispatch(const Tensor& residual, const Te
                                                 Tensor& prepared, Tensor& finish_delta,
                                                 WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -12,8 +12,8 @@ int check(bool condition, const char* message) {
     return 1;
 }
 
-using ninfer::EngineOptions;
-using ninfer::runtime::normalize_engine_options;
+using infernix::EngineOptions;
+using infernix::runtime::normalize_engine_options;
 
 } // namespace
 
@@ -28,12 +28,12 @@ int main() {
         EngineOptions options;
         options.max_concurrency                = 2;
         options.prefill_chunk                  = 2048;
-        options.context_cache.mode             = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.mode             = infernix::ContextCacheMode::Hybrid;
         const EngineOptions normalized         = normalize_engine_options(options);
-        const ninfer::ContextCacheOptions& out = normalized.context_cache;
+        const infernix::ContextCacheOptions& out = normalized.context_cache;
         failures +=
-            check(out.mode == ninfer::ContextCacheMode::Hybrid &&
-                      out.host_capacity_bytes == ninfer::kDefaultHybridHostCacheBytes &&
+            check(out.mode == infernix::ContextCacheMode::Hybrid &&
+                      out.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                       out.hybrid.device_snapshot_slots == 3U && out.device_state_slots == 3U &&
                       out.hybrid.max_new_taps == 8U && out.hybrid.tap_ladder_tokens == 4096U &&
                       out.hybrid.tap_min_gap_tokens == 2048U,
@@ -46,9 +46,9 @@ int main() {
         EngineOptions options;
         options.max_concurrency                   = 8;
         options.prefill_chunk                     = 8192;
-        options.context_cache.mode                = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.mode                = infernix::ContextCacheMode::Hybrid;
         options.context_cache.host_capacity_bytes = 0;
-        const ninfer::ContextCacheOptions out     = normalize_engine_options(options).context_cache;
+        const infernix::ContextCacheOptions out     = normalize_engine_options(options).context_cache;
         failures +=
             check(out.host_capacity_bytes == 0U && out.hybrid.device_snapshot_slots == 10U &&
                       out.hybrid.max_new_taps == 2U && out.hybrid.tap_ladder_tokens == 16384U &&
@@ -60,12 +60,12 @@ int main() {
     {
         EngineOptions options;
         options.max_concurrency                            = 4;
-        options.context_cache.mode                         = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.mode                         = infernix::ContextCacheMode::Hybrid;
         options.context_cache.hybrid.device_snapshot_slots = 12;
         options.context_cache.hybrid.max_new_taps          = 3;
         options.context_cache.hybrid.tap_ladder_tokens     = 8192;
         options.context_cache.hybrid.tap_min_gap_tokens    = 512;
-        const ninfer::ContextCacheOptions out = normalize_engine_options(options).context_cache;
+        const infernix::ContextCacheOptions out = normalize_engine_options(options).context_cache;
         failures +=
             check(out.hybrid.device_snapshot_slots == 12U && out.device_state_slots == 12U &&
                       out.hybrid.max_new_taps == 3U && out.hybrid.tap_ladder_tokens == 8192U &&
@@ -77,16 +77,16 @@ int main() {
     {
         EngineOptions options;
         options.context_cache.enabled         = false;
-        options.context_cache.mode            = ninfer::ContextCacheMode::Hybrid;
-        const ninfer::ContextCacheOptions out = normalize_engine_options(options).context_cache;
-        failures += check(out.mode == ninfer::ContextCacheMode::Original,
+        options.context_cache.mode            = infernix::ContextCacheMode::Hybrid;
+        const infernix::ContextCacheOptions out = normalize_engine_options(options).context_cache;
+        failures += check(out.mode == infernix::ContextCacheMode::Original,
                           "a disabled hybrid cache was not run as the disabled original manager");
     }
 
     // Hybrid mode rejects the original cache's Device slots and out-of-range tuning.
     for (int variant = 0; variant < 3; ++variant) {
         EngineOptions options;
-        options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.mode = infernix::ContextCacheMode::Hybrid;
         if (variant == 0) { options.context_cache.device_state_slots = 2; }
         if (variant == 1) { options.context_cache.hybrid.device_snapshot_slots = 65; }
         if (variant == 2) { options.context_cache.hybrid.tap_min_gap_tokens = 16; }
@@ -100,10 +100,10 @@ int main() {
     // The hybrid Host budget buys whole slabs; it must hold one snapshot (image slabs + tail slab)
     // plus one block. A 2 MiB slab and a 7-slab image need 9 slabs = 18 MiB; 0 disables the tier.
     {
-        ninfer::models::qwen3_5::detail::HybridHostLayout layout;
+        infernix::models::qwen3_5::detail::HybridHostLayout layout;
         layout.slab_bytes  = 2ULL << 20;
         layout.image_slabs = 7;
-        using ninfer::models::qwen3_5::detail::hybrid_host_slabs;
+        using infernix::models::qwen3_5::detail::hybrid_host_slabs;
         failures += check(hybrid_host_slabs(layout, 0) == 0, "a zero Host budget must disable");
         failures += check(hybrid_host_slabs(layout, 18ULL << 20) == 9U,
                           "the minimum Host budget did not buy exactly one snapshot and a block");
@@ -121,14 +121,14 @@ int main() {
     {
         EngineOptions options;
         options.max_concurrency    = 2;
-        options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
-        const ninfer::ContextCacheOptions qwen4 =
-            normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp).context_cache;
-        failures += check(qwen4.host_capacity_bytes == ninfer::kDefaultQwen4ExpHybridHostCacheBytes &&
+        options.context_cache.mode = infernix::ContextCacheMode::Hybrid;
+        const infernix::ContextCacheOptions qwen4 =
+            normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp).context_cache;
+        failures += check(qwen4.host_capacity_bytes == infernix::kDefaultQwen4ExpHybridHostCacheBytes &&
                               qwen4.hybrid.device_snapshot_slots == 0U && qwen4.hybrid.max_new_taps == 8U,
                           "Qwen3.8-Flash-Next hybrid defaults are wrong");
-        const ninfer::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
-        failures += check(qwen35.host_capacity_bytes == ninfer::kDefaultHybridHostCacheBytes &&
+        const infernix::ContextCacheOptions qwen35 = normalize_engine_options(options).context_cache;
+        failures += check(qwen35.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                               qwen35.hybrid.device_snapshot_slots == 3U,
                           "Qwen3.5 hybrid defaults changed");
     }
@@ -136,13 +136,13 @@ int main() {
     // original prefix cache.
     for (int variant = 0; variant < 3; ++variant) {
         EngineOptions options;
-        options.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.mode = infernix::ContextCacheMode::Hybrid;
         if (variant == 0) { options.context_cache.host_capacity_bytes = 0; }
         if (variant == 1) { options.context_cache.hybrid.device_snapshot_slots = 1; }
-        if (variant == 2) { options.context_cache.mode = ninfer::ContextCacheMode::Original; }
+        if (variant == 2) { options.context_cache.mode = infernix::ContextCacheMode::Original; }
         bool rejected = false;
         try {
-            (void)normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp);
+            (void)normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp);
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "Qwen3.8-Flash-Next normalization accepted an unservable cache");
     }
@@ -151,7 +151,7 @@ int main() {
         options.context_cache.enabled = false;
         bool accepted = true;
         try {
-            (void)normalize_engine_options(options, ninfer::models::Architecture::Qwen4Exp);
+            (void)normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp);
         } catch (const std::invalid_argument&) { accepted = false; }
         failures += check(accepted, "Qwen3.8-Flash-Next refused a disabled context cache");
     }

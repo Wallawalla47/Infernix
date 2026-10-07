@@ -7,7 +7,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // One launch per grid.y-sized token slice; each CTA covers up to kMaxCols columns.
 template <class Schedule, class Output, class Epilogue>
@@ -41,4 +41,4 @@ void launch_q8_a16_stream_linear(const Tensor& x, const Weight& weight, Tensor& 
                                    LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,7 +1,7 @@
 #pragma once
 #include "core/device.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int Bytes>
 __device__ __forceinline__ unsigned char* q8_shared_storage() {
     static_assert(Bytes <= 99 * 1024);
@@ -24,4 +24,4 @@ int q8_prepare_shared() {
     } else
         return 0;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

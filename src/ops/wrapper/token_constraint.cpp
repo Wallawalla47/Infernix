@@ -1,5 +1,5 @@
-// ninfer::ops - constrain_logits wrapper: public contract validation and launcher dispatch.
-#include "ninfer/ops/token_constraint.h"
+// infernix::ops - constrain_logits wrapper: public contract validation and launcher dispatch.
+#include "infernix/ops/token_constraint.h"
 
 #include "ops/launcher/token_constraint.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require(const Tensor& tensor, DType dtype, std::int32_t rows, std::int32_t columns,
@@ -74,4 +74,4 @@ void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
                                     valid_rows, records, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

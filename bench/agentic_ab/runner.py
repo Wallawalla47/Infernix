@@ -54,7 +54,7 @@ LAUNCH_BAT = os.environ.get("AB_LAUNCH_BAT",
 MODEL = os.environ.get("AB_MODEL")  # default: the model path in the launch bat
 TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
                                os.path.join(REPO, "build-windows", "apps", "Release",
-                                            "ninfer-serve.exe"))
+                                            "infernix-serve.exe"))
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
                              os.path.join(HERE, "control", "build", "apps", "Release",
                                           "ninfer-serve.exe"))
@@ -97,10 +97,10 @@ def log(msg):
 # ---------------------------------------------------------------------------------------
 
 def parse_bat(path):
-    """(model_path, [(flag, value|None), ...]) from the ninfer-serve line of a launch bat."""
+    """(model_path, [(flag, value|None), ...]) from the infernix-serve line of a launch bat."""
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            if "ninfer-serve" in line and not line.lstrip().lower().startswith("rem"):
+            if "infernix-serve" in line and not line.lstrip().lower().startswith("rem"):
                 toks = [a if a else b for a, b in re.findall(r'"([^"]*)"|(\S+)', line)]
                 model = toks[1]
                 flags, i = [], 2
@@ -113,7 +113,7 @@ def parse_bat(path):
                     flags.append((name, val))
                     i += 1
                 return model, flags
-    raise SystemExit("no ninfer-serve command line in %s" % path)
+    raise SystemExit("no infernix-serve command line in %s" % path)
 
 
 def help_flags(exe):

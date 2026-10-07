@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 struct NgramConfig {
     std::uint32_t vocab_size                         = 0;
@@ -43,4 +43,4 @@ private:
     std::uint64_t padded_rows_ = 0;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

@@ -1,7 +1,7 @@
 #include "ops/linear/bf16/bf16_template_launch.cuh"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                    Tensor& k, Tensor& v, cudaStream_t stream) {
     using Schedule = Bf16ScheduleInstance<
@@ -14,4 +14,4 @@ void bf16_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
     launch_bf16_a16_gemv<Schedule>(bf16_a16_operands(x, weight), output, LinearIdentityEpilogue{},
                                    stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

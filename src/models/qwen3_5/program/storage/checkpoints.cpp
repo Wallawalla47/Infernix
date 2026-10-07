@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 bool checkpoint_releasable(const ProgramImpl& program, CheckpointHandle handle) {
@@ -463,4 +463,4 @@ std::size_t ProgramImpl::release_redundant_host(std::span<const CheckpointHandle
     return before - host_context_arena->occupied_bytes();
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -3,7 +3,7 @@
 #include "core/pdl.cuh"
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <int Capacity>
 __global__ __launch_bounds__(Capacity * 16, 4) void dynamic_grouped_conv_prepare_reduce_kernel(
@@ -67,4 +67,4 @@ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute rou
     else
         launch<16>(route, base, partial, prepared, finish, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

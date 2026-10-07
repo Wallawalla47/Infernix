@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::product {
+namespace infernix::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
@@ -154,4 +154,4 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     throw std::invalid_argument("invalid speculative backend");
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

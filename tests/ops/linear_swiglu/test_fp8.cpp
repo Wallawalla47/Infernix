@@ -1,6 +1,6 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/linear_swiglu_test_common.h"
-#include "ninfer/ops/linear_swiglu.h"
+#include "infernix/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -10,7 +10,7 @@
 
 namespace {
 int check_negative_gate() {
-    using namespace ninfer;
+    using namespace infernix;
     namespace qw = test::quantized_weight;
     if (test::cuda_unavailable()) return 0;
     constexpr int rows = 34816, k = 5120, half = rows / 2, max_tokens = 513;
@@ -56,8 +56,8 @@ int check_negative_gate() {
 } // namespace
 
 int main() {
-    using namespace ninfer;
-    using namespace ninfer::test::linear_swiglu;
+    using namespace infernix;
+    using namespace infernix::test::linear_swiglu;
 
     try {
         constexpr std::array kA16Cases{1,  2,  4,  5,  8,  9,  16,  17,  24,  25,

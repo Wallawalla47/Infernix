@@ -1,4 +1,4 @@
-"""Demand-driven reads of a NInfer v3 entry and its recorded continuation files."""
+"""Demand-driven reads of a Infernix v3 entry and its recorded continuation files."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class Artifact:
                 raise ArtifactError("truncated v3 entry header")
             magic, json_bytes, self.artifact_id = HEADER.unpack(raw)
             if magic != MAGIC:
-                raise ArtifactError("expected NInfer v3 entry magic")
+                raise ArtifactError("expected Infernix v3 entry magic")
             integer(json_bytes, "json_bytes", positive=True)
             if json_bytes > entry_bytes - HEADER.size:
                 raise ArtifactError("directory JSON exceeds entry file")

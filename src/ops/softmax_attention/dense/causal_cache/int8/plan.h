@@ -1,9 +1,9 @@
 #pragma once
 
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 #include "ops/softmax_attention/common/causal_partition.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Int8KvFamily { Grouped, ParallelGrouped, Tiled };
 
@@ -22,4 +22,4 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
                                     CausalAttentionExecutionEnvelope envelope,
                                     int multiprocessor_count);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

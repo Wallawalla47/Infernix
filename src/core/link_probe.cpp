@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer {
+namespace infernix {
 
 double measure_h2d_bytes_per_second(const void* source, void* destination, std::size_t bytes, int repetitions) {
     if (source == nullptr || destination == nullptr || bytes == 0 || repetitions <= 0) {
@@ -42,4 +42,4 @@ double measure_h2d_bytes_per_second(const void* source, void* destination, std::
     return best;
 }
 
-} // namespace ninfer
+} // namespace infernix

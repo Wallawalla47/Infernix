@@ -1,5 +1,5 @@
 #pragma once
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/request.h"
 #include <array>
 #include <cstddef>
@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
@@ -90,4 +90,4 @@ private:
     friend class Frontend;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

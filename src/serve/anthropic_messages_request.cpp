@@ -14,7 +14,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = RequestJson;
@@ -79,8 +79,8 @@ std::optional<CacheBoundary::Ttl> cache_boundary(const Json& value, const char* 
 }
 
 CacheBoundary explicit_cache_boundary(CacheBoundary::Ttl ttl) {
-    return CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                         .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+    return CacheBoundary{.kind     = infernix::PromptCacheMarkerKind::SharedStablePrefix,
+                         .evidence = infernix::SharedCandidateEvidence::ExplicitBoundary,
                          .ttl      = ttl};
 }
 
@@ -97,18 +97,18 @@ std::string require_tool_name(const Json& object, const char* param) {
     return name;
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
+infernix::product::media_acquire::Source parse_image_source(const Json& block) {
     if (!block.contains("source") || !block.at("source").is_object()) {
         bad_request("image block must contain a source object", "messages");
     }
     const Json& source     = block.at("source");
     const std::string type = require_string(source, "type", "messages", "image source");
-    ninfer::product::media_acquire::Source result;
+    infernix::product::media_acquire::Source result;
     if (type == "base64") {
         result.media_type = require_string(source, "media_type", "messages", "base64 image source");
         const std::string data = require_string(source, "data", "messages", "base64 image source");
         if (data.empty()) { bad_request("base64 image data must not be empty", "messages"); }
-        result.kind  = ninfer::product::media_acquire::SourceKind::Data;
+        result.kind  = infernix::product::media_acquire::SourceKind::Data;
         result.value = "data:" + result.media_type + ";base64," + data;
         return result;
     }
@@ -117,11 +117,11 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& block) {
         if (!result.value.starts_with("http://") && !result.value.starts_with("https://")) {
             bad_request("image URL must use HTTP(S)", "messages");
         }
-        result.kind = ninfer::product::media_acquire::SourceKind::Url;
+        result.kind = infernix::product::media_acquire::SourceKind::Url;
         return result;
     }
     if (type == "file") {
-        bad_request("image file sources require an Anthropic Files API, which NInfer does not "
+        bad_request("image file sources require an Anthropic Files API, which Infernix does not "
                     "provide",
                     "messages", "files_not_supported");
     }
@@ -153,7 +153,7 @@ ContentPart parse_image(const Json& block) {
     const std::string policy = transformations.at("oversized_image").get<std::string>();
     if (policy == "downsize") { return result; }
     if (policy == "error") {
-        result.image_resize_policy = ninfer::ImageResizePolicy::RejectOversized;
+        result.image_resize_policy = infernix::ImageResizePolicy::RejectOversized;
         return result;
     }
     bad_request("transformations.oversized_image must be 'downsize' or 'error'", "messages");
@@ -285,15 +285,15 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
         } else if (type == "tool_result") {
             result.emplace_back(parse_tool_result(block));
         } else if (type == "document") {
-            bad_request("document blocks require document and citation semantics that NInfer does "
+            bad_request("document blocks require document and citation semantics that Infernix does "
                         "not provide",
                         "messages", "documents_not_supported");
         } else if (type == "search_result") {
-            bad_request("search_result blocks require source and citation semantics that NInfer "
+            bad_request("search_result blocks require source and citation semantics that Infernix "
                         "does not provide",
                         "messages", "search_results_not_supported");
         } else if (is_server_tool_block(type)) {
-            bad_request("server tool result blocks require an executor that NInfer does not "
+            bad_request("server tool result blocks require an executor that Infernix does not "
                         "provide",
                         "messages", "server_tools_not_supported");
         } else {
@@ -322,7 +322,7 @@ ChatTurn parse_assistant_blocks(const Json& content) {
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
             // Visible Thinking text is the prompt. A block returned under display:"omitted" has
-            // empty text and carries its reasoning in an NInfer signature; any other signature is
+            // empty text and carries its reasoning in an Infernix signature; any other signature is
             // transport metadata and stays outside the lowered request.
             std::optional<std::string> hidden;
             if (thinking.empty() && block.contains("signature") &&
@@ -350,7 +350,7 @@ ChatTurn parse_assistant_blocks(const Json& content) {
                 // flattened assistant turn. It is advisory, so execution continues without it.
             }
         } else if (is_server_tool_block(type)) {
-            bad_request("server tool content blocks require an executor that NInfer does not "
+            bad_request("server tool content blocks require an executor that Infernix does not "
                         "provide",
                         "messages", "server_tools_not_supported");
         } else {
@@ -645,7 +645,7 @@ void parse_messages(const Json& body, GenerationRequest& request) {
     lower_messages(std::move(parsed), request);
 
     if (!request.messages.empty() && request.messages.back().role == ChatRole::Assistant) {
-        request.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        request.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     }
 }
 
@@ -812,25 +812,25 @@ void lower_tools(const Json& body, GenerationRequest& request) {
 
     for (ParsedTool& tool : definitions) {
         if (tool.source == ToolSource::Toolset) {
-            bad_request("Anthropic toolsets require a tool loader that NInfer does not provide",
+            bad_request("Anthropic toolsets require a tool loader that Infernix does not provide",
                         "tools", "toolsets_not_supported");
         }
         if (tool.source == ToolSource::AnthropicProvided) {
             bad_request("Anthropic-provided tool type '" + tool.source_type +
                             "' requires its predefined prompt schema or server executor, which "
-                            "NInfer does not provide",
+                            "Infernix does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
         // strict=true is advisory: generation is not constrained to the declared JSON Schema.
         if (tool.defer_loading) {
-            bad_request("defer_loading=true requires a deferred tool loader that NInfer does not "
+            bad_request("defer_loading=true requires a deferred tool loader that Infernix does not "
                         "provide",
                         "tools", "deferred_tools_not_supported");
         }
         if (tool.allowed_callers &&
             std::find(tool.allowed_callers->begin(), tool.allowed_callers->end(), "direct") ==
                 tool.allowed_callers->end()) {
-            bad_request("tool allowed_callers excludes direct model calls, and NInfer provides no "
+            bad_request("tool allowed_callers excludes direct model calls, and Infernix provides no "
                         "alternate caller",
                         "tools", "tool_caller_not_supported");
         }
@@ -891,7 +891,7 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which NInfer does not "
+        bad_request("output_config.format requires constrained decoding, which Infernix does not "
                     "provide",
                     "output_config.format", "output_config_format_not_supported");
     }
@@ -993,7 +993,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                         "target the same boundary with different ttl values",
                         "cache_control", "conflicting_cache_ttl");
         }
-        automatic_target->value().evidence |= ninfer::SharedCandidateEvidence::RequestedAutomatic;
+        automatic_target->value().evidence |= infernix::SharedCandidateEvidence::RequestedAutomatic;
         return;
     }
     if (explicit_boundaries.size() == kMaximumExplicitPromptCacheMarkers) {
@@ -1002,8 +1002,8 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                     "cache_control", "too_many_cache_breakpoints");
     }
     *automatic_target =
-        CacheBoundary{.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                      .evidence = ninfer::SharedCandidateEvidence::RequestedAutomatic,
+        CacheBoundary{.kind     = infernix::PromptCacheMarkerKind::SharedStablePrefix,
+                      .evidence = infernix::SharedCandidateEvidence::RequestedAutomatic,
                       .ttl      = *automatic_ttl};
 }
 
@@ -1015,7 +1015,7 @@ void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurp
     parse_effort(body, request, purpose);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
-        bad_request("container requires an external execution environment that NInfer does not "
+        bad_request("container requires an external execution environment that Infernix does not "
                     "provide",
                     "container", "container_not_supported");
     }
@@ -1046,7 +1046,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     if (max_tokens) {
         result.output_tokens_explicit = true;
         if (*max_tokens == 0) {
-            bad_request("max_tokens=0 requires a completed cache prewarm lifecycle that NInfer "
+            bad_request("max_tokens=0 requires a completed cache prewarm lifecycle that Infernix "
                         "does not provide",
                         "max_tokens", "cache_prewarm_not_supported");
         }
@@ -1071,4 +1071,4 @@ AnthropicCountTokensRequest parse_anthropic_count_tokens_request(const Json& bod
     return result;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

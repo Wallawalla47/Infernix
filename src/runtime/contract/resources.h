@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 enum class CheckpointRole : std::uint8_t { InputReplay, LongAnchor, SharedPrefix, Continuation };
 
@@ -129,4 +129,4 @@ struct KvCapacityResolution {
     std::size_t planned_slack_bytes                  = 0;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

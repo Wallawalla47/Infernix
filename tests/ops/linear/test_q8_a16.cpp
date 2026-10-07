@@ -11,7 +11,7 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::test::linear;
+using namespace infernix::test::linear;
 
 struct Geometry {
     std::int32_t n;
@@ -74,11 +74,11 @@ int q8_a16_conformance() {
             }
         }
         for (int t : {1, 8, 16, 32, 48, 64, 65, 128}) {
-            calls.push_back({t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true});
+            calls.push_back({t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, true});
         }
         for (int t : {1, 16, 64, 128}) calls.push_back({t, CallForm::A16Convenience});
-        calls.push_back({17, CallForm::Policy, ninfer::ops::LinearPolicy::AllowA8});
-        calls.push_back({64, CallForm::Policy, ninfer::ops::LinearPolicy::AllowA4});
+        calls.push_back({17, CallForm::Policy, infernix::ops::LinearPolicy::AllowA8});
+        calls.push_back({64, CallForm::Policy, infernix::ops::LinearPolicy::AllowA4});
         failures += run_shape("Q8_A16", ActivationCompute::A16, make_q8_g32_fp16_weight,
                               {shape.n, shape.k, shape.seed, Comparison::Sampled, true, calls});
     }
@@ -105,40 +105,40 @@ int q8_a16_column_invariance() {
         std::uint32_t state = shape.seed;
         for (auto& bits : activation) {
             state = state * 1664525U + 1013904223U;
-            bits  = ninfer::test::f32_to_bf16(
+            bits  = infernix::test::f32_to_bf16(
                 static_cast<float>(static_cast<std::int32_t>(state >> 8) - (1 << 23)) /
                 static_cast<float>(1 << 23));
         }
         const std::size_t out_bytes = static_cast<std::size_t>(shape.n) * kColumns * 2;
         void *weight = nullptr, *x = nullptr, *y = nullptr;
-        ninfer::test::cuda_check(cudaMalloc(&weight, host.payload.size()), "weight");
-        ninfer::test::cuda_check(cudaMalloc(&x, activation.size() * 2), "activation");
-        ninfer::test::cuda_check(cudaMalloc(&y, out_bytes), "output");
-        ninfer::test::cuda_check(
+        infernix::test::cuda_check(cudaMalloc(&weight, host.payload.size()), "weight");
+        infernix::test::cuda_check(cudaMalloc(&x, activation.size() * 2), "activation");
+        infernix::test::cuda_check(cudaMalloc(&y, out_bytes), "output");
+        infernix::test::cuda_check(
             cudaMemcpy(weight, host.payload.data(), host.payload.size(), cudaMemcpyHostToDevice),
             "upload weight");
-        ninfer::test::cuda_check(
+        infernix::test::cuda_check(
             cudaMemcpy(x, activation.data(), activation.size() * 2, cudaMemcpyHostToDevice),
             "upload activation");
-        const ninfer::Weight w = host.device_weight(weight);
+        const infernix::Weight w = host.device_weight(weight);
         std::vector<std::uint16_t> alone(static_cast<std::size_t>(shape.n) * kColumns);
         for (int column = 0; column < kColumns; ++column) {
-            ninfer::Tensor input(static_cast<std::uint16_t*>(x) +
+            infernix::Tensor input(static_cast<std::uint16_t*>(x) +
                                      static_cast<std::size_t>(column) * shape.k,
-                                 ninfer::DType::BF16, {shape.k, 1});
-            ninfer::Tensor output(y, ninfer::DType::BF16, {shape.n, 1});
-            ninfer::ops::linear(input, w, output, nullptr);
-            ninfer::test::cuda_check(
+                                 infernix::DType::BF16, {shape.k, 1});
+            infernix::Tensor output(y, infernix::DType::BF16, {shape.n, 1});
+            infernix::ops::linear(input, w, output, nullptr);
+            infernix::test::cuda_check(
                 cudaMemcpy(alone.data() + static_cast<std::size_t>(column) * shape.n, y,
                            static_cast<std::size_t>(shape.n) * 2, cudaMemcpyDeviceToHost),
                 "read single column");
         }
         for (int t = 2; t <= kColumns; ++t) {
-            ninfer::Tensor input(x, ninfer::DType::BF16, {shape.k, t});
-            ninfer::Tensor output(y, ninfer::DType::BF16, {shape.n, t});
-            ninfer::ops::linear(input, w, output, nullptr);
+            infernix::Tensor input(x, infernix::DType::BF16, {shape.k, t});
+            infernix::Tensor output(y, infernix::DType::BF16, {shape.n, t});
+            infernix::ops::linear(input, w, output, nullptr);
             std::vector<std::uint16_t> together(static_cast<std::size_t>(shape.n) * t);
-            ninfer::test::cuda_check(
+            infernix::test::cuda_check(
                 cudaMemcpy(together.data(), y, together.size() * 2, cudaMemcpyDeviceToHost),
                 "read columns");
             std::size_t differing = 0;
@@ -158,7 +158,7 @@ int q8_a16_column_invariance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
+    if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

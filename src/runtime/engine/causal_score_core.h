@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/device.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <condition_variable>
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Single-owner execution core for offline causal scoring. It deliberately has no request queue,
 // Scheduler, ResourceManager, continuation catalog, or batching policy.
@@ -163,4 +163,4 @@ private:
     std::thread worker_;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

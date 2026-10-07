@@ -2,7 +2,7 @@
 #include "ops/linear/q8/q8_instance_launch.cuh"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Geometry = Q8N2048K16384;
 using Access   = Q8ScaleAccess;
@@ -56,4 +56,4 @@ Q8Launch select_q8_n2048_k16384(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

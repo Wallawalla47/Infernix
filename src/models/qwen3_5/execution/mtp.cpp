@@ -1,13 +1,13 @@
 #include "models/qwen3_5/execution/mtp.h"
 
 #include "core/layout.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/linear_pair.h"
-#include "ninfer/ops/mtp_pack.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/linear_pair.h"
+#include "infernix/ops/mtp_pack.h"
 
 #include <algorithm>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 std::size_t mtp_projection_workspace_bytes(const MtpProjectionParameters& parameters,
                                            std::int32_t first, std::int32_t last) {
@@ -136,4 +136,4 @@ void mtp_query_gate_projection(const Tensor& hidden, const MtpProjectionParamete
     mtp_projection(hidden, parameters, config, query, gate, key, value, workspace, stream);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

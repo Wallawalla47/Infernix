@@ -1,6 +1,6 @@
 #include "ops/linear/q5/q5_shapes.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 Q5Launch select_q5_n5120_k17408(std::int32_t tokens) {
     // Selected with complete-Op cold CUDA Graph measurements on RTX 5090.
     if (tokens <= 1) return launch_q5_a16_direct_r1_t1_w4_k17408;
@@ -17,4 +17,4 @@ Q5Launch select_q5_n5120_k17408(std::int32_t tokens) {
     if (tokens <= 256) return launch_q5_a16_mma_r32_t128;
     return launch_q5_a16_mma_r64_t128;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

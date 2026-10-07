@@ -1,7 +1,7 @@
 #include "ops/linear/nvfp4/nvfp4_a4_tma_launch.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <int K, CUtensorMapL2promotion Promotion = CU_TENSOR_MAP_L2_PROMOTION_NONE>
 void launch(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream) {
@@ -38,4 +38,4 @@ void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& 
     }
     throw std::invalid_argument("NVFP4 TMA linear: unsupported geometry");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

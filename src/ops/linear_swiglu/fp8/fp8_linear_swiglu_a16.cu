@@ -11,7 +11,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry              = Fp8N34816K5120;
@@ -54,4 +54,4 @@ void fp8_linear_swiglu_matrix_launch(const Tensor& x, const Weight& weight, Tens
         return mma.template operator()<Fp8A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>();
     mma.template operator()<Fp8A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 
 bool same_grid(const VisionGrid& left, const VisionGrid& right) {
@@ -450,4 +450,4 @@ bool prefix_matches(const PreparedPromptData& prompt, std::span<const TokenId> r
            resident_identity.matches(prompt, count);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

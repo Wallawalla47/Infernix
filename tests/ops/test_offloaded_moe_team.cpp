@@ -12,8 +12,8 @@
 #include <thread>
 #include <vector>
 
-namespace moe      = ninfer::ops::offloaded_moe;
-namespace fixtures = ninfer::test::offloaded_moe;
+namespace moe      = infernix::ops::offloaded_moe;
+namespace fixtures = infernix::test::offloaded_moe;
 
 namespace {
 

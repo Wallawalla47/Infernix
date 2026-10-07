@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 using OverlayClock = std::chrono::steady_clock;
@@ -155,4 +155,4 @@ void encode_overlay_suffix(DeviceContext& device, const Parameters& parameters,
     session.set_preencoded(std::move(results), stats);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

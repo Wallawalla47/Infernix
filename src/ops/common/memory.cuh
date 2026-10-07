@@ -3,7 +3,7 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 enum class Cache { ca, cg };
 
@@ -111,4 +111,4 @@ __device__ __forceinline__ void pipe_wait() {
     __pipeline_wait_prior(Groups);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

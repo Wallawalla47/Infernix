@@ -1,7 +1,7 @@
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
 #include "ops/linear_attention/kimi_delta_attention/recurrent.cuh"
 
-namespace ninfer::ops::detail::kimi_delta_attention {
+namespace infernix::ops::detail::kimi_delta_attention {
 
 void launch_recurrent(const Arguments& a, cudaStream_t stream) {
     const dim3 grid(a.value_heads, 1, kStateDim / kBlockDv);
@@ -23,4 +23,4 @@ void launch_batch_update(const Arguments& a, const std::int32_t* slots, int batc
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail::kimi_delta_attention
+} // namespace infernix::ops::detail::kimi_delta_attention

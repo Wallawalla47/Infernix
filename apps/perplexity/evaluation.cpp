@@ -5,7 +5,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 
 std::vector<WindowPlan> plan_windows(std::size_t tokens, std::uint32_t context,
                                      std::uint32_t stride) {
@@ -66,4 +66,4 @@ double ScoreAggregate::mean_nll() const {
 
 double ScoreAggregate::ppl() const { return std::exp(mean_nll()); }
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

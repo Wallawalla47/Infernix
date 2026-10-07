@@ -17,7 +17,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 struct DFlashLocalStateSpec {
     std::uint32_t layers   = 0;
@@ -252,4 +252,4 @@ private:
     void for_each_host_component(std::int32_t slot, StateImagePart part, Visit&& visit) const;
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

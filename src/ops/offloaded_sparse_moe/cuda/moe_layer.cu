@@ -9,7 +9,7 @@
 // Experts with more than eight columns in a call take the tensor-core wide route instead
 // (wide_expert.h); these kernels skip them.
 
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
 
@@ -25,7 +25,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 namespace moe = offloaded_moe;
@@ -1418,4 +1418,4 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
     check_launch("combine");
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

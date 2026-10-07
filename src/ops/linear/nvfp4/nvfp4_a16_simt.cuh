@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Geometry, int ActiveTokens, class Schedule>
 struct Nvfp4A16SimtSharedStorage {
@@ -291,4 +291,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

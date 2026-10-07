@@ -2,7 +2,7 @@
 #include "ops/linear/q6/q6_simt_launch.cuh"
 #include "ops/linear/q6/q6_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void launch_q6_a16_simt_r8_t4(const Tensor& x, const Weight& weight, Tensor& out,
                               cudaStream_t stream) {
@@ -20,4 +20,4 @@ void launch_q6_a16_gemv_r4_w2_g16(const Tensor& x, const Weight& weight, Tensor&
         stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

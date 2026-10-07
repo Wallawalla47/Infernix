@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/embedding.h"
+#include "infernix/ops/embedding.h"
 #include "ops/op_tester.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -16,8 +16,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule>
 struct Nvfp4A4SharedStorage {
@@ -347,4 +347,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

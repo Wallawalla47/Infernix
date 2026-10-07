@@ -11,23 +11,23 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = nlohmann::json;
 
-constexpr char kReasoningSummaryPlaceholder[] = "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
+constexpr char kReasoningSummaryPlaceholder[] = "Reasoning summary is not supported. (Infernix: OpenAI Responses API)";
 
-std::string response_status(ninfer::FinishReason reason) {
+std::string response_status(infernix::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::OutputLimit:
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::OutputLimit:
+    case infernix::FinishReason::ContextCapacity:
         return "incomplete";
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::Cancelled:
         return "cancelled";
-    case ninfer::FinishReason::None:
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::StopString:
+    case infernix::FinishReason::None:
+    case infernix::FinishReason::StopToken:
+    case infernix::FinishReason::StopString:
         return "completed";
     }
     return "failed";
@@ -156,7 +156,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         if (ids.call_ids[index].empty()) {
             ids.call_ids[index] = new_openai_response_item_id("call");
         }
-        const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+        const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
         Json item                             = {{"id", ids.function_calls[index]},
                                                  {"type", "function_call"},
                                                  {"status", "completed"},
@@ -173,7 +173,7 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
         history.reasoning_content = outcome.reasoning;
         history.tool_calls.reserve(outcome.tool_calls.size());
         for (std::size_t index = 0; index < outcome.tool_calls.size(); ++index) {
-            const ninfer::GeneratedToolCall& call = outcome.tool_calls[index];
+            const infernix::GeneratedToolCall& call = outcome.tool_calls[index];
             history.tool_calls.push_back(ToolCall{.id             = ids.call_ids[index],
                                                   .name           = call.name,
                                                   .arguments_json = call.arguments_json});
@@ -492,7 +492,7 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
 
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
     impl_->ids.call_ids.reserve(outcome.tool_calls.size());
-    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
+    for (const infernix::GeneratedToolCall& call : outcome.tool_calls) {
         const std::string item_id = new_openai_response_item_id("fc");
         const std::string call_id = new_openai_response_item_id("call");
         impl_->ids.function_calls.push_back(item_id);
@@ -561,4 +561,4 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

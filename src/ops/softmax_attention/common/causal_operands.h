@@ -7,7 +7,7 @@
 #include <type_traits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct CausalAttentionOperands {
     const __nv_bfloat16* q;
     const std::int32_t* positions;
@@ -111,4 +111,4 @@ void validate_quantized_causal_operands(const CausalAttentionOperands& p, View c
         throw std::invalid_argument("quantized causal attention: invalid operands");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -34,7 +34,7 @@
 #include <thread>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 class HostExpertTier final : public ops::offloaded_moe::RecordProvider {
 public:
@@ -173,4 +173,4 @@ private:
     std::thread agent_;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

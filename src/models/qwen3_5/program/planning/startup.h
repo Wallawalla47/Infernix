@@ -19,7 +19,7 @@
 #include <optional>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 using TensorLayout                              = TensorRegion;
 
@@ -194,4 +194,4 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

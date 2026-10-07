@@ -1,12 +1,12 @@
 #include "models/qwen3_5/program/round_buffers.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_tree.h"
 #include "models/load_options.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 constexpr std::size_t kArenaAlign = 256;
@@ -537,4 +537,4 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     }
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

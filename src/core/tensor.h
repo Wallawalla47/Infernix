@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <initializer_list>
 
-namespace ninfer {
+namespace infernix {
 
 struct Tensor {
     void* data         = nullptr;
@@ -27,4 +27,4 @@ struct Tensor {
     Tensor permute(std::initializer_list<int> order) const;
 };
 
-} // namespace ninfer
+} // namespace infernix

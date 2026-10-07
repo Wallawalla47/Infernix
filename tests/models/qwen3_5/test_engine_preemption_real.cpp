@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +24,7 @@ constexpr std::uint32_t kPromptTokens    = 192;
 constexpr std::uint32_t kOutputTokens    = 256;
 constexpr std::uint32_t kCapacity        = 512;
 constexpr std::size_t kSnapshotHostBytes = 512ULL << 20;
-const ninfer::GenerationObservationOptions kObservations{
+const infernix::GenerationObservationOptions kObservations{
     .phase_timings = true, .live_timings = true, .prompt_progress = true};
 
 enum class CancelStage {
@@ -42,16 +42,16 @@ std::string_view setting(const char* name, std::string_view fallback) {
     return value && *value ? value : fallback;
 }
 
-ninfer::SpeculativeBackend backend(std::string_view name) {
-    if (name == "none") { return ninfer::SpeculativeBackend::None; }
-    if (name == "mtp") { return ninfer::SpeculativeBackend::Mtp; }
-    if (name == "dflash") { return ninfer::SpeculativeBackend::DFlash; }
-    if (name == "dflash2") { return ninfer::SpeculativeBackend::DFlash2; }
-    throw std::invalid_argument("NINFER_TEST_BACKEND must be none, mtp, dflash or dflash2");
+infernix::SpeculativeBackend backend(std::string_view name) {
+    if (name == "none") { return infernix::SpeculativeBackend::None; }
+    if (name == "mtp") { return infernix::SpeculativeBackend::Mtp; }
+    if (name == "dflash") { return infernix::SpeculativeBackend::DFlash; }
+    if (name == "dflash2") { return infernix::SpeculativeBackend::DFlash2; }
+    throw std::invalid_argument("INFERNIX_TEST_BACKEND must be none, mtp, dflash or dflash2");
 }
 
-ninfer::RequestOptions request(std::uint32_t outputs) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions request(std::uint32_t outputs) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = false;
@@ -60,19 +60,19 @@ ninfer::RequestOptions request(std::uint32_t outputs) {
     return options;
 }
 
-ninfer::EngineOptions engine_options(const std::filesystem::path& artifact,
-                                     ninfer::SpeculativeBackend selected, bool snapshot) {
-    ninfer::EngineOptions options;
+infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
+                                     infernix::SpeculativeBackend selected, bool snapshot) {
+    infernix::EngineOptions options;
     options.artifact_path        = artifact;
     options.max_context          = kCapacity;
-    options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(kCapacity);
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(kCapacity);
     options.prefill_chunk        = 128;
     options.max_concurrency      = 2;
     options.max_pending_requests = 2;
     options.speculative.backend  = selected;
-    if (selected != ninfer::SpeculativeBackend::None) {
+    if (selected != infernix::SpeculativeBackend::None) {
         options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     }
     // History is deliberately disabled: the two cases exercise only the requests' own recovery.
     options.context_cache.enabled             = false;
@@ -115,12 +115,12 @@ struct Timeline {
     std::array<std::uint64_t, 2> finished{};
 };
 
-class ObservationSink final : public ninfer::OutputSink {
+class ObservationSink final : public infernix::OutputSink {
 public:
     ObservationSink(Timeline& timeline, std::size_t row, std::function<void()> on_start = {})
         : timeline_(timeline), row_(row), on_start_(std::move(on_start)) {}
 
-    void start(ninfer::GenerationStart start) override {
+    void start(infernix::GenerationStart start) override {
         require(++starts_ == 1, "resume published GenerationStart more than once");
         require(start.prompt.prompt_tokens == kPromptTokens && start.reused_prompt_tokens == 0,
                 "initial admission reported an unexpected prompt or history hit");
@@ -128,7 +128,7 @@ public:
         if (on_start_) { on_start_(); }
     }
 
-    void progress(ninfer::PromptProgress progress) override {
+    void progress(infernix::PromptProgress progress) override {
         require(starts_ == 1 && !timing_seen_ && progress.total_prompt_tokens == kPromptTokens &&
                     progress.reused_prompt_tokens == 0 &&
                     progress.processed_prompt_tokens >= processed_ &&
@@ -139,7 +139,7 @@ public:
         progress_elapsed_ns_ = progress.elapsed_ns;
     }
 
-    void timing(ninfer::GenerationTimingObservation timing) override {
+    void timing(infernix::GenerationTimingObservation timing) override {
         require(starts_ == 1 && processed_ == kPromptTokens &&
                     timing.generated_tokens > last_timing_.generated_tokens &&
                     timing.generated_tokens <= kOutputTokens &&
@@ -152,16 +152,16 @@ public:
         timeline_.output(row_, timing.generated_tokens == kOutputTokens);
     }
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(infernix::OutputDelta delta) override {
         require(timing_seen_, "output delta preceded its committed-token observation");
-        (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning_ : content_) += delta.text;
+        (delta.channel == infernix::OutputChannel::Reasoning ? reasoning_ : content_) += delta.text;
     }
 
     [[nodiscard]] std::uint32_t committed_tokens() const noexcept {
         return last_timing_.generated_tokens;
     }
 
-    void validate(const ninfer::GenerationResult& result, ninfer::SpeculativeBackend selected,
+    void validate(const infernix::GenerationResult& result, infernix::SpeculativeBackend selected,
                   bool cancelled = false) const {
         require(starts_ == 1 && timing_seen_ && processed_ == kPromptTokens &&
                     last_timing_.generated_tokens == result.generated_token_ids.size(),
@@ -169,18 +169,18 @@ public:
         require(result.prompt.prompt_tokens == kPromptTokens &&
                     (cancelled ? result.generated_token_ids.size() > 1 &&
                                      result.generated_token_ids.size() < kOutputTokens &&
-                                     result.finish_reason == ninfer::FinishReason::Cancelled
+                                     result.finish_reason == infernix::FinishReason::Cancelled
                                : result.generated_token_ids.size() == kOutputTokens &&
-                                     result.finish_reason == ninfer::FinishReason::OutputLimit),
+                                     result.finish_reason == infernix::FinishReason::OutputLimit),
                 "resumed request did not honor its original output budget");
         // Compare only the two publication views of this request, never different math paths.
         require(content_ == result.content && reasoning_ == result.reasoning,
                 "stream and terminal response disagree after recovery");
         require(result.reused_prompt_tokens == 0 &&
-                    result.prefix_reuse_path == ninfer::PrefixReusePath::Root,
+                    result.prefix_reuse_path == infernix::PrefixReusePath::Root,
                 "self recovery was incorrectly reported as an initial history hit");
         require(result.speculative.backend == selected &&
-                    (selected == ninfer::SpeculativeBackend::None ||
+                    (selected == infernix::SpeculativeBackend::None ||
                      (result.speculative.enabled && result.speculative.draft_window == 3 &&
                       result.speculative.rounds + result.speculative.fallback_steps != 0)),
                 "request did not execute the selected backend");
@@ -232,12 +232,12 @@ private:
     bool timing_seen_                  = false;
     std::uint32_t processed_           = 0;
     std::uint64_t progress_elapsed_ns_ = 0;
-    ninfer::GenerationTimingObservation last_timing_;
+    infernix::GenerationTimingObservation last_timing_;
     std::string content_;
     std::string reasoning_;
 };
 
-void settled(const ninfer::RuntimeStats& stats, const ninfer::MemorySummary& memory) {
+void settled(const infernix::RuntimeStats& stats, const infernix::MemorySummary& memory) {
     require(stats.running_requests == 0 && stats.waiting_requests == 0 &&
                 stats.paused_requests == 0 && stats.replaying_requests == 0 &&
                 stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
@@ -251,10 +251,10 @@ void settled(const ninfer::RuntimeStats& stats, const ninfer::MemorySummary& mem
             "completed recovery retained physical resources with history disabled");
 }
 
-void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend selected,
+void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
               std::string_view backend_name, bool snapshot,
               CancelStage cancel_stage = CancelStage::None) {
-    ninfer::Engine engine(engine_options(artifact, selected, snapshot));
+    infernix::Engine engine(engine_options(artifact, selected, snapshot));
     const auto memory = engine.memory_summary();
     require(memory.max_context == kCapacity && memory.kv_capacity == kCapacity,
             "Engine changed the fixed pressure workload's context capacity");
@@ -262,9 +262,9 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
             "Engine exceeded the fixture's fixed Host quota");
     const auto before = engine.runtime_stats();
     std::array<unsigned, 2> first_token_counts{};
-    std::array<ninfer::GenerationObservationOptions, 2> observations{kObservations, kObservations};
+    std::array<infernix::GenerationObservationOptions, 2> observations{kObservations, kObservations};
     for (std::size_t i = 0; i < observations.size(); ++i) {
-        observations[i].first_token = [&, i](const ninfer::GenerationFirstTokenObservation& first) {
+        observations[i].first_token = [&, i](const infernix::GenerationFirstTokenObservation& first) {
             require(first.elapsed_since_submit_seconds > 0.0 && first.prepare_seconds >= 0.0,
                     "first-token observation has invalid time boundaries");
             ++first_token_counts[i];
@@ -274,8 +274,8 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     // Main KV pages hold 64 tokens. Both 192-token prompts fit together in six of eight pages;
     // both can begin decoding, but their continued growth cannot remain resident together.
     // Each 448-token complete request fits alone, including the K=3 speculative unit.
-    std::vector<ninfer::TokenId> first_prompt(kPromptTokens, 198);
-    std::vector<ninfer::TokenId> second_prompt(kPromptTokens, 198);
+    std::vector<infernix::TokenId> first_prompt(kPromptTokens, 198);
+    std::vector<infernix::TokenId> second_prompt(kPromptTokens, 198);
     first_prompt.front()  = 1000;
     second_prompt.front() = 1001;
     auto first_prepared   = engine.prepare_tokens(std::move(first_prompt));
@@ -284,15 +284,15 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     Timeline timeline;
     std::mutex handoff_mutex;
     std::condition_variable handoff;
-    std::optional<ninfer::GenerationHandle> second_handle;
+    std::optional<infernix::GenerationHandle> second_handle;
     bool first_finished = false;
     std::exception_ptr first_error;
-    std::optional<ninfer::GenerationResult> first_result;
+    std::optional<infernix::GenerationResult> first_result;
     ObservationSink first_sink(timeline, 0, [&] {
         // OutputSink runs in wait()'s consumer thread. This gate submits already prepared input
         // at the observed first admission without holding up the Engine or a model callback.
         auto handle = engine.submit(std::move(second_prepared), request(kOutputTokens),
-                                    ninfer::OutputConsumerMode::Streaming, observations[1]);
+                                    infernix::OutputConsumerMode::Streaming, observations[1]);
         {
             std::lock_guard lock(handoff_mutex);
             second_handle.emplace(std::move(handle));
@@ -301,7 +301,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
     });
     ObservationSink second_sink(timeline, 1);
     auto first_handle = engine.submit(std::move(first_prepared), request(kOutputTokens),
-                                      ninfer::OutputConsumerMode::Streaming, observations[0]);
+                                      infernix::OutputConsumerMode::Streaming, observations[0]);
     std::jthread first_consumer([&] {
         try {
             first_result = first_handle.wait(&first_sink);
@@ -314,7 +314,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
         handoff.notify_one();
     });
 
-    ninfer::GenerationHandle second;
+    infernix::GenerationHandle second;
     {
         std::unique_lock lock(handoff_mutex);
         handoff.wait(lock, [&] { return second_handle.has_value() || first_finished; });
@@ -326,9 +326,9 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
         throw std::runtime_error("first admission never submitted the second request");
     }
     bool cancellation_requested = false;
-    ninfer::RuntimeStats cancellation_observed;
+    infernix::RuntimeStats cancellation_observed;
     std::uint32_t committed_at_cancellation = 0;
-    const ninfer::CancellationView cancellation([&] {
+    const infernix::CancellationView cancellation([&] {
         if (cancellation_requested) { return true; }
         if (cancel_stage == CancelStage::None) { return false; }
         const auto stats    = engine.runtime_stats();
@@ -390,9 +390,9 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
                         second_result.generated_token_ids.size() - 2,
             "replay was charged to initial prefill or delivered decode tokens");
 
-    ninfer::GenerationSchedulingStats totals;
+    infernix::GenerationSchedulingStats totals;
     for (const auto* result :
-         std::array<const ninfer::GenerationResult*, 2>{&*first_result, &second_result}) {
+         std::array<const infernix::GenerationResult*, 2>{&*first_result, &second_result}) {
         totals.preemptions += result->scheduling.preemptions;
         totals.replay_restores += result->scheduling.replay_restores;
         totals.snapshot_restores += result->scheduling.snapshot_restores;
@@ -464,7 +464,7 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
 
     const auto probe = engine.generate(engine.prepare_tokens({198, 1002, 198}), request(4));
     require(probe.generated_token_ids.size() == 4 &&
-                probe.finish_reason == ninfer::FinishReason::OutputLimit,
+                probe.finish_reason == infernix::FinishReason::OutputLimit,
             "request after recovery could not reuse the released execution resources");
     const auto settled_memory = engine.memory_summary();
     settled(engine.runtime_stats(), settled_memory);
@@ -474,21 +474,21 @@ void exercise(const std::filesystem::path& artifact, ninfer::SpeculativeBackend 
 } // namespace
 
 int main() {
-    const auto configured_artifact = setting("NINFER_TEST_ARTIFACT", "");
+    const auto configured_artifact = setting("INFERNIX_TEST_ARTIFACT", "");
     if (configured_artifact.empty()) {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
     const std::filesystem::path artifact(configured_artifact);
     try {
         require(std::filesystem::is_regular_file(artifact),
-                "NINFER_TEST_ARTIFACT is not a regular file");
-        const auto backend_name = setting("NINFER_TEST_BACKEND", "none");
+                "INFERNIX_TEST_ARTIFACT is not a regular file");
+        const auto backend_name = setting("INFERNIX_TEST_BACKEND", "none");
         const auto selected     = backend(backend_name);
-        const auto scenario     = setting("NINFER_PREEMPTION_REAL_SCENARIO", "all");
+        const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "snapshot" ||
                     scenario == "cancel-paused" || scenario == "cancel-replay",
-                "NINFER_PREEMPTION_REAL_SCENARIO must be all, replay, snapshot, cancel-paused "
+                "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, snapshot, cancel-paused "
                 "or cancel-replay");
         if (scenario == "all" || scenario == "replay") {
             exercise(artifact, selected, backend_name, false);

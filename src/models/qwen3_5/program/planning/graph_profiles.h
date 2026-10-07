@@ -1,12 +1,12 @@
 #pragma once
 #include "models/qwen3_5/program/program.h"
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 struct MtpCausalAttentionEnvelopes;
 struct DFlashEnvelopes;
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 [[nodiscard]] std::vector<GraphExecutionProfile> ordinary_graph_profiles(std::uint32_t capacity);
 [[nodiscard]] std::vector<GraphExecutionProfile>
@@ -22,4 +22,4 @@ mtp_causal_attention_envelopes(std::uint32_t max_frontier, std::uint32_t k, std:
 [[nodiscard]] execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
                                                           std::uint32_t max_frontier);
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -1,5 +1,5 @@
 {
-  "artifact_type": "ninfer_cli_examples",
+  "artifact_type": "infernix_cli_examples",
   "schema_version": 1,
   "working_directory": "repository root",
   "messages_format": "product CLI --messages JSON",

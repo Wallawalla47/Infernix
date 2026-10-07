@@ -4,7 +4,7 @@
 #include "core/device.h"
 #include "ops/linear/q8/q8_gemv_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 namespace {
 
@@ -52,4 +52,4 @@ void q8_companion_attn_input_decode_r16_launch(const Tensor& x, const Weight& we
     launch_companion_decode<16>(x, weight, q, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // A fast prompt launch: warps per CTA and number of key splits. More than one split divides every
 // row block's key pages among CTAs and merges their FP32 partial rows, so a launch whose row blocks
@@ -76,4 +76,4 @@ inline int fast_prompt_multiprocessors() {
     return count;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail
