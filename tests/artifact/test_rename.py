@@ -73,6 +73,27 @@ def test_rename_moves_volumes_and_keeps_payload_in_place(tmp_path):
     ]
 
 
+def test_numbered_names_every_file_as_a_shard(tmp_path):
+    old = tmp_path / "model.ninfer"
+    identity = _sharded(old)
+
+    result = rename(old, "model.infernix", numbered=True)
+
+    names = [f"model-{i:05d}-of-00004.infernix" for i in (1, 2, 3, 4)]
+    assert result["entry"] == str(tmp_path / names[0])
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        names + [names[0] + ".conversion.json"]
+    )
+    for index in (1, 2, 3):
+        part = tmp_path / names[index]
+        assert HEADER.unpack(part.read_bytes()[: HEADER.size]) == (PART_MAGIC, index, identity)
+    with Artifact(tmp_path / names[0]) as artifact:
+        assert [f.path for f in artifact.directory.files] == [None] + names[1:]
+        assert artifact.read_object("data") == PAYLOAD
+    report = json.loads((tmp_path / (names[0] + ".conversion.json")).read_text())
+    assert report["files"] == names
+
+
 @pytest.mark.parametrize("blocker", ["model.infernix", "model.infernix.part-0002"])
 def test_existing_target_leaves_the_set_unchanged(tmp_path, blocker):
     old = tmp_path / "model.ninfer"

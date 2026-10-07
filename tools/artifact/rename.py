@@ -1,12 +1,16 @@
 """Rename an Infernix v3 file set in place, for example a `.ninfer` download to `.infernix`.
 
     python -m tools.artifact.rename DIR/model.ninfer model.infernix
+    python -m tools.artifact.rename DIR/model.infernix model.infernix --numbered
 
-The continuation volumes take the writer's names for the new entry (`<entry>.part-NNNN`), and the
-entry's `files` table is rewritten inside the entry's existing directory space (the JSON's trailing
-reserve and the alignment area before the payload), so no payload byte moves and the artifact_id is
-kept. The converter's `<entry>.conversion.json` report follows, with the file names in it updated.
-Other `<entry>.*` sidecars (an n-gram volume, a saved expert state) are listed, not renamed.
+By default the continuation volumes take the writer's names for the new entry
+(`<entry>.part-NNNN`). `--numbered` names every file of the set as a numbered shard instead,
+`model-00001-of-00003.infernix` (the entry, which is the file to open) to
+`model-00003-of-00003.infernix`. Either way the entry's `files` table is rewritten inside the entry's
+existing directory space (the JSON's trailing reserve and the alignment area before the payload), so
+no payload byte moves and the artifact_id is kept. The converter's `<entry>.conversion.json` report
+follows, with the file names in it updated. Other `<entry>.*` sidecars (an n-gram volume, a saved
+expert state) are listed, not renamed.
 """
 
 from __future__ import annotations
@@ -29,12 +33,22 @@ def part_name(entry_name: str, index: int) -> str:
     return f"{entry_name}.part-{index:04d}"
 
 
-def _plan(entry: Path, new_name: str) -> tuple[list[tuple[Path, Path]], bytes, bytes]:
-    """Validate the set and return the volume renames, the old and the new directory region."""
+def file_names(new_name: str, count: int, numbered: bool) -> list[str]:
+    """The set's new file names, the entry first."""
+    if not numbered:
+        return [new_name] + [part_name(new_name, index) for index in range(1, count)]
+    stem, dot, extension = new_name.rpartition(".")
+    if not dot or not stem:
+        raise ArtifactError(f"{new_name!r}: a numbered name needs an extension, e.g. model.infernix")
+    return [f"{stem}-{index:05d}-of-{count:05d}.{extension}" for index in range(1, count + 1)]
+
+
+def _plan(
+    entry: Path, new_name: str, numbered: bool
+) -> tuple[Path, list[tuple[Path, Path]], bytes, bytes]:
+    """Validate the set; return the new entry, the volume renames and the old and new directory region."""
     if not new_name or Path(new_name).name != new_name or new_name in (".", ".."):
         raise ArtifactError(f"{new_name!r}: give a file name, not a path")
-    if new_name == entry.name:
-        raise ArtifactError("the new name is the current name")
     with Artifact(entry) as artifact:
         files = artifact.directory.files
         offset = 0
@@ -42,6 +56,9 @@ def _plan(entry: Path, new_name: str) -> tuple[list[tuple[Path, Path]], bytes, b
             offset += file.payload_bytes
             artifact.read_range(offset, 1)  # opens and checks the next continuation volume
         payload_offset = artifact.payload_offset
+    names = file_names(new_name, len(files), numbered)
+    if names[0] == entry.name:
+        raise ArtifactError("the new name is the current name")
     with entry.open("rb") as stream:
         old_region = stream.read(payload_offset)
     _, json_bytes, _ = HEADER.unpack(old_region[: HEADER.size])
@@ -49,7 +66,7 @@ def _plan(entry: Path, new_name: str) -> tuple[list[tuple[Path, Path]], bytes, b
     renames = []
     for index in range(1, len(value["files"])):
         old = entry.parent / value["files"][index]["path"]
-        new = entry.parent / part_name(new_name, index)
+        new = entry.parent / names[index]
         value["files"][index]["path"] = new.name
         if old != new:
             renames.append((old, new))
@@ -62,7 +79,7 @@ def _plan(entry: Path, new_name: str) -> tuple[list[tuple[Path, Path]], bytes, b
         )
     new_json_bytes = max(json_bytes, len(data))
     assert align_up(HEADER.size + new_json_bytes, PAYLOAD_ALIGNMENT) == payload_offset
-    parse_directory(json.loads(data.decode("utf-8")), entry_name=new_name)
+    parse_directory(json.loads(data.decode("utf-8")), entry_name=names[0])
     new_region = (
         old_region[:8]
         + new_json_bytes.to_bytes(8, "little")
@@ -71,11 +88,11 @@ def _plan(entry: Path, new_name: str) -> tuple[list[tuple[Path, Path]], bytes, b
         + b" " * (new_json_bytes - len(data))
         + bytes(payload_offset - HEADER.size - new_json_bytes)
     )
-    targets = [new for _, new in renames] + [entry.parent / new_name]
-    for target in targets:
+    new_entry = entry.parent / names[0]
+    for target in [new for _, new in renames] + [new_entry]:
         if target.exists():
             raise ArtifactError(f"{target} already exists")
-    return renames, old_region, new_region
+    return new_entry, renames, old_region, new_region
 
 
 def _rename_report(entry: Path, new_entry: Path, names: dict[str, str]) -> Path | None:
@@ -93,10 +110,9 @@ def _rename_report(entry: Path, new_entry: Path, names: dict[str, str]) -> Path 
     return target
 
 
-def rename(entry: str | Path, new_name: str) -> dict:
+def rename(entry: str | Path, new_name: str, *, numbered: bool = False) -> dict:
     entry = Path(entry)
-    renames, old_region, new_region = _plan(entry, new_name)
-    new_entry = entry.with_name(new_name)
+    new_entry, renames, old_region, new_region = _plan(entry, new_name, numbered)
     done: list[tuple[Path, Path]] = []
     written = False
     try:
@@ -141,8 +157,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("entry", help="the entry file of the set")
     parser.add_argument("new_name", help="the new entry file name, in the same directory")
+    parser.add_argument(
+        "--numbered",
+        action="store_true",
+        help="name every file NAME-0000i-of-0000n.EXT (the first is the entry) instead of "
+        "NAME.EXT plus NAME.EXT.part-NNNN",
+    )
     args = parser.parse_args()
-    print(json.dumps(rename(args.entry, args.new_name), ensure_ascii=False, indent=2))
+    result = rename(args.entry, args.new_name, numbered=args.numbered)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
