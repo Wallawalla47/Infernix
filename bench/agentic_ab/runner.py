@@ -183,6 +183,55 @@ def wait_gpu_idle(timeout=240, threshold=6000):
     raise SystemExit("GPU still busy (%s MiB in use); stop the other server first" % mib)
 
 
+def available_ram_bytes():
+    """Physical memory available to a new process (None where it cannot be read)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong),
+                            ("total_phys", ctypes.c_ulonglong), ("avail_phys", ctypes.c_ulonglong),
+                            ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
+                            ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong),
+                            ("avail_extended", ctypes.c_ulonglong)]
+
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(MemoryStatus)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return None
+            return status.avail_phys
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for ln in f:
+                if ln.startswith("MemAvailable:"):
+                    return int(ln.split()[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def wait_ram_released(timeout=300, settle_seconds=10, step_bytes=256 << 20):
+    """After a server stops: wait until available host RAM stops rising. A stopped engine releases
+    its pinned memory (tens of GiB for Qwen3.8-Flash-Next's experts) seconds after its process
+    exits; an arm started meanwhile sizes its RAM tiers against the leftover and runs in another
+    regime (the SSD expert tier instead of every expert in RAM)."""
+    deadline = time.time() + timeout
+    last, stable_since = available_ram_bytes(), time.time()
+    if last is None:
+        return
+    while time.time() < deadline:
+        time.sleep(2)
+        now = available_ram_bytes()
+        if now is None:
+            return
+        if now > last + step_bytes:
+            last, stable_since = now, time.time()
+        elif time.time() - stable_since >= settle_seconds:
+            log("host RAM settled at %.1f GiB available" % (now / 2 ** 30))
+            return
+    log("host RAM still changing after %ds; continuing" % timeout)
+
+
 def read_server_start(path):
     if not os.path.exists(path):
         return None
@@ -252,6 +301,7 @@ class Serve:
             except Exception:
                 self.proc.kill()
         wait_gpu_idle()
+        wait_ram_released()
 
 
 class StrataServe:
