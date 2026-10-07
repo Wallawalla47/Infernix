@@ -46,7 +46,7 @@ is tuned on NVIDIA GeForce RTX 5090.
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Snapshot/Replay recovery,
 and one compact decode batch per round.
-Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
+Generation and offline CausalScoring use the same public `.infernix` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous
 batching, and priority/QoS require an explicit product change. Another training instance or mixture
@@ -57,8 +57,9 @@ local workflow. Do not derive requirements from a different deployment or trust 
 
 Keep these ownership boundaries visible when selecting a design:
 
-- v3 `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
-  Engine. Infernix has no Python model-inference route or installed/exported C++ SDK.
+- The v3 container (`.infernix`, or `.ninfer` from upstream) is the only C++ product artifact; CLI,
+  serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
+  route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend

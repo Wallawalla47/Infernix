@@ -1,6 +1,8 @@
 # Weight conversion
 
-Infernix's converter creates `.ninfer` artifacts from local weights and a Python recipe. A recipe
+Infernix's converter creates `.infernix` artifacts from local weights and a Python recipe; the
+container is the one NInfer named `.ninfer`, and Infernix loads either extension, so the examples
+below that write `.ninfer` work unchanged with `--out <name>.infernix`. A recipe
 can reuse an official conversion, change selected layers or projections, combine sources, or call
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
 logical bindings and frontend resources.

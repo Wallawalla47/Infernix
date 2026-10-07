@@ -66,7 +66,7 @@ struct Options {
 };
 
 std::string usage_text() {
-    return "usage: infernix-perplexity <model.ninfer> "
+    return "usage: infernix-perplexity <model.infernix> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"

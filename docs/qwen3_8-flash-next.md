@@ -43,7 +43,7 @@ precision changes speed, never output. `--proposal` adds the smaller draft head 
 
 ```text
 python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_flash_next_nvfp4_dense8 \
-  --components text,vision,mtp --proposal --device cpu --out <dir>/qwen3_8_flash_next_nvfp4_dense8.ninfer \
+  --components text,vision,mtp --proposal --device cpu --out <dir>/qwen3_8_flash_next_nvfp4_dense8.infernix \
   --ngram-out <nvme>/qwen3_8_flash_next.ngram
 ```
 
@@ -56,9 +56,9 @@ python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_
 ## Run
 
 ```text
-infernix <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
+infernix <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
   --prompt "..."
-infernix-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
+infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8 --max-context 16384 \
   --prefill-chunk 4096
 ```
 

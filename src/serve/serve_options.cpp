@@ -128,7 +128,7 @@ std::optional<std::size_t> parse_vram_headroom(const char* text) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [options]\n"
+           " <model.infernix> [options]\n"
            "\n"
            "Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.\n"
            "  --help, -h                 show this help and exit\n"

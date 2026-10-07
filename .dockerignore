@@ -25,6 +25,7 @@ models
 *.log
 *.ncu-rep
 *.ninfer
+*.infernix
 *.nsys-rep
 *.pyc
 *.qdrep
