@@ -111,7 +111,7 @@ by the same client, so all engines are measured the same way.
 | | Infernix | Strata |
 |---|---|---|
 | Version | branch `Infernix` at `cc76e684` | 0.1.40 (release engine; server `82f46a8`, 0.1.40.1) |
-| Model | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) converted with recipe B: NVIDIA's NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVFP4-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
+| Model | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts quantized with NVIDIA Model Optimizer) converted with recipe B: the NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVFP4-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
 | KV cache and context | INT8, 262,144 tokens | INT8, 262,144 tokens (32,768 cells per layer resident in VRAM) |
 | Speculation | MTP, `--draft-tokens 4 --lm-head-draft` | MTP, `--spec 4 --spec-min-p 0.70` |
 | Other settings | n-gram volume on NVMe, `--prefill-chunk 4096` | `--expert-cache auto --prefill auto --resident-budget-gib 68 --pool-workers 15 --pcie-frac 0.00` |
@@ -340,13 +340,13 @@ the Linux filesystem first (reads through `/mnt/` are slow).
   [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4),
   the QAT-trained NVFP4 checkpoint, with the same draft model and proposal head.
 - **[Qwen3.8-Flash-Next-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVFP4-Infernix)**
-  (`.infernix`): [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-  converted with recipe B (NVIDIA's NVFP4 experts bit-exact, Q8 dense projections), with the MTP
+  (`.infernix`): [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
+  converted with recipe B (its NVFP4 experts bit-exact, Q8 dense projections), with the MTP
   drafter and a proposal head for `--lm-head-draft`; the 52 GB n-gram volume is built from the same
   checkpoint (see the [Flash-Next guide](docs/qwen3_8-flash-next.md#convert)).
 
 Infernix loads `.infernix` and `.ninfer` artifacts (the same format); `python -m tools.convert`
-writes either.
+writes either, and `python -m tools.artifact.rename` renames an existing one in place.
 
 ## What else is in the engine
 
