@@ -69,6 +69,8 @@ struct HostMemoryLedger {
 
     // One log line: the inputs and the outcome.
     [[nodiscard]] std::string describe() const;
+    // One plain line for the console: free RAM and where the experts go (describe() has every term).
+    [[nodiscard]] std::string summary() const;
 };
 
 [[nodiscard]] HostMemoryLedger plan_host_memory(const HostMemorySnapshot& snapshot, const HostMemoryDemand& demand);

@@ -1126,6 +1126,12 @@ struct PromptReadout {
     float top_logprob = 0.0F;
 };
 
+// Qwen3.8-Flash-Next: one request's routed-expert lookups and those its VRAM expert cache served.
+struct ExpertCacheStats {
+    std::uint64_t routed = 0;
+    std::uint64_t hits   = 0;
+};
+
 struct GenerationResult {
     // Unique within this Engine instance; diagnostic correlation only.
     std::uint64_t engine_request_id = 0;
@@ -1149,6 +1155,9 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
+    // Present for models that cache routed experts in VRAM (Qwen3.8-Flash-Next) and requests that
+    // finished normally.
+    std::optional<ExpertCacheStats> expert_cache;
     // Present exactly when the request named readout tokens and its prompt completed.
     std::optional<PromptReadout> readout;
     // One entry per generated token of a constrained request, in output order.

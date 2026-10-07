@@ -65,6 +65,21 @@ std::string HostMemoryLedger::describe() const {
     return line;
 }
 
+std::string HostMemoryLedger::summary() const {
+    char line[320];
+    if (placement == ExpertPlacement::Full) {
+        std::snprintf(line, sizeof(line), "RAM: %.1f of %.1f GiB free; every expert fits in RAM (%.1f GiB)",
+                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(demand.expert_banks));
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "RAM: %.1f of %.1f GiB free; %.1f of the experts' %.1f GiB fit in RAM%s, the rest are read "
+                      "from the model files on demand (slower)",
+                      gib(snapshot.available_physical), gib(snapshot.total_physical), gib(expert_ram),
+                      gib(demand.expert_banks), capped ? " (--expert-ram-mib)" : "");
+    }
+    return line;
+}
+
 std::uint32_t graph_bound(std::uint32_t lanes, std::uint32_t max_width, std::uint32_t mtp_draft_tokens) {
     std::uint32_t graphs = lanes;
     if (max_width > 1) { graphs += lanes * max_width; }

@@ -814,6 +814,7 @@ private:
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
+        result.expert_cache            = request->expert_cache;
         result.thinking                = request->output.thinking_stats();
         result.readout                 = std::move(request->readout);
         result.constrained_draws       = std::move(request->constrained_draws);
@@ -934,6 +935,7 @@ private:
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             request->constrained_draws  = std::move(finished.constrained_draws);
+            if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
             request->terminal_reason.reset();
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);

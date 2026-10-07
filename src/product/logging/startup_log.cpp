@@ -155,7 +155,8 @@ std::string progress_line_candidate(const PhasePresentation& phase, const Startu
         out << " | "
             << format_pretty_bytes(static_cast<std::uint64_t>(state.smoothed_bytes_per_second))
             << "/s";
-        if (include_eta && event.current < event.total) {
+        // Below 5 % the rate is from a few early samples and the ETA misleads.
+        if (include_eta && event.current < event.total && ratio >= 0.05) {
             const double eta =
                 static_cast<double>(event.total - event.current) / state.smoothed_bytes_per_second;
             out << " | ETA " << format_pretty_duration(eta);

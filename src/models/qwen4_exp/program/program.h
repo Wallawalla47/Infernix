@@ -277,6 +277,7 @@ struct FinishResult {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::vector<ConstrainedDraw> constrained_draws;
+    std::optional<ExpertCacheStats> expert_cache;
     std::optional<CheckpointHandle> checkpoint; // never set
 };
 

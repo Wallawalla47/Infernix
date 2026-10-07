@@ -58,7 +58,7 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
         try {
             options.diagnostic_observer.callback(Diagnostic{.level = level, .message = text});
         } catch (...) {}
-    } else {
+    } else if (level != DiagnosticLevel::Debug) {
         std::fprintf(stderr, "[engine] %s\n", text.c_str());
     }
 }
@@ -130,7 +130,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.load_staging = kLoadStagingBytes;
     demand.expert_cap   = options.expert_ram_bytes;
     const auto ledger   = models::qwen4_exp::plan_host_memory(host_memory_snapshot(), demand);
-    report(options, DiagnosticLevel::Info, ledger.describe());
+    report(options, DiagnosticLevel::Info, ledger.summary());
+    report(options, DiagnosticLevel::Debug, ledger.describe());
     if (ledger.cap_too_large) {
         throw std::runtime_error("--expert-ram-mib " + std::to_string(*options.expert_ram_bytes >> 20) +
                                  " asks for more Host RAM than is free now (" + ledger.describe() +
@@ -287,7 +288,22 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                       device_contributors(dense, device_plan).c_str(), mib(sizing.reserve), device_plan.graph_bound,
                       mib(sizing.headroom), options.vram_headroom_bytes ? "set" : "auto", sizing.frames,
                       static_cast<double>(frames_bytes) / static_cast<double>(1ULL << 30), mib(after_startup));
-        report(options, DiagnosticLevel::Info, line);
+        report(options, DiagnosticLevel::Debug, line);
+        const double gib = static_cast<double>(1ULL << 30);
+        char summary[320];
+        if (device_plan.kv_max > device_plan.kv) {
+            std::snprintf(summary, sizeof(summary),
+                          "VRAM: model %.2f GiB, KV cache %.2f GiB (grows to %.2f GiB as contexts lengthen, taking room "
+                          "from the expert cache), expert cache %u experts (%.1f GiB)",
+                          static_cast<double>(dense) / gib, static_cast<double>(device_plan.kv) / gib,
+                          static_cast<double>(device_plan.kv_max) / gib, sizing.frames,
+                          static_cast<double>(frames_bytes) / gib);
+        } else {
+            std::snprintf(summary, sizeof(summary), "VRAM: model %.2f GiB, KV cache %.2f GiB, expert cache %u experts (%.1f GiB)",
+                          static_cast<double>(dense) / gib, static_cast<double>(device_plan.kv) / gib, sizing.frames,
+                          static_cast<double>(frames_bytes) / gib);
+        }
+        report(options, DiagnosticLevel::Info, summary);
     }
     const MemorySummary memory = instance->program->memory_summary();
     auto& resolution                         = instance->kv_capacity_resolution;
