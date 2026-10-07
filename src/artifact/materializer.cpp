@@ -94,9 +94,15 @@ void check_cuda(cudaError_t status, const char* operation) {
     }
 }
 
+// A staging slot for direct reads, which need a kPayloadAlignment-aligned destination. A pinned
+// allocation is not always page-aligned (the runtime may place a small one inside an earlier
+// allocation's pages), so the slot over-allocates by one alignment unit and reads into `data`
+// (upstream Neroued/ninfer#372).
 class Slot {
 public:
-    explicit Slot(std::size_t bytes) : buffer(bytes) {
+    explicit Slot(std::size_t bytes) : buffer(bytes + kPayloadAlignment) {
+        const auto base = reinterpret_cast<std::uintptr_t>(buffer.data());
+        data = reinterpret_cast<std::byte*>((base + kPayloadAlignment - 1) / kPayloadAlignment * kPayloadAlignment);
         check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
                    "create weight staging completion event");
     }
@@ -114,6 +120,7 @@ public:
     }
 
     PinnedHostBuffer buffer;
+    std::byte* data   = nullptr; // kPayloadAlignment-aligned, `bytes` long, inside buffer
     cudaEvent_t event = nullptr;
     bool pending      = false;
 };
@@ -459,7 +466,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                 slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
             const auto received  = reader.read_direct(
-                span.file, source, {static_cast<std::byte*>(slot.buffer.data()), request});
+                span.file, source, {slot.data, request});
             if (received < std::min<std::uint64_t>(request, remaining)) {
                 throw ArtifactError("direct read ended before the required payload");
             }
@@ -472,7 +479,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 const auto end    = std::min(chunk_end, range.end);
                 if (begin < end) {
                     check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                               static_cast<const std::byte*>(slot.buffer.data()) +
+                                               slot.data +
                                                    (begin - source),
                                                static_cast<std::size_t>(end - begin),
                                                cudaMemcpyHostToDevice, device.transfer_stream),
