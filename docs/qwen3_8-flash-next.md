@@ -160,7 +160,7 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
 
 - **Host RAM.** Snapshots (116 MB each) and KV blocks live in one pinned Host pool,
   `--host-context-mib` (default 4096, must be positive). It is pinned at startup and counted in the
-  RAM ledger (`prefix cache` in the ledger line). `--no-prefix-reuse` turns the cache off and frees
+  RAM ledger (`prefix cache` in the ledger line that `--log-level debug` prints). `--no-prefix-reuse` turns the cache off and frees
   that RAM for the experts.
 - **Snapshots.** Each turn leaves one at the generation opener (the assistant turn's start) and one
   at its end; shared prefixes (the system and tools block, client breakpoints) get one where they
@@ -197,7 +197,8 @@ and whether the GPU drives a display (DXGI outputs, then NVML). The expert cache
 where `fixed` is the dense weights plus the KV cache, workspaces and staging, `reserve` is
 max(256 MiB, 128 MiB + 4 MiB per CUDA graph the engine may capture, counting at most 32), and
 `headroom` is `--vram-headroom-mib`: by default 512 MiB when the GPU drives a display (or cannot
-tell) and 256 MiB when it does not. One line reports the result, for example:
+tell) and 256 MiB when it does not. The console shows a one-line summary (`VRAM: model …, KV cache
+…, expert cache …`); `--log-level debug` adds the full ledger, for example:
 
 ```text
 VRAM ledger: 32607 MiB card, no display, 547 in use before loading; dense weights 4198 MiB, KV 1024,

@@ -299,6 +299,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
             << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
     }
+    if (metrics.expert_cache && metrics.expert_cache->routed != 0) {
+        out << " | expert cache "
+            << product::format_pretty_percent(static_cast<double>(metrics.expert_cache->hits) /
+                                              static_cast<double>(metrics.expert_cache->routed))
+            << " hit";
+    }
     if (metrics.tree_rounds != 0) {
         out << " | trees " << product::format_pretty_count(metrics.tree_rounds) << " rounds, "
             << product::format_pretty_count(metrics.tree_side_accepted_tokens)
@@ -531,17 +537,24 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     const infernix::ContextCacheOptions& cache      = engine.context_cache;
     const infernix::ContextCostSummary context_cost = service.load_summary().context_cost;
 
-    logger_->info("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
-                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
-                  kv_capacity_mode_name(memory.kv_capacity_mode),
-                  product::format_pretty_count(memory.kv_capacity_page_groups),
-                  product::format_pretty_count(memory.kv_capacity_max_page_groups),
-                  product::format_pretty_bytes(memory.runtime_reservation_bytes),
-                  product::format_pretty_bytes(memory.available_after_startup_bytes));
+    logger_->info("capacity | {} tokens of context across all requests ({} KV)",
+                  product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache));
+    logger_->debug("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
+                   product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
+                   kv_capacity_mode_name(memory.kv_capacity_mode),
+                   product::format_pretty_count(memory.kv_capacity_page_groups),
+                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
+                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
+                   product::format_pretty_bytes(memory.available_after_startup_bytes));
 
-    logger_->info("context | history {} | {} active + {} extra device states | host {}",
-                  cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
-                  product::format_pretty_bytes(*cache.host_capacity_bytes));
+    if (cache.enabled) {
+        logger_->info("prefix cache | on | {} in RAM", product::format_pretty_bytes(*cache.host_capacity_bytes));
+    } else {
+        logger_->info("prefix cache | off");
+    }
+    logger_->debug("context | history {} | {} active + {} extra device states | host {}",
+                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+                   product::format_pretty_bytes(*cache.host_capacity_bytes));
 
     if (product::draft_tree_enabled(engine.speculative)) {
         logger_->info("draft trees | {} | up to {} paths",

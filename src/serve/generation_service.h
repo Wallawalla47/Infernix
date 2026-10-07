@@ -51,6 +51,7 @@ struct GenerationMetrics {
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
     std::vector<std::uint64_t> speculative_accepted_per_position;
+    std::optional<infernix::ExpertCacheStats> expert_cache;
     std::uint64_t ngram_rounds                  = 0;
     std::uint64_t ngram_drafted_tokens          = 0;
     std::uint64_t ngram_accepted_tokens         = 0;

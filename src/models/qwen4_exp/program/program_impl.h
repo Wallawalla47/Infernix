@@ -1922,6 +1922,11 @@ public:
             out.timings           = timings(lanes_[index]);
             out.speculative       = lanes_[index].speculative;
             out.constrained_draws = std::move(lanes_[index].constraint_trace);
+            if (residency_) {
+                const auto& s = residency_->stats();
+                const auto& a = lanes_[index].cache_at_admission;
+                out.expert_cache = ExpertCacheStats{.routed = s.routed - a.routed, .hits = s.hits - a.hits};
+            }
             report_cache(lanes_[index]);
             report_ngram(lanes_[index]);
             prefix_finish(lanes_[index], index);
@@ -2123,7 +2128,8 @@ public:
         if (tier_) { prefill_tier(load.state ? &*load.state : nullptr); }
         if (options_.expert_state.empty() || !options_.expert_cache) { return; }
         if (!load.state) {
-            diagnostic("expert cache starts empty: " + load.message);
+            diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
+            diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
             expert_state_saved_ = std::chrono::steady_clock::now();
             return;
         }
@@ -2132,12 +2138,16 @@ public:
         const std::uint32_t loaded = residency_->warm_start(*load.state, kSeedCountCap, max_keys, device_.stream);
         device_.synchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const double loaded_gib =
+            static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
         char line[256];
-        std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s (%.1f GiB in %.2f s)", loaded,
-                      residency_->frames(), options_.expert_state.string().c_str(),
-                      static_cast<double>(loaded) * static_cast<double>(residency_->frame_stride()) / (1ULL << 30),
-                      seconds);
+        std::snprintf(line, sizeof(line),
+                      "expert cache: restored the %u most-used experts from the last session (%.1f GiB in %.2f s)",
+                      loaded, loaded_gib, seconds);
         diagnostic(line);
+        std::snprintf(line, sizeof(line), "expert cache warm start: %u of %u frames from %s", loaded,
+                      residency_->frames(), options_.expert_state.string().c_str());
+        diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;
     }
@@ -2301,7 +2311,7 @@ private:
                           static_cast<unsigned long long>(cpu),
                           s.routed ? 100.0 * static_cast<double>(s.hits) / static_cast<double>(s.routed) : 0.0,
                           free_vram >> 20);
-            diagnostic(text);
+            diagnostic(text, DiagnosticLevel::Debug);
             if (tier_) {
                 // The tier's counters as of the last round boundary.
                 const auto& t = tier_->stats();
@@ -2318,7 +2328,7 @@ private:
                               static_cast<unsigned long long>(t.fetch_from_ram - a.fetch_from_ram),
                               static_cast<unsigned long long>(t.admitted - a.admitted),
                               static_cast<unsigned long long>(s.demotions - at_admission.demotions));
-                diagnostic(text);
+                diagnostic(text, DiagnosticLevel::Debug);
             }
         } catch (...) {}
     }
@@ -2363,7 +2373,7 @@ private:
                           "recurrent state, records and workspace %zu MiB)",
                           residency_->frames(), static_cast<double>(record_stride) / 1048576.0, lanes,
                           lanes == 1 ? "" : "s", lane_frames, kv_text, (state + workspace) >> 20);
-            diagnostic(text);
+            diagnostic(text, DiagnosticLevel::Debug);
         } catch (...) {}
     }
 
@@ -2392,7 +2402,7 @@ private:
                               waits[1] ? static_cast<double>(waits[0]) * 1e-3 / static_cast<double>(waits[1]) : 0.0);
                 line += text;
             }
-            diagnostic(line);
+            diagnostic(line, DiagnosticLevel::Debug);
         } catch (...) {}
     }
 
@@ -2880,7 +2890,7 @@ private:
                       static_cast<unsigned long long>(split.cpu_experts - split_at_lease_.cpu_experts),
                       static_cast<unsigned long long>(split.streamed_experts - split_at_lease_.streamed_experts),
                       static_cast<unsigned long long>(walk_prefetched_chunks_ - prefetched_at_lease_));
-        diagnostic(line);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
 
     // Whether a lane other than `index` is prefilling.
@@ -3720,6 +3730,9 @@ private:
                       rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured", pcie_divisor(),
                       static_cast<unsigned long long>(promotion_interval()),
                       options_.prefill_cpu_split ? split_columns() : 0);
+        diagnostic(text, DiagnosticLevel::Debug);
+        std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
+                      options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
         diagnostic(text);
     }
 

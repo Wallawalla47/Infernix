@@ -258,8 +258,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     for (const auto& placement : plan.device_objects) {
         total = checked_add(total, placement.bytes, "device payload bytes");
     }
+    // Progress counts the pinned reads (Qwen3.8-Flash-Next's 63 GiB of experts) as well as the
+    // device upload, so the phase's rate and ETA describe the whole load.
+    std::uint64_t pinned_total = 0;
+    for (const auto& placement : plan.pinned_objects) {
+        pinned_total = checked_add(pinned_total, placement.bytes, "pinned payload bytes");
+    }
+    const std::uint64_t load_total = checked_add(total, pinned_total, "loaded payload bytes");
+    std::uint64_t pinned_done      = 0;
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
-                            total);
+                            load_total);
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
     out.stats_.file_bytes            = reader.file_bytes();
@@ -381,6 +389,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             divisor};
         out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, placement.bytes,
                                               "pinned bytes");
+        pinned_done = checked_add(pinned_done, placement.bytes, "pinned progress");
+        phase.progress(pinned_done, load_total);
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {
@@ -415,7 +425,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
     }
     if (ranges.empty()) {
-        phase.complete();
+        phase.complete(pinned_done, load_total);
         return out;
     }
     std::sort(ranges.begin(), ranges.end(), [](const auto& a, const auto& b) {
@@ -492,7 +502,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             check_cuda(cudaEventRecord(slot.event, device.transfer_stream),
                        "record weight staging completion");
             slot.pending = true;
-            phase.progress(copied, total);
+            phase.progress(pinned_done + copied, load_total);
         }
     }
     for (const auto& slot : slots) { slot->wait(); }
@@ -504,7 +514,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     slots.clear();
-    phase.complete(copied, total);
+    phase.complete(pinned_done + copied, load_total);
     return out;
 }
 
