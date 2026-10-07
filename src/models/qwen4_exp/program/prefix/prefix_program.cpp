@@ -417,7 +417,10 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
     // The snapshot the waiting request resumes from is where two conversations diverge: it is
     // published as a boundary, so neither lineage supersedes it.
     Lane& lane = lanes_[best->lane];
-    if (lane.phase != Phase::Prefill) { return true; } // an in-flight capture: nothing to plan
+    // An in-flight capture (a decoding sibling's, or one at or before a prefilling sibling's state,
+    // whose call ended there and is enqueued): nothing to plan. Splitting the remaining calls at such
+    // a target would plan a call that ends where the lane already is.
+    if (lane.phase != Phase::Prefill || best->target <= lane.state_tokens) { return true; }
     auto& taps = lane.prefix.taps;
     const auto at = std::lower_bound(taps.begin(), taps.end(), best->target,
                                      [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });

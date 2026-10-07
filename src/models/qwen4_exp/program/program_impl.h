@@ -1532,7 +1532,11 @@ public:
         }
         const std::int32_t begin = static_cast<std::int32_t>(lane.state_tokens);
         if (lane.next_call >= lane.calls.size() || lane.calls[lane.next_call] <= lane.state_tokens) {
-            throw std::logic_error("Qwen4Exp: the lane's prefill plan does not continue its state");
+            throw std::logic_error(
+                "Qwen4Exp: the lane's prefill plan does not continue its state (lane " + std::to_string(index) +
+                ", call " + std::to_string(lane.next_call) + " of " + std::to_string(lane.calls.size()) +
+                (lane.next_call < lane.calls.size() ? ", ending at " + std::to_string(lane.calls[lane.next_call]) : "") +
+                ", state " + std::to_string(lane.state_tokens) + ", prompt end " + std::to_string(lane.prefill_end) + ")");
         }
         if (const std::size_t end = walk_span_end(lane, index); end > lane.next_call) {
             walk_begin(lane, index, end);
