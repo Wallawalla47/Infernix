@@ -121,8 +121,8 @@ not NVFP4's E4M3 scales per 16.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
 
-Recorded 2026-10-05/06. This compares Infernix's Flash-Next artifacts, which import RadixArk's NVFP4
-checkpoint (NVIDIA Model Optimizer experts) bit-exactly
+This compares Infernix's Flash-Next artifact, which imports NVIDIA's NVFP4 checkpoint
+(`nvidia/Qwen3.8-Flash-Next-NVFP4`) bit-exactly
 ([design §6.1](qwen3_8-flash-next-design.md#61-recipes-qwen3_8_flash_next_nvfp4-a-and-qwen3_8_flash_next_nvfp4_dense8-b)),
 with `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL`. That GGUF is the file the Strata engine runs
 on this machine. The quality figures were measured. The speed figures are **estimates, not
@@ -131,19 +131,23 @@ measurements**: no UD-Q4_K_XL support exists in Infernix.
 ### 4.1 Measured quality
 
 Teacher-forced on identical token ids
-([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)).
-Infernix ran recipe A with INT8 KV; Strata ran UD-Q4_K_XL with INT8 KV. The texts were 2,557
-positions of code, a document and a chat transcript, all ≤ 1,024 tokens.
+([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)),
+recorded 2026-10-07. Infernix ran recipe B (`e3be72cde`) with INT8 KV; Strata 0.1.40 ran UD-Q4_K_XL
+with INT8 KV. The texts were 2,557 positions of code, a document and a chat transcript, all ≤ 1,024
+tokens.
 
-| | Perplexity | ΔNLL (Infernix − Strata) |
-|---|---:|---:|
-| Code | 1.9052 / 1.9051 | +0.000 ± 0.016 |
-| Document | 9.5874 / 9.7671 | −0.019 ± 0.017 |
-| Chat | 3.3611 / 3.8692 | **−0.141 ± 0.024** |
-| All | 4.564 / 4.864 | **−0.064 ± 0.012** |
+| | Perplexity (Infernix / Strata) | ΔNLL (Infernix − Strata) | Top-1 agreement | KL(Strata ‖ Infernix) mean / p99 |
+|---|---:|---:|---:|---:|
+| Code | 1.9050 / 1.8994 | +0.003 ± 0.013 | 95.7 % | 0.023 / 0.30 |
+| Document | 9.7812 / 9.7209 | +0.006 ± 0.014 | 86.4 % | 0.052 / 0.59 |
+| Chat | 3.4774 / 3.8520 | **−0.102 ± 0.023** | 90.7 % | 0.106 / 1.64 |
+| All | 4.6635 / 4.8435 | **−0.038 ± 0.011** | | |
 
-Recipe B (8-bit dense) costs +0.008 ± 0.010 nats against recipe A. It therefore keeps the same
-lead over Strata.
+Infernix ties Strata on code and the document and is better on chat. Recipe B (8-bit dense) cost
++0.008 ± 0.010 nats against recipe A on an earlier checkpoint with the same BF16 dense weights;
+recipe A was not converted from NVIDIA's checkpoint. The figures recorded here before 2026-10-07
+(recipe A 4.564 against Strata 0.1.39's 4.864) were measured on `RadixArk/Qwen3.8-Flash-Next-NVFP4`,
+whose routed experts carry a different calibration.
 
 **This compares engines as well as weights.** Several of Strata's numerical choices differ from
 Infernix's:
@@ -170,6 +174,15 @@ These facts come from the GGUF headers (4 shards, 111.3 GB).
 
 At 4.5 bits per weight, Q4_K is the same size as NVFP4. The dense path has the same bytes in both
 artifacts. The differences are the larger down projections, plus the format of the arithmetic.
+
+Average bits per weight of the text decoder (176.944 G weights in each; scales counted, vision and
+the MTP drafter excluded since the GGUF files hold neither):
+
+| | Routed experts | Dense and other | PLE n-gram table | All | Without the n-gram table |
+|---|---:|---:|---:|---:|---:|
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` | 4.50 | 16.00 | 8.00 | 5.83 | 4.95 |
+| Infernix recipe B + n-gram volume | 4.50 | 10.34 | 8.19 (4 KiB block padding) | 5.73 | 4.73 |
+| Unsloth UD-Q4_K_XL | 5.10 | 8.90 | 4.50 | 5.03 | 5.25 |
 
 ### 4.3 Conclusion
 
