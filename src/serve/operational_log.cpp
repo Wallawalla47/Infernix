@@ -321,6 +321,12 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
         }
     }
+    if (outcome.thinking.loop_detected) {
+        out << " | reasoning loop after "
+            << product::format_pretty_count(outcome.thinking.loop_thinking_tokens) << " thinking tokens ("
+            << static_cast<int>(outcome.thinking.loop_coverage * 100.0F + 0.5F) << "% repeated), "
+            << (outcome.thinking.applied ? "concluded" : "stopped");
+    }
     if (metrics.vision_offload_window_seconds > 0.0) {
         out << " vision_offload_ms=" << metrics.vision_offload_window_seconds * 1000.0
             << " vision_offload_evicted_mib="

@@ -176,6 +176,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
+           "  --reasoning-loop MODE      off (default), stop or conclude: every 512 thinking\n"
+           "                             tokens, check whether 25% of the last 2,000 words\n"
+           "                             repeat 12-word passages seen 3 times; stop ends the\n"
+           "                             reply as length, conclude closes the thinking with\n"
+           "                             the thinking-budget message and lets the model answer\n"
            "  --model-id ID              override the artifact metadata.name reported by\n"
            "                             the server\n"
            "  --chat-template FILE       replace the artifact frontend chat template at\n"
@@ -363,6 +368,15 @@ std::string serve_usage_text(const char* argv0) {
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n";
+}
+
+const char* reasoning_loop_name(ninfer::ReasoningLoopAction action) noexcept {
+    switch (action) {
+    case ninfer::ReasoningLoopAction::Stop: return "stop";
+    case ninfer::ReasoningLoopAction::Conclude: return "conclude";
+    case ninfer::ReasoningLoopAction::Off: break;
+    }
+    return "off";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -646,6 +660,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.thinking_budget_message = require_value("--thinking-budget-message");
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
+            }
+        } else if (arg == "--reasoning-loop") {
+            const std::string_view value = require_value("--reasoning-loop");
+            if (value == "off") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Off;
+            } else if (value == "stop") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Stop;
+            } else if (value == "conclude") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Conclude;
+            } else {
+                throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
             }
         } else if (arg == "--vision") {
             options.enable_vision = true;

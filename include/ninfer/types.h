@@ -453,11 +453,22 @@ struct StopPolicy {
     bool publish_stop_token     = false;
 };
 
+// What the reasoning-loop guard does when the open thinking keeps repeating whole passages (every
+// 512 thinking tokens, the share of the last 2,000 words inside a 12-word passage seen three times
+// reaches 25 %).
+enum class ReasoningLoopAction : std::uint8_t {
+    Off,      // no check
+    Stop,     // end the request there (FinishReason::OutputLimit)
+    Conclude, // inject the thinking-close control (as a reached thinking budget does) and let the
+              // model answer; Stop when the remaining output budget cannot hold it and one token
+};
+
 struct ThinkingControlOptions {
     // Positive maximum accepted model-origin tokens while the Qwen thinking phase remains open.
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
+    ReasoningLoopAction loop = ReasoningLoopAction::Off;
 };
 
 // Most tokens one prompt readout may name.
@@ -1079,6 +1090,11 @@ struct ThinkingBudgetStats {
     // Complete tokenizer-derived target-control suffix committed by Engine.
     std::uint32_t injected_tokens = 0;
     bool applied                  = false;
+    // The reasoning-loop guard fired: after this many model-origin thinking tokens, at this
+    // repeated-passage coverage (ThinkingControlOptions::loop decided the action).
+    bool loop_detected               = false;
+    std::uint32_t loop_thinking_tokens = 0;
+    float loop_coverage              = 0.0F;
 };
 
 enum class PrefixReusePath : std::uint8_t {

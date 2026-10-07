@@ -321,6 +321,8 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+        // A token constraint owns every output step, so the guard's injected close has no room.
+        if (request.constraint.empty()) { options.execution.thinking.loop = server.reasoning_loop; }
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.output.raw                     = false;

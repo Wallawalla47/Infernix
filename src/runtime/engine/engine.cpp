@@ -60,6 +60,10 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
             // The budget's injected close would occupy steps the constraint owns.
             throw std::invalid_argument("constraint cannot be combined with a thinking budget");
         }
+        if (options.execution.thinking.loop == ReasoningLoopAction::Conclude) {
+            // So would the loop guard's.
+            throw std::invalid_argument("constraint cannot be combined with reasoning-loop conclude");
+        }
         if (options.execution.requested_output_tokens > constraint.steps.size()) {
             throw std::invalid_argument("constraint has fewer steps than requested output tokens");
         }
