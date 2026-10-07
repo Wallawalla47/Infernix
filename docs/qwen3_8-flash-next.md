@@ -113,6 +113,10 @@ ninfer-serve <artifact>.ninfer --ngram-volume <volume>.ngram --kv-dtype int8 --m
 - The engine starts six CPU worker threads for missed experts (up to 16 per layer call). They
   spin while decoding. More
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
+- On Windows the engine opts its process out of power throttling. Windows otherwise slows a
+  process it considers in the background (a server whose console is not in front, a job without a
+  window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
+  and 98.7 exempt (design §19.3.19).
 - `--vision` enables images and video. The vision tower stays in pinned RAM and borrows expert
   frames only while it encodes (`--vision-offload auto`).
 - The expert cache fills the VRAM that remains; see [VRAM](#vram).

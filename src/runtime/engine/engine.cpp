@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/power_throttling.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
@@ -361,6 +362,8 @@ public:
 };
 
 Engine::Engine(EngineOptions options) {
+    // Before any host thread starts: a throttled process runs every one of them slower.
+    exempt_process_from_power_throttling();
     StartupObserver startup_observer = options.startup_observer;
     StartupPhaseScope startup_phase(startup_observer, StartupPhase::EngineStartup);
     impl_ = std::make_shared<Impl>(std::move(options));

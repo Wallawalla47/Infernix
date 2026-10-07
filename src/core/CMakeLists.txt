@@ -16,6 +16,7 @@ add_library(ninfer_core STATIC
   host_memory.cpp
   host_worker_pool.cpp
   link_probe.cpp
+  power_throttling.cpp
   vram_budget.cpp
   gdn_replay_records.cpp
   cyclic_kv_cache.cpp
