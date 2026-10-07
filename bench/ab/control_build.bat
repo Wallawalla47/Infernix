@@ -1,6 +1,6 @@
 @echo off
 setlocal
-REM Control-arm build driver: upstream + Windows port (upstream-Windows-Port, f2406102).
+REM Control-arm build driver: NInfer + Windows port (upstream-Windows-Port, f2406102).
 REM Mirrors the fork's build_native.bat (vcvars64 + vcpkg FFmpeg env) but targets the
 REM control worktree/build and builds only the infernix-serve app (tests/benchmarks off).
 REM control\src must be a checkout/worktree of the control branch; control\build is

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agentic A/B benchmark runner: upstream + Windows port (control) vs this fork (treatment).
+"""Agentic A/B benchmark runner: NInfer + Windows port (control) vs Infernix (treatment).
 
 Serves each build in turn on the same GPU with the same model, replays the closed-loop
 agentic workload from workload.py against it over the OpenAI chat-completions API, and
@@ -10,7 +10,7 @@ every arm, which is how client requests and log records are joined.
 Sequence:
   1. calibrate: the largest --max-context (starting at the launch bat's own value) at which
      the control serve starts; every arm runs at it;
-  2. treatment arm: the launch bat's flags plus AB_TREATMENT_EXTRA_FLAGS, with the fork's
+  2. treatment arm: the launch bat's flags plus AB_TREATMENT_EXTRA_FLAGS, with Infernix's
      default hybrid prefix cache;
   3. optional alt arm: AB_ALT_EXE (default the treatment build) with the treatment's flags plus
      AB_ALT_EXTRA_FLAGS (default the original prefix cache), so one run compares two fork
@@ -58,9 +58,9 @@ TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
                              os.path.join(HERE, "control", "build", "apps", "Release",
                                           "ninfer-serve.exe"))
-# Fork flags the launch bat does not already carry.
+# Infernix flags the launch bat does not already carry.
 TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
-# Selects the fork's original checkpoint-catalog prefix cache instead of the default hybrid one.
+# Selects Infernix's original checkpoint-catalog prefix cache instead of the default hybrid one.
 ORIGINAL_CACHE_FLAG = "--use-original-prefix-caching"
 # What the alt arm adds to the treatment's flags, and the build it runs (default the treatment's).
 ALT_EXTRA_FLAGS = os.environ.get("AB_ALT_EXTRA_FLAGS", ORIGINAL_CACHE_FLAG).split()

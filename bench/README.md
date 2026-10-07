@@ -11,12 +11,12 @@ prefix reuse and preemption. Its frozen request corpus is documented under
 [`fixtures/ttft/`](fixtures/ttft/README.md). That client does not call the benchmark executables or
 Engine directly.
 
-The closed-loop agentic A/B suite under [`agentic_ab/`](agentic_ab/README.md) (upstream + Windows
-port vs this fork, black-box OpenAI API) replays interleaved agent sessions, subagent fan-outs,
+The closed-loop agentic A/B suite under [`agentic_ab/`](agentic_ab/README.md) (NInfer + Windows
+port vs Infernix, black-box OpenAI API) replays interleaved agent sessions, subagent fan-outs,
 compaction, retries and aborts shaped from the production request logs, and reports cache hits,
 TTFT, cold prefill and output rates. It and the decode-saturation suite of
 `tools/bench/run_serve_concurrency.py` produce the numbers in the
-[fork README](../README.md#performance-this-fork-vs-upstream). The older serve A/B rig
+[README](../README.md#benchmarks). The older serve A/B rig
 under [`ab/`](ab/README.md) predates the `e31bc99b` merge.
 
 ## Benchmark inputs
@@ -160,9 +160,9 @@ infernix_decode_quality_gen model.ninfer corpus.txt base-ngram.txt 32 1536 384 n
 infernix_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt other.txt
 ```
 
-Use the same artifact and corpus for every build. The generator uses only Engine API that upstream
-Infernix also has, so for a fork-versus-upstream comparison copy `decode_quality_gen.cpp` into an
-upstream checkout and build it there with `INFERNIX_DECODE_QUALITY_UPSTREAM` defined (it removes the
+Use the same artifact and corpus for every build. The generator uses only Engine API that NInfer
+also has, so for an Infernix-versus-NInfer comparison copy `decode_quality_gen.cpp` into an
+NInfer checkout and build it there with `INFERNIX_DECODE_QUALITY_NINFER` defined (it removes the
 n-gram option), linked to `infernix_engine` like any benchmark. Rounding noise makes builds diverge
 after a few dozen tokens, which is why each build is judged on its own prefixes. Treat agreement
 differences of a few tenths of a percent over about 12,000 tokens as unresolved unless they repeat

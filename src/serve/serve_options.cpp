@@ -256,7 +256,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --cache-tap-min-gap N      minimum tokens between ladder snapshots\n"
            "                             (default max(1024, prefill chunk))\n"
            "\n"
-           "ORIGINAL PREFIX CACHING SYSTEM (upstream's continuation/checkpoint cache;\n"
+           "ORIGINAL PREFIX CACHING SYSTEM (NInfer's continuation/checkpoint cache;\n"
            "Qwen3.5 artifacts only)\n"
            "  --use-original-prefix-caching\n"
            "                             use this system instead of the new one; the\n"

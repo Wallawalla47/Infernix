@@ -31,7 +31,7 @@ and the chunk size only picks the scatter. So:
   intended distribution, not whether noise happened to favour the corpus.
 - The best reference for a given weight set is the same artifact with 16-bit activations
   (`EngineOptions::a16_activations`), scored in one pass with BF16 KV.
-- Exact outputs (for example BF16 KV prefill, where no fork kernel differs from upstream) must
+- Exact outputs (for example BF16 KV prefill, where no Infernix kernel differs from NInfer) must
   still match exactly; noise tolerance applies only to paths whose arithmetic changed.
 
 ## 2. Tools
@@ -44,13 +44,13 @@ and the chunk size only picks the scatter. So:
 | `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference ([benchmarks](../../bench/README.md#decode-quality)) |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
-need the decode-quality pair. The generator uses only Engine API that upstream also has, so the
-same source builds in an upstream checkout for a like-for-like comparison.
+need the decode-quality pair. The generator uses only Engine API that NInfer also has, so the
+same source builds in an NInfer checkout for a like-for-like comparison.
 
 ## 3. Recorded results
 
 Measured on 2026-10-05 on an RTX 5090 (CUDA 13.4, Windows), Gold-Star-Infer at `5fbfc3db` against
-upstream `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
+NInfer `68c54356` plus the Windows port (with only a `--prefill-chunk` option added to its
 perplexity tool), official Qwen3.8-27B NVFP4 artifact unless stated. The reference in these runs
 lifted only the 4-bit (MLP) sites to 16-bit activations; sites that run 8-bit activations (FP8
 projections) kept them. `a16_activations` lifts those too, so it is a stricter reference: the KL
@@ -72,21 +72,21 @@ KL to the reference at one pass / 4096-token chunks, with uncached prefill time 
 
 `a16_activations` also lifts the 8-bit sites, so it is at least as slow as the last row.
 
-### 3.2 Fork against upstream, prefill
+### 3.2 Infernix against NInfer, prefill
 
 Perplexity at six chunk sizes (512, 1024, 2048, 3584, 7168 and one 14,336-token pass), paired by
 chunk size:
 
-| KV | Fork mean | Upstream mean | Fork - upstream | By chunk size |
+| KV | Infernix mean | NInfer mean | Infernix - NInfer | By chunk size |
 |---|---|---|---|---|
 | BF16 | 2.33446 | 2.33446 | 0 | identical at all six |
-| INT8 | 2.32850 | 2.33129 | -0.12 % | fork lower at 5 of 6; t = -1.4, not significant |
-| NVFP4 | 2.33694 | 2.33643 | +0.02 % | fork lower at 3 of 6; spread 0.54 %; worst +0.89 % at 1024 |
+| INT8 | 2.32850 | 2.33129 | -0.12 % | Infernix lower at 5 of 6; t = -1.4, not significant |
+| NVFP4 | 2.33694 | 2.33643 | +0.02 % | Infernix lower at 3 of 6; spread 0.54 %; worst +0.89 % at 1024 |
 
-The fork changes no arithmetic shared by every KV format, and its INT8 and NVFP4 prompt-attention
-kernels are as accurate as upstream's within this resolution.
+Infernix changes no arithmetic shared by every KV format, and its INT8 and NVFP4 prompt-attention
+kernels are as accurate as NInfer's within this resolution.
 
-### 3.3 Fork against upstream, decode
+### 3.3 Infernix against NInfer, decode
 
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
 7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
@@ -95,14 +95,14 @@ tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and 
 
 | Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
 |---|---|---|---|---|
-| Upstream | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
-| Fork | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
-| Fork with n-gram drafting (15 drafts, min match 12) | 0.9729 | 0.0087 | 0.9764 | 0.0071 |
+| NInfer | 0.9736 | 0.0080 | 0.9743 | 0.0073 |
+| Infernix | 0.9736 | 0.0086 | 0.9762 | 0.0072 |
+| Infernix with n-gram drafting (15 drafts, min match 12) | 0.9729 | 0.0087 | 0.9764 | 0.0071 |
 
-Greedy decode chooses the reference's top token at least as often as upstream's under both
+Greedy decode chooses the reference's top token at least as often as NInfer's under both
 references; the differences are a few tenths of a percent and change order between them, so they
 are within noise. Builds share their first
-54-68 generated tokens on average before rounding noise makes them diverge; the fork with and
+54-68 generated tokens on average before rounding noise makes them diverge; Infernix with and
 without n-gram drafting shares 267 of 384.
 
 ### 3.4 Rejected: adaptive (4 or 6) activation block scaling

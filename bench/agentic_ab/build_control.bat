@@ -1,11 +1,11 @@
 @echo off
 setlocal
-REM Control-arm build driver for the agentic A/B suite: upstream + Windows port.
+REM Control-arm build driver for the agentic A/B suite: NInfer + Windows port.
 REM
-REM The control checkout should be upstream master at the same upstream commit this
-REM fork has merged, plus only the Windows-port commit, so the A/B does not credit the
-REM fork with upstream's own newer work. Example (from the fork checkout):
-REM   git worktree add -b ab/upstream-windows-port <dir>\src origin/master
+REM The control checkout should be NInfer master at the same NInfer commit
+REM Infernix has merged, plus only the Windows-port commit, so the A/B does not credit
+REM Infernix with NInfer's own newer work. Example (from the Infernix checkout):
+REM   git worktree add -b ab/ninfer-windows-port <dir>\src origin/master
 REM   git -C <dir>\src cherry-pick <windows-port-commit>
 REM
 REM Usage: build_control.bat configure|build

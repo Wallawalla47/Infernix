@@ -407,5 +407,5 @@ no continuation or checkpoint that external requests could hit.
 | Converter and Python container tools | `tools/convert/`, `tools/artifact/` |
 
 The public C++ interface serves in-repository applications; Infernix does not install or export a C++
-SDK. The v3 container (`.infernix`, or `.ninfer` from upstream) is the only C++ product artifact; the
+SDK. The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; the
 CLI, server and inference benchmarks all go through the public Engine, and the converter provides no Python model-inference path.

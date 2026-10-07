@@ -228,7 +228,7 @@ head, NVFP4 KV, minimum match 12, no additional soak and MTP. It checks retained
 device versus host-restored state, cancellation, queued isolation, output budgets,
 partial pages and context tails. Append `--strict-fresh` to additionally require
 bit-identical fresh-prefill and cached output. That separate diagnostic may return
-2 on quantized paths, including upstream without ngram; all retained-state checks
+2 on quantized paths, including NInfer without ngram; all retained-state checks
 remain mandatory. It skips without the artifact environment variable.
 
 `infernix_ngram_archive_real` uses `INFERNIX_NGRAM_TEST_WEIGHTS` and takes the backend
@@ -249,9 +249,9 @@ It skips when the artifact environment variable is absent.
 
 The optional fourth argument `--strict-fresh` additionally requires bit-identical
 fresh-versus-cached generation and returns 2 when that diagnostic differs. Quantized
-prefill/cache paths can already differ on upstream without ngram, including in
+prefill/cache paths can already differ on NInfer without ngram, including in
 reasoning text; this is distinct from cached-repeat determinism and budget correctness.
-Keep that diagnostic separate when comparing upstream and patched engines.
+Keep that diagnostic separate when comparing NInfer and patched engines.
 
 `infernix_ngram_stop_chat_real` uses the same artifact environment variable and accepts
 a backend and ngram draft size, for example `dflash2 15`. Neural draft size is five.

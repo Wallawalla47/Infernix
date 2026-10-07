@@ -2,7 +2,7 @@
 
 namespace infernix::ops::detail {
 
-// The fused gate_up of a Q6 Qwen3.8-27B MLP (upstream PR #284). It shares K=5120 with the output
+// The fused gate_up of a Q6 Qwen3.8-27B MLP (NInfer PR #284). It shares K=5120 with the output
 // head, so it takes that shape's capacity routes on the unified Q6 templates; the PR's own ladder
 // named the pre-unification SIMT and K-split MMA instances, which no longer exist.
 Q6Launch select_q6_n34816_k5120(std::int32_t tokens) {

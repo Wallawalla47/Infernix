@@ -57,7 +57,7 @@ local workflow. Do not derive requirements from a different deployment or trust 
 
 Keep these ownership boundaries visible when selecting a design:
 
-- The v3 container (`.infernix`, or `.ninfer` from upstream) is the only C++ product artifact; CLI,
+- The v3 container (`.infernix`, or `.ninfer` from NInfer) is the only C++ product artifact; CLI,
   serving, and inference benchmarks use the public Engine. Infernix has no Python model-inference
   route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and

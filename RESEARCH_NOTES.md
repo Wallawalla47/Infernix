@@ -561,7 +561,7 @@ that does pay.
 
 ## The MX-FP8 tiled prompt kernel: FP16 P×V, cost-aware splits and issue order
 
-The FP8 and K8V4 prompt kernel (upstream's `mxfp8_tiled_mma.cuh`: QK on block-scaled FP8 Tensor
+The FP8 and K8V4 prompt kernel (NInfer's `mxfp8_tiled_mma.cuh`: QK on block-scaled FP8 Tensor
 Cores, each V tile decoded once per CTA into a shared FP16 arena) accumulated P×V with FP16 MMAs
 in FP32. On RTX 5090 that form runs at half the FP16 rate (`mma_rates.cu`, dense mma.sync:
 FP16 with FP16 accumulation 508 TFLOPS, with FP32 accumulation 254; E4M3 block-scaled with FP32
@@ -579,7 +579,7 @@ attention layer (append entry, 24/4 geometry, cold cache, graph, three alternati
   columns -19 % over an empty context and -10 % over 8K, 1024 columns -14 % over an empty
   context, -0.3 to -3 % from 32K; FP8 alike. Slower: K8V4 512 columns over an empty context +3 %
   and FP8 256 columns +3.5 % (passes from +1.4 %).
-- Split count from a cost model instead of the fewest waves per split: upstream's partition chose
+- Split count from a cost model instead of the fewest waves per split: NInfer's partition chose
   the split count that minimizes waves per split and ignored storing and merging every split's
   FP32 rows, so a chunk over a short context split into up to eight (4096 columns over an empty
   context: 1731 us against 820 us for 3584 columns). The kernel and the merge now take the
@@ -588,7 +588,7 @@ attention layer (append entry, 24/4 geometry, cold cache, graph, three alternati
   two changes above, against master: K8V4 -5.5 to -58 % (3584 columns -31.5 % over an empty
   context, -26 % over 8K, -22 % over 32K, -15 % over 128K; 4096 columns over an empty context
   -58 %), FP8 -5.7 to -59 %, faster at every point measured (256-4096 columns, 0-128K keys).
-- Split workspace: upstream's partition reserves FP32 partials for its full split target, about
+- Split workspace: NInfer's partition reserves FP32 partials for its full split target, about
   550 MiB at 3328-column launches with 4096-token prefill chunks (169 MiB at its default 1024),
   which comes out of the KV cache. FP8 and K8V4 keep that (their workspace is master's); NVFP4 on
   this kernel keeps its old 64 MiB budget (below). The budget costs every format alike: with 64 MiB
@@ -624,7 +624,7 @@ of stack (the register-decode kernel: 120-216). Its attention-suite error agains
 register-decode kernel's (relative L2 0.0017). Against master's fast kernel, with the issue order,
 split cost and split budget: -6 to -26 % wherever it runs (3584 columns -7.8 % over an empty
 context, -14.6 % over 8K, -15.5 % over 32K, -17.5 % over 128K; 1024-2048 columns -6 to -16 % from
-8K keys; 0.32-0.63 times upstream's tiled NVFP4 kernel).
+8K keys; 0.32-0.63 times NInfer's tiled NVFP4 kernel).
 Before the issue order and split cost it was 13 % slower at 3584 columns over an empty context and
 2.2 times slower at 4096. Its splits keep the old kernel's 64 MiB partial budget (one split's
 FP32 rows are always written for the merge, so wide launches reserve up to about 85 MiB, against
@@ -639,7 +639,7 @@ kernel (the threshold re-tune is below).
 The same kernel with an INT8 key policy (one INT8 Q code and FP32 scale per row and 64-dimension
 group, s8 QK per group with both group scales in FP32) and INT8 V decoded once into the arena
 used exactly the 99 KB of shared memory a block may have and 0-8 bytes of stack, and matched the
-fast INT8 kernel's error (relative L2 0.0017). With upstream's split counts it took 9-20 % less
+fast INT8 kernel's error (relative L2 0.0017). With NInfer's split counts it took 9-20 % less
 time than the fast INT8 kernel for 1024-2048 columns from 8K visible keys, but 7 % more for
 1408-2048 columns over an empty context, 9 % more for 3584 columns over an empty context and about
 the same for full chunks over long contexts. Those wins came from splitting into up to eight
@@ -655,7 +655,7 @@ norm-preserving mismatch).
 
 In the decode-once kernel the V arena holds E4M3 bytes instead of FP16 (half the shared memory)
 and P×V runs on block-scaled E4M3 Tensor Cores with FP32 accumulation, four times the rate of the
-upstream FP32-accumulate form. Probabilities are formed as 256 p against the tile's own row maximum:
+NInfer FP32-accumulate form. Probabilities are formed as 256 p against the tile's own row maximum:
 the softmax reference follows each tile's row maximum (held within 2^40 of the running maximum,
 so the FP32 accumulator and row sum cannot overflow), which keeps values down to 2^-17 of that
 tile's largest instead of flushing a tile's whole diffuse tail below the running maximum's E4M3
