@@ -125,20 +125,13 @@ Strata runs with its configuration on this machine (`strata-unsloth-ud-q4_k_xl.j
 engines run with MTP: Strata refuses to start this model pack without speculation (`--spec` 2 or
 more).
 
-**Model size.** Average bits per weight of the text decoder, the part both files contain (176.9
-billion weights each; scales counted; vision and the MTP drafter left out because the GGUF holds
-neither):
-
-| | Routed experts | Dense and other | PLE n-gram table | All | Without the n-gram table |
-|---|---:|---:|---:|---:|---:|
-| Infernix artifact + n-gram volume | 4.50 | 10.34 | 8.19 | 5.73 | 4.73 |
-| `nvidia/Qwen3.8-Flash-Next-NVFP4` (source) | 4.50 | 16.00 | 8.00 | 5.83 | 4.95 |
-| Unsloth UD-Q4_K_XL (Strata) | 5.10 | 8.90 | 4.50 | 5.03 | 5.25 |
-
-Infernix keeps NVIDIA's 4.5-bit experts and 8-bit n-gram table unchanged (the 8.19 includes the
-volume's 4 KiB block padding) and stores the dense projections at 8.5 bits. The GGUF spends more
-on the experts (Q4_K/Q5_K gate and up, Q5_1/Q8_0 down) and much less on the n-gram table (IQ4_NL),
-which makes the whole file smaller.
+The two engines run different quantizations of the same model: Strata cannot run NVFP4, and
+Infernix cannot run the GGUF. Neither file is uniformly higher precision. The GGUF is smaller
+overall (111 GB, against about 127 GB for the Infernix artifact with its n-gram volume) but stores
+the routed experts, which dominate the bytes read per token, at about 5.1 bits per weight against
+NVFP4's 4.5, so Strata reads slightly more expert data per token. Infernix keeps the dense layers
+(8-bit and BF16) and the n-gram table (8-bit) at higher precision. On the same token ids Infernix's
+quality is slightly better (perplexity 4.664 against 4.844).
 
 **Context length** (one request at a time):
 
