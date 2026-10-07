@@ -31,6 +31,8 @@ venv/
 *.gguf
 *.ninfer
 *.ninfer.conversion.json
+*.infernix
+*.infernix.conversion.json
 /models/
 out/
 

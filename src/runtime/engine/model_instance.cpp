@@ -24,8 +24,10 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
-    if (options.artifact_path.extension() != ".ninfer") {
-        throw std::invalid_argument("Infernix accepts only .ninfer artifacts");
+    // .infernix and .ninfer name the same v3 container (Infernix began as a fork of NInfer).
+    if (const auto extension = options.artifact_path.extension();
+        extension != ".infernix" && extension != ".ninfer") {
+        throw std::invalid_argument("Infernix accepts only .infernix and .ninfer artifacts");
     }
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");

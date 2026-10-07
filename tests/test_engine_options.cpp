@@ -16,8 +16,9 @@ int check(bool condition, const char* message) {
 }
 
 // The exception an Engine over a nonexistent artifact raises for these options.
-std::string construction_error(infernix::EngineOptions options, bool& invalid_argument) {
-    options.artifact_path = "absent-artifact-for-option-validation.ninfer";
+std::string construction_error(infernix::EngineOptions options, bool& invalid_argument,
+                               const char* artifact = "absent-artifact-for-option-validation.ninfer") {
+    options.artifact_path = artifact;
     try {
         infernix::Engine engine(std::move(options));
     } catch (const std::invalid_argument& error) {
@@ -41,6 +42,20 @@ int main() {
     }
     int failures = 0;
     infernix::EngineOptions options;
+    // Both artifact extensions name the same container; any other is rejected before reading.
+    for (const char* artifact : {"absent-artifact.infernix", "absent-artifact.ninfer"}) {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument, artifact);
+        failures += check(what.find("accepts only") == std::string::npos,
+                          "an .infernix or .ninfer artifact path was rejected by its extension");
+    }
+    {
+        bool invalid_argument  = false;
+        const std::string what = construction_error(options, invalid_argument, "absent-artifact.gguf");
+        failures += check(invalid_argument &&
+                              what.find("accepts only .infernix and .ninfer") != std::string::npos,
+                          "an artifact path with another extension was accepted");
+    }
     // Without the opt-outs every KV format passes this check; INT8 and NVFP4 then take the fast
     // kernels.
     for (const auto storage :

@@ -1,6 +1,6 @@
 # HTTP serving
 
-`build/apps/infernix-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
+`build/apps/infernix-serve` loads one v3 `.infernix` (or `.ninfer`) artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident Infernix Engine.
 
 ## Start the server
