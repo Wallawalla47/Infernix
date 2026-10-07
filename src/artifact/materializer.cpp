@@ -97,7 +97,7 @@ void check_cuda(cudaError_t status, const char* operation) {
 // A staging slot for direct reads, which need a kPayloadAlignment-aligned destination. A pinned
 // allocation is not always page-aligned (the runtime may place a small one inside an earlier
 // allocation's pages), so the slot over-allocates by one alignment unit and reads into `data`
-// (upstream Neroued/ninfer#372).
+// (NInfer Neroued/ninfer#372).
 class Slot {
 public:
     explicit Slot(std::size_t bytes) : buffer(bytes + kPayloadAlignment) {

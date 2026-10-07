@@ -1,5 +1,5 @@
 // A column of a fused residual projection must not change its bits with the batch width
-// (upstream issue Neroued/ninfer#374).
+// (NInfer issue Neroued/ninfer#374).
 //
 // The NVFP4 A4 route launches a FullTokens kernel instance when the width fills whole token tiles
 // and a predicated one otherwise. If the epilogue scales the accumulator outside the

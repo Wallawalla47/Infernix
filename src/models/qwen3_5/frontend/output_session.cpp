@@ -401,7 +401,7 @@ public:
         semantic.loop             = thinking.loop;
         // The semantic tracker counts the model's own thinking tokens for every response that starts
         // in thinking: the request log reports that count (model_thinking_tokens), so it must run
-        // without a budget too (upstream Neroued/ninfer#373; it used to stay 0 unless a budget was
+        // without a budget too (NInfer Neroued/ninfer#373; it used to stay 0 unless a budget was
         // set). The budget caps it and the loop guard reads it. Cost: one close-marker scan per
         // generated token.
         semantic.in_reasoning = starts_in_reasoning;

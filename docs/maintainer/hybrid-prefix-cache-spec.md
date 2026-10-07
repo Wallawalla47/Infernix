@@ -1448,44 +1448,44 @@ None of these were A/B tested; each is a correctness, behavior or log fix.
 | The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
 | A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `infernix-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
 | One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |
-| A cancellation, and a failed admission's rollback, wait for the Device before the lane's pages, state image and execution row return to the pools or move into the index (2026-10-01, upstream `75a89050`) | §7.7 | A non-final prefill step returns without waiting, so a cancel can arrive with the lane's next chunk still queued. The block-table shadow already waited for its own queued copies; the wait now covers everything the lane releases. Not reproduced as a failure. The `cancel-prefill` and `cancel-prefill-dflash2` real scenarios cancel after the first reported chunk (the cancel landed at 1,024 of 3,172 prompt tokens): the lane's next request matches a run without the cancellation, and a request extending the cancelled prompt resumes from its published prefix and matches an uncached run |
+| A cancellation, and a failed admission's rollback, wait for the Device before the lane's pages, state image and execution row return to the pools or move into the index (2026-10-01, NInfer `75a89050`) | §7.7 | A non-final prefill step returns without waiting, so a cancel can arrive with the lane's next chunk still queued. The block-table shadow already waited for its own queued copies; the wait now covers everything the lane releases. Not reproduced as a failure. The `cancel-prefill` and `cancel-prefill-dflash2` real scenarios cancel after the first reported chunk (the cancel landed at 1,024 of 3,172 prompt tokens): the lane's next request matches a run without the cancellation, and a request extending the cancelled prompt resumes from its published prefix and matches an uncached run |
 
-### 16.5 Changes from upstream's TTFT campaign (2026-09-30)
+### 16.5 Changes from NInfer's TTFT campaign (2026-09-30)
 
-Upstream's public-HTTP TTFT campaign (`tools/bench/ttft`, its cache profiles translated to this
-cache's options at equal Device state slots and pinned Host bytes) ran against the upstream port of
+NInfer's public-HTTP TTFT campaign (`tools/bench/ttft`, its cache profiles translated to this
+cache's options at equal Device state slots and pinned Host bytes) ran against the NInfer port of
 this cache in WSL2 on the same RTX 5090. Five of its cases resumed a conversation from the root, or
-far behind its newest snapshot, where upstream's checkpoint-catalog cache resumed from the conversation's own
-checkpoint. Measured with one sample per case on the upstream port; the eviction code is the same
+far behind its newest snapshot, where NInfer's checkpoint-catalog cache resumed from the conversation's own
+checkpoint. Measured with one sample per case on the NInfer port; the eviction code is the same
 in both trees.
 
 | change | section | result | status |
 |---|---|---|---|
-| A sequence supersedes the snapshot it resumed from before its new snapshot takes a slot | §9.2, §9.3 | `session-alternating` (2 Device snapshot slots, no Host tier; two sessions sharing a 4K prefix): A2 and B2 TTFT 305 → 22 ms (upstream 49 ms). Before, each session's endpoint took the slot of the other session's endpoint, not of the shared tap it had resumed from | kept |
-| Device-only slots evicted by GDSF priority, only for a new snapshot worth as much, and before a Host-backed slot gives up its Device copy | §9.2 | `resume-after-interference-device` (same profile; two short requests between a 7.7K conversation's turns): resume 600 → 22 ms (upstream 78 ms); `resume-after-interference-catalog` 600 → 22 ms (632 ms) | kept |
-| A snapshot image goes to the Host only by displacing snapshots worth no more; protocol-automatic markers published as ordinary taps rather than `Boundary` snapshots | §7.1, §8.3, §9.3 | `private-state-working-set-shift` (2 Device slots, 384 MiB Host, DFlash2; four 2K conversations in two phases): the second phase's continuations 204–215 → 40–49 ms (upstream 48 ms). New images had displaced the snapshots the waiting conversations resume from | kept |
-| A `Boundary` snapshot is superseded like any other while no other conversation has continued from it | §9.3 | same case: B1 207 → 39 ms. Each conversation kept its system-block boundary beside its newer snapshot, so the other conversation's snapshot lost its slot. All eight continuations now take 20–40 ms (upstream 48–56 ms) | kept |
-| A deeper tap supersedes the sequence's previous tap of the same prompt (the endpoint does not supersede the prompt's last tap) | §9.3 | `session-alternating-64k-host-swap` (4.5 GiB Host for two 64K sessions whose KV takes 4 GiB): A2 2381 → 176 ms, B2 164 → 113 ms (upstream 242 and 171 ms). Valued against the tap below it, each ladder tap was worth more per byte than the prompt's last tap, so GDSF kept the four ladder taps and evicted the last tap until A resumed from 48K | kept |
+| A sequence supersedes the snapshot it resumed from before its new snapshot takes a slot | §9.2, §9.3 | `session-alternating` (2 Device snapshot slots, no Host tier; two sessions sharing a 4K prefix): A2 and B2 TTFT 305 → 22 ms (NInfer 49 ms). Before, each session's endpoint took the slot of the other session's endpoint, not of the shared tap it had resumed from | kept |
+| Device-only slots evicted by GDSF priority, only for a new snapshot worth as much, and before a Host-backed slot gives up its Device copy | §9.2 | `resume-after-interference-device` (same profile; two short requests between a 7.7K conversation's turns): resume 600 → 22 ms (NInfer 78 ms); `resume-after-interference-catalog` 600 → 22 ms (632 ms) | kept |
+| A snapshot image goes to the Host only by displacing snapshots worth no more; protocol-automatic markers published as ordinary taps rather than `Boundary` snapshots | §7.1, §8.3, §9.3 | `private-state-working-set-shift` (2 Device slots, 384 MiB Host, DFlash2; four 2K conversations in two phases): the second phase's continuations 204–215 → 40–49 ms (NInfer 48 ms). New images had displaced the snapshots the waiting conversations resume from | kept |
+| A `Boundary` snapshot is superseded like any other while no other conversation has continued from it | §9.3 | same case: B1 207 → 39 ms. Each conversation kept its system-block boundary beside its newer snapshot, so the other conversation's snapshot lost its slot. All eight continuations now take 20–40 ms (NInfer 48–56 ms) | kept |
+| A deeper tap supersedes the sequence's previous tap of the same prompt (the endpoint does not supersede the prompt's last tap) | §9.3 | `session-alternating-64k-host-swap` (4.5 GiB Host for two 64K sessions whose KV takes 4 GiB): A2 2381 → 176 ms, B2 164 → 113 ms (NInfer 242 and 171 ms). Valued against the tap below it, each ladder tap was worth more per byte than the prompt's last tap, so GDSF kept the four ladder taps and evicted the last tap until A resumed from 48K | kept |
 | Flexible taps (prompt tail, ladder) as a separate snapshot kind, evicted before every other retained snapshot | §9.3 | broke a regenerate-after-edit resume: with DFlash2 and a 1 GiB Host tier, the prompt-tail tap a request diverging late in the previous prompt needed went first (`restore-exact-dflash2` real test) | reverted |
 | The same kind starting from half a hit in its GDSF value | §9.3 | no change on the two cases it targeted | reverted |
 | Host admission by value (`F·C/Z`) instead of priority `H` | §9.3 | meant for small tiers, where `L` rises by a whole snapshot's value per eviction and almost any new image outranks the rest: stale snapshots worth more per byte then kept the tier from new ones, and the index test's Host backup found no slabs | reverted |
 
 The full campaign after these changes (3 samples per case) gives a geometric-mean TTFT ratio of
-0.658 against upstream's cache over 259 (case, role) observations: 172 faster by more than 10%, 18
+0.658 against NInfer's cache over 259 (case, role) observations: 172 faster by more than 10%, 18
 slower. The slower roles are not eviction. The 55K rotation (six sessions resumed round-robin with
 Device KV for about four) restores every session from Host, about 101 ms each, because Device KV is
-LRU over a cyclic working set larger than the Device; upstream's cache keeps three sessions resident
+LRU over a cyclic working set larger than the Device; NInfer's cache keeps three sessions resident
 (72 ms) and restores the other three in 125–245 ms, so its per-round mean is higher (128 against 99
 ms) while three roles are faster. A repeat of an identical prompt prefills its last few tokens
-(about 20 ms), where upstream's cache samples from the hidden state stored with its checkpoint (6
+(about 20 ms), where NInfer's cache samples from the hidden state stored with its checkpoint (6
 ms): the prompt's last tap sits before the generation opener, and a snapshot at the prompt's exact
 end would cost a whole state image per request for byte-identical repeats only. The other slower
 roles are arrival races between concurrent requests and timing effects in profiles that run with the
 cache off.
 
-### 16.6 Port onto upstream's continuation/checkpoint engine (2026-10-05)
+### 16.6 Port onto NInfer's continuation/checkpoint engine (2026-10-05)
 
-Upstream (`abb7f14f8`) replaced its context cache, Engine core and Program storage: incremental unit
+NInfer (`abb7f14f8`) replaced its context cache, Engine core and Program storage: incremental unit
 reservation with resource-pressure preemption and Snapshot/Replay recovery, a binding transaction
 for every lane start, logical KV page and StateImage stores with replicas, and a single
 `--host-context-mib` Host budget. The hybrid cache was ported onto it rather than kept on the
@@ -1501,7 +1501,7 @@ superseded storage:
   record-addressed KV Host copies) maps onto the new stores directly.
 - In Hybrid mode the Host budget is the slab pool and the Program keeps no Host context arena, so a
   paused request recovers by Replay; the tree usually still holds its prefix.
-- `--use-original-prefix-caching` now selects upstream's new continuation/checkpoint cache; the
+- `--use-original-prefix-caching` now selects NInfer's new continuation/checkpoint cache; the
   old catalog cache and its flags (`--host-cache-mib`, `--host-state-slots`, `--host-kv-mib`,
   catalogs, long anchors) were removed with it. `--host-context-mib` replaces `--host-cache-mib`.
 - The per-request `materialization` admission diagnostics were dropped with the old transaction;

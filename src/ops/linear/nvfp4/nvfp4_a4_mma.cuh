@@ -297,7 +297,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                   "reordered rows require a collective epilogue");
     // Scale with an explicit rounded multiply: the residual add after it must not contract into one
     // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
-    // full (upstream Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
+    // full (NInfer Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
     if constexpr (collective) {
 #pragma unroll
         for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)

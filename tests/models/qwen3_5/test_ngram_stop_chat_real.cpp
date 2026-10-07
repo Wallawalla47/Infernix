@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
         std::cout << "canonical stop controls passed cases=" << cases
                   << " partial=" << partial_cases << " ngram_accepted=" << accepted
                   << " fresh_differences=" << fresh_differences << std::endl;
-        // Upstream also differs between fresh prefill and a retained decode prefix.
+        // NInfer also differs between fresh prefill and a retained decode prefix.
         // Keep that stronger numerical diagnostic separate from commit/reuse correctness.
         return strict_fresh && fresh_differences ? 2 : 0;
     } catch (const std::exception& error) {

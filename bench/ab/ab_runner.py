@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Autonomous A/B benchmark: upstream + Windows port (control) vs. fork (treatment).
+"""Autonomous A/B benchmark: NInfer + Windows port (control) vs. Infernix (treatment).
 
-Runs both arms sequentially against the SAME official Infernix Qwen3.8-27B NVFP4
+Runs both arms sequentially against the SAME official NInfer Qwen3.8-27B NVFP4
 artifact and the SAME synthesized agentic workloads (ab_workloads.py), using the
 serve's own request log (--request-log-jsonl, same schema as the production
 log.json) as the source of truth for metrics. Collects avg TTFT, prefix-cache
@@ -39,7 +39,7 @@ AB_DIR = os.path.dirname(os.path.abspath(__file__))
 DEPLOY = os.environ.get("AB_DEPLOY", r"E:\NInfer-Deploy-V3")
 MODEL = os.environ.get("AB_MODEL",
                        os.path.join(DEPLOY, "qwen3_8_27b_nvfp4-official.ninfer"))
-# Control = upstream + Windows port (f2406102), built from a control worktree via
+# Control = NInfer + Windows port (f2406102), built from a control worktree via
 # control_build.bat. Prefer this directory's own control build; fall back to the
 # machine-specific build location.
 _control_default = os.path.join(AB_DIR, "control", "build", "apps", "Release",
@@ -47,7 +47,7 @@ _control_default = os.path.join(AB_DIR, "control", "build", "apps", "Release",
 if not os.path.exists(_control_default):
     _control_default = r"E:\NInfer-V3\deploy-working\ab\control\build\apps\Release\infernix-serve.exe"
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE", _control_default)
-# Treatment = the fork's current master, the existing Windows build.
+# Treatment = Infernix's current master, the existing Windows build.
 TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
                                r"E:\NInfer-V3\build-windows\apps\Release\infernix-serve.exe")
 PRODUCTION_BAT = os.environ.get(
@@ -61,7 +61,7 @@ HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
 WORKLOAD_SEED = 42
 
-# The bat uses --max-context 220000, but the upstream serve bakes in a 1 GiB automatic KV
+# The bat uses --max-context 220000, but the NInfer serve bakes in a 1 GiB automatic KV
 # headroom that has no flag to lower, and its minimum KV reservation scales with max-context:
 # at 220000 it needs 9.05 GiB + 1 GiB but only 8.88 GiB is free after the 21.3 GiB weights.
 # We probe the largest context at which the control starts and run BOTH arms at that context
@@ -73,9 +73,9 @@ BAT_MAX_CONTEXT = "220000"
 # with no value. They match the production launcher bat with the tested variant
 # --prefill-chunk 2048 / --ngram-min-match 12; edit here to benchmark your own
 # configuration. The treatment uses all of them; the control uses the subset its
-# --help supports (fork-only flags are dropped automatically). --request-log-jsonl
-# is appended by build_args(). The published run used the fork's original prefix cache with
-# explicit Host state/KV and catalog capacities; that cache is now upstream's context cache, which
+# --help supports (Infernix-only flags are dropped automatically). --request-log-jsonl
+# is appended by build_args(). The published run used Infernix's original prefix cache with
+# explicit Host state/KV and catalog capacities; that cache is now NInfer's context cache, which
 # --use-original-prefix-caching selects and --host-context-mib sizes.
 BAT_FLAGS = [
     ("--host", HOST), ("--port", str(PORT)),
@@ -470,9 +470,9 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     if prompts:
         med_prompt = statistics.median(prompts)
     L = []
-    L.append("## Inference performance: this fork vs upstream (A/B benchmark)\n")
-    L.append("Both arms serve the same official Infernix Qwen3.8-27B NVFP4 artifact (%s) on a "
-             "%s, run at the same max-context (%d — the largest context at which the upstream "
+    L.append("## Inference performance: Infernix vs NInfer (A/B benchmark)\n")
+    L.append("Both arms serve the same official NInfer Qwen3.8-27B NVFP4 artifact (%s) on a "
+             "%s, run at the same max-context (%d — the largest context at which the NInfer "
              "arm starts on this card; see below) and replay the same synthesized agentic "
              "workload: %d requests shaped from the production request log (multi-turn "
              "tool-agent sessions, ~%s-token shared prefix, median prompt ≈ %sK tokens, two "
@@ -480,7 +480,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
              "max-concurrency 2).\n"
              % (os.path.basename(MODEL), gpu_name(), ctx, n, _tok(ab_workloads.BASE_TOKENS),
                 _fmt((med_prompt or 0) / 1000.0)))
-    L.append("| Metric | Upstream + Windows port | This Infernix-custom fork | Δ |\n")
+    L.append("| Metric | NInfer + Windows port | Infernix | Δ |\n")
     L.append("|---|---|---|---|\n")
     L.append("| Avg TTFT (s, lower better) | %s | %s | %s |\n"
              % (_sec(ca.get("ttft_s_mean")), _sec(ta.get("ttft_s_mean")),
@@ -504,10 +504,10 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     L.append("")
     L.append("- Avg/median TTFT over all %d completed requests per arm.\n" % n)
     L.append("- Cold (root) prefill = requests that did a full uncached prefill "
-             "(n: upstream %s, fork %s).\n"
+             "(n: NInfer %s, Infernix %s).\n"
              % (ca.get("n_cold_requests"), ta.get("n_cold_requests")))
     L.append("- Output tok/s = total completion tokens / total decode wall time (completion "
-             "tokens: upstream %s, fork %s; thinking on for both arms; per-request decode "
+             "tokens: NInfer %s, Infernix %s; thinking on for both arms; per-request decode "
              "rates are comparable — see the per-request tables in the full report).\n"
              % (_tok(ca.get("total_completion_tokens")), _tok(ta.get("total_completion_tokens"))))
     # Cache-hit stats by reuse path (union of paths seen by either arm).
@@ -515,7 +515,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     if paths:
         L.append("- Cache hits by reuse path (requests / hit tokens):\n")
         L.append("  \n")
-        L.append("  | Path | Upstream | This Infernix-custom fork |\n")
+        L.append("  | Path | NInfer | Infernix |\n")
         L.append("  |---|---|---|\n")
         for p in paths:
             c = ca.get("cache_path_stats", {}).get(p, {"requests": 0, "hit_tokens": 0})
@@ -523,18 +523,18 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
             L.append("  | %s | %d / %s | %d / %s |\n"
                      % (p, c["requests"], _tok(c["hit_tokens"]), t["requests"], _tok(t["hit_tokens"])))
         L.append("")
-    L.append("**Configuration and launch parameters.** Model: the official Infernix Qwen3.8-27B "
+    L.append("**Configuration and launch parameters.** Model: the official NInfer Qwen3.8-27B "
              "NVFP4 artifact `%s`; GPU: %s; max-context %d for both arms; max-concurrency 2; "
              "`--kv-dtype int8`.\n" % (os.path.basename(MODEL), gpu_name(), ctx))
-    L.append("Launch parameters, this fork (all flags):\n\n```\n%s\n```\n" % _flag_str(treat_flags))
-    L.append("Launch parameters, upstream + Windows port (same list minus the fork-only flags "
+    L.append("Launch parameters, Infernix (all flags):\n\n```\n%s\n```\n" % _flag_str(treat_flags))
+    L.append("Launch parameters, NInfer + Windows port (same list minus the Infernix-only flags "
              "it does not support, which are dropped: %s):\n\n```\n%s\n```\n"
              % (", ".join("`%s`" % d for d in dropped), _flag_str(ctrl_flags)))
-    L.append("The upstream serve bakes an automatic 1 GiB KV headroom into `--kv-capacity auto` "
-             "that has no flag to lower (the fork's `--vram-headroom-mib 0`), so it cannot start "
+    L.append("The NInfer serve bakes an automatic 1 GiB KV headroom into `--kv-capacity auto` "
+             "that has no flag to lower (Infernix's `--vram-headroom-mib 0`), so it cannot start "
              "at the production max-context %s on this card; both arms run at the same "
              "calibrated %d so the arms stay comparable. Thinking is on for both arms "
-             "(`--default-thinking-budget` + `--preserve-thinking`; both upstream-supported).\n"
+             "(`--default-thinking-budget` + `--preserve-thinking`; both NInfer-supported).\n"
              % (BAT_MAX_CONTEXT, ctx))
     L.append("Workload: seed %d; groups replayed in order, requests within a group sent "
              "concurrently. The full rig (workload generator, runner, watchdog, control build "
@@ -546,7 +546,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
 def compute_report(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     ca, ta = ctrl["aggregates"], treat["aggregates"]
     L = []
-    L.append("# Infernix A/B: upstream + Windows fixes (control) vs. fork (treatment)\n")
+    L.append("# Infernix A/B: NInfer + Windows fixes (control) vs. Infernix (treatment)\n")
     L.append("Generated: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
     L.append("Control: %s\n" % CONTROL_EXE)
     L.append("Treatment: %s\n" % TREATMENT_EXE)
@@ -559,9 +559,9 @@ def compute_report(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     L.append("- Control flags: %s\n" % _flag_str(ctrl_flags))
     L.append("- Treatment flags: %s\n" % _flag_str(treat_flags))
     L.append("- **max-context deviation:** the production bat uses %s; both arms run at the "
-             "calibrated value %d. The upstream serve cannot start at %s on this 32 GiB card: it "
+             "calibrated value %d. The NInfer serve cannot start at %s on this 32 GiB card: it "
              "bakes an automatic KV headroom into `--kv-capacity auto` that has no flag to lower "
-             "(the fork's `--vram-headroom-mib 0`), so its minimum KV reservation plus that headroom "
+             "(Infernix's `--vram-headroom-mib 0`), so its minimum KV reservation plus that headroom "
              "exceeds the memory free after the weights. Shrinking max-context shrinks the "
              "reservation; the treatment matches the control's context so the arms stay "
              "comparable. Workload prompts are capped at ~140K tokens + output headroom so "
@@ -607,7 +607,7 @@ def _table(rows):
 def calibrate_control(ctrl_flags):
     """Probe the largest --max-context at which the CONTROL serve starts.
 
-    Upstream bakes a 1 GiB automatic KV headroom into `--kv-capacity auto` with no flag to
+    NInfer bakes a 1 GiB automatic KV headroom into `--kv-capacity auto` with no flag to
     lower it, and the minimum KV reservation grows with max-context: at the bat's 220000 the
     control needs 9.05 GiB + 1 GiB but only 8.88 GiB is free after the 21.3 GiB weights
     (see serve_control.log). A smaller context shrinks the reservation; the treatment runs at
@@ -685,7 +685,7 @@ def main():
     supported = help_flags(CONTROL_EXE) if os.path.exists(CONTROL_EXE) else set()
     ctrl_flags = [f for f in BAT_FLAGS if f[0] in supported]
     dropped = [f[0] for f in BAT_FLAGS if f[0] not in supported]
-    log("control supported %d/%d flags; dropped (unsupported by upstream): %s"
+    log("control supported %d/%d flags; dropped (unsupported by NInfer): %s"
         % (len(ctrl_flags), len(BAT_FLAGS), ", ".join(dropped)))
 
     if dry:
@@ -698,7 +698,7 @@ def main():
     failure = None
     try:
         wait_gpu_idle()
-        # Upstream cannot start at the bat's 220000 context (1 GiB default KV headroom);
+        # NInfer cannot start at the bat's 220000 context (1 GiB default KV headroom);
         # calibrate the largest workable context and apply it to both arms.
         ctx, ctrl_proc, ctrl_flags = calibrate_control(ctrl_flags)
         treat_flags = with_max_context(treat_flags, ctx)

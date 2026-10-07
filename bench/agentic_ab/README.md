@@ -1,8 +1,8 @@
-# Agentic A/B benchmark: upstream + Windows port vs this fork
+# Agentic A/B benchmark: NInfer + Windows port vs Infernix
 
 A black-box A/B benchmark of two `infernix-serve` builds serving the same model on the same GPU,
 driven by a closed-loop replay of real agentic coding traffic over the OpenAI chat-completions
-API. The fork runs its default hybrid prefix cache; an optional third arm runs the fork build with
+API. Infernix runs its default hybrid prefix cache; an optional third arm runs Infernix build with
 the original prefix cache (`--use-original-prefix-caching`). It produces a
 README-style comparison table covering:
 
@@ -85,18 +85,18 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 
 ## Fairness
 
-- **Control = upstream at the commit the fork has merged, plus only the Windows port.** A
-  control built from an older upstream would credit the fork with upstream's own newer work.
+- **Control = NInfer at the commit Infernix has merged, plus only the Windows port.** A
+  control built from an older NInfer would credit Infernix with NInfer's own newer work.
 - **Same launch configuration.** The treatment runs the deploy folder's launch bat
   (`AB_LAUNCH_BAT`, default the official-artifact launcher) plus `AB_TREATMENT_EXTRA_FLAGS`
   (default none). The control runs the same flags minus the ones its `--help` does not
   advertise.
 - **Same host RAM.** Both builds size their pinned Host tier with `--host-context-mib`, so the
   control gets the treatment's value unchanged.
-- **Same context.** Upstream keeps a fixed 1 GiB of VRAM spare under `--kv-capacity auto`, so it
+- **Same context.** NInfer keeps a fixed 1 GiB of VRAM spare under `--kv-capacity auto`, so it
   may not start at the bat's context. The runner tries the bat's value first, then 200000,
-  180000, 170000, 160000, and runs every arm at the first one the control starts with. The
-  fork's larger device KV at that context (`--vram-headroom-mib 0` and its measured CUDA Graph
+  180000, 170000, 160000, and runs every arm at the first one the control starts with.
+  Infernix's larger device KV at that context (`--vram-headroom-mib 0` and its measured CUDA Graph
   allowance) is part of what is being compared and is shown in the report header.
 
 ## Running it
@@ -106,7 +106,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 2. Build the control:
 
    ```bat
-   git worktree add -b ab/upstream-windows-port <dir>\src origin/master
+   git worktree add -b ab/ninfer-windows-port <dir>\src origin/master
    git -C <dir>\src cherry-pick <windows-port-commit>
    set AB_CONTROL_SRC=<dir>\src
    set AB_CONTROL_BUILD=<dir>\build
@@ -139,7 +139,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |
-| `AB_ALT_EXE` | the treatment executable; another build puts a second fork build in the alt arm |
+| `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
 | `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, original prefix cache") |
 | `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
 | `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | `E:\Strata\Strata` / its `strata-unsloth-ud-q4_k_xl.json` |

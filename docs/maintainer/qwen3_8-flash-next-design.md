@@ -263,7 +263,7 @@ cache large; replay at comparable capacity gives the Strata policy 0.87-0.92 (§
   There is nothing new on decode or cache policy. The ideas are folded into §9.2 and §13.
 - **chimpera/strata-nvfp4** (reported, not verified) runs Qwen3.8 NVFP4 experts with ~7,200-7,350
   slots on a 5090. It tunes the adaptive tier to every 2 rounds, decay 0.92 and 192 swaps, and
-  reports 30-40% fewer misses than upstream.
+  reports 30-40% fewer misses than Strata's.
 
 **Strata v0.1.39 (2026-10-04).** Strata was re-read at `6f32ec0`: 217 commits after `99f3dbd`,
 v0.1.39 plus the #465, #583 and #646 follow-ups. The numbers below are Strata's own, measured on its
@@ -332,7 +332,7 @@ With min_p 0 the steps launch back to back.
   - `f23ea57`: a control that changes only the prefill chunk moves teacher-forced KL by
     0.023-0.038 at 8.5K-99K tokens (V100).
 - **Unchanged:** the adaptive tier, `pcie_frac` and `DraftPolicy`. There is still no prefill CPU
-  assist upstream.
+  assist in Strata.
 
 Most of #646 removes a host handshake this design never had. The transferable mechanisms:
 - a codebook held in registers, which exposed a local-memory table in our expert kernels;
@@ -3237,7 +3237,7 @@ server, then each alone.
     40).
   - **Why C = 1 matches.** One row verifies at most 8 columns: MTP with up to 4 drafts uses at
     most 5, n-gram 8. Two rows verify 2 × W columns, so they cross into MMA.
-  - **Contract.** Upstream promises no bit-identity across verification widths
+  - **Contract.** NInfer promises no bit-identity across verification widths
     ([n-gram guide](../ngram.md)), so this is the documented behaviour, not a defect. The probe
     does not exclude other width-dependent routes (QSA verification attention, GDN record) from
     also contributing.
@@ -3410,7 +3410,7 @@ These defaults were set on 2026-10-04, before any measurement; the user may over
 |---|---|---|
 | Prefix | Host tier 4 GiB by default; `--host-context-mib` may set more, with the startup guard | 8-12 GiB for ~100K-token agentic sessions, if ≥ 16 GiB stays free after model and Vision |
 | Prefix | Zero Device snapshot slots (needs the P1 index extension) | Qwen3.5-style C + 1: ~84 frames at C = 1, ≈ 0.35 % decode |
-| Prefix | Exactness as upstream: a resume equals the capturing request's own computation, may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold-run equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included, so echo turns lose endpoint reuse |
+| Prefix | Exactness as NInfer: a resume equals the capturing request's own computation, may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold-run equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included, so echo turns lose endpoint reuse |
 | Prefix | P7 prefill CPU assist implemented, kept only if prefix M6 shows ≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged | No P7 (it changes shared offloaded-MoE Op code) |
 | Prefix | Exact Structural and Explicit taps kept even when they add a call (~1.3 s once per new preamble) | Demote them to flexible when they cost > 0.1 s |
 | Prefix | Generation-opener tap kept after endpoint resumes (~25-40 ms and 116 MB Host per turn), with a fallback counter | Drop it as Qwen3.5 does; revisit if fallbacks stay ≈ 0 |
@@ -4087,7 +4087,7 @@ M6 gate.
 | MTP edge cases (MR1-MR8) wrong, invisible at C = 1 greedy | Explicit `mtp_cells`; U3; D1 in X1, X3, X4, X10, X14, X15, X17; counters |
 | Cross-stream races (COW source, copy-outs, restores) | Host-only COW sources straight into the private page per layer; ticketed events; `layer_waits[1]`; `delay_streams` (X14, X16); sanitizer |
 | Copy-engine FIFO stalls (restores ahead of inputs, bulk D2H ahead of readbacks) | Submission order; transfer-stream order; M0 → `download_pinned` or pacing; M4 |
-| Cached ≠ uncached at near-ties (E4) surprises users | Upstream contract, documented; `--no-prefix-reuse` |
+| Cached ≠ uncached at near-ties (E4) surprises users | NInfer's contract, documented; `--no-prefix-reuse` |
 | Whole-extent reservations evict other conversations' Device blocks | Host-backed (~20 ms per 30K); lease windows deferred |
 | P7 gains less than predicted (DRAM contention) | M6 gate; P7 is independent of P0-P6 |
 | The opener after endpoint resumes costs ~30 ms per agentic turn for nothing if echoes are always exact | Counter; drop later if M1/M7 show ≈ 0 fallbacks |
@@ -4099,7 +4099,7 @@ M6 gate.
 |---|---|---|
 | Host tier size | **4 GiB**, more by `--host-context-mib` | 8-12 GiB for ~100K-token agentic sessions if ≥ 16 GiB stays free after model and Vision |
 | Device snapshot slots | **0** (frame-free; needs P1) | `C + 1` as Qwen3.5 (~84 frames ≈ 0.35 % decode) |
-| Exactness contract | **As upstream** (E1-E6): a resume equals the capturing request's own computation and may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included (echo turns lose endpoint reuse) |
+| Exactness contract | **As NInfer** (E1-E6): a resume equals the capturing request's own computation and may differ from an uncached run at near-ties; `--no-prefix-reuse` for strict reproducibility | Cold equality: resume only from grid-aligned flexible taps of cold pure-prefill lineages with no exact tap before F (E3) and refuse every other resume, endpoints and exact taps included (echo turns lose endpoint reuse) |
 | P7 prefill CPU assist (shared offloaded-MoE Op change) | **Implemented, kept only if M6 passes** (≥ 10 % TTFT gain for 64-1,024-token suffixes, no regression ≥ 2,048, tg512 unchanged): it is the main post-hit lever and also speeds short cold prompts | No P7 (it changes shared offloaded-MoE Op code) |
 | Exact Structural/Explicit taps that add a call (~1.3 s once per new preamble) | **Kept** | Demote when Δ > 0.1 s |
 | Generation opener after endpoint resumes | **Kept**: ~25-40 ms + 116 MB Host per turn; it rescues echoes that diverge inside the generated turn, saving the tool result's re-prefill; break-even ~1-3 % mismatches for 1-3K-token results (estimated); each snapshot records `lineage_echo`, and an admission that resumes from an opener snapshot with `lineage_echo` set counts `endpoint_mismatch_fallbacks` (reported by M1 and M7) | Drop as Qwen3.5 does (`hybrid_program.cpp:986-996`, a ~15 ms split on 27B), or later for echo lineages if fallbacks stay ≈ 0 |
@@ -6459,7 +6459,7 @@ Already planned and confirmed by Strata, no change:
 
 Unchanged by Strata:
 - n-gram S4a (mailbox), kept parked on its trigger.
-- Prefix P7 (CPU assist): upstream Strata still has none.
+- Prefix P7 (CPU assist): Strata still has none.
 - Q8 Phase 1b. Strata's two-kernel HC read measured −4 to −6 % on an Intel B70, but its
   column-sliced GR down measured +7.8 % on the same card, so M1 decides the form.
 
@@ -8695,11 +8695,11 @@ so the normalization's FMA contraction differs per instance), and end to end it 
 noise (tg8k plain +2.4 % on the erratic unthrottled baseline, serve −0.3 to −1.1 %). Not worth a
 change of output.
 
-### 19.3.20 Upstream dev's tuned 2560-wide Linear routes (2026-10-07)
+### 19.3.20 NInfer dev's tuned 2560-wide Linear routes (2026-10-07)
 
-Upstream dev (`35e9b5c85..070fa61a3`) tuned Q8 and BF16 routes for the Flash-Next shapes. Op level
+NInfer dev (`35e9b5c85..070fa61a3`) tuned Q8 and BF16 routes for the Flash-Next shapes. Op level
 (RTX 5090, cold L2, CUDA Graph, two ABBA rounds; `fn/rigs/item7`) on the four production
-`ops::linear` problems, upstream against Gold:
+`ops::linear` problems, NInfer against Gold:
 
 | Problem | T = 1-8 | T = 9-64 | T = 4096 |
 |---|---|---|---|
@@ -8708,13 +8708,13 @@ Upstream dev (`35e9b5c85..070fa61a3`) tuned Q8 and BF16 routes for the Flash-Nex
 | BF16 96×2560 (GDN a/b) | −27 to −46 % | −26 to −44 % | +44 % |
 | BF16 13952×2560 (QSA group) | 0 to −4.5 % | about 0 | +3.6 % |
 
-**Exactness** (full outputs per width): upstream's routes are not Gold's bits, and upstream itself
+**Exactness** (full outputs per width): NInfer's routes are not Gold's bits, and NInfer itself
 runs a GEMV at T = 1 and split-K kernels from T = 2, so its T = 1 column differs from the same
 column at T = 2-8 (Gold's classes are {1..8} and {9..}). Two variants were built on Gold's
 schedules (TEMP `INFERNIX_TMP_UP7`):
-- **a**: one upstream family over T = 1..8, Gold above; Gold's width classes kept; bits differ at
+- **a**: one NInfer family over T = 1..8, Gold above; Gold's width classes kept; bits differ at
   T ≤ 8 in a few outputs per thousand (at most 5 BF16 steps);
-- **b**: upstream's selector to T = 128 (T = 1 on its T = 2 kernel).
+- **b**: NInfer's selector to T = 128 (T = 1 on its T = 2 kernel).
 
 **End to end** (dense8m, int8 KV, process exempt from power throttling, 3 rotated reps):
 
@@ -8734,7 +8734,7 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
   against 4.712), so these runs cannot resolve a quality change of this size. Prefix-cache,
   preemption and decide real tests pass under both variants.
 - **Not adopted**: about 1 % of engine speed for a change of output that cannot be shown harmless.
-- **BF16 96×2560 at T ≤ 8 alone: not adopted either.** Upstream's SIMT schedule (8-row blocks,
+- **BF16 96×2560 at T ≤ 8 alone: not adopted either.** NInfer's SIMT schedule (8-row blocks,
   4.6-5.2 µs instead of 6.8-8.8 µs) matched the skinny GEMV bit for bit on the bench's synthetic
   inputs at every T = 1..8, but not on the model's activations: with it alone, greedy prose2k
   diverged from Gold (deterministically, three runs) and the prefix-cache real test's restored
@@ -8744,7 +8744,7 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
-Gold-Star-Infer 5fbfc3dbe. That branch carries upstream's continuation/checkpoint Engine:
+Gold-Star-Infer 5fbfc3dbe. That branch carries NInfer's continuation/checkpoint Engine:
 resource-pressure preemption with Snapshot/Replay recovery, unit reservations, and a two-step
 admission. Only the final commit of the port builds; the replayed commits in between do not
 compile on their own, because the new contract changed the Program surface under them.

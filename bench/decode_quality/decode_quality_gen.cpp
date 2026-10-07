@@ -3,9 +3,9 @@
 // optimized proposal head, INT8 KV, CUDA Graph decode. infernix_decode_quality_judge scores the
 // output of any number of builds against one 16-bit-activation reference.
 //
-// This file uses only Engine API that upstream NInfer also has, so the same source builds in an
-// upstream checkout (define INFERNIX_DECODE_QUALITY_UPSTREAM there: it drops n-gram drafting, which
-// upstream lacks). That is how bench/README.md compares this fork's decode with upstream's.
+// This file uses only Engine API that NInfer also has, so the same source builds in an
+// NInfer checkout (define INFERNIX_DECODE_QUALITY_NINFER there: it drops n-gram drafting, which
+// NInfer lacks). That is how bench/README.md compares Infernix's decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
 //                                  <new_tokens> [ngram]
@@ -51,8 +51,8 @@ int main(int argc, char** argv) {
         options.context_cache.device_state_slots  = 0;
         options.context_cache.host_capacity_bytes = 0;
         if (ngram) {
-#if defined(INFERNIX_DECODE_QUALITY_UPSTREAM)
-            std::cerr << "n-gram drafting is not available upstream\n";
+#if defined(INFERNIX_DECODE_QUALITY_NINFER)
+            std::cerr << "n-gram drafting is not available NInfer\n";
             return 2;
 #else
             // infernix-serve's production n-gram settings.

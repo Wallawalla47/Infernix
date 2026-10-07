@@ -510,7 +510,7 @@ def headline(arms, ms):
 
 
 def each(arms, value, fmt=lambda v: v):
-    """`upstream 1.2, fork 3.4, fork + original cache 5.6`, for the notes."""
+    """`ninfer 1.2, infernix 3.4, infernix original-cache 5.6`, for the notes."""
     return ", ".join("%s %s" % (SHORT[a].lower(), fmt(value(a))) for a in arms)
 
 
@@ -803,7 +803,7 @@ def main(argv):
     L.append("## Launch parameters\n")
     for a in arms:
         if a == "control":
-            L.append("%s (fork-only flags dropped: %s):\n\n```text\n%s\n```\n"
+            L.append("%s (Infernix-only flags dropped: %s):\n\n```text\n%s\n```\n"
                      % (LABEL[a], ", ".join("`%s`" % d for d in cfg.get("dropped_for_control", [])),
                         flag_str(cfg.get("control_flags", []))))
         else:
