@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`)
 
-Infernix runs the NVFP4 checkpoint of Qwen3.8-Flash-Next
-([RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4),
-routed experts quantized with NVIDIA Model Optimizer) on one RTX 5090 (32 GB). The 24,576
+Infernix runs NVIDIA's NVFP4 checkpoint of Qwen3.8-Flash-Next
+([nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)) on one
+RTX 5090 (32 GB). The 24,576
 routed experts (63 GiB) live in pinned host RAM. A VRAM expert cache holds the hot ones, and the
 CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an NVMe volume. The
 design, measurements and open work are in the
@@ -36,18 +36,24 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 
 ## Convert
 
-Recipe B is recommended. It is recipe A, which imports every checkpoint tensor bit-exactly, with the
-BF16 dense projections and `lm_head` stored in `q8_g32_fp16`. Its measured quality cost is
-+0.008 ± 0.010 nats (not significant), and it decodes ~22 % faster. Its MTP drafter is stored in
+Recipe B is recommended. It is recipe A, which imports NVIDIA's NVFP4 experts and the FP8 n-gram
+table bit-exactly and keeps the BF16 tensors BF16, with the dense projections and `lm_head` stored
+in `q8_g32_fp16`. Its quality cost against recipe A was +0.008 ± 0.010 nats (not significant),
+measured on a checkpoint with the same BF16 dense weights but other expert calibration
+(`RadixArk/Qwen3.8-Flash-Next-NVFP4`), and it decodes ~22 % faster. Its MTP drafter is stored in
 `q8_g32_fp16` with `q4_g64_fp16` routed experts. The drafter only proposes tokens, so its
 precision changes speed, never output. `--proposal` adds the smaller draft head that
 `--lm-head-draft` uses.
 
 ```text
-python -m tools.convert --model <Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_flash_next_nvfp4_dense8 \
-  --components text,vision,mtp --proposal --device cpu --out <dir>/qwen3_8_flash_next_nvfp4_dense8.infernix \
-  --ngram-out <nvme>/qwen3_8_flash_next.ngram
+python -m tools.convert --model <nvidia/Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_flash_next_nvfp4_dense8 \
+  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix \
+  --out <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix --ngram-out <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix --numbered
 ```
+
+The second command names the three files as numbered parts
+(`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix` and so on); Infernix opens part 1.
 
 - **Recipe A.** Use `--recipe qwen3_8_flash_next_nvfp4` instead.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
@@ -242,6 +248,11 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 RTX 5090 on PCIe Gen5 x8, i9-13900K, DDR5-5800, recipe B, INT8 KV, one request. The expert cache
 warms up over the first few hundred tokens of a session.
 
+The speed figures in this guide were measured before 2026-10-07 on an artifact converted from
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` instead of NVIDIA's checkpoint. Re-measured on NVIDIA's, the
+README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
+[README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata) are the current figures.
+
 | Workload | tok/s |
 |---|---:|
 | `infernix_bench` tg512, `--spec mtp --draft-tokens 4 --lm-head-draft` (warm cache) | ~134 |
@@ -261,4 +272,5 @@ length follows the measured acceptance, so prose mostly drafts one token and sta
 fast as plain decode (design §19.2).
 
 **Quality.** Teacher-forced perplexity over three frozen texts (2,557 positions, INT8 KV): recipe
-A 4.564, recipe B 4.600. For comparison, Strata with UD-Q4_K_XL and INT8 KV gives 4.864.
+B 4.664. For comparison, Strata 0.1.40 with UD-Q4_K_XL and INT8 KV gives 4.844 on the same token ids
+(−0.038 ± 0.011 nats for Infernix; level on code and documents, better on chat).

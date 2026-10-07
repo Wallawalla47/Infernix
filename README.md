@@ -23,15 +23,15 @@ Infernix keeps the experts in pinned system RAM, caches the hot ones in VRAM, co
 each layer's cache misses on the CPU while the rest cross PCIe, and streams the 52 GB per-layer
 n-gram embedding table from an NVMe drive.
 
-- **Faster than Strata** on the same RTX 5090, both with the model's MTP drafter: 4.7-6.4× sooner
-  to the first token and 1.7-1.8× the decode speed from 8K to 250K tokens of context, and in a
-  replayed agentic coding workload under a quarter of Strata's average time to first token (5.5 s
+- **Faster than Strata** on the same RTX 5090, both with the model's MTP drafter: 4.6-6.4× sooner
+  to the first token and 1.6-1.8× the decode speed from 8K to 250K tokens of context, and in a
+  replayed agentic coding workload under a quarter of Strata's average time to first token (5.4 s
   against 25.3 s) and less than half its wall time
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata)).
-- **Quality at least Strata's**: teacher-forced perplexity 4.600 against Strata's 4.864 on the same
+- **Quality at least Strata's**: teacher-forced perplexity 4.664 against Strata's 4.844 on the same
   texts (lower is better); every optimisation was held to that bar.
 - **Long context**: 262K tokens natively, up to 1M with YaRN (`--rope-yarn-factor`); a 250K-token
-  prompt prefills at ~7.4K tok/s (34 s), and decoding with MTP stayed at 134-174 tok/s from 8K to
+  prompt prefills at ~7.3K tok/s (34 s), and decoding with MTP stayed at 136-164 tok/s from 8K to
   250K tokens.
 - **Every KV format** (`int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`), images and video,
   the hybrid prefix cache, concurrent requests with resource-pressure preemption, an SSD expert
@@ -59,7 +59,7 @@ Setup, conversion and tuning: [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next
 
 ## Benchmarks
 
-Measured on 7 October 2026 on one machine: an RTX 5090 (32 GB, driver 617.14) in a **PCIe Gen5
+Measured on 7-8 October 2026 on one machine: an RTX 5090 (32 GB, driver 617.14) in a **PCIe Gen5
 x8** link, a Core i9-13900K, 96 GB of DDR5-5800, Samsung 990 PRO NVMe drives and Windows 11. The
 card runs at x8 in this machine; at Gen5 x16 absolute speeds are likely to be higher, most of all
 for Qwen3.8-Flash-Next, whose expert-cache misses cross PCIe on every token.
@@ -86,6 +86,10 @@ by the same client, so all engines are measured the same way.
     (and each setting) writes slightly different text, so single-prompt decode figures move by up
     to ±20 %. Tokens per round and rounds/s show which of the two moved; the agentic replay
     measures decode over hundreds of outputs.
+  - Qwen3.8-Flash-Next servers start from a saved expert-cache state, as Infernix does in normal
+    use after its first session (`<artifact>.expert-state`, here written by an earlier session on
+    unrelated Wikipedia text). Started cold instead, Infernix measured within 0.5 % on the
+    context-length test.
 - **Agentic replay** ([`bench/agentic_ab`](bench/agentic_ab/README.md)). Three interleaved
   coding-agent sessions plus eleven subagents: 130 requests per run with 25K-135K-token prompts,
   tool calls, compactions, retries and aborted requests, sampled at temperature 1.0, closed loop
@@ -110,8 +114,8 @@ by the same client, so all engines are measured the same way.
 
 | | Infernix | Strata |
 |---|---|---|
-| Version | branch `Infernix` at `cc76e684` | 0.1.40 (release engine; server `82f46a8`, 0.1.40.1) |
-| Model | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) (NVFP4 experts quantized with NVIDIA Model Optimizer) converted with recipe B: the NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVFP4-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
+| Version | branch `Infernix` at `3b35ccf9` (artifact converted at `e3be72cd`) | 0.1.40 (release engine; server `82f46a8`, 0.1.40.1) |
+| Model | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) converted with recipe B: NVIDIA's NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
 | KV cache and context | INT8, 262,144 tokens | INT8, 262,144 tokens (32,768 cells per layer resident in VRAM) |
 | Speculation | MTP, `--draft-tokens 4 --lm-head-draft` | MTP, `--spec 4 --spec-min-p 0.70` |
 | Other settings | n-gram volume on NVMe, `--prefill-chunk 4096` | `--expert-cache auto --prefill auto --resident-budget-gib 68 --pool-workers 15 --pcie-frac 0.00` |
@@ -121,15 +125,30 @@ Strata runs with its configuration on this machine (`strata-unsloth-ud-q4_k_xl.j
 engines run with MTP: Strata refuses to start this model pack without speculation (`--spec` 2 or
 more).
 
+**Model size.** Average bits per weight of the text decoder, the part both files contain (176.9
+billion weights each; scales counted; vision and the MTP drafter left out because the GGUF holds
+neither):
+
+| | Routed experts | Dense and other | PLE n-gram table | All | Without the n-gram table |
+|---|---:|---:|---:|---:|---:|
+| Infernix artifact + n-gram volume | 4.50 | 10.34 | 8.19 | 5.73 | 4.73 |
+| `nvidia/Qwen3.8-Flash-Next-NVFP4` (source) | 4.50 | 16.00 | 8.00 | 5.83 | 4.95 |
+| Unsloth UD-Q4_K_XL (Strata) | 5.10 | 8.90 | 4.50 | 5.03 | 5.25 |
+
+Infernix keeps NVIDIA's 4.5-bit experts and 8-bit n-gram table unchanged (the 8.19 includes the
+volume's 4 KiB block padding) and stores the dense projections at 8.5 bits. The GGUF spends more
+on the experts (Q4_K/Q5_K gate and up, Q5_1/Q8_0 down) and much less on the n-gram table (IQ4_NL),
+which makes the whole file smaller.
+
 **Context length** (one request at a time):
 
 | Context | Engine | TTFT (s) | Prefill tok/s | Decode tok/s | Tokens per round | Rounds/s |
 |---|---|---:|---:|---:|---:|---:|
-| ~8K | Infernix | **1.92** (1.92-1.92) | **4,208** | **142.9** (135.8-146.7) | **2.24** | **65.1** |
+| ~8K | Infernix | **1.93** (1.92-1.93) | **4,192** | **138.8** (138.0-139.9) | **2.03** | **68.7** |
 | ~8K | Strata | 12.28 (11.30-13.38) | 661 | 86.4 (83.4-90.3) | 1.94 | 44.9 |
-| ~128K | Infernix | **17.84** (17.82-17.87) | **7,179** | **138.4** (133.7-143.2) | **2.59** | **54.2** |
+| ~128K | Infernix | **17.86** (17.84-17.87) | **7,174** | **136.2** (135.8-136.7) | **2.66** | **51.5** |
 | ~128K | Strata | 103.27 (95.54-110.99) | 1,247 | 77.2 (74.0-80.3) | 2.27 | 34.2 |
-| ~250K | Infernix | **33.87** (33.40-34.34) | **7,387** | **159.9** (146.0-173.7) | **3.37** | **48.3** |
+| ~250K | Infernix | **34.24** (34.03-34.45) | **7,306** | **153.3** (142.6-164.1) | **3.13** | **49.7** |
 | ~250K | Strata | 158.07 (136.53-179.60) | 1,612 | 95.8 (86.0-105.7) | 2.89 | 33.2 |
 
 **Follow-ups:**
@@ -137,8 +156,8 @@ more).
 | Follow-up | Infernix: cached / prompt tokens | Infernix TTFT (s) | Strata: cached / prompt tokens | Strata TTFT (s) |
 |---|---:|---:|---:|---:|
 | F1, newest ~250K conversation | 251,180 / 251,213 (99.99 %) | **0.25** | 250,136 / 250,163 (99.99 %) | 1.13 |
-| F2, earlier 128K conversation | 0 / 129,147 | **17.77** | 0 / 128,111 | 99.12 |
-| F3, earlier 8K conversation | 0 / 9,135 | **2.08** | 0 / 8,101 | 11.44 |
+| F2, earlier 128K conversation | 0 / 129,147 | **17.79** | 0 / 128,111 | 99.12 |
+| F3, earlier 8K conversation | 0 / 9,135 | **2.09** | 0 / 8,101 | 11.44 |
 
 Neither engine kept the two older conversations: Strata keeps one conversation by default, and
 Infernix's default 8 GiB host cache had been filled by the two 250K contexts after them. The
@@ -151,40 +170,40 @@ seeds):
 
 | Metric | Strata | Infernix | Change |
 |---|---:|---:|---:|
-| Average time to first token (s) | 25.3 (24.5-26.2) | **5.5** (5.5-5.5) | −78.3 % |
-| Median time to first token (s) | 16.50 (15.80-17.20) | **2.52** (2.26-2.79) | −84.6 % |
-| 90th-percentile time to first token (s) | 59.4 (58.7-60.1) | **12.5** (12.3-12.7) | −79.0 % |
-| Average TTFT, turns that continue a conversation (s) | 24.82 (24.54-25.09) | **5.55** (5.38-5.72) | −77.6 % |
-| Average TTFT, new long prompts (s) | 37.2 (37.1-37.3) | **9.5** (8.9-10.1) | −74.4 % |
-| Prompt tokens served from cache | 64.3 % (59.1-69.5) | **84.5 %** (84.1-84.8) | +20.2 points |
-| Prompt tokens prefilled | 932K (796K-1,067K) | **415K** (411K-420K) | −54.4 % |
+| Average time to first token (s) | 25.3 (24.5-26.2) | **5.4** (4.6-6.2) | −78.5 % |
+| Median time to first token (s) | 16.50 (15.80-17.20) | **2.55** (2.23-2.88) | −84.6 % |
+| 90th-percentile time to first token (s) | 59.4 (58.7-60.1) | **13.0** (10.4-15.5) | −78.2 % |
+| Average TTFT, turns that continue a conversation (s) | 24.82 (24.54-25.09) | **4.87** (3.94-5.80) | −80.3 % |
+| Average TTFT, new long prompts (s) | 37.2 (37.1-37.3) | **14.5** (12.4-16.7) | −60.9 % |
+| Prompt tokens served from cache | 64.3 % (59.1-69.5) | **83.7 %** (83.2-84.1) | +19.4 points |
+| Prompt tokens prefilled | 932K (796K-1,067K) | **436K** (419K-453K) | −52.4 % |
 | Main-session turns that re-prefilled the whole prompt (of 41) | 8 (6-10) | **0** | −8 |
-| Prefill tok/s, requests with no cache hit | 1,467 (1,460-1,473) | **5,983** (5,944-6,023) | 4.1× |
-| Output tok/s, one request decoding | 86 (85-87) | **128** (127-129) | +49.4 % |
-| Output tok/s, two requests decoding (combined) | (one at a time) | 164 (162-166) | |
-| Output tok/s, at the run's own batching | 86 (85-87) | **147** (146-148) | +71.2 % |
-| Decode rounds/s, one request (engine speed) | 40.5 (40.2-40.9) | **66.3** (65.7-67.0) | +63.7 % |
-| Tokens per round, one request (draft acceptance) | **2.12** | 1.93 (1.93-1.94) | −8.7 % |
-| Workload wall time (min) | 18.3 (17.6-19.0) | **8.1** (8.0-8.3) | −55.4 % |
+| Prefill tok/s, requests with no cache hit | 1,494 (1,460-1,527) | **5,830** (5,646-6,015) | 3.9× |
+| Output tok/s, one request decoding | 86 (85-87) | **129** (127-130) | +49.8 % |
+| Output tok/s, two requests decoding (combined) | (one at a time) | 167 (164-170) | |
+| Output tok/s, at the run's own batching | 86 (85-87) | **146** (143-149) | +69.8 % |
+| Decode rounds/s, one request (engine speed) | 40.5 (40.2-40.9) | **64.9** (64.7-65.2) | +60.2 % |
+| Tokens per round, one request (draft acceptance) | **2.12** | 1.98 (1.95-2.01) | −6.5 % |
+| Workload wall time (min) | 18.3 (17.6-19.0) | **8.1** (7.9-8.3) | −55.8 % |
 
-Strata's columns come from its runs of the same two seeds a few hours earlier (same Strata, same
-workload); Infernix's were rerun on `cc76e684`. Infernix wrote more in both runs (46.1K and 49.0K
-output tokens against Strata's 35.8K and 31.3K) and still finished in less than half the time.
+Strata's columns come from its runs of the same two seeds on 7 October (same Strata, same
+workload); Infernix's were run on `3b35ccf9` with the NVIDIA-source artifact. Infernix wrote more in
+both runs (45.6K and 45.2K output tokens against Strata's 35.8K and 31.3K) and still finished in
+less than half the time.
 
-Strata's drafts are still accepted a little more often (2.12 against 1.93 tokens per round);
-Infernix decodes faster because each round takes about 40 % less time. The difference is which
+Strata's drafts are still accepted a little more often (2.12 against 1.98 tokens per round);
+Infernix decodes faster because each round takes nearly 40 % less time. The difference is which
 drafts each engine offers, not output quality: both verify every draft, and on the same texts
-Infernix's perplexity is 4.600 against Strata's 4.864. Strata offers a draft only while its draft
+Infernix's perplexity is 4.664 against Strata's 4.844. Strata offers a draft only while its draft
 layer is at least 70 % sure of it; Infernix cuts a single request's drafts at the first below
 50 %, and two requests decoding together now draft for both with one shared length (output
 unchanged either way; see the Flash-Next guide's `--max-concurrency`).
 
-Against the earlier Infernix replay on `c9ee0445`/`9061adb8`, before those two changes: average
-TTFT 6.3 → 5.5 s, one request 123 → 128 tok/s, two requests together 151 → 164 tok/s, tokens per
-round 1.75 → 1.93, wall time 8.4 → 8.1 min. One request's rounds/s fell from 70.4 to 66.3 (−6 %)
-and, in the context-length test, by 2-3 % at 8K and 128K (unchanged at 250K). The cut shortens
-rounds rather than lengthening them, so this is either the draft head's added log-probability
-pass or a difference in the generated text; these runs do not separate the two.
+Earlier versions of these tables were measured on an artifact converted by mistake from
+`RadixArk/Qwen3.8-Flash-Next-NVFP4`, another Model Optimizer quantization of the same model with
+its own expert calibration. NVIDIA's checkpoint measured within a few per cent of it on speed
+(context-length decode 1.6-4.1 % lower, agentic replay level) and slightly higher perplexity (4.664
+against 4.600, both below Strata's).
 
 The agentic replay found two crashes, both fixed on the `Infernix` branch: `c9ee0445` (a long
 prompt's layer walk outlived the prefix-cache events it waited on) and `9061adb8` (with the SSD
@@ -302,7 +321,7 @@ infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 
 For Qwen3.8-Flash-Next, see the [Flash-Next guide](docs/qwen3_8-flash-next.md#run):
 
 ```bat
-infernix-serve.exe qwen3_8_flash_next_nvfp4_dense8.infernix --ngram-volume qwen3_8_flash_next.ngram --kv-dtype int8 --max-context 65536 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft
+infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 65536 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft
 ```
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts, and
@@ -339,9 +358,9 @@ the Linux filesystem first (reads through `/mnt/` are slow).
 - **[Qwen3.8-27B-Quasar-NinferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NinferV3)**:
   [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4),
   the QAT-trained NVFP4 checkpoint, with the same draft model and proposal head.
-- **[Qwen3.8-Flash-Next-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVFP4-Infernix)**
-  (`.infernix`): [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4)
-  converted with recipe B (its NVFP4 experts bit-exact, Q8 dense projections), with the MTP
+- **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)**
+  (`.infernix`): [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
+  converted with recipe B (NVIDIA's NVFP4 experts bit-exact, Q8 dense projections), with the MTP
   drafter and a proposal head for `--lm-head-draft`; the 52 GB n-gram volume is built from the same
   checkpoint (see the [Flash-Next guide](docs/qwen3_8-flash-next.md#convert)).
 
