@@ -50,6 +50,7 @@ enum SlotPin : std::uint8_t {
     kPinD2H      = 1U << 2, // an in-flight demotion writes it
     kPinUse      = 1U << 3, // a landing read by the current round
     kPinPrefetch = 1U << 4, // a prefetch read in flight
+    kPinStream   = 1U << 5, // a prefill expert stream copies its record
 };
 
 // The list a non-resident slot belongs to.
@@ -138,6 +139,15 @@ public:
     }
     void prefetch_ended(std::uint32_t slot) { slots_[slot].pins &= static_cast<std::uint8_t>(~kPinPrefetch); }
 
+    // ---- prefill expert stream
+    // The stream will copy `key`'s host record (resident or shadow): its slot keeps the record until
+    // release_stream_pins, which the engine calls at a boundary after the stream's copies landed. The
+    // stream plans a chunk's copies at its start and enqueues them layer by layer, across boundaries
+    // in a layer walk, so an admission must not evict or rewrite a planned record. A key without a
+    // host copy is not planned and is ignored here.
+    void stream_pin(std::uint32_t key);
+    void release_stream_pins();
+
     // ---- VRAM interplay (design §4.8)
     void queued(std::uint32_t key);             // T8
     void unqueued(std::uint32_t key);           // T9
@@ -195,6 +205,7 @@ private:
     std::vector<std::uint32_t> free_resident_; // free slots of the resident partition
     std::vector<std::uint32_t> ring_, prefetch_, demotion_;
     std::vector<std::uint32_t> used_; // slots holding a Use pin
+    std::vector<std::uint32_t> streamed_; // slots holding a Stream pin
     std::vector<HeapEntry> heap_[2];
     std::vector<std::uint8_t> dirty_mark_;
     std::vector<std::uint32_t> dirty_;
