@@ -8582,6 +8582,96 @@ rotations.
   - Against 245,760 tokens at `--max-context 262144` without YaRN (8.2K, 73.7, 87.9), these numbers
     follow the length. The YaRN index rotation's own cost was not measured at equal length.
 
+### 19.3.19 Host threads: power throttling, not placement (2026-10-07)
+
+**Question.** Strata pins its host thread away from CPU 0, where Windows delivers the GPU's
+interrupts (`--host-core last`, from eddoursul's fork), and the CPU leg of a decode miss ends
+30-50 µs after the PCIe leg (§19.3.16). Gold left its CPU expert threads unpinned.
+
+**Placement A/B, round 1** (i9-13900K: 8 P-cores with two threads each and 16 E-cores; dense8m,
+int8 KV; rig `fn/rigs/split/place`; arms rotated over 3 reps; outputs identical in every arm):
+the service thread and five workers unpinned, on dedicated P-cores away from CPU 0
+(`dedicated`), or with the service thread on CPU 0 (`waiter`). `dedicated` doubled tg8k (plain
+46.1 → 93.7 tok/s, MTP 72.3 → 132.2) but cost 0.7-4.1 % in serving. Unpinned runs were erratic
+(36.6-62.7 tok/s plain) and far below this design's earlier measurements, and putting the
+waiting thread on the interrupt core was as good or better (CLI MTP +57 % against +36 %), so the
+interrupt-core hypothesis does not hold here.
+
+**Cause.** The rigs run without a visible window. Windows power throttling
+(EcoQoS) treats such a process as background: lower clocks, threads steered to E-cores. Pinning
+only hid it for the pinned threads.
+
+**Round 2** (`fn/rigs/split/place2`, every arm but `none` exempt from execution-speed throttling):
+
+| Workload | none | exempt | exempt + P-core set | exempt + dedicated | exempt + waiter |
+|---|---:|---:|---:|---:|---:|
+| tg8k plain | 37.6 | 98.7 | 98.6 | 95.2 | 94.0 |
+| tg8k MTP | 63.8 | 135.6 | 136.1 | 130.9 | 132.1 |
+| CLI code MTP | 80.7 | 140.3 | 140.9 | 134.1 | 133.5 |
+| serve C = 2 MTP, warm | 63.4 | 107.1 | 107.8 | 103.2 | 104.9 |
+| serve C = 4 plain, warm | 81.9 | 143.7 | 143.3 | 138.2 | 138.8 |
+
+- **The exemption is the whole gain** (+69-162 %); a P-core affinity set adds nothing measurable
+  and pinning each thread to one core costs 3-4 %.
+- **Kept:** `core/power_throttling` exempts the process once, when an Engine is constructed
+  (Windows; a no-op elsewhere). No placement code is kept.
+- A server in a foreground console was not measured; whether it is throttled depends on Windows'
+  foreground heuristics, so the exemption also protects a console left in the background.
+
+**Fused per-head RMSNorm + RoPE in QSA attention (Strata #783 PR-f): rejected.** The Qwen3.5 text
+form of `ops::rmsnorm_rope` was extended to (24,2) heads, M-RoPE positions and the generic and
+YaRN coefficient routes. It was not bit-identical to the split route for the generic and
+prepared coefficient instances (rare single-element differences; the rotation's SASS matched,
+so the normalization's FMA contraction differs per instance), and end to end it measured within
+noise (tg8k plain +2.4 % on the erratic unthrottled baseline, serve −0.3 to −1.1 %). Not worth a
+change of output.
+
+### 19.3.20 Upstream dev's tuned 2560-wide Linear routes (2026-10-07)
+
+Upstream dev (`35e9b5c85..070fa61a3`) tuned Q8 and BF16 routes for the Flash-Next shapes. Op level
+(RTX 5090, cold L2, CUDA Graph, two ABBA rounds; `fn/rigs/item7`) on the four production
+`ops::linear` problems, upstream against Gold:
+
+| Problem | T = 1-8 | T = 9-64 | T = 4096 |
+|---|---|---|---|
+| Q8 2560×6144 (GDN and QSA output) | −10 to −41 % | −45 to −75 % | +0.1 % |
+| Q8 16384×2560 (GDN q/k/v/z) | −6.5 to −33 % | −8 to −36 % | −4.5 % |
+| BF16 96×2560 (GDN a/b) | −27 to −46 % | −26 to −44 % | +44 % |
+| BF16 13952×2560 (QSA group) | 0 to −4.5 % | about 0 | +3.6 % |
+
+**Exactness** (full outputs per width): upstream's routes are not Gold's bits, and upstream itself
+runs a GEMV at T = 1 and split-K kernels from T = 2, so its T = 1 column differs from the same
+column at T = 2-8 (Gold's classes are {1..8} and {9..}). Two variants were built on Gold's
+schedules (TEMP `NINFER_TMP_UP7`):
+- **a**: one upstream family over T = 1..8, Gold above; Gold's width classes kept; bits differ at
+  T ≤ 8 in a few outputs per thousand (at most 5 BF16 steps);
+- **b**: upstream's selector to T = 128 (T = 1 on its T = 2 kernel).
+
+**End to end** (dense8m, int8 KV, process exempt from power throttling, 3 rotated reps):
+
+| Workload | Gold | a | b |
+|---|---:|---:|---:|
+| tg8k plain | 98.94 | 99.82 (+0.9 %) | 99.80 (+0.9 %) |
+| tg8k MTP | 136.64 | 160.18 (+17.2 %) | 160.17 (+17.2 %) |
+| serve C = 2 MTP, fill / warm | 86.94 / 108.28 | −0.8 % / +0.8 % | −0.5 % / −0.4 % |
+| serve C = 4 plain, fill / warm | 110.24 / 143.86 | −0.8 % / +0.8 % | −0.9 % / −0.8 % |
+
+- The tg8k MTP gain is the text, not the engine: the changed bits change the bench's generated
+  text, and its MTP acceptance rose from 0.665 to 0.800. Plain decode (+0.9 %) is the engine's
+  gain; serving over 24 prompts is within ±0.9 %.
+- Quality (teacher-forced code/doc/chat at `--chunk 8` and `--chunk 32`, which run the decode-width
+  routes): KL to Gold 0.055-0.063 with dNLL −0.014 ± 0.009 to +0.048 ± 0.011, its sign flipping
+  between texts and chunk widths. Gold's own two chunk widths differ by as much (perplexity 4.558
+  against 4.712), so these runs cannot resolve a quality change of this size. Prefix-cache,
+  preemption and decide real tests pass under both variants.
+- **Not adopted**: about 1 % of engine speed for a change of output that cannot be shown harmless.
+- **BF16 96×2560 at T ≤ 8 alone: not adopted either.** Upstream's SIMT schedule (8-row blocks,
+  4.6-5.2 µs instead of 6.8-8.8 µs) matched the skinny GEMV bit for bit on the bench's synthetic
+  inputs at every T = 1..8, but not on the model's activations: with it alone, greedy prose2k
+  diverged from Gold (deterministically, three runs) and the prefix-cache real test's restored
+  resume differed from the original turn at token 30. Synthetic-input equality is not evidence of
+  bit-exactness for a different reduction order.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
