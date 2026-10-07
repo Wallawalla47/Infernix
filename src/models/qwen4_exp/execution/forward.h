@@ -197,6 +197,9 @@ struct MtpCall {
     // draft head's argmax token of each column.
     Tensor residual_out; // BF16 [S*H, T]
     Tensor drafts;       // I32 [T]
+    // Optional: each draft's log-probability under the draft head (FP32 [1, T]), the confidence
+    // a draft-length cut reads.
+    Tensor draft_logprobs;
     // Cells whose next token is an image token take its visual embedding (prompt cells only).
     const VisionInput* vision = nullptr;
 };

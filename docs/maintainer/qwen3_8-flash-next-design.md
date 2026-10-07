@@ -6210,6 +6210,39 @@ that shares a prefix with a lane whose capture there has not landed; four reques
 prompts sent together (two identical) reproduced it on two of three fresh servers, and none of six
 after the fix.
 
+#### Confidence cut for one-row drafts (measured and adopted, 2026-10-07)
+
+The agentic replay against Strata showed Strata's drafts accepted more often (72 % against 62 %
+per draft). Both engines verify every draft and accept it with the target's probability, so this
+was a matter of which drafts are offered, not of output quality: Strata only offers a draft while
+the draft layer's probability of it is at least `--spec-min-p` (0.70 in the configuration
+measured), while Infernix chose the length from per-position acceptance alone. The proposal head
+was ruled out first (`--lm-head-draft` on and off: 76.1 % and 76.1 %).
+
+The draft head now also writes each draft's log-probability (`ops::top_logprobs` over the head's
+rows, K = 1, beside the argmax), and a one-row round verifies its drafts only up to the first below
+probability 0.5 (`kDraftMinLogprob`). C = 1, AIME prompts sampled, MTP 4 with the proposal head:
+
+| Variant | tok/s | Acceptance |
+|---|---:|---:|
+| No cut | 139.5 | 76.1 % |
+| Cut 0.5, the cost policy's length | **145.6** | 82.1 % |
+| Cut 0.7, the cost policy's length | 142.6 | 86.3 % |
+| Cut 0.5, the most drafts (4) | 140.7 | 75.6 % |
+| Cut 0.7, the most drafts (Strata's form) | 144.4 | 86.0 % |
+
+A confirmation (no cut / cut 0.5 alternated twice, eight rounds each) reproduced 138.8 and 147.2
+tok/s to the decimal (+6.1 %). Greedy output with the cut is byte-identical to without. Pair rounds
+keep their length: their columns' n-gram rows are staged at offsets that depend on the width
+before the drafts are known.
+
+The production build, which computes the log-probabilities every round, repeated it: C = 1
+sampled 147.2 tok/s with 81.8 % accepted. At C = 2 greedy decode ran 162.3 tok/s before and 162.2
+after in one session, so the extra head pass costs pair rounds nothing measurable. C = 2 sampled
+gave 160.8 tok/s against 164.9 for the pair policy in an earlier session, on different sampled
+text; no same-session sampled run separates the two. The prefix-cache, preemption and decide real
+tests pass.
+
 ### 19.3.6 Strata-derived options (2026-10-04)
 
 Strata was re-read at `6f32ec0` (§3.1, "Strata v0.1.39"). The review ran six area sweeps: expert

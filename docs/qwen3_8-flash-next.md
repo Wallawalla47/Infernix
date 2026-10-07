@@ -99,7 +99,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   each round's dense weight reads, but their routed experts barely overlap.
   - Speculation (`--spec mtp`, `--ngram-draft-tokens`) depends on how many requests decode
     together:
-    - one: the request picks its own draft length;
+    - one: the request picks its own draft length, and verifies its drafts only up to the first
+      the drafter gives less than 0.5 probability (C = 1 sampled MTP on an RTX 5090: 138.8 ->
+      147.2 tok/s, 75.6 -> 81.8 % of drafts accepted; output unchanged, since every draft is still
+      verified);
     - two: both draft the same number of tokens, 0-2 chosen from their acceptance, so neither is
       padded to the other's draft. Such a round has at most 6 columns, where concurrent requests
       give the same greedy output as each alone (design §19.3.5). Measured on an RTX 5090 with

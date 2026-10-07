@@ -12,6 +12,7 @@
 #include "infernix/ops/ple.h"
 #include "infernix/ops/projection_fp32.h"
 #include "infernix/ops/argmax.h"
+#include "infernix/ops/top_logprobs.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "infernix/ops/cast.h"
 #include "infernix/ops/resident_moe.h"
@@ -750,6 +751,14 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
             ops::argmax(narrow, head.token_ids, drafts, rows_out, s);
         } else {
             ops::argmax(narrow, drafts, dim(parameters_.model.resources().public_token_count), s);
+        }
+        if (call.draft_logprobs.data != nullptr) {
+            // The top row's log-probability over the head's rows: the draft's own (same rows, same
+            // tie order as the argmax above).
+            const std::int32_t valid = head.rows ? rows_out : dim(parameters_.model.resources().public_token_count);
+            Tensor top_row = work_.alloc(DType::I32, {1, T});
+            Tensor logprob(call.draft_logprobs.data, DType::FP32, {1, T});
+            ops::top_logprobs(narrow, valid, top_row, logprob, s);
         }
     } catch (const std::exception& error) {
         throw std::runtime_error(std::string("qwen4_exp/mtp: ") + error.what());
