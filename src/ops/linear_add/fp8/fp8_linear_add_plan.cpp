@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 enum class Fp8LinearAddRoute : std::uint8_t {
@@ -61,4 +61,4 @@ void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& resi
     fp8_linear_add_a8_launch(x, weight, residual, workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

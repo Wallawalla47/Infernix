@@ -1,11 +1,11 @@
 // Public warm-cache Graph benchmark for the fused tail-pack RMSNorm contract.
-#include "ninfer/ops/rmsnorm_pack_tail.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/rmsnorm_pack_tail.h"
+#include "infernix_bench_common.h"
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 struct Options {

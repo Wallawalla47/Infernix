@@ -2,10 +2,10 @@
 
 #include <cstdint>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Portable unsigned 128-bit integer. MSVC has no native 128-bit type, so this
-// emulates the operations NInfer's host code needs (the context-cost model and
+// emulates the operations Infernix's host code needs (the context-cost model and
 // prefill work) with 64-bit limb arithmetic; every operation is constexpr.
 // Multiplication assumes both operands' high 64 bits are zero (all call sites
 // multiply 64-bit values); division supports an arbitrary nonzero 64-bit divisor.
@@ -88,4 +88,4 @@ inline constexpr bool operator>=(uint128 a, uint128 b) noexcept { return !(a < b
 inline constexpr bool operator>(uint128 a, uint128 b) noexcept { return b < a; }
 inline constexpr bool operator<=(uint128 a, uint128 b) noexcept { return !(b < a); }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

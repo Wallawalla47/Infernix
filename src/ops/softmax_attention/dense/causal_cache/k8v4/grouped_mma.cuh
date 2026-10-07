@@ -9,7 +9,7 @@
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 #include "ops/softmax_attention/common/causal_tree.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // Rotated FP8 Q/K use native FP8 MMA. Rotated NVFP4 V widens to FP16 for FP32 PV accumulation.
 template <class Geometry, class Schedule, bool MultiBatch, bool Masked, class CacheInput,
           bool ParallelQueries = false, bool Tree = false>
@@ -287,12 +287,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 store_vec(v_dst, make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     int physical_page = block_table[first_tile >> kPagedKVPageShift];
     issue_kv_tile(first_tile, physical_page);
-    ninfer::ops::cp_wait<0>();
+    infernix::ops::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
@@ -497,7 +497,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 }
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { infernix::ops::cp_wait<0>(); }
         __syncthreads();
     }
     // The KV stream is done: a programmatic merge may begin launching as CTAs finish.
@@ -553,4 +553,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

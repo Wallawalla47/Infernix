@@ -8,7 +8,7 @@
 #include "ops/softmax_attention/dense/causal_cache/int8/fast_tiled_plan.h"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // causal_softmax_attention_prompt_wave_tokens() counts waves of these rows.
 static_assert(CausalPromptI8FastShape<8>::Br == 128);
@@ -85,4 +85,4 @@ void launch_int8_kv_fast_tiled_mma(const CausalAttentionOperands& p, Int8KvReadV
                nullptr);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

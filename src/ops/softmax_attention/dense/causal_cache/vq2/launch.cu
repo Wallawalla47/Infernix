@@ -15,7 +15,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 // The natural merge of the grouped kernels applies the inverse rotation over whole rows.
@@ -168,18 +168,18 @@ void grouped_routes(const CausalAttentionOperands& p, const VqKvCacheView& cache
         return;
     }
     switch (p.width) {
-#define NINFER_VQ_GROUPED(T)                                                                       \
+#define INFERNIX_VQ_GROUPED(T)                                                                       \
     case T:                                                                                        \
         return batch.template operator()<T, false>()
-        NINFER_VQ_GROUPED(1);
-        NINFER_VQ_GROUPED(2);
-        NINFER_VQ_GROUPED(3);
-        NINFER_VQ_GROUPED(4);
-        NINFER_VQ_GROUPED(5);
-        NINFER_VQ_GROUPED(6);
-        NINFER_VQ_GROUPED(7);
-        NINFER_VQ_GROUPED(8);
-#undef NINFER_VQ_GROUPED
+        INFERNIX_VQ_GROUPED(1);
+        INFERNIX_VQ_GROUPED(2);
+        INFERNIX_VQ_GROUPED(3);
+        INFERNIX_VQ_GROUPED(4);
+        INFERNIX_VQ_GROUPED(5);
+        INFERNIX_VQ_GROUPED(6);
+        INFERNIX_VQ_GROUPED(7);
+        INFERNIX_VQ_GROUPED(8);
+#undef INFERNIX_VQ_GROUPED
     }
     throw std::logic_error("VQ grouped plan exceeds the selected token tile");
 }
@@ -367,4 +367,4 @@ std::size_t vq_kv_workspace_bytes(int heads, int kv_heads, int batch, int min_wi
     return maximum;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

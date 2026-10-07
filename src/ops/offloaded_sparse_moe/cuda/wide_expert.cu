@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::offloaded_moe::wide {
+namespace infernix::ops::offloaded_moe::wide {
 namespace {
 
 constexpr int kPlanThreads     = 1024;
@@ -225,4 +225,4 @@ void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     launch<Matrix::Down>(call, pass, DownEpilogue{call.scales, call.dispatch.entries, call.outputs}, stream);
 }
 
-} // namespace ninfer::ops::offloaded_moe::wide
+} // namespace infernix::ops::offloaded_moe::wide

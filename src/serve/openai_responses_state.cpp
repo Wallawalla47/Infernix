@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 [[noreturn]] void invalid_tool_history(std::string message) {
@@ -193,4 +193,4 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     return resolved;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

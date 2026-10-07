@@ -1,19 +1,19 @@
-"""Check each NInfer Qwen4Exp block's op chains against the FP64 reference on identical inputs.
+"""Check each Infernix Qwen4Exp block's op chains against the FP64 reference on identical inputs.
 
     python -m tools.flash_next.block_check --model CHECKPOINT --tokens 1,2,3 --blocks blocks.bin \\
         --residuals residuals.bin [--layers 0,1,3]
 
 ``blocks.bin`` and ``residuals.bin`` are the ``--blocks`` and ``--residuals`` taps of
-ninfer_qwen4_exp_forward_real_test: BF16 ``[layers][mixer in, mixer out, MoE in, MoE out][T][H]``
+infernix_qwen4_exp_forward_real_test: BF16 ``[layers][mixer in, mixer out, MoE in, MoE out][T][H]``
 and BF16 ``[layers][T][S*H]`` (the residual after each block). For every selected layer the
-reference recomputes, from NInfer's own inputs:
+reference recomputes, from Infernix's own inputs:
 
 - ``attn_mix``: the PLE injection (its layer only) and the attention-side hyper-connection mixer,
   from the residual entering the block;
-- ``mixer``: GDN or QSA from NInfer's mixer input;
-- ``mlp_mix``: the injection of NInfer's mixer output and the MLP-side mixer;
-- ``moe``: the MoE from NInfer's MoE input;
-- ``residual``: the injection of NInfer's MoE output,
+- ``mixer``: GDN or QSA from Infernix's mixer input;
+- ``mlp_mix``: the injection of Infernix's mixer output and the MLP-side mixer;
+- ``moe``: the MoE from Infernix's MoE input;
+- ``residual``: the injection of Infernix's MoE output,
 
 so each reported error belongs to that op chain alone rather than to accumulated drift.
 """

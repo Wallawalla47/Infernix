@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include "core/device.h"
 #include "core/nvtx.h"
@@ -24,7 +24,7 @@
 #include <utility>
 #include <variant>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 DeviceContext initialize_device(const EngineOptions& options) {
@@ -639,4 +639,4 @@ void Engine::stop() noexcept {
     if (impl_ != nullptr) { impl_->stop(); }
 }
 
-} // namespace ninfer
+} // namespace infernix

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
@@ -88,4 +88,4 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                 const Tensor& A_log, const Tensor& dt_bias,
                                                 Tensor& g, Tensor& beta, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

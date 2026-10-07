@@ -15,7 +15,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 namespace frontend {
 struct ToolCallOutputContract;
@@ -211,4 +211,4 @@ public:
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
 };
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

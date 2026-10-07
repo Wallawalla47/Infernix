@@ -1,10 +1,10 @@
 #pragma once
 
-// Next-token distribution comparison for ninfer-perplexity: a reference run saves each scored
+// Next-token distribution comparison for infernix-perplexity: a reference run saves each scored
 // position's most probable tokens, and a later run of the same corpus windows measures its
 // KL divergence from them.
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 
 // Most probable tokens a reference keeps per scored position.
 inline constexpr std::uint32_t kReferenceTopTokens = 32;
@@ -123,4 +123,4 @@ private:
     std::vector<double> values_;
 };
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

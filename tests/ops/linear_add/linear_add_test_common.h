@@ -6,7 +6,7 @@
 #include <span>
 #include <string_view>
 
-namespace ninfer::test::linear_add {
+namespace infernix::test::linear_add {
 
 enum class WeightFormat : std::uint8_t {
     BF16,
@@ -35,4 +35,4 @@ bool cuda_available();
 
 int run_shape(std::string_view label, WeightFormat format, const ShapeCase& shape);
 
-} // namespace ninfer::test::linear_add
+} // namespace infernix::test::linear_add

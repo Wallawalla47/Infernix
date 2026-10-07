@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 // Called only for tool-result text. Recognize consecutive numbered runs, never
 // rewrite target messages. Preserve code indentation after exactly one separator.
@@ -68,4 +68,4 @@ inline std::vector<std::string> ngram_numbered_sources(std::string_view text) {
     return sources;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/common/causal_geometry.h"
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int TokenTile, int Warps, int KeyTile, int MinBlocks = 1, bool DynamicArena = true>
 struct Fp8KvGroupedMmaSchedule {
@@ -48,4 +48,4 @@ struct Fp8KvMergeSchedule {
     static constexpr int kThreads = 256;
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

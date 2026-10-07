@@ -8,7 +8,7 @@
 #include <map>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 std::string prefill_signature(const Model& model) {
     using Json         = nlohmann::json;
@@ -82,4 +82,4 @@ std::string prefill_signature(const Model& model) {
     return frontend::sha256_hex(frontend::sha256(facts.dump()));
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

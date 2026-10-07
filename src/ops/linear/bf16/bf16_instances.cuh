@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/bf16/bf16_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 using Bf16A16MmaR32T32K256S3 =
     Bf16A16MmaSchedule<32, 32, 256, 16, 8, 3, 1, Cache::cg, Cache::cg,
@@ -33,4 +33,4 @@ using Bf16A16TmaTailR64T64S3 = Bf16A16TmaTailMmaSchedule<64, 64, 32, 32, 3>;
 using Bf16A16TmaTailR64T128S2Rows =
     Bf16A16TmaTailMmaSchedule<64, 128, 32, 32, 2, 1, Bf16MmaRaster::RowFast>;
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

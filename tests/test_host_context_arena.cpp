@@ -20,7 +20,7 @@ void expect(bool condition, std::string_view message) {
 }
 
 void test_reserve_publish_and_rollback() {
-    ninfer::HostContextArena arena(1025, 1);
+    infernix::HostContextArena arena(1025, 1);
     expect(arena.capacity_bytes() == 1025 && arena.occupied_bytes() == 0,
            "idle fixed backing remains fully charged");
     auto source = arena.allocate(257);
@@ -55,10 +55,10 @@ void test_reserve_publish_and_rollback() {
 }
 
 void test_fragmentation_and_split() {
-    ninfer::HostContextArena arena(2048, 256);
+    infernix::HostContextArena arena(2048, 256);
     auto full = arena.allocate(2048);
     full->publish();
-    std::vector<ninfer::HostContextAllocation> pieces;
+    std::vector<infernix::HostContextAllocation> pieces;
     pieces.reserve(8);
     while (full->bytes() > 256) {
         auto split = arena.split(std::move(*full), 256);
@@ -86,7 +86,7 @@ void test_fragmentation_and_split() {
     merged.reset();
     expect(arena.occupied_bytes() == 0 && arena.allocation_count() == 0 && arena.can_allocate(2048),
            "all split pieces return to one complete reusable extent");
-    ninfer::HostContextArena disabled(0, 256);
+    infernix::HostContextArena disabled(0, 256);
     expect(!disabled.allocate(256) && disabled.capacity_bytes() == 0,
            "Host zero has no backing or allocations");
 }

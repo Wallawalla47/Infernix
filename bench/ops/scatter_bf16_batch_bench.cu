@@ -1,7 +1,7 @@
 // Measures five public feature-slice captures into a strided lane-owned pool.
-#include "ninfer/ops/scatter.h"
+#include "infernix/ops/scatter.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <algorithm>
@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 struct Options {
@@ -53,7 +53,7 @@ Options parse(int argc, char** argv) {
             continue;
         }
         if (arg == "--help") {
-            std::puts("usage: ninfer_scatter_bf16_batch_bench [--rows D] [--widths W,...] "
+            std::puts("usage: infernix_scatter_bf16_batch_bench [--rows D] [--widths W,...] "
                       "[--batches B,...] [--counts full|one|ragged|zero] [--execution eager|graph] "
                       "[--cache cold|warm] [--graph-calls 1..64] [--warmup N] [--repeat N] "
                       "[--csv-out PATH] [--profile]");

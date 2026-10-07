@@ -1,4 +1,4 @@
-# NInfer Engine Architecture
+# Infernix Engine Architecture
 
 This document defines model instances, execution ownership, the request lifecycle and the commit
 relationships across modules.
@@ -15,7 +15,7 @@ Each round, the decode-ready requests holding an execution permit form one compa
 and Replay chunks are interleaved.
 
 Text, Vision, prefix reuse, MTP, DFlash/DFlash2, the CLI and HTTP serving all go through the public
-`ninfer::Engine`. A speculative backend is an execution path internal to the Program and shares request
+`infernix::Engine`. A speculative backend is an execution path internal to the Program and shares request
 scheduling, commit and result publication with ordinary decode.
 The artifact must provide Text; startup independently selects Vision and either none or one spec
 backend, and binds and prepares only the selected features and their shared dependencies.
@@ -391,7 +391,7 @@ no continuation or checkpoint that external requests could hit.
 
 | Responsibility | Main location |
 |---|---|
-| Public Engine facade | `include/ninfer/engine.h`, `src/runtime/engine/engine.cpp` |
+| Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
 | Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
 | Instance construction | `src/runtime/engine/model_instance.*` |
 | Cache owners, index and costs | `src/runtime/engine/context_cache/` |
@@ -402,10 +402,10 @@ no continuation or checkpoint that external requests could hit.
 | Frontend and model state layout | `src/models/qwen3_5/frontend/`, `state/` |
 | Tensors, arenas, graphs, physical KV and raw transfers | `src/core/` |
 | Generic artifact framing and materialization | `src/artifact/` |
-| Closed compute and state-transition Ops | `src/ops/`, `include/ninfer/ops/` |
+| Closed compute and state-transition Ops | `src/ops/`, `include/infernix/ops/` |
 | Input conversion, media acquisition and the HTTP Gateway | `src/product/`, `src/media/decode/`, `src/serve/` |
 | Converter and Python container tools | `tools/convert/`, `tools/artifact/` |
 
-The public C++ interface serves in-repository applications; NInfer does not install or export a C++
+The public C++ interface serves in-repository applications; Infernix does not install or export a C++
 SDK. The v3 `.ninfer` is the only C++ product artifact; the CLI, server and inference benchmarks all go
 through the public Engine, and the converter provides no Python model-inference path.

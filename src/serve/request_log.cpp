@@ -24,7 +24,7 @@
 #include <unistd.h>
 #endif
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = nlohmann::json;
@@ -83,32 +83,32 @@ std::string cuda_uuid_string(const cudaUUID_t& uuid) {
     return out.str();
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) {
+const char* finish_reason_name(infernix::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case infernix::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case infernix::FinishReason::OutputLimit:
         return "output_limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::ContextCapacity:
         return "context_capacity";
-    case ninfer::FinishReason::StopToken:
+    case infernix::FinishReason::StopToken:
         return "stop_token";
-    case ninfer::FinishReason::StopString:
+    case infernix::FinishReason::StopString:
         return "stop_string";
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
 }
 
-Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
+Json tool_call_parse_json(const infernix::ToolCallParseDiagnostics& diagnostics) {
     return Json{{"marker_seen", diagnostics.marker_seen},
                 {"structured_call_count", diagnostics.structured_call_count},
                 {"empty_arguments_omitted", diagnostics.empty_arguments_omitted},
                 {"schema_mismatch_arguments", diagnostics.schema_mismatch_arguments},
                 {"duplicate_parameters_repaired", diagnostics.duplicate_parameters_repaired},
                 {"fallback_reason",
-                 ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
+                 infernix::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)},
                 {"tolerant_recovered", diagnostics.tolerant_recovered}};
 }
 
@@ -127,43 +127,43 @@ Json requested_reasoning_effort_json(const std::optional<RequestedReasoningEffor
                      : Json(nullptr);
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) {
+const char* kv_cache_name(infernix::KvCacheStorage storage) {
     switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
+    case infernix::KvCacheStorage::BFloat16:
         return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
+    case infernix::KvCacheStorage::Int8Group64:
         return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+    case infernix::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
+    case infernix::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
-    case ninfer::KvCacheStorage::Vq2:
+    case infernix::KvCacheStorage::Vq2:
         return "vq2";
-    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+    case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
     }
     return "unknown";
 }
 
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+const char* kv_capacity_mode_name(infernix::KvCapacityMode mode) {
+    return mode == infernix::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
-const char* proposal_head_name(ninfer::ProposalHead proposal) {
-    return proposal == ninfer::ProposalHead::Optimized ? "optimized" : "full";
+const char* proposal_head_name(infernix::ProposalHead proposal) {
+    return proposal == infernix::ProposalHead::Optimized ? "optimized" : "full";
 }
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
+const char* prefix_reuse_path_name(infernix::PrefixReusePath path) {
     switch (path) {
-    case ninfer::PrefixReusePath::Root:
+    case infernix::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::Checkpoint:
+    case infernix::PrefixReusePath::Checkpoint:
         return "checkpoint";
-    case ninfer::PrefixReusePath::HybridEndpoint:
+    case infernix::PrefixReusePath::HybridEndpoint:
         return "hybrid_endpoint";
-    case ninfer::PrefixReusePath::HybridSnapshot:
+    case infernix::PrefixReusePath::HybridSnapshot:
         return "hybrid_snapshot";
     }
     return "unknown";
@@ -177,8 +177,8 @@ Json event_base(const std::string& server_instance_id, std::uint64_t timestamp, 
                 {"server_instance_id", server_instance_id}};
 }
 
-const char* scheduling_transition_name(ninfer::GenerationSchedulingTransition transition) {
-    using Transition = ninfer::GenerationSchedulingTransition;
+const char* scheduling_transition_name(infernix::GenerationSchedulingTransition transition) {
+    using Transition = infernix::GenerationSchedulingTransition;
     switch (transition) {
     case Transition::PauseStarted:
         return "pause_started";
@@ -200,19 +200,19 @@ const char* scheduling_transition_name(ninfer::GenerationSchedulingTransition tr
     throw std::logic_error("invalid scheduling transition");
 }
 
-Json recovery_route_json(ninfer::GenerationRecoveryRoute route) {
+Json recovery_route_json(infernix::GenerationRecoveryRoute route) {
     switch (route) {
-    case ninfer::GenerationRecoveryRoute::None:
+    case infernix::GenerationRecoveryRoute::None:
         return nullptr;
-    case ninfer::GenerationRecoveryRoute::Snapshot:
+    case infernix::GenerationRecoveryRoute::Snapshot:
         return "snapshot";
-    case ninfer::GenerationRecoveryRoute::Replay:
+    case infernix::GenerationRecoveryRoute::Replay:
         return "replay";
     }
     throw std::logic_error("invalid recovery route");
 }
 
-Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
+Json sampler_json(const infernix::ResolvedSamplingParameters& sampling) {
     return Json{{"temperature", sampling.temperature},
                 {"top_p", sampling.top_p},
                 {"top_k", sampling.top_k},
@@ -222,7 +222,7 @@ Json sampler_json(const ninfer::ResolvedSamplingParameters& sampling) {
                 {"seed", sampling.seed}};
 }
 
-Json preset_json(const ninfer::SamplingPreset& preset) {
+Json preset_json(const infernix::SamplingPreset& preset) {
     return Json{{"temperature", preset.temperature},
                 {"top_p", preset.top_p},
                 {"top_k", preset.top_k},
@@ -231,7 +231,7 @@ Json preset_json(const ninfer::SamplingPreset& preset) {
                 {"frequency_penalty", preset.frequency_penalty}};
 }
 
-Json overrides_json(const ninfer::SamplingOverrides& overrides) {
+Json overrides_json(const infernix::SamplingOverrides& overrides) {
     Json result{{"temperature", nullptr},
                 {"top_p", nullptr},
                 {"top_k", nullptr},
@@ -324,13 +324,13 @@ Json error_json(const ApiError& error) {
                 {"message", error.message}};
 }
 
-Json arena_json(const ninfer::ArenaMemorySummary& arena) {
+Json arena_json(const infernix::ArenaMemorySummary& arena) {
     return Json{{"capacity_bytes", arena.capacity_bytes},
                 {"used_bytes", arena.used_bytes},
                 {"peak_used_bytes", arena.peak_used_bytes}};
 }
 
-Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySummary>& vision) {
+Json vision_workspace_json(const std::optional<infernix::VisionWorkspaceMemorySummary>& vision) {
     if (!vision) { return nullptr; }
     return Json{{"aggregate_prompt_tokens", vision->aggregate_prompt_tokens},
                 {"max_item_tokens", vision->max_item_tokens},
@@ -372,7 +372,7 @@ Json speculative_json(const GenerationMetrics& metrics) {
                                         : Json(nullptr)}}}};
 }
 
-Json scheduling_json(const ninfer::GenerationSchedulingStats& stats) {
+Json scheduling_json(const infernix::GenerationSchedulingStats& stats) {
     return Json{{"preemptions", stats.preemptions},
                 {"snapshot_restores", stats.snapshot_restores},
                 {"replay_restores", stats.replay_restores},
@@ -390,13 +390,13 @@ double nanoseconds_to_microseconds(std::uint64_t value) noexcept {
     return static_cast<double>(value) * 1.0e-3;
 }
 
-double request_host_exposed_seconds(const ninfer::GenerationEngineTiming& timing) noexcept {
+double request_host_exposed_seconds(const infernix::GenerationEngineTiming& timing) noexcept {
     return timing.engine_boundary_exposed_seconds + timing.program_submit_exposed_seconds +
            timing.program_post_exposed_seconds + timing.engine_commit_output_exposed_seconds +
            timing.engine_maintenance_exposed_seconds;
 }
 
-Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
+Json request_engine_timing_json(const infernix::GenerationEngineTiming& timing) {
     return Json{
         {"queue_wait_seconds", timing.queue_wait_seconds},
         {"host_exposed_seconds",
@@ -414,14 +414,14 @@ Json request_engine_timing_json(const ninfer::GenerationEngineTiming& timing) {
     };
 }
 
-Json work_timing_json(const ninfer::GenerationWorkTiming& timing) {
+Json work_timing_json(const infernix::GenerationWorkTiming& timing) {
     return Json{{"submit_seconds", timing.submit_seconds},
                 {"wait_seconds", timing.wait_seconds},
                 {"post_seconds", timing.post_seconds},
                 {"gpu_seconds", timing.gpu_seconds}};
 }
 
-Json first_output_timing_json(const ninfer::GenerationFirstOutputTiming& timing) {
+Json first_output_timing_json(const infernix::GenerationFirstOutputTiming& timing) {
     Json transfers = Json::object();
     constexpr std::array resources{"state", "main_kv", "backend_kv"};
     constexpr std::array directions{"d2h", "h2d", "d2d"};
@@ -442,9 +442,9 @@ Json first_output_timing_json(const ninfer::GenerationFirstOutputTiming& timing)
                 {"context_transfers", std::move(transfers)}};
 }
 
-ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats& previous,
-                                             const ninfer::RuntimeHostWorkStats& current) {
-    return ninfer::RuntimeHostWorkStats{
+infernix::RuntimeHostWorkStats host_work_delta(const infernix::RuntimeHostWorkStats& previous,
+                                             const infernix::RuntimeHostWorkStats& current) {
+    return infernix::RuntimeHostWorkStats{
         .engine_boundary_ns =
             monotonic_delta(previous.engine_boundary_ns, current.engine_boundary_ns),
         .program_submit_ns = monotonic_delta(previous.program_submit_ns, current.program_submit_ns),
@@ -472,7 +472,7 @@ ninfer::RuntimeHostWorkStats host_work_delta(const ninfer::RuntimeHostWorkStats&
     };
 }
 
-std::uint64_t host_active_ns(const ninfer::RuntimeHostWorkStats& timing) noexcept {
+std::uint64_t host_active_ns(const infernix::RuntimeHostWorkStats& timing) noexcept {
     return timing.engine_boundary_ns + timing.program_submit_ns + timing.program_post_ns +
            timing.engine_commit_output_ns + timing.engine_maintenance_ns;
 }
@@ -486,9 +486,9 @@ Json microseconds_per(std::uint64_t nanoseconds, std::uint64_t count) {
 
 std::string format_server_start_json(
     const std::string& server_instance_id, std::uint64_t timestamp, const ServeOptions& options,
-    const ninfer::EngineOptions& engine_options,
-    const ninfer::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
-    const ninfer::LoadSummary& load, const ninfer::MemorySummary& memory,
+    const infernix::EngineOptions& engine_options,
+    const infernix::ModelSamplingDefaults& sampling_defaults, const std::string& public_model_id,
+    const infernix::LoadSummary& load, const infernix::MemorySummary& memory,
     const ServerLogEnvironment& environment, std::optional<std::uint64_t> artifact_size_bytes) {
     Json record = event_base(server_instance_id, timestamp, "server_start");
 
@@ -530,8 +530,8 @@ std::string format_server_start_json(
                                                           {"host_object_count", load.host_object_count},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
-    const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
-    const ninfer::ContextCostSummary& context_cost = load.context_cost;
+    const infernix::ContextCacheOptions& cache       = engine_options.context_cache;
+    const infernix::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
         static_cast<std::uint64_t>(engine_options.max_concurrency) +
         cache.device_state_slots.value();
@@ -567,9 +567,9 @@ std::string format_server_start_json(
              {"ngram_session_bytes", engine_options.speculative.ngram_session_bytes},
              {"ngram_native_sessions", options.ngram_native_sessions},
              {"proposal_head", proposal_head_name(engine_options.speculative.proposal_head)},
-             {"context_cost", Json{{"transfer_source", ninfer::context_cost_preset_source_name(
+             {"context_cost", Json{{"transfer_source", infernix::context_cost_preset_source_name(
                                                            context_cost.transfer_source)},
-                                   {"prefill_source", ninfer::context_cost_preset_source_name(
+                                   {"prefill_source", infernix::context_cost_preset_source_name(
                                                           context_cost.prefill_source)},
                                    {"hardware_class", context_cost.hardware_class},
                                    {"prefill_signature", context_cost.prefill_signature},
@@ -622,7 +622,7 @@ std::string
 format_request_scheduling_json(const std::string& server_instance_id,
                                std::uint64_t timestamp_unix_ms, std::uint64_t request_id,
                                const std::string& http_request_id,
-                               const ninfer::GenerationSchedulingObservation& observation) {
+                               const infernix::GenerationSchedulingObservation& observation) {
     Json record       = event_base(server_instance_id, timestamp_unix_ms, "request_scheduling");
     record["request"] = Json{{"request_id", request_id}, {"http_request_id", http_request_id}};
     record["engine_request_id"] = observation.engine_request_id;
@@ -711,8 +711,8 @@ std::string format_request_error_json(const std::string& server_instance_id,
 std::string format_throughput_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                    const ThroughputReport& report) {
     Json record                          = event_base(server_instance_id, timestamp, "throughput");
-    const ninfer::RuntimeStats& previous = report.previous;
-    const ninfer::RuntimeStats& current  = report.current;
+    const infernix::RuntimeStats& previous = report.previous;
+    const infernix::RuntimeStats& current  = report.current;
     const double prefill_rate =
         report.interval_seconds > 0.0
             ? static_cast<double>(report.computed_prefill_tokens) / report.interval_seconds
@@ -726,7 +726,7 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
         average_batch = static_cast<double>(report.decode_row_rounds) /
                         static_cast<double>(report.decode_rounds);
     }
-    const ninfer::RuntimeHostWorkStats host =
+    const infernix::RuntimeHostWorkStats host =
         host_work_delta(previous.host_work, current.host_work);
     const std::uint64_t active_host = host_active_ns(host);
     record["interval_seconds"]      = report.interval_seconds;
@@ -974,11 +974,11 @@ JsonlRequestLog::JsonlRequestLog(const std::string& path,
 }
 
 void JsonlRequestLog::write_server_start(const ServeOptions& options,
-                                         const ninfer::EngineOptions& engine_options,
-                                         const ninfer::ModelSamplingDefaults& sampling_defaults,
+                                         const infernix::EngineOptions& engine_options,
+                                         const infernix::ModelSamplingDefaults& sampling_defaults,
                                          const std::string& public_model_id,
-                                         const ninfer::LoadSummary& load,
-                                         const ninfer::MemorySummary& memory) {
+                                         const infernix::LoadSummary& load,
+                                         const infernix::MemorySummary& memory) {
     if (!enabled()) { return; }
     std::error_code error;
     const std::uintmax_t size = std::filesystem::file_size(options.artifact_path, error);
@@ -1001,7 +1001,7 @@ void JsonlRequestLog::write_request_start(const RequestLogContext& context) {
 
 void JsonlRequestLog::write_request_scheduling(
     std::uint64_t request_id, const std::string& http_request_id,
-    const ninfer::GenerationSchedulingObservation& observation) {
+    const infernix::GenerationSchedulingObservation& observation) {
     if (!enabled()) { return; }
     append(format_request_scheduling_json(server_instance_id_, unix_time_ms(), request_id,
                                           http_request_id, observation));
@@ -1102,4 +1102,4 @@ std::string JsonlRequestLog::rotate_locked() {
     return warning;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

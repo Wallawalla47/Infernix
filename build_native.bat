@@ -1,6 +1,6 @@
 @echo off
 setlocal
-REM Native MSVC (VS18) + CUDA 13.4 native Windows build driver for NInfer.
+REM Native MSVC (VS18) + CUDA 13.4 native Windows build driver for Infernix.
 REM Based on PR #13 (docs/windows.md) with one local adaptation: dependencies come
 REM from the prebuilt global vcpkg tree at C:\vcpkg (ffmpeg 9.0.1 + curl 8.21
 REM x64-windows) instead of manifest-mode rebuilding (ffmpeg 8.1.1 source build
@@ -19,7 +19,7 @@ if "%1"=="configure" (
     -DVCPKG_TARGET_TRIPLET=x64-windows ^
     -DCMAKE_PREFIX_PATH="C:\vcpkg\installed\x64-windows" ^
     -DCMAKE_CUDA_ARCHITECTURES=120a ^
-    -DNINFER_BUILD_APPS=ON ^
+    -DINFERNIX_BUILD_APPS=ON ^
     -DBUILD_TESTING=ON
 ) else if "%1"=="build" (
   cmake --build build-windows --config Release --parallel

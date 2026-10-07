@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 constexpr std::uint64_t kGamma  = 0x9E3779B97F4A7C15ULL;
@@ -82,4 +82,4 @@ void NgramHash::row_ids(std::span<const std::int32_t> history, std::size_t count
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

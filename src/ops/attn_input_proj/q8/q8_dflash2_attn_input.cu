@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry                          = Q8LinearGeometry<6144, 5120>;
@@ -113,4 +113,4 @@ void q8_dflash2_attn_input_mma_r32_c64_k128_launch(const Tensor& x, const Weight
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-"""NInfer v3 representation and file tools.
+"""Infernix v3 representation and file tools.
 
 formats defines stored numbers; layouts defines their byte geometry; codecs
 packs and decodes exact words. tensor_output maps row blocks to complete objects.

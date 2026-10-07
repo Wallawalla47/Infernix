@@ -1,4 +1,4 @@
-add_library(ninfer_runtime_support STATIC
+add_library(infernix_runtime_support STATIC
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/kv_capacity.cpp
@@ -7,24 +7,24 @@ add_library(ninfer_runtime_support STATIC
   prefix_cache/prefix_index.cpp
   prefix_cache/tap_planner.cpp
 )
-ninfer_internal_includes(ninfer_runtime_support)
-target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core PRIVATE ninfer::json)
+infernix_internal_includes(infernix_runtime_support)
+target_link_libraries(infernix_runtime_support PUBLIC infernix_core PRIVATE infernix::json)
 
 # Public Engine and common contracts; model execution remains in the model layer.
-add_library(ninfer_engine STATIC
+add_library(infernix_engine STATIC
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )
-ninfer_internal_includes(ninfer_engine)
-target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(ninfer_engine PRIVATE
-  ninfer_model_runtime
-  ninfer_artifact
-  ninfer_core
-  ninfer_runtime_support
-  ninfer_ops
-  ninfer_text
-  ninfer_media_decode)
-add_library(ninfer::engine ALIAS ninfer_engine)
+infernix_internal_includes(infernix_engine)
+target_include_directories(infernix_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(infernix_engine PRIVATE
+  infernix_model_runtime
+  infernix_artifact
+  infernix_core
+  infernix_runtime_support
+  infernix_ops
+  infernix_text
+  infernix_media_decode)
+add_library(infernix::engine ALIAS infernix_engine)

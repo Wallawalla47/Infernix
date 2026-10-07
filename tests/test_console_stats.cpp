@@ -10,7 +10,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace infernix::serve;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -43,7 +43,7 @@ int main() {
     // Engine speculative totals include n-gram rounds; the model drafter gets only the remainder.
     GenerationOutcome mixed                     = outcome(1000, 600, 101, 0.25, 0.2, 2.0);
     mixed.metrics.decode_share_seconds          = 0.8;
-    mixed.metrics.speculative_backend           = ninfer::SpeculativeBackend::DFlash2;
+    mixed.metrics.speculative_backend           = infernix::SpeculativeBackend::DFlash2;
     mixed.metrics.speculative_rounds            = 30;
     mixed.metrics.speculative_draft_tokens      = 300;
     mixed.metrics.speculative_accepted_tokens   = 150;
@@ -63,17 +63,17 @@ int main() {
     failures += check(sample.ngram_rounds == 10 && sample.ngram_drafted_tokens == 100 &&
                           sample.ngram_accepted_tokens == 70,
                       "n-gram totals must be carried unchanged");
-    failures += check(sample.speculative_backend == ninfer::SpeculativeBackend::DFlash2,
+    failures += check(sample.speculative_backend == infernix::SpeculativeBackend::DFlash2,
                       "a request with model drafts must name its drafter");
 
     GenerationOutcome ngram_only                = outcome(10, 0, 5, 0.1, 0.01, 0.1);
-    ngram_only.metrics.speculative_backend      = ninfer::SpeculativeBackend::Mtp;
+    ngram_only.metrics.speculative_backend      = infernix::SpeculativeBackend::Mtp;
     ngram_only.metrics.speculative_rounds       = 2;
     ngram_only.metrics.speculative_draft_tokens = 8;
     ngram_only.metrics.ngram_rounds             = 2;
     ngram_only.metrics.ngram_drafted_tokens     = 8;
     failures += check(make_console_request_sample(ngram_only).speculative_backend ==
-                          ninfer::SpeculativeBackend::None,
+                          infernix::SpeculativeBackend::None,
                       "a request without model drafts must not name a drafter");
 
     // Ratios and rates weigh requests by tokens and time; zero-duration phases do not dilute them.
@@ -124,7 +124,7 @@ int main() {
     snapshot.running             = 1;
     snapshot.waiting             = 0;
     snapshot.recent_window       = 10;
-    snapshot.speculative_backend = ninfer::SpeculativeBackend::DFlash2;
+    snapshot.speculative_backend = infernix::SpeculativeBackend::DFlash2;
     snapshot.session.add(sample);
     snapshot.recent                      = snapshot.session;
     const std::vector<std::string> lines = render_console_stats_panel(snapshot);
@@ -152,7 +152,7 @@ int main() {
         // Every column shown, the table still fits a console snapped to half of a 1920-pixel
         // screen.
         for (std::size_t index = 1; index < lines.size(); ++index) {
-            failures += check(ninfer::product::terminal_display_width(lines[index]) <= 93,
+            failures += check(infernix::product::terminal_display_width(lines[index]) <= 93,
                               "panel table must fit a half-width console");
         }
     }
@@ -172,8 +172,8 @@ int main() {
                       "a session without decode did not show empty decode rate and batch cells");
 
     // The recent row appears once the session outgrows the window and covers only its requests.
-    const auto logging = std::make_unique<ninfer::product::LoggingRuntime>(
-        ninfer::product::LoggingOptions{.logger_name = "console-stats-test"});
+    const auto logging = std::make_unique<infernix::product::LoggingRuntime>(
+        infernix::product::LoggingOptions{.logger_name = "console-stats-test"});
     ConsoleStatsPanel panel(logging->terminal_panel());
     for (int index = 0; index < 12; ++index) {
         panel.request_done(outcome(100, 0, 2, index < 2 ? 5.0 : 0.5, 0.1, 0.1));
@@ -193,8 +193,8 @@ int main() {
                       "a session beyond the window shows the recent row");
 
     // Terminal fitting counts visible columns only and never splits an escape sequence.
-    using ninfer::product::fit_terminal_line;
-    using ninfer::product::terminal_display_width;
+    using infernix::product::fit_terminal_line;
+    using infernix::product::terminal_display_width;
     const std::string styled = "\x1b[1mabcdef\x1b[0m";
     failures += check(terminal_display_width(styled) == 6, "escapes must occupy no columns");
     failures += check(fit_terminal_line(styled, 3) == "\x1b[1mabc\x1b[0m",

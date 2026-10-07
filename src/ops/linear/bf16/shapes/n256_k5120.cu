@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
     if (tokens <= 76)
         return launch_bf16_sliced_k_mma<
@@ -18,4 +18,4 @@ Bf16Launch select_bf16_n256_k5120(std::int32_t tokens) {
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T32K64S3, 5120>>;
     return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K128S2, 5120>>;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

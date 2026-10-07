@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kHidden           = 2048;
@@ -303,4 +303,4 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
     launch_s4_tiled(weights, destination, plan, workspace, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-"""Synthesized agentic workloads for the NInfer A/B benchmark.
+"""Synthesized agentic workloads for the Infernix A/B benchmark.
 
 Mirrors the SHAPE and SCALE of the production request log (E:\\NInfer-Deploy-V3\\log.json,
 775 requests): long multi-turn OpenAI chat-completions sessions with ~33 tools,

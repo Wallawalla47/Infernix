@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheNvfp4HeadDim        = 256;
 inline constexpr int kKVCacheNvfp4Group          = 16;
@@ -212,4 +212,4 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
     };
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

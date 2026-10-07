@@ -9,7 +9,7 @@
 #include <map>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 using Json = nlohmann::ordered_json;
@@ -563,4 +563,4 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
     return result;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

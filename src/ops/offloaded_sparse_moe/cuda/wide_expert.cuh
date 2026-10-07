@@ -29,7 +29,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe::wide {
+namespace infernix::ops::offloaded_moe::wide {
 
 // The activation planes of one call: A4(x) for the gate/up GEMM and A4(h) for the down GEMM.
 struct alignas(128) Descriptors {
@@ -428,4 +428,4 @@ void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaS
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::offloaded_moe::wide
+} // namespace infernix::ops::offloaded_moe::wide

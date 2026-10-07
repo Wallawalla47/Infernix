@@ -1,5 +1,5 @@
-// ninfer::ops - top_logprobs wrapper: public contract validation and launcher dispatch.
-#include "ninfer/ops/top_logprobs.h"
+// infernix::ops - top_logprobs wrapper: public contract validation and launcher dispatch.
+#include "infernix/ops/top_logprobs.h"
 
 #include "ops/launcher/top_logprobs.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require_rank_two(const Tensor& tensor, const char* label) {
@@ -77,4 +77,4 @@ void top_logprobs(const Tensor& logits, std::int32_t valid_rows, Tensor& ids, Te
     detail::top_logprobs_launch(logits, valid_rows, ids, output, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

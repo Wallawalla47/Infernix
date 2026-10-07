@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <cuda_runtime.h>
@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 [[nodiscard]] std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens);
 
@@ -36,4 +36,4 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                              cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

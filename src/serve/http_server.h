@@ -21,7 +21,7 @@
 #include <string_view>
 #include <thread>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
@@ -106,9 +106,9 @@ private:
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
     void record_request_start(const RequestLogContext& context);
-    [[nodiscard]] ninfer::GenerationSchedulingObserver
+    [[nodiscard]] infernix::GenerationSchedulingObserver
     scheduling_observer(std::uint64_t request_id, std::string http_request_id);
-    [[nodiscard]] ninfer::GenerationFirstTokenObserver first_token_observer();
+    [[nodiscard]] infernix::GenerationFirstTokenObserver first_token_observer();
     void record_request_rejected(const RequestRejectionLogContext& context);
     void record_request_done(const RequestLogContext& context, const GenerationOutcome& outcome);
     void record_request_failure(const RequestLogContext& context, const RequestFailure& failure);
@@ -120,7 +120,7 @@ private:
     GenerationService* service_ = nullptr;
     ServeOptions options_;
     std::string public_model_id_;
-    ninfer::ModelMetadata model_metadata_;
+    infernix::ModelMetadata model_metadata_;
     // /v1/decide answer labels, computed from the loaded tokenizer when the service attaches.
     std::vector<DecideLabel> decide_labels_;
     OpenAIResponsesStore openai_responses_store_;
@@ -136,4 +136,4 @@ private:
     bool stats_stopping_ = false;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

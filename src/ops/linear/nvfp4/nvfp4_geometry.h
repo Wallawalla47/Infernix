@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <std::int32_t OutputRows, std::int32_t InputRows>
 struct Nvfp4Geometry {
     static_assert(OutputRows > 0 && InputRows > 0);
@@ -67,4 +67,4 @@ inline Nvfp4GeometryId resolve_nvfp4_geometry(std::int32_t output_rows, std::int
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

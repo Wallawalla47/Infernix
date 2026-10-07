@@ -1,10 +1,10 @@
-#include "ninfer_build_id.h"
+#include "infernix_build_id.h"
 #include "corpus.h"
 #include "distribution.h"
 #include "evaluation.h"
 
 #include "product/rope_yarn_options.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/engine_diagnostics.h"
@@ -38,10 +38,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using json  = nlohmann::json;
-using ninfer::perplexity::CorpusSelection;
-using ninfer::perplexity::DivergenceAggregate;
-using ninfer::perplexity::ScoreAggregate;
-using ninfer::perplexity::WindowPlan;
+using infernix::perplexity::CorpusSelection;
+using infernix::perplexity::DivergenceAggregate;
+using infernix::perplexity::ScoreAggregate;
+using infernix::perplexity::WindowPlan;
 
 struct Options {
     bool help_requested = false;
@@ -56,17 +56,17 @@ struct Options {
     std::uint32_t stride                = 2048;
     std::optional<std::uint32_t> prefill_chunk;
     int device                          = 0;
-    ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    infernix::KvCacheStorage kv           = infernix::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     bool original_int8_prefill_kernel   = false;
-    ninfer::PrefillPv8 prefill_8bit_pv          = ninfer::PrefillPv8::Auto;
+    infernix::PrefillPv8 prefill_8bit_pv          = infernix::PrefillPv8::Auto;
     bool original_nvfp4_prefill_kernel  = false;
     bool a16_activations                = false;
-    ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
+    infernix::product::LogLevel log_level = infernix::product::LogLevel::Info;
 };
 
 std::string usage_text() {
-    return "usage: ninfer-perplexity <model.ninfer> "
+    return "usage: infernix-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--prefill-chunk N] (tokens per scoring prefill pass, a multiple of 128;\n"
@@ -75,7 +75,7 @@ std::string usage_text() {
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2] (default fp8)\n"
            "       [--use-original-int8-prefill-kernel (int8 only; default fast kernel)]\n"
            "       [--prefill-8bit-pv | --no-prefill-8bit-pv] (8-bit P*V for INT8 and K4V2;\n"
-           "        FP16 for NVFP4, K8V4 and VQ2, which default to 8-bit; see ninfer-serve)\n"
+           "        FP16 for NVFP4, K8V4 and VQ2, which default to 8-bit; see infernix-serve)\n"
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--a16-activations] (16-bit activations in every linear: the reference for\n"
            "        measuring activation quantization; at least 3x slower on NVFP4 artifacts)\n"
@@ -122,7 +122,7 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--quick") {
             out.quick = true;
         } else if (option == "--rope-yarn-factor") {
-            out.rope_yarn_factor = ninfer::product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
+            out.rope_yarn_factor = infernix::product::parse_rope_yarn_factor(value("--rope-yarn-factor"));
         } else if (option == "--context") {
             out.context = parse_integer<std::uint32_t>(value("--context"), "context");
         } else if (option == "--stride") {
@@ -134,9 +134,9 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--use-original-int8-prefill-kernel") {
             out.original_int8_prefill_kernel = true;
         } else if (option == "--prefill-8bit-pv") {
-            out.prefill_8bit_pv = ninfer::PrefillPv8::On;
+            out.prefill_8bit_pv = infernix::PrefillPv8::On;
         } else if (option == "--no-prefill-8bit-pv") {
-            out.prefill_8bit_pv = ninfer::PrefillPv8::Off;
+            out.prefill_8bit_pv = infernix::PrefillPv8::Off;
         } else if (option == "--use-original-nvfp4-prefill-kernel") {
             out.original_nvfp4_prefill_kernel = true;
         } else if (option == "--a16-activations") {
@@ -144,19 +144,19 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
-                out.kv = ninfer::KvCacheStorage::BFloat16;
+                out.kv = infernix::KvCacheStorage::BFloat16;
             } else if (dtype == "int8") {
-                out.kv = ninfer::KvCacheStorage::Int8Group64;
+                out.kv = infernix::KvCacheStorage::Int8Group64;
             } else if (dtype == "fp8") {
-                out.kv = ninfer::KvCacheStorage::Fp8E4M3Row256;
+                out.kv = infernix::KvCacheStorage::Fp8E4M3Row256;
             } else if (dtype == "nvfp4") {
-                out.kv = ninfer::KvCacheStorage::Nvfp4Group16;
+                out.kv = infernix::KvCacheStorage::Nvfp4Group16;
             } else if (dtype == "k8v4") {
-                out.kv = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+                out.kv = infernix::KvCacheStorage::Fp8KeyNvfp4Value;
             } else if (dtype == "vq2") {
-                out.kv = ninfer::KvCacheStorage::Vq2;
+                out.kv = infernix::KvCacheStorage::Vq2;
             } else if (dtype == "k4v2") {
-                out.kv = ninfer::KvCacheStorage::Q4KeyVq2Value;
+                out.kv = infernix::KvCacheStorage::Q4KeyVq2Value;
             } else {
                 usage_error("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, vq2, or k4v2");
             }
@@ -167,7 +167,7 @@ Options parse_options(int argc, char** argv) {
         } else if (option == "--kl-reference") {
             out.kl_reference = std::filesystem::path(value("--kl-reference"));
         } else if (option == "--log-level") {
-            out.log_level = ninfer::product::parse_log_level(value("--log-level"));
+            out.log_level = infernix::product::parse_log_level(value("--log-level"));
         } else {
             usage_error("unknown option: " + std::string(option));
         }
@@ -182,21 +182,21 @@ Options parse_options(int argc, char** argv) {
     return out;
 }
 
-std::string kv_name(ninfer::KvCacheStorage value) {
+std::string kv_name(infernix::KvCacheStorage value) {
     switch (value) {
-    case ninfer::KvCacheStorage::BFloat16:
+    case infernix::KvCacheStorage::BFloat16:
         return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
+    case infernix::KvCacheStorage::Int8Group64:
         return "int8-g64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+    case infernix::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-r256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
+    case infernix::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
-    case ninfer::KvCacheStorage::Vq2:
+    case infernix::KvCacheStorage::Vq2:
         return "vq2";
-    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+    case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
     }
     throw std::logic_error("unknown KV dtype");
@@ -226,7 +226,7 @@ std::string timestamp() {
 }
 
 std::filesystem::path prepare_output_directory(const Options& options,
-                                               const ninfer::LoadSummary& load,
+                                               const infernix::LoadSummary& load,
                                                const CorpusSelection& corpus) {
     std::filesystem::path output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
@@ -256,18 +256,18 @@ json aggregate_json(const ScoreAggregate& value) {
 }
 
 struct EvaluationStream {
-    ninfer::perplexity::CorpusStream source;
-    std::vector<ninfer::TokenId> tokens;
+    infernix::perplexity::CorpusStream source;
+    std::vector<infernix::TokenId> tokens;
     std::vector<WindowPlan> windows;
 };
 
 int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
-        ninfer::product::StartupLogRenderer& startup_log,
-        const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
+        infernix::product::StartupLogRenderer& startup_log,
+        const std::shared_ptr<infernix::product::TerminalProgress>& progress) {
     const Clock::time_point total_started = Clock::now();
-    ninfer::EngineOptions engine_options;
+    infernix::EngineOptions engine_options;
     engine_options.artifact_path    = options.artifact;
-    engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
+    engine_options.purpose          = infernix::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
     engine_options.rope_yarn_factor  = options.rope_yarn_factor;
@@ -278,28 +278,28 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
     engine_options.a16_activations               = options.a16_activations;
     engine_options.startup_observer = startup_log.observer();
-    engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
-    ninfer::Engine engine(std::move(engine_options));
-    const ninfer::LoadSummary load = engine.load_summary();
+    engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
+    infernix::Engine engine(std::move(engine_options));
+    const infernix::LoadSummary load = engine.load_summary();
     startup_log.engine_ready(load);
 
     const Clock::time_point preflight_started = Clock::now();
     logger->info("preparing corpus");
     CorpusSelection corpus = options.corpus
-                                 ? ninfer::perplexity::load_corpus(*options.corpus, options.quick)
-                                 : ninfer::perplexity::load_custom_text(*options.text);
+                                 ? infernix::perplexity::load_corpus(*options.corpus, options.quick)
+                                 : infernix::perplexity::load_custom_text(*options.text);
     std::vector<EvaluationStream> streams;
     streams.reserve(corpus.streams.size());
     std::uint64_t total_scored_tokens = 0;
     std::uint64_t total_input_tokens  = 0;
     std::uint64_t total_windows       = 0;
     for (auto& source : corpus.streams) {
-        std::vector<ninfer::TokenId> tokens = engine.tokenize_text(source.text);
+        std::vector<infernix::TokenId> tokens = engine.tokenize_text(source.text);
         if (tokens.size() < 2) {
             throw std::runtime_error("stream tokenized to fewer than two tokens: " + source.id);
         }
         std::vector<WindowPlan> windows =
-            ninfer::perplexity::plan_windows(tokens.size(), options.context, options.stride);
+            infernix::perplexity::plan_windows(tokens.size(), options.context, options.stride);
         total_input_tokens += static_cast<std::uint64_t>(tokens.size());
         total_scored_tokens += static_cast<std::uint64_t>(tokens.size() - 1);
         total_windows += static_cast<std::uint64_t>(windows.size());
@@ -309,23 +309,23 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     const double preflight_seconds = seconds_since(preflight_started);
     logger->info("corpus ready | {} streams | {} input tokens | {} scored tokens | {} windows | {}",
-                 ninfer::product::format_pretty_count(streams.size()),
-                 ninfer::product::format_pretty_count(total_input_tokens),
-                 ninfer::product::format_pretty_count(total_scored_tokens),
-                 ninfer::product::format_pretty_count(total_windows),
-                 ninfer::product::format_pretty_duration(preflight_seconds));
+                 infernix::product::format_pretty_count(streams.size()),
+                 infernix::product::format_pretty_count(total_input_tokens),
+                 infernix::product::format_pretty_count(total_scored_tokens),
+                 infernix::product::format_pretty_count(total_windows),
+                 infernix::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
-    const ninfer::perplexity::ReferenceHeader reference_header{.corpus_id = corpus.corpus_id,
+    const infernix::perplexity::ReferenceHeader reference_header{.corpus_id = corpus.corpus_id,
                                                                 .mode      = corpus.mode,
                                                                 .context   = options.context,
                                                                 .stride    = options.stride};
-    std::optional<ninfer::perplexity::ReferenceWriter> top_tokens;
+    std::optional<infernix::perplexity::ReferenceWriter> top_tokens;
     if (options.save_top_tokens) { top_tokens.emplace(*options.save_top_tokens, reference_header); }
-    std::optional<ninfer::perplexity::ReferenceReader> kl_reference;
+    std::optional<infernix::perplexity::ReferenceReader> kl_reference;
     if (options.kl_reference) {
         kl_reference.emplace(*options.kl_reference);
-        const ninfer::perplexity::ReferenceHeader& saved = kl_reference->header();
+        const infernix::perplexity::ReferenceHeader& saved = kl_reference->header();
         if (saved.corpus_id != reference_header.corpus_id || saved.mode != reference_header.mode ||
             saved.context != reference_header.context || saved.stride != reference_header.stride) {
             throw std::runtime_error("--kl-reference was recorded for corpus " + saved.corpus_id +
@@ -336,13 +336,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     }
     // The evaluated run's own most probable token, for top-1 agreement.
     const std::uint32_t own_top_tokens =
-        top_tokens ? ninfer::perplexity::kReferenceTopTokens : (kl_reference ? 1U : 0U);
+        top_tokens ? infernix::perplexity::kReferenceTopTokens : (kl_reference ? 1U : 0U);
     DivergenceAggregate overall_divergence;
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
-                 ninfer::product::format_pretty_count(streams.size()),
-                 ninfer::product::format_pretty_count(total_scored_tokens),
-                 ninfer::product::format_pretty_count(total_windows));
+                 infernix::product::format_pretty_count(streams.size()),
+                 infernix::product::format_pretty_count(total_scored_tokens),
+                 infernix::product::format_pretty_count(total_windows));
     Clock::time_point next_progress = scoring_started + std::chrono::seconds(10);
     ScoreAggregate overall;
     std::map<std::string, ScoreAggregate> domains;
@@ -353,9 +353,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         EvaluationStream& stream = streams[stream_index];
         std::ostringstream stream_status;
         stream_status << "  scoring [" << stream_index + 1 << '/' << streams.size() << "] "
-                      << ninfer::product::format_pretty_text(stream.source.id) << " | "
-                      << ninfer::product::format_pretty_count(stream.tokens.size()) << " tokens | "
-                      << ninfer::product::format_pretty_count(stream.windows.size()) << " windows";
+                      << infernix::product::format_pretty_text(stream.source.id) << " | "
+                      << infernix::product::format_pretty_count(stream.tokens.size()) << " tokens | "
+                      << infernix::product::format_pretty_count(stream.windows.size()) << " windows";
         if (progress->enabled()) {
             progress->update(stream_status.str());
         } else {
@@ -367,13 +367,13 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         json window_reports = json::array();
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
-            std::vector<ninfer::TokenId> input(
+            std::vector<infernix::TokenId> input(
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
                 stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
             const Clock::time_point window_started = Clock::now();
-            const std::uint64_t input_hash = ninfer::perplexity::token_fingerprint(input);
-            ninfer::ScoreOptions score_options{.top_k = own_top_tokens};
-            std::optional<ninfer::perplexity::ReferenceWindow> reference;
+            const std::uint64_t input_hash = infernix::perplexity::token_fingerprint(input);
+            infernix::ScoreOptions score_options{.top_k = own_top_tokens};
+            std::optional<infernix::perplexity::ReferenceWindow> reference;
             if (kl_reference) {
                 reference = kl_reference->next();
                 if (reference->stream_index != stream_index ||
@@ -387,7 +387,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 score_options.candidates_per_position = kl_reference->header().top_k;
                 score_options.candidates              = reference->top_ids;
             }
-            ninfer::ScoreResult scored;
+            infernix::ScoreResult scored;
             try {
                 scored = engine.score_tokens(std::move(input), window.first_target,
                                              std::move(score_options));
@@ -422,7 +422,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                     // The predicted token at window input index first_target + position follows
                     // that many tokens of context.
                     stream_divergence.add(window.first_target + position,
-                                          ninfer::perplexity::position_divergence(
+                                          infernix::perplexity::position_divergence(
                                               reference_top, evaluated_top, top1_match,
                                               reference->target_logprobs[position],
                                               logprobs[position]));
@@ -450,8 +450,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 const std::uint64_t remaining = total_scored_tokens - overall.scored_tokens;
                 const double eta = rate > 0 ? static_cast<double>(remaining) / rate : 0.0;
                 std::ostringstream line;
-                line << "scoring | " << ninfer::product::format_pretty_count(overall.scored_tokens)
-                     << '/' << ninfer::product::format_pretty_count(total_scored_tokens)
+                line << "scoring | " << infernix::product::format_pretty_count(overall.scored_tokens)
+                     << '/' << infernix::product::format_pretty_count(total_scored_tokens)
                      << " tokens | " << completed_windows << '/' << total_windows
                      << " windows | PPL " << std::fixed << std::setprecision(4) << overall.ppl();
                 if (kl_reference && stream_divergence.positions() > 0) {
@@ -459,9 +459,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                          << stream_divergence.mean_kl() << std::fixed;
                 }
                 line
-                     << " | " << ninfer::product::format_pretty_rate(rate, "tok") << " | elapsed "
-                     << ninfer::product::format_pretty_duration(elapsed) << " | ETA "
-                     << ninfer::product::format_pretty_duration(eta);
+                     << " | " << infernix::product::format_pretty_rate(rate, "tok") << " | elapsed "
+                     << infernix::product::format_pretty_duration(elapsed) << " | ETA "
+                     << infernix::product::format_pretty_duration(eta);
                 if (progress->enabled()) {
                     progress->update("  " + line.str());
                 } else {
@@ -473,14 +473,14 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         const double stream_seconds = seconds_since(stream_started);
         progress->clear();
         logger->info("[{}/{}] {} | {} scored tokens | PPL {:.6g} | {}", stream_index + 1,
-                     streams.size(), ninfer::product::format_pretty_text(stream.source.id),
-                     ninfer::product::format_pretty_count(stream_score.scored_tokens),
-                     stream_score.ppl(), ninfer::product::format_pretty_duration(stream_seconds));
+                     streams.size(), infernix::product::format_pretty_text(stream.source.id),
+                     infernix::product::format_pretty_count(stream_score.scored_tokens),
+                     stream_score.ppl(), infernix::product::format_pretty_duration(stream_seconds));
         json stream_report               = aggregate_json(stream_score);
         if (kl_reference) {
             logger->info("[{}/{}] {} | KL {:.4e} | top-1 agreement {:.4f} | by context {}",
                          stream_index + 1, streams.size(),
-                         ninfer::product::format_pretty_text(stream.source.id),
+                         infernix::product::format_pretty_text(stream.source.id),
                          stream_divergence.mean_kl(), stream_divergence.top1_agreement(),
                          stream_divergence.bucket_summary());
             stream_report["kl_divergence"] = stream_divergence.to_json();
@@ -501,9 +501,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     if (top_tokens) { top_tokens->finish(); }
     if (kl_reference) { kl_reference->finish(); }
     logger->info("scoring complete | {} tokens | {} windows | PPL {:.6g} | {} | {}",
-                 ninfer::product::format_pretty_count(overall.scored_tokens), completed_windows,
-                 overall.ppl(), ninfer::product::format_pretty_duration(scoring_seconds),
-                 ninfer::product::format_pretty_rate(
+                 infernix::product::format_pretty_count(overall.scored_tokens), completed_windows,
+                 overall.ppl(), infernix::product::format_pretty_duration(scoring_seconds),
+                 infernix::product::format_pretty_rate(
                      static_cast<double>(overall.scored_tokens) / scoring_seconds, "tok"));
     json domain_reports = json::array();
     for (const auto& [domain, aggregate] : domains) {
@@ -533,7 +533,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"context_tokens", options.context},
           {"rope_yarn_factor", options.rope_yarn_factor},
           {"original_int8_prefill_kernel", options.original_int8_prefill_kernel},
-          {"prefill_8bit_pv", ninfer::prefill_pv8_name(options.prefill_8bit_pv)},
+          {"prefill_8bit_pv", infernix::prefill_pv8_name(options.prefill_8bit_pv)},
           {"original_nvfp4_prefill_kernel", options.original_nvfp4_prefill_kernel},
           {"a16_activations", options.a16_activations},
           {"stride_tokens", options.stride},
@@ -553,7 +553,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     };
     if (top_tokens) {
         report["top_tokens"] = {{"path", std::filesystem::absolute(*options.save_top_tokens).string()},
-                                {"per_position", ninfer::perplexity::kReferenceTopTokens}};
+                                {"per_position", infernix::perplexity::kReferenceTopTokens}};
     }
     if (kl_reference) {
         json divergence         = overall_divergence.to_json();
@@ -610,7 +610,7 @@ int main(int argc, char** argv) {
     try {
         options = parse_options(argc, argv);
     } catch (const std::exception& error) {
-        std::cerr << "ninfer-perplexity: " << error.what() << '\n';
+        std::cerr << "infernix-perplexity: " << error.what() << '\n';
         std::cerr << usage_text();
         return 1;
     }
@@ -619,20 +619,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    ninfer::product::LoggingRuntime logging(
-        {.logger_name  = "ninfer-perplexity",
+    infernix::product::LoggingRuntime logging(
+        {.logger_name  = "infernix-perplexity",
          .level        = options.log_level,
-         .presentation = ninfer::product::LogPresentation::Tool});
+         .presentation = infernix::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-#ifdef NINFER_BUILD_ID
-    logger->info("build {}", NINFER_BUILD_ID);
+#ifdef INFERNIX_BUILD_ID
+    logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
-    ninfer::product::StartupLogRenderer startup_log(logging);
+    infernix::product::StartupLogRenderer startup_log(logging);
     try {
         return run(options, logger, startup_log, logging.terminal_progress());
     } catch (const std::exception& error) {
         logging.terminal_progress()->clear();
-        logger->error("{}", ninfer::product::format_pretty_text(error.what()));
+        logger->error("{}", infernix::product::format_pretty_text(error.what()));
         return 1;
     }
 }

@@ -9,7 +9,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 using expert_cache::CacheController;
@@ -664,4 +664,4 @@ void ExpertResidency::issue_loads(cudaStream_t compute) {
     }
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

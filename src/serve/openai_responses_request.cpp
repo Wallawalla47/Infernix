@@ -12,7 +12,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = RequestJson;
@@ -116,9 +116,9 @@ std::string item_id(const Json& item, const char* prefix) {
     return item.at("id").get<std::string>();
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+infernix::product::media_acquire::Source parse_image_source(const Json& part) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
-        bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
+        bad_request("input_image.file_id requires a Files API, which Infernix does not provide",
                     "input", "file_inputs_not_supported");
     }
     if (!part.contains("image_url") || !part.at("image_url").is_string() ||
@@ -135,29 +135,29 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         }
     }
 
-    ninfer::product::media_acquire::Source source;
+    infernix::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = infernix::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = infernix::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
     }
     return source;
 }
 
-ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
+infernix::product::media_acquire::Source parse_video_source(const Json& part) {
     if (!part.contains("video_url") || !part.at("video_url").is_string() ||
         part.at("video_url").get_ref<const std::string&>().empty()) {
         bad_request("input_video must contain a non-empty video_url", "input");
     }
-    ninfer::product::media_acquire::Source source;
+    infernix::product::media_acquire::Source source;
     source.value = part.at("video_url").get<std::string>();
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = infernix::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = infernix::product::media_acquire::SourceKind::Url;
     } else {
         bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
     }
@@ -280,7 +280,7 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         return;
     }
     if (type == "input_file") {
-        bad_request("input_file requires a Files API, which NInfer does not provide", "input",
+        bad_request("input_file requires a Files API, which Infernix does not provide", "input",
                     "file_inputs_not_supported");
     }
     if (type == "input_audio") {
@@ -660,7 +660,7 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
             assistant.flush(out.input_turns);
             out.input_turns.push_back(std::move(result));
         } else if (type == "input_file") {
-            bad_request("input_file requires a Files API, which NInfer does not provide", "input",
+            bad_request("input_file requires a Files API, which Infernix does not provide", "input",
                         "file_inputs_not_supported");
         } else {
             bad_request("unsupported input Item type: " + type, "input", "item_type_not_supported");
@@ -812,11 +812,11 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
         }
         if (type != "namespace") {
             bad_request("tool type '" + type +
-                            "' requires an executor that NInfer does not provide",
+                            "' requires an executor that Infernix does not provide",
                         "tools", "tool_type_not_supported");
         }
 
-        // OpenAI Responses beta groups functions/custom tools under a namespace. NInfer lowers
+        // OpenAI Responses beta groups functions/custom tools under a namespace. Infernix lowers
         // only nested functions because custom tools require unsupported free-form decoding.
         reject_nonnull_unknown_members(item, namespace_members, "tools");
         const std::string namespace_name = require_namespace_tool_name(item);
@@ -1297,4 +1297,4 @@ parse_openai_responses_input_tokens_request(const Json& body, const RequestLimit
     return std::move(parsed.prompt);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

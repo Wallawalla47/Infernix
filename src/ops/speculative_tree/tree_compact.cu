@@ -1,10 +1,10 @@
-// ninfer::ops - moving an accepted verification-tree path onto the main-chain columns.
-#include "ninfer/ops/speculative_tree.h"
+// infernix::ops - moving an accepted verification-tree path onto the main-chain columns.
+#include "infernix/ops/speculative_tree.h"
 
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
 #include "core/pdl.cuh"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/kv_window.cuh"
 
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr int kCompactThreads   = 256;
@@ -317,4 +317,4 @@ void speculative_tree_compact_kv(const PagedKVBatchLayerView* layers, std::int32
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

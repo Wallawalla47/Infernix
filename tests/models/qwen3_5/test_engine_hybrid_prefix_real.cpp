@@ -1,8 +1,8 @@
 // Real-artifact scenarios for the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
-// §13.3). Requires NINFER_TEST_ARTIFACT; NINFER_HYBRID_REAL_SCENARIO selects one scenario.
+// §13.3). Requires INFERNIX_TEST_ARTIFACT; INFERNIX_HYBRID_REAL_SCENARIO selects one scenario.
 
 #include "kv_cache_storage.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <array>
@@ -29,48 +29,48 @@ constexpr std::uint32_t kPrefillChunk = 512;
 // Tokens per cached KV block.
 constexpr std::uint32_t kBlock = 64;
 
-// NINFER_HYBRID_KV_DTYPE selects the KV storage every scenario runs with (default bf16), so the
+// INFERNIX_HYBRID_KV_DTYPE selects the KV storage every scenario runs with (default bf16), so the
 // Host tier's page records and restores are exercised for each profile.
-ninfer::KvCacheStorage kv_storage = ninfer::KvCacheStorage::BFloat16;
+infernix::KvCacheStorage kv_storage = infernix::KvCacheStorage::BFloat16;
 
 // Deterministic ordinary-vocabulary tokens; the content only has to be reproducible.
-std::vector<ninfer::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
-    std::vector<ninfer::TokenId> tokens;
+std::vector<infernix::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
+    std::vector<infernix::TokenId> tokens;
     tokens.reserve(count);
     std::uint32_t state = seed * 2654435761U + 1U;
     for (std::size_t index = 0; index < count; ++index) {
         state = state * 1664525U + 1013904223U;
-        tokens.push_back(static_cast<ninfer::TokenId>(1000U + (state >> 8U) % 30000U));
+        tokens.push_back(static_cast<infernix::TokenId>(1000U + (state >> 8U) % 30000U));
     }
     return tokens;
 }
 
-ninfer::EngineOptions hybrid_options(const char* artifact, ninfer::SpeculativeBackend backend,
+infernix::EngineOptions hybrid_options(const char* artifact, infernix::SpeculativeBackend backend,
                                      std::uint32_t kv_tokens, std::size_t host_bytes,
                                      std::uint32_t device_slots) {
-    ninfer::EngineOptions options;
+    infernix::EngineOptions options;
     options.artifact_path        = artifact;
     options.max_context          = 4096;
-    options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(kv_tokens);
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(kv_tokens);
     options.prefill_chunk        = kPrefillChunk;
     options.kv_cache             = kv_storage;
     options.speculative.backend  = backend;
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
-    if (backend == ninfer::SpeculativeBackend::Mtp) {
+    if (backend == infernix::SpeculativeBackend::Mtp) {
         options.speculative.draft_tokens  = 3;
-        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
-    } else if (backend == ninfer::SpeculativeBackend::DFlash2) {
+        options.speculative.proposal_head = infernix::ProposalHead::Optimized;
+    } else if (backend == infernix::SpeculativeBackend::DFlash2) {
         options.speculative.draft_tokens = 7;
     }
-    options.context_cache.mode                         = ninfer::ContextCacheMode::Hybrid;
+    options.context_cache.mode                         = infernix::ContextCacheMode::Hybrid;
     options.context_cache.host_capacity_bytes          = host_bytes;
     options.context_cache.hybrid.device_snapshot_slots = device_slots;
     return options;
 }
 
-ninfer::RequestOptions greedy(std::uint32_t outputs) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions greedy(std::uint32_t outputs) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = true;
@@ -82,16 +82,16 @@ template <typename Call>
 bool fails_unavailable(Call&& call) {
     try {
         std::forward<Call>(call)();
-    } catch (const ninfer::RequestError& error) {
-        return error.kind() == ninfer::RequestErrorKind::Unavailable;
+    } catch (const infernix::RequestError& error) {
+        return error.kind() == infernix::RequestErrorKind::Unavailable;
     }
     return false;
 }
 
 struct Observed {
-    std::vector<ninfer::TokenId> tokens;
+    std::vector<infernix::TokenId> tokens;
     std::uint32_t reused = 0;
-    ninfer::RuntimeStats stats;
+    infernix::RuntimeStats stats;
 };
 
 // A later request restores a flexible prompt-tail snapshot the first request captured at its last
@@ -99,20 +99,20 @@ struct Observed {
 // constrained engine is first forced to evict the snapshot image and most of its blocks, so the
 // same snapshot comes back through the Host slabs. Both restores carry identical bytes and resume
 // at the same frontier with the same chunking, so greedy generation must match token for token.
-int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend backend) {
-    const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 1);
-    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 2);
+int exercise_restore_exact(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 1);
+    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 2);
     second.insert(second.end(), suffix.begin(), suffix.end());
     // 3900 prompt tokens need 61 of the constrained engine's 64 pages, evicting all but the
     // first few of the first request's cached blocks.
-    const std::vector<ninfer::TokenId> pressure = synthetic_tokens(3900, 3);
+    const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 3);
 
-    const auto run = [&](ninfer::EngineOptions options, bool apply_pressure) {
-        ninfer::Engine engine(std::move(options));
+    const auto run = [&](infernix::EngineOptions options, bool apply_pressure) {
+        infernix::Engine engine(std::move(options));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         if (apply_pressure) { (void)engine.generate(engine.prepare_tokens(pressure), greedy(4)); }
-        const ninfer::GenerationResult result =
+        const infernix::GenerationResult result =
             engine.generate(engine.prepare_tokens(second), greedy(24));
         return Observed{result.generated_token_ids, result.reused_prompt_tokens,
                         engine.runtime_stats()};
@@ -154,16 +154,16 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
 // the previous file and leaves no temporary one.
 int exercise_persist(const char* artifact) {
     const std::filesystem::path file =
-        std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test.bin";
+        std::filesystem::temp_directory_path() / "infernix-hybrid-persist-real-test.bin";
     std::error_code ignored;
     std::filesystem::remove(file, ignored);
-    const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 4);
-    std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
-    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 5);
+    const std::vector<infernix::TokenId> first = synthetic_tokens(1500, 4);
+    std::vector<infernix::TokenId> second(first.begin(), first.begin() + 1400);
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(300, 5);
     second.insert(second.end(), suffix.begin(), suffix.end());
     const auto options = [&](const char* identity) {
-        ninfer::EngineOptions result =
-            hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+        infernix::EngineOptions result =
+            hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
         if (identity != nullptr) {
             result.context_cache.hybrid.persistent_file     = file;
             result.context_cache.hybrid.persistent_identity = identity;
@@ -171,20 +171,20 @@ int exercise_persist(const char* artifact) {
         return result;
     };
 
-    std::vector<ninfer::TokenId> reference;
+    std::vector<infernix::TokenId> reference;
     {
-        ninfer::Engine engine(options(nullptr));
+        infernix::Engine engine(options(nullptr));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
     }
     int failures = 0;
     {
-        // The Engine stops the way ninfer-serve does: stop() while a generation is still far from
+        // The Engine stops the way infernix-serve does: stop() while a generation is still far from
         // its output limit. It fails as Unavailable instead of running on, new work is refused,
         // and the Host tier is still saved.
-        ninfer::Engine saver(options("persist-test"));
+        infernix::Engine saver(options("persist-test"));
         (void)saver.generate(saver.prepare_tokens(first), greedy(8));
-        ninfer::GenerationHandle running =
+        infernix::GenerationHandle running =
             saver.submit(saver.prepare_tokens(synthetic_tokens(200, 6)), greedy(3500));
         std::this_thread::sleep_for(std::chrono::seconds(2));
         saver.stop();
@@ -210,15 +210,15 @@ int exercise_persist(const char* artifact) {
     }
     // The saver's file, for the smaller Host tier below (the loader saves over `file`).
     const std::filesystem::path partial =
-        std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test-partial.bin";
+        std::filesystem::temp_directory_path() / "infernix-hybrid-persist-real-test-partial.bin";
     std::filesystem::copy_file(file, partial, std::filesystem::copy_options::overwrite_existing);
     // The file read is published as one startup phase: the whole file, never a failure (a failed
     // phase would be logged as a failed startup).
-    std::vector<ninfer::StartupEvent> load_events;
-    const auto observe = [&](ninfer::EngineOptions result) {
+    std::vector<infernix::StartupEvent> load_events;
+    const auto observe = [&](infernix::EngineOptions result) {
         load_events.clear();
-        result.startup_observer.callback = [&](const ninfer::StartupEvent& event) {
-            if (event.phase == ninfer::StartupPhase::PrefixCacheLoad) {
+        result.startup_observer.callback = [&](const infernix::StartupEvent& event) {
+            if (event.phase == infernix::StartupPhase::PrefixCacheLoad) {
                 load_events.push_back(event);
             }
         };
@@ -232,30 +232,30 @@ int exercise_persist(const char* artifact) {
                         load_events[index].current <= expected_bytes;
         }
         return load_events.size() >= 2 &&
-               load_events.front().status == ninfer::StartupStatus::Begin &&
+               load_events.front().status == infernix::StartupStatus::Begin &&
                load_events.front().total == expected_bytes &&
-               load_events.back().status == ninfer::StartupStatus::Complete &&
+               load_events.back().status == infernix::StartupStatus::Complete &&
                load_events.back().current == expected_bytes && monotonic &&
                std::all_of(load_events.begin() + 1, load_events.end() - 1,
-                           [](const ninfer::StartupEvent& event) {
-                               return event.status == ninfer::StartupStatus::Progress;
+                           [](const infernix::StartupEvent& event) {
+                               return event.status == infernix::StartupStatus::Progress;
                            });
     };
     std::uint64_t required_host_bytes = 0;
     std::uint64_t saved_snapshots     = 0;
     {
         const std::uint64_t file_bytes = std::filesystem::file_size(file);
-        ninfer::Engine loader(observed("persist-test"));
+        infernix::Engine loader(observed("persist-test"));
         if (!one_phase(file_bytes)) {
             std::cerr << "persist: the file read was not published as one complete phase ("
                       << load_events.size() << " events)\n";
             ++failures;
         }
-        const ninfer::LoadSummary summary = loader.load_summary();
-        const ninfer::GenerationResult resumed =
+        const infernix::LoadSummary summary = loader.load_summary();
+        const infernix::GenerationResult resumed =
             loader.generate(loader.prepare_tokens(second), greedy(24));
-        const ninfer::RuntimeStats stats                     = loader.runtime_stats();
-        const ninfer::LoadSummary::PrefixCacheRestore& cache = summary.prefix_cache;
+        const infernix::RuntimeStats stats                     = loader.runtime_stats();
+        const infernix::LoadSummary::PrefixCacheRestore& cache = summary.prefix_cache;
         if (!cache.restored || cache.snapshots == 0 || cache.snapshots != cache.saved_snapshots ||
             cache.blocks != cache.saved_blocks || cache.required_host_bytes > cache.host_bytes) {
             std::cerr << "persist: the saved Host tier was not wholly restored (" << cache.message
@@ -276,8 +276,8 @@ int exercise_persist(const char* artifact) {
         }
     }
     {
-        ninfer::Engine foreign(observed("another-build"));
-        const ninfer::LoadSummary summary = foreign.load_summary();
+        infernix::Engine foreign(observed("another-build"));
+        const infernix::LoadSummary summary = foreign.load_summary();
         if (!load_events.empty()) {
             std::cerr << "persist: a file from another build published a load phase\n";
             ++failures;
@@ -295,13 +295,13 @@ int exercise_persist(const char* artifact) {
     } else {
         // One slab short of the file: whole snapshots are dropped, never all of them, and only the
         // chosen entries are read.
-        ninfer::EngineOptions small                    = observe(hybrid_options(
-            artifact, ninfer::SpeculativeBackend::None, 16384, required_host_bytes - 1, 8));
+        infernix::EngineOptions small                    = observe(hybrid_options(
+            artifact, infernix::SpeculativeBackend::None, 16384, required_host_bytes - 1, 8));
         small.context_cache.hybrid.persistent_file     = partial;
         small.context_cache.hybrid.persistent_identity = "persist-test";
         const std::uint64_t file_bytes                 = std::filesystem::file_size(partial);
-        ninfer::Engine engine(std::move(small));
-        const ninfer::LoadSummary::PrefixCacheRestore cache = engine.load_summary().prefix_cache;
+        infernix::Engine engine(std::move(small));
+        const infernix::LoadSummary::PrefixCacheRestore cache = engine.load_summary().prefix_cache;
         if (!cache.restored || cache.snapshots == 0 || cache.snapshots >= cache.saved_snapshots ||
             cache.blocks > cache.saved_blocks || cache.required_host_bytes <= cache.host_bytes) {
             std::cerr << "persist: a smaller Host tier restored " << cache.snapshots << " of "
@@ -315,7 +315,7 @@ int exercise_persist(const char* artifact) {
         }
         (void)engine.generate(engine.prepare_tokens(second), greedy(4));
     }
-    // A Ctrl+C during ninfer-serve's stop abandons the save: the unfinished file is deleted and
+    // A Ctrl+C during infernix-serve's stop abandons the save: the unfinished file is deleted and
     // the previous file stays as it was, whether the save was writing or had not begun.
     std::filesystem::path temporary = file;
     temporary += ".tmp";
@@ -326,13 +326,13 @@ int exercise_persist(const char* artifact) {
                std::filesystem::file_size(file, error) == bytes &&
                std::filesystem::last_write_time(file, error) == time;
     };
-    using Abandon = ninfer::PrefixCacheSaveControl::Abandon;
+    using Abandon = infernix::PrefixCacheSaveControl::Abandon;
     {
-        ninfer::EngineOptions writing                = options("persist-test");
-        const ninfer::PrefixCacheSaveControl control = writing.context_cache.hybrid.persistent_save;
+        infernix::EngineOptions writing                = options("persist-test");
+        const infernix::PrefixCacheSaveControl control = writing.context_cache.hybrid.persistent_save;
         std::optional<Abandon> result;
         {
-            ninfer::Engine engine(std::move(writing));
+            infernix::Engine engine(std::move(writing));
             (void)engine.generate(engine.prepare_tokens(first), greedy(8));
             std::thread interrupt([&] {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
@@ -351,11 +351,11 @@ int exercise_persist(const char* artifact) {
         }
     }
     {
-        ninfer::EngineOptions early                  = options("persist-test");
-        const ninfer::PrefixCacheSaveControl control = early.context_cache.hybrid.persistent_save;
+        infernix::EngineOptions early                  = options("persist-test");
+        const infernix::PrefixCacheSaveControl control = early.context_cache.hybrid.persistent_save;
         Abandon result                               = Abandon::StillWriting;
         {
-            ninfer::Engine engine(std::move(early));
+            infernix::Engine engine(std::move(early));
             (void)engine.generate(engine.prepare_tokens(first), greedy(8));
             result = control.abandon(std::chrono::milliseconds(0));
         }
@@ -377,28 +377,28 @@ int exercise_persist(const char* artifact) {
 //   uncached run's.
 // - Inside a block, the snapshot goes on the block boundary below, where it publishes at once.
 int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool compare_output) {
-    const std::vector<ninfer::TokenId> shared        = synthetic_tokens(shared_tokens, 6);
-    std::vector<ninfer::TokenId> first               = shared;
-    std::vector<ninfer::TokenId> second              = shared;
-    const std::vector<ninfer::TokenId> first_suffix  = synthetic_tokens(40, 7);
-    const std::vector<ninfer::TokenId> second_suffix = synthetic_tokens(40, 8);
+    const std::vector<infernix::TokenId> shared        = synthetic_tokens(shared_tokens, 6);
+    std::vector<infernix::TokenId> first               = shared;
+    std::vector<infernix::TokenId> second              = shared;
+    const std::vector<infernix::TokenId> first_suffix  = synthetic_tokens(40, 7);
+    const std::vector<infernix::TokenId> second_suffix = synthetic_tokens(40, 8);
     first.insert(first.end(), first_suffix.begin(), first_suffix.end());
     second.insert(second.end(), second_suffix.begin(), second_suffix.end());
     const std::uint32_t expected = shared_tokens / kBlock * kBlock;
 
-    ninfer::EngineOptions options =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
     options.max_concurrency = 2;
-    std::vector<ninfer::TokenId> reference;
+    std::vector<infernix::TokenId> reference;
     if (compare_output) {
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         reference = engine.generate(engine.prepare_tokens(second), greedy(16)).generated_token_ids;
     }
-    ninfer::Engine engine(options);
-    ninfer::GenerationHandle leader    = engine.submit(engine.prepare_tokens(first), greedy(1));
-    ninfer::GenerationHandle follower  = engine.submit(engine.prepare_tokens(second), greedy(16));
-    const ninfer::GenerationResult led = leader.wait();
-    const ninfer::GenerationResult followed = follower.wait();
+    infernix::Engine engine(options);
+    infernix::GenerationHandle leader    = engine.submit(engine.prepare_tokens(first), greedy(1));
+    infernix::GenerationHandle follower  = engine.submit(engine.prepare_tokens(second), greedy(16));
+    const infernix::GenerationResult led = leader.wait();
+    const infernix::GenerationResult followed = follower.wait();
     int failures                            = 0;
     if (led.reused_prompt_tokens != 0 || followed.reused_prompt_tokens != expected) {
         std::cerr << "coalesce " << shared_tokens << ": the leader reused "
@@ -419,24 +419,24 @@ int exercise_coalesce(const char* artifact, std::uint32_t shared_tokens, bool co
 // generate what it generates alone. The second stops after its first token so the first decodes
 // alone, as in its reference.
 int exercise_interleaved(const char* artifact) {
-    const std::vector<ninfer::TokenId> first  = synthetic_tokens(3 * kPrefillChunk + 100, 9);
-    const std::vector<ninfer::TokenId> second = synthetic_tokens(3 * kPrefillChunk + 60, 10);
-    ninfer::EngineOptions options =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    const std::vector<infernix::TokenId> first  = synthetic_tokens(3 * kPrefillChunk + 100, 9);
+    const std::vector<infernix::TokenId> second = synthetic_tokens(3 * kPrefillChunk + 60, 10);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
     options.max_concurrency = 2;
-    std::vector<ninfer::TokenId> first_alone;
-    std::vector<ninfer::TokenId> second_alone;
+    std::vector<infernix::TokenId> first_alone;
+    std::vector<infernix::TokenId> second_alone;
     {
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         first_alone = engine.generate(engine.prepare_tokens(first), greedy(16)).generated_token_ids;
         second_alone =
             engine.generate(engine.prepare_tokens(second), greedy(1)).generated_token_ids;
     }
-    ninfer::Engine engine(options);
-    ninfer::GenerationHandle a = engine.submit(engine.prepare_tokens(first), greedy(16));
-    ninfer::GenerationHandle b = engine.submit(engine.prepare_tokens(second), greedy(1));
-    const ninfer::GenerationResult first_together  = a.wait();
-    const ninfer::GenerationResult second_together = b.wait();
+    infernix::Engine engine(options);
+    infernix::GenerationHandle a = engine.submit(engine.prepare_tokens(first), greedy(16));
+    infernix::GenerationHandle b = engine.submit(engine.prepare_tokens(second), greedy(1));
+    const infernix::GenerationResult first_together  = a.wait();
+    const infernix::GenerationResult second_together = b.wait();
     int failures                                   = 0;
     if (first_together.generated_token_ids != first_alone ||
         second_together.generated_token_ids != second_alone) {
@@ -453,17 +453,17 @@ int exercise_interleaved(const char* artifact) {
 // Requests cancellation once the first prefill chunk is reported. Non-final prefill steps return
 // without waiting for the Device, so the cancellation usually reaches the Program with a later
 // chunk still queued.
-class CancelAfterFirstChunk final : public ninfer::OutputSink {
+class CancelAfterFirstChunk final : public infernix::OutputSink {
 public:
-    void start(ninfer::GenerationStart) override {}
+    void start(infernix::GenerationStart) override {}
 
-    void progress(ninfer::PromptProgress progress) override {
+    void progress(infernix::PromptProgress progress) override {
         if (progress.processed_prompt_tokens != 0) { requested_.store(true); }
     }
 
-    void timing(ninfer::GenerationTimingObservation) override {}
+    void timing(infernix::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta) override {}
+    void publish(infernix::OutputDelta) override {}
 
     [[nodiscard]] bool requested() const { return requested_.load(); }
 
@@ -475,39 +475,39 @@ private:
 // next request, on an unrelated prompt, must generate what it generates on an Engine that never
 // saw the cancellation, and a request extending the cancelled prompt must resume from that prefix
 // and generate what an uncached run generates.
-int exercise_cancel_prefill(const char* artifact, ninfer::SpeculativeBackend backend) {
-    const std::vector<ninfer::TokenId> prompt = synthetic_tokens(6 * kPrefillChunk + 100, 11);
-    std::vector<ninfer::TokenId> extended     = prompt;
-    const std::vector<ninfer::TokenId> suffix = synthetic_tokens(60, 12);
+int exercise_cancel_prefill(const char* artifact, infernix::SpeculativeBackend backend) {
+    const std::vector<infernix::TokenId> prompt = synthetic_tokens(6 * kPrefillChunk + 100, 11);
+    std::vector<infernix::TokenId> extended     = prompt;
+    const std::vector<infernix::TokenId> suffix = synthetic_tokens(60, 12);
     extended.insert(extended.end(), suffix.begin(), suffix.end());
-    const std::vector<ninfer::TokenId> unrelated = synthetic_tokens(2 * kPrefillChunk + 30, 13);
-    const ninfer::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
+    const std::vector<infernix::TokenId> unrelated = synthetic_tokens(2 * kPrefillChunk + 30, 13);
+    const infernix::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
 
-    std::vector<ninfer::TokenId> extended_uncached;
-    std::vector<ninfer::TokenId> unrelated_alone;
+    std::vector<infernix::TokenId> extended_uncached;
+    std::vector<infernix::TokenId> unrelated_alone;
     {
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         extended_uncached =
             engine.generate(engine.prepare_tokens(extended), greedy(16)).generated_token_ids;
         unrelated_alone =
             engine.generate(engine.prepare_tokens(unrelated), greedy(16)).generated_token_ids;
     }
-    ninfer::Engine engine(options);
+    infernix::Engine engine(options);
     CancelAfterFirstChunk sink;
-    ninfer::GenerationHandle handle =
+    infernix::GenerationHandle handle =
         engine.submit(engine.prepare_tokens(prompt), greedy(16),
-                      ninfer::OutputConsumerMode::Streaming, {.prompt_progress = true});
-    const ninfer::GenerationResult cancelled =
-        handle.wait(&sink, ninfer::CancellationView([&sink] { return sink.requested(); }));
-    const ninfer::GenerationResult next =
+                      infernix::OutputConsumerMode::Streaming, {.prompt_progress = true});
+    const infernix::GenerationResult cancelled =
+        handle.wait(&sink, infernix::CancellationView([&sink] { return sink.requested(); }));
+    const infernix::GenerationResult next =
         engine.generate(engine.prepare_tokens(unrelated), greedy(16));
-    const ninfer::GenerationResult resumed =
+    const infernix::GenerationResult resumed =
         engine.generate(engine.prepare_tokens(extended), greedy(16));
 
-    const char* name = backend == ninfer::SpeculativeBackend::DFlash2 ? "cancel-prefill-dflash2"
+    const char* name = backend == infernix::SpeculativeBackend::DFlash2 ? "cancel-prefill-dflash2"
                                                                       : "cancel-prefill";
     int failures     = 0;
-    if (cancelled.finish_reason != ninfer::FinishReason::Cancelled ||
+    if (cancelled.finish_reason != infernix::FinishReason::Cancelled ||
         !cancelled.generated_token_ids.empty()) {
         std::cerr << name << ": the request was not cancelled during prefill (reason="
                   << static_cast<int>(cancelled.finish_reason)
@@ -536,11 +536,11 @@ int exercise_cancel_prefill(const char* artifact, ninfer::SpeculativeBackend bac
     return failures;
 }
 
-ninfer::ChatMessage text_message(ninfer::ChatRole role, std::string text) {
-    ninfer::ChatMessage message;
+infernix::ChatMessage text_message(infernix::ChatRole role, std::string text) {
+    infernix::ChatMessage message;
     message.role = role;
-    message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+    message.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text, .text = std::move(text), .media = {}});
     return message;
 }
 
@@ -549,17 +549,17 @@ ninfer::ChatMessage text_message(ninfer::ChatRole role, std::string text) {
 // Hybrid taps must keep their semantic placement under those hints.
 bool protocol_hints = false;
 
-ninfer::PromptInput conversation(std::vector<ninfer::ChatMessage> messages) {
-    ninfer::PromptInput input;
+infernix::PromptInput conversation(std::vector<infernix::ChatMessage> messages) {
+    infernix::PromptInput input;
     input.messages                = std::move(messages);
     input.options.enable_thinking = false;
     if (protocol_hints) {
         input.context_cache.allow_engine_automatic_shared_prefixes = false;
-        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+        input.context_cache.markers.push_back(infernix::PromptCacheMarker{
             .after_message_count = static_cast<std::uint32_t>(input.messages.size()),
-            .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-            .evidence            = ninfer::SharedCandidateEvidence::DefaultAutomatic,
-            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+            .kind                = infernix::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence            = infernix::SharedCandidateEvidence::DefaultAutomatic,
+            .location            = infernix::PromptCacheMarkerLocation::MessageBoundary,
         });
     }
     return input;
@@ -569,34 +569,34 @@ ninfer::PromptInput conversation(std::vector<ninfer::ChatMessage> messages) {
 // opener (not 64-token-floored), and a new conversation with the same leading system block resumes
 // at that block's end.
 int exercise_turns(const char* artifact, std::size_t host_bytes) {
-    ninfer::EngineOptions options =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 8192, host_bytes, 0);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, host_bytes, 0);
     options.context_cache.hybrid.device_snapshot_slots.reset();
-    ninfer::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options));
 
     std::string system = "You are a careful assistant for a small engineering team.";
     for (int sentence = 0; sentence < 60; ++sentence) {
         system += " Rule " + std::to_string(sentence) +
                   ": answer precisely, cite the relevant component, and keep replies short.";
     }
-    const ninfer::ChatMessage leading = text_message(ninfer::ChatRole::System, system);
-    const ninfer::ChatMessage first_user =
-        text_message(ninfer::ChatRole::User, "Name three prime numbers.");
+    const infernix::ChatMessage leading = text_message(infernix::ChatRole::System, system);
+    const infernix::ChatMessage first_user =
+        text_message(infernix::ChatRole::User, "Name three prime numbers.");
 
-    const ninfer::GenerationResult first =
+    const infernix::GenerationResult first =
         engine.generate(engine.prepare(conversation({leading, first_user})), greedy(24));
-    const ninfer::GenerationResult second = engine.generate(
+    const infernix::GenerationResult second = engine.generate(
         engine.prepare(conversation({leading, first_user,
-                                     text_message(ninfer::ChatRole::Assistant, first.content),
-                                     text_message(ninfer::ChatRole::User, "Now name two more.")})),
+                                     text_message(infernix::ChatRole::Assistant, first.content),
+                                     text_message(infernix::ChatRole::User, "Now name two more.")})),
         greedy(8));
-    const ninfer::GenerationResult other = engine.generate(
+    const infernix::GenerationResult other = engine.generate(
         engine.prepare(
-            conversation({leading, text_message(ninfer::ChatRole::User, "What is a hash table?")})),
+            conversation({leading, text_message(infernix::ChatRole::User, "What is a hash table?")})),
         greedy(8));
     const std::uint32_t other_user_tokens =
         engine
-            .prepare(conversation({text_message(ninfer::ChatRole::User, "What is a hash table?")}))
+            .prepare(conversation({text_message(infernix::ChatRole::User, "What is a hash table?")}))
             .summary()
             .prompt_tokens;
 
@@ -617,7 +617,7 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
                   << other.prompt.prompt_tokens << " tokens; expected the system block end\n";
         ++failures;
     }
-    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    const infernix::RuntimeStats stats = engine.runtime_stats();
     if (stats.hybrid_taps_created == 0 || stats.hybrid_snapshot_hits < 2) {
         std::cerr << "turns: taps=" << stats.hybrid_taps_created
                   << " hits=" << stats.hybrid_snapshot_hits << '\n';
@@ -643,11 +643,11 @@ std::vector<std::uint8_t> gradient_ppm(int size, int phase) {
 // tokens with a different image cannot reuse anything from the image onwards (its blocks carry the
 // image's content key) and never resume inside the image's span.
 int exercise_vision(const char* artifact) {
-    ninfer::EngineOptions options =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 8192, 1ULL << 30, 0);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 8192, 1ULL << 30, 0);
     options.context_cache.hybrid.device_snapshot_slots.reset();
     options.enable_vision = true;
-    ninfer::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options));
 
     std::string system = "You describe images for an accessibility service.";
     for (int sentence = 0; sentence < 30; ++sentence) {
@@ -655,27 +655,27 @@ int exercise_vision(const char* artifact) {
             " Rule " + std::to_string(sentence) + ": name colours, shapes and layout plainly.";
     }
     const auto prompt = [&](const std::vector<std::uint8_t>& image, const char* question) {
-        ninfer::ChatMessage user;
-        user.role = ninfer::ChatRole::User;
-        ninfer::MessagePart media;
-        media.kind              = ninfer::MessagePartKind::Media;
-        media.media.kind        = ninfer::MediaKind::Image;
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        infernix::MessagePart media;
+        media.kind              = infernix::MessagePartKind::Media;
+        media.media.kind        = infernix::MediaKind::Image;
         media.media.bytes       = image;
         media.media.media_type  = "image/x-portable-pixmap";
         media.media.source_name = "image.ppm";
         user.parts.push_back(std::move(media));
-        user.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
-        return conversation({text_message(ninfer::ChatRole::System, system), std::move(user)});
+        user.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = question, .media = {}});
+        return conversation({text_message(infernix::ChatRole::System, system), std::move(user)});
     };
     const std::vector<std::uint8_t> first_image  = gradient_ppm(512, 0);
     const std::vector<std::uint8_t> second_image = gradient_ppm(512, 97);
 
-    const ninfer::GenerationResult first =
+    const infernix::GenerationResult first =
         engine.generate(engine.prepare(prompt(first_image, "Describe the image.")), greedy(4));
-    const ninfer::GenerationResult same =
+    const infernix::GenerationResult same =
         engine.generate(engine.prepare(prompt(first_image, "Describe the image.")), greedy(4));
-    const ninfer::GenerationResult other =
+    const infernix::GenerationResult other =
         engine.generate(engine.prepare(prompt(second_image, "Describe the image.")), greedy(4));
 
     int failures = 0;
@@ -702,11 +702,11 @@ int exercise_vision(const char* artifact) {
 // questions: the second waits for the first one's snapshot past the image and encodes nothing.
 // A different image behind the same text shares only the text before it and is encoded.
 int exercise_coalesce_vision(const char* artifact) {
-    ninfer::EngineOptions options =
-        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
+    infernix::EngineOptions options =
+        hybrid_options(artifact, infernix::SpeculativeBackend::None, 16384, 1ULL << 30, 8);
     options.max_concurrency = 2;
     options.enable_vision   = true;
-    ninfer::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options));
 
     std::string system = "You inspect screenshots for a test automation service.";
     for (int sentence = 0; sentence < 60; ++sentence) {
@@ -714,30 +714,30 @@ int exercise_coalesce_vision(const char* artifact) {
                   ": report the colours, regions and any visible text exactly.";
     }
     const auto prompt = [&](const std::vector<std::uint8_t>& image, const char* question) {
-        ninfer::ChatMessage user;
-        user.role = ninfer::ChatRole::User;
-        ninfer::MessagePart media;
-        media.kind              = ninfer::MessagePartKind::Media;
-        media.media.kind        = ninfer::MediaKind::Image;
+        infernix::ChatMessage user;
+        user.role = infernix::ChatRole::User;
+        infernix::MessagePart media;
+        media.kind              = infernix::MessagePartKind::Media;
+        media.media.kind        = infernix::MediaKind::Image;
         media.media.bytes       = image;
         media.media.media_type  = "image/x-portable-pixmap";
         media.media.source_name = "image.ppm";
         user.parts.push_back(std::move(media));
-        user.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
-        return conversation({text_message(ninfer::ChatRole::System, system), std::move(user)});
+        user.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = question, .media = {}});
+        return conversation({text_message(infernix::ChatRole::System, system), std::move(user)});
     };
     const std::vector<std::uint8_t> image = gradient_ppm(512, 11);
     const std::vector<std::uint8_t> other = gradient_ppm(512, 151);
 
     int failures = 0;
     const auto pair = [&](const std::vector<std::uint8_t>& second_image, bool same) {
-        ninfer::GenerationHandle leader =
+        infernix::GenerationHandle leader =
             engine.submit(engine.prepare(prompt(image, "Which colour dominates?")), greedy(1));
-        ninfer::GenerationHandle follower = engine.submit(
+        infernix::GenerationHandle follower = engine.submit(
             engine.prepare(prompt(second_image, "Is there any text in the image?")), greedy(4));
-        const ninfer::GenerationResult led      = leader.wait();
-        const ninfer::GenerationResult followed = follower.wait();
+        const infernix::GenerationResult led      = leader.wait();
+        const infernix::GenerationResult followed = follower.wait();
         // The image's 256 merged tokens end within a few tokens of where the questions diverge.
         const std::uint32_t question_tokens =
             followed.prompt.prompt_tokens >= 40U ? 40U : followed.prompt.prompt_tokens;
@@ -769,21 +769,21 @@ int exercise_coalesce_vision(const char* artifact) {
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
-    if (const char* storage = std::getenv("NINFER_HYBRID_KV_DTYPE");
+    if (const char* storage = std::getenv("INFERNIX_HYBRID_KV_DTYPE");
         storage != nullptr && *storage != '\0') {
         try {
-            kv_storage = ninfer::test::parse_kv_cache_storage(storage);
+            kv_storage = infernix::test::parse_kv_cache_storage(storage);
         } catch (const std::invalid_argument&) {
-            std::cerr << "unknown NINFER_HYBRID_KV_DTYPE " << storage << '\n';
+            std::cerr << "unknown INFERNIX_HYBRID_KV_DTYPE " << storage << '\n';
             return 1;
         }
     }
-    const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
+    const char* selected            = std::getenv("INFERNIX_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
     constexpr std::array<std::string_view, 15> kScenarios{"all",
                                                           "restore-exact",
@@ -800,20 +800,20 @@ int main() {
                                                           "cancel-prefill",
                                                           "cancel-prefill-dflash2"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
-        std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
+        std::cerr << "unknown INFERNIX_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
     }
     int failures = 0;
     try {
         const bool all = scenario == "all";
         if (all || scenario == "restore-exact") {
-            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::None);
+            failures += exercise_restore_exact(artifact, infernix::SpeculativeBackend::None);
         }
         if (all || scenario == "restore-exact-mtp") {
-            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::Mtp);
+            failures += exercise_restore_exact(artifact, infernix::SpeculativeBackend::Mtp);
         }
         if (all || scenario == "restore-exact-dflash2") {
-            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::DFlash2);
+            failures += exercise_restore_exact(artifact, infernix::SpeculativeBackend::DFlash2);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }
@@ -821,10 +821,10 @@ int main() {
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
         if (all || scenario == "cancel-prefill") {
-            failures += exercise_cancel_prefill(artifact, ninfer::SpeculativeBackend::None);
+            failures += exercise_cancel_prefill(artifact, infernix::SpeculativeBackend::None);
         }
         if (all || scenario == "cancel-prefill-dflash2") {
-            failures += exercise_cancel_prefill(artifact, ninfer::SpeculativeBackend::DFlash2);
+            failures += exercise_cancel_prefill(artifact, infernix::SpeculativeBackend::DFlash2);
         }
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);

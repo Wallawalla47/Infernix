@@ -9,13 +9,13 @@ not change the production Linear route and does not reselect any route winner.
 The benchmark measures only:
 
 ```text
-ninfer::ops::linear(x, w, out, policy, workspace, stream)
+infernix::ops::linear(x, w, out, policy, workspace, stream)
 ```
 
 This is a permanently retained public benchmark. The measured calls of single, sweep, suite and profile
 must all go through the public entry point above; fixtures can construct inputs by the public weight
 format, but the benchmark must not include Linear private launcher/plan/dispatch headers, must not call
-`ninfer::ops::detail`, and must not offer candidate, kernel or route forcing options.
+`infernix::ops::detail`, and must not offer candidate, kernel or route forcing options.
 
 Q4/Q5/Q6/Q8 LinearAdd, LinearSwiGLU, LinearPair and other fused Ops are not part of this benchmark. They
 continue to be measured independently by their own benchmarks.
@@ -47,7 +47,7 @@ The benchmark serves four concrete needs.
 Explicitly specify the weight type, `N`, `K` and `T` to measure one production Linear point:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 --t 8
 ```
@@ -59,7 +59,7 @@ selector.
 The command for a BF16 decode exact point is:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype bf16 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
@@ -67,7 +67,7 @@ The command for a BF16 decode exact point is:
 The permanent NVFP4 A16 decode point is:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a16 \
   --n 14336 --k 5120 --t 1
 ```
@@ -75,7 +75,7 @@ The permanent NVFP4 A16 decode point is:
 Its main W4A4 MMA point is:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 14336 --k 5120 --t 1024
 ```
@@ -83,19 +83,19 @@ Its main W4A4 MMA point is:
 The other four permanent NVFP4 problems use the same numeric entry point, for example:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 16384 --k 5120 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 34816 --k 5120 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 5120 --k 6144 --t 1024
 
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 \
   --n 5120 --k 17408 --t 1024
 ```
@@ -107,7 +107,7 @@ pre-quantization is not a production metric of this benchmark.
 FP8 uses the same entry point, for example:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype fp8 --policy a8 \
   --n 14336 --k 5120 --t 1024
 ```
@@ -122,7 +122,7 @@ Profile mode must accept exactly one exact point:
 
 ```bash
 ncu --profile-from-start off ... \
-  ./build/bench/ninfer_linear_bench \
+  ./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 --t 8 --profile
 ```
@@ -153,7 +153,7 @@ The following distinctions must still be kept:
 Fix `(qtype,N,K,policy)` and scan a T range continuously:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 \
   --n 4096 --k 5120 \
   --sweep 1:32:1 \
@@ -178,9 +178,9 @@ To avoid hand-writing `(qtype,N,K,T)` every time, the benchmark registers a smal
 representative 27B/35B points. One suite call runs all points in order:
 
 ```bash
-./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
-./build/bench/ninfer_linear_bench --suite all
+./build/bench/infernix_linear_bench --suite qwen3_6_27b
+./build/bench/infernix_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/infernix_linear_bench --suite all
 ```
 
 Running without arguments still prints usage and does not implicitly start a heavy suite. A suite is an
@@ -491,7 +491,7 @@ explicit points of numeric geometry.
 The completed verification and RTX 5090 measurement records are kept below, with the timing conditions
 listed with each item:
 
-1. the `ninfer_linear_bench` Release target builds;
+1. the `infernix_linear_bench` Release target builds;
 2. the 49 points of the 27B suite and the 37 points of the 35B-A3B suite all execute through the public
    Linear;
 3. `all` merges into 68 unique points, and shared Vision exact points execute only once;

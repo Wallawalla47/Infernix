@@ -1,4 +1,4 @@
-#include "ninfer/ops/speculative_round.h"
+#include "infernix/ops/speculative_round.h"
 #include "ops/host_parallel.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -18,8 +18,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 
@@ -1737,7 +1737,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc > 2 || (argc == 2 && std::string_view(argv[1]) != "--transforms-only")) {
-        std::cerr << "usage: ninfer_speculative_round_test "
+        std::cerr << "usage: infernix_speculative_round_test "
                      "[--transforms-only|--ngram-only|--onehot-distribution|--mtp-onehot|--mtp-"
                      "distribution|--ngram-negative-penalties|--wide-accept|--wide-distribution]\n";
         return 2;

@@ -7,7 +7,7 @@
 #include "ops/linear/q6/q6_operands.h"
 #include "ops/linear/q6/q6_a16_sliced_k_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue = LinearIdentityEpilogue>
 void launch_q6_a16_sliced_k_mma(const Q6LinearOperands& operands, Output output, Epilogue epilogue,
@@ -38,4 +38,4 @@ void launch_q6_a16_sliced_k_mma(const Q6LinearOperands& operands, Output output,
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

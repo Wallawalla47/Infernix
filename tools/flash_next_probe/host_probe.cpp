@@ -39,7 +39,7 @@
 
 #include <sys/mman.h>
 
-namespace moe = ninfer::ops::offloaded_moe;
+namespace moe = infernix::ops::offloaded_moe;
 
 namespace {
 

@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 // The frontend (tokenizer, chat template, output parsing) is the Qwen3.5 family's, unchanged
 // (docs/maintainer/qwen3_8-flash-next-design.md §7).
@@ -87,4 +87,4 @@ private:
     std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

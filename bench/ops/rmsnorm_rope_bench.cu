@@ -1,13 +1,13 @@
 // Public-Op benchmark for the variable-width DFlash2 pair, context-K and text RMSNorm+RoPE
 // profiles. The text profile carries both routes: the three calls the model issues today, and the
 // fused Op that replaces them.
-#include "ninfer/ops/rmsnorm_rope.h"
+#include "infernix/ops/rmsnorm_rope.h"
 #include "core/device.h"
 
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rope.h"
 
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -54,7 +54,7 @@ struct Options {
 [[noreturn]] void usage(const char* message) {
     std::fprintf(stderr,
                  "error: %s\n"
-                 "usage: ninfer_rmsnorm_rope_bench --form pair|single|text "
+                 "usage: infernix_rmsnorm_rope_bench --form pair|single|text "
                  "[--route split|fused] "
                  "[--widths W,...] [--batches B,...] [--tokens T,...] [--execution eager|graph] "
                  "[--warmup N] [--repeat N] [--profile]\n",
@@ -356,7 +356,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_rmsnorm_rope_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_rmsnorm_rope_bench: %s\n", error.what());
         return 1;
     }
 }

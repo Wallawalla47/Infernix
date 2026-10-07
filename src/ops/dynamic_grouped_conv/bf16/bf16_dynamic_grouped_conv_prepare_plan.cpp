@@ -1,11 +1,11 @@
 #include "core/weight.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
 #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_kernels.h"
-#include "ninfer/ops/rmsnorm.h"
+#include "infernix/ops/rmsnorm.h"
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 DynamicConvPrepareRoute resolve_route(int tokens) {
     // Complete cold-cache Graph timings favor split-8 R16 through 48 columns.
@@ -50,4 +50,4 @@ void bf16_dynamic_grouped_conv_prepare_dispatch(const Tensor& residual, const Te
     execute(resolve_route(residual.ne[1] * residual.ne[2]), residual, norm, eps, base, weight,
             prepared, finish, workspace, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

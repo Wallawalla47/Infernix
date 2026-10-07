@@ -19,7 +19,7 @@
 
 namespace {
 
-using namespace ninfer;
+using namespace infernix;
 namespace qwen      = models::qwen3_5;
 namespace execution = qwen::execution;
 
@@ -249,9 +249,9 @@ void run(const char* artifact, SpeculativeBackend backend) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
     try {

@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __device__ __forceinline__ int kv_window_slot(int position) {
     return position < kKVWindowSinkTokens
@@ -78,4 +78,4 @@ __device__ __forceinline__ std::uint32_t kv_window_tag(int position, const std::
     return kv_window_tag_finish(hash, scale_bits);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

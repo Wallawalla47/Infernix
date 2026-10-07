@@ -21,9 +21,9 @@
 #include <random>
 #include <vector>
 
-namespace canon = ninfer::ops::canon;
-namespace moe   = ninfer::ops::offloaded_moe;
-namespace fixtures = ninfer::test::offloaded_moe;
+namespace canon = infernix::ops::canon;
+namespace moe   = infernix::ops::offloaded_moe;
+namespace fixtures = infernix::test::offloaded_moe;
 using fixtures::Expert;
 using fixtures::random_activations;
 using fixtures::random_expert;

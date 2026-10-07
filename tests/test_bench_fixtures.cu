@@ -7,9 +7,9 @@
 #include <stdexcept>
 #include <vector>
 
-using namespace ninfer;
-namespace qb     = ninfer::bench;
-namespace oracle = ninfer::test::quantized_weight;
+using namespace infernix;
+namespace qb     = infernix::bench;
+namespace oracle = infernix::test::quantized_weight;
 
 namespace {
 

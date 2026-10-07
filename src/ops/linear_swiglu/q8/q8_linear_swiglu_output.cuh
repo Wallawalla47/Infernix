@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int IntermediateRows>
 struct Q8SwiGluPairedRows {
@@ -28,4 +28,4 @@ struct Q8SwiGluDirectEpilogue {
         if (col + 1 < columns) output.store(row, col + 1, silu(projected.y) * projected.w);
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

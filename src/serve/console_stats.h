@@ -15,11 +15,11 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::product {
+namespace infernix::product {
 class TerminalPanel;
 }
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 // One completed request's contribution. Speculative totals from the Engine include n-gram rounds;
 // the model fields here are the remainder (MTP or DFlash drafting), so the two sources never double
@@ -84,7 +84,7 @@ public:
     void request_done(const GenerationOutcome& outcome);
     void request_failure(const RequestFailure& failure);
     void request_rejected(const RequestFailure& failure);
-    void runtime(const ninfer::RuntimeStats& current);
+    void runtime(const infernix::RuntimeStats& current);
     void show();
 
     [[nodiscard]] ConsoleStatsSnapshot snapshot() const;
@@ -98,4 +98,4 @@ private:
     std::deque<ConsoleRequestSample> recent_;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

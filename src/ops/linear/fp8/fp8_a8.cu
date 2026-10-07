@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class ActivationGeometry, int Threads = 256>
@@ -101,4 +101,4 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

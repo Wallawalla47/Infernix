@@ -21,7 +21,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace infernix::serve;
 using Json = nlohmann::json;
 
 long long test_process_id() {
@@ -67,21 +67,21 @@ int main() {
     options.model_id_override              = "deployment-alias";
     options.request_log_jsonl              = "requests.jsonl";
     options.max_context                    = 262144;
-    options.kv_capacity                    = ninfer::KvCapacityPolicy::explicit_capacity(524288);
+    options.kv_capacity                    = infernix::KvCapacityPolicy::explicit_capacity(524288);
     options.prefill_chunk                  = 1024;
     options.log_stats_interval_ms          = 2500;
-    options.kv_cache                       = ninfer::KvCacheStorage::Fp8E4M3Row256;
-    options.speculative.backend            = ninfer::SpeculativeBackend::Mtp;
+    options.kv_cache                       = infernix::KvCacheStorage::Fp8E4M3Row256;
+    options.speculative.backend            = infernix::SpeculativeBackend::Mtp;
     options.speculative.draft_tokens       = 3;
-    options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+    options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
     options.enable_vision                  = false;
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
     options.sampling_overrides.temperature = 0.6F;
-    options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
+    options.startup_argv = {"infernix-serve", options.artifact_path, "--api-key", "<redacted>"};
 
-    ninfer::EngineOptions engine_options;
+    infernix::EngineOptions engine_options;
     engine_options.artifact_path                     = options.artifact_path;
     engine_options.device                            = options.device;
     engine_options.max_context                       = options.max_context;
@@ -96,12 +96,12 @@ int main() {
     engine_options.context_cache.device_state_slots  = 2;
     engine_options.context_cache.host_capacity_bytes = 64ULL << 20;
 
-    const ninfer::ModelSamplingDefaults sampling_defaults{
+    const infernix::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
         .non_thinking = {.temperature = 0.7F, .top_k = 20, .top_p = 0.8F, .presence_penalty = 1.5F},
     };
 
-    ninfer::LoadSummary load;
+    infernix::LoadSummary load;
     load.architecture         = "Qwen3_5ForCausalLM";
     load.model_name           = "qwen3.6-27b";
     load.weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"};
@@ -113,24 +113,24 @@ int main() {
     load.device_object_count  = 42;
     load.host_object_count    = 6;
     load.context_cost         = {
-                .transfer_source   = ninfer::ContextCostPresetSource::External,
-                .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+                .transfer_source   = infernix::ContextCostPresetSource::External,
+                .prefill_source    = infernix::ContextCostPresetSource::CompiledDefault,
                 .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
                 .prefill_signature = "example-prefill-signature",
                 .preset_path       = "local-costs.json",
     };
 
-    ninfer::MemorySummary memory;
+    infernix::MemorySummary memory;
     memory.max_context                 = 262144;
-    memory.kv_capacity_mode            = ninfer::KvCapacityMode::Explicit;
+    memory.kv_capacity_mode            = infernix::KvCapacityMode::Explicit;
     memory.kv_capacity                 = 524288;
     memory.kv_capacity_page_groups     = 8192;
     memory.kv_capacity_max_page_groups = 16384;
-    memory.kv_cache                    = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    memory.kv_cache                    = infernix::KvCacheStorage::Fp8E4M3Row256;
     memory.weights.capacity_bytes      = 100;
     memory.sequence.capacity_bytes     = 200;
     memory.workspace.capacity_bytes    = 500;
-    memory.vision_workspace            = ninfer::VisionWorkspaceMemorySummary{
+    memory.vision_workspace            = infernix::VisionWorkspaceMemorySummary{
                    .aggregate_prompt_tokens = 32768,
                    .max_item_tokens         = 16384,
                    .general_capacity_bytes  = 300,
@@ -200,7 +200,7 @@ int main() {
                   server.at("engine").at("draft_tree_auto") == false &&
                   server.at("engine").at("draft_tree_paths") == 8,
               "tree verification table missing");
-    options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
+    options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
     memory.kv_cache         = options.kv_cache;
     const Json nvfp4_server = Json::parse(format_server_start_json(
@@ -208,7 +208,7 @@ int main() {
         memory, environment, std::uint64_t{123456}));
     failures +=
         check(nvfp4_server.at("engine").at("kv_cache") == "nvfp4", "NVFP4 KV report name missing");
-    options.kv_cache        = ninfer::KvCacheStorage::Fp8KeyNvfp4Value;
+    options.kv_cache        = infernix::KvCacheStorage::Fp8KeyNvfp4Value;
     engine_options.kv_cache = options.kv_cache;
     memory.kv_cache         = options.kv_cache;
     const Json k8v4_server  = Json::parse(format_server_start_json(
@@ -217,8 +217,8 @@ int main() {
     failures +=
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
     for (const auto& [storage, name] :
-         {std::pair{ninfer::KvCacheStorage::Vq2, "vq2"},
-          std::pair{ninfer::KvCacheStorage::Q4KeyVq2Value, "k4v2"}}) {
+         {std::pair{infernix::KvCacheStorage::Vq2, "vq2"},
+          std::pair{infernix::KvCacheStorage::Q4KeyVq2Value, "k4v2"}}) {
         options.kv_cache        = storage;
         engine_options.kv_cache = storage;
         memory.kv_cache         = storage;
@@ -294,7 +294,7 @@ int main() {
     PreparedRequest prepared;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
-    prepared.reasoning_effort                          = ninfer::ReasoningEffort::XHigh;
+    prepared.reasoning_effort                          = infernix::ReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
@@ -413,7 +413,7 @@ int main() {
     GenerationOutcome outcome;
     outcome.prompt_tokens                   = 401;
     outcome.completion_tokens               = 1024;
-    outcome.finish_reason                   = ninfer::FinishReason::OutputLimit;
+    outcome.finish_reason                   = infernix::FinishReason::OutputLimit;
     outcome.metrics.prepare_seconds         = 0.1234567890123;
     outcome.metrics.ttft_seconds            = 0.3580246791357;
     outcome.metrics.vision_seconds          = 0.0;
@@ -422,7 +422,7 @@ int main() {
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
     outcome.metrics.computed_prefill_tokens = 300;
-    outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::Checkpoint;
+    outcome.metrics.prefix_reuse_path       = infernix::PrefixReusePath::Checkpoint;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
                   .engine_boundary_exposed_seconds      = 0.001,
@@ -437,7 +437,7 @@ int main() {
                   .decode_rounds                        = 2,
                   .control_units                        = 1,
     };
-    outcome.metrics.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
+    outcome.metrics.speculative_backend               = infernix::SpeculativeBackend::Mtp;
     outcome.metrics.speculative_draft_window          = 3;
     outcome.metrics.speculative_rounds                = 300;
     outcome.metrics.speculative_draft_tokens          = 900;
@@ -466,7 +466,7 @@ int main() {
                                .device_to_host_bytes = 3145728,
                                .host_to_device_bytes = 2097152,
     };
-    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+    outcome.thinking = infernix::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
@@ -492,7 +492,7 @@ int main() {
     failures += check(done.at("result").at("computed_prefill_tokens") == 300,
                       "initial computed prompt tokens must exclude separately reported replay");
     auto cancelled                            = outcome;
-    cancelled.finish_reason                   = ninfer::FinishReason::Cancelled;
+    cancelled.finish_reason                   = infernix::FinishReason::Cancelled;
     cancelled.completion_tokens               = 0;
     cancelled.metrics.computed_prefill_tokens = 128;
     cancelled.metrics.prefill_seconds         = 0.25;
@@ -555,7 +555,7 @@ int main() {
     auto observed                        = outcome;
     observed.generated_token_ids         = {17, 151645};
     observed.completion_tokens           = 2;
-    observed.metrics.first_output_timing = ninfer::GenerationFirstOutputTiming{
+    observed.metrics.first_output_timing = infernix::GenerationFirstOutputTiming{
         .elapsed_seconds         = 0.312345678901234,
         .initial_binding_seconds = 0.023456789012345,
         .engine                  = {.queue_wait_seconds             = 0.001,
@@ -588,9 +588,9 @@ int main() {
                               Json::array({17, 151645}) &&
                           observed_done.at("result").at("completion_tokens") == 2,
                       "request diagnostics lost exact generated token IDs or schema version");
-    const ninfer::GenerationSchedulingObservation scheduling{
-        .transition              = ninfer::GenerationSchedulingTransition::ReplayComplete,
-        .route                   = ninfer::GenerationRecoveryRoute::Replay,
+    const infernix::GenerationSchedulingObservation scheduling{
+        .transition              = infernix::GenerationSchedulingTransition::ReplayComplete,
+        .route                   = infernix::GenerationRecoveryRoute::Replay,
         .engine_request_id       = 19,
         .steady_ns               = 9007199254740993ULL,
         .elapsed_ns              = 123456789,
@@ -622,8 +622,8 @@ int main() {
             scheduling_json.at("progress").at("request_replayed_tokens") == 512,
         "scheduling observation lost request identity, precise clock or paired work counters");
     auto pausing       = scheduling;
-    pausing.transition = ninfer::GenerationSchedulingTransition::PauseStarted;
-    pausing.route      = ninfer::GenerationRecoveryRoute::None;
+    pausing.transition = infernix::GenerationSchedulingTransition::PauseStarted;
+    pausing.route      = infernix::GenerationRecoveryRoute::None;
     const Json pausing_json =
         Json::parse(format_request_scheduling_json("serve-test", 3003, 8, "http-eight", pausing));
     failures += check(pausing_json.at("transition") == "pause_started" &&
@@ -672,13 +672,13 @@ int main() {
 
     GenerationOutcome normalized_tool_outcome = outcome;
     normalized_tool_outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
+        infernix::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
     normalized_tool_outcome.tool_call_parse = {
         .marker_seen               = true,
         .structured_call_count     = 1,
         .empty_arguments_omitted   = 1,
         .schema_mismatch_arguments = 2,
-        .fallback_reason           = ninfer::ToolCallParseFallbackReason::None,
+        .fallback_reason           = infernix::ToolCallParseFallbackReason::None,
         .tolerant_recovered        = true,
     };
     const Json normalized_tool_done =
@@ -705,7 +705,7 @@ int main() {
           .structured_call_count     = 0,
           .empty_arguments_omitted   = 0,
           .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::DuplicateParameter,
+          .fallback_reason           = infernix::ToolCallParseFallbackReason::DuplicateParameter,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
@@ -912,7 +912,7 @@ int main() {
 
     const std::filesystem::path log_path =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-test-" + std::to_string(test_process_id()) + ".jsonl");
+        ("infernix-request-log-test-" + std::to_string(test_process_id()) + ".jsonl");
     std::filesystem::remove(log_path);
     {
         JsonlRequestLog writer(log_path.string());
@@ -949,7 +949,7 @@ int main() {
     // Size-based rotation keeps the newest files, each starting with the server's start record.
     const std::filesystem::path rotation_dir =
         std::filesystem::temp_directory_path() /
-        ("ninfer-request-log-rotation-" + std::to_string(test_process_id()));
+        ("infernix-request-log-rotation-" + std::to_string(test_process_id()));
     const std::filesystem::path rotation_log = rotation_dir / "requests.jsonl";
     const auto rotated                       = [&](int index) {
         return std::filesystem::path(rotation_log.string() + '.' + std::to_string(index));

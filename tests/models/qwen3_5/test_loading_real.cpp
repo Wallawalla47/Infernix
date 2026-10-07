@@ -16,10 +16,10 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::models;
-namespace qwen = ninfer::models::qwen3_5;
-using ninfer::test::artifact_fixture::require;
+using namespace infernix;
+using namespace infernix::models;
+namespace qwen = infernix::models::qwen3_5;
+using infernix::test::artifact_fixture::require;
 
 struct Sample {
     std::uint64_t offset;
@@ -161,7 +161,7 @@ void check_native_inputs(const qwen::Model& model) {
         (void)ops::prepare_linear_weight(model.input(draft.output_head_use));
     }
     if (model.weight(weights.text.output_head).uses.size() > 1) {
-        ninfer::test::artifact_fixture::rejects<std::invalid_argument>(
+        infernix::test::artifact_fixture::rejects<std::invalid_argument>(
             [&] { (void)model.input(weights.text.output_head); },
             "ambiguous shared output-head Use was silently selected");
     }

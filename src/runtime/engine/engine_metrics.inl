@@ -1,6 +1,6 @@
 #pragma once
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 template <class Instance, class Manager>
 nvtx::Name EngineCore<Instance, Manager>::phase_range_name(EngineHostPhase phase) noexcept {
@@ -306,4 +306,4 @@ void EngineCore<Instance, Manager>::record_execution_work(GenerationWorkTiming& 
     work.gpu_seconds += timing.gpu_elapsed_ns * 1.0e-9;
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

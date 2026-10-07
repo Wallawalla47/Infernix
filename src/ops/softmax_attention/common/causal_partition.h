@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Capture reserves partials for the largest row window. Producer and merge use
 // the same row window; a wider capture never changes a row's work partition.
@@ -62,4 +62,4 @@ __host__ __device__ inline int causal_row_window(int first_position, int width,
     return window < visible_capacity ? window : visible_capacity;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

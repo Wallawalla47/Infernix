@@ -3,7 +3,7 @@
 #include <limits>
 #include <set>
 
-namespace ninfer::models::qwen3_5::loading {
+namespace infernix::models::qwen3_5::loading {
 
 AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std::string& p) {
     const auto& a = config.attention.value();
@@ -143,4 +143,4 @@ ProposalWeights bind_proposal(Bindings& b, const artifact::Proposal& proposal,
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5::loading
+} // namespace infernix::models::qwen3_5::loading

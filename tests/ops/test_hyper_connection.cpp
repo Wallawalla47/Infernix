@@ -14,7 +14,7 @@
 // composed route rounds Rn, z, m and u to BF16, so its bound is 2^-5 |ref| + 2^-6 rms(ref) and
 // injects to 2^-7 relative + 2^-9.
 
-#include "ninfer/ops/hyper_connection.h"
+#include "infernix/ops/hyper_connection.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
 
@@ -32,9 +32,9 @@
 
 namespace {
 
-namespace t = ninfer::test;
-using ninfer::DType;
-using ninfer::Tensor;
+namespace t = infernix::test;
+using infernix::DType;
+using infernix::Tensor;
 
 constexpr int kS = 4, kH = 2560, kRank = 320, kW = kS * kH;
 constexpr float kEps = 1e-6F;
@@ -121,7 +121,7 @@ float half_to_float(std::uint16_t h) {
     return static_cast<float>(sign ? -value : value);
 }
 
-std::vector<float> decode_q8(const ninfer::test::quantized_weight::PackedWeight& w) {
+std::vector<float> decode_q8(const infernix::test::quantized_weight::PackedWeight& w) {
     const int n = w.weight.n, k = w.weight.k, padded = w.weight.padded_shape[1];
     std::vector<float> out(static_cast<std::size_t>(n) * k);
     for (int r = 0; r < n; ++r) {
@@ -149,7 +149,7 @@ std::uint16_t half_bits(double value) {
     return static_cast<std::uint16_t>(((e + 15) << 10) | std::min(fraction, 1023));
 }
 
-void randomize_q8(ninfer::test::quantized_weight::PackedWeight& w, std::uint32_t seed) {
+void randomize_q8(infernix::test::quantized_weight::PackedWeight& w, std::uint32_t seed) {
     const int n = w.weight.n, k = w.weight.k, padded = w.weight.padded_shape[1];
     std::uint32_t state = seed;
     for (int r = 0; r < n; ++r) {
@@ -170,10 +170,10 @@ void randomize_q8(ninfer::test::quantized_weight::PackedWeight& w, std::uint32_t
 
 struct Problem {
     int down_rows = 0;
-    ninfer::test::quantized_weight::PackedWeight down, up;
+    infernix::test::quantized_weight::PackedWeight down, up;
     std::vector<float> down_values, up_values; // decoded independently
     std::unique_ptr<Device> down_payload, up_payload;
-    ninfer::Weight down_w, up_w;
+    infernix::Weight down_w, up_w;
     std::vector<std::uint16_t> norm;
     std::unique_ptr<Device> norm_device;
 };
@@ -217,7 +217,7 @@ struct Result {
     std::vector<float> inject;
 };
 
-Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject, ninfer::WorkspaceArena& ws,
+Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject, infernix::WorkspaceArena& ws,
            cudaStream_t stream, bool graph = false) {
     Device rd(r.size() * 2), xd(static_cast<std::size_t>(kH) * T * 2), id(static_cast<std::size_t>(kS) * T * 4);
     t::cuda_check(cudaMemcpy(rd.p, r.data(), r.size() * 2, cudaMemcpyHostToDevice), "residual");
@@ -226,7 +226,7 @@ Result run(Problem& p, const std::vector<std::uint16_t>& r, int T, bool inject, 
     Tensor x(xd.p, DType::BF16, {kH, T});
     Tensor inj(id.p, DType::FP32, {kS, T});
     const auto call = [&] {
-        ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, ninfer::ops::LinearPolicy::A16Only, kS, kRank, kEps,
+        infernix::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, kEps,
                                           x, inject ? &inj : nullptr, ws, stream);
     };
     if (graph) {
@@ -296,9 +296,9 @@ int main() {
         t::cuda_check(cudaStreamCreate(&stream), "stream");
         for (const bool inject : {true, false}) {
             Problem p = make_problem(inject);
-            const std::size_t capacity = ninfer::ops::hyper_connection_mix_workspace_capacity_bytes(
-                p.down_w, p.up_w, ninfer::ops::LinearPolicy::A16Only, kS, kRank, 64);
-            ninfer::WorkspaceArena ws(capacity);
+            const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
+                p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 64);
+            infernix::WorkspaceArena ws(capacity);
             const std::string tag = inject ? "inject" : "no inject";
             for (const int T : {1, 4, 5, 8, 9, 16, 17, 64}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
@@ -329,7 +329,7 @@ int main() {
         // Shapes that disagree are refused.
         {
             Problem p = make_problem(true);
-            ninfer::WorkspaceArena ws(1 << 20);
+            infernix::WorkspaceArena ws(1 << 20);
             Device rd(static_cast<std::size_t>(kW) * 2), xd(kH * 2);
             const Tensor R(rd.p, DType::BF16, {kW, 1});
             const Tensor w(p.norm_device->p, DType::BF16, {kW});
@@ -337,7 +337,7 @@ int main() {
             bool threw = false;
             try {
                 // The down projection carries injection rows the call does not ask for.
-                ninfer::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, ninfer::ops::LinearPolicy::A16Only, kS, kRank,
+                infernix::ops::hyper_connection_mix(R, w, p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank,
                                                   kEps, x, nullptr, ws, stream);
             } catch (const std::invalid_argument&) { threw = true; }
             check(threw, "a down projection with unused injection rows is refused");

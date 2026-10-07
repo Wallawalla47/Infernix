@@ -1,6 +1,6 @@
 #include "ops/linear/q4/q4_instance_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void launch_q4_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
@@ -82,4 +82,4 @@ void launch_q4_a16_sliced_k2048_t4(const Tensor& x, const Weight& w, Tensor& out
     launch_q4_a16_sliced_instance<q4_instances::SlicedK2048T4>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -4,7 +4,7 @@
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include <algorithm>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Geometry, class Schedule>
 void fp8_linear_a16_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_fp8_a16_gemv<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
@@ -52,4 +52,4 @@ void launch_fp8_a8_tma(const Tensor& x, const Weight& w, Tensor& out, Fp8A8Works
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n}, LinearIdentityEpilogue{},
         stream, scratch.partials);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

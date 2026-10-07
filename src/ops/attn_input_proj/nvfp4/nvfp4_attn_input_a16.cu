@@ -3,7 +3,7 @@
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                  Tensor& k, Tensor& v, cudaStream_t stream) {
     const int tokens = x.ne[1];
@@ -60,4 +60,4 @@ void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
         return;
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

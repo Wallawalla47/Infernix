@@ -7,7 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_a4_tma_launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Nvfp4N16384K5120;
@@ -56,4 +56,4 @@ void nvfp4_gdn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& qk
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

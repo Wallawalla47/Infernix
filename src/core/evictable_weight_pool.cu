@@ -12,12 +12,12 @@
 #include <string>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 using Clock = std::chrono::steady_clock;
 
-#define NINFER_CU_CHECK(expr) ::ninfer::vmm::check((expr), #expr)
+#define INFERNIX_CU_CHECK(expr) ::infernix::vmm::check((expr), #expr)
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -45,7 +45,7 @@ struct EvictableWeightPool::Impl {
     double last_restore_seconds = 0.0;
 
     void map_home(std::size_t piece) {
-        NINFER_CU_CHECK(cuMemMap(home + offsets[piece], sizes[piece], 0, handles[piece], 0));
+        INFERNIX_CU_CHECK(cuMemMap(home + offsets[piece], sizes[piece], 0, handles[piece], 0));
         set_access(home + offsets[piece], sizes[piece]);
     }
 
@@ -78,8 +78,8 @@ EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make
     // planning hint in config.overlay_bytes.
     impl.overlay_reserved = impl.arena_reserved - impl.tail_begin;
 
-    NINFER_CU_CHECK(cuMemAddressReserve(&impl.home, impl.arena_reserved, kChunkBytes, 0, 0));
-    NINFER_CU_CHECK(cuMemAddressReserve(&impl.overlay, impl.overlay_reserved, kChunkBytes, 0, 0));
+    INFERNIX_CU_CHECK(cuMemAddressReserve(&impl.home, impl.arena_reserved, kChunkBytes, 0, 0));
+    INFERNIX_CU_CHECK(cuMemAddressReserve(&impl.overlay, impl.overlay_reserved, kChunkBytes, 0, 0));
 
     // Non-evictable prefix in large pieces, evictable tail in chunks.
     constexpr std::size_t kPrefixPiece = 1024ULL * 1024ULL * 1024ULL;
@@ -99,7 +99,7 @@ EvictableWeightPool::EvictableWeightPool(const Config& config) : impl_(std::make
 
     impl.handles.resize(impl.offsets.size());
     for (std::size_t piece = 0; piece < impl.offsets.size(); ++piece) {
-        NINFER_CU_CHECK(cuMemCreate(&impl.handles[piece], impl.sizes[piece], &prop, 0));
+        INFERNIX_CU_CHECK(cuMemCreate(&impl.handles[piece], impl.sizes[piece], &prop, 0));
         impl.map_home(piece);
     }
 }
@@ -169,8 +169,8 @@ std::byte* EvictableWeightPool::evict(std::size_t bytes, std::size_t* mapped_byt
     const std::size_t first = impl.handles.size() - chunks;
     for (std::size_t rank = 0; rank < chunks; ++rank) {
         const std::size_t piece = first + rank;
-        NINFER_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
-        NINFER_CU_CHECK(
+        INFERNIX_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]));
+        INFERNIX_CU_CHECK(
             cuMemMap(impl.overlay + rank * kChunkBytes, impl.sizes[piece], 0,
                      impl.handles[piece], 0));
         impl.set_access(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
@@ -189,7 +189,7 @@ void EvictableWeightPool::restore(cudaStream_t stream) {
     const std::size_t first  = impl.handles.size() - chunks;
     for (std::size_t rank = 0; rank < chunks; ++rank) {
         const std::size_t piece = first + rank;
-        NINFER_CU_CHECK(cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]));
+        INFERNIX_CU_CHECK(cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]));
         impl.map_home(piece);
     }
     // Only bytes below arena_bytes ever hold weights; the aligned slack stays untouched.
@@ -218,4 +218,4 @@ double EvictableWeightPool::last_restore_seconds() const noexcept {
     return impl_->last_restore_seconds;
 }
 
-} // namespace ninfer
+} // namespace infernix

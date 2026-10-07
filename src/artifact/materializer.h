@@ -5,7 +5,7 @@
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
 #include "core/weight_view.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <filesystem>
 #include <memory>
@@ -13,7 +13,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 class Reader;
 
@@ -164,4 +164,4 @@ private:
                                                std::unique_ptr<EvictableWeightPool> eviction_pool =
                                                    nullptr);
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

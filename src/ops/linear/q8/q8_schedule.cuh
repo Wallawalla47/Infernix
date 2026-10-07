@@ -3,7 +3,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpStage, int Stages,
           Cache CodeCache, int MinBlocksPerSm, bool Predicated = false>
@@ -217,4 +217,4 @@ struct Q8A16GroupedSlicedKMmaSchedule {
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

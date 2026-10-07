@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 bool sparse_moe_uses_small_t(std::int32_t tokens) noexcept {
     return tokens >= kSparseMoeSmallTMin && tokens <= kSparseMoeSmallTMax;
@@ -66,4 +66,4 @@ SparseMoeSmallTPlan resolve_sparse_moe_small_t_plan(std::int32_t tokens, QType r
     return plan;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

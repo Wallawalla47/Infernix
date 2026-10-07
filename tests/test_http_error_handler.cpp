@@ -8,7 +8,7 @@
 namespace {
 
 using Json = nlohmann::json;
-using ninfer::serve::ServeOptions;
+using infernix::serve::ServeOptions;
 
 int check(bool condition, const char* message) {
     if (condition) { return 0; }
@@ -23,47 +23,47 @@ int main() {
     ServeOptions options;
     options.max_request_bytes = 1234;
 
-    const ninfer::serve::ApiError media_budget = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::MediaBudgetExceeded,
+    const infernix::serve::ApiError media_budget = infernix::serve::request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::MediaBudgetExceeded,
                              "vision tokens exceed processor budget"));
     failures += check(media_budget.status == 400 && media_budget.code == "media_budget_exceeded",
                       "media resource rejection did not map to HTTP 400");
-    const ninfer::serve::ApiError invalid_media = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::InvalidMedia, "failed to open media"));
+    const infernix::serve::ApiError invalid_media = infernix::serve::request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::InvalidMedia, "failed to open media"));
     failures += check(invalid_media.status == 400 && invalid_media.code == "invalid_media" &&
                           invalid_media.param == "messages",
                       "invalid media did not retain its client-input classification");
-    const ninfer::serve::ApiError context_limit = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::ContextLengthExceeded,
+    const infernix::serve::ApiError context_limit = infernix::serve::request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::ContextLengthExceeded,
                              "prepared prompt has 200 tokens, exceeding Engine max_context 128"));
     failures +=
         check(context_limit.status == 400 && context_limit.code == "context_length_exceeded" &&
                   context_limit.message.find("200 tokens") != std::string::npos &&
                   context_limit.message.find("128") != std::string::npos,
               "context rejection lost its HTTP classification or capacity details");
-    const ninfer::serve::ApiError thinking_capacity = ninfer::serve::request_error_to_api_error(
-        ninfer::RequestError(ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient,
+    const infernix::serve::ApiError thinking_capacity = infernix::serve::request_error_to_api_error(
+        infernix::RequestError(infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient,
                              "thinking control suffix does not fit"));
     failures += check(thinking_capacity.status == 400 &&
                           thinking_capacity.code == "thinking_budget_capacity_insufficient" &&
                           thinking_capacity.param.empty(),
                       "thinking budget capacity error mapping mismatch");
-    const ninfer::serve::ApiError cancelled =
-        ninfer::serve::request_error_to_api_error(ninfer::RequestError(
-            ninfer::RequestErrorKind::Cancelled, "request cancelled during preparation"));
+    const infernix::serve::ApiError cancelled =
+        infernix::serve::request_error_to_api_error(infernix::RequestError(
+            infernix::RequestErrorKind::Cancelled, "request cancelled during preparation"));
     failures += check(cancelled.status == 499 && cancelled.code == "client_disconnected" &&
                           cancelled.param.empty(),
                       "preparation cancellation did not retain its HTTP classification");
 
     failures +=
-        check(ninfer::serve::matches_bearer_credential("Bearer secret", "secret") &&
-                  ninfer::serve::matches_bearer_credential("bearer secret", "secret") &&
-                  ninfer::serve::matches_bearer_credential("\tBEARER   secret\t", "secret"),
+        check(infernix::serve::matches_bearer_credential("Bearer secret", "secret") &&
+                  infernix::serve::matches_bearer_credential("bearer secret", "secret") &&
+                  infernix::serve::matches_bearer_credential("\tBEARER   secret\t", "secret"),
               "valid Bearer credentials were rejected because of scheme case or whitespace");
-    failures += check(!ninfer::serve::matches_bearer_credential("Basic secret", "secret") &&
-                          !ninfer::serve::matches_bearer_credential("Bearer wrong", "secret") &&
-                          !ninfer::serve::matches_bearer_credential("Bearersecret", "secret") &&
-                          !ninfer::serve::matches_bearer_credential("Bearer secret", ""),
+    failures += check(!infernix::serve::matches_bearer_credential("Basic secret", "secret") &&
+                          !infernix::serve::matches_bearer_credential("Bearer wrong", "secret") &&
+                          !infernix::serve::matches_bearer_credential("Bearersecret", "secret") &&
+                          !infernix::serve::matches_bearer_credential("Bearer secret", ""),
                       "invalid Bearer credentials were accepted");
 
     httplib::Request messages_request;
@@ -71,14 +71,14 @@ int main() {
     httplib::Response messages_response;
     messages_response.status = 400;
     const auto initial_messages_result =
-        ninfer::serve::handle_unrendered_http_error(options, messages_request, messages_response);
+        infernix::serve::handle_unrendered_http_error(options, messages_request, messages_response);
     const std::string messages_request_id = messages_response.get_header_value("request-id");
     failures += check(initial_messages_result == httplib::Server::HandlerResponse::Unhandled &&
                           messages_response.body.empty() && messages_request_id.starts_with("req_"),
                       "Anthropic HTTP request ID was not established before error rendering");
     messages_response.status = 413;
     const auto messages_result =
-        ninfer::serve::handle_unrendered_http_error(options, messages_request, messages_response);
+        infernix::serve::handle_unrendered_http_error(options, messages_request, messages_response);
     const Json messages_body = Json::parse(messages_response.body);
     failures += check(messages_result == httplib::Server::HandlerResponse::Handled &&
                           messages_body.at("type") == "error" &&
@@ -98,7 +98,7 @@ int main() {
     httplib::Response openai_response;
     openai_response.status = 413;
     const auto openai_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, openai_response);
+        infernix::serve::handle_unrendered_http_error(options, openai_request, openai_response);
     const Json openai_body = Json::parse(openai_response.body);
     failures += check(openai_result == httplib::Server::HandlerResponse::Handled &&
                           openai_body.at("error").at("code") == "request_too_large" &&
@@ -113,7 +113,7 @@ int main() {
     httplib::Response missing_messages_response;
     missing_messages_response.status = 404;
     missing_messages_response.set_header("request-id", "req_existing");
-    const auto missing_messages_result = ninfer::serve::handle_unrendered_http_error(
+    const auto missing_messages_result = infernix::serve::handle_unrendered_http_error(
         options, missing_messages_request, missing_messages_response);
     const Json missing_messages_body = Json::parse(missing_messages_response.body);
     failures +=
@@ -134,7 +134,7 @@ int main() {
         R"({"type":"error","error":{"type":"request_too_large"},"request_id":"req_authored"})",
         "application/json");
     const std::string authored_messages_body = authored_messages_response.body;
-    const auto authored_messages_result      = ninfer::serve::handle_unrendered_http_error(
+    const auto authored_messages_result      = infernix::serve::handle_unrendered_http_error(
         options, messages_request, authored_messages_response);
     failures +=
         check(authored_messages_result == httplib::Server::HandlerResponse::Unhandled &&
@@ -149,7 +149,7 @@ int main() {
     authored_response.set_content(R"({"error":{"code":"application_error"}})", "application/json");
     const std::string authored_body = authored_response.body;
     const auto authored_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, authored_response);
+        infernix::serve::handle_unrendered_http_error(options, openai_request, authored_response);
     failures += check(authored_result == httplib::Server::HandlerResponse::Unhandled &&
                           authored_response.body == authored_body &&
                           authored_response.get_header_value_count("x-request-id") == 1 &&
@@ -159,7 +159,7 @@ int main() {
     httplib::Response other_response;
     other_response.status = 400;
     const auto other_result =
-        ninfer::serve::handle_unrendered_http_error(options, openai_request, other_response);
+        infernix::serve::handle_unrendered_http_error(options, openai_request, other_response);
     failures += check(other_result == httplib::Server::HandlerResponse::Unhandled &&
                           other_response.body.empty(),
                       "non-413 response was changed by the payload-limit handler");

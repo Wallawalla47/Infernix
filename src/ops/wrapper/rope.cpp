@@ -1,4 +1,4 @@
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/rope.h"
 
 #include "ops/launcher/rope.h"
 
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kTextHeadDim = 256;
@@ -234,4 +234,4 @@ PreparedRope prepare_rope(int rotary_dim, float theta, const RopeScaling& scalin
     return prepared;
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

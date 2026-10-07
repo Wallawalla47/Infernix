@@ -2,9 +2,9 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
-// Speculative verification trees (ninfer/ops/speculative_tree.h). Column a of a verification row
+// Speculative verification trees (infernix/ops/speculative_tree.h). Column a of a verification row
 // appends its key at block_start + a, block_start being the position of the row's first column.
 // Bit a of a query column's ancestor mask admits that key; keys before the block (the committed
 // prefix) stay visible under the causal rule alone.
@@ -25,4 +25,4 @@ __device__ __forceinline__ std::uint32_t causal_tree_mask(const std::uint32_t* m
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -13,7 +13,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 std::string sse_error_event(const ApiError& error) {
@@ -43,7 +43,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                                 .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
     try {
-        ninfer::GenerationObservationOptions observation{
+        infernix::GenerationObservationOptions observation{
             .phase_timings   = true,
             .live_timings    = request.stream && request.timings_per_token,
             .prompt_progress = request.stream && request.return_progress,
@@ -163,7 +163,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 GenerationOutcome outcome;
                 try {
                     StreamSink output;
-                    output.on_start = [&](const ninfer::GenerationStart& start) {
+                    output.on_start = [&](const infernix::GenerationStart& start) {
                         encoder->note_start(start);
                         if (return_progress) {
                             render_and_write(transport,
@@ -171,13 +171,13 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                         }
                     };
                     if (return_progress) {
-                        output.on_progress = [&](const ninfer::PromptProgress& progress) {
+                        output.on_progress = [&](const infernix::PromptProgress& progress) {
                             render_and_write(transport,
                                              [&] { return encoder->prompt_progress(progress); });
                         };
                     }
                     if (timings_per_token) {
-                        output.on_timing = [&](const ninfer::GenerationTimingObservation& timing) {
+                        output.on_timing = [&](const infernix::GenerationTimingObservation& timing) {
                             encoder->note_timing(timing);
                         };
                     }
@@ -216,7 +216,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 }
 
                 lifecycle->done(outcome);
-                if (outcome.finish_reason == ninfer::FinishReason::Cancelled ||
+                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
                     stream->cancelled.load(std::memory_order_acquire)) {
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -266,4 +266,4 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     }
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

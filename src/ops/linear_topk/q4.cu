@@ -9,7 +9,7 @@
 #include <array>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 struct Q4TopKOutput {
@@ -60,4 +60,4 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

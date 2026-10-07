@@ -1,7 +1,7 @@
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Geometry   = Fp8Geometry<34816, 5120>;
 using C4         = Fp8A16SimtSchedule<4, 2, 16, 4, 1, Fp8SimtActivationAccess::TokenPacked,
@@ -60,4 +60,4 @@ std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
 
 const Fp8LinearShape kFp8N34816K5120{34816,     5120,    launch_a16,
                                      launch_a8, uses_a8, partial_capacity_bytes};
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

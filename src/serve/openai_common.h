@@ -11,7 +11,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 enum class OpenAIPromptCacheAutomatic : std::uint8_t {
     Default,
@@ -43,4 +43,4 @@ std::string new_openai_request_id();
 std::string new_openai_response_id();
 std::string new_openai_response_item_id(std::string_view prefix);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

@@ -2,7 +2,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Bf16KvLivePartition {
     int splits;
@@ -36,4 +36,4 @@ struct Bf16KvPartition {
     }
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

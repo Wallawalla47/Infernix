@@ -1,13 +1,13 @@
 #pragma once
 
-// ninfer::ops::detail - private launch prototypes for embedding variants.
+// infernix::ops::detail - private launch prototypes for embedding variants.
 
 #include "core/weight.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Q8EmbedRoute {
     Auto,
@@ -27,4 +27,4 @@ void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor&
                                  Q8EmbedRoute route, cudaStream_t stream);
 const char* q8_embed_route_name(Q8EmbedRoute route);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

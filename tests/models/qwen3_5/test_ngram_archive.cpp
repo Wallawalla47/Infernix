@@ -12,8 +12,8 @@
 #include <string>
 #include <thread>
 
-using namespace ninfer::models::qwen3_5;
-using ninfer::TokenId;
+using namespace infernix::models::qwen3_5;
+using infernix::TokenId;
 
 namespace {
 

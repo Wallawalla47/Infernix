@@ -19,7 +19,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kRows   = 12288;
@@ -220,4 +220,4 @@ void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

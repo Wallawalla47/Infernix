@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ninfer_eval.config import load_config
-from ninfer_eval.coordinator import Coordinator, load_resume_config
+from infernix_eval.config import load_config
+from infernix_eval.coordinator import Coordinator, load_resume_config
 
 
 class CoordinatorTest(unittest.TestCase):

@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-namespace q4 = ninfer::models::qwen4_exp;
+namespace q4 = infernix::models::qwen4_exp;
 
 namespace {
 

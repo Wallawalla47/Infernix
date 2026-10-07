@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 namespace {
 
@@ -235,4 +235,4 @@ void q8_linear_swiglu_dispatch(const Tensor& x, const Weight& w, Tensor& out, cu
     q8_linear_swiglu_execute_plan(q8_linear_swiglu_resolve_plan(problem), x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -10,7 +10,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json = RequestJson;
@@ -81,7 +81,7 @@ void validate_standard_output_controls(const Json& body) {
         if (!functions.empty()) {
             bad_request(
                 "non-empty legacy functions require the legacy prompt and single-function-call "
-                "response contract, which NInfer does not expose; use tools instead",
+                "response contract, which Infernix does not expose; use tools instead",
                 "functions", "legacy_tools_not_supported");
         }
     }
@@ -95,7 +95,7 @@ void validate_standard_output_controls(const Json& body) {
             }
         } else if (choice.is_object()) {
             bad_request(
-                "a named legacy function_call requires forced tool invocation, which NInfer "
+                "a named legacy function_call requires forced tool invocation, which Infernix "
                 "cannot guarantee",
                 "function_call", "legacy_tools_not_supported");
         } else {
@@ -113,7 +113,7 @@ void validate_standard_output_controls(const Json& body) {
             const double value = iterator.value().get<double>();
             if (!std::isfinite(value) || value != 0.0) {
                 bad_request(
-                    "nonzero logit_bias requires per-token logit modification, which NInfer "
+                    "nonzero logit_bias requires per-token logit modification, which Infernix "
                     "does not provide",
                     "logit_bias", "logit_bias_not_supported");
             }
@@ -125,7 +125,7 @@ void validate_standard_output_controls(const Json& body) {
         }
         if (body.at("logprobs").get<bool>()) {
             bad_request("logprobs=true requires per-token log probabilities in the response, which "
-                        "NInfer does not provide",
+                        "Infernix does not provide",
                         "logprobs", "logprobs_not_supported");
         }
     }
@@ -133,7 +133,7 @@ void validate_standard_output_controls(const Json& body) {
         if (*top_logprobs != 0) {
             bad_request(
                 "nonzero top_logprobs requires alternative-token probabilities in the response, "
-                "which NInfer does not provide",
+                "which Infernix does not provide",
                 "top_logprobs", "logprobs_not_supported");
         }
     }
@@ -163,7 +163,7 @@ void validate_standard_output_controls(const Json& body) {
             }
             if (modality.get<std::string>() != "text") {
                 bad_request(
-                    "the requested output modality requires non-text generation, while NInfer "
+                    "the requested output modality requires non-text generation, while Infernix "
                     "produces text only",
                     "modalities", "modality_not_supported");
             }
@@ -172,13 +172,13 @@ void validate_standard_output_controls(const Json& body) {
 
     if (body.contains("web_search_options") && !body.at("web_search_options").is_null()) {
         bad_request(
-            "web_search_options requests hosted web search and citations, which NInfer does not "
+            "web_search_options requests hosted web search and citations, which Infernix does not "
             "provide",
             "web_search_options", "web_search_not_supported");
     }
     if (body.contains("moderation") && !body.at("moderation").is_null()) {
         bad_request(
-            "moderation requests input/output moderation behavior, which NInfer does not provide",
+            "moderation requests input/output moderation behavior, which Infernix does not provide",
             "moderation", "moderation_not_supported");
     }
     if (body.contains("verbosity") && !body.at("verbosity").is_null()) {
@@ -192,7 +192,7 @@ void validate_standard_output_controls(const Json& body) {
         if (value != "medium") {
             bad_request(
                 "verbosity='" + value +
-                    "' requires an output-length style constraint that NInfer cannot guarantee; "
+                    "' requires an output-length style constraint that Infernix cannot guarantee; "
                     "the default 'medium' value is accepted",
                 "verbosity", "verbosity_not_supported");
         }
@@ -202,7 +202,7 @@ void validate_standard_output_controls(const Json& body) {
         if (!body.at("store").is_boolean()) { bad_request("store must be a boolean", "store"); }
         if (body.at("store").get<bool>()) {
             bad_request(
-                "store=true requires a retrievable stored Chat Completion, which NInfer does not "
+                "store=true requires a retrievable stored Chat Completion, which Infernix does not "
                 "provide",
                 "store", "store_not_supported");
         }
@@ -224,13 +224,13 @@ void validate_constrained_decoding_extensions(const Json& body) {
             continue;
         }
         bad_request(std::string(field) +
-                        " requests constrained decoding, which NInfer does not provide",
+                        " requests constrained decoding, which Infernix does not provide",
                     field, "constrained_decoding_not_supported");
     }
 }
 
 void validate_compatibility_hints(const Json& body) {
-    // vLLM exposes repetition_penalty, but NInfer's Engine intentionally has no such sampler.
+    // vLLM exposes repetition_penalty, but Infernix's Engine intentionally has no such sampler.
     // The neutral value is accepted so common client defaults remain harmless.
     if (body.contains("repetition_penalty") && !body.at("repetition_penalty").is_null()) {
         if (!body.at("repetition_penalty").is_number()) {
@@ -239,13 +239,13 @@ void validate_compatibility_hints(const Json& body) {
         const double value = body.at("repetition_penalty").get<double>();
         if (!std::isfinite(value) || value != 1.0) {
             bad_request(
-                "a non-neutral repetition_penalty requires a sampler transform that NInfer does "
+                "a non-neutral repetition_penalty requires a sampler transform that Infernix does "
                 "not provide; only repetition_penalty=1 is accepted",
                 "repetition_penalty", "repetition_penalty_not_supported");
         }
     }
 
-    // vLLM/SGLang expose processor-specific kwargs. They cannot be honored by NInfer's fixed
+    // vLLM/SGLang expose processor-specific kwargs. They cannot be honored by Infernix's fixed
     // Vision frontend, so only omitted/null-valued overrides are semantically neutral.
     if (body.contains("mm_processor_kwargs") && !body.at("mm_processor_kwargs").is_null()) {
         if (!body.at("mm_processor_kwargs").is_object()) {
@@ -255,7 +255,7 @@ void validate_compatibility_hints(const Json& body) {
              iterator != body.at("mm_processor_kwargs").end(); ++iterator) {
             if (!iterator.value().is_null()) {
                 bad_request(
-                    "mm_processor_kwargs contains a non-null preprocessing override that NInfer's "
+                    "mm_processor_kwargs contains a non-null preprocessing override that Infernix's "
                     "fixed Vision frontend cannot apply",
                     "mm_processor_kwargs", "mm_processor_kwargs_not_supported");
             }
@@ -263,7 +263,7 @@ void validate_compatibility_hints(const Json& body) {
     }
 }
 
-ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
+infernix::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
                                                        bool image) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
@@ -286,7 +286,7 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             if (detail != "auto") {
                 bad_request(
                     "image_url.detail='" + detail +
-                        "' requests an explicit preprocessing profile that NInfer's fixed Vision "
+                        "' requests an explicit preprocessing profile that Infernix's fixed Vision "
                         "frontend cannot apply; use 'auto'",
                     "messages", "image_detail_not_supported");
             }
@@ -296,12 +296,12 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
     }
     if (url.empty()) { bad_request(std::string(field) + " URL must not be empty", "messages"); }
 
-    ninfer::product::media_acquire::Source source;
+    infernix::product::media_acquire::Source source;
     source.value = std::move(url);
     if (source.value.starts_with("data:")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Data;
+        source.kind = infernix::product::media_acquire::SourceKind::Data;
     } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = ninfer::product::media_acquire::SourceKind::Url;
+        source.kind = infernix::product::media_acquire::SourceKind::Url;
     } else {
         bad_request(std::string(field) + " must use HTTP(S) or a data URI", "messages");
     }
@@ -350,7 +350,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             parsed.source = parse_media_url(part, "image_url", true);
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
-            // multimodal models. NInfer maps it to the Engine's native Video input.
+            // multimodal models. Infernix maps it to the Engine's native Video input.
             if (turn.role != ChatRole::User) {
                 bad_request("video_url is only supported on user messages", "messages",
                             "modality_not_supported");
@@ -456,7 +456,7 @@ void validate_message_name(const Json& item, ChatRole role) {
     // that non-standard field as an ignored compatibility hint; it never reaches the Engine or
     // prompt renderer.
     if (!name.empty() && role != ChatRole::Tool) {
-        bad_request("a non-empty message name changes participant identity, which NInfer's chat "
+        bad_request("a non-empty message name changes participant identity, which Infernix's chat "
                     "template cannot represent",
                     "messages", "message_name_not_supported");
     }
@@ -522,7 +522,7 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
 ChatTurn parse_assistant_message(const Json& item, std::size_t index) {
     if (item.contains("audio") && !item.at("audio").is_null()) {
         bad_request("assistant audio history requires resolving a previous audio response, which "
-                    "NInfer cannot provide",
+                    "Infernix cannot provide",
                     "messages", "assistant_history_not_supported");
     }
 
@@ -603,11 +603,11 @@ void parse_messages(const Json& body, GenerationRequest& output) {
     // A trailing assistant message is an assistant prefill, matching the Anthropic endpoint: the
     // client sends back a partial assistant turn and the Engine continues it in place.
     if (!output.messages.empty() && output.messages.back().role == ChatRole::Assistant) {
-        output.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+        output.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     }
 }
 
-// Custom tools carry no declared JSON Schema: their input is free-form text. NInfer serves them as
+// Custom tools carry no declared JSON Schema: their input is free-form text. Infernix serves them as
 // a single-string-input function under the same name, so callers that dispatch by tool name (for
 // example the GitHub Copilot CLI and MCP clients) keep working. A declared `format` is carried as
 // descriptive prompt metadata only, because the engine has no constrained decoding for it.
@@ -664,7 +664,7 @@ void parse_tools(const Json& body, GenerationRequest& output) {
         if (type != "function") {
             bad_request(
                 "tool type '" + type +
-                    "' requires a non-function output contract that NInfer does not provide",
+                    "' requires a non-function output contract that Infernix does not provide",
                 prefix + ".type", "tool_type_not_supported");
         }
         if (!item.contains("function") || !item.at("function").is_object()) {
@@ -693,7 +693,7 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
-            // strict:true is accepted as advisory. NInfer cannot constrain decoding to the declared
+            // strict:true is accepted as advisory. Infernix cannot constrain decoding to the declared
             // schema, so the flag does not change generation (docs/serving.md).
         }
         output.tools.push_back(std::move(tool));
@@ -726,7 +726,7 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
         if (item.at("type").get<std::string>() != "function" &&
             item.at("type").get<std::string>() != "custom") {
             bad_request(
-                "allowed_tools entries must select a function or custom tool, because NInfer "
+                "allowed_tools entries must select a function or custom tool, because Infernix "
                 "provides no other output contract",
                 prefix + ".type", "tool_type_not_supported");
         }
@@ -846,13 +846,13 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
     sampling.seed              = get_seed(body);
 
     // vLLM and SGLang expose top_k/min_p on their OpenAI-compatible endpoints; both map directly
-    // to NInfer's native sampler and are useful for Qwen's published sampling presets.
+    // to Infernix's native sampler and are useful for Qwen's published sampling presets.
     sampling.top_k = optional_int(body, "top_k");
     sampling.min_p = get_number(body, "min_p");
 
     if (const std::optional<int> count = optional_int(body, "n")) {
         if (*count != 1) {
-            bad_request("n requests multiple completions, while NInfer produces one completion per "
+            bad_request("n requests multiple completions, while Infernix produces one completion per "
                         "request; only n=1 is supported",
                         "n", "n_not_supported");
         }
@@ -983,4 +983,4 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     return output;
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

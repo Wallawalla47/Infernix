@@ -26,7 +26,7 @@ std::string failure_message(const Attempt& attempt) {
 
 int main() {
     int failures = 0;
-    const ninfer::runtime::SequenceCapacityCurve curve{
+    const infernix::runtime::SequenceCapacityCurve curve{
         .main_page_tokens                     = 64,
         .minimum_main_page_groups             = 2,
         .maximum_main_page_groups             = 6,
@@ -35,7 +35,7 @@ int main() {
     };
 
     const auto automatic =
-        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(), curve, 1360, 50);
+        infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve, 1360, 50);
     failures +=
         check(automatic.main_page_groups == 4 && automatic.resolved_tokens == 256 &&
                   automatic.runtime_reservation_bytes == 1256 &&
@@ -43,12 +43,12 @@ int main() {
               "automatic KV capacity did not select the largest fitting page count");
 
     const auto capped =
-        ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(), curve, 10000, 50);
+        infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve, 10000, 50);
     failures += check(capped.main_page_groups == 6 && capped.resolved_tokens == 384,
                       "automatic KV capacity exceeded or missed the target maximum");
 
-    const auto explicit_capacity = ninfer::runtime::resolve_kv_capacity(
-        ninfer::KvCapacityPolicy::explicit_capacity(129), curve, 1200, 50);
+    const auto explicit_capacity = infernix::runtime::resolve_kv_capacity(
+        infernix::KvCapacityPolicy::explicit_capacity(129), curve, 1200, 50);
     failures +=
         check(explicit_capacity.main_page_groups == 3 && explicit_capacity.resolved_tokens == 192 &&
                   explicit_capacity.runtime_reservation_bytes == 1128 &&
@@ -56,7 +56,7 @@ int main() {
               "explicit KV capacity did not use page-aligned token semantics or kept a headroom");
 
     const std::string insufficient_message = failure_message([&] {
-        (void)ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::automatic(), curve,
+        (void)infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::automatic(), curve,
                                                    1049, 50);
     });
     failures += check(!insufficient_message.empty(),
@@ -69,7 +69,7 @@ int main() {
         "automatic KV capacity error does not state the combined reservation + headroom total");
 
     const std::string explicit_message = failure_message([&] {
-        (void)ninfer::runtime::resolve_kv_capacity(ninfer::KvCapacityPolicy::explicit_capacity(384),
+        (void)infernix::runtime::resolve_kv_capacity(infernix::KvCapacityPolicy::explicit_capacity(384),
                                                    curve, 1400, 50);
     });
     failures += check(

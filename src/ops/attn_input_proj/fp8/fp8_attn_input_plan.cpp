@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 enum class Fp8AttnInputRoute : std::uint8_t {
@@ -64,4 +64,4 @@ void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, T
     fp8_attn_input_a8_launch(x, weight, q, gate, k, v, scratch, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,6 +1,6 @@
 #include "ops/linear/q6/q6_shapes.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // The fused gate_up of a Q6 Qwen3.8-27B MLP (upstream PR #284). It shares K=5120 with the output
 // head, so it takes that shape's capacity routes on the unified Q6 templates; the PR's own ladder
@@ -19,4 +19,4 @@ Q6Launch select_q6_n34816_k5120(std::int32_t tokens) {
     return launch_q6_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -5,11 +5,11 @@
 // captured graph launched after an L2 flush: in a forward, a layer's KV is never L2-resident.
 // Plane contents are fixed finite fixture values; the timing does not depend on them.
 
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/qsa.h"
 
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "ops/qsa/qsa_select.h"
 
 #include <cuda_bf16.h>
@@ -23,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -106,7 +106,7 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--repeat") {
             o.repeat = std::atoi(argv[++i]);
         } else if (arg == "--help") {
-            std::printf("ninfer_qsa_attention_bench [--storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
+            std::printf("infernix_qsa_attention_bench [--storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2] "
                         "[--contexts 8192,131072] [--widths 1,5] [--warmup N] [--repeat N]\n");
             std::exit(0);
         } else {
@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_qsa_attention_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_qsa_attention_bench: %s\n", error.what());
         return 1;
     }
 }

@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Columns the fused route serves in one call.
 inline constexpr std::int32_t kHcMixFusedMaxColumns = 16;
@@ -30,4 +30,4 @@ void hc_mix_q8(const Tensor& residual, const Tensor& norm_weight, const Weight& 
                std::int32_t streams, std::int32_t rank, float eps, Tensor& x, Tensor* inject, void* partials,
                cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

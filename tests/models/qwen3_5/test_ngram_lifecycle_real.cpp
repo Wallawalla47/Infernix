@@ -1,5 +1,5 @@
 #include "kv_cache_storage.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
@@ -18,11 +18,11 @@ void require(bool value, const char* message) {
     if (!value) { throw std::runtime_error(message); }
 }
 
-std::uint64_t ngram_rounds(const ninfer::GenerationResult& result) {
+std::uint64_t ngram_rounds(const infernix::GenerationResult& result) {
     return result.speculative.ngram_rounds;
 }
 
-std::uint64_t ngram_accepted(const ninfer::GenerationResult& result) {
+std::uint64_t ngram_accepted(const infernix::GenerationResult& result) {
     return result.speculative.ngram_accepted_tokens;
 }
 
@@ -31,8 +31,8 @@ std::string copy_prefill(const std::string& source, const std::string& prefix) {
            "Output only the same file, without explanation or Markdown:\n\n" + prefix;
 }
 
-ninfer::RequestOptions request(unsigned output, bool reuse) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions request(unsigned output, bool reuse) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens    = output;
     options.execution.sampling.temperature       = 0;
     options.execution.sampling.presence_penalty  = 0;
@@ -42,59 +42,59 @@ ninfer::RequestOptions request(unsigned output, bool reuse) {
     return options;
 }
 
-struct Sink : ninfer::OutputSink {
+struct Sink : infernix::OutputSink {
     std::atomic<std::size_t> bytes{0};
 
-    void start(ninfer::GenerationStart) override {}
+    void start(infernix::GenerationStart) override {}
 
-    void progress(ninfer::PromptProgress) override {}
+    void progress(infernix::PromptProgress) override {}
 
-    void timing(ninfer::GenerationTimingObservation) override {}
+    void timing(infernix::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override { bytes += delta.text.size(); }
+    void publish(infernix::OutputDelta delta) override { bytes += delta.text.size(); }
 };
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto* artifact = std::getenv("NINFER_NGRAM_TEST_WEIGHTS");
-    if (!artifact || !*artifact) { artifact = std::getenv("NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS"); }
+    const auto* artifact = std::getenv("INFERNIX_NGRAM_TEST_WEIGHTS");
+    if (!artifact || !*artifact) { artifact = std::getenv("INFERNIX_QWEN3_8_27B_DFLASH2_WEIGHTS"); }
     if (!artifact || !*artifact) { return 77; }
     try {
         const bool strict_fresh = argc > 1 && std::string(argv[argc - 1]) == "--strict-fresh";
         if (strict_fresh) { --argc; }
         const unsigned ngram_k = argc > 1 ? std::stoul(argv[1]) : 15U;
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path       = artifact;
         options.max_context         = 4096;
-        options.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+        options.kv_capacity         = infernix::KvCapacityPolicy::explicit_capacity(4096);
         options.max_concurrency     = 1;
         options.prefill_chunk       = 1024;
         options.enable_vision       = false;
-        options.kv_cache            = ninfer::KvCacheStorage::Nvfp4Group16;
-        options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+        options.kv_cache            = infernix::KvCacheStorage::Nvfp4Group16;
+        options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
         const std::string backend   = argc > 8 ? argv[8] : "dflash2";
         if (backend == "mtp") {
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
         } else if (backend == "dflash") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash;
         } else if (backend != "dflash2") {
             throw std::invalid_argument("unsupported fixture backend");
         }
         options.speculative.draft_tokens       = 5;
         options.speculative.ngram_draft_tokens = ngram_k;
-        options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head      = infernix::ProposalHead::Optimized;
         if (argc > 2) { options.speculative.draft_tokens = std::stoul(argv[2]); }
         if (argc > 3) { options.use_cuda_graph = std::stoi(argv[3]) != 0; }
         if (argc > 4 && std::stoi(argv[4]) == 0) {
-            options.speculative.proposal_head = ninfer::ProposalHead::Full;
+            options.speculative.proposal_head = infernix::ProposalHead::Full;
         }
         const std::string codec = argc > 5 ? argv[5] : "nvfp4";
-        options.kv_cache        = ninfer::test::parse_kv_cache_storage(codec);
+        options.kv_cache        = infernix::test::parse_kv_cache_storage(codec);
         if (argc > 6) { options.speculative.ngram_min_match = std::stoul(argv[6]); }
         std::cout << "ngram=" << ngram_k << " artifact=" << artifact << " backend=" << backend
                   << " neural=" << options.speculative.draft_tokens
                   << " graph=" << options.use_cuda_graph << " full_head="
-                  << (options.speculative.proposal_head == ninfer::ProposalHead::Full)
+                  << (options.speculative.proposal_head == infernix::ProposalHead::Full)
                   << " codec=" << codec << std::endl;
         options.context_cache.device_state_slots                = 0;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
@@ -116,9 +116,9 @@ int main(int argc, char** argv) {
                 require(ngram_k == 0, "multi-slot regression must leave ngram disabled");
                 const bool canonical    = std::string(argv[9]) == "concurrency";
                 options.max_concurrency = 2;
-                ninfer::Engine engine(options);
-                std::vector<std::vector<ninfer::TokenId>> prompts, references;
-                std::vector<ninfer::PromptInput> chat_prompts;
+                infernix::Engine engine(options);
+                std::vector<std::vector<infernix::TokenId>> prompts, references;
+                std::vector<infernix::PromptInput> chat_prompts;
                 std::vector<std::string> reference_texts;
                 const auto prepare = [&](std::size_t row) {
                     return canonical ? engine.prepare(chat_prompts[row])
@@ -134,11 +134,11 @@ int main(int argc, char** argv) {
                         "Here is a Python file:\n\n" + file +
                         "Here is the same Python file again, unchanged:\n\ndef " + name +
                         "_0(value):\n"));
-                    ninfer::PromptInput input;
-                    ninfer::ChatMessage user;
-                    user.role = ninfer::ChatRole::User;
-                    user.parts.push_back(ninfer::MessagePart{
-                        .kind = ninfer::MessagePartKind::Text,
+                    infernix::PromptInput input;
+                    infernix::ChatMessage user;
+                    user.role = infernix::ChatRole::User;
+                    user.parts.push_back(infernix::MessagePart{
+                        .kind = infernix::MessagePartKind::Text,
                         .text = "Repeat the following Python file exactly. Output only the file, "
                                 "with no "
                                 "explanation or Markdown fences. Do not make any changes.\n\n" +
@@ -194,7 +194,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             require(std::string(argv[9]) == "sanitizer-smoke", "unsupported fixture mode");
-            ninfer::Engine engine(options);
+            infernix::Engine engine(options);
             const auto prompt = engine.tokenize_text(
                 copy_prefill(source, "def transform_0(value):\n    offset = 17"));
             // One prefill-sampled token must leave room for every draft plus its bonus.
@@ -224,12 +224,12 @@ int main(int argc, char** argv) {
                       << std::endl;
             return 0;
         }
-        std::vector<ninfer::TokenId> device_retained, device_restored;
+        std::vector<infernix::TokenId> device_retained, device_restored;
         {
             auto control_options                                 = options;
             control_options.context_cache.device_state_slots     = 2;
             control_options.context_cache.host_capacity_bytes = 0;
-            ninfer::Engine control(control_options);
+            infernix::Engine control(control_options);
             auto control_prompt = control.tokenize_text(text);
             device_retained =
                 control.generate(control.prepare_tokens(control_prompt), request(256, true))
@@ -250,7 +250,7 @@ int main(int argc, char** argv) {
                       << " equals_fresh=" << (device_restored == control_fresh.generated_token_ids)
                       << std::endl;
         }
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         const auto prompt = engine.tokenize_text(text);
         require(prompt.size() > 2048 && prompt.size() + 512 < 4096,
                 "pressure fixture size invalid");
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
             const auto licensed = 1 + result.speculative.rounds +
                                   result.speculative.accepted_tokens +
                                   result.speculative.fallback_steps;
-            if (result.finish_reason != ninfer::FinishReason::StopToken ||
+            if (result.finish_reason != infernix::FinishReason::StopToken ||
                 result.generated_token_ids.size() >= licensed ||
                 (ngram_k != 0 && ngram_rounds(result) == 0)) {
                 continue;
@@ -329,8 +329,8 @@ int main(int argc, char** argv) {
         Sink sink;
         const auto cancelled =
             engine.generate(engine.prepare_tokens(prompt), request(512, true), &sink,
-                            ninfer::CancellationView([&] { return sink.bytes.load() >= 128; }));
-        require(cancelled.finish_reason == ninfer::FinishReason::Cancelled &&
+                            infernix::CancellationView([&] { return sink.bytes.load() >= 128; }));
+        require(cancelled.finish_reason == infernix::FinishReason::Cancelled &&
                     cancelled.generated_token_ids.size() < 512 &&
                     (ngram_k == 0 || ngram_rounds(cancelled) > 0),
                 "stream cancellation did not interrupt an ngram request");
@@ -339,7 +339,7 @@ int main(int argc, char** argv) {
                 "cancelled request contaminated subsequent fresh generation");
         std::cout << "ngram cancellation and recovery passed" << std::endl;
 
-        std::vector<std::vector<ninfer::TokenId>> queued_prompts, expected;
+        std::vector<std::vector<infernix::TokenId>> queued_prompts, expected;
         for (const std::string name : {"alpha", "beta", "gamma"}) {
             std::string file;
             for (int i = 0; i < 12; ++i) {
@@ -354,7 +354,7 @@ int main(int argc, char** argv) {
         }
         require(expected[0] != expected[1] && expected[1] != expected[2],
                 "queued isolation fixture did not produce distinct outputs");
-        std::vector<ninfer::GenerationHandle> handles;
+        std::vector<infernix::GenerationHandle> handles;
         for (const auto& queued : queued_prompts) {
             handles.push_back(engine.submit(engine.prepare_tokens(queued), request(96, false)));
         }
@@ -390,7 +390,7 @@ int main(int argc, char** argv) {
         }
         if (soak != 0) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            ninfer::RuntimeStats stats;
+            infernix::RuntimeStats stats;
             do {
                 stats = engine.runtime_stats();
                 if (stats.running_requests == 0 && stats.waiting_requests == 0 &&
@@ -416,19 +416,19 @@ int main(int argc, char** argv) {
         for (unsigned budget = 1; budget <= maximum_budget; ++budget) {
             const auto result =
                 engine.generate(engine.prepare_tokens(queued_prompts[0]), request(budget, false));
-            require(result.finish_reason == ninfer::FinishReason::OutputLimit &&
+            require(result.finish_reason == infernix::FinishReason::OutputLimit &&
                         result.generated_token_ids.size() == budget &&
                         std::equal(result.generated_token_ids.begin(),
                                    result.generated_token_ids.end(), expected[0].begin()),
                     "output budget changed or exceeded its licensed reference prefix");
         }
-        ninfer::test::speculative_page_boundary(engine);
+        infernix::test::speculative_page_boundary(engine);
         for (const unsigned gap : {1U, 4U, 15U, 16U, 31U, 32U, 33U, 63U, 64U}) {
-            std::vector<ninfer::TokenId> tail_prompt(options.max_context - gap, 198);
+            std::vector<infernix::TokenId> tail_prompt(options.max_context - gap, 198);
             tail_prompt.back() = prompt.back();
             const auto tail =
                 engine.generate(engine.prepare_tokens(tail_prompt), request(gap + 8, false));
-            require(tail.finish_reason == ninfer::FinishReason::ContextCapacity &&
+            require(tail.finish_reason == infernix::FinishReason::ContextCapacity &&
                         tail.generated_token_ids.size() == gap + 1,
                     "speculative verification escaped the context capacity tail");
         }

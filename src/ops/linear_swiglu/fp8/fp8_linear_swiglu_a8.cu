@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Tma64x128 = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Tma64x256 = Fp8A8TmaMmaSchedule<64, 256, 128, 2, 4, 2, 1>;
@@ -38,4 +38,4 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     if (x.ne[1] <= 192) return launch.template operator()<Tma64x256>();
     launch.template operator()<Bulk>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

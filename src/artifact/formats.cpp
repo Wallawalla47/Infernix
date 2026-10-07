@@ -4,7 +4,7 @@
 
 #include <array>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 namespace {
 
 constexpr std::array kFormats = {
@@ -59,4 +59,4 @@ std::string_view layout_name(QuantLayout layout) noexcept {
     return {};
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

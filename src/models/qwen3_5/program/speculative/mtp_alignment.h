@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 struct MtpAlignmentWindow {
     std::uint32_t hidden_begin             = 0;
@@ -77,4 +77,4 @@ shifted_visual_overlap(std::span<const std::int32_t> scatter_indices, std::uint3
     return overlap;
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

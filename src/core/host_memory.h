@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer {
+namespace infernix {
 
 // Physical Host memory the OS can hand out now without paging: free plus reclaimable file cache
 // (Windows ullAvailPhys, Linux MemAvailable). Callers that lock large Host blocks check it first,
@@ -27,8 +27,8 @@ struct HostMemorySnapshot {
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();
 
 // Keeps at least `bytes` of this process resident (Windows: a hard minimum working set), so a small
-// RAM reserve trims other programs before NInfer's own pageable memory. False when the OS refuses
+// RAM reserve trims other programs before Infernix's own pageable memory. False when the OS refuses
 // or has no such control (non-fatal: the caller logs it).
 [[nodiscard]] bool reserve_process_working_set(std::uint64_t bytes) noexcept;
 
-} // namespace ninfer
+} // namespace infernix

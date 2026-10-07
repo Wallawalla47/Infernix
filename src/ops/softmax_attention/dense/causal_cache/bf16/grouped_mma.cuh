@@ -6,7 +6,7 @@
 #include "ops/softmax_attention/common/causal_partition.h"
 #include "ops/softmax_attention/common/causal_tree.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class G, class S, class Input>
 __device__ __forceinline__ void
@@ -333,4 +333,4 @@ __launch_bounds__(S::kLaunchBoundThreads, S::kMinBlocks) __global__
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

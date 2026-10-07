@@ -12,7 +12,7 @@
 
 #include <mutex>
 
-namespace ninfer {
+namespace infernix {
 
 void exempt_process_from_power_throttling() noexcept {
 #if defined(_WIN32)
@@ -29,4 +29,4 @@ void exempt_process_from_power_throttling() noexcept {
 #endif
 }
 
-} // namespace ninfer
+} // namespace infernix

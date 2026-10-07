@@ -1,4 +1,4 @@
-#include "ninfer_build_id.h"
+#include "infernix_build_id.h"
 
 #include "product/logging/logging.h"
 #include "product/logging/engine_diagnostics.h"
@@ -36,8 +36,8 @@
 
 namespace {
 
-using ninfer::serve::StopControl;
-using ninfer::serve::StopEvent;
+using infernix::serve::StopControl;
+using infernix::serve::StopEvent;
 
 // Routes console and signal events to the StopControl and withdraws an unconfirmed Ctrl+C once
 // its window passes. Events arrive on a thread of their own (the Windows console-control thread or
@@ -121,7 +121,7 @@ private:
 
 class ServingScope {
 public:
-    ServingScope(StopControl& control, ninfer::serve::HttpServer& server) : control_(control) {
+    ServingScope(StopControl& control, infernix::serve::HttpServer& server) : control_(control) {
         control_.serve([&server] { server.stop(); });
     }
 
@@ -187,8 +187,8 @@ void install_stop_handlers() {
 // rebuild invalidates a saved cache whose bytes it may compute differently.
 std::string binary_identity(const char* argv0) {
     std::string out;
-#ifdef NINFER_BUILD_ID
-    out = NINFER_BUILD_ID;
+#ifdef INFERNIX_BUILD_ID
+    out = INFERNIX_BUILD_ID;
 #endif
     std::error_code error;
 #ifdef _WIN32
@@ -216,19 +216,19 @@ std::string binary_identity(const char* argv0) {
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::serve::ServeOptions options;
+    infernix::serve::ServeOptions options;
     try {
-        options = ninfer::serve::parse_serve_options(argc, argv);
+        options = infernix::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
-        std::cerr << "ninfer-serve: " << exception.what() << '\n';
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        std::cerr << "infernix-serve: " << exception.what() << '\n';
+        std::cerr << infernix::serve::serve_usage_text(argv[0]);
         return 1;
     } catch (const std::exception& exception) {
-        std::cerr << "ninfer-serve: " << exception.what() << '\n';
+        std::cerr << "infernix-serve: " << exception.what() << '\n';
         return 1;
     }
     if (options.help_requested) {
-        std::cout << ninfer::serve::serve_usage_text(argv[0]);
+        std::cout << infernix::serve::serve_usage_text(argv[0]);
         return 0;
     }
     if (!options.context_cache.hybrid.persistent_file.empty()) {
@@ -236,29 +236,29 @@ int main(int argc, char** argv) {
     }
     install_stop_handlers();
     // Token/level colouring is opt-in (--log-colours on); the default keeps the log plain.
-    ninfer::serve::set_operational_log_colours(options.log_colours);
+    infernix::serve::set_operational_log_colours(options.log_colours);
 
-    ninfer::product::LoggingOptions logging_options;
-    logging_options.logger_name  = "ninfer-serve";
+    infernix::product::LoggingOptions logging_options;
+    logging_options.logger_name  = "infernix-serve";
     logging_options.level        = options.log_level;
-    logging_options.presentation = ninfer::product::LogPresentation::Service;
-    logging_options.color        = options.log_colours ? ninfer::product::LogColorMode::Always
-                                                       : ninfer::product::LogColorMode::Never;
-    ninfer::product::LoggingRuntime logging(logging_options);
+    logging_options.presentation = infernix::product::LogPresentation::Service;
+    logging_options.color        = options.log_colours ? infernix::product::LogColorMode::Always
+                                                       : infernix::product::LogColorMode::Never;
+    infernix::product::LoggingRuntime logging(logging_options);
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-    ninfer::product::StartupLogRenderer startup_log(logging);
-    ninfer::serve::OperationalLog operational_log(logger);
+    infernix::product::StartupLogRenderer startup_log(logging);
+    infernix::serve::OperationalLog operational_log(logger);
     // Stop prompts use the transient bottom line beneath the statistics panel; output without one
     // (redirected, or not a terminal) logs them instead.
-    const std::shared_ptr<ninfer::product::TerminalProgress> console_line =
+    const std::shared_ptr<infernix::product::TerminalProgress> console_line =
         logging.terminal_progress();
     // Shares its state with the Engine's copy of the options, and outlives the Engine.
-    const ninfer::PrefixCacheSaveControl save_control =
+    const infernix::PrefixCacheSaveControl save_control =
         options.context_cache.hybrid.persistent_save;
     StopControl stop_control(
         !options.context_cache.hybrid.persistent_file.empty(),
         {.show =
-             [&](const ninfer::serve::StopConsoleLine& line) {
+             [&](const infernix::serve::StopConsoleLine& line) {
                  if (console_line->enabled()) {
                      if (line.text.empty()) {
                          console_line->clear();
@@ -266,12 +266,12 @@ int main(int argc, char** argv) {
                          console_line->update(line.text);
                      }
                  } else if (line.prompt) {
-                     operational_log.write({.severity = ninfer::serve::OperationalSeverity::Warning,
+                     operational_log.write({.severity = infernix::serve::OperationalSeverity::Warning,
                                             .message  = line.text});
                  }
              },
          .record =
-             [&](const ninfer::serve::OperationalRecord& record) { operational_log.write(record); },
+             [&](const infernix::serve::OperationalRecord& record) { operational_log.write(record); },
          // The writer checks between slabs of a few MiB, so it lets go within milliseconds unless
          // the disk stalls.
          .abandon_save = [save_control] { return save_control.abandon(std::chrono::seconds(2)); },
@@ -284,17 +284,17 @@ int main(int argc, char** argv) {
     bool serving = false;
 
     try {
-        ninfer::serve::HttpServer server(options, logger, logging.terminal_panel());
+        infernix::serve::HttpServer server(options, logger, logging.terminal_panel());
         if (!server.bind()) {
             operational_log.bind_failure(options.host, options.port);
             return 1;
         }
 
-#ifdef NINFER_BUILD_ID
-        logger->info("build {}", NINFER_BUILD_ID);
+#ifdef INFERNIX_BUILD_ID
+        logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
-        ninfer::serve::GenerationService service(
-            options, startup_log.observer(), ninfer::product::engine_diagnostic_observer(logger));
+        infernix::serve::GenerationService service(
+            options, startup_log.observer(), infernix::product::engine_diagnostic_observer(logger));
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
 

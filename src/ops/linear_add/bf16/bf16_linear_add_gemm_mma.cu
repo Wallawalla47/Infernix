@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_template_launch.cuh"
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 template <class Schedule>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
@@ -42,4 +42,4 @@ void bf16_linear_add_mma_launch(const Tensor& x, const Weight& weight, Tensor& r
     else
         tma.template operator()<Bf16A16TmaR64T128K64S2>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

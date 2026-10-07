@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Read view of a vector-quantized cache (Vq2, Q4KeyVq2Value) with its exact recent-key window.
 // Window planes are indexed by sequence state slot (window_slots[b], or 0 for a single view).
@@ -66,4 +66,4 @@ void validate_vq_causal_operands(const CausalAttentionOperands& p, const VqKvCac
         throw std::invalid_argument("VQ causal attention: invalid operands");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

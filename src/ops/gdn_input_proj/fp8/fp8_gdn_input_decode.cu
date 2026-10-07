@@ -9,7 +9,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                  cudaStream_t stream) {
@@ -21,4 +21,4 @@ void fp8_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& 
         fp8_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

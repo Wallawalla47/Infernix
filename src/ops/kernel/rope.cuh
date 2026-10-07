@@ -1,6 +1,6 @@
 #pragma once
 
-// Implements: include/ninfer/ops/rope.h
+// Implements: include/infernix/ops/rope.h
 // Fixed matches: BF16 Qwen3.6 Text 24Q/4K and 16Q/2K at D/R=256/64, DFlash 32Q/8K at
 // D/R=128/128, plus packed Vision 16Q/16K at D/R=72/72. One CTA owns one token and shares its
 // rotary coefficients across heads.
@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 enum class RopeKernelMode : std::int32_t {
     Text1D,
@@ -271,4 +271,4 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

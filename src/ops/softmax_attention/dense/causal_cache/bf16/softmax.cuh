@@ -5,7 +5,7 @@
 #include <math_constants.h>
 #include <limits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr float kBf16KvNegativeInfinity = -std::numeric_limits<float>::infinity();
 
@@ -45,4 +45,4 @@ __device__ __forceinline__ float bf16_kv_state_weight(float maximum, float sum, 
     return sum > 0.0f ? exp2_approx(maximum - combined) : 0.0f;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

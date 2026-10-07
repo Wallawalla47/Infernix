@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 // One routed expert of one layer call. Device pointers; x and y are [ncols][kHidden] BF16.
 struct NarrowJob {
@@ -35,4 +35,4 @@ std::size_t narrow_workspace_bytes(int jobs);
 // narrow_workspace_bytes(jobs) bytes of device memory.
 void launch_narrow_experts(const NarrowJob* jobs, int job_count, void* workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

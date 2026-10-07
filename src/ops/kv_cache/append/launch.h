@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ninfer/ops/kv_cache_append.h"
+#include "infernix/ops/kv_cache_append.h"
 
 #include <cuda_fp16.h>
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
                             PagedKVLayerView cache, cudaStream_t stream);
@@ -75,4 +75,4 @@ void kv_cache_append_prefix_launch(const Tensor& k, const Tensor& v, const Tenso
                                    CyclicKVCacheLayerView cache,
                                    const KVCacheAppendPrefixPlan& plan, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

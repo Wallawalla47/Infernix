@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -14,9 +14,9 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::input_projection;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::input_projection;
 
 namespace {
 

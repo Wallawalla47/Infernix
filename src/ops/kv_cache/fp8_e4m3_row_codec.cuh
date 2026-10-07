@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kKVCacheFp8HeadDim        = 256;
 inline constexpr int kKVCacheFp8Group          = 256;
@@ -78,4 +78,4 @@ __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint
     return __hmul2(kv_cache_fp8_code2_to_half2(storage), __halves2half2(scale, scale));
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

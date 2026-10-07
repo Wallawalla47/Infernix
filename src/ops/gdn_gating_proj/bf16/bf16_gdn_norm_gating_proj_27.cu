@@ -8,7 +8,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
@@ -119,4 +119,4 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
         launch.template operator()<4, 256>();
     CUDA_CHECK(cudaGetLastError());
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

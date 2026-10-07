@@ -1,8 +1,8 @@
-"""Compare NInfer logits (FP32 .bin of one position) with the FP64 reference (reference.py .npz).
+"""Compare Infernix logits (FP32 .bin of one position) with the FP64 reference (reference.py .npz).
 
-    python -m tools.flash_next.compare_logits --reference ref.npz --position -1 --ninfer logits.bin         [--residuals residuals.bin --routes routes.bin]
+    python -m tools.flash_next.compare_logits --reference ref.npz --position -1 --infernix logits.bin         [--residuals residuals.bin --routes routes.bin]
 
-The optional per-block taps of ninfer_qwen4_exp_forward_real_test (BF16 [blocks, T, S*H] residuals
+The optional per-block taps of infernix_qwen4_exp_forward_real_test (BF16 [blocks, T, S*H] residuals
 and I32 [blocks, T, top k] routed expert ids) are compared block by block: the relative residual
 error per position and the routed-set overlap show where any divergence starts.
 """
@@ -28,13 +28,13 @@ def compare(reference: np.ndarray, candidate: np.ndarray) -> dict:
     top_ref = np.argsort(-reference)[:10]
     top_cand = np.argsort(-candidate)[:10]
     return {
-        "kl_ref_to_ninfer": float((p * (ref_lp - cand_lp)).sum()),
+        "kl_ref_to_infernix": float((p * (ref_lp - cand_lp)).sum()),
         "max_abs_logit_diff": float(np.abs(reference - candidate).max()),
         "rms_logit_diff": float(np.sqrt(((reference - candidate) ** 2).mean())),
         "top1_agree": bool(top_ref[0] == top_cand[0]),
         "top10_overlap": int(len(set(top_ref) & set(top_cand))),
         "reference_top5": top_ref[:5].tolist(),
-        "ninfer_top5": top_cand[:5].tolist(),
+        "infernix_top5": top_cand[:5].tolist(),
         "reference_top1_prob": float(p[top_ref[0]]),
     }
 
@@ -68,7 +68,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--position", type=int, default=-1)
-    parser.add_argument("--ninfer", type=Path, required=True)
+    parser.add_argument("--infernix", type=Path, required=True)
     parser.add_argument("--residuals", type=Path)
     parser.add_argument("--routes", type=Path)
     args = parser.parse_args()

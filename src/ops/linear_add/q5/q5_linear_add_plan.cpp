@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
@@ -243,4 +243,4 @@ void q5_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& residual_o
     q5_linear_add_execute_plan(plan, x, w, residual_out, ws, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

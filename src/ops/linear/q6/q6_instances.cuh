@@ -2,7 +2,7 @@
 
 #include "ops/linear/q6/q6_schedule.cuh"
 
-namespace ninfer::ops::detail::q6_instances {
+namespace infernix::ops::detail::q6_instances {
 
 using SimtR8T4 = Q6A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
@@ -36,4 +36,4 @@ using MmaR64T112 = Q6A16MmaSchedule<64, 112, 64, 16, 112, 2, 1, Q6MmaFragmentPip
 using MmaR64T128 = Q6A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q6MmaFragmentPipeline::Serial,
                                     Cache::cg, Cache::cg, Q6ScaleLoad::Pair32>;
 
-} // namespace ninfer::ops::detail::q6_instances
+} // namespace infernix::ops::detail::q6_instances

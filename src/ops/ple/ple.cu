@@ -1,4 +1,4 @@
-#include "ninfer/ops/ple.h"
+#include "infernix/ops/ple.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -255,4 +255,4 @@ void ple_conv_commit(const Tensor& normalized, const Tensor& commit_columns, Ten
     check_launch("commit");
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

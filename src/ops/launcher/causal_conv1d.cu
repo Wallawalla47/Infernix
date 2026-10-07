@@ -1,4 +1,4 @@
-// ninfer::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
+// infernix::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "ops/launcher/causal_conv1d.h"
 
 #include "ops/common/math.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // The small-T routes launch one thread per channel and token in one block, so the bound and the
 // channel tile together may not exceed the hardware block ceiling.
@@ -341,4 +341,4 @@ void causal_conv1d_from_states_launch(const Tensor& x, const Tensor& weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

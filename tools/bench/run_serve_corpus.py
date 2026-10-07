@@ -83,9 +83,9 @@ SCENARIO_FIXTURES = {
 }
 
 WARMUP_FIXTURE = "text_smoke_zh"
-RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
+RUN_ARTIFACT_TYPE = "infernix_serve_corpus_result"
 RUN_SCHEMA_VERSION = 8
-SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
+SERVER_LOG_ARTIFACT_TYPE = "infernix_serve_request_log"
 SERVER_LOG_SCHEMA_VERSION = 25
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
@@ -143,7 +143,7 @@ class ServerLogTail:
     def _check_process(self) -> None:
         returncode = self.process.poll()
         if returncode is not None:
-            raise CampaignError(f"ninfer-serve exited unexpectedly with status {returncode}")
+            raise CampaignError(f"infernix-serve exited unexpectedly with status {returncode}")
 
     def _read_new(self) -> None:
         if not self.path.exists():
@@ -227,7 +227,7 @@ class RunningServer:
         while True:
             returncode = self.process.poll()
             if returncode is not None:
-                raise CampaignError(f"ninfer-serve exited during startup with status {returncode}")
+                raise CampaignError(f"infernix-serve exited during startup with status {returncode}")
             connection = http.client.HTTPConnection(self.host, self.port, timeout=2.0)
             try:
                 connection.request("GET", "/health", headers={"Connection": "close"})
@@ -246,7 +246,7 @@ class RunningServer:
                 connection.close()
             if time.monotonic() >= deadline:
                 raise CampaignError(
-                    f"timed out waiting for ninfer-serve at http://{self.host}:{self.port}"
+                    f"timed out waiting for infernix-serve at http://{self.host}:{self.port}"
                 )
             time.sleep(0.2)
 
@@ -275,8 +275,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--serve",
         type=Path,
-        default=REPO_ROOT / "build/apps/ninfer-serve",
-        help="ninfer-serve executable",
+        default=REPO_ROOT / "build/apps/infernix-serve",
+        help="infernix-serve executable",
     )
     parser.add_argument(
         "--artifact",
@@ -1260,9 +1260,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     serve = args.serve.expanduser().resolve()
     if not serve.is_file():
-        raise CampaignError(f"ninfer-serve executable not found: {serve}")
+        raise CampaignError(f"infernix-serve executable not found: {serve}")
     if not os.access(serve, os.X_OK):
-        raise CampaignError(f"ninfer-serve is not executable: {serve}")
+        raise CampaignError(f"infernix-serve is not executable: {serve}")
 
     artifacts = parse_artifacts(args.artifact)
     mode_names = args.mode or list(DEFAULT_MODES)

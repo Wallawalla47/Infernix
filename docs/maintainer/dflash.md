@@ -2,7 +2,7 @@
 
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
-NInfer implements DFlash and DFlash2 as optional components of the
+Infernix implements DFlash and DFlash2 as optional components of the
 [Qwen3.5 model](qwen3_5-model.md). Their private config and bindings select the stored weights;
 startup chooses one backend, draft width and proposal head.
 
@@ -75,7 +75,7 @@ of one role can be selected independently of the other.
 
 DFlash2's fused context materializer stores BF16 K and `FP16_RNE(BF16(v_raw))` V. Raw K has no
 observable BF16 cast between projection and head normalization. This complete contract is in
-[`context_kv_materialize.h`](../../include/ninfer/ops/context_kv_materialize.h). If a prefill chunk
+[`context_kv_materialize.h`](../../include/infernix/ops/context_kv_materialize.h). If a prefill chunk
 exceeds the local ring capacity, only its final live window needs storage; the context frontier
 still advances by the complete chunk.
 
@@ -103,8 +103,8 @@ Endpoints at distance S−1 are included; distance S is excluded. Populated sequ
 the symmetric interval. With a full left context and `p_query=F+i`, the row sees at most `S-1-i`
 context positions, plus all W query rows for the supported widths. A full layer attends all
 populated context and query rows. These masks are specified by
-[`sliding_window_attention.h`](../../include/ninfer/ops/sliding_window_attention.h) and
-[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h).
+[`sliding_window_attention.h`](../../include/infernix/ops/sliding_window_attention.h) and
+[`softmax_attention.h`](../../include/infernix/ops/softmax_attention.h).
 
 ## DFlash backbone and proposal
 
@@ -167,7 +167,7 @@ x_next = y + mlp_conv.finish(z, finish_delta_m)
 The native fused prepare emits BF16 prepared input and BF16 finish delta. Internal normalized
 input and projected coefficients are private intermediates; finish consumes the represented delta
 from prepare. The contract is
-[`dynamic_grouped_conv.h`](../../include/ninfer/ops/dynamic_grouped_conv.h). After all layers, final
+[`dynamic_grouped_conv.h`](../../include/infernix/ops/dynamic_grouped_conv.h). After all layers, final
 plain RMSNorm produces mask hidden columns for the selector.
 
 ## DFlash2 candidate path
@@ -206,7 +206,7 @@ optimization. The Op retains the actual FP32 q_i and global candidate IDs for ta
 It ignores other target sampling controls. The RNG key uses request seed, `F+i` and the distinct
 DFlash2-proposal purpose; compact-batch row does not define random identity. Exact inputs,
 tie-breaking and storage are in
-[`candidate_selector.h`](../../include/ninfer/ops/candidate_selector.h).
+[`candidate_selector.h`](../../include/infernix/ops/candidate_selector.h).
 
 ## Target verification and committed prefix
 

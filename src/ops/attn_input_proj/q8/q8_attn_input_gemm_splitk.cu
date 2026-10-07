@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kTargetRows             = 9216;
@@ -137,4 +137,4 @@ void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

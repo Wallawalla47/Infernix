@@ -3,7 +3,7 @@
 #include "core/pdl.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_sliced_k_mma_kernel(
@@ -187,4 +187,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_s
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

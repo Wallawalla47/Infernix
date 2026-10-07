@@ -3,7 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/schema.h"
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 WeightGeometry describe_tensor(const TensorObject& object) {
     try {
@@ -16,4 +16,4 @@ WeightGeometry describe_tensor(const TensorObject& object) {
     } catch (const std::exception& error) { throw ArtifactError(object.id + ": " + error.what()); }
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

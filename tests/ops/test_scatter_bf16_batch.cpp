@@ -1,4 +1,4 @@
-#include "ninfer/ops/scatter.h"
+#include "infernix/ops/scatter.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include "ops/op_tester.h"
@@ -9,8 +9,8 @@
 #include <iostream>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 constexpr std::array<int, 8> order{7, 0, 4, 2, 6, 1, 5, 3};

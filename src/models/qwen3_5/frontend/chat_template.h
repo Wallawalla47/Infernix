@@ -4,7 +4,7 @@
 #include "text/jinja.h"
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
-#include <ninfer/types.h>
+#include <infernix/types.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 
 inline constexpr std::string_view kCanonicalReasoningCloseSerialization = "\n</think>\n\n";
 
@@ -150,4 +150,4 @@ private:
     std::uint8_t accepted_efforts_ = 0x3f;
 };
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

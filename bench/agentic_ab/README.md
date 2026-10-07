@@ -1,6 +1,6 @@
 # Agentic A/B benchmark: upstream + Windows port vs this fork
 
-A black-box A/B benchmark of two `ninfer-serve` builds serving the same model on the same GPU,
+A black-box A/B benchmark of two `infernix-serve` builds serving the same model on the same GPU,
 driven by a closed-loop replay of real agentic coding traffic over the OpenAI chat-completions
 API. The fork runs its default hybrid prefix cache; an optional third arm runs the fork build with
 the original prefix cache (`--use-original-prefix-caching`). It produces a
@@ -135,7 +135,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_LAUNCH_BAT` | `<AB_DEPLOY>\LaunchQwen3.8-27B-official-dflash2-ngram.bat` |
 | `AB_DEPLOY` | `E:\NInfer-Deploy-V3` |
 | `AB_MODEL` | the model path in the launch bat |
-| `AB_TREATMENT_EXE` | `build-windows\apps\Release\ninfer-serve.exe` in this checkout |
+| `AB_TREATMENT_EXE` | `build-windows\apps\Release\infernix-serve.exe` in this checkout |
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
 | `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |

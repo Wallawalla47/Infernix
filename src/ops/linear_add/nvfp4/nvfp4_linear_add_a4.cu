@@ -9,7 +9,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 // Up to 64 tokens the N=5120 projections are one wave of 80 CTAs, so their time is the weight
@@ -87,4 +87,4 @@ void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& r
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

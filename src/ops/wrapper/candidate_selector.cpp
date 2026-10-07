@@ -1,4 +1,4 @@
-#include "ninfer/ops/candidate_selector.h"
+#include "infernix/ops/candidate_selector.h"
 
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kCandidates   = 16;
@@ -202,4 +202,4 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
         successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

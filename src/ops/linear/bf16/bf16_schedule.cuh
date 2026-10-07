@@ -4,7 +4,7 @@
 #include <cuda_bf16.h>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class Bf16ActivationAccess : std::uint8_t {
     Direct,
@@ -235,4 +235,4 @@ struct Bf16ScheduleInstance : Schedule {
     static constexpr bool kExactTokens  = ExactTokens;
     static constexpr int kBlockTokens   = Capacity ? Capacity : Schedule::kBlockTokens;
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

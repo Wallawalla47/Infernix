@@ -10,11 +10,11 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 struct Directory;
 }
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 enum class MixerKind { FullAttention, LinearAttention };
 enum class DraftAttentionKind { FullAttention, SlidingAttention };
@@ -154,4 +154,4 @@ struct Config {
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

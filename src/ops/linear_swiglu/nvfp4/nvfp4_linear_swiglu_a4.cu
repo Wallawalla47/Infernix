@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Nvfp4N34816K5120;
@@ -66,4 +66,4 @@ void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

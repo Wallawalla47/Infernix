@@ -38,7 +38,7 @@ approval requirements beyond the user's instructions and the actual execution en
 
 ## Product and architecture
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
+Infernix is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path. The implementation targets `sm_120a` and
 is tuned on NVIDIA GeForce RTX 5090.
@@ -58,7 +58,7 @@ local workflow. Do not derive requirements from a different deployment or trust 
 Keep these ownership boundaries visible when selecting a design:
 
 - v3 `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
-  Engine. NInfer has no Python model-inference route or installed/exported C++ SDK.
+  Engine. Infernix has no Python model-inference route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend
@@ -177,7 +177,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
-| In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
+| In-tree C++ interface | `include/infernix/engine.h`, `include/infernix/types.h` |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 

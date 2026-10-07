@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 Model::Model(Config config, LoadOptions options, ModelWeights weights,
              std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
@@ -28,4 +28,4 @@ ops::WeightInput Model::input(WeightId id) const {
     return input(WeightUseId{id, 0});
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

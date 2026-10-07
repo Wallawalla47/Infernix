@@ -19,7 +19,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 class NgramVolume {
 public:
@@ -77,4 +77,4 @@ private:
 // The volume beside the artifact: `<artifact>.ngram`.
 [[nodiscard]] std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact);
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

@@ -4,7 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
-#include "ninfer/ops/linear_swiglu.h"
+#include "infernix/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -26,7 +26,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::linear_swiglu {
+namespace infernix::test::linear_swiglu {
 namespace {
 
 // The criterion belongs to the activation-compute profile, not the weight storage format or a
@@ -381,4 +381,4 @@ int run_profile(std::string_view label, const Profile& profile,
     return failures;
 }
 
-} // namespace ninfer::test::linear_swiglu
+} // namespace infernix::test::linear_swiglu

@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::bench::fixture {
+namespace infernix::bench::fixture {
 
 // Stateless, reproducible samples. Mixing the seed separately prevents two operands from
 // becoming shifted views of the same sequence. The full 64-bit element index participates.
@@ -72,4 +72,4 @@ inline cudaError_t fill_bytes(void* data, std::size_t bytes, std::uint64_t seed,
     return cudaGetLastError();
 }
 
-} // namespace ninfer::bench::fixture
+} // namespace infernix::bench::fixture

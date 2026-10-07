@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 std::size_t estimate_turn_bytes(const ChatTurn& turn) {
@@ -245,4 +245,4 @@ void OpenAIResponsesStore::erase_locked(const std::string& id) {
     records_.erase(found);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

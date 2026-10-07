@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 template <typename Geometry>
 __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
@@ -136,4 +136,4 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
                                             lane, scratch[warp]);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

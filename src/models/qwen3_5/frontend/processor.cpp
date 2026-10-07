@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 [[noreturn]] void throw_decode_error(const media::decode::Error& error) {
@@ -1106,4 +1106,4 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     return output;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

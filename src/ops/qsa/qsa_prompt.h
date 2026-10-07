@@ -23,14 +23,14 @@
 // FP32 accumulators; rotated values (NVFP4, K8V4) are rotated back after the merge. The FP64
 // oracle of qsa_attention qualifies it (tests/ops/test_qsa.cpp).
 
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/qsa.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 /// The exact window of a vector-quantized layer (vq2, k4v2) and a wide call's staged rows, as QSA's
 /// kernels read them; null pointers when absent. Window planes as ops/kv_cache/kv_window.cuh:
@@ -61,4 +61,4 @@ void qsa_prompt_attention(const Tensor& q, const QsaKVLayer& layer, const QsaBat
                           const std::int32_t* counts, Tensor& out, cudaStream_t stream,
                           const QsaVqWindow& vq);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

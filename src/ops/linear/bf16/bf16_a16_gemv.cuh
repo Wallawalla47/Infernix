@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Values>
 struct alignas(Values* static_cast<int>(sizeof(__nv_bfloat16))) Bf16GemvPack {
@@ -266,4 +266,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_g
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

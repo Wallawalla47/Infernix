@@ -22,7 +22,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, bool FullTokens, class Epilogue, class Output, class RowPolicy>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a8_mma_kernel(
@@ -136,4 +136,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         row_begin, token_begin, operands.rows, tokens, warp, lane);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

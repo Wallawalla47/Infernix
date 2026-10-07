@@ -15,7 +15,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 class ArtifactError : public std::runtime_error {
 public:
@@ -121,4 +121,4 @@ void require_members(const Json& value, std::initializer_list<std::string_view> 
 [[nodiscard]] std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment,
                                      std::string_view label);
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

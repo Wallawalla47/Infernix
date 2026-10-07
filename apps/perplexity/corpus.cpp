@@ -9,7 +9,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 namespace {
 
 using json = nlohmann::json;
@@ -180,4 +180,4 @@ CorpusSelection load_custom_text(const std::filesystem::path& path) {
     return result;
 }
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

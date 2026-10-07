@@ -14,7 +14,7 @@
 #include "ops/softmax_attention/dense/causal_cache/vq2/operands.h"
 #include "ops/softmax_attention/dense/causal_cache/vq2/tile_io.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Grouped attention over a vector-quantized cache for rows of up to eight columns (eight warps),
 // and for wider rows as independent sixteen-column CTAs (ParallelQueries, sixteen warps, so a tile's
@@ -722,4 +722,4 @@ __launch_bounds__(kVqGroupedWarps<TokenTile> * 32, TokenTile > 8 ? 1 : 2) __glob
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

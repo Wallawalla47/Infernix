@@ -7,7 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_a4_tma_launch.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 using Nvfp4A4Launch = void (*)(const Weight&, Tensor&, Nvfp4A4Workspace, std::int32_t,
                                cudaStream_t);
 
@@ -86,4 +86,4 @@ void launch_nvfp4_a4(const Tensor& x, const Weight& weight, Tensor& out, Nvfp4A4
                              route.reciprocal_quantize);
     route.launch(weight, out, scratch, x.ne[1], stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

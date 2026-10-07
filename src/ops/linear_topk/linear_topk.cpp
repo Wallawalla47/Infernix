@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/linear_topk.h"
+#include "infernix/ops/linear_topk.h"
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear_topk/linear_topk_launch.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 enum class HeadProfile : std::uint8_t {
@@ -273,4 +273,4 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
     execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -239,7 +239,7 @@ string string::strip(bool left, bool right, std::optional<const std::string_view
                         : unicode::whitespace(cp);
     };
     const auto bytes =
-        ninfer::text::unicode_internal::trim_utf8(text, left, right, match, "Jinja string");
+        infernix::text::unicode_internal::trim_utf8(text, left, right, match, "Jinja string");
     return cut_bytes(bytes.begin, bytes.end, true);
 }
 

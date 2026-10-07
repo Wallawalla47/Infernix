@@ -5,7 +5,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using ShapeSelector = Q8Launch (*)(std::int32_t);
 
@@ -77,4 +77,4 @@ void q8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     select_q8_launch(w.n, w.k, x.ne[1], policy)(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

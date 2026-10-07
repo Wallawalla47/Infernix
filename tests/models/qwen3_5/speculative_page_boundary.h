@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <vector>
 
-namespace ninfer::test {
+namespace infernix::test {
 
 // Exercise the same resource transition for DFlash's Full KV and DFlash2's cyclic-only state.
 inline void speculative_page_boundary(Engine& engine) {
@@ -61,4 +61,4 @@ inline void speculative_page_boundary(Engine& engine) {
           "generation after page-boundary settlement did not complete");
 }
 
-} // namespace ninfer::test
+} // namespace infernix::test

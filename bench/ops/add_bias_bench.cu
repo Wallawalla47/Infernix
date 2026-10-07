@@ -1,5 +1,5 @@
-#include "ninfer/ops/add_bias.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/add_bias.h"
+#include "infernix_bench_common.h"
 #include "ops/common/bf16_vector.cuh"
 
 #include <cuda_runtime.h>
@@ -11,8 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

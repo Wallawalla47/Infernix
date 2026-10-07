@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 
@@ -116,4 +116,4 @@ void q5_linear_add_mma_r64_t128_launch(const Tensor& x, const Weight& w, Tensor&
                                        cudaStream_t stream) {
     launch_route<q5_instances::MmaR64T128>(x, w, residual, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

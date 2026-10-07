@@ -5,9 +5,9 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
-#include "ninfer/ops/prepare_ragged_prefix.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/scatter.h"
+#include "infernix/ops/prepare_ragged_prefix.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/scatter.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
@@ -83,9 +83,9 @@ void ordinary_decode_batch(OrdinaryBatchContext& state, std::int32_t batch_size,
     run_prepared(state, executable, body);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 namespace {
 
@@ -1149,4 +1149,4 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
 }
 
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

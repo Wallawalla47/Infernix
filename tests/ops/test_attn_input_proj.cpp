@@ -1,6 +1,6 @@
 #include "core/weight.h"
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/weight_input.h"
 
 #include "core/device.h"
 #include "core/decode_graph.h"
@@ -19,10 +19,10 @@
 #include <thread>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
-using namespace ninfer::test::direct_bf16_weight;
-using namespace ninfer::test::input_projection;
+using namespace infernix;
+using namespace infernix::test;
+using namespace infernix::test::direct_bf16_weight;
+using namespace infernix::test::input_projection;
 
 namespace {
 
@@ -636,7 +636,7 @@ int main(int argc, char** argv) {
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
     if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+        std::cerr << "usage: infernix_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {

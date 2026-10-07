@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Nvfp4N14336K5120;
@@ -65,4 +65,4 @@ void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

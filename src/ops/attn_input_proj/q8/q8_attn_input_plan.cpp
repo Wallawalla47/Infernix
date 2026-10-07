@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 namespace {
 
@@ -278,4 +278,4 @@ void q8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Te
     q8_attn_input_execute_plan(q8_attn_input_resolve_plan(problem), x, weight, q, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

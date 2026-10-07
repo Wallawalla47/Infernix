@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __device__ __forceinline__ void cta_mbarrier_init(std::uint64_t* barrier, std::uint32_t arrivals) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
@@ -44,4 +44,4 @@ __device__ __forceinline__ void cta_mbarrier_fence_init() {
     asm volatile("fence.mbarrier_init.release.cluster;" : : : "memory");
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

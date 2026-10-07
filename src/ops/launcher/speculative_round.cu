@@ -1,4 +1,4 @@
-// Implements: include/ninfer/ops/speculative_round.h
+// Implements: include/infernix/ops/speculative_round.h
 // Match: validated speculative state and BF16 verification logits.
 // Algorithm assumptions: the shared sampling layout selects either one block
 // or a two-launch partial/group pipeline without host reads of device config.
@@ -12,7 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void speculative_prepare_verify_inputs_launch(const Tensor& anchors, const Tensor& drafts,
                                               const Tensor& base_positions,
@@ -280,4 +280,4 @@ void proposal_remap_token_ids_launch(Tensor& proposal_tokens, const std::int32_t
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

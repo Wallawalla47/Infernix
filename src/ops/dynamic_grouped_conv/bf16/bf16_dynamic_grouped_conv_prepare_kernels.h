@@ -3,7 +3,7 @@
 #include "core/tensor.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct DynamicConvPrepareRoute {
     int rows;
     int columns;
@@ -17,4 +17,4 @@ void bf16_dynamic_grouped_conv_prepare_reduce_launch(DynamicConvPrepareRoute rou
                                                      const Tensor& base, const float* partial,
                                                      Tensor& prepared, Tensor& finish,
                                                      cudaStream_t stream);
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

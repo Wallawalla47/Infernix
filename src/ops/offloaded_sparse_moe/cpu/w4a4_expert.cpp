@@ -12,16 +12,16 @@
 #    else
 #        include <cpuid.h>
 #    endif
-#    define NINFER_MOE_X86 1
+#    define INFERNIX_MOE_X86 1
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
-#    define NINFER_TARGET(x)
+#    define INFERNIX_TARGET(x)
 #else
-#    define NINFER_TARGET(x) __attribute__((target(x)))
+#    define INFERNIX_TARGET(x) __attribute__((target(x)))
 #endif
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 namespace {
 
 using canon::A4Block;
@@ -52,7 +52,7 @@ void row_sums_scalar(const std::uint8_t* matrix, int blocks, int rg_begin, int r
     }
 }
 
-#if defined(NINFER_MOE_X86)
+#if defined(INFERNIX_MOE_X86)
 
 // Software prefetch `distance` bytes ahead along the unit stream (design §10.3). The best distance
 // depends on the host's memory latency and core speed, so calibration chooses it (§14.2).
@@ -78,7 +78,7 @@ inline std::int32_t quad_word(const A4Block& a, int q) {
 
 // ----------------------------------------------------------------------------------- AVX-512
 
-NINFER_TARGET("avx512f,avx512bw,avx512vnni")
+INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
 inline __m512i scales16_avx512(const std::uint8_t* s) {
     const __m512i w    = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(s)));
     const __m512i m    = _mm512_and_si512(w, _mm512_set1_epi32(7));
@@ -90,7 +90,7 @@ inline __m512i scales16_avx512(const std::uint8_t* s) {
 }
 
 template <int N>
-NINFER_TARGET("avx512f,avx512bw,avx512vnni")
+INFERNIX_TARGET("avx512f,avx512bw,avx512vnni")
 void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end,
                      const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) {
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data()));
@@ -137,7 +137,7 @@ void row_sums_avx512(const std::uint8_t* matrix, int blocks, int rg_begin, int r
 
 // ----------------------------------------------------------------------------------- AVX2
 
-NINFER_TARGET("avx2")
+INFERNIX_TARGET("avx2")
 inline __m256i scales8_avx2(const std::uint8_t* s) {
     const __m256i w    = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(s)));
     const __m256i m    = _mm256_and_si256(w, _mm256_set1_epi32(7));
@@ -148,19 +148,19 @@ inline __m256i scales8_avx2(const std::uint8_t* s) {
     return _mm256_blendv_epi8(norm, m, sub);
 }
 
-NINFER_TARGET("avx2")
+INFERNIX_TARGET("avx2")
 inline __m256i dot4_avx2(__m256i acc, __m256i w, __m256i a) {
     const __m256i pairs = _mm256_maddubs_epi16(w, a); // |pair| <= 2 * 24 * 12: no saturation
     return _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, _mm256_set1_epi16(1)));
 }
 
-NINFER_TARGET("avx2,avxvnni")
+INFERNIX_TARGET("avx2,avxvnni")
 inline __m256i dot4_avxvnni(__m256i acc, __m256i w, __m256i a) {
     return _mm256_dpbusd_avx_epi32(acc, w, a);
 }
 
 // One body, two target attributes: AVX-VNNI must not leak into the plain AVX2 variant.
-#define NINFER_AVX2_ROW_SUMS(NAME, DOT) \
+#define INFERNIX_AVX2_ROW_SUMS(NAME, DOT) \
 void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
                    const A4Block* const* acts, std::int64_t* out, int prefetch_bytes) { \
     const __m128i lut128 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kBiasedCodes.data())); \
@@ -216,16 +216,16 @@ void NAME(const std::uint8_t* matrix, int blocks, int rg_begin, int rg_end, \
 }
 
 template <int N>
-NINFER_TARGET("avx2")
-NINFER_AVX2_ROW_SUMS(row_sums_avx2, dot4_avx2)
+INFERNIX_TARGET("avx2")
+INFERNIX_AVX2_ROW_SUMS(row_sums_avx2, dot4_avx2)
 
 template <int N>
-NINFER_TARGET("avx2,avxvnni")
-NINFER_AVX2_ROW_SUMS(row_sums_avxvnni, dot4_avxvnni)
+INFERNIX_TARGET("avx2,avxvnni")
+INFERNIX_AVX2_ROW_SUMS(row_sums_avxvnni, dot4_avxvnni)
 
-#undef NINFER_AVX2_ROW_SUMS
+#undef INFERNIX_AVX2_ROW_SUMS
 
-#define NINFER_MOE_DISPATCH(CALL)                                                                   \
+#define INFERNIX_MOE_DISPATCH(CALL)                                                                   \
     switch (ncols) {                                                                                \
     case 1: CALL(1); break;                                                                         \
     case 2: CALL(2); break;                                                                         \
@@ -288,7 +288,7 @@ const CpuFeatures& features() {
     return f;
 }
 
-#endif // NINFER_MOE_X86
+#endif // INFERNIX_MOE_X86
 
 } // namespace
 
@@ -303,7 +303,7 @@ const char* cpu_isa_name(CpuIsa isa) {
 }
 
 bool cpu_isa_supported(CpuIsa isa) {
-#if defined(NINFER_MOE_X86)
+#if defined(INFERNIX_MOE_X86)
     switch (isa) {
     case CpuIsa::kScalar: return true;
     case CpuIsa::kAvx2: return features().avx2;
@@ -329,21 +329,21 @@ void rg16_row_sums(CpuIsa isa, const std::uint8_t* matrix, int blocks, int rg_be
     if (!cpu_isa_supported(isa)) { throw std::invalid_argument("offloaded_moe: unsupported CPU ISA"); }
     switch (isa) {
     case CpuIsa::kScalar: row_sums_scalar(matrix, blocks, rg_begin, rg_end, acts, ncols, out); return;
-#if defined(NINFER_MOE_X86)
+#if defined(INFERNIX_MOE_X86)
     case CpuIsa::kAvx512Vnni:
-#    define NINFER_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        NINFER_MOE_DISPATCH(NINFER_CALL)
-#    undef NINFER_CALL
+#    define INFERNIX_CALL(n) row_sums_avx512<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
+#    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvxVnni:
-#    define NINFER_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        NINFER_MOE_DISPATCH(NINFER_CALL)
-#    undef NINFER_CALL
+#    define INFERNIX_CALL(n) row_sums_avxvnni<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
+#    undef INFERNIX_CALL
         return;
     case CpuIsa::kAvx2:
-#    define NINFER_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
-        NINFER_MOE_DISPATCH(NINFER_CALL)
-#    undef NINFER_CALL
+#    define INFERNIX_CALL(n) row_sums_avx2<n>(matrix, blocks, rg_begin, rg_end, acts, out, prefetch_bytes)
+        INFERNIX_MOE_DISPATCH(INFERNIX_CALL)
+#    undef INFERNIX_CALL
         return;
 #else
     default: break;
@@ -423,4 +423,4 @@ void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& 
     down_rows(isa, record, scales, h_cptr, ncols, 0, kDownRowGroups, y, prefetch_bytes);
 }
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

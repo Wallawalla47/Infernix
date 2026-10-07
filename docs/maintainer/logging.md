@@ -7,7 +7,7 @@ operational producers follow this contract.
 
 ## 1. Output classes
 
-NInfer has four distinct output classes. A shared destination such as stderr does not make them the
+Infernix has four distinct output classes. A shared destination such as stderr does not make them the
 same contract.
 
 | Class | Examples | Owner and representation |
@@ -27,8 +27,8 @@ but neither consumes the other renderer's text.
 
 ## 2. Dependency and ownership
 
-NInfer vendors the compiled spdlog library under `third_party/spdlog`. Configuration never fetches
-network content or selects a system version. The `ninfer_product_logging` target is the only NInfer
+Infernix vendors the compiled spdlog library under `third_party/spdlog`. Configuration never fetches
+network content or selects a system version. The `infernix_product_logging` target is the only Infernix
 library that owns logger construction policy.
 
 An application entry point creates one `product::LoggingRuntime` with its executable name and owns
@@ -37,8 +37,8 @@ it until every component and worker that can log has stopped. Components receive
 or shutdown behavior.
 
 No code may call spdlog's global default logger, mutate its global pattern or level, or register an
-application logger in the global registry. `ninfer_core`, `ninfer_artifact`, `ninfer_ops`,
-`ninfer_engine`, and model libraries do not link product logging. These layers communicate an
+application logger in the global registry. `infernix_core`, `infernix_artifact`, `infernix_ops`,
+`infernix_engine`, and model libraries do not link product logging. These layers communicate an
 observable diagnostic through an owning typed event/callback; the product adapter decides whether
 to log it.
 
@@ -124,7 +124,7 @@ return and C++ exception unwinding; a fatal CUDA `abort()` uses the emergency di
 does not unwind typed scopes. Rate limiting belongs to the product renderer. Producers do not print
 ad hoc dots, percentages, carriage-return lines, or duplicate completion summaries.
 
-When stderr is a terminal, `ninfer_product_logging` may render one transient startup or offline-tool
+When stderr is a terminal, `infernix_product_logging` may render one transient startup or offline-tool
 progress line below persistent records. The progress-aware stderr sink owns the same mutex as normal
 records: it erases the transient line before a log record and redraws it afterward. Only a phase
 with real byte progress displays a percentage, rate, or ETA. Completion erases the line and emits a
@@ -166,7 +166,7 @@ explicit emergency cases above remain direct outputs because they are different 
 
 ## 7. Verification policy
 
-Logging tests protect NInfer-owned observable semantics, not private object shape. The request-log
+Logging tests protect Infernix-owned observable semantics, not private object shape. The request-log
 test covers the consumed JSONL schema, representative request/throughput pretty records, Serve
 failure severity, and exclusion of arbitrary client error text. The pretty-logging test covers the
 observable Service and Tool prefixes. The corpus consumer test protects its exact schema-version

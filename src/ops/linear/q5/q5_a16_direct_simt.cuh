@@ -5,7 +5,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Direct global loads retain the split-2/split-4 SIMT dataflow. Each warp owns
 // contiguous 256-value phases; the CTA reduces K before invoking the epilogue.
@@ -106,4 +106,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_dir
     if constexpr (JoinPdl) pdl::wait_for_dependencies();
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

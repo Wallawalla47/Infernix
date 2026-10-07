@@ -6,7 +6,7 @@
 #include <set>
 #include <unordered_set>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 std::uint64_t checked_add(std::uint64_t a, std::uint64_t b, std::string_view label) {
     if (b > std::numeric_limits<std::uint64_t>::max() - a) {
@@ -360,4 +360,4 @@ Directory parse_directory(const Json& root, std::string_view entry_name) {
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

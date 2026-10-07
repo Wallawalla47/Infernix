@@ -13,7 +13,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int Tokens, class Publish>
@@ -142,4 +142,4 @@ void fp8_gdn_record_fused_launch(const Tensor& x, const Weight& weight, const Te
         value, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

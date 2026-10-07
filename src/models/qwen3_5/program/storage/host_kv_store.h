@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 class HostKVExtentStore;
 
@@ -658,4 +658,4 @@ inline HostKVExtentReservation::~HostKVExtentReservation() {
     if (owner_ != nullptr) { owner_->abort(*this); }
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

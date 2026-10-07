@@ -16,7 +16,7 @@
 #include <limits>
 #include <vector>
 
-namespace ninfer::test::vq {
+namespace infernix::test::vq {
 
 inline constexpr int kDim      = 256;
 inline constexpr int kWords    = 32;
@@ -132,7 +132,7 @@ struct EncodedRow {
 };
 
 inline float codebook(int p, int j) {
-    return static_cast<float>(ninfer::ops::kKVCacheVq2Codebook[8 * p + j]);
+    return static_cast<float>(infernix::ops::kKVCacheVq2Codebook[8 * p + j]);
 }
 
 // kv_cache_vq2_pattern_distance: |P|^2 - 2 * dot + (odd ? 4 * m : 0) in the same FP32 order.
@@ -197,13 +197,13 @@ inline EncodedRow encode_vq2(const std::array<float, kDim>& y) {
                 sign ^= 1u << flip;
             }
             for (int j = 0; j < 8; ++j) {
-                const int v               = ninfer::ops::kKVCacheVq2Codebook[8 * best_p + j];
+                const int v               = infernix::ops::kKVCacheVq2Codebook[8 * best_p + j];
                 out.levels[8 * w + j]     = ((sign >> j) & 1u) ? -v : v;
                 dot = std::fma(y[8 * w + j], static_cast<float>(out.levels[8 * w + j]), dot);
             }
             code = static_cast<std::uint32_t>(best_p) | ((sign & 0x7fu) << 9);
         } else {
-            for (int j = 0; j < 8; ++j) out.levels[8 * w + j] = ninfer::ops::kKVCacheVq2Codebook[j];
+            for (int j = 0; j < 8; ++j) out.levels[8 * w + j] = infernix::ops::kKVCacheVq2Codebook[j];
         }
         dots[w]              = dot;
         out.codes[2 * w]     = static_cast<std::uint8_t>(code & 0xffu);
@@ -299,4 +299,4 @@ inline int window_slot(int position) {
     return position < 64 ? position : 64 + (position & 1023);
 }
 
-} // namespace ninfer::test::vq
+} // namespace infernix::test::vq

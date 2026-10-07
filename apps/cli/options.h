@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "product/logging/logging.h"
 
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::cli {
+namespace infernix::cli {
 
 struct Options {
     bool help_requested = false;
@@ -50,7 +50,7 @@ struct Options {
     std::optional<bool> log_colours; // --log-colours on|off (unset = on when stderr is a terminal)
     std::optional<bool> enable_thinking;
     std::optional<std::uint32_t> thinking_budget;
-    ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
+    infernix::ReasoningLoopAction reasoning_loop = infernix::ReasoningLoopAction::Off;
     std::optional<ReasoningEffort> reasoning_effort;
 
     std::vector<TokenId> stop_token_ids;
@@ -65,4 +65,4 @@ struct Options {
 [[nodiscard]] Options parse_options(int argc, char** argv);
 [[nodiscard]] std::string usage_text(const char* argv0);
 
-} // namespace ninfer::cli
+} // namespace infernix::cli

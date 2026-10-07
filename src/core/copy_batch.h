@@ -16,7 +16,7 @@
 #include <map>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 class CopyBatch {
 public:
@@ -36,4 +36,4 @@ private:
     std::map<std::uintptr_t, std::uintptr_t> ranges_; // pending destinations: begin -> end
 };
 
-} // namespace ninfer
+} // namespace infernix

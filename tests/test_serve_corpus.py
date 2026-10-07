@@ -94,7 +94,7 @@ def test_result_record_parses_request_host_exposure() -> None:
     payload = {"model": spec.model_id}
     response = {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
     event = {
-        "artifact_type": "ninfer_serve_request_log",
+        "artifact_type": "infernix_serve_request_log",
         "schema_version": corpus.SERVER_LOG_SCHEMA_VERSION,
         "event": "request_done",
         "request": {

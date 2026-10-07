@@ -11,7 +11,7 @@
 // heads 1-4; ratios 4, 8, 64 and 128 (a pooled key across two pages); exact ties across the
 // threshold, zero-score ties, bins larger than the candidate buffer, near ties; and CUDA Graph
 // capture replayed with new positions over garbage scratch.
-#include "ninfer/ops/qsa.h"
+#include "infernix/ops/qsa.h"
 #include "core/paged_kv_cache.h"
 #include "ops/host_parallel.h"
 #include "ops/kernel/paged_kv_address.cuh"
@@ -31,15 +31,15 @@
 #include <utility>
 #include <vector>
 
-using ninfer::DeviceBuffer;
-using ninfer::DType;
-using ninfer::kPagedKVPageSize;
-using ninfer::Tensor;
-using ninfer::ops::kPagedKVPageMask;
-using ninfer::ops::kPagedKVPageShift;
-using ninfer::ops::QsaBatch;
-using ninfer::ops::QsaGeometry;
-using ninfer::test::cuda_check;
+using infernix::DeviceBuffer;
+using infernix::DType;
+using infernix::kPagedKVPageSize;
+using infernix::Tensor;
+using infernix::ops::kPagedKVPageMask;
+using infernix::ops::kPagedKVPageShift;
+using infernix::ops::QsaBatch;
+using infernix::ops::QsaGeometry;
+using infernix::test::cuda_check;
 
 namespace {
 
@@ -244,8 +244,8 @@ QsaGeometry geometry_of(const Case& c) {
             .rotary_dim = 64, .budget = c.budget, .ratio = c.ratio, .theta = 1.0e7F, .eps = 1.0e-6F};
 }
 
-std::uint16_t to_bf16(float f) { return ninfer::test::f32_to_bf16(f); }
-float from_bf16(std::uint16_t h) { return ninfer::test::bf16_to_f32(h); }
+std::uint16_t to_bf16(float f) { return infernix::test::f32_to_bf16(f); }
+float from_bf16(std::uint16_t h) { return infernix::test::bf16_to_f32(h); }
 
 struct Fixture {
     QsaGeometry g{};
@@ -414,7 +414,7 @@ Fp64Scores fp64_scores(const Fixture& f, int t) {
     out.bound.resize(n);
     const double scale = 1.0 / std::sqrt(static_cast<double>(kDi));
     const float* q     = f.q.data() + static_cast<std::size_t>(t) * H * kDi;
-    ninfer::test::parallel_ranges(n, ninfer::test::threads_for_rows(n), [&](std::int64_t begin, std::int64_t end) {
+    infernix::test::parallel_ranges(n, infernix::test::threads_for_rows(n), [&](std::int64_t begin, std::int64_t end) {
         for (std::int64_t b = begin; b < end; ++b) {
             const float* k = f.keys[row].data() + b * kDi;
             double s = 0, a = 0;
@@ -465,15 +465,15 @@ Selection run_reference(const Fixture& f, cudaStream_t stream) {
 }
 
 struct ProductionBuffers {
-    ninfer::test::GuardedDeviceBuffer scratch, selected, counts;
+    infernix::test::GuardedDeviceBuffer scratch, selected, counts;
     ProductionBuffers(const Fixture& f)
-        : scratch(ninfer::ops::detail::qsa_select_scratch_bytes(f.g, f.columns, f.max_context)),
+        : scratch(infernix::ops::detail::qsa_select_scratch_bytes(f.g, f.columns, f.max_context)),
           selected(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns) * f.top),
           counts(sizeof(std::int32_t) * static_cast<std::size_t>(f.columns)) {}
 };
 
 void launch_production(const Fixture& f, ProductionBuffers& buffers, cudaStream_t stream) {
-    ninfer::ops::detail::qsa_select(f.index_q(), f.pooled(), f.batch_view(), f.g, f.max_context,
+    infernix::ops::detail::qsa_select(f.index_q(), f.pooled(), f.batch_view(), f.g, f.max_context,
                                     buffers.scratch.data(), buffers.scratch.bytes(),
                                     {static_cast<std::int32_t*>(buffers.selected.data()),
                                      static_cast<std::int32_t*>(buffers.counts.data())},
@@ -486,8 +486,8 @@ Selection read_production(const Fixture& f, ProductionBuffers& buffers, const st
     out.counts.resize(f.columns);
     buffers.selected.copy_to_host(out.selected.data(), out.selected.size() * 4);
     buffers.counts.copy_to_host(out.counts.data(), out.counts.size() * 4);
-    const auto scores = ninfer::ops::detail::qsa_select_scores(buffers.scratch.data(), f.g, f.max_context);
-    const int group   = ninfer::ops::detail::kQsaSelectGroupColumns;
+    const auto scores = infernix::ops::detail::qsa_select_scores(buffers.scratch.data(), f.g, f.max_context);
+    const int group   = infernix::ops::detail::kQsaSelectGroupColumns;
     out.score_begin   = (f.columns - 1) / group * group;
     out.score_stride  = scores.stride;
     out.scores.resize(static_cast<std::size_t>(f.columns - out.score_begin) * scores.stride);
@@ -761,7 +761,7 @@ std::vector<Case> cases() {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }

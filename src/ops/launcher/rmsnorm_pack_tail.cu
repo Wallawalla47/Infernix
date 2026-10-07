@@ -4,7 +4,7 @@
 #include "core/pdl.cuh"
 #include "ops/kernel/rmsnorm_pack_tail.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void rmsnorm_pack_tail_launch(const Tensor& input, const Tensor& weight, Tensor& output,
                               cudaStream_t stream) {
@@ -18,4 +18,4 @@ void rmsnorm_pack_tail_launch(const Tensor& input, const Tensor& weight, Tensor&
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-add_library(ninfer_artifact STATIC
+add_library(infernix_artifact STATIC
   schema.cpp
   formats.cpp
   layouts.cpp
@@ -8,5 +8,5 @@ add_library(ninfer_artifact STATIC
   materializer.cpp
   views.cpp
 )
-ninfer_internal_includes(ninfer_artifact)
-target_link_libraries(ninfer_artifact PUBLIC ninfer_core ninfer::json)
+infernix_internal_includes(infernix_artifact)
+target_link_libraries(infernix_artifact PUBLIC infernix_core infernix::json)

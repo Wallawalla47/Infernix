@@ -3,6 +3,6 @@
 #include "core/tensor.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 using Nvfp4Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 }

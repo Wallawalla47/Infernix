@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/linear_add.h"
+#include "infernix/ops/linear_add.h"
 #include "core/device.h"
 
 #include "ops/op_tester.h"
@@ -18,8 +18,8 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
 constexpr ReductionCriterion kA16Tolerance{
@@ -268,7 +268,7 @@ int main(int argc, char** argv) {
         std::cerr << "usage: " << argv[0] << " [--wide-only]\n";
         return 2;
     }
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

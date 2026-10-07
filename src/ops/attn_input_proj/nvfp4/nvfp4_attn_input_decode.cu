@@ -8,7 +8,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {} // namespace
 
 void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
@@ -29,4 +29,4 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
         nvfp4_a16_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

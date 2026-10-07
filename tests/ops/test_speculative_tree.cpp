@@ -3,10 +3,10 @@
 // against a host oracle), tree acceptance (exact greedy walk, chain equivalence, recursive
 // rejection output distribution), path-parallel GDN convolution and record replay, and
 // accepted-path compaction of record planes and of every paged KV storage format.
-#include "ninfer/ops/candidate_selector.h"
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/candidate_selector.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include "core/arena.h"
@@ -29,8 +29,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

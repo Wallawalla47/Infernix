@@ -1,5 +1,5 @@
-// ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
-#include "ninfer/ops/softmax_attention.h"
+// infernix::ops - causal cached Softmax Attention validation and finite route dispatch.
+#include "infernix/ops/softmax_attention.h"
 
 #include "core/device.h"
 #include "core/layout.h"
@@ -23,7 +23,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim             = 256;
@@ -449,4 +449,4 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      execution);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/nvtx.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/context_cache/types.h"
@@ -19,7 +19,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 enum class RequestEngineHostPhase : std::uint8_t {
     Boundary,
@@ -228,4 +228,4 @@ struct RequestRecord {
     bool capacity_released = false;
 };
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

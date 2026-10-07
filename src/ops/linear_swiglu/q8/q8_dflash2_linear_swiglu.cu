@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry                       = Q8LinearGeometry<34816, 5120>;
@@ -60,4 +60,4 @@ void q8_dflash2_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weig
     kLaunchers[index](x, weight, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

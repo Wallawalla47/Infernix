@@ -8,7 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 namespace {
 
 constexpr std::array<char, 8> kMagic{'N', 'I', 'N', 'F', 'T', 'O', 'P', 'K'};
@@ -308,4 +308,4 @@ std::string DivergenceAggregate::bucket_summary() const {
     return out.str();
 }
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

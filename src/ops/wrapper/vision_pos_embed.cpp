@@ -1,10 +1,10 @@
-#include "ninfer/ops/vision_pos_embed.h"
+#include "infernix/ops/vision_pos_embed.h"
 
 #include "ops/launcher/vision_pos_embed.h"
 
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tensor& weights,
                           Tensor& x, cudaStream_t stream) {
@@ -35,4 +35,4 @@ void vision_pos_embed_add(const Tensor& table, const Tensor& indices, const Tens
     detail::vision_pos_embed_add_launch(table, indices, weights, x, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp::detail {
+namespace infernix::models::qwen4_exp::detail {
 
 namespace vx = qwen3_5::execution;
 
@@ -211,4 +211,4 @@ const execution::VisionInput* ProgramImpl::stage_mtp_vision(Lane& lane, std::uin
     return mtp_vision_inputs_.data();
 }
 
-} // namespace ninfer::models::qwen4_exp::detail
+} // namespace infernix::models::qwen4_exp::detail

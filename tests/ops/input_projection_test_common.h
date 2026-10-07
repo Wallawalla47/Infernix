@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::test::input_projection {
+namespace infernix::test::input_projection {
 
 // The complete NVFP4 A4 attention-input-projection criterion and its row sample (the original
 // seven grid points widened to stabilize the distribution-level verdict).
@@ -210,4 +210,4 @@ inline std::vector<std::uint16_t> bf16_bits(std::span<const float> values) {
     return bits;
 }
 
-} // namespace ninfer::test::input_projection
+} // namespace infernix::test::input_projection

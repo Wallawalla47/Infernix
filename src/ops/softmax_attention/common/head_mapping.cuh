@@ -2,7 +2,7 @@
 
 // Compile-time form of the public contiguous query-head to KV-head mapping.
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 template <int QHeadsValue, int KVHeadsValue>
 struct AttentionHeadMapping {
@@ -14,4 +14,4 @@ struct AttentionHeadMapping {
     static constexpr int GroupSize = QHeads / KVHeads;
 };
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

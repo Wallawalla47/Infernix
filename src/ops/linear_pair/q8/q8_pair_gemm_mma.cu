@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 namespace {
 
@@ -83,4 +83,4 @@ void q8_pair_gemm_mma_r32_c128_launch(bool full, const Tensor& x, const Weight& 
     launch_tile<128>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

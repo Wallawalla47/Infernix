@@ -5,7 +5,7 @@
 #include "ops/gdn_input_proj/gdn_conv.cuh"
 #include "ops/linear/q8/q8_gemv_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Output = LinearBf16SegmentedOutput<8192, 4096>;
@@ -80,4 +80,4 @@ void q8_gdn_input_decode_conv_snapshot_launch(
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

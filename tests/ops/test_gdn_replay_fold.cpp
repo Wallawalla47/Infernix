@@ -1,6 +1,6 @@
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gdn_input_proj.h"
-#include "ninfer/ops/gdn_replay.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_replay.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -27,8 +27,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 
@@ -536,8 +536,8 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
 
 template <std::int32_t kWidth>
 int run_record_fold_rounds() {
-    using ninfer::test::input_projection::DevicePackedWeight;
-    using ninfer::test::input_projection::make_bf16_activation;
+    using infernix::test::input_projection::DevicePackedWeight;
+    using infernix::test::input_projection::make_bf16_activation;
 
     constexpr FoldProfile kProfile{48, 48, 10240};
     constexpr std::int32_t kHidden       = 5120;
@@ -810,7 +810,7 @@ int main(int argc, char** argv) {
             } else if (argument == "--batched") {
                 batched_only = true;
             } else {
-                std::cerr << "usage: ninfer_gdn_replay_fold_test --wide-only "
+                std::cerr << "usage: infernix_gdn_replay_fold_test --wide-only "
                              "[--width 33|48|64] [--layers 48|30] [--batched]\n";
                 return 2;
             }
@@ -867,7 +867,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc != 1) {
-        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only [--width W] "
+        std::cerr << "usage: infernix_gdn_replay_fold_test [--ngram-only|--wide-only [--width W] "
                      "[--layers L] [--batched]]\n";
         return 2;
     }

@@ -3,8 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ninfer_eval.config import ConfigError, load_config
-from ninfer_eval.secrets import resolve_target
+from infernix_eval.config import ConfigError, load_config
+from infernix_eval.secrets import resolve_target
 
 BASE = """
 schema_version: 1

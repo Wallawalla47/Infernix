@@ -1,13 +1,13 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstdarg>
 #include <cstdio>
 #include <string>
 #include <utility>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Publishes one Engine runtime diagnostic through the product's observer. Without an observer,
 // Info and above are written to stderr. It never throws: a logging failure must not disturb the
@@ -40,4 +40,4 @@ inline void publish_diagnostic(const DiagnosticObserver& observer, DiagnosticLev
     } catch (...) {}
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

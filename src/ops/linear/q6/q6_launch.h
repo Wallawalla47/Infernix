@@ -3,7 +3,7 @@
 #include "core/weight.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 using Q6Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q6_a16_simt_r8_t4(const Tensor& x, const Weight& weight, Tensor& out,
                               cudaStream_t stream);
@@ -41,4 +41,4 @@ void launch_q6_a16_mma_r64_t128(const Tensor& x, const Weight& weight, Tensor& o
                                 cudaStream_t stream);
 void launch_q6_a16_mma_r64_t112(const Tensor& x, const Weight& weight, Tensor& out,
                                 cudaStream_t stream);
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

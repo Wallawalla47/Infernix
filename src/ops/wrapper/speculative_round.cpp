@@ -1,15 +1,15 @@
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kSparseMaxDrafts        = 63;
@@ -382,4 +382,4 @@ void proposal_remap_token_ids(Tensor& proposal_tokens, const std::int32_t* id_ma
     detail::proposal_remap_token_ids_launch(proposal_tokens, id_map, n, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

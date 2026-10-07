@@ -12,7 +12,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int Values>
 struct Fp8ActivationPack {
@@ -254,4 +254,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_si
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

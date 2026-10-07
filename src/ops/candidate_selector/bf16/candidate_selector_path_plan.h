@@ -2,11 +2,11 @@
 #include "core/tensor.h"
 #include "core/layout.h"
 #include "core/arena.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_tree.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 enum class SelectorRoute { Direct, Lattice };
 
 struct SelectorWorkspace {
@@ -33,4 +33,4 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                       const Tensor& base_positions, const SamplingConfig* configs,
                                       Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                                       cudaStream_t stream);
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

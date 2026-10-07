@@ -10,7 +10,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 struct VisionTokenRange {
     std::uint32_t begin = 0;
@@ -37,4 +37,4 @@ void prompt_block_keys(const PreparedPromptData& prompt, std::vector<std::uint64
                                                 const PreparedPromptData& sibling,
                                                 std::uint32_t shared) noexcept;
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

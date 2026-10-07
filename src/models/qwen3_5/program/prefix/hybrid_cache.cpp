@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 using runtime::prefix_cache::CacheCostModel;
 using runtime::prefix_cache::CopyState;
@@ -782,4 +782,4 @@ void HybridPrefixCache::drop_snapshot_device_image(SnapshotRef snapshot) noexcep
     release_snapshot(snapshot);
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

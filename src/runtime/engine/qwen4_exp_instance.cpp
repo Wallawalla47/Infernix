@@ -21,7 +21,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 namespace {
 
 // The pinned Host tier of Qwen3.8-Flash-Next's prefix cache when --host-context-mib is not given.
@@ -144,7 +144,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         streamed.stream_experts = true;
         plan                    = models::qwen4_exp::plan_load(reader, streamed);
     }
-    // A small reserve trims other programs' working sets; keep NInfer's own pageable memory
+    // A small reserve trims other programs' working sets; keep Infernix's own pageable memory
     // resident so its heap and driver pages never hard-fault from the page file.
     if (!reserve_process_working_set(demand.process_growth)) {
         report(options, DiagnosticLevel::Warning,
@@ -347,4 +347,4 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     return {std::move(instance), std::move(summary), std::move(metadata), std::move(resolved)};
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

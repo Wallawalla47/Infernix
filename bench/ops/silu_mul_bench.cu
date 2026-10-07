@@ -2,9 +2,9 @@
 // (intermediate = 17408). This binary is the ncu/nsys target; the GB/s it
 // prints is informational only -- the gate is ncu sustained DRAM %% (see
 // docs/op-development.md §8).
-//   ./ninfer_silu_mul_bench --tokens 1,2,3,4,5,6,48
-#include "ninfer/ops/silu_mul.h"
-#include "ninfer_bench_common.h"
+//   ./infernix_silu_mul_bench --tokens 1,2,3,4,5,6,48
+#include "infernix/ops/silu_mul.h"
+#include "infernix_bench_common.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -12,8 +12,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

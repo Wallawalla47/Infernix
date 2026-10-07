@@ -2,7 +2,7 @@
 
 #include "ops/softmax_attention/dense/causal_cache/bf16/tile_io.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Both mainloops publish either FP32 (unnormalized numerator, log2 maximum, sum)
 // or one final BF16 result. No low-precision partial materialization is involved.
@@ -25,4 +25,4 @@ __device__ __forceinline__ void bf16_kv_store_pair(CausalPartialView partial, __
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

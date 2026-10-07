@@ -1,11 +1,11 @@
-#include "ninfer/ops/prepare_ragged_prefix.h"
+#include "infernix/ops/prepare_ragged_prefix.h"
 
 #include "ops/launcher/prepare_ragged_prefix.h"
 
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tensor& starts,
                            const Tensor& ends, Tensor& destination, Tensor& positions,
@@ -40,4 +40,4 @@ void prepare_ragged_prefix(const Tensor& source, const Tensor& lanes, const Tens
                                          counts, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

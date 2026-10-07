@@ -21,7 +21,7 @@
 
 namespace {
 
-using namespace ninfer;
+using namespace infernix;
 namespace qwen = models::qwen3_5;
 
 constexpr std::uint32_t kCapacity      = 512;
@@ -1778,14 +1778,14 @@ SpeculativeBackend selected_backend(std::string_view name) {
 } // namespace
 
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
-        std::cout << "SKIP: set NINFER_TEST_ARTIFACT to an explicit .ninfer artifact\n";
+        std::cout << "SKIP: set INFERNIX_TEST_ARTIFACT to an explicit .ninfer artifact\n";
         return 77;
     }
     try {
         require(argc <= 2,
-                "usage: ninfer_qwen3_5_native_transactions_test [none|mtp|dflash|dflash2]");
+                "usage: infernix_qwen3_5_native_transactions_test [none|mtp|dflash|dflash2]");
         const auto backend = selected_backend(argc == 2 ? argv[1] : "none");
         DeviceContext device;
         models::LoadOptions selected;

@@ -2,7 +2,7 @@
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 SelectorRoute candidate_selector_path_route(int steps, int batch) {
     if (steps < 1 || steps > 15 || batch < 1 || batch > 8)
         throw std::invalid_argument("invalid selector K/B");
@@ -48,4 +48,4 @@ void candidate_selector_path_dispatch(const Tensor& candidate_ids, const Tensor&
                                    predecessor_codebook, successor_codebook, base_positions,
                                    configs, drafts, proposal_q, scratch, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

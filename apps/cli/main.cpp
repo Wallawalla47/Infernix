@@ -1,4 +1,4 @@
-#include "ninfer_build_id.h"
+#include "infernix_build_id.h"
 #include "options.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
@@ -8,7 +8,7 @@
 #include "product/prompt_input/prompt_input.h"
 #include "product/speculative_options.h"
 
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -26,33 +26,33 @@
 namespace {
 
 std::string format_seconds(double seconds) {
-    return ninfer::product::format_pretty_duration(seconds);
+    return infernix::product::format_pretty_duration(seconds);
 }
 
 std::string format_rate(double tokens, double seconds) {
     if (tokens <= 0.0 || seconds <= 0.0) { return "n/a"; }
-    return ninfer::product::format_pretty_rate(tokens / seconds, "tok");
+    return infernix::product::format_pretty_rate(tokens / seconds, "tok");
 }
 
 std::string format_percent(std::uint64_t numerator, std::uint64_t denominator) {
     if (denominator == 0) { return "n/a"; }
-    return ninfer::product::format_pretty_percent(static_cast<double>(numerator) /
+    return infernix::product::format_pretty_percent(static_cast<double>(numerator) /
                                                   static_cast<double>(denominator));
 }
 
 std::string format_bytes(std::uint64_t bytes) {
-    return ninfer::product::format_pretty_bytes(bytes);
+    return infernix::product::format_pretty_bytes(bytes);
 }
 
-std::string format_arena_used(const ninfer::ArenaMemorySummary& arena) {
+std::string format_arena_used(const infernix::ArenaMemorySummary& arena) {
     return format_bytes(arena.used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
-std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
+std::string format_arena_peak(const infernix::ArenaMemorySummary& arena) {
     return format_bytes(arena.peak_used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
-std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
+std::string format_sampling(const infernix::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
     std::ostringstream output;
     output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
@@ -62,46 +62,46 @@ std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) 
     return output.str();
 }
 
-std::string format_finish(ninfer::FinishReason reason) {
+std::string format_finish(infernix::FinishReason reason) {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case infernix::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case infernix::FinishReason::OutputLimit:
         return "output-limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::ContextCapacity:
         return "context-capacity";
-    case ninfer::FinishReason::StopToken:
+    case infernix::FinishReason::StopToken:
         return "stop-token";
-    case ninfer::FinishReason::StopString:
+    case infernix::FinishReason::StopString:
         return "stop-string";
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
 }
 
-std::string format_kv_cache(ninfer::KvCacheStorage storage) {
+std::string format_kv_cache(infernix::KvCacheStorage storage) {
     switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
+    case infernix::KvCacheStorage::BFloat16:
         return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
+    case infernix::KvCacheStorage::Int8Group64:
         return "int8-group64";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+    case infernix::KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
+    case infernix::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
-    case ninfer::KvCacheStorage::Vq2:
+    case infernix::KvCacheStorage::Vq2:
         return "vq2";
-    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+    case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
     }
     return "unknown";
 }
 
-std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+std::string format_kv_capacity_mode(infernix::KvCapacityMode mode) {
+    return mode == infernix::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
 // Stats colouring (stderr only). Each statistic gets a stable 256-colour ANSI
@@ -114,13 +114,13 @@ std::optional<bool> log_colours_flag; // set from --log-colours before any outpu
 bool stats_color_enabled() {
     static const bool enabled = [] {
         if (log_colours_flag.has_value()) { return *log_colours_flag; }
-        return ninfer::product::log_colour::stderr_is_console();
+        return infernix::product::log_colour::stderr_is_console();
     }();
     return enabled;
 }
 
 std::string colorize(std::string_view text, std::string_view key) {
-    return ninfer::product::log_colour::colourize(text, key, stats_color_enabled());
+    return infernix::product::log_colour::colourize(text, key, stats_color_enabled());
 }
 
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
@@ -141,20 +141,20 @@ void print_metric(std::string_view label, std::string_view value) {
     std::cerr << colorize(value, label) << '\n';
 }
 
-class StreamingSink final : public ninfer::OutputSink {
+class StreamingSink final : public infernix::OutputSink {
 public:
-    void start(ninfer::GenerationStart) override {}
+    void start(infernix::GenerationStart) override {}
 
-    void progress(ninfer::PromptProgress) override {}
+    void progress(infernix::PromptProgress) override {}
 
-    void timing(ninfer::GenerationTimingObservation) override {}
+    void timing(infernix::GenerationTimingObservation) override {}
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(infernix::OutputDelta delta) override {
         std::ostream& output =
-            delta.channel == ninfer::OutputChannel::Reasoning ? std::cerr : std::cout;
+            delta.channel == infernix::OutputChannel::Reasoning ? std::cerr : std::cout;
         output << delta.text;
         output.flush();
-        if (delta.channel == ninfer::OutputChannel::Reasoning) {
+        if (delta.channel == infernix::OutputChannel::Reasoning) {
             reasoning_seen_ = reasoning_seen_ || !delta.text.empty();
             if (!delta.text.empty()) { reasoning_ends_in_newline_ = delta.text.back() == '\n'; }
         } else {
@@ -181,9 +181,9 @@ private:
     bool finished_                  = false;
 };
 
-void print_generation_summary(const ninfer::GenerationResult& result,
-                              const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+void print_generation_summary(const infernix::GenerationResult& result,
+                              const infernix::ResolvedSamplingParameters& sampling,
+                              const infernix::MemorySummary& memory) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -236,9 +236,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("CUDA Graph memory used", format_bytes(memory.cuda_graph_measured_bytes));
     print_metric("planned device total", format_bytes(reserved));
 
-    const ninfer::SpeculativeStats& speculative = result.speculative;
+    const infernix::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
-        const std::string backend = ninfer::product::speculative_backend_name(speculative.backend);
+        const std::string backend = infernix::product::speculative_backend_name(speculative.backend);
         print_metric(backend + " draft window", std::to_string(speculative.draft_window));
         print_metric(backend + " rounds", std::to_string(speculative.rounds));
         print_metric(backend + " fallback steps", std::to_string(speculative.fallback_steps));
@@ -275,39 +275,39 @@ void print_generation_summary(const ninfer::GenerationResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
-    ninfer::cli::Options cli;
+    infernix::cli::Options cli;
     try {
-        cli = ninfer::cli::parse_options(argc, argv);
+        cli = infernix::cli::parse_options(argc, argv);
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
-        std::cerr << ninfer::cli::usage_text(argv[0]);
+        std::cerr << infernix::cli::usage_text(argv[0]);
         return 1;
     }
     if (cli.help_requested) {
-        std::cout << ninfer::cli::usage_text(argv[0]);
+        std::cout << infernix::cli::usage_text(argv[0]);
         return 0;
     }
     log_colours_flag = cli.log_colours;
 
-    ninfer::product::LoggingRuntime logging(
-        {.logger_name  = "ninfer",
+    infernix::product::LoggingRuntime logging(
+        {.logger_name  = "infernix",
          .level        = cli.log_level,
-         .presentation = ninfer::product::LogPresentation::Tool});
+         .presentation = infernix::product::LogPresentation::Tool});
     const std::shared_ptr<spdlog::logger> logger = logging.logger();
-#ifdef NINFER_BUILD_ID
-    logger->info("build {}", NINFER_BUILD_ID);
+#ifdef INFERNIX_BUILD_ID
+    logger->info("build {}", INFERNIX_BUILD_ID);
 #endif
-    ninfer::product::StartupLogRenderer startup_log(logging);
+    infernix::product::StartupLogRenderer startup_log(logging);
 
     try {
-        ninfer::PromptInput input =
+        infernix::PromptInput input =
             cli.messages_path.empty()
-                ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
-                : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
+                ? infernix::product::prompt_from_text(cli.prompt, cli.enable_thinking)
+                : infernix::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
         input.options.reasoning_effort = cli.reasoning_effort;
 
-        ninfer::RequestOptions request;
+        infernix::RequestOptions request;
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
@@ -316,7 +316,7 @@ int main(int argc, char** argv) {
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
 
-        ninfer::EngineOptions engine_options;
+        infernix::EngineOptions engine_options;
         engine_options.artifact_path            = cli.artifact_path;
         engine_options.chat_template_path       = cli.chat_template_path;
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
@@ -347,19 +347,19 @@ int main(int argc, char** argv) {
         engine_options.context_cache.device_state_slots  = 0;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.startup_observer                  = startup_log.observer();
-        engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
+        engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);
 
-        ninfer::Engine engine(std::move(engine_options));
+        infernix::Engine engine(std::move(engine_options));
         startup_log.engine_ready(engine.load_summary());
         engine.reset_memory_peaks();
 
-        ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
+        infernix::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
-                                                            ninfer::OutputConsumerMode::Streaming);
-        const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
-        ninfer::GenerationResult result;
+        infernix::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request),
+                                                            infernix::OutputConsumerMode::Streaming);
+        const infernix::ResolvedSamplingParameters sampling = generation.resolved_sampling();
+        infernix::GenerationResult result;
         try {
             result = generation.wait(&sink);
             sink.finish_streams();
@@ -380,7 +380,7 @@ int main(int argc, char** argv) {
         print_generation_summary(result, sampling, engine.memory_summary());
         return 0;
     } catch (const std::exception& error) {
-        logger->error("{}", ninfer::product::format_pretty_text(error.what()));
+        logger->error("{}", infernix::product::format_pretty_text(error.what()));
         return 1;
     }
 }

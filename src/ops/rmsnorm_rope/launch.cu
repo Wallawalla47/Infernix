@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <bool Pair, class Coefficients = NativeRopeCoefficients>
@@ -87,4 +87,4 @@ void rmsnorm_rope_text_launch(const Tensor& positions, const Tensor& q_norm_weig
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

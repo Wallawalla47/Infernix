@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 #include "ops/quantized_weight.h"
 
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::test::linear {
+namespace infernix::test::linear {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
@@ -68,4 +68,4 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
 // A declared token interval must reserve enough space for every public point it contains.
 int verify_workspace_envelopes(QType qtype, std::int32_t n, std::int32_t k);
 
-} // namespace ninfer::test::linear
+} // namespace infernix::test::linear

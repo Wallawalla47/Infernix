@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Fp8N34816K5120;
@@ -37,4 +37,4 @@ void fp8_linear_swiglu_decode_launch(const Tensor& x, const Weight& weight, Tens
         fp8_a16_operands(x, weight), output, Fp8SwiGluEpilogue{}, stream, Rows{});
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -11,7 +11,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 std::int32_t checked_i32(std::uint32_t value, const char* label) {
@@ -1203,4 +1203,4 @@ Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {
         .view({static_cast<std::int32_t>(logical_page_capacity())});
 }
 
-} // namespace ninfer
+} // namespace infernix

@@ -4,7 +4,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
                          &kFp8N5120K6144,  &kFp8N5120K17408, &kFp8N248320K5120};
@@ -44,4 +44,4 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0);
     shape.a8(x, weight, out, scratch, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 
 // Machine model used only to rank admission sources and to value snapshots for eviction. It never
 // decides feasibility. The Program fills it from the calibrated prefill coefficients and the
@@ -52,4 +52,4 @@ struct CacheCostModel {
     }
 };
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

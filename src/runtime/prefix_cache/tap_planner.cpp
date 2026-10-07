@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <optional>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 namespace {
 
 enum class Priority : std::uint8_t {
@@ -189,4 +189,4 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
     return accepted;
 }
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

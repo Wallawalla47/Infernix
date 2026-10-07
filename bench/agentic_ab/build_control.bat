@@ -11,7 +11,7 @@ REM
 REM Usage: build_control.bat configure|build
 REM   AB_CONTROL_SRC    control source checkout   (default: .\control\src)
 REM   AB_CONTROL_BUILD  control build directory   (default: .\control\build)
-REM Builds only ninfer-serve (apps on, tests/benchmarks off). Adjust the VS, vcpkg and
+REM Builds only infernix-serve (apps on, tests/benchmarks off). Adjust the VS, vcpkg and
 REM CUDA paths below for your machine.
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" >nul
 if errorlevel 1 exit /b 1

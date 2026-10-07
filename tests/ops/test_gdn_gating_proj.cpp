@@ -1,6 +1,6 @@
 #include "core/weight.h"
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/gdn_gating_proj.h"
+#include "infernix/ops/weight_input.h"
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

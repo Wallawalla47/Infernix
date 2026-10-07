@@ -11,15 +11,15 @@
 #include <map>
 #include <optional>
 
-namespace ninfer::test {
+namespace infernix::test {
 void materialization_cuda_errors(DeviceContext& device);
 }
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::artifact;
-using namespace ninfer::test::artifact_fixture;
+using namespace infernix;
+using namespace infernix::artifact;
+using namespace infernix::test::artifact_fixture;
 
 void materialization(DeviceContext& device) {
     Fixture fixture;
@@ -229,7 +229,7 @@ int main(int argc, char** argv) {
         }
         materialization(device);
         failure_and_host_only(device);
-        ninfer::test::materialization_cuda_errors(device);
+        infernix::test::materialization_cuda_errors(device);
         staging_reuse(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;

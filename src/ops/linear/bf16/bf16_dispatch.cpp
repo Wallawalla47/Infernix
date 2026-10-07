@@ -3,7 +3,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 struct ShapeEntry {
     std::int32_t n, k;
@@ -47,4 +47,4 @@ void bf16_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
                    cudaStream_t stream) {
     select_bf16_launch(weight.n, weight.k, x.ne[1], policy)(x, weight, out, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

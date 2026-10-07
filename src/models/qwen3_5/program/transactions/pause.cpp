@@ -5,7 +5,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 std::optional<CheckpointHandle> ProgramImpl::detach_checkpoint(SequenceState& state) {
     const auto frontier = state.text_kv_valid;
@@ -221,4 +221,4 @@ ResumeState ProgramImpl::complete_pause(ContextTransaction& tx) {
     invalidate_lane(tx.lane);
     return std::move(*tx.paused);
 }
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

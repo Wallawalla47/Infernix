@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 // One warp per word in the arg-min reduction: warp w scans patterns [16w, 16w + 16) for every
 // word, then reduces word w over the warps.
@@ -474,4 +474,4 @@ __launch_bounds__(32 * kKVCacheVqAppendWarpRows) __global__ void kv_cache_append
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

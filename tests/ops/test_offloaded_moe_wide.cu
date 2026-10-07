@@ -29,7 +29,7 @@
 //       slots, read zero-copy (bulk copies from mapped host memory, last, since only tests use it),
 //       in the double-buffered prefill passes, and on a rerun.
 #include "core/vmm_arena.h"
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/common/canonical_math.h"
 #include "ops/host_parallel.h"
 #include "ops/offloaded_moe_fixtures.h"
@@ -48,13 +48,13 @@
 #include <random>
 #include <vector>
 
-namespace canon    = ninfer::ops::canon;
-namespace moe      = ninfer::ops::offloaded_moe;
-namespace wide     = ninfer::ops::offloaded_moe::wide;
-namespace fixtures = ninfer::test::offloaded_moe;
-using ninfer::DType;
-using ninfer::Tensor;
-using ninfer::test::cuda_check;
+namespace canon    = infernix::ops::canon;
+namespace moe      = infernix::ops::offloaded_moe;
+namespace wide     = infernix::ops::offloaded_moe::wide;
+namespace fixtures = infernix::test::offloaded_moe;
+using infernix::DType;
+using infernix::Tensor;
+using infernix::test::cuda_check;
 
 namespace {
 
@@ -291,15 +291,15 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
     cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
     cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
-    ninfer::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
                                     Tensor(d_weights, DType::FP32, {top_k, columns}),
                                     Tensor(d_shared_gate, DType::FP32, {columns})};
-    ninfer::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
+    infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
     void* d_dispatch = nullptr;
     const int entries = top_k * columns;
-    cuda_check(cudaMalloc(&d_dispatch, ninfer::ops::moe_dispatch_bytes(experts, entries)), "cudaMalloc");
-    auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, entries);
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, entries)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, entries);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
     cuda_check(cudaDeviceSynchronize(), "dispatch");
 
     const auto x = fixtures::random_activations(rng, columns);
@@ -333,7 +333,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, ninfer::ops::moe_experts_workspace_bytes(max_jobs, entries)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries)), "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
     cuda_check(cudaMalloc(&d_out, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
@@ -360,7 +360,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     for (const Config& config : configs) {
         cuda_check(cudaMemset(d_out, 0xFF, out_elements * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
-        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
                                             .record_stride = stride,
@@ -378,7 +378,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
         }
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
-        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         const auto got = host_copy(d_out, out_elements);
         if (first_outputs.empty()) {
@@ -394,9 +394,9 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     // C7: the Program's frames (and the prefill stream's lent ring) live in a VMM arena mapped in
     // 64 MiB chunks, so a record can straddle two separately mapped chunks. Frame 0 and staging slot
     // 1 are placed across chunk boundaries; outputs must not change.
-    if (ninfer::VmmArena::supported(0)) {
+    if (infernix::VmmArena::supported(0)) {
         constexpr std::size_t kChunk = 64ULL << 20;
-        ninfer::VmmArena arena(0, 6 * kChunk, kChunk);
+        infernix::VmmArena arena(0, 6 * kChunk, kChunk);
         bool mapped = true;
         for (int c = 0; c < 6; ++c) { mapped = mapped && arena.map_chunk(); }
         check(mapped, "C7: the VMM arena maps its chunks");
@@ -414,7 +414,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                        Placement{"VMM staging across chunks", d_frame_base, stage_v, false},
                                        Placement{"VMM both, prefill passes", frames_v, stage_v, true}}) {
             cuda_check(cudaMemset(d_out, 0xFF, out_elements * sizeof(std::uint16_t)), "cudaMemset");
-            ninfer::ops::MoeExpertSource source{.frame_base    = place.frames,
+            infernix::ops::MoeExpertSource source{.frame_base    = place.frames,
                                                 .frames        = d_frames,
                                                 .host_records  = host_device,
                                                 .record_stride = stride,
@@ -427,7 +427,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
             }
             Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
             Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
-            ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+            infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
             cuda_check(cudaDeviceSynchronize(), "moe_experts");
             const auto again = host_copy(d_out, out_elements);
             long differing   = 0;
@@ -437,7 +437,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
         }
         // The probes below reuse the 64-slot run's job records and A4(h) plane: run it again before
         // the arena (which those records would otherwise point into) is released.
-        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
                                             .record_stride = stride,
@@ -446,7 +446,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                             .staging_slots = 64};
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
-        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
     } else {
         std::printf("   C7 skipped: no VMM\n");
@@ -456,7 +456,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     // C5: narrow-route entries equal the CPU engine.
     {
         std::vector<long> mismatches(static_cast<std::size_t>(entries), 0);
-        ninfer::test::parallel_ranges(entries, ninfer::test::host_thread_count(), [&](std::int64_t b, std::int64_t e) {
+        infernix::test::parallel_ranges(entries, infernix::test::host_thread_count(), [&](std::int64_t b, std::int64_t e) {
             for (std::int64_t entry = b; entry < e; ++entry) {
                 if (is_wide(static_cast<int>(entry))) { continue; }
                 const auto y = cpu_column(bank[static_cast<std::size_t>(expert_of(static_cast<int>(entry)))],
@@ -477,7 +477,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     } else {
         // C1-C3: probes of both GEMMs over the 64-slot rerun's single pass: its job records (frames
         // and staging slots) and A4(h) plane are still in place.
-        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
                                             .record_stride = stride,
@@ -502,7 +502,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
             c3_bad(static_cast<std::size_t>(entries), 0);
         std::vector<double> c1_worst(static_cast<std::size_t>(entries), 0.0), c2_worst(static_cast<std::size_t>(entries), 0.0);
         std::vector<Error> wide_error(static_cast<std::size_t>(entries)), control_error(static_cast<std::size_t>(entries));
-        ninfer::test::parallel_ranges(entries, ninfer::test::host_thread_count(), [&](std::int64_t b, std::int64_t e) {
+        infernix::test::parallel_ranges(entries, infernix::test::host_thread_count(), [&](std::int64_t b, std::int64_t e) {
             DecodedRow row{};
             for (std::int64_t entry64 = b; entry64 < e; ++entry64) {
                 const int entry = static_cast<int>(entry64);
@@ -625,7 +625,7 @@ int main() {
     // Unbuffered, so a failing case's last progress line survives a crash.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     test_codes_quantizer();
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return g_failures == 0 ? 77 : 1;
     }

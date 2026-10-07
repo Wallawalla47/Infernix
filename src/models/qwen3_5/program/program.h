@@ -1,5 +1,5 @@
 #pragma once
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -15,11 +15,11 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 struct DeviceContext;
 }
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace execution {
 class Parameters;
 }
@@ -573,4 +573,4 @@ private:
                                                     const EngineOptions&);
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
                                                       DeviceContext&, const StartupObserver&);
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr std::int32_t kLinearTopK                = 16;
 inline constexpr std::int32_t kLinearTopKMaxChunkColumns = 128;
@@ -58,4 +58,4 @@ allocate_linear_topk_workspace(Allocator& allocator, std::int32_t head_rows, std
     return out;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

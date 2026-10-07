@@ -1,4 +1,4 @@
-include(cmake/NinferBenchmarks.cmake)
+include(cmake/InfernixBenchmarks.cmake)
 include(ops/benchmarks.cmake)
 include(inference/benchmarks.cmake)
 include(decode_quality/benchmarks.cmake)

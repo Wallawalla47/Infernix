@@ -1,8 +1,8 @@
 // Public cold-cache benchmark for the three registered linear_topk profiles.
 #include "core/weight.h"
-#include "ninfer/ops/linear_topk.h"
+#include "infernix/ops/linear_topk.h"
 
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -18,8 +18,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

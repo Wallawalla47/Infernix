@@ -5,7 +5,7 @@
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Byte-pair decoding with staged code/high/scale planes. Activation staging is
 // independent of the number of warps sharing each row.
@@ -128,4 +128,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     if constexpr (JoinPdl) pdl::wait_for_dependencies();
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
-#include "ninfer/ops/rope.h"
-#include "ninfer/ops/weight_input.h"
+#include "infernix/ops/rope.h"
+#include "infernix/ops/weight_input.h"
 
 #include <array>
 #include <memory>
@@ -12,7 +12,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 using LinearParameters = ops::SingleProjectionWeight;
 
@@ -161,4 +161,4 @@ public:
     std::optional<ProposalParameters> proposal;
 };
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

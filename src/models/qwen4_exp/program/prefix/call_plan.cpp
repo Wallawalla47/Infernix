@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 namespace pc = runtime::prefix_cache;
 
@@ -88,4 +88,4 @@ bool inside_exclusion(std::uint32_t frontier, std::span<const pc::TapExclusion> 
     });
 }
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

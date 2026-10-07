@@ -5,7 +5,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr int kSparseMoeExperts = 256;
 inline constexpr int kSparseMoeTopK    = 8;
@@ -96,4 +96,4 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
     if (lane == 0) { *shared_scale = sigmoid(scores[kSparseMoeExperts]); }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

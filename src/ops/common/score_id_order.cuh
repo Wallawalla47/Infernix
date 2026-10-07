@@ -9,7 +9,7 @@
 
 #include <cuda_runtime.h>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 struct ScoreIdOrderGreater {
     __device__ __forceinline__ bool operator()(std::uint64_t lhs, std::uint64_t rhs) const {
@@ -40,4 +40,4 @@ __device__ __forceinline__ std::int32_t id_from_order_key(std::uint64_t key) {
     return static_cast<std::int32_t>(0xffffffffu - static_cast<std::uint32_t>(key));
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

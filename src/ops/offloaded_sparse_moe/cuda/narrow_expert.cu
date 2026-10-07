@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 namespace {
 
 using canon::A4Block;
@@ -125,4 +125,4 @@ void launch_narrow_experts(const NarrowJob* jobs, int job_count, void* workspace
     check(cudaGetLastError(), "down");
 }
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

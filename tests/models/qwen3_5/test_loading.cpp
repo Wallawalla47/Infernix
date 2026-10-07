@@ -9,10 +9,10 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::models;
-namespace qwen = ninfer::models::qwen3_5;
-using namespace ninfer::test::artifact_fixture;
+using namespace infernix;
+using namespace infernix::models;
+namespace qwen = infernix::models::qwen3_5;
+using namespace infernix::test::artifact_fixture;
 
 Json added_token(int id, const std::string& content) {
     return {{"id", id},        {"content", content}, {"special", true},    {"single_word", false},

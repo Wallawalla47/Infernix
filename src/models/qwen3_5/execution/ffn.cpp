@@ -1,15 +1,15 @@
 #include "models/qwen3_5/execution/ffn.h"
 
 #include "core/layout.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/linear_swiglu.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/silu_mul.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/linear_swiglu.h"
+#include "infernix/ops/residual_add.h"
+#include "infernix/ops/silu_mul.h"
 
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
                                 std::int32_t last, bool mtp, bool wide_verification) {
@@ -100,4 +100,4 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
                     residual_projection_policy(p.down, wide_verification), workspace, stream);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

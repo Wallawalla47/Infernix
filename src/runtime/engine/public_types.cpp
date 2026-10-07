@@ -1,11 +1,11 @@
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <utility>
 
-namespace ninfer {
+namespace infernix {
 
 CancellationView::CancellationView(std::function<bool()> requested)
     : requested_(std::move(requested)) {}
@@ -54,4 +54,4 @@ void PrefixCacheSaveControl::end(bool saved) const noexcept {
     state_->ended.notify_all();
 }
 
-} // namespace ninfer
+} // namespace infernix

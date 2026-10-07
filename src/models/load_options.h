@@ -1,11 +1,11 @@
 #pragma once
 
 #include "models/registry.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <string_view>
 
-namespace ninfer::models {
+namespace infernix::models {
 
 struct LoadOptions {
     EnginePurpose purpose                  = EnginePurpose::Generation;
@@ -82,4 +82,4 @@ struct LoadOptions {
             .a16_activations          = options.a16_activations};
 }
 
-} // namespace ninfer::models
+} // namespace infernix::models

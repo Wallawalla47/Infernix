@@ -18,7 +18,7 @@
 #include <dlfcn.h>
 #endif
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 std::mutex& fake_mutex() {
@@ -288,4 +288,4 @@ void set_vram_budget_source(std::function<VramSnapshot()> fake) {
 }
 } // namespace testing
 
-} // namespace ninfer
+} // namespace infernix

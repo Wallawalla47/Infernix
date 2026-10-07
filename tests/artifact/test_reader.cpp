@@ -10,9 +10,9 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::artifact;
-using namespace ninfer::test::artifact_fixture;
+using namespace infernix;
+using namespace infernix::artifact;
+using namespace infernix::test::artifact_fixture;
 
 void file_set_and_bindings() {
     Fixture fixture;

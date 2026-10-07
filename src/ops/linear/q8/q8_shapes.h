@@ -3,7 +3,7 @@
 #include "ops/linear/q8/q8_geometry.h"
 #include "ops/linear/q8/q8_launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 using Q8N1024K2048   = Q8LinearGeometry<1024, 2048>;
 using Q8N1024K5120   = Q8LinearGeometry<1024, 5120>;
@@ -55,4 +55,4 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n10240_k320(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k640(std::int32_t tokens);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

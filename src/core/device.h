@@ -5,11 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer {
+namespace infernix {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
-#define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
+#define CUDA_CHECK(expr) ::infernix::cuda_check((expr), #expr, __FILE__, __LINE__)
 
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
@@ -121,4 +121,4 @@ private:
     cudaEvent_t event_ = nullptr;
 };
 
-} // namespace ninfer
+} // namespace infernix

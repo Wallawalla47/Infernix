@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Response& res) {
     const std::string request_id = res.get_header_value("request-id");
@@ -173,7 +173,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 GenerationOutcome outcome;
                 try {
                     StreamSink output;
-                    output.on_start = [&](const ninfer::GenerationStart& start) {
+                    output.on_start = [&](const infernix::GenerationStart& start) {
                         render_and_write(transport, [&] { return encoder->start(start); });
                     };
                     output.on_reasoning = [&](const std::string& text) {
@@ -210,7 +210,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 lifecycle->done(outcome);
-                if (outcome.finish_reason == ninfer::FinishReason::Cancelled ||
+                if (outcome.finish_reason == infernix::FinishReason::Cancelled ||
                     stream->cancelled.load(std::memory_order_acquire)) {
                     lifecycle->response_failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));
@@ -258,4 +258,4 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     }
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

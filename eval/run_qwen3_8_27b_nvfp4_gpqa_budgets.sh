@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-server_bin="${repo_dir}/build/apps/ninfer-serve"
+server_bin="${repo_dir}/build/apps/infernix-serve"
 artifact="${repo_dir}/out/qwen3_8_27b_nvfp4.ninfer"
 config="${repo_dir}/eval/configs/qwen3_8_27b_nvfp4_gpqa_budgets.yaml"
 eval_python="${repo_dir}/eval/.venv/bin/python"
@@ -16,7 +16,7 @@ for required_file in "${server_bin}" "${artifact}" "${config}" "${eval_python}";
     fi
 done
 if [[ ! -x "${server_bin}" || ! -x "${eval_python}" ]]; then
-    echo "ninfer-serve and the evaluation Python must be executable" >&2
+    echo "infernix-serve and the evaluation Python must be executable" >&2
     exit 1
 fi
 if ! command -v curl >/dev/null 2>&1; then
@@ -86,18 +86,18 @@ run_tier() {
         fi
         if ! kill -0 "${server_pid}" 2>/dev/null; then
             wait "${server_pid}" || true
-            echo "ninfer-serve exited before becoming ready; see ${server_log}" >&2
+            echo "infernix-serve exited before becoming ready; see ${server_log}" >&2
             exit 1
         fi
         sleep 1
     done
     if [[ "${ready}" -ne 1 ]]; then
-        echo "ninfer-serve did not become ready within 180 seconds; see ${server_log}" >&2
+        echo "infernix-serve did not become ready within 180 seconds; see ${server_log}" >&2
         exit 1
     fi
 
     echo "running suite=${suite}; server_log=${server_log}; request_log=${request_log}"
-    PYTHONPATH="${repo_dir}/eval" "${eval_python}" -m ninfer_eval run \
+    PYTHONPATH="${repo_dir}/eval" "${eval_python}" -m infernix_eval run \
         --config "${config}" \
         --suite "${suite}"
 

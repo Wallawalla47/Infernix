@@ -5,11 +5,11 @@
 #include <cstdint>
 #include <chrono>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 struct StateImageHostLayout;
 }
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 using Clock = std::chrono::steady_clock;
 
@@ -31,4 +31,4 @@ kv_transfer_requirement(runtime::ContextResourceClass resource,
                         runtime::ContextTransferDirection direction, std::uint32_t pages,
                         TransferWork work);
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

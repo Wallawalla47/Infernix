@@ -2,7 +2,7 @@
 #include "ops/common/math.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int RowsPerBranch>
 struct Nvfp4SwiGluRows {
     static constexpr bool kPaired = true;
@@ -35,4 +35,4 @@ struct Nvfp4SwiGluEpilogue {
         output.store(row, token, silu(gate) * up);
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

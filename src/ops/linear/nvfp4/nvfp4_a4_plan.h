@@ -13,7 +13,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Nvfp4A4Workspace {
     std::uint8_t* codes  = nullptr;
@@ -66,4 +66,4 @@ void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Work
                               bool reciprocal_quotient = false);
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

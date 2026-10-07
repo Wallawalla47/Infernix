@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/q4/q4_schedule.cuh"
 
-namespace ninfer::ops::detail::q4_instances {
+namespace infernix::ops::detail::q4_instances {
 using GemvR4W1 =
     Q4A16GemvSchedule<4, 1, 16, 1, Q4GemvActivationAccess::Direct, Q4GemvLaneMapping::PackedWord8,
                       Q4GemvDecodeMode::Fp16Mantissa, Q4GemvCodeTransfer::AsyncVector16,
@@ -84,4 +84,4 @@ using MmaR32T128K64S2A2 = Q4A16MmaSchedule<32, 128, 64, 32, 32, 2, 2, Q4MmaFragm
                                            Cache::cg, Cache::cg, Q4ScaleLoad::Pair32, 2>;
 using SimtR4T4W2G8S2    = Q4A16SimtSchedule<4, 4, 2, 8, 2, Cache::ca, 1>;
 using SimtR4T1W2G8S2    = Q4A16SimtSchedule<4, 1, 2, 8, 2, Cache::ca, 1>;
-} // namespace ninfer::ops::detail::q4_instances
+} // namespace infernix::ops::detail::q4_instances

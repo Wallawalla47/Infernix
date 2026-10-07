@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models {
+namespace infernix::models {
 
 Architecture resolve_architecture(std::string_view architecture, std::string_view model_type) {
     if (architecture == "Qwen3_5ForCausalLM" && model_type == "qwen3_5_text") {
@@ -31,4 +31,4 @@ std::string_view architecture_name(Architecture architecture) noexcept {
     return {};
 }
 
-} // namespace ninfer::models
+} // namespace infernix::models

@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 struct VisionItemControl {
     PromptModality modality = PromptModality::Image;
@@ -46,4 +46,4 @@ struct VisionControlPlan {
                                                  const VisionControlPlan& plan,
                                                  std::uint32_t prepared_item_begin);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -11,7 +11,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int K>
 void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     const auto operands = fp8_a16_operands(x, weight);
@@ -65,4 +65,4 @@ void fp8_linear_add_matrix_launch(const Tensor& x, const Weight& weight, Tensor&
     else
         launch_matrix<17408>(x, weight, residual, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

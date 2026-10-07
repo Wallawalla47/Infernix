@@ -139,10 +139,10 @@ comparison. MTP0 and MTP3 use different workloads; no per-scenario speculative s
 
 ## Reproduction and reports
 
-Build [ninfer-serve](../../README.md#quick-start) and run from the repository root with Python 3.11:
+Build [infernix-serve](../../README.md#quick-start) and run from the repository root with Python 3.11:
 
 ```bash
-export NINFER_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
+export INFERNIX_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
 ```
 
 See the common [run/report conventions](methodology.md#publishing-and-updating-results).
@@ -154,8 +154,8 @@ Historical reports: `profiles/bench/serve_corpus_20260720/`.
 The original directory also contains other target/mode runs. This command selects only the MTP0 profile used here.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --mode mtp0 --sampling stochastic \
   --output profiles/bench/serve_corpus_27b_mtp0
@@ -166,8 +166,8 @@ The original directory also contains other target/mode runs. This command select
 Historical reports: `profiles/bench/serve_corpus_27b_nvfp4_w8_20260731/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp0 --sampling stochastic \
   --output profiles/bench/serve_corpus_27b_nvfp4_w8_20260731
@@ -178,8 +178,8 @@ Historical reports: `profiles/bench/serve_corpus_27b_nvfp4_w8_20260731/`.
 Historical reports: `profiles/bench/serve_corpus_27b_mtp3_20260724/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_corpus.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --mode mtp3 \
   --output profiles/bench/serve_corpus_27b_mtp3_20260724
@@ -190,8 +190,8 @@ Historical reports: `profiles/bench/serve_corpus_27b_mtp3_20260724/`.
 Historical reports: `profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp3 --suite corpus-makespan --concurrency 1 \
   --max-context 131072 --kv-capacity auto \
@@ -203,8 +203,8 @@ Historical reports: `profiles/bench/concurrent_corpus_27b_nvfp4_mtp3_20260811/`.
 Historical reports: `profiles/bench/concurrent_decode_27b_mtp3_20260811/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b.ninfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
@@ -217,8 +217,8 @@ Historical reports: `profiles/bench/concurrent_decode_27b_mtp3_20260811/`.
 Historical reports: `profiles/bench/concurrent_decode_27b_nvfp4_mtp3_20260811/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  --serve build/apps/ninfer-serve \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  --serve build/apps/infernix-serve \
   --artifact qwen3_6_27b=out/qwen3_6_27b_nvfp4.ninfer \
   --mode mtp3 --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \

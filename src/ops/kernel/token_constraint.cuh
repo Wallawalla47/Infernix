@@ -1,12 +1,12 @@
 #pragma once
 
-// Implements: include/ninfer/ops/token_constraint.h
+// Implements: include/infernix/ops/token_constraint.h
 // Match: contiguous BF16 [physical_rows,C] logits, I32 descriptors/choices, FP32 records.
 // Algorithm assumptions: one 256-thread CTA per column; the full-vocabulary log-sum-exp is the
 // target_logprobs single-pass reduction, and the permitted set (at most 16 tokens) is resolved by
 // one thread.
 
-#include "ninfer/ops/token_constraint.h"
+#include "infernix/ops/token_constraint.h"
 #include "ops/kernel/target_logprobs.cuh"
 
 #include <cuda_bf16.h>
@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kTokenConstraintBlock = 256;
 
@@ -92,4 +92,4 @@ __launch_bounds__(BlockSize) __global__
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

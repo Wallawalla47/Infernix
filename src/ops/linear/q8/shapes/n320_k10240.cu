@@ -1,7 +1,7 @@
 #include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/q8/q8_stream_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // Qwen3.8-Flash-Next final mixer down: the register-streamed route at 1-3 and 9-64 columns (2-7x faster than
 // the MMA tile there), the few-row SIMT route at 4-8 (M1 sweep). K1: 2 row(s) per warp, 8 warps splitting each
@@ -19,4 +19,4 @@ Q8Launch select_q8_n320_k10240(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

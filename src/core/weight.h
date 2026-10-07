@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace ninfer {
+namespace infernix {
 
 enum class QType : std::uint16_t {
     Q4_G64_FP16         = 0,
@@ -58,4 +58,4 @@ struct Weight {
     float input_scale_divisor  = 0.0F;
 };
 
-} // namespace ninfer
+} // namespace infernix

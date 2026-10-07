@@ -1,7 +1,7 @@
-// ninfer::ops - residual_add wrapper: implements the public api, validates parameters, and
+// infernix::ops - residual_add wrapper: implements the public api, validates parameters, and
 // dispatches to the launcher. Host-compiled; never includes the kernel header.
 // See docs/op-development.md §2.
-#include "ninfer/ops/residual_add.h"
+#include "infernix/ops/residual_add.h"
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t) {
@@ -49,4 +49,4 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
     detail::residual_add_launch(y, x, stream); // single variant -> direct dispatch
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

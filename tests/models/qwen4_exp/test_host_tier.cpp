@@ -16,7 +16,7 @@
 
 namespace {
 
-using namespace ninfer::models::qwen4_exp::expert_cache;
+using namespace infernix::models::qwen4_exp::expert_cache;
 
 int failures = 0;
 

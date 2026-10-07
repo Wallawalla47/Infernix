@@ -40,7 +40,7 @@ std::span<std::byte> aligned_ring(std::vector<std::byte>& storage, std::size_t b
     return {storage.data() + (kBlock - base % kBlock) % kBlock, blocks * kBlock};
 }
 
-void run(const ninfer::ReadOnlyFile& file, std::size_t count, std::size_t ring_blocks, std::mt19937& rng) {
+void run(const infernix::ReadOnlyFile& file, std::size_t count, std::size_t ring_blocks, std::mt19937& rng) {
     std::vector<std::uint64_t> blocks(count);
     for (auto& b : blocks) { b = rng() % kBlocks; } // random order, repeats likely
     std::vector<std::uint64_t> offsets;
@@ -63,7 +63,7 @@ void run(const ninfer::ReadOnlyFile& file, std::size_t count, std::size_t ring_b
 } // namespace
 
 int main() {
-    const auto path = std::filesystem::temp_directory_path() / "ninfer_read_only_file_test.bin";
+    const auto path = std::filesystem::temp_directory_path() / "infernix_read_only_file_test.bin";
     {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         std::vector<std::byte> block(kBlock);
@@ -73,7 +73,7 @@ int main() {
         }
     }
     try {
-        const ninfer::ReadOnlyFile file(path);
+        const infernix::ReadOnlyFile file(path);
         std::mt19937 rng(20261004);
         for (const std::size_t ring : {1U, 4U, 64U}) {
             for (const std::size_t count : {1U, 63U, 64U, 65U, 1000U}) { run(file, count, ring, rng); }
@@ -93,7 +93,7 @@ int main() {
         check(file.mapped_bytes().size() == kBlocks * kBlock, "FileMapping::Whole maps the whole file");
 
         // FileMapping::None (the n-gram volume): nothing mapped, the same direct reads and live size.
-        const ninfer::ReadOnlyFile direct(path, ninfer::FileMapping::None);
+        const infernix::ReadOnlyFile direct(path, infernix::FileMapping::None);
         check(direct.mapped_bytes().empty(), "FileMapping::None maps nothing");
         check(direct.current_bytes() == kBlocks * kBlock, "FileMapping::None reports the file's size");
         std::mt19937 unmapped(11);

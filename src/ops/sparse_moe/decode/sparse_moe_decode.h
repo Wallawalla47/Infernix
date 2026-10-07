@@ -3,14 +3,14 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class SparseMoeSmallTD3Schedule : std::uint8_t;
 enum class SparseMoeSmallTD4Schedule : std::uint8_t;
@@ -61,4 +61,4 @@ void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, 
                               const SparseMoeDecodePlan& plan,
                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

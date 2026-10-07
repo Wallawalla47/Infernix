@@ -1,4 +1,4 @@
-#include "ninfer/ops/prepare_masked_block.h"
+#include "infernix/ops/prepare_masked_block.h"
 
 #include "ops/launcher/prepare_masked_block.h"
 
@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require_i32_vector(const Tensor& tensor, std::int32_t size, const char* name) {
@@ -64,4 +64,4 @@ void prepare_masked_block(const Tensor& anchors, const Tensor& lengths, const Te
                                         block_size, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

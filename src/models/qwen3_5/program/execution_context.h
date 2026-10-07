@@ -4,10 +4,10 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/sliding_window_attention.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/sliding_window_attention.h"
+#include "infernix/ops/softmax_attention.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -22,7 +22,7 @@
 #include <optional>
 #include <span>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 using qwen3_5::PreparedPromptData;
 using detail::DFlashPersistentState;
@@ -222,4 +222,4 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
                          ops::CausalAttentionExecutionEnvelope target_envelope,
                          DecodeGraphExecutable* executable);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

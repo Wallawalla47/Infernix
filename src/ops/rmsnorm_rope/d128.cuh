@@ -4,7 +4,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct RmsnormRopeD128Pair {
     __nv_bfloat162 first;
@@ -44,4 +44,4 @@ __device__ __forceinline__ RmsnormRopeD128Pair rmsnorm_rope_d128_head(
     };
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

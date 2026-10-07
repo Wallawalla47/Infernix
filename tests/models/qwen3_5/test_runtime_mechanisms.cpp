@@ -17,7 +17,7 @@
 
 namespace {
 
-namespace q36 = ninfer::models::qwen3_5;
+namespace q36 = infernix::models::qwen3_5;
 
 int failures = 0;
 
@@ -28,7 +28,7 @@ void expect(bool condition, std::string_view message) {
 }
 
 void test_execution_timing_domains() {
-    using namespace ninfer::runtime;
+    using namespace infernix::runtime;
     ExecutionTimingRecorder recorder(ExecutionTimingPhase::Paused);
     recorder.include(
         {.submit_host_ns = 10, .device_wait_ns = 20, .post_host_ns = 30, .gpu_elapsed_ns = 100});
@@ -43,7 +43,7 @@ void test_execution_timing_domains() {
            "reading a completed execution timing must not accumulate its work again");
 }
 
-q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
+q36::DecoderStateSpec decoder_spec(infernix::KvCacheStorage storage, bool mtp) {
     return q36::DecoderStateSpec{
         .full_attention_layers     = 2,
         .mtp_layers                = 1,
@@ -58,66 +58,66 @@ q36::DecoderStateSpec decoder_spec(ninfer::KvCacheStorage storage, bool mtp) {
 }
 
 void test_decoder_layout() {
-    ninfer::LayoutBuilder bf16_builder;
+    infernix::LayoutBuilder bf16_builder;
     const q36::DecoderStateLayout bf16 = q36::plan_decoder_state(
-        bf16_builder, decoder_spec(ninfer::KvCacheStorage::BFloat16, false));
+        bf16_builder, decoder_spec(infernix::KvCacheStorage::BFloat16, false));
     (void)bf16_builder.finish(256);
     expect(bf16.text_kv.pages.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
     expect(bf16.text_kv.pages.spec.page_group_count == 5 &&
                bf16.text_kv.execution_tables.spec.logical_page_capacity == 3 &&
                bf16.text_kv.execution_tables.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
-    expect(bf16.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::BF16 &&
-               bf16.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::FP16 &&
-               bf16.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::BF16 &&
-               bf16.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
+    expect(bf16.text_kv.pages.planes[0].geometry.dtype == infernix::DType::BF16 &&
+               bf16.text_kv.pages.planes[1].geometry.dtype == infernix::DType::FP16 &&
+               bf16.text_kv.pages.planes[2].geometry.dtype == infernix::DType::BF16 &&
+               bf16.text_kv.pages.planes[3].geometry.dtype == infernix::DType::FP16,
            "BF16 KV has BF16 K and FP16 V without scale planes");
     expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
     expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
 
-    ninfer::LayoutBuilder int8_builder;
+    infernix::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 = q36::plan_decoder_state(
-        int8_builder, decoder_spec(ninfer::KvCacheStorage::Int8Group64, true));
+        int8_builder, decoder_spec(infernix::KvCacheStorage::Int8Group64, true));
     (void)int8_builder.finish(256);
     expect(int8.text_kv.pages.planes.size() == 8 &&
-               int8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
-               int8.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::FP16,
+               int8.text_kv.pages.planes[2].geometry.dtype == infernix::DType::FP16 &&
+               int8.text_kv.pages.planes[3].geometry.dtype == infernix::DType::FP16,
            "INT8 Text KV has code and scale planes per layer");
     expect(int8.mtp_kv.has_value() && int8.mtp_kv->layers == 1 &&
                int8.mtp_kv->pages.planes.size() == 4 &&
                int8.mtp_kv->pages.spec.page_group_count == 4 &&
                int8.mtp_kv->execution_tables.spec.logical_page_capacity == 3,
            "enabled MTP has one paged KV layer");
-    expect(int8.mtp_kv && int8.mtp_kv->pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
-               int8.mtp_kv->pages.planes[3].geometry.dtype == ninfer::DType::FP16,
+    expect(int8.mtp_kv && int8.mtp_kv->pages.planes[2].geometry.dtype == infernix::DType::FP16 &&
+               int8.mtp_kv->pages.planes[3].geometry.dtype == infernix::DType::FP16,
            "INT8 MTP KV has scale planes");
     expect(int8.kv_payload_bytes() == int8.text_kv.payload_bytes() + int8.mtp_kv->payload_bytes(),
            "INT8 Text/MTP KV payload accounting");
 
-    q36::DecoderStateSpec fp8_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
-    ninfer::LayoutBuilder fp8_builder;
+    q36::DecoderStateSpec fp8_spec = decoder_spec(infernix::KvCacheStorage::Fp8E4M3Row256, true);
+    infernix::LayoutBuilder fp8_builder;
     const q36::DecoderStateLayout fp8 = q36::plan_decoder_state(fp8_builder, fp8_spec);
     (void)fp8_builder.finish(256);
     expect(fp8.text_kv.pages.planes.size() == 8 &&
-               fp8.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
-               fp8.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               fp8.text_kv.pages.planes[0].geometry.dtype == infernix::DType::FP8_E4M3FN &&
+               fp8.text_kv.pages.planes[2].geometry.dtype == infernix::DType::FP16 &&
                fp8.text_kv.pages.planes[2].geometry.leading_extent == 1,
            "FP8 Text KV has row-scaled code and scale planes per layer");
     expect(fp8.mtp_kv && fp8.mtp_kv->pages.planes.size() == 4 &&
-               fp8.mtp_kv->pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               fp8.mtp_kv->pages.planes[0].geometry.dtype == infernix::DType::FP8_E4M3FN &&
                fp8.mtp_kv->pages.planes[2].geometry.leading_extent == 1,
            "FP8 MTP KV has row-scaled code and scale planes");
     expect(fp8.kv_payload_bytes() == fp8.text_kv.payload_bytes() + fp8.mtp_kv->payload_bytes(),
            "FP8 Text/MTP KV payload accounting");
 
-    ninfer::LayoutBuilder nvfp4_builder;
+    infernix::LayoutBuilder nvfp4_builder;
     const q36::DecoderStateLayout nvfp4 = q36::plan_decoder_state(
-        nvfp4_builder, decoder_spec(ninfer::KvCacheStorage::Nvfp4Group16, true));
+        nvfp4_builder, decoder_spec(infernix::KvCacheStorage::Nvfp4Group16, true));
     (void)nvfp4_builder.finish(256);
     expect(nvfp4.text_kv.pages.planes.size() == 8 &&
-               nvfp4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[0].geometry.dtype == infernix::DType::U8 &&
                nvfp4.text_kv.pages.planes[0].geometry.leading_extent == 128 &&
-               nvfp4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::U8 &&
+               nvfp4.text_kv.pages.planes[2].geometry.dtype == infernix::DType::U8 &&
                nvfp4.text_kv.pages.planes[2].geometry.leading_extent == 16,
            "NVFP4 Text KV has packed E2M1 code and E4M3 scale planes");
     constexpr std::size_t nvfp4_vector_bytes = 128 + 16;
@@ -128,18 +128,18 @@ void test_decoder_layout() {
                nvfp4.mtp_kv->payload_bytes() == 2ULL * nvfp4_vector_bytes * mtp_vectors,
            "NVFP4 Text/MTP physical payload bytes");
 
-    ninfer::LayoutBuilder k8v4_builder;
+    infernix::LayoutBuilder k8v4_builder;
     const q36::DecoderStateLayout k8v4 = q36::plan_decoder_state(
-        k8v4_builder, decoder_spec(ninfer::KvCacheStorage::Fp8KeyNvfp4Value, true));
+        k8v4_builder, decoder_spec(infernix::KvCacheStorage::Fp8KeyNvfp4Value, true));
     (void)k8v4_builder.finish(256);
     expect(k8v4.text_kv.pages.planes.size() == 8 &&
-               k8v4.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::FP8_E4M3FN &&
+               k8v4.text_kv.pages.planes[0].geometry.dtype == infernix::DType::FP8_E4M3FN &&
                k8v4.text_kv.pages.planes[0].geometry.leading_extent == 256 &&
-               k8v4.text_kv.pages.planes[1].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[1].geometry.dtype == infernix::DType::U8 &&
                k8v4.text_kv.pages.planes[1].geometry.leading_extent == 128 &&
-               k8v4.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+               k8v4.text_kv.pages.planes[2].geometry.dtype == infernix::DType::FP16 &&
                k8v4.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
-               k8v4.text_kv.pages.planes[3].geometry.dtype == ninfer::DType::U8 &&
+               k8v4.text_kv.pages.planes[3].geometry.dtype == infernix::DType::U8 &&
                k8v4.text_kv.pages.planes[3].geometry.leading_extent == 16,
            "K8V4 Text KV preserves independent key/value code and scale geometry");
     constexpr std::size_t k8_vector_bytes = 256 + 2;
@@ -152,17 +152,17 @@ void test_decoder_layout() {
     // Vector-quantized formats: compact code planes with one FP16 row scale. Their exact
     // recent-key window is sequence state (StateImage), not part of the page pool.
     for (const auto storage :
-         {ninfer::KvCacheStorage::Vq2, ninfer::KvCacheStorage::Q4KeyVq2Value}) {
-        ninfer::LayoutBuilder vq_builder;
+         {infernix::KvCacheStorage::Vq2, infernix::KvCacheStorage::Q4KeyVq2Value}) {
+        infernix::LayoutBuilder vq_builder;
         const q36::DecoderStateSpec spec = decoder_spec(storage, true);
         const q36::DecoderStateLayout vq = q36::plan_decoder_state(vq_builder, spec);
         (void)vq_builder.finish(256);
-        const int key_bytes = storage == ninfer::KvCacheStorage::Vq2 ? 64 : 128;
+        const int key_bytes = storage == infernix::KvCacheStorage::Vq2 ? 64 : 128;
         expect(vq.text_kv.pages.planes.size() == 8 &&
-                   vq.text_kv.pages.planes[0].geometry.dtype == ninfer::DType::U8 &&
+                   vq.text_kv.pages.planes[0].geometry.dtype == infernix::DType::U8 &&
                    vq.text_kv.pages.planes[0].geometry.leading_extent == key_bytes &&
                    vq.text_kv.pages.planes[1].geometry.leading_extent == 64 &&
-                   vq.text_kv.pages.planes[2].geometry.dtype == ninfer::DType::FP16 &&
+                   vq.text_kv.pages.planes[2].geometry.dtype == infernix::DType::FP16 &&
                    vq.text_kv.pages.planes[2].geometry.leading_extent == 1 &&
                    vq.text_kv.pages.planes[3].geometry.leading_extent == 1,
                "vector-quantized Text KV has code planes and FP16 row-scale planes");
@@ -179,13 +179,13 @@ void test_round_layout() {
     static_assert(offsetof(q36::DFlashDecodeIngress, anchors) % 16 == 0);
     static_assert(offsetof(q36::DFlashDecodeIngress, execution_frontiers) % 16 == 0);
     static_assert(offsetof(q36::DFlashDecodeIngress, sampling) % 16 == 0);
-    ninfer::LayoutBuilder builder;
+    infernix::LayoutBuilder builder;
     q36::RoundStateLayout round = q36::begin_round_state_layout(
         builder, q36::RoundStateSpec{.hidden       = 32,
                                      .output_rows  = 128,
                                      .draft_window = 5,
-                                     .backend      = ninfer::SpeculativeBackend::Mtp});
-    (void)builder.add_tensor(ninfer::DType::BF16, {32, 16}, 256, "exact prefill hidden");
+                                     .backend      = infernix::SpeculativeBackend::Mtp});
+    (void)builder.add_tensor(infernix::DType::BF16, {32, 16}, 256, "exact prefill hidden");
     q36::complete_round_state_layout(builder, round);
     (void)builder.finish(256);
     expect(round.complete, "round layout completes");
@@ -199,12 +199,12 @@ void test_round_layout() {
                round.mtp_decode->alignment_ids.shape[1] == 1,
            "MTP decode frame is explicit");
 
-    ninfer::LayoutBuilder speculative_builder;
+    infernix::LayoutBuilder speculative_builder;
     q36::RoundStateLayout dflash = q36::begin_round_state_layout(
         speculative_builder, q36::RoundStateSpec{.hidden       = 32,
                                                  .output_rows  = 128,
                                                  .draft_window = 15,
-                                                 .backend = ninfer::SpeculativeBackend::DFlash});
+                                                 .backend = infernix::SpeculativeBackend::DFlash});
     q36::complete_round_state_layout(speculative_builder, dflash);
     (void)speculative_builder.finish(256);
     expect(dflash.logits.shape[1] == 1 && dflash.dflash_prefill.has_value() &&
@@ -215,7 +215,7 @@ void test_round_layout() {
     expect(!dflash.mtp.has_value() && !dflash.mtp_decode.has_value(),
            "DFlash layout does not allocate MTP storage");
 
-    ninfer::LayoutBuilder scoring_builder;
+    infernix::LayoutBuilder scoring_builder;
     auto scoring = q36::begin_round_state_layout(
         scoring_builder, {.hidden = 32, .output_rows = 128, .causal_scoring = true});
     q36::complete_round_state_layout(scoring_builder, scoring);
@@ -225,13 +225,13 @@ void test_round_layout() {
                scoring.token.region.bytes == 0 && scoring.logits.region.bytes == 0,
            "scoring does not reserve generation frames or sampled output");
     for (const std::uint32_t rows : {1U, 2U, 8U}) {
-        ninfer::LayoutBuilder copy_builder;
+        infernix::LayoutBuilder copy_builder;
         auto copy_layout = q36::begin_round_state_layout(
             copy_builder, {.hidden         = 32,
                            .output_rows    = 128,
                            .batch_capacity = rows,
                            .draft_window   = 15,
-                           .backend        = ninfer::SpeculativeBackend::DFlash2});
+                           .backend        = infernix::SpeculativeBackend::DFlash2});
         q36::complete_round_state_layout(copy_builder, copy_layout);
         const auto bytes = copy_builder.finish(256);
         std::vector<std::byte> storage(bytes + 255);
@@ -271,13 +271,13 @@ void test_round_layout() {
             expect(rejected, "invalid narrowed frame width rejected");
         }
     }
-    ninfer::LayoutBuilder mtp_copy_builder;
+    infernix::LayoutBuilder mtp_copy_builder;
     auto mtp_copy_layout = q36::begin_round_state_layout(
         mtp_copy_builder, {.hidden         = 32,
                            .output_rows    = 128,
                            .batch_capacity = 1,
                            .draft_window   = 15,
-                           .backend        = ninfer::SpeculativeBackend::Mtp});
+                           .backend        = infernix::SpeculativeBackend::Mtp});
     q36::complete_round_state_layout(mtp_copy_builder, mtp_copy_layout);
     const auto mtp_bytes = mtp_copy_builder.finish(256);
     std::vector<std::byte> mtp_storage(mtp_bytes + 255);
@@ -313,13 +313,13 @@ void test_round_layout() {
     }
     // Above one request the narrowed MTP frame stays a dense [k+1,C] view of the native storage,
     // and the step-major proposal tensors keep their row stride.
-    ninfer::LayoutBuilder mtp_batch_builder;
+    infernix::LayoutBuilder mtp_batch_builder;
     auto mtp_batch_layout = q36::begin_round_state_layout(
         mtp_batch_builder, {.hidden         = 32,
                             .output_rows    = 128,
                             .batch_capacity = 3,
                             .draft_window   = 15,
-                            .backend        = ninfer::SpeculativeBackend::Mtp});
+                            .backend        = infernix::SpeculativeBackend::Mtp});
     q36::complete_round_state_layout(mtp_batch_builder, mtp_batch_layout);
     const auto mtp_batch_bytes = mtp_batch_builder.finish(256);
     std::vector<std::byte> mtp_batch_storage(mtp_batch_bytes + 255);
@@ -433,7 +433,7 @@ q36::PreparedPromptData identity_prompt(std::uint8_t digest_byte = 1) {
     return prompt;
 }
 
-void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
+void append_text_token(q36::PreparedPromptData& prompt, infernix::TokenId token,
                        std::int32_t position) {
     const std::size_t old_tokens = prompt.token_ids.size();
     std::vector<std::int32_t> positions;
@@ -451,7 +451,7 @@ void append_text_token(q36::PreparedPromptData& prompt, ninfer::TokenId token,
 
 void test_prefix_identity() {
     q36::PreparedPromptData original    = identity_prompt();
-    std::vector<ninfer::TokenId> ledger = original.token_ids;
+    std::vector<infernix::TokenId> ledger = original.token_ids;
     q36::detail::ResidentPrefixIdentity resident;
     q36::detail::PrefixShortlistDigests digests;
     resident.reserve(16);
@@ -508,7 +508,7 @@ void test_prefix_identity() {
 
     resident.append_generated(1, original.rope_delta);
     ledger.push_back(12);
-    const std::array<ninfer::TokenId, 1> generated{12};
+    const std::array<infernix::TokenId, 1> generated{12};
     digests.append_generated(generated, original.rope_delta);
     append_text_token(original, 12, 4);
     q36::detail::PrefixShortlistDigests rebuilt;
@@ -519,9 +519,9 @@ void test_prefix_identity() {
            "generated multimodal continuation identity");
 
     q36::PreparedPromptData accepted_rebuild = identity_prompt();
-    const std::array<ninfer::TokenId, 3> proposed{20, 21, 22};
-    const std::span<const ninfer::TokenId> accepted(proposed.data(), 2);
-    std::vector<ninfer::TokenId> accepted_ledger = accepted_rebuild.token_ids;
+    const std::array<infernix::TokenId, 3> proposed{20, 21, 22};
+    const std::span<const infernix::TokenId> accepted(proposed.data(), 2);
+    std::vector<infernix::TokenId> accepted_ledger = accepted_rebuild.token_ids;
     accepted_ledger.insert(accepted_ledger.end(), accepted.begin(), accepted.end());
     q36::detail::ResidentPrefixIdentity accepted_resident;
     q36::detail::PrefixShortlistDigests accepted_digests;

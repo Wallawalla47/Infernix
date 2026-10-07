@@ -14,7 +14,7 @@
 #include <string_view>
 
 namespace {
-namespace qwen = ninfer::models::qwen3_5;
+namespace qwen = infernix::models::qwen3_5;
 using qwen::detail::mtp_graph_profiles;
 
 void require(bool value, const char* message) {
@@ -43,7 +43,7 @@ void verify_profiles() {
             }
         }
         for (const auto backend :
-             {ninfer::SpeculativeBackend::DFlash, ninfer::SpeculativeBackend::DFlash2}) {
+             {infernix::SpeculativeBackend::DFlash, infernix::SpeculativeBackend::DFlash2}) {
             for (unsigned width = 1; width <= 63; ++width) {
                 const auto profiles =
                     qwen::detail::dflash_graph_profiles(backend, capacity, width);
@@ -68,17 +68,17 @@ void verify_profiles() {
         }
     }
     for (auto type :
-         {ninfer::QType::FP8_E4M3FN_ROW_BF16, ninfer::QType::NVFP4, ninfer::QType::Q8_G32_FP16}) {
-        for (auto policy : {ninfer::ops::LinearPolicy::A16Only, ninfer::ops::LinearPolicy::AllowA8,
-                            ninfer::ops::LinearPolicy::AllowA4}) {
+         {infernix::QType::FP8_E4M3FN_ROW_BF16, infernix::QType::NVFP4, infernix::QType::Q8_G32_FP16}) {
+        for (auto policy : {infernix::ops::LinearPolicy::A16Only, infernix::ops::LinearPolicy::AllowA8,
+                            infernix::ops::LinearPolicy::AllowA4}) {
             qwen::execution::LinearParameters p;
             p.weight.qtype = type;
             p.policy       = policy;
             require(qwen::execution::residual_projection_policy(p, false) == policy,
                     "ordinary residual policy must remain unchanged");
             require(qwen::execution::residual_projection_policy(p, true) ==
-                        (type == ninfer::QType::FP8_E4M3FN_ROW_BF16
-                             ? ninfer::ops::LinearPolicy::A16Only
+                        (type == infernix::QType::FP8_E4M3FN_ROW_BF16
+                             ? infernix::ops::LinearPolicy::A16Only
                              : policy),
                     "wide residual precision must be scoped to FP8");
         }
@@ -112,11 +112,11 @@ std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngra
 }
 
 void verify_real_plan(const char* artifact) {
-    ninfer::DeviceContext device;
-    ninfer::models::LoadOptions selected;
+    infernix::DeviceContext device;
+    infernix::models::LoadOptions selected;
     selected.vision        = false;
-    selected.speculative   = ninfer::SpeculativeBackend::Mtp;
-    selected.proposal_head = ninfer::ProposalHead::Optimized;
+    selected.speculative   = infernix::SpeculativeBackend::Mtp;
+    selected.proposal_head = infernix::ProposalHead::Optimized;
     auto model             = qwen::load_model(artifact, selected, device);
     const qwen::execution::Parameters parameters(*model);
     unsigned cases = 0;
@@ -125,17 +125,17 @@ void verify_real_plan(const char* artifact) {
             for (unsigned ngram : {0U, 1U, 2U, 3U, 4U, 5U, 15U, 31U, 32U, 33U, 47U, 63U}) {
                 std::array<std::size_t, 2> bytes{};
                 for (unsigned graphs = 0; graphs < 2; ++graphs) {
-                    ninfer::EngineOptions options;
+                    infernix::EngineOptions options;
                     options.max_context     = capacity;
-                    options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(capacity);
+                    options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(capacity);
                     options.max_concurrency = 1;
                     options.prefill_chunk   = 1024;
                     options.enable_vision   = false;
-                    options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
-                    options.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+                    options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
+                    options.speculative.backend              = infernix::SpeculativeBackend::Mtp;
                     options.speculative.draft_tokens         = neural;
                     options.speculative.ngram_draft_tokens   = ngram;
-                    options.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+                    options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
                     options.context_cache.device_state_slots = 1;
                     options.use_cuda_graph                   = graphs != 0;
                     auto planner     = qwen::make_sequence_planner(parameters, device, options);
@@ -161,7 +161,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         require(argc == 2 && std::string_view(argv[1]) == "--real", "expected optional --real");
-        const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+        const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
         if (!artifact || !*artifact) { return 77; }
         verify_real_plan(artifact);
         return 0;

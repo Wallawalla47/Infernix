@@ -4,7 +4,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 
 // Prompt boundary facts supplied by the Frontend (docs/maintainer/hybrid-prefix-cache-spec.md
 // §7.1). Positions are exact token frontiers.
@@ -76,4 +76,4 @@ struct TapPlannerConfig {
                                                 std::span<const TapExclusion> exclusions,
                                                 const TapPlannerConfig& config);
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

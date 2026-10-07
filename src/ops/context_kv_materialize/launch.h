@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ninfer/ops/context_kv_materialize.h"
+#include "infernix/ops/context_kv_materialize.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 enum class ContextKVMaterializeRoute : std::uint8_t {
     KSplit16,
@@ -37,4 +37,4 @@ void context_kv_materialize_launch(
     ContextKVMaterializeExecutionEnvelope envelope, ContextKVMaterializeRoute route,
     const Tensor& key_scratch, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

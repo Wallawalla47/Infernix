@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kRows           = 2048;
@@ -122,4 +122,4 @@ void q8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

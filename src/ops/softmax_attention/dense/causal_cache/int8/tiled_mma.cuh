@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <typename Geometry, typename Schedule, typename Metadata>
 __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
@@ -108,8 +108,8 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
             if (key <= max_query_abs) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
-                ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                infernix::ops::cp_async<8>(kd, &cache_k_scale[off]);
+                infernix::ops::cp_async<8>(vd, &cache_v_scale[off]);
             } else {
                 store_vec(kd, make_int2(0, 0));
                 store_vec(vd, make_int2(0, 0));
@@ -133,11 +133,11 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                 store_vec(vd, make_int4(0, 0, 0, 0));
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     issue_kv_tile(0);
-    ninfer::ops::cp_wait<0>();
+    infernix::ops::cp_wait<0>();
     __syncthreads();
 
     const int gid      = lane >> 2;
@@ -367,7 +367,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if (has_next) { infernix::ops::cp_wait<0>(); }
         __syncthreads();
     }
 
@@ -401,4 +401,4 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void int8_kv_tiled_mma_kernel(
     causal_zero_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid, Schedule::kThreads);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

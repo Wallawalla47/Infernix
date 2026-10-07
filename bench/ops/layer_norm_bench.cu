@@ -1,5 +1,5 @@
-#include "ninfer/ops/layer_norm.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/layer_norm.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_bf16.h>
 
@@ -8,8 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

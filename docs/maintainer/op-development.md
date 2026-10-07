@@ -1,13 +1,13 @@
-# NInfer Op Development Rules
+# Infernix Op Development Rules
 
 This document defines the repository-wide rules for admitting, specifying, owning, implementing,
-qualifying, and measuring NInfer Ops. An **Op** is a semantic execution contract. A CUDA
+qualifying, and measuring Infernix Ops. An **Op** is a semantic execution contract. A CUDA
 **kernel** is one implementation, or one stage of an implementation, of an Op.
 
 Repository-wide product scope, numerical principles, and evidence requirements remain in
 [`AGENTS.md`](../../AGENTS.md). When this document and a concrete Op contract differ about that
 Op's represented inputs, formula, supported domain, or observable effects, the contract in
-`include/ninfer/ops/` is the concrete authority and the inconsistency must be resolved.
+`include/infernix/ops/` is the concrete authority and the inconsistency must be resolved.
 
 ## 1. Scope and authorities
 
@@ -21,7 +21,7 @@ This file owns only rules that apply across Op families:
 
 The remaining authorities are:
 
-- `include/ninfer/ops/<family>.h` — the formula, represented inputs, supported domain, outputs,
+- `include/infernix/ops/<family>.h` — the formula, represented inputs, supported domain, outputs,
   state effects, alias rules, and workspace contract of a concrete Op;
 - [`tests/README.md`](../../tests/README.md) — test organization, commands, and common reporting
   mechanisms;
@@ -104,7 +104,7 @@ staging kernels, workspace layout helpers, and device primitives are parts of an
 not independently model-callable Ops.
 
 Every model-callable device transformation belongs to the central Op layer. A model implementation invokes a
-contract from `include/ninfer/ops/`, composes existing Ops and core mechanisms, or keeps host-side
+contract from `include/infernix/ops/`, composes existing Ops and core mechanisms, or keeps host-side
 schedule composition in the model implementation.
 
 ### 2.2 Semantic extents and private routes
@@ -167,8 +167,8 @@ direction is a core or host transfer.
 Repository-internal contracts live in:
 
 ```text
-include/ninfer/ops/<family>.h
-namespace ninfer::ops
+include/infernix/ops/<family>.h
+namespace infernix::ops
 ```
 
 They are execution-layer interfaces, not a public product ABI. A header may group closely related
@@ -314,7 +314,7 @@ views.
 
 A weight preparation entry resolves weight views and activation permissions into operands for a
 supported native overload, checking its parent geometry, format, layout and shape. See
-[`weight_input.h`](../../include/ninfer/ops/weight_input.h). Model execution composes the prepared
+[`weight_input.h`](../../include/infernix/ops/weight_input.h). Model execution composes the prepared
 Ops; resource queries and execution check their applicable contracts.
 
 Program owns persistent state instances and lifetime; core owns model-independent physical
@@ -348,7 +348,7 @@ ordering.
 
 - Name an Op after its mathematical transformation or explicit state transition, not its first
   model, layer role, schedule phase, or CUDA strategy.
-- Use `ninfer::ops` for semantic entries. Use `ninfer::ops::detail` only for private material that
+- Use `infernix::ops` for semantic entries. Use `infernix::ops::detail` only for private material that
   must cross translation-unit boundaries.
 - Name an implementation specialization by real match facts such as format, geometry, extent,
   device capability, or algorithm.
@@ -373,15 +373,15 @@ Enforce the boundary in code and build ownership:
 - `src/ops/**` does not include model, Program, schedule, product, or artifact-provenance headers;
 - model execution includes contract headers, never private launcher, kernel, common, codec, or plan
   headers;
-- `ninfer_ops` does not link a model implementation;
+- `infernix_ops` does not link a model implementation;
 - core and artifact do not link Ops or models;
 - explicit source lists give every implementation one build and link owner.
 
 The owning family registers its implementation in `src/ops/<family>/sources.cmake`; Linear
 delegates to one explicit manifest per numeric format. A family manifest includes its wrappers
 even when they live in the horizontal `wrapper/` directory. Ordinary sources contribute to
-`ninfer_ops`; the three NVFP4 sources requiring non-RDC compilation contribute to
-`ninfer_nvfp4_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
+`infernix_ops`; the three NVFP4 sources requiring non-RDC compilation contribute to
+`infernix_nvfp4_non_rdc` from their owning manifests. Shape files retain their `.cpp` or `.cu`
 language and separate translation units. See [Build system](build-system.md) for the target policy.
 
 ## 6. Qualification

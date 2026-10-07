@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Autonomous A/B benchmark: upstream + Windows port (control) vs. fork (treatment).
 
-Runs both arms sequentially against the SAME official NInfer Qwen3.8-27B NVFP4
+Runs both arms sequentially against the SAME official Infernix Qwen3.8-27B NVFP4
 artifact and the SAME synthesized agentic workloads (ab_workloads.py), using the
 serve's own request log (--request-log-jsonl, same schema as the production
 log.json) as the source of truth for metrics. Collects avg TTFT, prefix-cache
@@ -43,13 +43,13 @@ MODEL = os.environ.get("AB_MODEL",
 # control_build.bat. Prefer this directory's own control build; fall back to the
 # machine-specific build location.
 _control_default = os.path.join(AB_DIR, "control", "build", "apps", "Release",
-                                "ninfer-serve.exe")
+                                "infernix-serve.exe")
 if not os.path.exists(_control_default):
-    _control_default = r"E:\NInfer-V3\deploy-working\ab\control\build\apps\Release\ninfer-serve.exe"
+    _control_default = r"E:\NInfer-V3\deploy-working\ab\control\build\apps\Release\infernix-serve.exe"
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE", _control_default)
 # Treatment = the fork's current master, the existing Windows build.
 TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
-                               r"E:\NInfer-V3\build-windows\apps\Release\ninfer-serve.exe")
+                               r"E:\NInfer-V3\build-windows\apps\Release\infernix-serve.exe")
 PRODUCTION_BAT = os.environ.get(
     "AB_PRODUCTION_BAT", os.path.join(DEPLOY, "LaunchQwen3.8-27B-official-dflash2-ngram.bat"))
 REPORT = os.path.join(AB_DIR, "ab_report.md")
@@ -471,7 +471,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
         med_prompt = statistics.median(prompts)
     L = []
     L.append("## Inference performance: this fork vs upstream (A/B benchmark)\n")
-    L.append("Both arms serve the same official NInfer Qwen3.8-27B NVFP4 artifact (%s) on a "
+    L.append("Both arms serve the same official Infernix Qwen3.8-27B NVFP4 artifact (%s) on a "
              "%s, run at the same max-context (%d — the largest context at which the upstream "
              "arm starts on this card; see below) and replay the same synthesized agentic "
              "workload: %d requests shaped from the production request log (multi-turn "
@@ -480,7 +480,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
              "max-concurrency 2).\n"
              % (os.path.basename(MODEL), gpu_name(), ctx, n, _tok(ab_workloads.BASE_TOKENS),
                 _fmt((med_prompt or 0) / 1000.0)))
-    L.append("| Metric | Upstream + Windows port | This NInfer-custom fork | Δ |\n")
+    L.append("| Metric | Upstream + Windows port | This Infernix-custom fork | Δ |\n")
     L.append("|---|---|---|---|\n")
     L.append("| Avg TTFT (s, lower better) | %s | %s | %s |\n"
              % (_sec(ca.get("ttft_s_mean")), _sec(ta.get("ttft_s_mean")),
@@ -515,7 +515,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     if paths:
         L.append("- Cache hits by reuse path (requests / hit tokens):\n")
         L.append("  \n")
-        L.append("  | Path | Upstream | This NInfer-custom fork |\n")
+        L.append("  | Path | Upstream | This Infernix-custom fork |\n")
         L.append("  |---|---|---|\n")
         for p in paths:
             c = ca.get("cache_path_stats", {}).get(p, {"requests": 0, "hit_tokens": 0})
@@ -523,7 +523,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
             L.append("  | %s | %d / %s | %d / %s |\n"
                      % (p, c["requests"], _tok(c["hit_tokens"]), t["requests"], _tok(t["hit_tokens"])))
         L.append("")
-    L.append("**Configuration and launch parameters.** Model: the official NInfer Qwen3.8-27B "
+    L.append("**Configuration and launch parameters.** Model: the official Infernix Qwen3.8-27B "
              "NVFP4 artifact `%s`; GPU: %s; max-context %d for both arms; max-concurrency 2; "
              "`--kv-dtype int8`.\n" % (os.path.basename(MODEL), gpu_name(), ctx))
     L.append("Launch parameters, this fork (all flags):\n\n```\n%s\n```\n" % _flag_str(treat_flags))
@@ -546,7 +546,7 @@ def readme_block(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
 def compute_report(ctrl, treat, ctrl_flags, treat_flags, dropped, ctx):
     ca, ta = ctrl["aggregates"], treat["aggregates"]
     L = []
-    L.append("# NInfer A/B: upstream + Windows fixes (control) vs. fork (treatment)\n")
+    L.append("# Infernix A/B: upstream + Windows fixes (control) vs. fork (treatment)\n")
     L.append("Generated: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
     L.append("Control: %s\n" % CONTROL_EXE)
     L.append("Treatment: %s\n" % TREATMENT_EXE)

@@ -1,4 +1,4 @@
-set(ninfer_op_tests
+set(infernix_op_tests
   add_bias
   gelu
   silu_mul
@@ -29,136 +29,136 @@ set(ninfer_op_tests
   top_logprobs
   token_constraint
   position)
-foreach(op IN LISTS ninfer_op_tests)
-  ninfer_add_op_test(ninfer_${op}_test
+foreach(op IN LISTS infernix_op_tests)
+  infernix_add_op_test(infernix_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
-    LIBRARIES ninfer_ops)
+    LIBRARIES infernix_ops)
 endforeach()
 
-ninfer_add_op_test(ninfer_linear_topk_test
+infernix_add_op_test(infernix_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_candidate_selector_test
+infernix_add_op_test(infernix_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_softmax_attention_test
+infernix_add_op_test(infernix_softmax_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/main.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/causal_cache.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/plain_and_packed.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/softmax_attention/context.cpp"
-  LIBRARIES ninfer_ops
+  LIBRARIES infernix_ops
   ARGS --non-causal-only)
 # The causal cases, one entry per KV format: together they run exactly the cases of a run without
 # --kv-dtype, and `ctest -j` can run them concurrently.
 foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  add_test(NAME ninfer_softmax_attention_${kv_dtype}_test
-    COMMAND ninfer_softmax_attention_test --kv-dtype ${kv_dtype})
-  set_tests_properties(ninfer_softmax_attention_${kv_dtype}_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_test(NAME infernix_softmax_attention_${kv_dtype}_test
+    COMMAND infernix_softmax_attention_test --kv-dtype ${kv_dtype})
+  set_tests_properties(infernix_softmax_attention_${kv_dtype}_test PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
 # Beyond the native 262,144 visible keys that --rope-yarn-factor opens (up to 1,048,576).
-add_test(NAME ninfer_softmax_attention_extended_test
-  COMMAND ninfer_softmax_attention_test --extended)
-set_tests_properties(ninfer_softmax_attention_extended_test PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME infernix_softmax_attention_extended_test
+  COMMAND infernix_softmax_attention_test --extended)
+set_tests_properties(infernix_softmax_attention_extended_test PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_op_test(ninfer_sliding_window_attention_test
+infernix_add_op_test(infernix_sliding_window_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sliding_window_attention.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_kv_cache_append_test
+infernix_add_op_test(infernix_kv_cache_append_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_append.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_kv_cache_vq_test
+infernix_add_op_test(infernix_kv_cache_vq_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_cache_vq.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_vq_attention_test
+infernix_add_op_test(infernix_vq_attention_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vq_attention.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_rmsnorm_rope_test
+infernix_add_op_test(infernix_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_context_kv_materialize_test
+infernix_add_op_test(infernix_context_kv_materialize_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_context_kv_materialize.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-add_test(NAME ninfer_kv_cache_append_nvfp4_test
-  COMMAND ninfer_kv_cache_append_test --nvfp4-only)
+add_test(NAME infernix_kv_cache_append_nvfp4_test
+  COMMAND infernix_kv_cache_append_test --nvfp4-only)
 
-add_test(NAME ninfer_kv_cache_append_k8v4_test
-  COMMAND ninfer_kv_cache_append_test --k8v4-only)
+add_test(NAME infernix_kv_cache_append_k8v4_test
+  COMMAND infernix_kv_cache_append_test --k8v4-only)
 
 set_tests_properties(
-  ninfer_kv_cache_append_nvfp4_test
-  ninfer_kv_cache_append_k8v4_test
+  infernix_kv_cache_append_nvfp4_test
+  infernix_kv_cache_append_k8v4_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_op_test(ninfer_prepare_masked_block_test
+infernix_add_op_test(infernix_prepare_masked_block_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prepare_masked_block.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_sparse_moe_test
+infernix_add_op_test(infernix_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_mtp_pack_test
+infernix_add_op_test(infernix_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_mtp_round_test
+infernix_add_op_test(infernix_mtp_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_round.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_speculative_round_test
+infernix_add_op_test(infernix_speculative_round_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_round.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_speculative_tree_test
+infernix_add_op_test(infernix_speculative_tree_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_tree.cpp"
-  LIBRARIES ninfer_ops)
-set_tests_properties(ninfer_speculative_tree_test PROPERTIES TIMEOUT 600)
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_speculative_tree_test PROPERTIES TIMEOUT 600)
 
-ninfer_add_op_test(ninfer_attn_input_proj_test
+infernix_add_op_test(infernix_attn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_attn_input_proj_fused_rmsnorm_test
+infernix_add_op_test(infernix_attn_input_proj_fused_rmsnorm_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_attn_input_proj_fused_rmsnorm.cpp"
-  LIBRARIES ninfer_ops)
-set_tests_properties(ninfer_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_attn_input_proj_fused_rmsnorm_test PROPERTIES SKIP_RETURN_CODE 77)
 
-ninfer_add_op_test(ninfer_gdn_input_proj_test
+infernix_add_op_test(infernix_gdn_input_proj_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_dynamic_grouped_conv_prepare_test
+infernix_add_op_test(infernix_dynamic_grouped_conv_prepare_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dynamic_grouped_conv_prepare.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_linear_dynamic_grouped_conv_add_test
+infernix_add_op_test(infernix_linear_dynamic_grouped_conv_add_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_dynamic_grouped_conv_add.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
+infernix_add_op_test(infernix_gdn_input_proj_conv_snapshot_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_snapshot.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
+infernix_add_op_test(infernix_gdn_input_proj_conv_record_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
+infernix_add_op_test(infernix_gated_delta_net_replay_record_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_gdn_replay_fold_test
+infernix_add_op_test(infernix_gdn_replay_fold_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_replay_fold.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
 include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
@@ -166,86 +166,86 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
 foreach(kv_dtype bf16 int8 fp8 nvfp4 k8v4)
-  add_test(NAME ninfer_softmax_attention_wide_${kv_dtype}_test
-    COMMAND ninfer_softmax_attention_test --wide-only --kv-dtype ${kv_dtype})
-  set_tests_properties(ninfer_softmax_attention_wide_${kv_dtype}_test
+  add_test(NAME infernix_softmax_attention_wide_${kv_dtype}_test
+    COMMAND infernix_softmax_attention_test --wide-only --kv-dtype ${kv_dtype})
+  set_tests_properties(infernix_softmax_attention_wide_${kv_dtype}_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 endforeach()
 
-add_test(NAME ninfer_sparse_moe_wide_test
-  COMMAND ninfer_sparse_moe_test --wide-only)
-set_tests_properties(ninfer_sparse_moe_wide_test
+add_test(NAME infernix_sparse_moe_wide_test
+  COMMAND infernix_sparse_moe_test --wide-only)
+set_tests_properties(infernix_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
-  add_test(NAME ninfer_speculative_${test_suffix}_test
-    COMMAND ninfer_speculative_round_test --${mode})
-  set_tests_properties(ninfer_speculative_${test_suffix}_test
+  add_test(NAME infernix_speculative_${test_suffix}_test
+    COMMAND infernix_speculative_round_test --${mode})
+  set_tests_properties(infernix_speculative_${test_suffix}_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
 endforeach()
-set_tests_properties(ninfer_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
-set_tests_properties(ninfer_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+set_tests_properties(infernix_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
+set_tests_properties(infernix_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
 
 # The wide sweep, one entry per width and layer profile plus the batched cases: together they run
 # exactly the cases of --wide-only, and `ctest -j` runs them concurrently.
 foreach(width 33 48 64)
   foreach(layers 48 30)
-    add_test(NAME ninfer_gdn_replay_fold_wide_w${width}_l${layers}_test
-      COMMAND ninfer_gdn_replay_fold_test --wide-only --width ${width} --layers ${layers})
-    set_tests_properties(ninfer_gdn_replay_fold_wide_w${width}_l${layers}_test
+    add_test(NAME infernix_gdn_replay_fold_wide_w${width}_l${layers}_test
+      COMMAND infernix_gdn_replay_fold_test --wide-only --width ${width} --layers ${layers})
+    set_tests_properties(infernix_gdn_replay_fold_wide_w${width}_l${layers}_test
       PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   endforeach()
 endforeach()
-add_test(NAME ninfer_gdn_replay_fold_wide_batched_test
-  COMMAND ninfer_gdn_replay_fold_test --wide-only --batched)
-set_tests_properties(ninfer_gdn_replay_fold_wide_batched_test
+add_test(NAME infernix_gdn_replay_fold_wide_batched_test
+  COMMAND infernix_gdn_replay_fold_test --wide-only --batched)
+set_tests_properties(infernix_gdn_replay_fold_wide_batched_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 # hyper_connection_mix against the FP64 closed formula: fused Q8 route (T <= 16) and composed route.
-ninfer_add_op_test(ninfer_hyper_connection_test
+infernix_add_op_test(infernix_hyper_connection_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_hyper_connection.cpp"
-  LIBRARIES ninfer_linear_test_support)
-set_tests_properties(ninfer_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
+  LIBRARIES infernix_linear_test_support)
+set_tests_properties(infernix_hyper_connection_test PROPERTIES SKIP_RETURN_CODE 77)
 
 # Canonical W4A4 arithmetic and the CPU expert engine; host-only, needs no GPU.
-ninfer_add_op_test(ninfer_offloaded_moe_cpu_test
+infernix_add_op_test(infernix_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
-  LIBRARIES ninfer_offloaded_moe_cpu)
+  LIBRARIES infernix_offloaded_moe_cpu)
 
 # The CPU worker team: any worker count gives expert_forward's bits.
-ninfer_add_op_test(ninfer_offloaded_moe_team_test
+infernix_add_op_test(infernix_offloaded_moe_team_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_team.cpp"
-  LIBRARIES ninfer_offloaded_moe_cpu)
+  LIBRARIES infernix_offloaded_moe_cpu)
 
 # The GPU narrow route against the golden hashes and the CPU engine, bit for bit.
-ninfer_add_op_test(ninfer_offloaded_moe_cuda_test
+infernix_add_op_test(infernix_offloaded_moe_cuda_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
 # The layer route (routing, dispatch, staged or zero-copy misses) against the CPU engine.
 # Speculative verification's state Ops against their committing forms, bit for bit.
-ninfer_add_op_test(ninfer_speculative_state_ops_test
+infernix_add_op_test(infernix_speculative_state_ops_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_speculative_state_ops.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
 # QSA index queries, pooled keys and tails, selection and attention against FP64 oracles.
-ninfer_add_op_test(ninfer_qsa_test
+infernix_add_op_test(infernix_qsa_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa.cpp"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
 # QSA block selection against the kernel it replaced (bit for bit), the exact top-k of its own
 # scores and an FP64 oracle, also under CUDA Graph replay.
-ninfer_add_op_test(ninfer_qsa_select_test
+infernix_add_op_test(infernix_qsa_select_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qsa_select.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
-ninfer_add_op_test(ninfer_offloaded_moe_layer_test
+infernix_add_op_test(infernix_offloaded_moe_layer_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_layer.cu"
-  LIBRARIES ninfer_ops)
+  LIBRARIES infernix_ops)
 
 # The wide route (experts with more than eight columns) against its FP64 W4A4 oracle.
-ninfer_add_op_test(ninfer_offloaded_moe_wide_test
+infernix_add_op_test(infernix_offloaded_moe_wide_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_wide.cu"
-  LIBRARIES ninfer_ops)
-set_tests_properties(ninfer_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)
+  LIBRARIES infernix_ops)
+set_tests_properties(infernix_offloaded_moe_wide_test PROPERTIES TIMEOUT 900)

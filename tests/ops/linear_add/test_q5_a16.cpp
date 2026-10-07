@@ -6,8 +6,8 @@
 
 namespace {
 
-using ninfer::test::linear_add::ShapeCase;
-using ninfer::test::linear_add::WeightFormat;
+using infernix::test::linear_add::ShapeCase;
+using infernix::test::linear_add::WeightFormat;
 
 int q5_a16_conformance() {
     // Exercise the production transitions, including the same transitions in
@@ -21,10 +21,10 @@ int q5_a16_conformance() {
     constexpr std::array<std::int32_t, 7> full{8, 13, 32, 40, 80, 112, 192};
     int failures = 0;
     for (const auto k : {6144, 17408}) {
-        failures += ninfer::test::linear_add::run_shape(
+        failures += infernix::test::linear_add::run_shape(
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, starts, interiors, graphs, false, 512});
-        failures += ninfer::test::linear_add::run_shape(
+        failures += infernix::test::linear_add::run_shape(
             "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
             ShapeCase{5120, k, 401U, no_starts, full, {}, true, 0});
     }
@@ -34,7 +34,7 @@ int q5_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear_add::cuda_available()) {
+    if (!infernix::test::linear_add::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

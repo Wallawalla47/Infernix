@@ -4,7 +4,7 @@
 #include "core/tensor.h"
 #include <cuda_runtime.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 using Q8Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
@@ -29,4 +29,4 @@ void launch_q8_a16_simt_r4_t4_w2_g16_s2(const Tensor&, const Weight&, Tensor&, c
 void launch_q8_a16_sliced_r16_t16_w8_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_sliced_r16_t16_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 void launch_q8_a16_sliced_r16_t32_w4_s2(const Tensor&, const Weight&, Tensor&, cudaStream_t);
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

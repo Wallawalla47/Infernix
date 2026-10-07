@@ -6,7 +6,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/merge.cuh"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Geometry, bool Writable>
 void validate_bf16_kv_operands(const CausalAttentionOperands& p,
@@ -117,4 +117,4 @@ void launch_bf16_kv_tiled_mma(const CausalAttentionOperands& p, Bf16KvReadView c
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

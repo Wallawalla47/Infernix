@@ -8,7 +8,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 constexpr std::uint32_t kVersion = 1;
@@ -114,4 +114,4 @@ std::filesystem::path route_trace() {
 
 } // namespace testing
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

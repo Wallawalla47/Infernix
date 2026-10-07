@@ -4,7 +4,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 namespace {
 // Resource tiers bound inactive attention work. They are not kernel/topology boundaries.
 constexpr std::array<std::uint32_t, 7> kCausalVisibleTiers{128,  512,   2048, 4096,
@@ -106,4 +106,4 @@ execution::DFlashEnvelopes dflash_envelopes(std::uint32_t min_frontier,
     };
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

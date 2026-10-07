@@ -21,7 +21,7 @@
 #include <string>
 #include <thread>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -590,4 +590,4 @@ const DirectReadQueue::Stats& DirectReadQueue::stats() const noexcept { return i
 
 void DirectReadQueue::set_faults(const Faults& faults) { impl_->faults = faults; }
 
-} // namespace ninfer
+} // namespace infernix

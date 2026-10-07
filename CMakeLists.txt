@@ -8,16 +8,16 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
 endif()
 if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   message(FATAL_ERROR
-    "NInfer supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
+    "Infernix supports only CMAKE_CUDA_ARCHITECTURES=120a; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
 endif()
 
-project(ninfer LANGUAGES C CXX CUDA)
+project(infernix LANGUAGES C CXX CUDA)
 
 # --- Global settings ---------------------------------------------------------
-option(NINFER_BUILD_APPS "Build the NInfer CLI, server and perplexity evaluator" ON)
-option(BUILD_TESTING "Build NInfer tests" OFF)
-option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+option(INFERNIX_BUILD_APPS "Build the Infernix CLI, server and perplexity evaluator" ON)
+option(BUILD_TESTING "Build Infernix tests" OFF)
+option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,28 +38,28 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(CMAKE_GENERATOR MATCHES "Ninja")
-  set_property(GLOBAL PROPERTY JOB_POOLS ninfer_link=1)
-  set(CMAKE_JOB_POOL_LINK ninfer_link)
+  set_property(GLOBAL PROPERTY JOB_POOLS infernix_link=1)
+  set(CMAKE_JOB_POOL_LINK infernix_link)
 endif()
 
 # Tests also exercise product input, logging and protocol adapters.
-set(NINFER_BUILD_PRODUCT_SUPPORT OFF)
-if(NINFER_BUILD_APPS OR BUILD_TESTING)
-  set(NINFER_BUILD_PRODUCT_SUPPORT ON)
+set(INFERNIX_BUILD_PRODUCT_SUPPORT OFF)
+if(INFERNIX_BUILD_APPS OR BUILD_TESTING)
+  set(INFERNIX_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
 include(cmake/Dependencies.cmake)
-include(cmake/NinferTargets.cmake)
+include(cmake/InfernixTargets.cmake)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
-if(NINFER_BUILD_APPS)
+if(INFERNIX_BUILD_APPS)
   add_subdirectory(apps)
 endif()
 if(BUILD_TESTING)
   enable_testing()
   add_subdirectory(tests)
 endif()
-if(NINFER_BUILD_BENCHMARKS)
+if(INFERNIX_BUILD_BENCHMARKS)
   add_subdirectory(bench)
 endif()

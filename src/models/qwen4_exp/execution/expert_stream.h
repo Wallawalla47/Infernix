@@ -32,7 +32,7 @@
 #include <functional>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 
 class ExpertStream {
 public:
@@ -107,4 +107,4 @@ private:
     Stats stats_;
 };
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

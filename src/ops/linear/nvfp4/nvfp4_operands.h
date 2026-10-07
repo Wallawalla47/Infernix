@@ -6,7 +6,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct Nvfp4A16Operands {
     const __nv_bfloat16* x;
     const std::uint8_t* codes;
@@ -66,4 +66,4 @@ void validate_nvfp4_operands(const Operands& p) {
             throw std::invalid_argument("NVFP4 static K does not match operands");
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

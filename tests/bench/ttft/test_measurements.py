@@ -11,8 +11,8 @@ from tools.bench.ttft.cases import CaseDefinition, run_case
 from tools.bench.ttft.execution import CaseContext, RequestHandle
 from tools.bench.ttft.render import render_csv, render_markdown, render_request_analysis_csv
 from tools.bench.ttft.report import CampaignData, PlannedRun, load_campaign, summarize_campaign
-from tools.ninfer_serve.client import ProtocolEvent, ProtocolRequest, ServeExchangeResult
-from tools.ninfer_serve.openai_chat import ChatStreamAdapter
+from tools.infernix_serve.client import ProtocolEvent, ProtocolRequest, ServeExchangeResult
+from tools.infernix_serve.openai_chat import ChatStreamAdapter
 from tools.streaming_http.client import HttpExchangeResult, HttpResponseHead
 from tools.streaming_http.sse import SseDecoder
 
@@ -205,14 +205,14 @@ def logged_campaign(tmp_path, records, events, *, required=()):
     raw = tmp_path / "run.json"
     log = tmp_path / "requests.jsonl"
     raw.write_text(json.dumps({
-        "artifact_type": "ninfer_serve_ttft_run", "schema_version": 1,
+        "artifact_type": "infernix_serve_ttft_run", "schema_version": 1,
         "case": "test-case", "profile_label": "test-profile", "constructed": True,
         "status": "constructed", "server": {"model": "test-model"}, "requests": records,
         "notes": {"mechanism_requirements": list(required)},
     }))
     log.write_text("".join(json.dumps(event) + "\n" for event in events))
     (tmp_path / "manifest.json").write_text(json.dumps({
-        "artifact_type": "ninfer_serve_ttft_campaign", "schema_version": 2,
+        "artifact_type": "infernix_serve_ttft_campaign", "schema_version": 2,
         "run_count": 1, "case_count": 1,
         "plans": [{"case": "test-case", "profile": "test-profile", "sample": 1,
                    "raw": str(raw), "progress": str(tmp_path / "progress"),
@@ -223,7 +223,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 23,
+        "artifact_type": "infernix_serve_request_log", "schema_version": 23,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -306,7 +306,7 @@ def runtime_interval(*, schema=23, final=None, state_bytes=0, main_bytes=0,
     if peak is not None:
         occupancy["host_context_peak_occupied_bytes"] = peak
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": schema,
+        "artifact_type": "infernix_serve_request_log", "schema_version": schema,
         "event": "throughput", "server_instance_id": "serve-test",
         "interval_seconds": 0.125 if final else 1.0,
         "host_work": {"elapsed_seconds": {"total": host_seconds},
@@ -619,7 +619,7 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     done["schema_version"] = 24
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "ninfer_serve_request_log", "schema_version": 24,
+            "artifact_type": "infernix_serve_request_log", "schema_version": 24,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -665,7 +665,7 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
     done["schema_version"] = 24
     event = {
-        "artifact_type": "ninfer_serve_request_log", "schema_version": 24,
+        "artifact_type": "infernix_serve_request_log", "schema_version": 24,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

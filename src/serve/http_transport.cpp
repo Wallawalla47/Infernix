@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 bool has_ngram_generation(const NgramArchiveStats& stats) noexcept {
@@ -39,13 +39,13 @@ void set_socket_option(socket_t socket, int level, int option, const T& value) n
 
 void set_ngram_generation_header(httplib::Response& response, const NgramArchiveStats& stats) {
     if (has_ngram_generation(stats)) {
-        response.set_header("X-NInfer-Draft-Generation", std::to_string(stats.generation));
+        response.set_header("X-Infernix-Draft-Generation", std::to_string(stats.generation));
     }
 }
 
 std::string ngram_generation_comment(const NgramArchiveStats& stats) {
     if (!has_ngram_generation(stats)) { return {}; }
-    return ": ninfer-draft-generation: " + std::to_string(stats.generation) + "\n\n";
+    return ": infernix-draft-generation: " + std::to_string(stats.generation) + "\n\n";
 }
 
 RequestJson parse_json_body(const httplib::Request& request) {
@@ -69,27 +69,27 @@ NgramSessionHints resolve_ngram_session(const httplib::Request& request, const R
                                                      : std::string_view{};
     };
     NgramSessionHints hints;
-    if (request.has_header("x-ninfer-draft-session")) {
-        const auto key = request.get_header_value("x-ninfer-draft-session");
-        if (request.get_header_value_count("x-ninfer-draft-session") != 1 || !valid(key)) {
+    if (request.has_header("x-infernix-draft-session")) {
+        const auto key = request.get_header_value("x-infernix-draft-session");
+        if (request.get_header_value_count("x-infernix-draft-session") != 1 || !valid(key)) {
             return {};
         }
         hints.key = "explicit:" + key;
-        if (request.has_header("x-ninfer-draft-reset")) {
-            if (request.get_header_value_count("x-ninfer-draft-reset") != 1 ||
-                request.get_header_value("x-ninfer-draft-reset") != "1") {
+        if (request.has_header("x-infernix-draft-reset")) {
+            if (request.get_header_value_count("x-infernix-draft-reset") != 1 ||
+                request.get_header_value("x-infernix-draft-reset") != "1") {
                 return {};
             }
             hints.reset = true;
         }
-        const bool parent     = request.has_header("x-ninfer-draft-parent");
-        const bool generation = request.has_header("x-ninfer-draft-generation");
+        const bool parent     = request.has_header("x-infernix-draft-parent");
+        const bool generation = request.has_header("x-infernix-draft-generation");
         if (parent != generation || (parent && hints.reset)) { return {}; }
         if (parent) {
-            const auto name   = request.get_header_value("x-ninfer-draft-parent");
-            const auto number = request.get_header_value("x-ninfer-draft-generation");
-            if (!valid(name) || request.get_header_value_count("x-ninfer-draft-parent") != 1 ||
-                request.get_header_value_count("x-ninfer-draft-generation") != 1) {
+            const auto name   = request.get_header_value("x-infernix-draft-parent");
+            const auto number = request.get_header_value("x-infernix-draft-generation");
+            if (!valid(name) || request.get_header_value_count("x-infernix-draft-parent") != 1 ||
+                request.get_header_value_count("x-infernix-draft-generation") != 1) {
                 return {};
             }
             const auto [end, error] = std::from_chars(number.data(), number.data() + number.size(),
@@ -137,13 +137,13 @@ NgramSessionHints resolve_ngram_session(const httplib::Request& request, const R
             }
         }
     }
-    if (request.has_header("x-ninfer-draft-parent") ||
-        request.has_header("x-ninfer-draft-generation")) {
+    if (request.has_header("x-infernix-draft-parent") ||
+        request.has_header("x-infernix-draft-generation")) {
         return {};
     }
-    if (request.has_header("x-ninfer-draft-reset")) {
-        if (request.get_header_value_count("x-ninfer-draft-reset") != 1 ||
-            request.get_header_value("x-ninfer-draft-reset") != "1") {
+    if (request.has_header("x-infernix-draft-reset")) {
+        if (request.get_header_value_count("x-infernix-draft-reset") != 1 ||
+            request.get_header_value("x-infernix-draft-reset") != "1") {
             return {};
         }
         hints.reset = true;
@@ -222,7 +222,7 @@ void configure_http_server_socket(socket_t socket) noexcept {
 void set_owned_json_content(httplib::Response& response, std::string body,
                             std::shared_ptr<RequestLifetime> lifetime) {
     response.set_content(std::move(body), "application/json");
-    response.user_data.set("ninfer.request_lifetime", std::move(lifetime));
+    response.user_data.set("infernix.request_lifetime", std::move(lifetime));
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

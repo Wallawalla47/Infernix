@@ -1,4 +1,4 @@
-#include "ninfer/ops/rmsnorm_rope.h"
+#include "infernix/ops/rmsnorm_rope.h"
 
 #include "ops/rmsnorm_rope/launch.h"
 
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim       = 128;
@@ -176,4 +176,4 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
                                      k_out, tokens, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

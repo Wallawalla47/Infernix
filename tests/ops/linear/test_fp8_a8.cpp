@@ -7,8 +7,8 @@
 
 namespace {
 
-using namespace ninfer;
-using namespace ninfer::test::linear;
+using namespace infernix;
+using namespace infernix::test::linear;
 
 int run_fp8_a8() {
     constexpr std::array attn_decode_invocations{
@@ -217,7 +217,7 @@ int run_fp8_a8() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
+    if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

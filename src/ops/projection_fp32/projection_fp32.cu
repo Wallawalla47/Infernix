@@ -1,4 +1,4 @@
-#include "ninfer/ops/projection_fp32.h"
+#include "infernix/ops/projection_fp32.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -434,4 +434,4 @@ void projection_fp32(const Tensor& x, std::span<const Tensor* const> weights, Te
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -8,10 +8,10 @@
 // decoded 37.6 tok/s at 8K context throttled and 98.7 tok/s exempt (2.6x); serving at two and four
 // concurrent requests gained 69-81 %. Outputs are unchanged: only where and how fast threads run.
 
-namespace ninfer {
+namespace infernix {
 
 // Opts the calling process out of execution-speed power throttling, once per process. A no-op on
 // platforms without it (Linux) and when Windows refuses the request.
 void exempt_process_from_power_throttling() noexcept;
 
-} // namespace ninfer
+} // namespace infernix

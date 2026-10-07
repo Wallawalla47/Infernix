@@ -6,7 +6,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 bool ProgramImpl::context_blocks(SequenceHandle sequence) const noexcept {
     if (!context_transaction_ || !valid_sequence(sequence)) { return false; }
@@ -292,4 +292,4 @@ void ProgramImpl::abort_context() noexcept {
     } catch (...) { std::terminate(); }
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t row_begin, std::int32_t row_count,
@@ -145,4 +145,4 @@ void q4_q5_attn_input_mixed_r64_c128_s2_launch(const Tensor& x, const Weight& w0
     launch_mixed<GemmCfg<64, 128, 64, 64, 16, 2, 2, false, true, true>>(x, w0, w1, q, g, k, v,
                                                                         stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

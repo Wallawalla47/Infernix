@@ -2,7 +2,7 @@
 #include "ops/linear/q8/q8_instances.cuh"
 #include "ops/linear/q8/q8_sliced_k_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Geometry, int Capacity, class Schedule>
 void launch_q8_a16_sliced(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Instance = typename Schedule::template with_problem<Geometry::kInputRows, Capacity>;
@@ -11,4 +11,4 @@ void launch_q8_a16_sliced(const Tensor& x, const Weight& weight, Tensor& out, cu
         LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows},
         LinearIdentityEpilogue{}, stream, {}, pdl::Dependency::Programmatic);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

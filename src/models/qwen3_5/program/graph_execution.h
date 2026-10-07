@@ -6,7 +6,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 template <class Context, class Body>
 void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body) {
@@ -27,4 +27,4 @@ void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& bod
     definition.capture(state.execution.device.stream, body);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

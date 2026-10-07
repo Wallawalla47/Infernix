@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kRows        = 1024;
@@ -234,4 +234,4 @@ void q8_pair_splitk_medium_launch(Q8PairScheduleId schedule, const Tensor& x,
     throw std::invalid_argument("Q8 medium pair schedule does not cover this T");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

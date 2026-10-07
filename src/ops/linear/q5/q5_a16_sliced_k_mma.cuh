@@ -3,7 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int BlockRows>
 struct Q5IdentityRows {
@@ -295,4 +295,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_sli
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

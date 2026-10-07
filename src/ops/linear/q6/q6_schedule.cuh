@@ -3,7 +3,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/linear/q6/q6_rowsplit_storage.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int BlockRows, int BlockTokens, int WarpsPerRow, int GroupsPerWarpStage, int Stages,
           Cache CodeCache, int MinBlocksPerSm>
@@ -139,4 +139,4 @@ struct Q6A16SlicedKMmaSchedule {
     static_assert(kSharedBytes <= 48 * 1024, "Q6 sliced-K shared memory exceeds 48 KiB");
 };
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

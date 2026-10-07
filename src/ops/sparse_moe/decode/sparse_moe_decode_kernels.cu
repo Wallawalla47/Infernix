@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kHidden           = 2048;
@@ -757,4 +757,4 @@ void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, 
                         plan.next_weight_prefetch_bytes);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

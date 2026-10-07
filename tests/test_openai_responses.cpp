@@ -17,11 +17,11 @@
 
 namespace {
 
-using Json = ninfer::serve::RequestJson;
-using namespace ninfer::serve;
+using Json = infernix::serve::RequestJson;
+using namespace infernix::serve;
 
 constexpr char kReasoningSummaryPlaceholder[] =
-    "Reasoning summary is not supported. (Ninfer: OpenAI Responses API)";
+    "Reasoning summary is not supported. (Infernix: OpenAI Responses API)";
 
 int check(bool condition, const std::string& message) {
     if (condition) { return 0; }
@@ -91,12 +91,12 @@ Json parse_event(const std::string& wire) {
     return payload;
 }
 
-ChatTurn text_turn(ninfer::ChatRole role, std::string text) {
+ChatTurn text_turn(infernix::ChatRole role, std::string text) {
     ChatTurn turn;
     turn.role = role;
     ContentPart part;
     part.kind     = ContentKind::Text;
-    part.type_raw = role == ninfer::ChatRole::Assistant ? "output_text" : "input_text";
+    part.type_raw = role == infernix::ChatRole::Assistant ? "output_text" : "input_text";
     part.text     = std::move(text);
     turn.content.push_back(std::move(part));
     return turn;
@@ -104,7 +104,7 @@ ChatTurn text_turn(ninfer::ChatRole role, std::string text) {
 
 ChatTurn call_turn(std::initializer_list<std::pair<const char*, const char*>> calls) {
     ChatTurn turn;
-    turn.role = ninfer::ChatRole::Assistant;
+    turn.role = infernix::ChatRole::Assistant;
     for (const auto& [id, name] : calls) {
         turn.tool_calls.push_back(
             ToolCall{.id = id, .name = name, .arguments_json = R"({"value":1})"});
@@ -129,7 +129,7 @@ GenerationOutcome sample_outcome() {
     outcome.prompt_tokens                   = 11;
     outcome.completion_tokens               = 7;
     outcome.reasoning_tokens                = 3;
-    outcome.finish_reason                   = ninfer::FinishReason::StopToken;
+    outcome.finish_reason                   = infernix::FinishReason::StopToken;
     outcome.metrics.prefix_cache_hit_tokens = 4;
     return outcome;
 }
@@ -149,7 +149,7 @@ int test_basic_request_and_resolution() {
     int failures = 0;
     failures += check(request.prompt.model == "qwen3.6-27b", "model parsed");
     failures += check(request.prompt.input_turns.size() == 1 &&
-                          request.prompt.input_turns[0].role == ninfer::ChatRole::User &&
+                          request.prompt.input_turns[0].role == infernix::ChatRole::User &&
                           request.prompt.input_turns[0].content[0].text == "hello",
                       "string input normalized to a user turn");
     failures +=
@@ -173,7 +173,7 @@ int test_basic_request_and_resolution() {
     const OpenAIResponsesResolvedPrompt resolved =
         resolve_openai_responses_prompt(request.prompt, store, "resp_current", true);
     failures += check(resolved.generation.messages.size() == 2 &&
-                          resolved.generation.messages[0].role == ninfer::ChatRole::Developer &&
+                          resolved.generation.messages[0].role == infernix::ChatRole::Developer &&
                           resolved.generation.messages[0].content[0].text == "be concise" &&
                           resolved.generation.messages[1].content[0].text == "hello",
                       "instructions and current input composed in model order");
@@ -333,25 +333,25 @@ int test_typed_items_and_cache_markers() {
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
     failures += check(request.prompt.input_turns.size() == 4 &&
-                          request.prompt.input_turns[0].role == ninfer::ChatRole::Assistant &&
+                          request.prompt.input_turns[0].role == infernix::ChatRole::Assistant &&
                           request.prompt.input_turns[0].reasoning_content == "use tools" &&
                           request.prompt.input_turns[0].tool_calls.size() == 1,
                       "reasoning and function call form one assistant turn");
-    failures += check(request.prompt.input_turns[1].role == ninfer::ChatRole::Tool &&
+    failures += check(request.prompt.input_turns[1].role == infernix::ChatRole::Tool &&
                           request.prompt.input_turns[1].content.size() == 2 &&
                           request.prompt.input_turns[1].content[0].cache_boundary_after &&
                           request.prompt.input_turns[1].content[0].cache_boundary_after->kind ==
-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                              infernix::PromptCacheMarkerKind::SharedStablePrefix &&
                           request.prompt.input_turns[1].content[1].kind == ContentKind::Image,
                       "typed multimodal tool output and explicit cache marker preserved");
-    failures += check(request.prompt.input_turns[2].role == ninfer::ChatRole::Assistant &&
+    failures += check(request.prompt.input_turns[2].role == infernix::ChatRole::Assistant &&
                           request.prompt.input_turns[2].content[0].text == "cannot answer that" &&
                           request.prompt.input_items[3].at("status") == "incomplete" &&
                           request.prompt.input_items[3].at("phase") == "commentary",
                       "refusal text and harmless assistant metadata are accepted");
     failures += check(request.prompt.input_turns[3].content[0].cache_boundary_after &&
                           request.prompt.input_turns[3].content[0].cache_boundary_after->kind ==
-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                              infernix::PromptCacheMarkerKind::SharedStablePrefix,
                       "message cache marker preserved");
 
     OpenAIResponsesStore store(8, 1ULL << 20);
@@ -360,28 +360,28 @@ int test_typed_items_and_cache_markers() {
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[1].tool_call_id == "call_1",
                       "typed Items survive call-graph normalization");
-    const ninfer::PromptInput translated = to_prompt_input(
+    const infernix::PromptInput translated = to_prompt_input(
         resolved.generation, ResolvedPromptSemantics{}, [](const ContentPart& part) {
-            ninfer::OwnedMedia media;
-            media.kind  = part.kind == ContentKind::Image ? ninfer::MediaKind::Image
-                                                          : ninfer::MediaKind::Video;
+            infernix::OwnedMedia media;
+            media.kind  = part.kind == ContentKind::Image ? infernix::MediaKind::Image
+                                                          : infernix::MediaKind::Video;
             media.bytes = {1};
             return media;
         });
     failures += check(translated.context_cache.markers.size() == 2 &&
                           translated.context_cache.markers[0].kind ==
-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                              infernix::PromptCacheMarkerKind::SharedStablePrefix &&
                           translated.context_cache.markers[0].location ==
-                              ninfer::PromptCacheMarkerLocation::MessagePartBoundary &&
+                              infernix::PromptCacheMarkerLocation::MessagePartBoundary &&
                           translated.context_cache.markers[1].kind ==
-                              ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                              infernix::PromptCacheMarkerKind::SharedStablePrefix,
                       "Responses breakpoints become shared Engine part boundaries");
     return failures;
 }
 
 int test_prompt_cache_policy_after_history_resolution() {
-    using Location = ninfer::PromptCacheMarkerLocation;
-    using Evidence = ninfer::SharedCandidateEvidence;
+    using Location = infernix::PromptCacheMarkerLocation;
+    using Evidence = infernix::SharedCandidateEvidence;
     OpenAIResponsesStore store(8, 1ULL << 20);
     const Json initial_body{
         {"model", "m"},
@@ -414,7 +414,7 @@ int test_prompt_cache_policy_after_history_resolution() {
                       "automatic writes do not modify the input history retained for storage");
 
     auto stored_turns = initial.prompt.input_turns;
-    stored_turns.push_back(text_turn(ninfer::ChatRole::Assistant, "first answer"));
+    stored_turns.push_back(text_turn(infernix::ChatRole::Assistant, "first answer"));
     store.put(stored_parent(append_openai_response_context({}, std::move(stored_turns))));
     Json followup_body{{"model", "m"},
                        {"previous_response_id", "resp_parent"},
@@ -500,14 +500,14 @@ int test_contiguous_assistant_items() {
                       "contiguous assistant message and call created an extra turn");
     const ChatTurn& assistant = request.prompt.input_turns[1];
     failures +=
-        check(assistant.role == ninfer::ChatRole::Assistant && assistant.content.size() == 1 &&
+        check(assistant.role == infernix::ChatRole::Assistant && assistant.content.size() == 1 &&
                   assistant.content[0].text == "Let me check:" &&
                   assistant.content[0].cache_boundary_after &&
                   assistant.content[0].cache_boundary_after->kind ==
-                      ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                      infernix::PromptCacheMarkerKind::SharedStablePrefix &&
                   assistant.tool_calls.size() == 1 && assistant.tool_calls[0].id == "call_read",
               "assistant preamble, cache marker and function call were not coalesced");
-    failures += check(request.prompt.input_turns[2].role == ninfer::ChatRole::Tool &&
+    failures += check(request.prompt.input_turns[2].role == infernix::ChatRole::Tool &&
                           request.prompt.input_turns[2].tool_call_id == "call_read",
                       "function result did not end the assistant Item group");
     failures += check(request.prompt.input_items.size() == 5 &&
@@ -527,7 +527,7 @@ int test_contiguous_assistant_items() {
 }
 
 bool same_assistant_turn(const ChatTurn& left, const ChatTurn& right) {
-    if (left.role != ninfer::ChatRole::Assistant || right.role != ninfer::ChatRole::Assistant ||
+    if (left.role != infernix::ChatRole::Assistant || right.role != infernix::ChatRole::Assistant ||
         left.reasoning_content != right.reasoning_content ||
         left.content.size() != right.content.size() ||
         left.tool_calls.size() != right.tool_calls.size()) {
@@ -562,13 +562,13 @@ int test_response_output_history_round_trip() {
     GenerationOutcome outcome;
     outcome.reasoning     = "I should inspect both paths.";
     outcome.text          = "Let me check:";
-    outcome.finish_reason = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
         .name = "Edit",
         .arguments_json =
             R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
     outcome.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"b"})"});
+        infernix::GeneratedToolCall{.name = "read_file", .arguments_json = R"({"path":"b"})"});
     const BuiltOpenAIResponse built =
         make_openai_response_object("resp_round_trip", 1, source, {}, outcome);
 
@@ -614,7 +614,7 @@ int test_response_output_history_round_trip() {
 
     GenerationOutcome incomplete;
     incomplete.reasoning     = "unfinished reasoning";
-    incomplete.finish_reason = ninfer::FinishReason::OutputLimit;
+    incomplete.finish_reason = infernix::FinishReason::OutputLimit;
     const BuiltOpenAIResponse reasoning_only =
         make_openai_response_object("resp_reasoning_only", 1, source, {}, incomplete);
     const Json reasoning_replay = {
@@ -724,7 +724,7 @@ int test_tools_and_effective_subset() {
         R"({"model":"m","input":"probe","tools":[{"type":"function","name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}]})");
     const OpenAIResponsesCreateRequest ordered_request =
         parse_openai_responses_create_request(ordered, limits());
-    const ninfer::PromptInput ordered_prompt =
+    const infernix::PromptInput ordered_prompt =
         to_prompt_input(ordered_request.prompt.generation, ResolvedPromptSemantics{}, {});
     failures += check(
         ordered_prompt.options.tool_jsons.size() == 1 &&
@@ -777,8 +777,8 @@ int test_namespace_tools() {
               "Engine identity has an explicit reversible wire mapping");
 
     GenerationOutcome outcome;
-    outcome.finish_reason = ninfer::FinishReason::StopToken;
-    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
         .name = "mcp__clock__now", .arguments_json = R"({"timezone":"UTC"})"});
     const BuiltOpenAIResponse built =
         make_openai_response_object("resp_namespace", 1, request, {}, outcome);
@@ -847,7 +847,7 @@ int test_namespace_tools() {
                       "tool output identity must agree with its call_id");
 
     store.put(stored_parent(append_openai_response_context(
-        {}, {text_turn(ninfer::ChatRole::User, "time"),
+        {}, {text_turn(infernix::ChatRole::User, "time"),
              call_turn({{"call_stored_clock", "mcp__clock__now"}})})));
     const OpenAIResponsesCreateRequest stored_replay = parse_openai_responses_create_request(
         Json{{"model", "m"},
@@ -954,7 +954,7 @@ int test_explicit_rejections() {
 int test_previous_response_call_graph() {
     OpenAIResponsesStore store(16, 1ULL << 20);
     const OpenAIResponseContext context =
-        append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "run both"),
+        append_openai_response_context({}, {text_turn(infernix::ChatRole::User, "run both"),
                                             call_turn({{"call_a", "alpha"}, {"call_b", "beta"}})});
     store.put(stored_parent(context));
 
@@ -1079,7 +1079,7 @@ int test_response_object() {
 
     GenerationOutcome incomplete = sample_outcome();
     incomplete.text.clear();
-    incomplete.finish_reason = ninfer::FinishReason::OutputLimit;
+    incomplete.finish_reason = infernix::FinishReason::OutputLimit;
     const BuiltOpenAIResponse limited =
         make_openai_response_object("resp_limit", 123, request, runtime, incomplete);
     failures += check(limited.body.at("status") == "incomplete" &&
@@ -1093,7 +1093,7 @@ int test_response_object() {
     tools.text.clear();
     tools.reasoning.clear();
     tools.tool_calls.push_back(
-        ninfer::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
+        infernix::GeneratedToolCall{.name = "weather", .arguments_json = R"({"city":"Paris"})"});
     const BuiltOpenAIResponse tool_response =
         make_openai_response_object("resp_tool", 123, request, runtime, tools);
     const Json& item = tool_response.body.at("output").at(0);
@@ -1255,7 +1255,7 @@ int test_sse_sequence_and_failures() {
     OpenAIResponsesEventStream cancelled("resp_cancelled", 123, cancelled_request, {});
     (void)cancelled.start();
     GenerationOutcome cancelled_outcome;
-    cancelled_outcome.finish_reason                    = ninfer::FinishReason::Cancelled;
+    cancelled_outcome.finish_reason                    = infernix::FinishReason::Cancelled;
     const OpenAIResponsesStreamFinish cancelled_finish = cancelled.finish(cancelled_outcome);
     const Json cancelled_terminal = parse_event(cancelled.terminal(cancelled_finish.response));
     failures += check(cancelled_terminal.at("type") == "response.failed" &&
@@ -1267,8 +1267,8 @@ int test_sse_sequence_and_failures() {
 int test_input_tokens_uses_shared_state_path() {
     OpenAIResponsesStore store(8, 1ULL << 20);
     store.put(stored_parent(
-        append_openai_response_context({}, {text_turn(ninfer::ChatRole::User, "parent"),
-                                            text_turn(ninfer::ChatRole::Assistant, "answer")})));
+        append_openai_response_context({}, {text_turn(infernix::ChatRole::User, "parent"),
+                                            text_turn(infernix::ChatRole::Assistant, "answer")})));
 
     const OpenAIResponsesPromptRequest request = parse_openai_responses_input_tokens_request(
         Json{{"model", "m"},
@@ -1285,7 +1285,7 @@ int test_input_tokens_uses_shared_state_path() {
         resolve_openai_responses_prompt(request, store, std::nullopt, false);
     int failures = 0;
     failures += check(resolved.generation.messages.size() == 4 &&
-                          resolved.generation.messages[0].role == ninfer::ChatRole::Developer &&
+                          resolved.generation.messages[0].role == infernix::ChatRole::Developer &&
                           resolved.generation.messages.back().content[0].text == "next",
                       "input token counting resolves instructions, parent, and current input");
     failures += check(resolved.generation.tools.size() == 1 &&

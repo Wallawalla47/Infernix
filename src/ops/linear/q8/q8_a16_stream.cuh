@@ -7,7 +7,7 @@
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_shared.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Register-streamed Q8 decode GEMM (kernel K1 of the Qwen3.8-Flash-Next dense-Q8 plan): every code
 // and scale a warp's rows need is loaded into registers before the first FMA, so a warp keeps its
@@ -193,4 +193,4 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void q8_a16_stream
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

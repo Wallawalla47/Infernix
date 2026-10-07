@@ -8,7 +8,7 @@
 #include <string>
 #include <thread>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 constexpr char kMagic[8]          = {'N', 'I', 'N', 'F', 'E', 'R', 'N', 'G'};
@@ -157,4 +157,4 @@ std::filesystem::path default_ngram_volume(const std::filesystem::path& artifact
     return std::filesystem::path(artifact.string() + ".ngram");
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

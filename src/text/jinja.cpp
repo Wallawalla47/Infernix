@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace ninfer::text {
+namespace infernix::text {
 namespace {
 
 // Interpreter error decoration must not change request cancellation/deadline errors.
@@ -146,4 +146,4 @@ TemplateOutput JinjaTemplate::render(const nlohmann::ordered_json& input,
     }
 }
 
-} // namespace ninfer::text
+} // namespace infernix::text

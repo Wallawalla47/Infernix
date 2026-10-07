@@ -1,9 +1,9 @@
 // Public GDN and production-stage timing. Private launchers also measure the prefill
 // recurrent/chunked crossover, independently of decode/ReplaySSM.
 // Each sample is a cold-L2 CUDA Graph replay with the flush outside its timer.
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/l2norm.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/l2norm.h"
+#include "infernix_bench_common.h"
 #include "ops/linear_attention/gated_delta_net/chunked/launch.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
@@ -21,13 +21,13 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 
-namespace gated_delta_net_detail = ninfer::ops::detail::gated_delta_net;
-namespace chunked_detail         = ninfer::ops::detail::gated_delta_net::chunked;
+namespace gated_delta_net_detail = infernix::ops::detail::gated_delta_net;
+namespace chunked_detail         = infernix::ops::detail::gated_delta_net::chunked;
 
 constexpr std::int32_t kDefaultQkHeads    = 16;
 constexpr std::int32_t kDefaultValueHeads = 48;
@@ -731,7 +731,7 @@ int main(int argc, char** argv) {
         return 0;
     } catch (const std::exception& error) {
         if (stream != nullptr) { cudaStreamDestroy(stream); }
-        std::fprintf(stderr, "ninfer_gated_delta_net_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_gated_delta_net_bench: %s\n", error.what());
         return 1;
     }
 }

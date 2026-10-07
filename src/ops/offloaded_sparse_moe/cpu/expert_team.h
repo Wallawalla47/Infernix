@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 struct CpuExpertJob {
     const std::uint8_t* record = nullptr;
@@ -80,4 +80,4 @@ private:
     std::vector<std::thread> threads_;
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

@@ -8,7 +8,7 @@
 #include <array>
 #include <limits>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 
 struct Reader::Impl {
     std::filesystem::path entry;
@@ -31,7 +31,7 @@ struct Reader::Impl {
                     ": NInfer v2 artifact is not supported. Upgrade to v3 with: "
                     "python3 tools/upgrade_ninfer_v2_to_v3.py INPUT.ninfer OUTPUT.ninfer");
             }
-            throw ArtifactError(entry.string() + ": expected NInfer v3 entry magic");
+            throw ArtifactError(entry.string() + ": expected Infernix v3 entry magic");
         }
         const auto json_bytes = read_u64_le(header.data() + 8);
         if (!json_bytes || json_bytes > file->bytes() - kHeaderBytes ||
@@ -180,4 +180,4 @@ std::size_t Reader::read_direct(std::size_t file_index, std::uint64_t file_offse
     return impl_->file(file_index).read_direct(file_offset, destination);
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

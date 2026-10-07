@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
@@ -44,4 +44,4 @@ void bf16_linear_add_small_t_launch(const Tensor& x, const Weight& weight, Tenso
                                                                                   residual, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

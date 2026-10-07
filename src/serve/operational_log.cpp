@@ -13,7 +13,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 std::atomic<bool>& colours_enabled() {
@@ -75,33 +75,33 @@ OperationalSeverity failure_severity(RequestFailureClass classification) noexcep
     return OperationalSeverity::Error;
 }
 
-const char* finish_reason_name(ninfer::FinishReason reason) noexcept {
+const char* finish_reason_name(infernix::FinishReason reason) noexcept {
     switch (reason) {
-    case ninfer::FinishReason::None:
+    case infernix::FinishReason::None:
         return "none";
-    case ninfer::FinishReason::OutputLimit:
+    case infernix::FinishReason::OutputLimit:
         return "output limit";
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::ContextCapacity:
         return "context capacity";
-    case ninfer::FinishReason::StopToken:
+    case infernix::FinishReason::StopToken:
         return "stop token";
-    case ninfer::FinishReason::StopString:
+    case infernix::FinishReason::StopString:
         return "stop string";
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::Cancelled:
         return "cancelled";
     }
     return "unknown";
 }
 
-const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) noexcept {
+const char* prefix_reuse_path_name(infernix::PrefixReusePath path) noexcept {
     switch (path) {
-    case ninfer::PrefixReusePath::Root:
+    case infernix::PrefixReusePath::Root:
         return "root";
-    case ninfer::PrefixReusePath::Checkpoint:
+    case infernix::PrefixReusePath::Checkpoint:
         return "checkpoint";
-    case ninfer::PrefixReusePath::HybridEndpoint:
+    case infernix::PrefixReusePath::HybridEndpoint:
         return "hybrid_endpoint";
-    case ninfer::PrefixReusePath::HybridSnapshot:
+    case infernix::PrefixReusePath::HybridSnapshot:
         return "hybrid_snapshot";
     }
     return "unknown";
@@ -123,28 +123,28 @@ const char* protocol_name(std::string_view protocol) noexcept {
     return "http";
 }
 
-const char* kv_cache_name(ninfer::KvCacheStorage storage) noexcept {
+const char* kv_cache_name(infernix::KvCacheStorage storage) noexcept {
     switch (storage) {
-    case ninfer::KvCacheStorage::BFloat16:
+    case infernix::KvCacheStorage::BFloat16:
         return "bf16";
-    case ninfer::KvCacheStorage::Int8Group64:
+    case infernix::KvCacheStorage::Int8Group64:
         return "int8";
-    case ninfer::KvCacheStorage::Fp8E4M3Row256:
+    case infernix::KvCacheStorage::Fp8E4M3Row256:
         return "fp8";
-    case ninfer::KvCacheStorage::Nvfp4Group16:
+    case infernix::KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
-    case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
+    case infernix::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
-    case ninfer::KvCacheStorage::Vq2:
+    case infernix::KvCacheStorage::Vq2:
         return "vq2";
-    case ninfer::KvCacheStorage::Q4KeyVq2Value:
+    case infernix::KvCacheStorage::Q4KeyVq2Value:
         return "k4v2";
     }
     return "unknown";
 }
 
-const char* kv_capacity_mode_name(ninfer::KvCapacityMode mode) noexcept {
-    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+const char* kv_capacity_mode_name(infernix::KvCapacityMode mode) noexcept {
+    return mode == infernix::KvCapacityMode::Automatic ? "auto" : "explicit";
 }
 
 void append_clause(std::ostringstream& out, std::string_view clause) { out << " | " << clause; }
@@ -166,8 +166,8 @@ T monotonic_delta(T previous, T current) noexcept {
 }
 
 std::uint64_t host_active_ns(const ThroughputReport& report) noexcept {
-    const ninfer::RuntimeHostWorkStats& previous = report.previous.host_work;
-    const ninfer::RuntimeHostWorkStats& current  = report.current.host_work;
+    const infernix::RuntimeHostWorkStats& previous = report.previous.host_work;
+    const infernix::RuntimeHostWorkStats& current  = report.current.host_work;
     return monotonic_delta(previous.engine_boundary_ns, current.engine_boundary_ns) +
            monotonic_delta(previous.program_submit_ns, current.program_submit_ns) +
            monotonic_delta(previous.program_post_ns, current.program_post_ns) +
@@ -265,7 +265,7 @@ OperationalRecord render_request_done(const RequestLogContext& context,
                                    : 0.0;
     out << " | cache " << product::format_pretty_count(metrics.prefix_cache_hit_tokens) << " ("
         << product::format_pretty_percent(cache_ratio);
-    if (metrics.prefix_reuse_path != ninfer::PrefixReusePath::Root) {
+    if (metrics.prefix_reuse_path != infernix::PrefixReusePath::Root) {
         out << ", " << prefix_reuse_path_name(metrics.prefix_reuse_path);
     }
     out << ") | TTFT " << product::format_pretty_duration(metrics.ttft_seconds) << " | total "
@@ -340,9 +340,9 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
-    const ninfer::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    const infernix::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
     if (!outcome.tool_call_parse.marker_seen ||
-        reason == ninfer::ToolCallParseFallbackReason::None) {
+        reason == infernix::ToolCallParseFallbackReason::None) {
         return std::nullopt;
     }
     // Tolerant recovery retained structured calls after discarding a trailing suffix, or after
@@ -350,13 +350,13 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     // parse, not a fallback-to-text failure; note it as informational transparency. When the
     // tail truncation kept no calls, the region was returned as text and falls through to the
     // warning record below.
-    if (reason == ninfer::ToolCallParseFallbackReason::TruncatedTail &&
+    if (reason == infernix::ToolCallParseFallbackReason::TruncatedTail &&
         outcome.tool_call_parse.structured_call_count > 0) {
         return OperationalRecord{
             .severity = OperationalSeverity::Info,
             .message  = "req#" + std::to_string(context.id) +
                         " tolerated tool-call suffix discarded | " +
-                        pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+                        pretty_code(infernix::tool_call_parse_fallback_reason_name(reason)),
         };
     }
     // The reason names the verdict; a bounded, single-line snippet of the returned markup shows
@@ -375,7 +375,7 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)) +
+                   pretty_code(infernix::tool_call_parse_fallback_reason_name(reason)) +
                    (snippet.empty() ? std::string{} : " | " + snippet),
     };
 }
@@ -470,7 +470,7 @@ void OperationalLog::write(OperationalRecord record) const {
     // --log-colours on; the [timestamp] [level] prefix from the sink pattern
     // stays plain.
     const std::string message =
-        ninfer::product::log_colour::colourise_stats_line(record.message,
+        infernix::product::log_colour::colourise_stats_line(record.message,
                                                           operational_log_colours_enabled());
     switch (record.severity) {
     case OperationalSeverity::Info:
@@ -526,10 +526,10 @@ void OperationalLog::http_failure(std::string_view endpoint, const RequestFailur
 }
 
 void OperationalLog::engine_capacity(const GenerationService& service) const {
-    const ninfer::MemorySummary memory            = service.memory_summary();
-    const ninfer::EngineOptions& engine           = service.engine_options();
-    const ninfer::ContextCacheOptions& cache      = engine.context_cache;
-    const ninfer::ContextCostSummary context_cost = service.load_summary().context_cost;
+    const infernix::MemorySummary memory            = service.memory_summary();
+    const infernix::EngineOptions& engine           = service.engine_options();
+    const infernix::ContextCacheOptions& cache      = engine.context_cache;
+    const infernix::ContextCostSummary context_cost = service.load_summary().context_cost;
 
     logger_->info("capacity | KV {} tokens, {}, {} | pages {}/{} | runtime {} | free {}",
                   product::format_pretty_count(memory.kv_capacity), kv_cache_name(memory.kv_cache),
@@ -550,7 +550,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     }
 
     if (service.options().enable_vision) {
-        const ninfer::MediaCacheSummary media = service.media_cache_summary();
+        const infernix::MediaCacheSummary media = service.media_cache_summary();
         logger_->info("media | {} preprocess workers | cache {} | live {}",
                       media.preprocess_threads, product::format_pretty_bytes(media.capacity_bytes),
                       product::format_pretty_bytes(media.live_capacity_bytes));
@@ -573,8 +573,8 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                       product::format_pretty_bytes(memory.cuda_graph_allowance_bytes));
     }
     logger_->debug("context cost | transfer {} | prefill {} | hardware {} | prefill signature {}",
-                   ninfer::context_cost_preset_source_name(context_cost.transfer_source),
-                   ninfer::context_cost_preset_source_name(context_cost.prefill_source),
+                   infernix::context_cost_preset_source_name(context_cost.transfer_source),
+                   infernix::context_cost_preset_source_name(context_cost.prefill_source),
                    product::format_pretty_text(context_cost.hardware_class),
                    product::format_pretty_text(context_cost.prefill_signature));
 }
@@ -616,4 +616,4 @@ void OperationalLog::server_failure(bool serving, std::string_view detail) const
                       product::format_pretty_text(detail));
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

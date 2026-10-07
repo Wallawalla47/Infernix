@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 std::int32_t checked_i32(std::size_t value, const char* label) {
@@ -209,4 +209,4 @@ VisionControl build_vision_control(const PreparedPromptData& prompt, const Visio
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

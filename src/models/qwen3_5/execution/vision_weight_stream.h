@@ -16,7 +16,7 @@
 #include <cstdint>
 #include <span>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 // Staging regions start on 256-byte boundaries.
 [[nodiscard]] constexpr std::size_t vision_staging_align(std::size_t bytes) noexcept {
@@ -78,4 +78,4 @@ private:
     std::size_t upload_bytes_  = 0;
 };
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

@@ -2,7 +2,7 @@
 
 #include "artifact/schema.h"
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 void parse_resources(FrontendResources& resources, const Config& config) {
     resources.tokenizer = std::make_shared<const frontend::Tokenizer>(
@@ -44,4 +44,4 @@ void parse_resources(FrontendResources& resources, const Config& config) {
     }
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

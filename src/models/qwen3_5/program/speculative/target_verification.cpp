@@ -1,10 +1,10 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/execution_context.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
                           TextContext& card, TargetVerifyFrameView frame,
@@ -91,4 +91,4 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                  execution.device.stream);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

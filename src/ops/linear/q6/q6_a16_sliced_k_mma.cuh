@@ -3,7 +3,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Q6 integers are exactly representable in BF16. Scaling each 64-element
 // contraction in FP32 avoids a scaled-weight BF16 materialization.
@@ -218,4 +218,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q6_a16_sli
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

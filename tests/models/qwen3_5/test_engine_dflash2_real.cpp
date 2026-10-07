@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 #include "speculative_page_boundary.h"
 #include "kv_cache_storage.h"
 
@@ -14,8 +14,8 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-ninfer::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.sampling.seed           = 0;
@@ -24,20 +24,20 @@ ninfer::RequestOptions request(std::uint32_t outputs, bool reuse = false) {
     return options;
 }
 
-void valid(const ninfer::GenerationResult& result, std::size_t outputs) {
+void valid(const infernix::GenerationResult& result, std::size_t outputs) {
     require(result.generated_token_ids.size() == outputs &&
-                result.finish_reason == ninfer::FinishReason::OutputLimit,
+                result.finish_reason == infernix::FinishReason::OutputLimit,
             "DFlash2 did not honor the requested output budget");
     require(
-        result.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+        result.speculative.backend == infernix::SpeculativeBackend::DFlash2 &&
             (outputs == 1 || result.speculative.rounds + result.speculative.fallback_steps != 0),
         "generation bypassed DFlash2");
 }
 
-ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
+infernix::PromptInput media_prompt(infernix::MediaKind kind) {
     const std::string header = "P6\n64 64\n255\n";
-    ninfer::MessagePart media;
-    media.kind              = ninfer::MessagePartKind::Media;
+    infernix::MessagePart media;
+    media.kind              = infernix::MessagePartKind::Media;
     media.media.kind        = kind;
     media.media.media_type  = "image/x-portable-pixmap";
     media.media.source_name = "pattern.ppm";
@@ -47,13 +47,13 @@ ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
         media.media.bytes.push_back((i * 3) & 255);
         media.media.bytes.push_back((i * 7) & 255);
     }
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
     user.parts.push_back(std::move(media));
-    user.parts.push_back({.kind  = ninfer::MessagePartKind::Text,
+    user.parts.push_back({.kind  = infernix::MessagePartKind::Text,
                           .text  = "Describe the pattern briefly.",
                           .media = {}});
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(user));
     input.options.enable_thinking = false;
     return input;
@@ -66,9 +66,9 @@ ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
 // --draft-tree-nodes) runs every round family through DFlash2 tree verification; "auto" lets the
 // automatic widths choose.
 int main(int argc, char** argv) {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
-        std::cout << "skip: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
     try {
@@ -76,23 +76,23 @@ int main(int argc, char** argv) {
         const bool graph     = argc > 2 ? std::stoi(argv[2]) != 0 : true;
         const bool optimized = argc > 3 ? std::stoi(argv[3]) != 0 : true;
         const auto batch     = argc > 4 ? static_cast<unsigned>(std::stoul(argv[4])) : 8U;
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 2304;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304 * batch);
+        options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
         options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                   = graph;
         options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
-        options.kv_cache = ninfer::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
+        options.kv_cache = infernix::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");
         auto penalty     = request(24);
         penalty.execution.sampling.presence_penalty  = 0.5F;
         penalty.execution.sampling.frequency_penalty = 0.25F;
-        options.speculative.backend                  = ninfer::SpeculativeBackend::DFlash2;
+        options.speculative.backend                  = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
-            optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+            optimized ? infernix::ProposalHead::Optimized : infernix::ProposalHead::Full;
         const bool tree                     = argc > 8;
         const bool tree_auto                = tree && std::string(argv[8]) == "auto";
         options.speculative.draft_tree_auto = tree_auto;
@@ -109,11 +109,11 @@ int main(int argc, char** argv) {
                 options.speculative.draft_tree_nodes[entry] =
                     options.speculative.draft_tree_nodes[entry - 1];
         }
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         require(engine.memory_summary().kv_cache == options.kv_cache,
                 "Engine did not select the requested KV dtype");
         if (graph) {
-            const ninfer::MemorySummary memory = engine.memory_summary();
+            const infernix::MemorySummary memory = engine.memory_summary();
             require(memory.cuda_graph_measured_bytes != 0 &&
                         memory.cuda_graph_measured_bytes <= memory.cuda_graph_allowance_bytes,
                     ("CUDA Graph memory " + std::to_string(memory.cuda_graph_measured_bytes) +
@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
                         .c_str());
         }
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
-        ninfer::test::speculative_page_boundary(engine);
+        infernix::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         const auto& reference = first.generated_token_ids;
@@ -138,11 +138,11 @@ int main(int argc, char** argv) {
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
 
-        ninfer::PromptInput thinking_prompt;
+        infernix::PromptInput thinking_prompt;
         thinking_prompt.options.enable_thinking = true;
         thinking_prompt.messages.push_back({
-            .role  = ninfer::ChatRole::User,
-            .parts = {{.kind = ninfer::MessagePartKind::Text,
+            .role  = infernix::ChatRole::User,
+            .parts = {{.kind = infernix::MessagePartKind::Text,
                        .text = "Explain why there are infinitely many prime numbers."}},
         });
         auto thinking_request                      = request(64);
@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
                 "DFlash2 did not commit the forced thinking-control suffix");
 
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.
-        std::vector<ninfer::GenerationHandle> handles;
+        std::vector<infernix::GenerationHandle> handles;
         for (unsigned row = 0; row < batch; ++row) {
             handles.push_back(engine.submit(engine.prepare_tokens(prompt), request(2 + row * 3)));
         }
@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
                                       stopped.speculative.accepted_tokens +
                                       stopped.speculative.fallback_steps;
                 if (stopped.generated_token_ids.size() >= licensed) { continue; }
-                require(stopped.finish_reason == ninfer::FinishReason::StopToken &&
+                require(stopped.finish_reason == infernix::FinishReason::StopToken &&
                             !stopped.generated_token_ids.empty() &&
                             stopped.generated_token_ids.back() == reference[i],
                         "partial terminal did not stop at its token");
@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
             require(checked_partial, "fixture did not exercise a stop within a licensed block");
         }
         if (options.enable_vision) {
-            for (const auto kind : {ninfer::MediaKind::Image, ninfer::MediaKind::Video}) {
+            for (const auto kind : {infernix::MediaKind::Image, infernix::MediaKind::Video}) {
                 const auto image =
                     engine.generate(engine.prepare(media_prompt(kind)), request(8, true));
                 const auto reused_image =
@@ -242,7 +242,7 @@ int main(int argc, char** argv) {
                 "DFlash2 allocated or transferred a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
-            auto long_prompt = std::vector<ninfer::TokenId>(2100, 198);
+            auto long_prompt = std::vector<infernix::TokenId>(2100, 198);
             long_prompt.insert(long_prompt.end(), prompt.begin(), prompt.end());
             const auto long_run =
                 engine.generate(engine.prepare_tokens(long_prompt), request(12, true));
@@ -259,10 +259,10 @@ int main(int argc, char** argv) {
                     "DFlash2 ring wrap lost its retained frontier");
         }
         if (k == 15) {
-            auto tail_prompt   = std::vector<ninfer::TokenId>(options.max_context - 4, 198);
+            auto tail_prompt   = std::vector<infernix::TokenId>(options.max_context - 4, 198);
             tail_prompt.back() = prompt.back();
             const auto tail    = engine.generate(engine.prepare_tokens(tail_prompt), request(9));
-            require(tail.finish_reason == ninfer::FinishReason::ContextCapacity &&
+            require(tail.finish_reason == infernix::FinishReason::ContextCapacity &&
                         tail.generated_token_ids.size() == 5,
                     "full proposal window escaped the target context capacity tail");
         }

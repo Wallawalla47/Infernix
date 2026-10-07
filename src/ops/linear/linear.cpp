@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/linear.h"
+#include "infernix/ops/linear.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t checked_numel(const Tensor& tensor, const char* label) {
@@ -160,4 +160,4 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -15,7 +15,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry              = Nvfp4N34816K5120;
@@ -69,4 +69,4 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
             p, output, Nvfp4SwiGluEpilogue{}, stream, Nvfp4SwiGluMmaRows{});
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

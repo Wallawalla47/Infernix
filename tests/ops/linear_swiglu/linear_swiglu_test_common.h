@@ -7,7 +7,7 @@
 #include <span>
 #include <string_view>
 
-namespace ninfer::test::linear_swiglu {
+namespace infernix::test::linear_swiglu {
 
 enum class ActivationCompute : std::uint8_t {
     A16,
@@ -28,4 +28,4 @@ int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases = {});
 
-} // namespace ninfer::test::linear_swiglu
+} // namespace infernix::test::linear_swiglu

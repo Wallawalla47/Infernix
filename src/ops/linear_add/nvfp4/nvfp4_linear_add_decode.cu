@@ -6,7 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 #include "ops/linear/common/epilogue.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -38,4 +38,4 @@ void nvfp4_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tenso
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

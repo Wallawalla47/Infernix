@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 ExpertStore::ExpertStore(const artifact::StreamSource& source, std::span<const artifact::ObjectHandle> banks,
                          std::uint64_t record_stride, std::uint32_t experts, std::vector<std::vector<float>> multipliers)
@@ -74,4 +74,4 @@ std::span<const ExpertStore::Segment> ExpertStore::segments(std::uint32_t layer,
     return {record.segments.data(), record.count};
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

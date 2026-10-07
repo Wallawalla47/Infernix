@@ -3,14 +3,14 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/sparse_moe.h"
+#include "infernix/ops/sparse_moe.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr std::int32_t kSparseMoeSmallTMin = 2;
 // The fixed kernel domain covers the largest codec-specific small-T frontier.
@@ -64,4 +64,4 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
                                const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

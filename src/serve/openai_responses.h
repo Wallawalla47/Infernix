@@ -18,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct GenerationOutcome;
 
@@ -123,4 +123,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

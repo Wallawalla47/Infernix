@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/tiled_mma.cuh"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class G, class S>
 void launch_nvfp4_kv_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvReadView cache,
                                cudaStream_t stream) {
@@ -31,4 +31,4 @@ void launch_nvfp4_kv_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvReadView
                                            cache.table_stride});
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

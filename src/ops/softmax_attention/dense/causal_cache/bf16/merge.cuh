@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 #include "ops/softmax_attention/common/causal_partition.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Merge one query/head's split statistics once per CTA. Published scalars are separate
 // from the reduction/weight storage, so later writes cannot race another warp's scalar read.
@@ -109,4 +109,4 @@ __launch_bounds__(Schedule::kThreads) __global__
 }
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

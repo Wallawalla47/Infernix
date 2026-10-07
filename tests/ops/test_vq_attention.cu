@@ -15,8 +15,8 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "kv_cache_vq_reference.h"
-#include "ninfer/ops/kv_cache_append.h"
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/kv_cache_append.h"
+#include "infernix/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -31,8 +31,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 
@@ -167,7 +167,7 @@ public:
                                                (static_cast<std::uint32_t>(codes[r * bytes + 2 * w + 1]) << 8);
                     const unsigned low7  = (code >> 9) & 0x7fu;
                     const unsigned signs = low7 | ((std::popcount(low7) & 1u) << 7);
-                    const int magnitude  = ninfer::ops::kKVCacheVq2Codebook[8 * (code & 0x1ffu) + j];
+                    const int magnitude  = infernix::ops::kKVCacheVq2Codebook[8 * (code & 0x1ffu) + j];
                     level                = ((signs >> j) & 1u) ? -magnitude : magnitude;
                 }
                 out[8 * w + j] = static_cast<double>(static_cast<float>(level) *

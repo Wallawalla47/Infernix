@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 enum class Nvfp4LinearSwiGluRoute {
@@ -90,4 +90,4 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
     }
     throw std::logic_error("unreachable NVFP4 SwiGLU route");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -7,7 +7,7 @@
 #include <cstddef>
 #include <memory>
 
-namespace ninfer {
+namespace infernix {
 
 // VMM-backed weight arena whose tail region can be temporarily evicted: the physical
 // chunks behind the arena suffix are unmapped from their stable home addresses and
@@ -70,4 +70,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace infernix

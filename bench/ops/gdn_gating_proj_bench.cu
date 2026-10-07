@@ -1,6 +1,6 @@
 #include "core/weight.h"
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/gdn_gating_proj.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_profiler_api.h>
 #include <algorithm>
@@ -13,8 +13,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 struct Options {
@@ -26,7 +26,7 @@ struct Options {
 
 void help() {
     std::cout
-        << "usage: ninfer_gdn_gating_proj_bench [--geometry 27b|35b] [--weights parent|split] "
+        << "usage: infernix_gdn_gating_proj_bench [--geometry 27b|35b] [--weights parent|split] "
            "[--op norm|control] [--tokens T,...] [--execution eager|graph|both] [--cache "
            "cold|warm|both] "
            "[--graph-calls N] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n";

@@ -1,5 +1,5 @@
-// ninfer::ops - embedding wrapper: public api validation and qtype dispatch.
-#include "ninfer/ops/embedding.h"
+// infernix::ops - embedding wrapper: public api validation and qtype dispatch.
+#include "infernix/ops/embedding.h"
 
 #include "ops/common/math.h"
 #include "ops/linear/fp8/fp8_format.h"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -237,4 +237,4 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

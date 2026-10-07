@@ -1,5 +1,5 @@
-// ninfer::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
-#include "ninfer/ops/causal_conv1d_silu.h"
+// infernix::ops - causal_conv1d wrapper: public api validation and launcher dispatch.
+#include "infernix/ops/causal_conv1d_silu.h"
 
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -403,4 +403,4 @@ void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
     detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -7,7 +7,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 class HostContextArena;
 
@@ -109,4 +109,4 @@ private:
     std::vector<FreeExtent> free_extents_;
 };
 
-} // namespace ninfer
+} // namespace infernix

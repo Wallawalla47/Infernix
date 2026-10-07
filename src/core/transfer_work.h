@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace ninfer {
+namespace infernix {
 
 // Physical work represented by one logical context transfer. Payload bytes exclude host-arena
 // padding. Completed observations count actual cudaMemcpy/cudaMemcpy2D calls. Before Device
@@ -15,4 +15,4 @@ struct TransferWork {
     [[nodiscard]] friend constexpr bool operator==(TransferWork, TransferWork) noexcept = default;
 };
 
-} // namespace ninfer
+} // namespace infernix

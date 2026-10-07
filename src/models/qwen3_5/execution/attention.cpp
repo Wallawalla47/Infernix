@@ -1,13 +1,13 @@
 #include "models/qwen3_5/execution/attention.h"
 
-#include "ninfer/ops/attn_input_proj.h"
-#include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rmsnorm_rope.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/attn_input_proj.h"
+#include "infernix/ops/rmsnorm.h"
+#include "infernix/ops/rmsnorm_rope.h"
+#include "infernix/ops/rope.h"
 
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
@@ -92,4 +92,4 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
     ops::rope(positions, prepared, normalized_query, normalized_key, execution);
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

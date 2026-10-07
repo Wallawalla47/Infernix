@@ -1,11 +1,11 @@
 // Cold-cache benchmark and candidate tuner for the Qwen3.6-35B-A3B Q8 LinearAdd Op.
 
 #include "core/weight.h"
-#include "ninfer/ops/linear_add.h"
-#include "ninfer/ops/residual_add.h"
+#include "infernix/ops/linear_add.h"
+#include "infernix/ops/residual_add.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 #include "ops/linear_add/q8/q8_linear_add_plan.h"
@@ -24,7 +24,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -151,10 +151,10 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-        ninfer::bench::L2FlushBuffer flush(kFlushBytes);
-        ninfer::DeviceBuffer input =
+        infernix::bench::L2FlushBuffer flush(kFlushBytes);
+        infernix::DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t, 101U);
-        ninfer::DeviceBuffer residual =
+        infernix::DeviceBuffer residual =
             bench::make_bf16(static_cast<std::size_t>(kRows) * max_t, 103U);
         bench::SavedBuffer residual_initial(residual);
         const auto restore                  = [&](cudaStream_t s) { residual_initial.restore(s); };
@@ -252,7 +252,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_q8_linear_add_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_q8_linear_add_bench: %s\n", error.what());
         return 1;
     }
 }

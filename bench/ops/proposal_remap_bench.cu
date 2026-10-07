@@ -1,8 +1,8 @@
 // Public benchmark for the registered proposal token-id remap.
 
-#include "ninfer/ops/speculative_round.h"
+#include "infernix/ops/speculative_round.h"
 
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -14,8 +14,8 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 
@@ -72,12 +72,12 @@ int main(int argc, char** argv) {
             }
             token_counts = {tokens};
         } else if (argc != 1) {
-            throw std::invalid_argument("usage: ninfer_proposal_remap_bench [--tokens T]");
+            throw std::invalid_argument("usage: infernix_proposal_remap_bench [--tokens T]");
         }
         for (const int tokens : token_counts) { run(tokens); }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_proposal_remap_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_proposal_remap_bench: %s\n", error.what());
         return 2;
     }
 }

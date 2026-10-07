@@ -5,7 +5,7 @@
 // Visible Thinking text owns prompt semantics. With `thinking.display:"summarized"` its wire
 // signature is response metadata and never enters common request or Engine state. With
 // `display:"omitted"` the block's `thinking` is empty and the signature carries the reasoning
-// itself, so request lowering restores it from the returned block. A signature without the NInfer
+// itself, so request lowering restores it from the returned block. A signature without the Infernix
 // marker stays non-semantic transport metadata.
 
 #include "serve/request.h"
@@ -16,7 +16,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct GenerationOutcome;
 
@@ -31,7 +31,7 @@ struct AnthropicMessagesRequest {
 
 // Hidden-reasoning signature: a marker followed by the Base64 reasoning text.
 std::string encode_thinking_signature(std::string_view reasoning);
-// The reasoning carried by a signature, or nullopt when the signature is not an NInfer one.
+// The reasoning carried by a signature, or nullopt when the signature is not an Infernix one.
 // Throws std::invalid_argument when the marker is present but the payload is malformed.
 std::optional<std::string> decode_thinking_signature(std::string_view signature);
 
@@ -71,7 +71,7 @@ public:
     // The Engine start event is exact for normal streams. The no-argument form is reserved for an
     // error raised before admission, so an Anthropic error event still has a valid stream prefix.
     std::string start();
-    std::string start(const ninfer::GenerationStart& generation);
+    std::string start(const infernix::GenerationStart& generation);
 
     [[nodiscard]] bool started() const noexcept { return started_; }
 
@@ -99,4 +99,4 @@ private:
     bool text_open_     = false;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

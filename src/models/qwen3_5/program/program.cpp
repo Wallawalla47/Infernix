@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 
 SequencePlan::SequencePlan(std::unique_ptr<detail::SequencePlanImpl> impl) noexcept
@@ -366,4 +366,4 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

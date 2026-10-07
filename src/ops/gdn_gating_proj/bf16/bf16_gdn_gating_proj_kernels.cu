@@ -17,7 +17,7 @@
 #include <string>
 #include <type_traits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kN                  = 48;
@@ -625,4 +625,4 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
                                                            nullptr, g, beta, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

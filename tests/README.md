@@ -24,7 +24,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
 
 Tests are grouped by observable risk, not by mirroring every source file or class.
 `CMakeLists.txt` includes explicit registrations from `cmake/`, `artifact/`, `models/qwen3_5/`
-and `ops/`. Registration helpers live in `cmake/NinferTests.cmake`; included manifests keep
+and `ops/`. Registration helpers live in `cmake/InfernixTests.cmake`; included manifests keep
 executables and CTest working directories under `build/tests/`.
 `ops/op_tester.h` and `ops/op_check.h` own only reusable device/guard and comparison mechanics.
 Concrete numerical criteria remain named by the semantic Op suite; there are no cross-Op tolerance
@@ -56,38 +56,38 @@ The chat-template reference test uses Python Jinja2.
 Run a focused target for a localized change:
 
 ```bash
-cmake --build build --parallel --target ninfer_sampling_test
-ctest --test-dir build -R ninfer_sampling_test --output-on-failure
+cmake --build build --parallel --target infernix_sampling_test
+ctest --test-dir build -R infernix_sampling_test --output-on-failure
 ```
 
 Enable uniform floating-point error records when establishing or reviewing an Op criterion:
 
 ```bash
-NINFER_OP_REPORT_STATS=1 \
-  ctest --test-dir build -V -R '^ninfer_(rmsnorm|softmax_attention)_test$'
+INFERNIX_OP_REPORT_STATS=1 \
+  ctest --test-dir build -V -R '^infernix_(rmsnorm|softmax_attention)_test$'
 ```
 
 Every participating comparison emits one `OP_ERROR_STATS` record containing the stable case label,
 actual error, active limit, and error-to-limit ratio. The switch changes reporting only; the same
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
-`ninfer_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
+`infernix_softmax_attention_test --causal-only` runs both D256 geometries and all five KV types;
 `--kv-dtype bf16|int8|fp8|nvfp4|k8v4` selects the same complete causal suite for one type, and
 `--non-causal-only` runs only the packed and context sections. CTest registers the latter as
-`ninfer_softmax_attention_test` and the causal suite as one entry per KV type
-(`ninfer_softmax_attention_<type>_test`, and `ninfer_softmax_attention_wide_<type>_test` for
+`infernix_softmax_attention_test` and the causal suite as one entry per KV type
+(`infernix_softmax_attention_<type>_test`, and `infernix_softmax_attention_wide_<type>_test` for
 `--wide-only`), so `ctest -j` runs the KV types concurrently; together the entries run exactly the
 cases of one unsharded invocation.
 
-`ninfer_gdn_replay_fold_test --wide-only` likewise splits into one CTest entry per width and layer
-profile (`ninfer_gdn_replay_fold_wide_w<width>_l<layers>_test`, from `--width 33|48|64 --layers
-48|30`) plus `ninfer_gdn_replay_fold_wide_batched_test` (`--batched`). All seven together peak at
+`infernix_gdn_replay_fold_test --wide-only` likewise splits into one CTest entry per width and layer
+profile (`infernix_gdn_replay_fold_wide_w<width>_l<layers>_test`, from `--width 33|48|64 --layers
+48|30`) plus `infernix_gdn_replay_fold_wide_batched_test` (`--batched`). All seven together peak at
 about 17 GB of device memory on an RTX 5090.
 
-The vector-quantized `vq2` and `k4v2` caches have their own suites. `ninfer_kv_cache_vq_test`
+The vector-quantized `vq2` and `k4v2` caches have their own suites. `infernix_kv_cache_vq_test`
 compares every stored code, row scale, exact-window slot and tag with independent host encoders
 (`kv_cache_vq_reference.h`), checks untouched bytes, and moves tree-compacted slots between state
-slots. `ninfer_vq_attention_test` checks both geometries and both formats against an FP64 oracle
+slots. `infernix_vq_attention_test` checks both geometries and both formats against an FP64 oracle
 of the per-query read rule (sinks and keys at most 768 positions before the query as exact INT8-G64
 rows, every other key from its stored codes): grouped decode and verification widths, batched rows with partial valid columns, tree
 masks, prompt chunks with key splits, cached-only calls, stale window slots, and the window a wide
@@ -104,13 +104,13 @@ values are the serial mt19937 stream mapped in parallel, so they equal a serial 
 prefix while reserving the full execution-envelope page table. The runner reports elapsed time
 per KV type.
 
-`ninfer_qsa_test` checks Qwen3.8-Flash-Next's QSA at the real geometry against FP64 oracles:
+`infernix_qsa_test` checks Qwen3.8-Flash-Next's QSA at the real geometry against FP64 oracles:
 index queries, pooled keys read back from the paged plane, the raw-key tails exactly (including
 rewriting the last position of a block completed inside a call or a verification commit, as the
 MTP drafter does), chunking invariance, block selection (exact, on a value grid where FP32 scores
 are exact), and attention over decoded `bf16` and `int8` K/V across the dense/selected boundary.
 
-`ninfer_qsa_select_test` qualifies QSA block selection (`ops::detail::qsa_select`) against three
+`infernix_qsa_select_test` qualifies QSA block selection (`ops::detail::qsa_select`) against three
 oracles: the one-CTA-per-column kernel it replaced, kept verbatim in the test (counts and selected
 ids bitwise equal, FP32 scores bitwise equal where both keep them); the exact top-k of the
 production kernel's own scores (equal scores to the lower block id, ids ascending); and an FP64
@@ -124,9 +124,9 @@ Linear tests are independently runnable by weight and activation-compute profile
 
 ```bash
 cmake --build build --parallel --target \
-  ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
-  ninfer_linear_q6_a16_test ninfer_linear_q8_a16_test
-ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|q8)_a16_test$' --output-on-failure
+  infernix_linear_q4_a16_test infernix_linear_q5_a16_test \
+  infernix_linear_q6_a16_test infernix_linear_q8_a16_test
+ctest --test-dir build -R '^infernix_linear_(q4|q5|q6|q8)_a16_test$' --output-on-failure
 ```
 
 All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
@@ -158,7 +158,7 @@ cover consumption of their resulting representation.
 The real loading test accepts an explicit artifact path and optional component selection:
 
 ```bash
-./build/tests/ninfer_qwen3_5_loading_real_test \
+./build/tests/infernix_qwen3_5_loading_real_test \
   --artifact out/qwen3_6_27b.ninfer --vision --speculative mtp --proposal optimized
 ```
 
@@ -169,28 +169,28 @@ The C++ prefix/MTP integration test is separately opt-in because it loads the fu
 runs the real engine:
 
 ```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_prefix_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_prefix_real_test --output-on-failure
 ```
 
 The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
 score tile, overlapping target suffixes, and repeated-window State/KV isolation:
 
 ```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_score_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_score_real_test --output-on-failure
 ```
 
 Run the 35B-A3B MoE route independently:
 
 ```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_moe_real_test --output-on-failure
 ```
 
-Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Real-artifact targets
+Without `INFERNIX_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
-integration tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as
+integration tests serially. `INFERNIX_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as
 `vision`, `late-instructions` or `concurrent`; the default is `all`. These integration checks
 use behavior and state accounting rather than another numerical path's generated tokens as a golden.
 
@@ -198,34 +198,34 @@ The `attention` scenario checks the selected KV type, chunked prefill, concurren
 across a resource tier, prefix continuation, and workspace bounds:
 
 ```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
-NINFER_PREFIX_REAL_SCENARIO=attention NINFER_TEST_KV_DTYPE=fp8 \
-NINFER_TEST_SPECULATIVE=mtp NINFER_TEST_BATCH=2 \
-  ./build/tests/ninfer_qwen3_5_prefix_real_test
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_27b.ninfer \
+INFERNIX_PREFIX_REAL_SCENARIO=attention INFERNIX_TEST_KV_DTYPE=fp8 \
+INFERNIX_TEST_SPECULATIVE=mtp INFERNIX_TEST_BATCH=2 \
+  ./build/tests/infernix_qwen3_5_prefix_real_test
 ```
 
 KV choices are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; backend choices are
 `none`, `mtp`, `dflash`, and `dflash2`, requiring an artifact with the selected component. Batch
-defaults to 2; `NINFER_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The
+defaults to 2; `INFERNIX_TEST_DRAFT_TOKENS` overrides the default MTP3 or DFlash7 block. The
 DFlash2-specific integration executable, the n-gram lifecycle test (fifth argument) and the hybrid
-prefix test (`NINFER_HYBRID_KV_DTYPE`) accept the same KV names and reject unknown ones.
+prefix test (`INFERNIX_HYBRID_KV_DTYPE`) accept the same KV names and reject unknown ones.
 
 Continuation and pressure recovery have dedicated entries:
 
 ```bash
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
-  ctest --test-dir build -R ninfer_qwen3_5_agent_continuation_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R infernix_qwen3_5_agent_continuation_real_test --output-on-failure
 
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
-NINFER_TEST_BACKEND=dflash2 \
-  ctest --test-dir build -R ninfer_qwen3_5_preemption_real_test --output-on-failure
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+INFERNIX_TEST_BACKEND=dflash2 \
+  ctest --test-dir build -R infernix_qwen3_5_preemption_real_test --output-on-failure
 
-NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
-  ./build/tests/ninfer_qwen3_5_native_transactions_test dflash2
+INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ./build/tests/infernix_qwen3_5_native_transactions_test dflash2
 ```
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
-Snapshot/Replay recovery and cancellation while paused or replaying; `NINFER_PREEMPTION_REAL_SCENARIO`
+Snapshot/Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
 selects `all`, `snapshot`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover
 physical state/KV ownership, binding, capture, reclamation and abort; their positional backend is
 `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
@@ -242,7 +242,7 @@ PYTHONPATH=eval eval/.venv/bin/python -m unittest discover \
 Run the serving contract manually after starting a resident server in another terminal:
 
 ```bash
-./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
+./build/apps/infernix-serve out/qwen3_6_27b.ninfer \
   --host 127.0.0.1 --port 18080 --vision
 ```
 
@@ -292,11 +292,11 @@ decode binding, including shortened chunks and oversized local/full KV appends. 
 Program storage and the production prefill route; select the draft component stored in the artifact:
 
 ```bash
-cmake --build build -j --target ninfer_qwen3_5_dflash_prefill_real_test
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash2
-NINFER_TEST_ARTIFACT=out/qwen3_6_35b_a3b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash
+cmake --build build -j --target infernix_qwen3_5_dflash_prefill_real_test
+INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/infernix_qwen3_5_dflash_prefill_real_test dflash2
+INFERNIX_TEST_ARTIFACT=out/qwen3_6_35b_a3b.ninfer \
+  build/tests/infernix_qwen3_5_dflash_prefill_real_test dflash
 ```
 
 The Engine test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
@@ -311,13 +311,13 @@ local ring wrap, and the logical context-capacity tail. Optional Vision runs ima
 and prefix restore. Zero extra Device StateImage slots exercise Host snapshot/restore.
 
 ```bash
-cmake --build build -j --target ninfer_qwen3_5_dflash2_real_test
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 15 1 1 8
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 7 1 0 2 bf16 1 0
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_real_test 2 0 0 2 int8
+cmake --build build -j --target infernix_qwen3_5_dflash2_real_test
+INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
+  build/tests/infernix_qwen3_5_dflash2_real_test 15 1 1 8
+INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b.ninfer \
+  build/tests/infernix_qwen3_5_dflash2_real_test 7 1 0 2 bf16 1 0
+INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/infernix_qwen3_5_dflash2_real_test 2 0 0 2 int8
 ```
 
 Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`bf16`, `int8`,
@@ -325,7 +325,7 @@ Arguments are K, Graph enabled, optimized head enabled, maximum B, target KV (`b
 `15 1 1 8 bf16 0 3`. An optional eighth argument, a `--draft-tree-nodes` table such as
 `16,12,12,10` or `auto`, runs the fixture through DFlash2 tree verification (with `auto`, the
 same-seed replay check is skipped because the chosen widths follow measured round time); CTest
-runs a table on INT8, K8V4, NVFP4, VQ2 and K4V2 as `ninfer_qwen3_5_dflash2_tree_<kv>_real_test`. Run
+runs a table on INT8, K8V4, NVFP4, VQ2 and K4V2 as `infernix_qwen3_5_dflash2_tree_<kv>_real_test`. Run
 GPU integration tests serially. The
 individual Op suites remain the numerical/state-transition oracle; the fixed Engine fixture does
 not define bit parity across arbitrary floating-point routes.
@@ -339,9 +339,9 @@ the target's choice at most later positions; the test fails above 10 % disagreem
 committed token is more than 6 nats below the oracle's.
 
 ```bash
-cmake --build build -j --target ninfer_qwen3_5_dflash2_tree_greedy_real_test
-NINFER_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
-  build/tests/ninfer_qwen3_5_dflash2_tree_greedy_real_test int8 16
+cmake --build build -j --target infernix_qwen3_5_dflash2_tree_greedy_real_test
+INFERNIX_TEST_ARTIFACT=out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/infernix_qwen3_5_dflash2_tree_greedy_real_test int8 16
 ```
 
 Arguments are the target KV, the tree table (`auto` for automatic widths, `0` runs chain decoding

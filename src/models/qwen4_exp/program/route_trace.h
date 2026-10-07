@@ -35,7 +35,7 @@
 #include <functional>
 #include <span>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 enum class RouteTraceKind : std::uint32_t { PrefillChunk = 0, ForcedTokens = 1, Decode = 2, Verify = 3, Graph = 4 };
 enum class RouteTraceGraph : std::uint32_t { Decode = 0, Verify = 1, MtpDraft = 2, MtpCatchUp = 3 };
@@ -98,4 +98,4 @@ void set_route_trace(std::filesystem::path path);
 
 } // namespace testing
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

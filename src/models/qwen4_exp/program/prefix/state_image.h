@@ -27,7 +27,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 inline constexpr std::size_t kStateImageHeaderBytes = 256;
 inline constexpr std::size_t kStateImageAlignment   = 256;
@@ -196,4 +196,4 @@ struct PlaneRange {
 // The planes of KV layer `kv_layer` (attention layer index, or attention_layers for MTP).
 [[nodiscard]] PlaneRange kv_layer_planes(const KvPageGeometry& geometry, std::uint32_t kv_layer);
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

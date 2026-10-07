@@ -8,7 +8,7 @@
 #include <string>
 #include <string_view>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {});
 
@@ -26,4 +26,4 @@ bool optional_bool(const RequestJson& object, const char* key, bool fallback);
 // logs without control characters or invalid UTF-8.
 [[nodiscard]] std::string ascii_preview(std::string_view value, std::size_t limit = 64);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

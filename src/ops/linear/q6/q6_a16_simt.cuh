@@ -3,7 +3,7 @@
 #include "ops/common/warp.cuh"
 #include "ops/linear/q6/q6_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule>
 __device__ __forceinline__ void q6_simt_copy_code(uint4* shared_dst,
@@ -235,4 +235,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

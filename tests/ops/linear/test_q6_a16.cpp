@@ -5,14 +5,14 @@
 #include <iostream>
 
 namespace {
-using namespace ninfer::test::linear;
+using namespace infernix::test::linear;
 
 constexpr Invocation a16(std::int32_t t) { return {t}; }
 
 constexpr Invocation convenience(std::int32_t t) { return {t, CallForm::A16Convenience}; }
 
 constexpr Invocation graph(std::int32_t t) {
-    return {t, CallForm::Policy, ninfer::ops::LinearPolicy::A16Only, true};
+    return {t, CallForm::Policy, infernix::ops::LinearPolicy::A16Only, true};
 }
 
 int q6_a16_conformance() {
@@ -65,7 +65,7 @@ int q6_a16_conformance() {
 } // namespace
 
 int main() {
-    if (!ninfer::test::linear::cuda_available()) {
+    if (!infernix::test::linear::cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }

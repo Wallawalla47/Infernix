@@ -4,7 +4,7 @@
 #include "core/pdl.cuh"
 #include "ops/kernel/prepare_masked_block.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void prepare_masked_block_launch(const Tensor& anchors, const Tensor& lengths,
                                  const Tensor& valid_columns, std::int32_t mask_id, Tensor& ids,
@@ -19,4 +19,4 @@ void prepare_masked_block_launch(const Tensor& anchors, const Tensor& lengths,
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

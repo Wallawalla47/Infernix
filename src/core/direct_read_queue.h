@@ -8,7 +8,7 @@
 #include <system_error>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 // Asynchronous unbuffered reads of file byte ranges into caller memory, for reading expert records
 // from an artifact in place (design §19.3.7, the SSD expert tier). Files are opened unbuffered and
@@ -109,4 +109,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace infernix

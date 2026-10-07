@@ -3,7 +3,7 @@
 #include "core/device.h"
 #include "models/qwen3_5/execution/parameters.h"
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 [[nodiscard]] std::size_t
 attention_projection_workspace_bytes(const AttentionParameters& parameters, std::int32_t first,
@@ -27,4 +27,4 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, DeviceExecutionView execution);
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

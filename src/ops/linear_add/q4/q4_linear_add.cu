@@ -6,7 +6,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using GemvR1W8 =
@@ -63,4 +63,4 @@ Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::i
     return launch_mma<MmaR64T128>;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

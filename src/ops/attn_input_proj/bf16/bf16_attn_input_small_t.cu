@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
@@ -49,4 +49,4 @@ void bf16_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tenso
     kLaunchers[x.ne[1] - kBf16AttnInputSmallTMinTokens](x, weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

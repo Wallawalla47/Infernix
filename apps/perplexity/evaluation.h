@@ -5,7 +5,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::perplexity {
+namespace infernix::perplexity {
 
 struct WindowPlan {
     std::size_t input_begin    = 0;
@@ -28,4 +28,4 @@ struct ScoreAggregate {
     [[nodiscard]] double ppl() const;
 };
 
-} // namespace ninfer::perplexity
+} // namespace infernix::perplexity

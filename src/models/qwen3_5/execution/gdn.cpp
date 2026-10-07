@@ -1,12 +1,12 @@
 #include "models/qwen3_5/execution/gdn.h"
 
-#include "ninfer/ops/gdn_gating_proj.h"
-#include "ninfer/ops/gdn_input_proj.h"
+#include "infernix/ops/gdn_gating_proj.h"
+#include "infernix/ops/gdn_input_proj.h"
 
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 
 std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters, std::int32_t first,
                                            std::int32_t last) {
@@ -140,4 +140,4 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     }
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution

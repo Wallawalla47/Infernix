@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/common/causal_epilogue.cuh"
 #include "ops/softmax_attention/common/causal_softmax.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct Nvfp4KvBarriers {
     alignas(8) std::uint64_t k_full;
     alignas(8) std::uint64_t k_empty;
@@ -366,4 +366,4 @@ __global__ __launch_bounds__(Schedule::kThreads, 1) void nvfp4_kv_tiled_mma_kern
                                Schedule::kConsumerThreads);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

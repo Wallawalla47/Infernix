@@ -2,7 +2,7 @@
 #include "ops/linear/q8/q8_geometry.h"
 #include "ops/linear/q8/q8_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int TileTokens, int ActiveTokens>
 using Q8SlicedKDefault = Q8A16SlicedKMmaSchedule<
     TileTokens, 8, 1, TileTokens == 8 ? 5 : (TileTokens == 16 ? 4 : (TileTokens == 24 ? 3 : 2)),
@@ -37,4 +37,4 @@ using SlicedR16T16W4S2 = Q8A16SlicedKMmaSchedule<16, 4, 2, 1, Q8ScaleAccess::Sha
                                                  Cache::cg, Q8ActivationStage::PaddedZero>;
 using SlicedR16T32W4S2 = Q8A16SlicedKMmaSchedule<32, 4, 2, 1, Q8ScaleAccess::Shared>;
 } // namespace q8_instances
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

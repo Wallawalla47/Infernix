@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Q8LinearOperands {
     const __nv_bfloat16* x;
@@ -45,4 +45,4 @@ inline void validate_q8_operands(const Q8LinearOperands& operands) {
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-#include "ninfer/ops/sliding_window_attention.h"
+#include "infernix/ops/sliding_window_attention.h"
 
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -18,8 +18,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 constexpr int D = 128, Hq = 32, Hkv = 8, Lanes = 8;

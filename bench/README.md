@@ -1,7 +1,7 @@
 # Benchmarks
 
-`ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
-The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
+`infernix_bench` measures the complete public `infernix::Engine` route against a `.ninfer` artifact.
+The `bench/ops/` `infernix_<op>_bench` executables measure central public Op contracts while leaving
 implementation selection behind those contracts. Model benchmarks measure Program/model
 composition. Correctness lives in the affected test suites; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
@@ -39,11 +39,11 @@ the same fixture, seed, cache policy, and timing mode.
 
 `CMakeLists.txt` includes explicit registrations from `ops/`, `inference/`, `decode_quality/`,
 `context_cost/` and `models/qwen3_5/`. All executables remain under `build/bench/`; the Op registration helper
-lives in `cmake/NinferBenchmarks.cmake`.
+lives in `cmake/InfernixBenchmarks.cmake`.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
-cmake --build build -j --target ninfer_bench
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DINFERNIX_BUILD_BENCHMARKS=ON
+cmake --build build -j --target infernix_bench
 ```
 
 The `dev` configure preset also enables all benchmarks, alongside products and tests; see
@@ -74,7 +74,7 @@ decode graph before warmups and measured repetitions.
 ## CLI
 
 ```text
-ninfer_bench --weights <artifact.ninfer>
+infernix_bench --weights <artifact.ninfer>
           [--corpus <ids-path>]
           [-p, --n-prompt <list>]
           [-n, --n-gen <list>]
@@ -99,7 +99,7 @@ The factor is included in table, JSON and CSV reports.
 Example:
 
 ```bash
-./build/bench/ninfer_bench \
+./build/bench/infernix_bench \
   --weights out/qwen3_6_27b.ninfer \
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
@@ -116,7 +116,7 @@ load, graph construction, and warmup do not enter topology counts.
 For a DFlash2 companion artifact:
 
 ```bash
-./build/bench/ninfer_bench --weights out/qwen3_8_27b_nvfp4.ninfer \
+./build/bench/infernix_bench --weights out/qwen3_8_27b_nvfp4.ninfer \
   -pg '2048,128' --spec dflash2 --draft-tokens 7 --lm-head-draft \
   --max-ctx 4096 --kv-dtype bf16 --warmup 1 -r 3
 ```
@@ -137,7 +137,7 @@ remains neural-only unless its cases explicitly request ngram.
 
 ## Decode quality
 
-`ninfer_decode_quality_gen` and `ninfer_decode_quality_judge` measure what a build's decode path
+`infernix_decode_quality_gen` and `infernix_decode_quality_judge` measure what a build's decode path
 does to output quality, end to end. Perplexity scoring runs prefill only, so this is the check for
 decode kernels, speculative verification and n-gram drafting. The method and the recorded results
 are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
@@ -155,22 +155,22 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   they share exactly.
 
 ```bat
-ninfer_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
-ninfer_decode_quality_gen model.ninfer corpus.txt base-ngram.txt 32 1536 384 ngram
-ninfer_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt other.txt
+infernix_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
+infernix_decode_quality_gen model.ninfer corpus.txt base-ngram.txt 32 1536 384 ngram
+infernix_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt other.txt
 ```
 
 Use the same artifact and corpus for every build. The generator uses only Engine API that upstream
-NInfer also has, so for a fork-versus-upstream comparison copy `decode_quality_gen.cpp` into an
-upstream checkout and build it there with `NINFER_DECODE_QUALITY_UPSTREAM` defined (it removes the
-n-gram option), linked to `ninfer_engine` like any benchmark. Rounding noise makes builds diverge
+Infernix also has, so for a fork-versus-upstream comparison copy `decode_quality_gen.cpp` into an
+upstream checkout and build it there with `INFERNIX_DECODE_QUALITY_UPSTREAM` defined (it removes the
+n-gram option), linked to `infernix_engine` like any benchmark. Rounding noise makes builds diverge
 after a few dozen tokens, which is why each build is judged on its own prefixes. Treat agreement
 differences of a few tenths of a percent over about 12,000 tokens as unresolved unless they repeat
 on other segments.
 
 ## Context-cost calibration
 
-`ninfer_context_cost_bench` measures the static coefficients used to compare context-cache
+`infernix_context_cost_bench` measures the static coefficients used to compare context-cache
 materialization alternatives. It is an offline tool, not a startup benchmark or runtime autotuner.
 It has two independent suites:
 
@@ -205,8 +205,8 @@ with no such boundary it is simply `ceil(S/prefill_chunk)`.
 Build the tool, then measure machine transfer without a model:
 
 ```bash
-cmake --build build -j --target ninfer_context_cost_bench
-./build/bench/ninfer_context_cost_bench \
+cmake --build build -j --target infernix_context_cost_bench
+./build/bench/infernix_context_cost_bench \
   --suite transfer \
   --json profiles/bench/context_cost_transfer.json \
   --preset-out profiles/bench/context_cost_presets.json
@@ -215,7 +215,7 @@ cmake --build build -j --target ninfer_context_cost_bench
 Measure prefill separately when the GPU has room for the artifact:
 
 ```bash
-./build/bench/ninfer_context_cost_bench \
+./build/bench/infernix_context_cost_bench \
   --suite prefill \
   --artifact out/qwen3_6_27b.ninfer \
   --corpus bench/fixtures/bench_corpus.ids \
@@ -239,7 +239,7 @@ the runtime's strict loader before publication.
 [`context_cost_defaults.cpp`](../src/runtime/engine/context_cache/context_cost_defaults.cpp) is the sole table of
 defaults compiled into the binary. JSON is not a build input: `--preset-out` produces a runtime
 registry that can be selected immediately, without recompilation, through
-`EngineOptions.context_cost.preset_path` or `ninfer-serve --context-cost-presets`. Resolution always
+`EngineOptions.context_cost.preset_path` or `infernix-serve --context-cost-presets`. Resolution always
 starts with generic numerical coefficients,
 then independently applies matching compiled transfer/prefill values, then independently applies
 matching external values. A malformed explicit file is an error; a missing hardware or prefill-signature
@@ -249,7 +249,7 @@ and is not a runtime input.
 
 ## Linear Op benchmark
 
-`ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
+`infernix_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
 Q8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
 FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
@@ -257,7 +257,7 @@ route for the exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
 
-This is a long-lived public benchmark: every timed and profiled point calls `ninfer::ops::linear`
+This is a long-lived public benchmark: every timed and profiled point calls `infernix::ops::linear`
 and lets production dispatch choose the implementation. Candidate crossover work uses a
 task-local temporary sweep, puts the winner or boundary in production dispatch, and deletes losing
 candidates and temporary controls afterward; private launchers and route forcing do not belong in
@@ -268,14 +268,14 @@ elsewhere in this file.
 Build the benchmark and measure one exact production point:
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_bench
-./build/bench/ninfer_linear_bench \
+cmake --build build --parallel --target infernix_linear_bench
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 4096 --k 5120 --t 8
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype nvfp4 --policy a4 --n 14336 --k 5120 --t 1024
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
@@ -288,13 +288,13 @@ A continuous small-T sweep reuses one packed weight and one maximum-T activation
 allocation:
 
 ```bash
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 4096 --k 5120 \
   --sweep 1:128:1 --csv-out profiles/bench/q4_4096x5120_t1_128.csv
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 3456 --k 1152 \
   --sweep 4:512:4 --csv-out profiles/bench/q4_vision_qkv.csv
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q8 --policy a16 --n 248320 --k 5120 \
   --sweep 48:65:1 --warmup 5 --repeat 30
 ```
@@ -304,9 +304,9 @@ They are compact performance surveys, not copies of the production selector or n
 matrix:
 
 ```bash
-./build/bench/ninfer_linear_bench --suite qwen3_6_27b
-./build/bench/ninfer_linear_bench --suite qwen3_6_35b_a3b
-./build/bench/ninfer_linear_bench --suite all
+./build/bench/infernix_linear_bench --suite qwen3_6_27b
+./build/bench/infernix_linear_bench --suite qwen3_6_35b_a3b
+./build/bench/infernix_linear_bench --suite all
 ```
 
 When a point group includes `T=1`, `T1_lin_x` reports the calculated ratio
@@ -320,7 +320,7 @@ launches:
 
 ```bash
 ncu --profile-from-start off --set full \
-  ./build/bench/ninfer_linear_bench \
+  ./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 4096 --k 5120 --t 8 --profile
 ```
 
@@ -350,7 +350,7 @@ utilization still require NCU.
 
 ## LinearTopK Op benchmark
 
-`ninfer_linear_topk_bench` measures the complete public projection-plus-stable-top-16 Op for the
+`infernix_linear_topk_bench` measures the complete public projection-plus-stable-top-16 Op for the
 Q8 and row-FP8 full heads and the mapped Q4 optimized head. Its independent matrix-column axis is
 `U`; the default sweep covers every `U=1..120` needed by variable-width DFlash2 proposals. A fixed
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
@@ -362,17 +362,17 @@ Reported logical bandwidth counts the encoded head once, useful FLOPs count cand
 workspace bytes and Graph nodes describe the actual public call. These are Op measurements.
 
 ```bash
-cmake --build build -j --target ninfer_linear_topk_bench
-./build/bench/ninfer_linear_topk_bench
-./build/bench/ninfer_linear_topk_bench --profile q8-full --columns 7
-./build/bench/ninfer_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
-./build/bench/ninfer_linear_topk_bench --profile fp8-full --columns 120
-./build/bench/ninfer_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
+cmake --build build -j --target infernix_linear_topk_bench
+./build/bench/infernix_linear_topk_bench
+./build/bench/infernix_linear_topk_bench --profile q8-full --columns 7
+./build/bench/infernix_linear_topk_bench --columns 1,7,16,24,64,120 --repeat 25
+./build/bench/infernix_linear_topk_bench --profile fp8-full --columns 120
+./build/bench/infernix_linear_topk_bench --profile q4-optimized --columns 129 --repeat 60
 ```
 
 ## CandidateSelectorPath Op benchmark
 
-`ninfer_candidate_selector_bench` measures the complete public conditional selector for
+`infernix_candidate_selector_bench` measures the complete public conditional selector for
 `K=1..15`, `B=1..8`, 16 candidates and rank 256, with full BF16 codebooks `[256,248320]`.
 The default sweep covers all K/B pairs in greedy, stochastic and mixed modes (B=1 omits the
 redundant mixed case). Each cold-cache CUDA Graph sample follows a 256 MiB L2 eviction read.
@@ -380,14 +380,14 @@ It reports the selected route's required caller workspace and actual Graph node 
 interval includes all device work of the complete public Op; fixture allocation and setup are outside it.
 
 ```bash
-cmake --build build -j --target ninfer_candidate_selector_bench
-./build/bench/ninfer_candidate_selector_bench --warmup 8 --repeat 60
-./build/bench/ninfer_candidate_selector_bench --steps 15 --batch 8 --repeat 60
+cmake --build build -j --target infernix_candidate_selector_bench
+./build/bench/infernix_candidate_selector_bench --warmup 8 --repeat 60
+./build/bench/infernix_candidate_selector_bench --steps 15 --batch 8 --repeat 60
 ```
 
 ## Embedding Op benchmark
 
-`ninfer_embedding_bench` measures the public quantized embedding profiles: Q6 `[248320,5120]`,
+`infernix_embedding_bench` measures the public quantized embedding profiles: Q6 `[248320,5120]`,
 Q8 `[248320,5120]`, Q8 `[248320,2048]`, and row-scaled FP8 `[248320,5120]`. The default sweep is
 T=1..128; `--tokens` selects other matrix extents. This is an Op column domain, independent of a
 particular speculative algorithm's draft count.
@@ -404,19 +404,19 @@ normalizes per call. A cold bundle flushes only before its first call. `--profil
 call of one format and one extent for kernel profiling.
 
 ```bash
-cmake --build build -j --target ninfer_embedding_bench
-./build/bench/ninfer_embedding_bench --format q8-d5120 --execution graph --cache cold
-./build/bench/ninfer_embedding_bench --format fp8-d5120 \
+cmake --build build -j --target infernix_embedding_bench
+./build/bench/infernix_embedding_bench --format q8-d5120 --execution graph --cache cold
+./build/bench/infernix_embedding_bench --format fp8-d5120 \
   --tokens 8,16,24,32,40,48,56,64 --id-pattern masked --block-width 8
-./build/bench/ninfer_embedding_bench --format fp8-d5120 \
+./build/bench/infernix_embedding_bench --format fp8-d5120 \
   --tokens 16,32,48,64,80,96,112,128 --id-pattern masked --block-width 16 \
   --cache warm --graph-calls 32 --csv-out /tmp/embedding.csv
-./build/bench/ninfer_embedding_bench --format fp8-d5120 --tokens 128 --profile
+./build/bench/infernix_embedding_bench --format fp8-d5120 --tokens 128 --profile
 ```
 
 ## Batched feature scatter benchmark
 
-`ninfer_scatter_bf16_batch_bench` measures five public `scatter_bf16_batch` calls. Each copies
+`infernix_scatter_bf16_batch_bench` measures five public `scatter_bf16_batch` calls. Each copies
 one `[D,W,B]` source into a different D-row slice of the same `[5*D,W,8]` parent pool; default
 D=5120 matches DFlash2 feature capture. The calls use nonuniform exact BF16 bit patterns,
 permuted lane IDs and `--counts full|one|ragged|zero`. The measurement is the sum of five
@@ -428,16 +428,16 @@ time per capture, so a bundle has 160 kernel nodes. Cold mode flushes 256 MiB be
 interval, not between the five calls or individual repetitions within a bundle.
 
 ```bash
-cmake --build build -j --target ninfer_scatter_bf16_batch_bench
-./build/bench/ninfer_scatter_bf16_batch_bench --widths 1,2,8,9,16 --batches 1,8 --counts full
-./build/bench/ninfer_scatter_bf16_batch_bench --widths 2,8,16 --batches 1,8 \
+cmake --build build -j --target infernix_scatter_bf16_batch_bench
+./build/bench/infernix_scatter_bf16_batch_bench --widths 1,2,8,9,16 --batches 1,8 --counts full
+./build/bench/infernix_scatter_bf16_batch_bench --widths 2,8,16 --batches 1,8 \
   --counts ragged --cache warm --graph-calls 32 --csv-out /tmp/feature-scatter.csv
-./build/bench/ninfer_scatter_bf16_batch_bench --widths 16 --batches 8 --profile
+./build/bench/infernix_scatter_bf16_batch_bench --widths 16 --batches 8 --profile
 ```
 
 ## RMSNorm Op benchmark
 
-`ninfer_rmsnorm_bench` measures public RMSNorm, with `--kind dflash2_hidden` for plain D=5120,
+`infernix_rmsnorm_bench` measures public RMSNorm, with `--kind dflash2_hidden` for plain D=5120,
 `hidden27` for offset D=5120, and `target_q27` / `target_k27` for offset D=256 with 24 / 4 heads.
 The existing DFlash, 35B target and GatedRMSNorm profiles remain selectable in `--help`.
 `--tokens` supplies aggregate matrix columns, independently of the speculative block width.
@@ -449,16 +449,16 @@ gaps and normalize time per public call; a cold bundle flushes only before its f
 `--profile` brackets one public call with CUDA profiler start/stop.
 
 ```bash
-cmake --build build -j --target ninfer_rmsnorm_bench
-./build/bench/ninfer_rmsnorm_bench --kind dflash2_hidden --tokens 1,8,16,32,64,96,128,2048
-./build/bench/ninfer_rmsnorm_bench --kind target_q27 --tokens 1,8,16,32,64,96,128 \
+cmake --build build -j --target infernix_rmsnorm_bench
+./build/bench/infernix_rmsnorm_bench --kind dflash2_hidden --tokens 1,8,16,32,64,96,128,2048
+./build/bench/infernix_rmsnorm_bench --kind target_q27 --tokens 1,8,16,32,64,96,128 \
   --cache warm --graph-calls 32 --csv-out /tmp/rmsnorm.csv
-./build/bench/ninfer_rmsnorm_bench --kind hidden27 --tokens 128 --profile
+./build/bench/infernix_rmsnorm_bench --kind hidden27 --tokens 128 --profile
 ```
 
 ## GDN control-projection Op benchmark
 
-`ninfer_gdn_gating_proj_bench` measures the complete public `gdn_norm_gating_proj` (`--op norm`,
+`infernix_gdn_gating_proj_bench` measures the complete public `gdn_norm_gating_proj` (`--op norm`,
 default) or `gdn_gating_proj` (`--op control`). `--geometry 27b` uses D5120/H48 and defaults to the
 Qwen3.8 contiguous BF16 `[96,5120]` parent; `--weights split` measures the two-weight form.
 `--geometry 35b` uses the D2048/H32 parent. All numerical inputs are nonuniform represented values.
@@ -469,33 +469,33 @@ query against its measured peak. Cold runs flush 256 MiB before each call. For s
 `--profile` brackets one selected workload with CUDA profiler APIs. Production owns all dispatch.
 
 ```bash
-cmake --build build -j --target ninfer_gdn_gating_proj_bench
-./build/bench/ninfer_gdn_gating_proj_bench \
+cmake --build build -j --target infernix_gdn_gating_proj_bench
+./build/bench/infernix_gdn_gating_proj_bench \
   --geometry 27b --op norm --weights parent --tokens 1,2,4,8,9,16,32,64,128 \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_gdn_gating_proj_bench \
+./build/bench/infernix_gdn_gating_proj_bench \
   --geometry 27b --op norm --tokens 1,2,4,8,9,16,32,64,128 \
   --execution graph --cache warm --graph-calls 16 --csv-out /tmp/gdn-norm-warm.csv
-./build/bench/ninfer_gdn_gating_proj_bench \
+./build/bench/infernix_gdn_gating_proj_bench \
   --geometry 35b --op norm --tokens 16 --execution graph --cache cold --profile
 ```
 
 ## Dynamic grouped-convolution prepare Op benchmark
 
-`ninfer_dynamic_grouped_conv_prepare_bench` measures the complete BF16
+`infernix_dynamic_grouped_conv_prepare_bench` measures the complete BF16
 `rmsnorm_dynamic_grouped_conv_prepare` contract at every registered `B=1..8`. Each timed call
 includes RMSNorm, the `[1280,5120]` coefficient projection, the input-side two-tap grouped
 convolution, and both public output writes. Every sample follows a 256 MiB L2 eviction; the report
 contains complete-Op latency, useful coefficient-projection TFLOP/s, and exact workspace capacity.
 
 ```bash
-cmake --build build -j --target ninfer_dynamic_grouped_conv_prepare_bench
-./build/bench/ninfer_dynamic_grouped_conv_prepare_bench --warmup 10 --repeat 80
+cmake --build build -j --target infernix_dynamic_grouped_conv_prepare_bench
+./build/bench/infernix_dynamic_grouped_conv_prepare_bench --warmup 10 --repeat 80
 ```
 
 ## Gated DeltaNet Op benchmark
 
-`ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
+`infernix_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
 128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
 Running/chunked modes use batch 1; batch-update mode accepts exact `B=1..8` at `T=1`. Every
 measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed interval.
@@ -526,19 +526,19 @@ intermediates. These deterministic byte counts describe requests, not physical D
 physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
-cmake --build build -j --target ninfer_gated_delta_net_bench
-./build/bench/ninfer_gated_delta_net_bench \
+cmake --build build -j --target infernix_gated_delta_net_bench
+./build/bench/infernix_gated_delta_net_bench \
   --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
-./build/bench/ninfer_gated_delta_net_bench \
+./build/bench/infernix_gated_delta_net_bench \
   --batch-update --value-heads 32 --batch 8 --qk-norm fused --warmup 20 --repeat 100 --csv
-./build/bench/ninfer_gated_delta_net_bench \
+./build/bench/infernix_gated_delta_net_bench \
   --chunked-only --value-heads 32 --tokens 1024 --breakdown \
   --warmup 20 --repeat 100
 ```
 
 ## GDN input-projection Op benchmark
 
-`ninfer_gdn_input_proj_bench` measures all registered public `gdn_input_proj` forms: the 27B
+`infernix_gdn_input_proj_bench` measures all registered public `gdn_input_proj` forms: the 27B
 Q4/Q5 two-parent projection, the 35B Q8 single-parent projection, and the 27B NVFP4 or row-scaled
 FP8 single-parent projection under its admitted policies. Every timed and profiled point is exactly
 one public Op call. Single-parent workspace is queried and allocated through the public capacity
@@ -549,20 +549,20 @@ once, BF16 input once, and QKV/Z outputs once. FLOPs describe the complete regis
 The benchmark reports caller policy rather than inferring a private activation-compute route.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_bench
-./build/bench/ninfer_gdn_input_proj_bench \
+cmake --build build --parallel --target infernix_gdn_input_proj_bench
+./build/bench/infernix_gdn_input_proj_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 5 --repeat 30 \
   --csv-out profiles/bench/gdn_input_proj.csv
-./build/bench/ninfer_gdn_input_proj_bench \
+./build/bench/infernix_gdn_input_proj_bench \
   --format nvfp4 --nvfp4-policy a4 --tokens 1024 --cache cold --profile
-./build/bench/ninfer_gdn_input_proj_bench \
+./build/bench/infernix_gdn_input_proj_bench \
   --format fp8 --fp8-policy a8 --tokens 1,2,3,4,5,6,7,8 --cache cold
 ```
 
 ## GDN input projection/convolution Snapshot/Record Op benchmark
 
-`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6/Qwen3.8 Q4/Q5, NVFP4,
+`infernix_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6/Qwen3.8 Q4/Q5, NVFP4,
 row-scaled FP8, and Q8 `gdn_input_proj_conv_snapshot` / `gdn_input_proj_conv_record` forms for exact
 `B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not include
 private launchers, candidate selection, duplicated compositions, or route labels. Its default
@@ -577,24 +577,24 @@ results make launch and cache effects visible. The initial state occupies a slot
 published snapshot slots, so repeated replay does not introduce a benchmark-only state reset.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+cmake --build build --parallel --target infernix_gdn_input_proj_conv_snapshot_bench
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format q4q5 --sweep 1:6 --execution graph --cache both \
   --warmup 10 --repeat 100 \
   --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format q4q5 --form record --tokens 8 --batch 2 \
   --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format nvfp4 --nvfp4-policy a4 --sweep 1:17 \
   --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format q8 --tokens 16 --batch 8 \
   --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format nvfp4 --tokens 6 --batch 3 --valid-columns 6,3,1 \
   --execution graph --cache cold --warmup 10 --repeat 100
-./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+./build/bench/infernix_gdn_input_proj_conv_snapshot_bench \
   --format fp8 --fp8-policy a8 --form both --batch 1 --sweep 1:16 \
   --execution both --cache both --warmup 5 --repeat 30
 ```
@@ -611,7 +611,7 @@ public call. `--profile` likewise brackets one complete public call and requires
 point. There are no private headers, launchers, route labels, candidate controls, tile sizes, split
 counts, or kernel-name filters in these benchmarks.
 
-`ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
+`infernix_causal_softmax_attention_bench` measures the two public causal-cache entries:
 append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
 with BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, VQ2 and K4V2 KV storage (the latter two
 with their exact window planes, one state slot per batch row). Production dispatch
@@ -639,25 +639,25 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--fast-prompt-pv8` also selects the 8-bit P×V forms (INT8, NVFP4, K8V4, VQ2 and K4V2), and
 `--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
 `--prefill-split-workspace-mib`). `--prefill-8bit-pv` / `--no-prefill-8bit-pv` override the
-per-format P×V default of `ninfer-bench` itself (8-bit for NVFP4, K8V4 and VQ2; FP16 for INT8
+per-format P×V default of `infernix-bench` itself (8-bit for NVFP4, K8V4 and VQ2; FP16 for INT8
 and K4V2).
 
 ```bash
-cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
-./build/bench/ninfer_causal_softmax_attention_bench \
+cmake --build build --parallel --target infernix_causal_softmax_attention_bench
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry append --geometry all --kv-dtype all --batch 1,2,4,8 \
   --tokens 1,2,4,8,16 --context 8192,32768,131072 --mapping fragmented \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_causal_softmax_attention_bench \
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry append --geometry all --kv-dtype all --batch 1 \
   --tokens 1024 --context 8192,32768,131072 --mapping fragmented \
   --execution eager --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_causal_softmax_attention_bench \
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry append --geometry d256-h16-kv2 --kv-dtype int8 \
   --batch 3 --tokens 6 --row-contexts 127,2047,63 \
   --valid-columns 6,3,0 --table-rows 2,0,1 \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_causal_softmax_attention_bench \
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
   --tokens 16 --context 8192 --execution graph --cache cold --profile
 ```
@@ -680,19 +680,19 @@ and all PV use 16-bit Tensor Core throughput references. In particular, NVFP4 KV
 imply native FP4 QK. These useful-work fractions differ from profiler pipeline activity and actual
 DRAM traffic; use targeted profiling to explain the remaining gap.
 
-`ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
+`infernix_context_softmax_attention_bench` measures the public read-only context-plus-query contract
 at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
 external context length.
 
 ```bash
-cmake --build build --parallel --target ninfer_context_softmax_attention_bench
-./build/bench/ninfer_context_softmax_attention_bench \
+cmake --build build --parallel --target infernix_context_softmax_attention_bench
+./build/bench/infernix_context_softmax_attention_bench \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 0,2048,8192,32768,131072,196608,262144 \
   --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-`ninfer_sliding_window_attention_bench` measures the public Q32/KV8/D128 symmetric sliding-window
+`infernix_sliding_window_attention_bench` measures the public Q32/KV8/D128 symmetric sliding-window
 contract over a 2048- or 4096-slot cyclic BF16-K/FP16-V cache and a complete non-causal query
 block with nonzero represented K/V values. It reports the production route, key tile, split capacity,
 merge warp count, Graph node count, workspace, and exact batch shape. `--envelope-max N` holds the
@@ -702,12 +702,12 @@ gaps from short warm-cache measurements. For a cold bundle, L2 is flushed once b
 so only its first call starts cold. Profiling uses one public call (`--graph-calls 1`).
 
 ```bash
-cmake --build build --parallel --target ninfer_sliding_window_attention_bench
-./build/bench/ninfer_sliding_window_attention_bench \
+cmake --build build --parallel --target infernix_sliding_window_attention_bench
+./build/bench/infernix_sliding_window_attention_bench \
   --window 2048 --tokens 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --batches 1,2,3,4,5,6,7,8 \
   --context 64,96,97,128,2047,2048,262144 \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_sliding_window_attention_bench \
+./build/bench/infernix_sliding_window_attention_bench \
   --window 4096 \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --batches 1 \
@@ -715,21 +715,21 @@ cmake --build build --parallel --target ninfer_sliding_window_attention_bench
   --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-`ninfer_packed_softmax_attention_bench` measures both public dense Attention overloads: a uniform
+`infernix_packed_softmax_attention_bench` measures both public dense Attention overloads: a uniform
 plain-segment entry and a packed entry driven by cumulative segment lengths. Equal-length inputs
 can compare both public entries; nonuniform inputs select only `packed`.
 
 ```bash
-cmake --build build --parallel --target ninfer_packed_softmax_attention_bench
-./build/bench/ninfer_packed_softmax_attention_bench \
+cmake --build build --parallel --target infernix_packed_softmax_attention_bench
+./build/bench/infernix_packed_softmax_attention_bench \
   --entry both --segments 16 --length 256 \
   --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_packed_softmax_attention_bench \
+./build/bench/infernix_packed_softmax_attention_bench \
   --entry packed --segment-lengths 128,256,384,512 \
   --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-`ninfer_qsa_attention_bench` measures Qwen3.8-Flash-Next's public QSA attention (24/2 heads, D256,
+`infernix_qsa_attention_bench` measures Qwen3.8-Flash-Next's public QSA attention (24/2 heads, D256,
 a 4 x 128 indexer, budget 2048 in blocks of 4) for one row of W columns at the end of a C-token
 context, in any KV storage:
 - It reports the whole call (selection, attention, merge; for vq2/k4v2 also the Op's own append,
@@ -738,8 +738,8 @@ context, in any KV storage:
 - W = 1 is decode, 5 or 8 verification, and 86 or more columns the Tensor Core prompt route.
 
 ```bash
-cmake --build build --parallel --target ninfer_qsa_attention_bench
-./build/bench/ninfer_qsa_attention_bench --storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2 \
+cmake --build build --parallel --target infernix_qsa_attention_bench
+./build/bench/infernix_qsa_attention_bench --storage bf16,int8,fp8,nvfp4,k8v4,vq2,k4v2 \
   --contexts 8192,131072 --widths 1,5,8,256
 ```
 
@@ -749,7 +749,7 @@ instruction utilization require a profiler capture of the complete public call.
 
 ## KV cache append Op benchmark
 
-`ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
+`infernix_kv_cache_append_bench` unifies the two public append contracts without combining them in
 one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16, INT8-G64,
 FP8-E4M3FN-row256, NVFP4-G16, or K8V4 caches. Its report keeps key/value vector bytes separate for
 asymmetric storage profiles. `--mode prefix` calls device-count prefix publication for BF16
@@ -761,11 +761,11 @@ with the total Graph node count. A cold bundle flushes L2 only before its first 
 uses one public call.
 
 ```bash
-cmake --build build --parallel --target ninfer_kv_cache_append_bench
-./build/bench/ninfer_kv_cache_append_bench \
+cmake --build build --parallel --target infernix_kv_cache_append_bench
+./build/bench/infernix_kv_cache_append_bench \
   --mode full --full-geometry all --kv-dtype all --tokens 1,2,4,8,16 \
   --context 128 --execution graph --cache cold --warmup 10 --repeat 61
-./build/bench/ninfer_kv_cache_append_bench \
+./build/bench/infernix_kv_cache_append_bench \
   --mode prefix --tokens 1,2,4,8,16 --counts 0,1,2,4,8,16 \
   --layout all --execution graph --cache cold --warmup 10 --repeat 61
 ```
@@ -776,17 +776,17 @@ with a positive envelope still exercises device count handling and reports zero 
 
 ## Ragged-prefix preparation Op benchmark
 
-`ninfer_prepare_ragged_prefix_bench` measures the complete public gather/zero-fill operation,
+`infernix_prepare_ragged_prefix_bench` measures the complete public gather/zero-fill operation,
 including positions and counts. D=25600 is the DFlash2 feature vector; D=16384 covers existing
 DFlash. `--counts full|one|ragged|zero` controls actual per-request prefixes. Zero prefixes still
 write the full output tail and metadata. Each ordinary call has one kernel and zero scratch.
 
 ```bash
-cmake --build build -j --target ninfer_prepare_ragged_prefix_bench
-./build/bench/ninfer_prepare_ragged_prefix_bench \
+cmake --build build -j --target infernix_prepare_ragged_prefix_bench
+./build/bench/infernix_prepare_ragged_prefix_bench \
   --rows 25600 --widths 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --batches 1,2,3,4,5,6,7,8 --counts ragged --execution graph --cache cold
-./build/bench/ninfer_prepare_ragged_prefix_bench \
+./build/bench/infernix_prepare_ragged_prefix_bench \
   --widths 1,8,16 --batches 1,8 --counts full --cache warm --graph-calls 32
 ```
 
@@ -796,16 +796,16 @@ only before its first call. `--profile` captures one selected public call and re
 
 ## Masked-block preparation Op benchmark
 
-`ninfer_prepare_masked_block_bench` measures the public exact I32 anchor/mask transform for every
+`infernix_prepare_masked_block_bench` measures the public exact I32 anchor/mask transform for every
 registered `B=2..16`. Eager and graph modes call the same public contract; cold mode performs the
 256 MiB L2 eviction before the timed interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_prepare_masked_block_bench
-./build/bench/ninfer_prepare_masked_block_bench \
+cmake --build build --parallel --target infernix_prepare_masked_block_bench
+./build/bench/infernix_prepare_masked_block_bench \
   --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --execution graph --cache both --warmup 20 --repeat 101
-./build/bench/ninfer_prepare_masked_block_bench \
+./build/bench/infernix_prepare_masked_block_bench \
   --block-sizes 16 --execution graph --cache cold --profile
 ```
 
@@ -813,7 +813,7 @@ Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32
 
 ## Q8 LinearSwiGLU Op benchmark
 
-`ninfer_q8_linear_swiglu_bench` measures the public Q8 LinearSwiGLU profiles:
+`infernix_q8_linear_swiglu_bench` measures the public Q8 LinearSwiGLU profiles:
 `--problem companion` is `[12288,2048] -> [6144,T]`; `--problem dflash2` is
 `[34816,5120] -> [17408,T]`. Every timed call uses production dispatch and writes only the fused
 output. Workspace is queried for the requested interval before timing. Private candidate forcing
@@ -826,51 +826,51 @@ the logical weight/input/output bytes and the two projections' mathematical FLOP
 warms up and flushes before enabling CUDA profiling for exactly one complete Op call.
 
 ```bash
-cmake --build build -j --target ninfer_q8_linear_swiglu_bench
-./build/bench/ninfer_q8_linear_swiglu_bench \
+cmake --build build -j --target infernix_q8_linear_swiglu_bench
+./build/bench/infernix_q8_linear_swiglu_bench \
   --problem dflash2 --t-sweep 1,8,16,32,40,41,51,52,63,64,65,80,81,88,89,96,97,128,1024 \
   --execution graph --warmup 8 --repeat 60 \
   --csv-out profiles/bench/q8_linear_swiglu.csv
-./build/bench/ninfer_q8_linear_swiglu_bench \
+./build/bench/infernix_q8_linear_swiglu_bench \
   --problem dflash2 --profile --t-sweep 128
 ```
 
 ## Q4 LinearSwiGLU Op benchmark
 
-`ninfer_q4_linear_swiglu_bench` measures the public Q4 `[34816,5120] -> [17408,T]` profile and
+`infernix_q4_linear_swiglu_bench` measures the public Q4 `[34816,5120] -> [17408,T]` profile and
 queries workspace capacity for the requested aggregate interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
-./build/bench/ninfer_q4_linear_swiglu_bench \
+cmake --build build --parallel --target infernix_q4_linear_swiglu_bench
+./build/bench/infernix_q4_linear_swiglu_bench \
   --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
 ```
 
 ## NVFP4 LinearSwiGLU Op benchmark
 
-`ninfer_nvfp4_linear_swiglu_bench` measures the public NVFP4
+`infernix_nvfp4_linear_swiglu_bench` measures the public NVFP4
 `[34816,5120] -> [17408,T]` profile. Each sample measures the complete production-dispatched call,
 including activation quantization and caller-owned workspace when required. The fused epilogue
 consumes FP32 gate/up accumulators and writes only the final BF16 output.
 
 ```bash
-cmake --build build --parallel --target ninfer_nvfp4_linear_swiglu_bench
-./build/bench/ninfer_nvfp4_linear_swiglu_bench \
+cmake --build build --parallel --target infernix_nvfp4_linear_swiglu_bench
+./build/bench/infernix_nvfp4_linear_swiglu_bench \
   --policy a4 --t-sweep 5,48,49,56,64,65,96,97,128,256,1024 \
   --warmup 10 --repeat 50
 ```
 
 ## FP8 LinearSwiGLU Op benchmark
 
-`ninfer_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
+`infernix_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
 [17408,T]` profile. `--policy a8` measures the production resolver, including caller-owned
 activation workspace and the fused SwiGLU output; `--policy a16` measures the public A16 form.
 The Tensor Core percentage uses the RTX 5090 dense MXFP8/FP32-accumulate reference of 838 TFLOP/s
 only for extents that the production resolver sends to A8.
 
 ```bash
-cmake --build build --parallel --target ninfer_fp8_linear_swiglu_bench
-./build/bench/ninfer_fp8_linear_swiglu_bench \
+cmake --build build --parallel --target infernix_fp8_linear_swiglu_bench
+./build/bench/infernix_fp8_linear_swiglu_bench \
   --policy a8 \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,24,32,40,48,1024 \
   --warmup 5 --repeat 30
@@ -878,21 +878,21 @@ cmake --build build --parallel --target ninfer_fp8_linear_swiglu_bench
 
 ## Q5 LinearAdd Op benchmark
 
-`ninfer_q5_linear_add_bench` measures the public Q5 `[5120,6144]` and `[5120,17408]`
+`infernix_q5_linear_add_bench` measures the public Q5 `[5120,6144]` and `[5120,17408]`
 LinearAdd profiles. Every cold-cache sample is one production-dispatched public call, with the
 workspace capacity queried for the requested interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_q5_linear_add_bench
-./build/bench/ninfer_q5_linear_add_bench \
+cmake --build build --parallel --target infernix_q5_linear_add_bench
+./build/bench/infernix_q5_linear_add_bench \
   --k 6144 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
-./build/bench/ninfer_q5_linear_add_bench \
+./build/bench/infernix_q5_linear_add_bench \
   --k 17408 --t-sweep 1,2,4,8,16,24,32,48,49,56,64,192,193 --warmup 10 --repeat 50
 ```
 
 ## BF16 LinearAdd Op benchmark
 
-`ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
+`infernix_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
 in-place BF16 residual epilogue. Each production sample measures one complete public call after
 restoring the residual outside the timed region and flushing L2.
 Effective bandwidth counts the weight once, the activation once, and
@@ -900,41 +900,41 @@ the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explic
 references.
 
 ```bash
-cmake --build build --parallel --target ninfer_bf16_linear_add_bench
-./build/bench/ninfer_bf16_linear_add_bench \
+cmake --build build --parallel --target infernix_bf16_linear_add_bench
+./build/bench/infernix_bf16_linear_add_bench \
   --sweep 1:128:1 --route production --warmup 10 --repeat 50 \
   --csv-out profiles/bench/bf16_linear_add_t1_128.csv
-./build/bench/ninfer_bf16_linear_add_bench \
+./build/bench/infernix_bf16_linear_add_bench \
   --t-sweep 1024,1536,2048 --route production --warmup 10 --repeat 50
-./build/bench/ninfer_bf16_linear_add_bench \
+./build/bench/infernix_bf16_linear_add_bench \
   --t-sweep 1024 --route production --profile
 ```
 
 ## Q8 LinearAdd Op benchmark
 
-`ninfer_q8_linear_add_bench` measures the Q8 `[2048,4096]` and `[2048,6144]` projections with their
+`infernix_q8_linear_add_bench` measures the Q8 `[2048,4096]` and `[2048,6144]` projections with their
 BF16 residual epilogue. Production updates the residual in place and uses no workspace. Use
 `--production-only` for public evidence; every cold-cache sample follows a 256 MiB L2 flush.
 
 ```bash
-cmake --build build --parallel --target ninfer_q8_linear_add_bench
-./build/bench/ninfer_q8_linear_add_bench \
+cmake --build build --parallel --target infernix_q8_linear_add_bench
+./build/bench/infernix_q8_linear_add_bench \
   --k 4096 --production-only \
   --t-sweep 1,2,4,8,16,32,48,64,96,128 --warmup 10 --repeat 50
-./build/bench/ninfer_q8_linear_add_bench \
+./build/bench/infernix_q8_linear_add_bench \
   --k 6144 --production-only \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,64,65,96,128,256,640,641,896,960,1024,1280,2048 \
   --warmup 10 --repeat 50 --csv-out profiles/bench/q8_linear_add.csv
-./build/bench/ninfer_q8_linear_add_bench \
+./build/bench/infernix_q8_linear_add_bench \
   --production-only --t-sweep "$(seq -s, 1 2048)" \
   --warmup 3 --repeat 15 --csv-out profiles/bench/q8_linear_add_all_t.csv
-./build/bench/ninfer_q8_linear_add_bench \
+./build/bench/infernix_q8_linear_add_bench \
   --profile --production-only --t-sweep 1024
 ```
 
 ## FP8 LinearAdd Op benchmark
 
-`ninfer_fp8_linear_add_bench` measures the two public row-scaled FP8 LinearAdd registrations,
+`infernix_fp8_linear_add_bench` measures the two public row-scaled FP8 LinearAdd registrations,
 including activation quantization, caller-owned workspace, contraction, residual read, and final
 in-place BF16 write. `--policy a8` follows the independent production resolver of the selected
 semantic Op: `[5120,6144]` uses A16 below `T=22`, while `[5120,17408]` uses A16 below `T=25`; larger
@@ -942,18 +942,18 @@ extents use FP8/FP32-accumulate Tensor Core contraction. `TC_%` is reported only
 actually executes, against the RTX 5090 unit-scale MXFP8/FP32-accumulate 838 TFLOP/s reference.
 
 ```bash
-cmake --build build --parallel --target ninfer_fp8_linear_add_bench
-./build/bench/ninfer_fp8_linear_add_bench \
+cmake --build build --parallel --target infernix_fp8_linear_add_bench
+./build/bench/infernix_fp8_linear_add_bench \
   --k 6144 --policy a8 --t-sweep 1,2,4,8,16,20,21,22,32,48,1024 \
   --warmup 5 --repeat 30
-./build/bench/ninfer_fp8_linear_add_bench \
+./build/bench/infernix_fp8_linear_add_bench \
   --k 17408 --policy a8 --t-sweep 1,2,4,8,16,24,25,32,48,1024 \
   --warmup 5 --repeat 30
 ```
 
 ## Attention input-projection Op benchmark
 
-`ninfer_attn_input_proj_bench` measures every registered public `attn_input_proj()` weight/shape
+`infernix_attn_input_proj_bench` measures every registered public `attn_input_proj()` weight/shape
 contract: the 27B two-parent Q4/Q5 projection; the 35B Q8 Q/K/gate/V and companion Q/K/V
 projections; the DFlash2 Q8 `[6144,5120]` Q/K/V projection; and the 27B BF16, NVFP4, and FP8
 single-parent Q/K/gate/V projections. Fixture packing and public workspace capacity queries happen
@@ -971,31 +971,31 @@ allocation reserved for the entire requested sweep. Logical GB/s counts semantic
 bytes; it is not a measured DRAM utilization percentage.
 
 ```bash
-cmake --build build -j --target ninfer_attn_input_proj_bench
-./build/bench/ninfer_attn_input_proj_bench \
+cmake --build build -j --target infernix_attn_input_proj_bench
+./build/bench/infernix_attn_input_proj_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 10 --repeat 50 \
   --csv-out profiles/bench/attn_input_proj.csv
-./build/bench/ninfer_attn_input_proj_bench \
+./build/bench/infernix_attn_input_proj_bench \
   --format nvfp4 --nvfp4-policy a4 --tokens 1024 \
   --cache cold --warmup 10 --profile
-./build/bench/ninfer_attn_input_proj_bench \
+./build/bench/infernix_attn_input_proj_bench \
   --format fp8 --fp8-policy a8 --tokens 1,5,32,64,65,96,128 \
   --cache cold --warmup 10 --repeat 50
-./build/bench/ninfer_attn_input_proj_bench \
+./build/bench/infernix_attn_input_proj_bench \
   --format q8-dflash2-qkv --tokens 8,16,32,53,54,64,65,96,128,1024 \
   --execution graph --cache cold --warmup 10 --repeat 50
 ```
 
 The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
-it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.
+it is not a mode of Attention input projection. End-to-end target measurement uses `infernix_bench`.
 
 ## 35B sparse-MoE dFlash benchmark
 
-`ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
+`infernix_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
 Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. It is a long-lived public Op benchmark: fixture setup
 uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
-`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
+`infernix::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
 workspace views, launch decomposition, and schedule selection.
 
 CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
@@ -1006,11 +1006,11 @@ body while excluding fixture reset, L2 eviction, graph capture/instantiation/pri
 and host synchronization. `eager` uses the same public-call lambda and is only a comparison mode.
 
 ```bash
-cmake --build build --parallel --target ninfer_sparse_moe_bench
-./build/bench/ninfer_sparse_moe_bench \
+cmake --build build --parallel --target infernix_sparse_moe_bench
+./build/bench/infernix_sparse_moe_bench \
   --codec q4-q5 --tokens 1 --execution graph --cache both \
   --distribution trace-like --warmup 20 --repeat 200
-./build/bench/ninfer_sparse_moe_bench \
+./build/bench/infernix_sparse_moe_bench \
   --codec q4-q5 --sweep 1:128:1 --execution graph --cache cold \
   --distribution trace-like --warmup 5 --repeat 50 \
   --csv-out profiles/bench/sparse_moe_public_graph.csv
@@ -1029,25 +1029,25 @@ router plus eight routed and one shared gate/up and down matrix products.
 
 ## Q8 context K/V LinearPair benchmark
 
-`ninfer_linear_pair_bench` measures one public `linear_pair()` call over exact adjacent Q8
+`infernix_linear_pair_bench` measures one public `linear_pair()` call over exact adjacent Q8
 `[1024,K]` K/V row views of a `[6144,K]` QKV parent, for the registered `K=2048` and `K=5120`
 geometries. It uses cold-cache eager execution or CUDA Graph replay, accepts an arbitrary token
 list or sweep, and reports route-neutral effective bandwidth, logical FLOP/s, and calculated T=1
 linear extrapolation.
 
 ```bash
-cmake --build build -j --target ninfer_linear_pair_bench
-./build/bench/ninfer_linear_pair_bench \
+cmake --build build -j --target infernix_linear_pair_bench
+./build/bench/infernix_linear_pair_bench \
   --k 2048 --sweep 1:128:1 --execution graph --warmup 5 --repeat 30
-./build/bench/ninfer_linear_pair_bench \
+./build/bench/infernix_linear_pair_bench \
   --k 5120 --tokens 8,16,24,32,40,48,56,64 --execution graph --warmup 5 --repeat 30
-./build/bench/ninfer_linear_pair_bench \
+./build/bench/infernix_linear_pair_bench \
   --k 5120 --tokens 128,1024,2048 --execution eager --warmup 5 --repeat 30
 ```
 
 ## Five-layer context K/V materialization benchmark
 
-`ninfer_context_kv_materialize_bench` measures the complete capacity-2048 DFlash2 context-cache
+`infernix_context_kv_materialize_bench` measures the complete capacity-2048 DFlash2 context-cache
 state transition over `W=1..16,B=1..8` and single-request prefill `W=1..2048`. It calls the public
 Op with five independent `[6144,5120]` QKV-parent K/V row views and caller-owned workspace.
 CSV rows report physical geometry, count envelope, whole-Op latency, Graph nodes, and the public
@@ -1057,49 +1057,49 @@ outside the measurement. Zero-count rows verify an empty Graph and report latenc
 envelope. Widths above 16 are measured only for B=1. These are Op measurements, not Engine results.
 
 ```bash
-cmake --build build -j --target ninfer_context_kv_materialize_bench
-./build/bench/ninfer_context_kv_materialize_bench \
+cmake --build build -j --target infernix_context_kv_materialize_bench
+./build/bench/infernix_context_kv_materialize_bench \
   --widths 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --batches 1,2,3,4,5,6,7,8 --counts full --execution graph --warmup 8 --repeat 60
-./build/bench/ninfer_context_kv_materialize_bench \
+./build/bench/infernix_context_kv_materialize_bench \
   --widths 8,16,128,2048 --batches 1,8 --counts one --warmup 8 --repeat 60
-./build/bench/ninfer_context_kv_materialize_bench \
+./build/bench/infernix_context_kv_materialize_bench \
   --widths 17,85,86,128,512,1024,2048 --batches 1 --warmup 8 --repeat 60
 ```
 
 ## MTP exact-transform benchmark
 
-`ninfer_mtp_pack_bench` calls the public bit-exact pack or attention-split Op once per point:
+`infernix_mtp_pack_bench` calls the public bit-exact pack or attention-split Op once per point:
 
 ```bash
-cmake --build build --parallel --target ninfer_mtp_pack_bench
-./build/bench/ninfer_mtp_pack_bench --op pack --d 5120 --tokens 1,2,3,4,5,6,48
-./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
+cmake --build build --parallel --target infernix_mtp_pack_bench
+./build/bench/infernix_mtp_pack_bench --op pack --d 5120 --tokens 1,2,3,4,5,6,48
+./build/bench/infernix_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
 ```
 
 ## Model MTP round benchmark
 
-`ninfer_qwen3_5_mtp_round_bench` measures the native MTP proposal and verification round. It
+`infernix_qwen3_5_mtp_round_bench` measures the native MTP proposal and verification round. It
 constructs the same v3 ModelInstance used by Engine, prepares a fixed token seed, and drives the
 production Program's decode/commit schedule. It reports round latency and licensed-token counts:
 
 ```bash
-cmake --build build --parallel --target ninfer_qwen3_5_mtp_round_bench
-./build/bench/ninfer_qwen3_5_mtp_round_bench \
+cmake --build build --parallel --target infernix_qwen3_5_mtp_round_bench
+./build/bench/infernix_qwen3_5_mtp_round_bench \
   --artifact out/qwen3_6_27b.ninfer
 ```
 
 ## 35B complete DFlash round benchmark
 
-`ninfer_qwen3_5_dflash_round_bench` drives the production Program through consecutive
+`infernix_qwen3_5_dflash_round_bench` drives the production Program through consecutive
 steady DFlash rounds. A measured round includes the previous confirmed feature-to-context append,
 the six-layer proposal, target verify/accept, and host publication. It reports GPU and wall latency,
 real acceptance, per-position acceptance, mean licensed length, and published tokens/s:
 
 ```bash
 cmake --build build --parallel \
-  --target ninfer_qwen3_5_dflash_round_bench
-./build/bench/ninfer_qwen3_5_dflash_round_bench \
+  --target infernix_qwen3_5_dflash_round_bench
+./build/bench/infernix_qwen3_5_dflash_round_bench \
   --artifact out/qwen3_6_35b_a3b.ninfer \
   --context 4096 --draft-tokens 15 --proposal-head optimized
 ```
@@ -1115,10 +1115,10 @@ valid rows through `C=128`, and for the 131072-row shortlist through `C=120`. Wi
 covers every B=1 full-vocabulary width, both T1 routes, and both aggregate maxima:
 
 ```bash
-cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
-./build/bench/ninfer_argmax_bench
-./build/bench/ninfer_argmax_bench --shape full --cols 128
-./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
+cmake --build build --parallel --target infernix_argmax_bench infernix_sampling_select_bench
+./build/bench/infernix_argmax_bench
+./build/bench/infernix_argmax_bench --shape full --cols 128
+./build/bench/infernix_argmax_bench --shape shortlist --cols 120
 ```
 
 The G2/G3/G4 benchmark uses physical rows 248320 and valid token domain 248077. G2 covers optional
@@ -1136,16 +1136,16 @@ exercise rejection; `--extent 0` checks the bonus-only case. These DFlash2 measu
 measure Engine inference.
 
 ```bash
-./build/bench/ninfer_sampling_select_bench --matrix
-./build/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
-./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
-./build/bench/ninfer_sampling_select_bench \
+./build/bench/infernix_sampling_select_bench --matrix
+./build/bench/infernix_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
+./build/bench/infernix_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
+./build/bench/infernix_sampling_select_bench \
   --dflash2 --drafts 15 --batch 8 --mode greedy --graph-calls 32 --warmup 8 --repeat 60
-./build/bench/ninfer_sampling_select_bench \
+./build/bench/infernix_sampling_select_bench \
   --dflash2 --drafts 15 --batch 8 --mode stochastic --top-k 20 --warmup 8 --repeat 60
-./build/bench/ninfer_sampling_select_bench \
+./build/bench/infernix_sampling_select_bench \
   --dflash2 --drafts 7 --batch 8 --mode stochastic --mixed --extent 3
-./build/bench/ninfer_sampling_select_bench \
+./build/bench/infernix_sampling_select_bench \
   --dflash2 --drafts 15 --batch 8 --mode stochastic --no-counts --reject-at 7
 ```
 
@@ -1156,12 +1156,12 @@ append-and-attend and already-cached entries for the D256 H16/KV2 geometry. Batc
 qualification uses the append entry:
 
 ```bash
-./build/bench/ninfer_causal_softmax_attention_bench \
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry append --geometry d256-h16-kv2 --kv-dtype bf16 \
   --batch 1,2,4,8 \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 128,1024,8192 --execution graph --cache cold
-./build/bench/ninfer_causal_softmax_attention_bench \
+./build/bench/infernix_causal_softmax_attention_bench \
   --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 128,1024,8192 --execution graph --cache cold
@@ -1180,16 +1180,16 @@ bitwise work:
 
 ```bash
 cmake --build build --parallel --target \
-  ninfer_residual_add_bench ninfer_sigmoid_mul_bench \
-  ninfer_gelu_bench ninfer_add_bias_bench
+  infernix_residual_add_bench infernix_sigmoid_mul_bench \
+  infernix_gelu_bench infernix_add_bias_bench
 
-./build/bench/ninfer_residual_add_bench [--patches P] [--control]
-./build/bench/ninfer_sigmoid_mul_bench \
+./build/bench/infernix_residual_add_bench [--patches P] [--control]
+./build/bench/infernix_sigmoid_mul_bench \
   [--tokens T[,T...]] [--control | --candidate-block B]
-./build/bench/ninfer_position_bench \
+./build/bench/infernix_position_bench \
   [--tokens T[,T...]] [--candidate-block B] [--cold-graph] [--warmup N] [--repeat N]
-./build/bench/ninfer_gelu_bench [--mode tanh|exact --columns C] [--control]
-./build/bench/ninfer_add_bias_bench [--d D --columns C] [--control]
+./build/bench/infernix_gelu_bench [--mode tanh|exact --columns C] [--control]
+./build/bench/infernix_add_bias_bench [--d D --columns C] [--control]
 ```
 
 Aligned registered shapes use 16-byte BF16 packs in the cache-sized regime. GELU and AddBias
@@ -1198,13 +1198,13 @@ test shapes exercise the scalar fallbacks.
 
 ## Causal conv1d SiLU Op benchmark
 
-`ninfer_causal_conv1d_silu_bench` times one public entry per invocation. `--tokens` takes a list, so
+`infernix_causal_conv1d_silu_bench` times one public entry per invocation. `--tokens` takes a list, so
 a route decision comes from one process rather than a series of them. `--cache` defaults to warm;
 pass `--cache cold` for the state route decisions are made in.
 
 ```bash
-./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 8192 --tokens 1,2,7,15,16,17,24,32,33,64,65
-./build/bench/ninfer_causal_conv1d_silu_bench --split --cache cold --channels 10240 --tokens 1024,4096,8192
+./build/bench/infernix_causal_conv1d_silu_bench --split --cache cold --channels 8192 --tokens 1,2,7,15,16,17,24,32,33,64,65
+./build/bench/infernix_causal_conv1d_silu_bench --split --cache cold --channels 10240 --tokens 1024,4096,8192
 ```
 
 `--split` selects the split-output entry. Its partition follows the channel extent, because those
@@ -1217,7 +1217,7 @@ timing conditions. It is a decision benchmark and is meant to be removed once th
 closed.
 
 ```bash
-./build/bench/ninfer_causal_conv1d_silu_bench --legacy-stage --split --cache cold --channels 8192 --tokens 1024,8192
+./build/bench/infernix_causal_conv1d_silu_bench --legacy-stage --split --cache cold --channels 8192 --tokens 1024,8192
 ```
 
 ## Reports

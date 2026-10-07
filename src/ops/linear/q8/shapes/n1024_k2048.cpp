@@ -1,6 +1,6 @@
 #include "ops/linear/q8/q8_shapes.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 Q8Launch select_q8_n1024_k2048(std::int32_t tokens) {
     if (tokens <= 4) return launch_q8_a16_simt_r8_t4;
@@ -10,4 +10,4 @@ Q8Launch select_q8_n1024_k2048(std::int32_t tokens) {
     return launch_q8_a16_mma_r32_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

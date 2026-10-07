@@ -6,7 +6,7 @@
 
 #include <utility>
 
-namespace ninfer::product {
+namespace infernix::product {
 
 DiagnosticObserver engine_diagnostic_observer(std::shared_ptr<spdlog::logger> logger) {
     return DiagnosticObserver{
@@ -29,4 +29,4 @@ DiagnosticObserver engine_diagnostic_observer(std::shared_ptr<spdlog::logger> lo
         }};
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

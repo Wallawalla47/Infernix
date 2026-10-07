@@ -2,7 +2,7 @@
 #include "ops/common/math.cuh"
 #include "ops/linear/q8/q8_a16_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // The projection stays FP32 through the vectorized residual addition.
 struct Q8AddMmaEpilogue {
     template <class Schedule>
@@ -81,4 +81,4 @@ struct Q8AddMmaEpilogue {
         }
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

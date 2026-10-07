@@ -45,7 +45,7 @@ int main() {
     // Earlier work on the stream: the batch must land after this memset.
     CUDA_CHECK(cudaMemsetAsync(device, 0, kBlock * kBlocks, stream));
     {
-        ninfer::CopyBatch batch(stream);
+        infernix::CopyBatch batch(stream);
         // Disjoint: device block d <- host block (d * 7) % kBlocks for the first 32 blocks.
         for (std::size_t d = 0; d < 32; ++d) {
             const std::size_t s = (d * 7) % kBlocks;

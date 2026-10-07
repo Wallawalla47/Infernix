@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/weight.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
@@ -12,7 +12,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::bench {
+namespace infernix::bench {
 
 struct PackedQuantizedWeight {
     DeviceBuffer storage;
@@ -366,4 +366,4 @@ inline Weight row_view(const Weight& parent, std::int32_t row_begin, std::int32_
     return view;
 }
 
-} // namespace ninfer::bench
+} // namespace infernix::bench

@@ -1,6 +1,6 @@
 # Qwen3.5 model reference
 
-This reference describes the Qwen3.5 Dense and MoE mathematics implemented by NInfer, including
+This reference describes the Qwen3.5 Dense and MoE mathematics implemented by Infernix, including
 Text, MTP, Vision and their state semantics. The Qwen3.6 and Qwen3.8 releases used by the official
 artifacts are instances of these architectures. Their release names do not choose another graph.
 
@@ -158,8 +158,8 @@ The logical cached values are normalized/rotated K and projected V. Prefill appe
 uses causal attention; decode appends one column and attends over the visible prefix.
 
 Paging and KV quantization are storage choices. Their contracts are
-[`kv_cache_append.h`](../../include/ninfer/ops/kv_cache_append.h),
-[`softmax_attention.h`](../../include/ninfer/ops/softmax_attention.h) and
+[`kv_cache_append.h`](../../include/infernix/ops/kv_cache_append.h),
+[`softmax_attention.h`](../../include/infernix/ops/softmax_attention.h) and
 [paged KV cache](paged-kv-cache.md).
 
 ### Gated DeltaNet

@@ -9,7 +9,7 @@
 
 #include <memory>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Validates the options and resolves every default; the hybrid prefix cache's Host tier, Device
 // snapshot slots and tap budget depend on the model architecture.
@@ -50,4 +50,4 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
 
 [[nodiscard]] ConstructedModel construct_model(EngineOptions& options, DeviceContext& device);
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

@@ -339,7 +339,7 @@ def _draw_image(index: int) -> Any:
             width=12,
         )
     draw.rectangle((24, 24, 310, 112), fill=(245, 245, 245), outline=(10, 10, 10), width=5)
-    draw.text((42, 46), f"NINFER TTFT IMAGE {index:02d}", fill=(5, 5, 5))
+    draw.text((42, 46), f"INFERNIX TTFT IMAGE {index:02d}", fill=(5, 5, 5))
     return image
 
 
@@ -597,7 +597,7 @@ def build(tokenizer_path: Path) -> None:
         raise RuntimeError("28-image fixture exceeds the encoded-media byte limit")
 
     manifest: dict[str, Any] = {
-        "artifact_type": "ninfer_serve_ttft_corpus",
+        "artifact_type": "infernix_serve_ttft_corpus",
         "schema_version": 1,
         "tokenizer": {
             "identity": "Qwen/Qwen3.6-family",
@@ -737,7 +737,7 @@ def build(tokenizer_path: Path) -> None:
 def check() -> None:
     manifest_path = FIXTURE_ROOT / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("artifact_type") != "ninfer_serve_ttft_corpus":
+    if manifest.get("artifact_type") != "infernix_serve_ttft_corpus":
         raise RuntimeError("TTFT corpus manifest has the wrong artifact_type")
 
     records: list[dict[str, Any]] = []

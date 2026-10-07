@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using bf16 = __nv_bfloat16;
@@ -120,4 +120,4 @@ void q8_linear_swiglu_stream_pair_launch(const Tensor& x, const Weight& w, Tenso
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -3,7 +3,7 @@
 #include <array>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 namespace {
 
 constexpr ContextPrefillCost kGroupwise27bPrefill{
@@ -79,4 +79,4 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults() {
     return defaults;
 }
 
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

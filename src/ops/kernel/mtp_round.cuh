@@ -1,11 +1,11 @@
 #pragma once
 
-// Implements: include/ninfer/ops/mtp_round.h
+// Implements: include/infernix/ops/mtp_round.h
 // Match: request-major K=1..63 verification and N=1..5 next MTP proposals.
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 __global__ void mtp_prepare_next_round_kernel(
     const std::int32_t* verify_ids, const std::int32_t* next_anchors, const std::int32_t* accepted,
@@ -41,4 +41,4 @@ __global__ void mtp_prepare_next_round_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

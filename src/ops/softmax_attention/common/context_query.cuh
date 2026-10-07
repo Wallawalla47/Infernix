@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 inline constexpr int kContextQueryHeadDim  = 128;
 inline constexpr int kContextQueryQHeads   = 32;
@@ -579,4 +579,4 @@ context_query_reduce_body(const __nv_bfloat16* __restrict__ partial_acc,
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

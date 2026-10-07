@@ -1,5 +1,5 @@
 #include "core/weight.h"
-#include "ninfer/ops/attn_input_proj.h"
+#include "infernix/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -295,4 +295,4 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     detail::q8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

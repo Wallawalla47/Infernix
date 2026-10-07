@@ -3,7 +3,7 @@
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     const Fp8AttentionInputOutput output{
@@ -17,4 +17,4 @@ void fp8_attn_input_a16_small_mma_launch(const Tensor& x, const Weight& weight, 
     if (x.ne[1] <= 24) return launch.template operator()<Fp8SlicedInstance<32, 4, 2>>();
     launch.template operator()<Fp8SlicedInstance<32, 4, 1>>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

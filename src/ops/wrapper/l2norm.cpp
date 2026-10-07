@@ -1,5 +1,5 @@
-// ninfer::ops - l2norm wrapper: public api validation and launcher dispatch.
-#include "ninfer/ops/l2norm.h"
+// infernix::ops - l2norm wrapper: public api validation and launcher dispatch.
+#include "infernix/ops/l2norm.h"
 
 #include "ops/launcher/l2norm.h" // detail::l2norm_launch
 
@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
@@ -69,4 +69,4 @@ void l2norm(const Tensor& x, float eps, Tensor& out, cudaStream_t stream) {
     detail::l2norm_launch(x, eps, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

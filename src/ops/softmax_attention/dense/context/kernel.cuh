@@ -2,7 +2,7 @@
 
 #include "ops/softmax_attention/common/context_query.cuh"
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 struct ContextAttentionPolicy {
     static constexpr bool PageMapped = true;
@@ -102,4 +102,4 @@ __launch_bounds__(128, 2) __global__
                                                 valid_columns, max_context, split_capacity, out);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

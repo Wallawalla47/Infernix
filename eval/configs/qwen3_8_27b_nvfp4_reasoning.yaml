@@ -48,7 +48,7 @@ suites:
           top_k: 20
           presence_penalty: 0.0
           frequency_penalty: 0.0
-          # NInfer has no repetition_penalty field; the recommended 1.0 is the identity operation.
+          # Infernix has no repetition_penalty field; the recommended 1.0 is the identity operation.
           # At C=2, two full budgets use 245,760 of the measured 255,360-token KV pool.
           max_tokens: 122880
           seed: 42

@@ -11,7 +11,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class Geometry>
@@ -44,4 +44,4 @@ void fp8_linear_add_decode_launch(const Tensor& x, const Weight& weight, Tensor&
     throw std::invalid_argument("fp8 linear_add: unsupported problem");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

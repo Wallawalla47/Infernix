@@ -34,8 +34,8 @@
 
 namespace {
 
-using Frontend        = ninfer::models::qwen3_5::Frontend;
-using FrontendFactory = ninfer::models::qwen3_5::FrontendTestAccess;
+using Frontend        = infernix::models::qwen3_5::Frontend;
+using FrontendFactory = infernix::models::qwen3_5::FrontendTestAccess;
 
 struct FrontendResources {
     std::string tokenizer_json, tokenizer_config_json, chat_template_jinja, generation_config_json;
@@ -43,27 +43,27 @@ struct FrontendResources {
 };
 
 Frontend make_frontend(const FrontendResources& source,
-                       ninfer::models::qwen3_5::FrontendOptions options) {
-    ninfer::models::qwen3_5::FrontendResources parsed{
+                       infernix::models::qwen3_5::FrontendOptions options) {
+    infernix::models::qwen3_5::FrontendResources parsed{
         source.tokenizer_json,           source.tokenizer_config_json,
         source.chat_template_jinja,      source.generation_config_json,
         source.preprocessor_config_json, source.video_preprocessor_config_json};
-    parsed.tokenizer = std::make_shared<const ninfer::models::qwen3_5::frontend::Tokenizer>(
-        ninfer::models::qwen3_5::frontend::TokenizerResources{
+    parsed.tokenizer = std::make_shared<const infernix::models::qwen3_5::frontend::Tokenizer>(
+        infernix::models::qwen3_5::frontend::TokenizerResources{
             source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
     parsed.public_token_count = static_cast<std::uint32_t>(parsed.tokenizer->vocab_size());
-    return ninfer::models::qwen3_5::make_frontend(parsed, options);
+    return infernix::models::qwen3_5::make_frontend(parsed, options);
 }
 
 Frontend make_frontend(const FrontendResources& source, bool vision = true) {
-    ninfer::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen3_5::FrontendOptions options;
     options.vision_enabled = vision;
     options.max_context    = std::numeric_limits<std::uint32_t>::max();
     return make_frontend(source, options);
 }
 
-using PublishedOutput = ninfer::models::qwen3_5::PublishedOutput;
-namespace fi          = ninfer::models::qwen3_5::frontend;
+using PublishedOutput = infernix::models::qwen3_5::PublishedOutput;
+namespace fi          = infernix::models::qwen3_5::frontend;
 
 constexpr std::string_view kThinkingControlGuidance =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
@@ -73,9 +73,9 @@ constexpr std::string_view kThinkingControl =
     "thinking directly now.\n</think>\n\n";
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
-constexpr ninfer::TokenId kFixtureByteTokenBase = 1'000;
+constexpr infernix::TokenId kFixtureByteTokenBase = 1'000;
 
-constexpr ninfer::TokenId fixture_byte_token(std::uint8_t byte) {
+constexpr infernix::TokenId fixture_byte_token(std::uint8_t byte) {
     // Preserve IDs already used by the output-session fixtures. All other bytes live outside the
     // added-token range so the synthetic tokenizer can encode arbitrary UTF-8 test input.
     switch (byte) {
@@ -116,24 +116,24 @@ constexpr ninfer::TokenId fixture_byte_token(std::uint8_t byte) {
     }
 }
 
-constexpr ninfer::TokenId kByte80Token = fixture_byte_token(0x80);
-constexpr ninfer::TokenId kByteE0Token = fixture_byte_token(0xe0);
-constexpr ninfer::TokenId kByteEDToken = fixture_byte_token(0xed);
-constexpr ninfer::TokenId kByteA0Token = fixture_byte_token(0xa0);
-constexpr ninfer::TokenId kByteF4Token = fixture_byte_token(0xf4);
-constexpr ninfer::TokenId kByte90Token = fixture_byte_token(0x90);
-constexpr ninfer::TokenId kByteF5Token = fixture_byte_token(0xf5);
-constexpr ninfer::TokenId kByteF0Token = fixture_byte_token(0xf0);
-constexpr ninfer::TokenId kByte9FToken = fixture_byte_token(0x9f);
-constexpr ninfer::TokenId kByte98Token = fixture_byte_token(0x98);
-constexpr ninfer::TokenId kByteC2Token = fixture_byte_token(0xc2);
-constexpr ninfer::TokenId kByteA2Token = fixture_byte_token(0xa2);
+constexpr infernix::TokenId kByte80Token = fixture_byte_token(0x80);
+constexpr infernix::TokenId kByteE0Token = fixture_byte_token(0xe0);
+constexpr infernix::TokenId kByteEDToken = fixture_byte_token(0xed);
+constexpr infernix::TokenId kByteA0Token = fixture_byte_token(0xa0);
+constexpr infernix::TokenId kByteF4Token = fixture_byte_token(0xf4);
+constexpr infernix::TokenId kByte90Token = fixture_byte_token(0x90);
+constexpr infernix::TokenId kByteF5Token = fixture_byte_token(0xf5);
+constexpr infernix::TokenId kByteF0Token = fixture_byte_token(0xf0);
+constexpr infernix::TokenId kByte9FToken = fixture_byte_token(0x9f);
+constexpr infernix::TokenId kByte98Token = fixture_byte_token(0x98);
+constexpr infernix::TokenId kByteC2Token = fixture_byte_token(0xc2);
+constexpr infernix::TokenId kByteA2Token = fixture_byte_token(0xa2);
 
 // The fixture's added token for the literal reasoning close marker.
-constexpr ninfer::TokenId kFixtureThinkCloseToken = 248069;
+constexpr infernix::TokenId kFixtureThinkCloseToken = 248069;
 
-std::vector<ninfer::TokenId> fixture_tokens(std::string_view text) {
-    std::vector<ninfer::TokenId> tokens;
+std::vector<infernix::TokenId> fixture_tokens(std::string_view text) {
+    std::vector<infernix::TokenId> tokens;
     tokens.reserve(text.size());
     for (const char byte : text) {
         tokens.push_back(fixture_byte_token(static_cast<std::uint8_t>(byte)));
@@ -169,13 +169,13 @@ std::string read_template_fixture(const char* path) { return read_file(path); }
 
 const std::string& thinking_toggle_template_source() {
     static const std::string source =
-        read_template_fixture(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_6.jinja");
+        read_template_fixture(INFERNIX_SOURCE_DIR "/tools/chat_templates/qwen3_6.jinja");
     return source;
 }
 
 const std::string& reasoning_effort_template_source() {
     static const std::string source =
-        read_template_fixture(NINFER_SOURCE_DIR "/tools/chat_templates/qwen3_8.jinja");
+        read_template_fixture(INFERNIX_SOURCE_DIR "/tools/chat_templates/qwen3_8.jinja");
     return source;
 }
 
@@ -208,7 +208,7 @@ std::string byte_level_symbol(std::uint8_t target) {
                              (value >= 174 && value <= 255);
         const std::uint32_t codepoint = visible ? static_cast<std::uint32_t>(value) : next++;
         if (value == target) {
-            return ninfer::text::unicode_internal::codepoint_to_utf8(
+            return infernix::text::unicode_internal::codepoint_to_utf8(
                 static_cast<std::int32_t>(codepoint));
         }
     }
@@ -304,38 +304,38 @@ std::vector<std::uint8_t> block_ppm(int width, int height, std::uint8_t value) {
     return ppm;
 }
 
-ninfer::PromptInput image_text_input(std::vector<std::uint8_t> bytes, std::string text,
+infernix::PromptInput image_text_input(std::vector<std::uint8_t> bytes, std::string text,
                                      std::string source_name) {
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+    infernix::MessagePart image;
+    image.kind              = infernix::MessagePartKind::Media;
+    image.media.kind        = infernix::MediaKind::Image;
     image.media.bytes       = std::move(bytes);
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = std::move(source_name);
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(std::move(image));
     if (!text.empty()) {
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        message.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = std::move(text), .media = {}});
     }
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     return input;
 }
 
-ninfer::PromptInput image_input() {
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+infernix::PromptInput image_input() {
+    infernix::MessagePart image;
+    image.kind              = infernix::MessagePartKind::Media;
+    image.media.kind        = infernix::MediaKind::Image;
     image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(std::move(image));
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     return input;
 }
@@ -347,15 +347,15 @@ constexpr std::array<std::uint8_t, 32> kGradientDigest{
     0x4d, 0x21, 0xff, 0xc7, 0xe9, 0xa2, 0x2b, 0x34, 0xc0, 0xec, 0x99, 0x84, 0x6c, 0xa9, 0xa4, 0x8a,
 };
 
-std::string channel_text(const PublishedOutput& output, ninfer::OutputChannel channel) {
+std::string channel_text(const PublishedOutput& output, infernix::OutputChannel channel) {
     std::string result;
-    for (const ninfer::OutputDelta& delta : output) {
+    for (const infernix::OutputDelta& delta : output) {
         if (delta.channel == channel) { result += delta.text; }
     }
     return result;
 }
 
-fi::ChatMessage chat_message(ninfer::ChatRole role, std::string content) {
+fi::ChatMessage chat_message(infernix::ChatRole role, std::string content) {
     fi::ChatMessage message;
     message.role = role;
     message.parts.push_back(fi::ChatPart::text_part(std::move(content)));
@@ -381,21 +381,21 @@ bool throws_invalid_argument(Callable&& callable) {
 }
 
 int test_invalid_public_part_enums(const Frontend& frontend) {
-    ninfer::ChatMessage invalid_part_message;
-    invalid_part_message.role = ninfer::ChatRole::User;
-    invalid_part_message.parts.push_back(ninfer::MessagePart{
-        .kind = static_cast<ninfer::MessagePartKind>(255), .text = "invalid", .media = {}});
-    ninfer::PromptInput invalid_part;
+    infernix::ChatMessage invalid_part_message;
+    invalid_part_message.role = infernix::ChatRole::User;
+    invalid_part_message.parts.push_back(infernix::MessagePart{
+        .kind = static_cast<infernix::MessagePartKind>(255), .text = "invalid", .media = {}});
+    infernix::PromptInput invalid_part;
     invalid_part.messages.push_back(std::move(invalid_part_message));
 
-    ninfer::MessagePart media;
-    media.kind       = ninfer::MessagePartKind::Media;
-    media.media.kind = static_cast<ninfer::MediaKind>(255);
+    infernix::MessagePart media;
+    media.kind       = infernix::MessagePartKind::Media;
+    media.media.kind = static_cast<infernix::MediaKind>(255);
     media.media.bytes.push_back(0);
-    ninfer::ChatMessage invalid_media_message;
-    invalid_media_message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage invalid_media_message;
+    invalid_media_message.role = infernix::ChatRole::User;
     invalid_media_message.parts.push_back(std::move(media));
-    ninfer::PromptInput invalid_media;
+    infernix::PromptInput invalid_media;
     invalid_media.messages.push_back(std::move(invalid_media_message));
 
     int failures =
@@ -421,8 +421,8 @@ template <class Callable>
 bool throws_context_length(Callable&& callable) {
     try {
         callable();
-    } catch (const ninfer::RequestError& error) {
-        return error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+    } catch (const infernix::RequestError& error) {
+        return error.kind() == infernix::RequestErrorKind::ContextLengthExceeded;
     }
     return false;
 }
@@ -449,7 +449,7 @@ int test_declared_frontend_semantics() {
         ascii_text.push_back(static_cast<char>(codepoint));
     }
     for (std::size_t offset = 0; offset < ascii_text.size(); ++offset) {
-        namespace unicode = ninfer::text::unicode_internal;
+        namespace unicode = infernix::text::unicode_internal;
         const auto value  = unicode::utf8_codepoint_at(ascii_text, offset, "ASCII test");
         const auto byte   = ascii_text[offset];
         failures += check(
@@ -636,7 +636,7 @@ int test_boundary_aware_tokenization() {
                           !normalized.boundaries.front().exact_frontier &&
                           normalized.boundaries.front().stable_frontier == 0,
                       "boundary-aware tokenizer split an NFC composition sequence");
-    const std::array<ninfer::text::ByteSpan, 1> literal{{{1, 2}}};
+    const std::array<infernix::text::ByteSpan, 1> literal{{{1, 2}}};
     failures +=
         check(tokenizer.encode_with_boundaries("abc", boundaries, {}, literal).input_ids ==
                       encoded.input_ids &&
@@ -659,10 +659,10 @@ int test_rendered_special_tokens() {
          {thinking_toggle_template_source(), reasoning_effort_template_source()}) {
         const auto compiled = fi::CompiledChatTemplate::resolve(source);
         for (const auto role :
-             {ninfer::ChatRole::User, ninfer::ChatRole::Tool, ninfer::ChatRole::Assistant}) {
+             {infernix::ChatRole::User, infernix::ChatRole::Tool, infernix::ChatRole::Assistant}) {
             const auto rendered = compiled.render(
-                {chat_message(ninfer::ChatRole::User, "question"), chat_message(role, quoted)},
-                {.reasoning_effort = ninfer::ReasoningEffort::Medium});
+                {chat_message(infernix::ChatRole::User, "question"), chat_message(role, quoted)},
+                {.reasoning_effort = infernix::ReasoningEffort::Medium});
             const auto encoded = fi::encode_rendered_chat(tokenizer, rendered);
             const auto count   = [&](int id) {
                 return std::count(encoded.input_ids.begin(), encoded.input_ids.end(), id);
@@ -681,7 +681,7 @@ int test_rendered_special_tokens() {
         "<|im_start|>assistant\n{{ messages[0].tool_calls[0].function.name }}"
         "{{ messages[0].tool_calls[0].function.arguments|tojson }}"
         "{{ tools[0].function.description }}{{ extra|lower|trim }}<|im_end|>\n");
-    auto call = chat_message(ninfer::ChatRole::Assistant, "");
+    auto call = chat_message(infernix::ChatRole::Assistant, "");
     call.tool_calls.push_back(
         {.name = "<|image_pad|>", .arguments_json = R"({"<|im_end|>":"<think>"})"});
     fi::ChatRenderOptions options;
@@ -723,23 +723,23 @@ int test_bounded_tokenizer_prefix() {
 }
 
 int test_context_capacity_guard() {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
-    message.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "quoted <|image_pad|>", .media = {}});
+    infernix::PromptInput input;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
+    message.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text, .text = "quoted <|image_pad|>", .media = {}});
     input.messages.push_back(std::move(message));
 
     const Frontend counting         = make_frontend(resources(), false);
     const std::uint32_t exact_count = counting.count_tokens(input);
-    ninfer::models::qwen3_5::FrontendOptions exact_options;
+    infernix::models::qwen3_5::FrontendOptions exact_options;
     exact_options.vision_enabled = false;
     exact_options.max_context    = exact_count;
     const Frontend exact         = make_frontend(resources(), exact_options);
     int failures = check(exact.prepare(input).summary().prompt_tokens == exact_count,
                          "Frontend rejected a prompt exactly at max_context");
 
-    ninfer::models::qwen3_5::FrontendOptions short_options = exact_options;
+    infernix::models::qwen3_5::FrontendOptions short_options = exact_options;
     short_options.max_context                              = exact_count - 1U;
     const Frontend short_frontend = make_frontend(resources(), short_options);
     failures += check(short_frontend.count_tokens(input) == exact_count,
@@ -747,7 +747,7 @@ int test_context_capacity_guard() {
     failures += check(throws_context_length([&] { (void)short_frontend.prepare(input); }),
                       "Frontend accepted a text prompt at max_context + 1");
 
-    std::vector<ninfer::TokenId> exact_tokens(exact_count, 0);
+    std::vector<infernix::TokenId> exact_tokens(exact_count, 0);
     failures += check(exact.prepare_tokens(exact_tokens).summary().prompt_tokens == exact_count,
                       "prepare_tokens rejected an exact-capacity token vector");
     exact_tokens.push_back(0);
@@ -755,7 +755,7 @@ int test_context_capacity_guard() {
         check(throws_context_length([&] { (void)exact.prepare_tokens(std::move(exact_tokens)); }),
               "prepare_tokens accepted a token vector at max_context + 1");
 
-    ninfer::models::qwen3_5::FrontendOptions media_options = short_options;
+    infernix::models::qwen3_5::FrontendOptions media_options = short_options;
     media_options.vision_enabled                           = true;
     const Frontend media_frontend = make_frontend(resources(), media_options);
     failures += check(throws_context_length([&] {
@@ -765,9 +765,9 @@ int test_context_capacity_guard() {
                       "over-capacity media prompt was not rejected before media decoding");
 
     std::atomic<int> control_checks{0};
-    ninfer::PreparationControl cancelled_during_tokenization{
+    infernix::PreparationControl cancelled_during_tokenization{
         .deadline     = {},
-        .cancellation = ninfer::CancellationView(
+        .cancellation = infernix::CancellationView(
             [&control_checks] { return control_checks.fetch_add(1) >= 2; }),
     };
     try {
@@ -775,9 +775,9 @@ int test_context_capacity_guard() {
             image_text_input({0}, std::string(64, 'x'), "cancel-before-oversize.bin"),
             cancelled_during_tokenization);
         failures += check(false, "cancelled over-capacity media prompt completed successfully");
-    } catch (const ninfer::RequestError& error) {
+    } catch (const infernix::RequestError& error) {
         failures +=
-            check(error.kind() == ninfer::RequestErrorKind::Cancelled && control_checks.load() == 3,
+            check(error.kind() == infernix::RequestErrorKind::Cancelled && control_checks.load() == 3,
                   "media over-capacity result took priority over tokenization cancellation");
     }
     return failures;
@@ -788,34 +788,34 @@ int test_selected_template_instruction_prefix() {
     no_generation.add_generation_prompt = false;
 
     const std::string leading_developer =
-        render_chat_text({chat_message(ninfer::ChatRole::Developer, "policy"),
-                          chat_message(ninfer::ChatRole::User, "hi")},
+        render_chat_text({chat_message(infernix::ChatRole::Developer, "policy"),
+                          chat_message(infernix::ChatRole::User, "hi")},
                          no_generation);
     int failures = check(leading_developer == "<|im_start|>system\npolicy<|im_end|>\n"
                                               "<|im_start|>user\nhi<|im_end|>\n",
                          "leading developer did not use the existing Qwen system path");
 
     const std::string late_system =
-        render_chat_text({chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "  current diagnostics  ")},
+        render_chat_text({chat_message(infernix::ChatRole::User, "hi"),
+                          chat_message(infernix::ChatRole::System, "  current diagnostics  ")},
                          no_generation);
     failures += check(late_system == "<|im_start|>user\nhi<|im_end|>\n"
                                      "<|im_start|>system\ncurrent diagnostics<|im_end|>\n",
                       "late system turn was not rendered at its original position");
     failures += check(
-        render_chat_text({chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::Developer, "  current diagnostics  ")},
+        render_chat_text({chat_message(infernix::ChatRole::User, "hi"),
+                          chat_message(infernix::ChatRole::Developer, "  current diagnostics  ")},
                          no_generation) == late_system,
         "developer and system did not lower to the same in-place Qwen block");
 
     const std::string stable_history =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi")},
+        render_chat_text({chat_message(infernix::ChatRole::System, "stable policy"),
+                          chat_message(infernix::ChatRole::User, "hi")},
                          no_generation);
     const std::string appended_diagnostics =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "current diagnostics")},
+        render_chat_text({chat_message(infernix::ChatRole::System, "stable policy"),
+                          chat_message(infernix::ChatRole::User, "hi"),
+                          chat_message(infernix::ChatRole::System, "current diagnostics")},
                          no_generation);
     failures += check(appended_diagnostics.starts_with(stable_history) &&
                           appended_diagnostics.substr(stable_history.size()) ==
@@ -832,9 +832,9 @@ int test_selected_template_instruction_prefix() {
     tools.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
     const std::string tools_with_late_system =
-        render_chat_text({chat_message(ninfer::ChatRole::System, "stable policy"),
-                          chat_message(ninfer::ChatRole::User, "hi"),
-                          chat_message(ninfer::ChatRole::System, "current diagnostics")},
+        render_chat_text({chat_message(infernix::ChatRole::System, "stable policy"),
+                          chat_message(infernix::ChatRole::User, "hi"),
+                          chat_message(infernix::ChatRole::System, "current diagnostics")},
                          tools);
     const std::size_t tools_position  = tools_with_late_system.find("# Tools");
     const std::size_t policy_position = tools_with_late_system.find("stable policy");
@@ -850,39 +850,39 @@ int test_selected_template_instruction_prefix() {
               "late system duplicated or moved the leading tools/instruction block");
 
     const fi::RenderedChat generated =
-        render_chat({chat_message(ninfer::ChatRole::User, "hi"),
-                     chat_message(ninfer::ChatRole::System, "current diagnostics")});
+        render_chat({chat_message(infernix::ChatRole::User, "hi"),
+                     chat_message(infernix::ChatRole::System, "current diagnostics")});
     const std::string assistant_header = "<|im_start|>assistant\n";
     const std::size_t header           = generated.text.rfind(assistant_header);
     failures += check(header != std::string::npos && generated.rewrite_checkpoint &&
                           generated.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
                           generated.rewrite_checkpoint->offset == header &&
                           generated.text.find("current diagnostics<|im_end|>\n", 0) < header,
                       "late system was not included before the generation rewrite boundary");
 
-    fi::ChatMessage invalid = chat_message(ninfer::ChatRole::System, "diagnostics");
+    fi::ChatMessage invalid = chat_message(infernix::ChatRole::System, "diagnostics");
     invalid.tool_calls.push_back({.id = "call", .name = "f", .arguments_json = "{}"});
     failures += check(throws_invalid_argument([&] {
-                          (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), invalid},
+                          (void)render_chat({chat_message(infernix::ChatRole::User, "hi"), invalid},
                                             no_generation);
                       }),
                       "system turn carrying assistant tool metadata was accepted");
 
-    fi::ChatMessage media_instruction = chat_message(ninfer::ChatRole::Developer, "diagnostics");
+    fi::ChatMessage media_instruction = chat_message(infernix::ChatRole::Developer, "diagnostics");
     media_instruction.parts.push_back(fi::ChatPart::image({}));
     failures +=
         check(throws_invalid_argument([&] {
-                  (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), media_instruction},
+                  (void)render_chat({chat_message(infernix::ChatRole::User, "hi"), media_instruction},
                                     no_generation);
               }),
               "developer turn carrying media was accepted");
 
-    fi::ChatMessage invalid_role = chat_message(ninfer::ChatRole::User, "bad");
-    invalid_role.role            = static_cast<ninfer::ChatRole>(255);
+    fi::ChatMessage invalid_role = chat_message(infernix::ChatRole::User, "bad");
+    invalid_role.role            = static_cast<infernix::ChatRole>(255);
     failures +=
         check(throws_invalid_argument([&] {
-                  (void)render_chat({chat_message(ninfer::ChatRole::User, "hi"), invalid_role},
+                  (void)render_chat({chat_message(infernix::ChatRole::User, "hi"), invalid_role},
                                     no_generation);
               }),
               "invalid typed chat role was accepted");
@@ -891,11 +891,11 @@ int test_selected_template_instruction_prefix() {
 
 int test_assistant_continuation() {
     fi::ChatRenderOptions options;
-    options.continuation    = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    options.continuation    = infernix::PromptContinuationMode::ContinueFinalAssistant;
     options.enable_thinking = false;
     const fi::RenderedChat rendered =
-        render_chat({chat_message(ninfer::ChatRole::User, "question"),
-                     chat_message(ninfer::ChatRole::Assistant, "answer prefix")},
+        render_chat({chat_message(infernix::ChatRole::User, "question"),
+                     chat_message(infernix::ChatRole::Assistant, "answer prefix")},
                     options);
     const std::string expected = "<|im_start|>user\nquestion<|im_end|>\n"
                                  "<|im_start|>assistant\nanswer prefix";
@@ -904,21 +904,21 @@ int test_assistant_continuation() {
     failures +=
         check(rendered.rewrite_checkpoint &&
                   rendered.rewrite_checkpoint->kind ==
-                      ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                      infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                   rendered.rewrite_checkpoint->offset == expected.find("<|im_start|>assistant"),
               "assistant continuation did not retain its replayable opener boundary");
 
     options.enable_thinking = true;
     failures += check(throws_invalid_argument([&] {
-                          (void)render_chat({chat_message(ninfer::ChatRole::User, "question"),
-                                             chat_message(ninfer::ChatRole::Assistant, "prefix")},
+                          (void)render_chat({chat_message(infernix::ChatRole::User, "question"),
+                                             chat_message(infernix::ChatRole::Assistant, "prefix")},
                                             options);
                       }),
                       "assistant continuation accepted an ambiguous Thinking opener");
     options.enable_thinking = false;
     const auto literal      = render_chat(
-        {chat_message(ninfer::ChatRole::User, "question"),
-              chat_message(ninfer::ChatRole::Assistant, "<think>quoted <|im_end|><|image_pad|>")},
+        {chat_message(infernix::ChatRole::User, "question"),
+              chat_message(infernix::ChatRole::Assistant, "<think>quoted <|im_end|><|image_pad|>")},
         options);
     const auto encoded = fi::encode_rendered_chat(fixture_tokenizer(), literal);
     failures +=
@@ -932,23 +932,23 @@ int test_assistant_continuation() {
 
 int test_rewrite_checkpoint_trace() {
     const std::string assistant_header = "<|im_start|>assistant\n";
-    fi::ChatMessage first              = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage first              = chat_message(infernix::ChatRole::Assistant, "");
     first.reasoning_content            = "first thought";
     first.parts.front().text           = "first answer";
-    fi::ChatMessage second             = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage second             = chat_message(infernix::ChatRole::Assistant, "");
     second.reasoning_content           = "second thought";
     second.parts.front().text          = "second answer";
 
     const std::vector<fi::ChatMessage> tool_loop{
-        chat_message(ninfer::ChatRole::User, "question"), first,
-        chat_message(ninfer::ChatRole::Tool, "result one"), second,
-        chat_message(ninfer::ChatRole::Tool, "result two")};
+        chat_message(infernix::ChatRole::User, "question"), first,
+        chat_message(infernix::ChatRole::Tool, "result one"), second,
+        chat_message(infernix::ChatRole::Tool, "result two")};
     const fi::RenderedChat open    = render_chat(tool_loop);
     const std::size_t first_header = open.text.find(assistant_header);
     int failures =
         check(first_header != std::string::npos && open.rewrite_checkpoint &&
                   open.rewrite_checkpoint->kind ==
-                      ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                      infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
                   open.rewrite_checkpoint->offset == first_header,
               "tool loop did not retain the stable prefix before its first assistant turn");
     const auto initial = render_chat({tool_loop.front()});
@@ -967,7 +967,7 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t preserved_header = preserved.text.rfind(assistant_header);
     failures += check(preserved_header != std::string::npos && preserved.rewrite_checkpoint &&
                           preserved.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                           preserved.rewrite_checkpoint->offset == preserved_header &&
                           preserved.rewrite_checkpoint->recovery_offset == preserved_header &&
                           preserved.text.ends_with("<think>\n"),
@@ -978,33 +978,33 @@ int test_rewrite_checkpoint_trace() {
     const std::size_t nonthinking_header = nonthinking.text.rfind(assistant_header);
     failures += check(nonthinking_header != std::string::npos && nonthinking.rewrite_checkpoint &&
                           nonthinking.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking.rewrite_checkpoint->offset == nonthinking_header &&
                           nonthinking.text.ends_with("<think>\n\n</think>\n\n"),
                       "non-thinking response replay did not checkpoint before its generation "
                       "prologue");
 
     std::vector<fi::ChatMessage> next_turn = tool_loop;
-    next_turn.push_back(chat_message(ninfer::ChatRole::User, "next question"));
+    next_turn.push_back(chat_message(infernix::ChatRole::User, "next question"));
     const fi::RenderedChat next    = render_chat(next_turn);
     const std::size_t final_header = next.text.rfind(assistant_header);
     failures += check(final_header != std::string::npos && next.rewrite_checkpoint &&
                           next.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
                           next.rewrite_checkpoint->offset == final_header,
                       "new user turn did not move the rewrite boundary before its generation "
                       "opener");
 
     const fi::RenderedChat branch =
-        render_chat({chat_message(ninfer::ChatRole::User, "question"),
-                     chat_message(ninfer::ChatRole::User, "summarize the conversation")},
+        render_chat({chat_message(infernix::ChatRole::User, "question"),
+                     chat_message(infernix::ChatRole::User, "summarize the conversation")},
                     preserve);
     const fi::RenderedChat source =
-        render_chat({chat_message(ninfer::ChatRole::User, "question")}, preserve);
+        render_chat({chat_message(infernix::ChatRole::User, "question")}, preserve);
     failures += check(
         source.rewrite_checkpoint &&
             source.rewrite_checkpoint->kind ==
-                ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
             branch.text.starts_with(source.text.substr(0, source.rewrite_checkpoint->offset)) &&
             !branch.text.starts_with(
                 source.text.substr(0, source.rewrite_checkpoint->offset + assistant_header.size())),
@@ -1013,7 +1013,7 @@ int test_rewrite_checkpoint_trace() {
     fi::ChatRenderOptions no_generation;
     no_generation.add_generation_prompt = false;
     const fi::RenderedChat no_assistant =
-        render_chat({chat_message(ninfer::ChatRole::User, "question")}, no_generation);
+        render_chat({chat_message(infernix::ChatRole::User, "question")}, no_generation);
     failures += check(!no_assistant.rewrite_checkpoint,
                       "boundary-less prompt unexpectedly published a rewrite boundary");
 
@@ -1024,26 +1024,26 @@ int test_rewrite_checkpoint_trace() {
     no_generation.preserve_thinking = false;
 
     const fi::RenderedChat wrapped = render_chat(
-        {chat_message(ninfer::ChatRole::User, "question"), first,
-         chat_message(ninfer::ChatRole::User, "<tool_response>compat result</tool_response>"),
+        {chat_message(infernix::ChatRole::User, "question"), first,
+         chat_message(infernix::ChatRole::User, "<tool_response>compat result</tool_response>"),
          second},
         no_generation);
     const std::size_t wrapped_first = wrapped.text.find(assistant_header);
     failures += check(wrapped.rewrite_checkpoint &&
                           wrapped.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
                           wrapped.rewrite_checkpoint->offset == wrapped_first,
                       "bare tool-response wrapper incorrectly advanced the real user turn");
     return failures;
 }
 
 int test_selected_template_recovery_boundary() {
-    auto assistant              = chat_message(ninfer::ChatRole::Assistant, "answer");
+    auto assistant              = chat_message(infernix::ChatRole::Assistant, "answer");
     assistant.reasoning_content = "retained reasoning";
     const std::vector<std::vector<fi::ChatMessage>> histories{
-        {chat_message(ninfer::ChatRole::User, "question"), assistant,
-         chat_message(ninfer::ChatRole::Tool, "result")},
-        {chat_message(ninfer::ChatRole::Tool, "imported result"), assistant}};
+        {chat_message(infernix::ChatRole::User, "question"), assistant,
+         chat_message(infernix::ChatRole::Tool, "result")},
+        {chat_message(infernix::ChatRole::Tool, "imported result"), assistant}};
     int failures = 0;
     for (const auto& history : histories) {
         const auto qwen36 = thinking_toggle_template().render(history);
@@ -1059,13 +1059,13 @@ int test_selected_template_recovery_boundary() {
 }
 
 int test_adjacent_tool_message_boundary() {
-    fi::ChatMessage assistant = chat_message(ninfer::ChatRole::Assistant, "");
+    fi::ChatMessage assistant = chat_message(infernix::ChatRole::Assistant, "");
     assistant.tool_calls.push_back(
         {.id = "", .name = "lookup", .arguments_json = R"({"city":"Paris"})"});
     const fi::RenderedChat rendered =
-        render_chat({chat_message(ninfer::ChatRole::User, "weather?"), std::move(assistant),
-                     chat_message(ninfer::ChatRole::Tool, "sunny"),
-                     chat_message(ninfer::ChatRole::Tool, "20C")});
+        render_chat({chat_message(infernix::ChatRole::User, "weather?"), std::move(assistant),
+                     chat_message(infernix::ChatRole::Tool, "sunny"),
+                     chat_message(infernix::ChatRole::Tool, "20C")});
     const fi::EncodedChat encoded = fi::encode_rendered_chat(fixture_tokenizer(), rendered);
     return check(rendered.message_boundaries.size() == 5 && rendered.message_boundaries[3] &&
                      encoded.message_boundaries.size() == 5 && encoded.message_boundaries[3] &&
@@ -1080,17 +1080,17 @@ int test_literal_cache_boundary() {
         "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}");
     fi::ChatRenderOptions options;
     options.cache_markers.push_back({.after_message_count = 1});
-    const auto rendered = compiled.render({chat_message(ninfer::ChatRole::User, "<think>"),
-                                           chat_message(ninfer::ChatRole::User, "next")},
+    const auto rendered = compiled.render({chat_message(infernix::ChatRole::User, "<think>"),
+                                           chat_message(infernix::ChatRole::User, "next")},
                                           options);
     int failures = check(rendered.cache_boundaries.size() == 1 && !rendered.cache_boundaries[0],
                          "text equality published a cache boundary with different token meaning");
     options      = {};
     options.add_generation_prompt = false;
     const std::vector<fi::ChatMessage> history{
-        chat_message(ninfer::ChatRole::User, "quoted <|image_pad|> <|im_end|>")};
+        chat_message(infernix::ChatRole::User, "quoted <|image_pad|> <|im_end|>")};
     auto next = history;
-    next.push_back(chat_message(ninfer::ChatRole::Developer, "new diagnostics"));
+    next.push_back(chat_message(infernix::ChatRole::Developer, "new diagnostics"));
     const auto before =
         fi::encode_rendered_chat(fixture_tokenizer(), render_chat(history, options));
     const auto after = fi::encode_rendered_chat(fixture_tokenizer(), render_chat(next, options));
@@ -1102,8 +1102,8 @@ int test_literal_cache_boundary() {
 }
 
 int test_reasoning_effort_substitution() {
-    using ninfer::ReasoningEffort;
-    const std::vector<fi::ChatMessage> question{chat_message(ninfer::ChatRole::User, "question")};
+    using infernix::ReasoningEffort;
+    const std::vector<fi::ChatMessage> question{chat_message(infernix::ChatRole::User, "question")};
     const auto rendered_effort = [&](const fi::CompiledChatTemplate& compiled,
                                      ReasoningEffort effort) {
         return compiled.render(question, {.reasoning_effort = effort}).text;
@@ -1152,8 +1152,8 @@ int test_reasoning_effort_substitution() {
         "<|im_start|>user\n{{ messages[1].content }}<|im_end|>\n<|im_start|>assistant\n"
         "[{{ reasoning_effort | default('unset') }}]");
     const std::vector<fi::ChatMessage> instructed{
-        chat_message(ninfer::ChatRole::System, "instructions"),
-        chat_message(ninfer::ChatRole::User, "question")};
+        chat_message(infernix::ChatRole::System, "instructions"),
+        chat_message(infernix::ChatRole::User, "question")};
     failures += check(
         unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::Medium})
                 .text.ends_with("[medium]") &&
@@ -1185,9 +1185,9 @@ int test_official_resource_guards() {
     mismatched_config["chat_template"] = reasoning_effort_template_source();
     mismatched.tokenizer_config_json   = mismatched_config.dump();
     const auto standalone              = make_frontend(mismatched, false);
-    ninfer::PromptInput input;
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::PromptInput input;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back({.text = "hello"});
     input.messages.push_back(std::move(message));
     failures += check(standalone.prepare(input).summary().starts_in_reasoning,
@@ -1206,7 +1206,7 @@ int test_template_file_execution() {
     struct Temporary {
         std::filesystem::path path =
             std::filesystem::temp_directory_path() /
-            ("ninfer-chat-template-" +
+            ("infernix-chat-template-" +
              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
              ".jinja");
 
@@ -1223,7 +1223,7 @@ int test_template_file_execution() {
         std::ofstream stream(file.path);
         stream << source;
     }
-    ninfer::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen3_5::FrontendOptions options;
     options.vision_enabled     = false;
     options.chat_template_path = file.path;
     const auto overridden      = make_frontend(resources("{{ messages[0].content }}"), options);
@@ -1231,10 +1231,10 @@ int test_template_file_execution() {
         std::ofstream stream(file.path);
         stream << "changed after startup";
     }
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     for (const auto role :
-         {ninfer::ChatRole::User, ninfer::ChatRole::System, ninfer::ChatRole::Developer}) {
-        ninfer::ChatMessage message;
+         {infernix::ChatRole::User, infernix::ChatRole::System, infernix::ChatRole::Developer}) {
+        infernix::ChatMessage message;
         message.role = role;
         message.parts.push_back({.text = "text"});
         input.messages.push_back(std::move(message));
@@ -1292,15 +1292,15 @@ int test_media_token_ids_come_from_tokenizer() {
 }
 
 int test_text_and_image_prepare(const Frontend& frontend) {
-    ninfer::ChatMessage text_message;
-    text_message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage text_message;
+    text_message.role = infernix::ChatRole::User;
     text_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput text_input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput text_input;
     text_input.messages.push_back(std::move(text_message));
     auto text             = frontend.prepare(std::move(text_input));
     const auto& text_data = FrontendFactory::inspect(text);
-    const std::vector<ninfer::TokenId> expected{248045,
+    const std::vector<infernix::TokenId> expected{248045,
                                                 fixture_byte_token('u'),
                                                 fixture_byte_token('s'),
                                                 fixture_byte_token('e'),
@@ -1317,7 +1317,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         check(text_data.token_ids == expected, "text frontend did not render/tokenize chat");
     failures += check(text_data.identity.rewrite_checkpoint &&
                           text_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
                           text_data.identity.rewrite_checkpoint->frontier == 9 &&
                           text_data.identity.rewrite_checkpoint->recovery_frontier == 7 &&
                           text_data.starts_in_reasoning && !text_data.has_media(),
@@ -1327,29 +1327,29 @@ int test_text_and_image_prepare(const Frontend& frontend) {
                   text_data.position_axis(2).back() == 12,
               "text frontend did not construct axis-major positions");
 
-    ninfer::ChatMessage preserved_message;
-    preserved_message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage preserved_message;
+    preserved_message.role = infernix::ChatRole::User;
     preserved_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput preserved_input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput preserved_input;
     preserved_input.messages.push_back(std::move(preserved_message));
     preserved_input.options.preserve_thinking = true;
     const auto preserved_prompt               = frontend.prepare(std::move(preserved_input));
     const auto& preserved_data                = FrontendFactory::inspect(preserved_prompt);
     failures += check(preserved_data.identity.rewrite_checkpoint &&
                           preserved_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                           preserved_data.identity.rewrite_checkpoint->frontier == 9 &&
                           preserved_data.identity.rewrite_checkpoint->frontier <
                               preserved_data.token_ids.size(),
                       "preserve-thinking prompt did not publish a pre-generation response "
                       "checkpoint");
 
-    ninfer::ChatMessage nonthinking_message;
-    nonthinking_message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage nonthinking_message;
+    nonthinking_message.role = infernix::ChatRole::User;
     nonthinking_message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput nonthinking_input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput nonthinking_input;
     nonthinking_input.messages.push_back(std::move(nonthinking_message));
     nonthinking_input.options.preserve_thinking = true;
     nonthinking_input.options.enable_thinking   = false;
@@ -1357,28 +1357,28 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     const auto& nonthinking_data                = FrontendFactory::inspect(nonthinking_prompt);
     failures += check(nonthinking_data.identity.rewrite_checkpoint &&
                           nonthinking_data.identity.rewrite_checkpoint->kind ==
-                              ninfer::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
+                              infernix::models::qwen3_5::RewriteCheckpointKind::ResponseReplay &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier == 9 &&
                           nonthinking_data.identity.rewrite_checkpoint->frontier <
                               nonthinking_data.token_ids.size() &&
                           !nonthinking_data.starts_in_reasoning,
                       "non-thinking prompt did not publish a pre-generation response checkpoint");
 
-    ninfer::MessagePart image;
-    image.kind              = ninfer::MessagePartKind::Media;
-    image.media.kind        = ninfer::MediaKind::Image;
+    infernix::MessagePart image;
+    image.kind              = infernix::MessagePartKind::Media;
+    image.media.kind        = infernix::MediaKind::Image;
     image.media.bytes       = gradient_ppm();
     image.media.media_type  = "image/x-portable-pixmap";
     image.media.source_name = "inline.ppm";
-    ninfer::ChatMessage image_message;
-    image_message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage image_message;
+    image_message.role = infernix::ChatRole::User;
     image_message.parts.push_back(std::move(image));
-    ninfer::PromptInput image_input;
+    infernix::PromptInput image_input;
     image_input.messages.push_back(std::move(image_message));
-    image_input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+    image_input.context_cache.markers.push_back(infernix::PromptCacheMarker{
         .after_message_count      = 1,
-        .kind                     = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
-        .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+        .kind                     = infernix::PromptCacheMarkerKind::PrivateLongAnchor,
+        .location                 = infernix::PromptCacheMarkerLocation::MessagePartBoundary,
         .after_message_part_count = 1,
     });
     auto prepared             = frontend.prepare(std::move(image_input));
@@ -1413,7 +1413,7 @@ int test_text_and_image_prepare(const Frontend& frontend) {
             prepared_data.prepare.vision_tokens == 4 && prepared_data.identity.reusable &&
             prepared_data.identity.rewrite_checkpoint &&
             prepared_data.identity.rewrite_checkpoint->kind ==
-                ninfer::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+                infernix::models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
             prepared_data.identity.rewrite_checkpoint->frontier < prepared_data.token_ids.size(),
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
@@ -1422,8 +1422,8 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         const auto explicit_marker = std::find_if(
             prepared_data.context_cache.opportunities.begin(),
             prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
-                return ninfer::has_shared_candidate_evidence(
-                    opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+                return infernix::has_shared_candidate_evidence(
+                    opportunity.evidence, infernix::SharedCandidateEvidence::ExplicitBoundary);
             });
         failures += check(explicit_marker != prepared_data.context_cache.opportunities.end() &&
                               explicit_marker->frontier >= span.begin + span.count &&
@@ -1448,7 +1448,7 @@ int test_template_media_contract() {
     for (const char* source : {"<|image_pad|>", "<|vision_start|><|image_pad|><|vision_end|>"}) {
         failures += check(throws_invalid_argument([&] {
                               (void)fi::CompiledChatTemplate::resolve(source).render(
-                                  {chat_message(ninfer::ChatRole::User, "hello")});
+                                  {chat_message(infernix::ChatRole::User, "hello")});
                           }),
                           "invalid template-authored media controls were accepted");
     }
@@ -1461,7 +1461,7 @@ int test_template_media_contract() {
                       "template media type mismatch was accepted");
     const auto frontend = make_frontend(resources());
     auto input          = image_input();
-    const ninfer::MessagePart quoted{
+    const infernix::MessagePart quoted{
         .text = "quoted <|vision_start|><|image_pad|><|vision_end|> <|video_pad|>"};
     input.messages.front().parts.insert(input.messages.front().parts.begin(), quoted);
     input.messages.front().parts.push_back(quoted);
@@ -1484,21 +1484,21 @@ int test_image_resize_rejection_policy() {
         R"({"patch_size":16,"temporal_patch_size":2,"merge_size":2,"image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"size":{"shortest_edge":4096,"longest_edge":1048576}})";
     const Frontend frontend = make_frontend(owned);
 
-    ninfer::PromptInput small = image_input();
+    infernix::PromptInput small = image_input();
     small.messages[0].parts[0].media.image_resize_policy =
-        ninfer::ImageResizePolicy::RejectOversized;
+        infernix::ImageResizePolicy::RejectOversized;
     int failures = check(frontend.count_tokens(std::move(small)) != 0,
                          "oversized_image=error rejected an image that needed no downsize");
 
-    ninfer::PromptInput oversized =
+    infernix::PromptInput oversized =
         image_text_input(block_ppm(2048, 1024, 127), {}, "oversized.ppm");
     oversized.messages[0].parts[0].media.image_resize_policy =
-        ninfer::ImageResizePolicy::RejectOversized;
+        infernix::ImageResizePolicy::RejectOversized;
     try {
         (void)frontend.count_tokens(std::move(oversized));
         failures += check(false, "oversized_image=error allowed a required Vision downsize");
-    } catch (const ninfer::RequestError& error) {
-        failures += check(error.kind() == ninfer::RequestErrorKind::InvalidMedia,
+    } catch (const infernix::RequestError& error) {
+        failures += check(error.kind() == infernix::RequestErrorKind::InvalidMedia,
                           "oversized_image=error used the wrong request-error classification");
     }
     return failures;
@@ -1507,25 +1507,25 @@ int test_image_resize_rejection_policy() {
 int test_explicit_leading_instruction_cache_boundary() {
     const Frontend frontend           = make_frontend(resources(), false);
     constexpr std::string_view stable = "stable cache section.";
-    ninfer::ChatMessage system;
-    system.role = ninfer::ChatRole::System;
-    system.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = std::string(stable), .media = {}});
-    system.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "\ndynamic working directory", .media = {}});
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = "question", .media = {}});
+    infernix::ChatMessage system;
+    system.role = infernix::ChatRole::System;
+    system.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text, .text = std::string(stable), .media = {}});
+    system.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text, .text = "\ndynamic working directory", .media = {}});
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
+    user.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text, .text = "question", .media = {}});
 
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(system));
     input.messages.push_back(std::move(user));
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"inspect","parameters":{"type":"object"}}})");
-    input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-        .kind                      = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-        .location                  = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary,
+    input.context_cache.markers.push_back(infernix::PromptCacheMarker{
+        .kind                      = infernix::PromptCacheMarkerKind::SharedStablePrefix,
+        .location                  = infernix::PromptCacheMarkerLocation::LeadingInstructionBoundary,
         .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
     });
 
@@ -1534,11 +1534,11 @@ int test_explicit_leading_instruction_cache_boundary() {
     const auto explicit_marker = std::find_if(
         data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
         [](const auto& opportunity) {
-            return ninfer::has_shared_candidate_evidence(
-                opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+            return infernix::has_shared_candidate_evidence(
+                opportunity.evidence, infernix::SharedCandidateEvidence::ExplicitBoundary);
         });
     return check(explicit_marker != data.context_cache.opportunities.end() &&
-                     explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                     explicit_marker->kind == infernix::PromptCacheMarkerKind::SharedStablePrefix &&
                      explicit_marker->frontier != 0 &&
                      explicit_marker->frontier < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
@@ -1590,9 +1590,9 @@ int test_trimmed_source_cache_boundaries() {
         const fi::Tokenizer tokenizer(
             {source.tokenizer_json, source.tokenizer_config_json, source.generation_config_json});
         const auto frontend = make_frontend(source, false);
-        for (const auto role : {ninfer::ChatRole::System, ninfer::ChatRole::User}) {
-            ninfer::PromptInput input;
-            ninfer::ChatMessage marked;
+        for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::User}) {
+            infernix::PromptInput input;
+            infernix::ChatMessage marked;
             marked.role            = role;
             std::size_t source_end = 0;
             for (std::size_t i = 0; i < item.parts.size(); ++i) {
@@ -1600,19 +1600,19 @@ int test_trimmed_source_cache_boundaries() {
                 if (i < item.marked_part) source_end += item.parts[i].size();
             }
             input.messages.push_back(std::move(marked));
-            ninfer::ChatMessage suffix;
-            suffix.role = ninfer::ChatRole::User;
+            infernix::ChatMessage suffix;
+            suffix.role = infernix::ChatRole::User;
             suffix.parts.push_back({.text = "question"});
             input.messages.push_back(std::move(suffix));
             input.context_cache.allow_engine_automatic_shared_prefixes = false;
-            ninfer::PromptCacheMarker marker;
-            marker.kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
-            marker.evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary;
-            if (role == ninfer::ChatRole::System) {
-                marker.location = ninfer::PromptCacheMarkerLocation::LeadingInstructionBoundary;
+            infernix::PromptCacheMarker marker;
+            marker.kind     = infernix::PromptCacheMarkerKind::SharedStablePrefix;
+            marker.evidence = infernix::SharedCandidateEvidence::ExplicitBoundary;
+            if (role == infernix::ChatRole::System) {
+                marker.location = infernix::PromptCacheMarkerLocation::LeadingInstructionBoundary;
                 marker.leading_instruction_bytes = static_cast<std::uint32_t>(source_end);
             } else {
-                marker.location            = ninfer::PromptCacheMarkerLocation::MessagePartBoundary;
+                marker.location            = infernix::PromptCacheMarkerLocation::MessagePartBoundary;
                 marker.after_message_count = 1;
                 marker.after_message_part_count = static_cast<std::uint32_t>(item.marked_part);
             }
@@ -1623,7 +1623,7 @@ int test_trimmed_source_cache_boundaries() {
             if (item.prefix) {
                 const std::string expected =
                     "<|im_start|>" +
-                    std::string(role == ninfer::ChatRole::System ? "system" : "user") + "\n" +
+                    std::string(role == infernix::ChatRole::System ? "system" : "user") + "\n" +
                     *item.prefix;
                 const bool matches =
                     opportunities.size() == 1 &&
@@ -1632,7 +1632,7 @@ int test_trimmed_source_cache_boundaries() {
                         expected;
                 if (!matches) {
                     std::cerr << "expression=" << item.expression
-                              << " role=" << (role == ninfer::ChatRole::System ? "system" : "user")
+                              << " role=" << (role == infernix::ChatRole::System ? "system" : "user")
                               << " failed to preserve the trimmed source boundary\n";
                 }
                 failures += check(
@@ -1659,16 +1659,16 @@ int test_source_part_recovery_boundary() {
     for (const bool custom : {false, true}) {
         const auto frontend = make_frontend(
             resources(custom ? custom_template : thinking_toggle_template_source()), false);
-        for (const auto& [role, name] : {std::pair{ninfer::ChatRole::User, "user"},
-                                         std::pair{ninfer::ChatRole::System, "system"},
-                                         std::pair{ninfer::ChatRole::Developer, "developer"}}) {
+        for (const auto& [role, name] : {std::pair{infernix::ChatRole::User, "user"},
+                                         std::pair{infernix::ChatRole::System, "system"},
+                                         std::pair{infernix::ChatRole::Developer, "developer"}}) {
             for (const bool preserve : {false, true}) {
-                ninfer::PromptInput input;
-                ninfer::ChatMessage seed;
-                seed.role = ninfer::ChatRole::User;
+                infernix::PromptInput input;
+                infernix::ChatMessage seed;
+                seed.role = infernix::ChatRole::User;
                 seed.parts.push_back({.text = "seed"});
                 input.messages.push_back(std::move(seed));
-                ninfer::ChatMessage message;
+                infernix::ChatMessage message;
                 message.role = role;
                 message.parts.push_back({.text = "alpha"});
                 message.parts.push_back({.text = " beta"});
@@ -1678,8 +1678,8 @@ int test_source_part_recovery_boundary() {
                 input.context_cache.allow_engine_automatic_shared_prefixes = false;
                 input.context_cache.markers.push_back({
                     .after_message_count = 2,
-                    .evidence            = ninfer::SharedCandidateEvidence::DefaultAutomatic,
-                    .location            = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                    .evidence            = infernix::SharedCandidateEvidence::DefaultAutomatic,
+                    .location            = infernix::PromptCacheMarkerLocation::MessagePartBoundary,
                     .after_message_part_count = 2,
                 });
                 const auto prepared = frontend.prepare(input);
@@ -1687,7 +1687,7 @@ int test_source_part_recovery_boundary() {
                 const std::string expected =
                     custom ? "[user]seed[/complete-message]\n[" + std::string(name) + "]alpha beta"
                            : "<|im_start|>user\nseed<|im_end|>\n<|im_start|>" +
-                                 std::string(role == ninfer::ChatRole::User ? "user" : "system") +
+                                 std::string(role == infernix::ChatRole::User ? "user" : "system") +
                                  "\nalpha beta";
                 const auto frontier = data.context_cache.opportunities.empty()
                                           ? 0U
@@ -1723,13 +1723,13 @@ int test_input_recovery_requires_proven_closing() {
             "{% for m in messages %}<|im_start|>{{ m.role }}\n" + body +
             "<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif "
             "%}");
-        const auto rendered = compiled.render({chat_message(ninfer::ChatRole::User, "content")});
+        const auto rendered = compiled.render({chat_message(infernix::ChatRole::User, "content")});
         failures +=
             check(rendered.rewrite_checkpoint && rendered.rewrite_checkpoint->recovery_offset ==
                                                      rendered.rewrite_checkpoint->offset,
                   "unproved custom source boundary replaced the typed recovery state");
     }
-    const auto empty = render_chat({chat_message(ninfer::ChatRole::User, "")});
+    const auto empty = render_chat({chat_message(infernix::ChatRole::User, "")});
     failures += check(empty.rewrite_checkpoint && empty.rewrite_checkpoint->recovery_offset ==
                                                       empty.rewrite_checkpoint->offset,
                       "empty user content fabricated an earlier source recovery point");
@@ -1745,14 +1745,14 @@ int test_automatic_message_boundary_fallback() {
                                 "{% else %}|closed|{% endif %}"),
                       false);
     const auto expected = fixture_tokenizer().encode("user:alpha beta");
-    using Evidence      = ninfer::SharedCandidateEvidence;
+    using Evidence      = infernix::SharedCandidateEvidence;
     int failures        = 0;
     for (const auto evidence :
          {Evidence::DefaultAutomatic, Evidence::RequestedAutomatic, Evidence::ExplicitBoundary,
           Evidence::ExplicitBoundary | Evidence::DefaultAutomatic}) {
-        ninfer::PromptInput input;
-        ninfer::ChatMessage message;
-        message.role = ninfer::ChatRole::User;
+        infernix::PromptInput input;
+        infernix::ChatMessage message;
+        message.role = infernix::ChatRole::User;
         message.parts.push_back({.text = "alpha"});
         message.parts.push_back({.text = " beta"});
         input.messages.push_back(std::move(message));
@@ -1760,12 +1760,12 @@ int test_automatic_message_boundary_fallback() {
         input.context_cache.markers.push_back({
             .after_message_count = 1,
             .evidence            = evidence,
-            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+            .location            = infernix::PromptCacheMarkerLocation::MessageBoundary,
         });
         const auto prepared = frontend.prepare(std::move(input));
         const auto& data    = FrontendFactory::inspect(prepared);
         const bool explicit_boundary =
-            ninfer::has_shared_candidate_evidence(evidence, Evidence::ExplicitBoundary);
+            infernix::has_shared_candidate_evidence(evidence, Evidence::ExplicitBoundary);
         if (explicit_boundary) {
             failures += check(data.context_cache.opportunities.empty(),
                               "unproved explicit message boundary fell back to a content part");
@@ -1785,18 +1785,18 @@ int test_automatic_message_boundary_fallback() {
 int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
     constexpr std::size_t kMediaItems     = 17;
     const std::vector<std::uint8_t> bytes = gradient_ppm();
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     for (std::size_t index = 0; index < kMediaItems; ++index) {
-        ninfer::OwnedMedia media;
-        media.kind        = ninfer::MediaKind::Image;
+        infernix::OwnedMedia media;
+        media.kind        = infernix::MediaKind::Image;
         media.bytes       = bytes;
         media.media_type  = "image/x-portable-pixmap";
         media.source_name = "aggregate-" + std::to_string(index) + ".ppm";
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Media, .text = {}, .media = std::move(media)});
+        message.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Media, .text = {}, .media = std::move(media)});
     }
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     const auto prepared = frontend.prepare(std::move(input));
     const auto& data    = FrontendFactory::inspect(prepared);
@@ -1809,12 +1809,12 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
 
     fi::ProcessorOptions options;
     options.max_encoded_media_bytes = bytes.size() * 2 - 1;
-    auto cache = std::make_shared<fi::MediaPreprocessCache>(ninfer::kDefaultMediaCacheBytes,
-                                                            ninfer::kDefaultMediaLiveBytes);
+    auto cache = std::make_shared<fi::MediaPreprocessCache>(infernix::kDefaultMediaCacheBytes,
+                                                            infernix::kDefaultMediaLiveBytes);
     fi::Processor processor(fixture_tokenizer(), thinking_toggle_template(), options,
                             std::move(cache));
     fi::ChatMessage internal_message;
-    internal_message.role = ninfer::ChatRole::User;
+    internal_message.role = infernix::ChatRole::User;
     for (std::size_t index = 0; index < 2; ++index) {
         internal_message.parts.push_back(
             fi::ChatPart::image(fi::MediaData{.bytes       = bytes,
@@ -1830,10 +1830,10 @@ int test_media_admission_uses_aggregate_resources(const Frontend& frontend) {
 
 int test_multimodal_prompt_over_removed_32k_cap(const Frontend& frontend) {
     const std::string long_text(40'000, 'x');
-    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
+    const infernix::MediaCacheSummary before_count = frontend.media_cache_summary();
     const std::uint32_t counted =
         frontend.count_tokens(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
-    const ninfer::MediaCacheSummary after_count = frontend.media_cache_summary();
+    const infernix::MediaCacheSummary after_count = frontend.media_cache_summary();
     const auto prepared =
         frontend.prepare(image_text_input(gradient_ppm(), long_text, "long-context.ppm"));
     const auto& data = FrontendFactory::inspect(prepared);
@@ -1865,21 +1865,21 @@ int test_attention_pairs_are_diagnostic(const Frontend& frontend) {
 }
 
 int test_video_prepare(const Frontend& frontend) {
-    ninfer::MessagePart video;
-    video.kind              = ninfer::MessagePartKind::Media;
-    video.media.kind        = ninfer::MediaKind::Video;
+    infernix::MessagePart video;
+    video.kind              = infernix::MessagePartKind::Media;
+    video.media.kind        = infernix::MediaKind::Video;
     video.media.bytes       = gradient_ppm();
     video.media.media_type  = "image/x-portable-pixmap";
     video.media.source_name = "single-frame.ppm";
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(std::move(video));
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
 
-    const ninfer::MediaCacheSummary before_count = frontend.media_cache_summary();
+    const infernix::MediaCacheSummary before_count = frontend.media_cache_summary();
     const std::uint32_t counted                  = frontend.count_tokens(input);
-    const ninfer::MediaCacheSummary after_count  = frontend.media_cache_summary();
+    const infernix::MediaCacheSummary after_count  = frontend.media_cache_summary();
     auto prepared                                = frontend.prepare(std::move(input));
     const auto& prepared_data                    = FrontendFactory::inspect(prepared);
     int failures = check(prepared_data.vision_items.size() == 1 && prepared_data.has_media() &&
@@ -1893,7 +1893,7 @@ int test_video_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty()) {
         const auto& item = prepared_data.vision_items.front();
         failures +=
-            check(item.modality == ninfer::models::qwen3_5::PromptModality::Video &&
+            check(item.modality == infernix::models::qwen3_5::PromptModality::Video &&
                       item.grid.temporal == 1 && item.grid.height == 4 && item.grid.width == 4 &&
                       item.patch_count == 16 && item.content_digest == kGradientDigest &&
                       item.timestamps.size() == 1 && item.timestamps.front() == 0.0 &&
@@ -1918,8 +1918,8 @@ int test_video_prepare(const Frontend& frontend) {
 // as the prefix index computes it, and with media one Vision key per block that is zero before the
 // first image and tells apart images that render to the same placeholder tokens.
 int test_prefix_block_keys(const Frontend& frontend) {
-    namespace pc = ninfer::runtime::prefix_cache;
-    std::vector<ninfer::TokenId> tokens(200);
+    namespace pc = infernix::runtime::prefix_cache;
+    std::vector<infernix::TokenId> tokens(200);
     for (std::size_t index = 0; index < tokens.size(); ++index) {
         tokens[index] = fixture_byte_token(static_cast<std::uint8_t>('a' + index % 26));
     }
@@ -1936,20 +1936,20 @@ int test_prefix_block_keys(const Frontend& frontend) {
         after.push_back(static_cast<char>('A' + index % 26));
     }
     const auto prepare_image = [&](std::vector<std::uint8_t> bytes) {
-        ninfer::MessagePart image;
-        image.kind              = ninfer::MessagePartKind::Media;
-        image.media.kind        = ninfer::MediaKind::Image;
+        infernix::MessagePart image;
+        image.kind              = infernix::MessagePartKind::Media;
+        image.media.kind        = infernix::MediaKind::Image;
         image.media.bytes       = std::move(bytes);
         image.media.media_type  = "image/x-portable-pixmap";
         image.media.source_name = "inline.ppm";
-        ninfer::ChatMessage message;
-        message.role = ninfer::ChatRole::User;
-        message.parts.push_back(ninfer::MessagePart{
-            .kind = ninfer::MessagePartKind::Text, .text = before, .media = {}});
+        infernix::ChatMessage message;
+        message.role = infernix::ChatRole::User;
+        message.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = before, .media = {}});
         message.parts.push_back(std::move(image));
         message.parts.push_back(
-            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = after, .media = {}});
-        ninfer::PromptInput input;
+            infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = after, .media = {}});
+        infernix::PromptInput input;
         input.messages.push_back(std::move(message));
         return frontend.prepare(std::move(input));
     };
@@ -1988,22 +1988,22 @@ int test_prefix_block_keys(const Frontend& frontend) {
 
 int test_cross_round_stop(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
-    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    infernix::StopPolicy stop;
+    stop.strings.push_back(infernix::StopString{.text = "STOP"});
     auto session = frontend.make_output_session(prompt, stop);
 
-    const auto first_decision = session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2,
-                                                      ninfer::FinishReason::OutputLimit);
+    const auto first_decision = session.preview_model(std::array<infernix::TokenId, 1>{1}, 2,
+                                                      infernix::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "cross-round stop ended before the stop string was complete");
     const auto first = session.commit_preview();
-    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+    failures += check(channel_text(first, infernix::OutputChannel::Content) == "hello",
                       "cross-round stop did not retain the ambiguous suffix");
 
-    const auto second_decision = session.preview_model(std::array<ninfer::TokenId, 1>{2}, 1,
-                                                       ninfer::FinishReason::OutputLimit);
+    const auto second_decision = session.preview_model(std::array<infernix::TokenId, 1>{2}, 1,
+                                                       infernix::FinishReason::OutputLimit);
     failures += check(second_decision.accepted_tokens == 1 &&
-                          second_decision.finish_reason == ninfer::FinishReason::StopString,
+                          second_decision.finish_reason == infernix::FinishReason::StopString,
                       "cross-round stop did not select the exact terminal token prefix");
     const auto second = session.commit_preview();
     failures += check(second.empty(), "stop marker or same-token suffix leaked to output");
@@ -2014,17 +2014,17 @@ int test_cross_round_stop(const Frontend& frontend) {
 
 int test_same_token_stop_priority(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
+    infernix::StopPolicy stop;
     stop.strings = {
-        ninfer::StopString{.text = "tail", .include_in_output = true},
-        ninfer::StopString{.text = "OPtail"},
-        ninfer::StopString{.text = "OP", .include_in_output = true},
+        infernix::StopString{.text = "tail", .include_in_output = true},
+        infernix::StopString{.text = "OPtail"},
+        infernix::StopString{.text = "OP", .include_in_output = true},
     };
     auto session        = frontend.make_output_session(prompt, stop);
-    const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{2}, 2,
-                                                ninfer::FinishReason::OutputLimit);
+    const auto decision = session.preview_model(std::array<infernix::TokenId, 1>{2}, 2,
+                                                infernix::FinishReason::OutputLimit);
     int failures        = check(decision.accepted_tokens == 1 &&
-                                    decision.finish_reason == ninfer::FinishReason::StopString,
+                                    decision.finish_reason == infernix::FinishReason::StopString,
                                 "same-token stop strings did not select a terminal prefix");
     const auto output   = session.commit_preview();
     failures += check(output.empty(),
@@ -2034,24 +2034,24 @@ int test_same_token_stop_priority(const Frontend& frontend) {
 
 int test_terminal_flush(const Frontend& frontend) {
     auto prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy stop;
-    stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    infernix::StopPolicy stop;
+    stop.strings.push_back(infernix::StopString{.text = "STOP"});
     auto session = frontend.make_output_session(prompt, stop);
 
-    const auto first_decision = session.preview_model(std::array<ninfer::TokenId, 1>{1}, 2,
-                                                      ninfer::FinishReason::OutputLimit);
+    const auto first_decision = session.preview_model(std::array<infernix::TokenId, 1>{1}, 2,
+                                                      infernix::FinishReason::OutputLimit);
     int failures     = check(first_decision.accepted_tokens == 1 && !first_decision.finished(),
                              "terminal flush setup unexpectedly finished");
     const auto first = session.commit_preview();
-    failures += check(channel_text(first, ninfer::OutputChannel::Content) == "hello",
+    failures += check(channel_text(first, infernix::OutputChannel::Content) == "hello",
                       "terminal flush setup did not retain the possible stop suffix");
 
-    const auto terminal = session.preview_terminal(ninfer::FinishReason::Cancelled);
+    const auto terminal = session.preview_terminal(infernix::FinishReason::Cancelled);
     failures += check(terminal.accepted_tokens == 0 &&
-                          terminal.finish_reason == ninfer::FinishReason::Cancelled,
+                          terminal.finish_reason == infernix::FinishReason::Cancelled,
                       "between-round terminal preview returned the wrong decision");
     const auto flushed = session.commit_preview();
-    failures += check(channel_text(flushed, ninfer::OutputChannel::Content) == "ST",
+    failures += check(channel_text(flushed, infernix::OutputChannel::Content) == "ST",
                       "between-round terminal preview lost the pending stop suffix");
     return failures;
 }
@@ -2059,41 +2059,41 @@ int test_terminal_flush(const Frontend& frontend) {
 int test_structured_tool_output() {
     const Frontend frontend = make_frontend(resources());
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"TaskUpdate","parameters":{"type":"object","properties":{"taskId":{"type":"string"},"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["taskId"]}}})");
     auto prompt = frontend.prepare(std::move(input));
     auto session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        frontend.make_output_session(prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64});
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
         "</parameter>\n<parameter=enabled>\n</parameter>\n<parameter=count>\nmany\n"
         "</parameter>\n</function>\n</tool_call>";
-    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
-                                                ninfer::FinishReason::OutputLimit);
-    int failures        = check(decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                                                infernix::FinishReason::OutputLimit);
+    int failures        = check(decision.finish_reason == infernix::FinishReason::OutputLimit,
                                 "tool output did not reach the terminal transaction");
     const auto output   = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "Calling.",
+    failures += check(channel_text(output, infernix::OutputChannel::Content) == "Calling.",
                       "frontend did not hide the terminal tool-call suffix");
-    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    const std::vector<infernix::GeneratedToolCall> calls = session.take_tool_calls();
     failures += check(calls.size() == 1 && calls.front().name == "TaskUpdate",
                       "frontend did not publish the structured tool call");
     failures += check(session.tool_call_parse_diagnostics() ==
-                          ninfer::ToolCallParseDiagnostics{
+                          infernix::ToolCallParseDiagnostics{
                               .marker_seen               = true,
                               .structured_call_count     = 1,
                               .empty_arguments_omitted   = 1,
                               .schema_mismatch_arguments = 1,
-                              .fallback_reason = ninfer::ToolCallParseFallbackReason::None,
+                              .fallback_reason = infernix::ToolCallParseFallbackReason::None,
                           },
                       "frontend did not retain tool-call parse diagnostics");
     if (!calls.empty()) {
@@ -2106,22 +2106,22 @@ int test_structured_tool_output() {
 }
 
 int test_reasoning_split(const Frontend& frontend) {
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
     input.options.enable_thinking = true;
     auto prompt                   = frontend.prepare(std::move(input));
 
     auto canonical_session = frontend.make_output_session(prompt, {});
-    const std::vector<ninfer::TokenId> canonical_tokens =
+    const std::vector<infernix::TokenId> canonical_tokens =
         fixture_tokenizer().encode("thought\n</think>\n\n");
     const auto canonical = canonical_session.preview_model(
         canonical_tokens, static_cast<std::uint32_t>(canonical_tokens.size() + 1U),
-        ninfer::FinishReason::OutputLimit);
+        infernix::FinishReason::OutputLimit);
     int failures =
         check(canonical.accepted_tokens == canonical_tokens.size() && !canonical.finished() &&
                   canonical.prefix_execution_split_after == canonical_tokens.size(),
@@ -2129,30 +2129,30 @@ int test_reasoning_split(const Frontend& frontend) {
     (void)canonical_session.commit_preview();
 
     auto session = frontend.make_output_session(prompt, {});
-    const std::array<ninfer::TokenId, 2> tokens{3, 4};
-    const auto decision = session.preview_model(tokens, 2, ninfer::FinishReason::OutputLimit);
+    const std::array<infernix::TokenId, 2> tokens{3, 4};
+    const auto decision = session.preview_model(tokens, 2, infernix::FinishReason::OutputLimit);
     failures += check(decision.accepted_tokens == 2 &&
-                          decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                          decision.finish_reason == infernix::FinishReason::OutputLimit &&
                           !decision.prefix_execution_split_after,
                       "reasoning close inside a mixed token produced an execution frontier");
     const auto output = session.commit_preview();
-    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "thought",
+    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) == "thought",
                       "reasoning channel did not remove the close marker");
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) == "answer",
+    failures += check(channel_text(output, infernix::OutputChannel::Content) == "answer",
                       "content channel did not strip the post-thinking separator");
     failures += check(session.reasoning_tokens() == 2,
                       "reasoning token usage did not count accepted reasoning tokens exactly");
     return failures;
 }
 
-ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend) {
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+infernix::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend) {
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
-    input.options.continuation    = ninfer::PromptContinuationMode::NewAssistantTurn;
+    input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
     input.options.enable_thinking = true;
     return frontend.prepare(std::move(input));
 }
@@ -2161,10 +2161,10 @@ int test_reasoning_close_requires_boundary(const Frontend& frontend) {
     auto prompt  = thinking_prompt(frontend);
     auto session = frontend.make_output_session(prompt, {});
 
-    std::vector<ninfer::TokenId> quoted = fixture_tokens("discussing ");
+    std::vector<infernix::TokenId> quoted = fixture_tokens("discussing ");
     quoted.push_back(kFixtureThinkCloseToken);
     const auto quoted_decision =
-        session.preview_model(quoted, 64, ninfer::FinishReason::OutputLimit);
+        session.preview_model(quoted, 64, infernix::FinishReason::OutputLimit);
     const auto quoted_output = session.commit_preview();
 
     int failures = 0;
@@ -2172,38 +2172,38 @@ int test_reasoning_close_requires_boundary(const Frontend& frontend) {
         check(quoted_decision.accepted_tokens == quoted.size() && !quoted_decision.finished(),
               "a close candidate at a round boundary ended its round early");
     failures +=
-        check(channel_text(quoted_output, ninfer::OutputChannel::Reasoning) == "discussing " &&
-                  channel_text(quoted_output, ninfer::OutputChannel::Content).empty(),
+        check(channel_text(quoted_output, infernix::OutputChannel::Reasoning) == "discussing " &&
+                  channel_text(quoted_output, infernix::OutputChannel::Content).empty(),
               "a close candidate at a round boundary was not held for its following byte");
 
     const auto quoted_tail = fixture_tokens("'; then hidden\n");
     const auto tail_decision =
-        session.preview_model(quoted_tail, 64, ninfer::FinishReason::OutputLimit);
+        session.preview_model(quoted_tail, 64, infernix::FinishReason::OutputLimit);
     const auto tail_output = session.commit_preview();
-    failures += check(channel_text(tail_output, ninfer::OutputChannel::Reasoning) ==
+    failures += check(channel_text(tail_output, infernix::OutputChannel::Reasoning) ==
                               "</think>'; then hidden\n" &&
-                          channel_text(tail_output, ninfer::OutputChannel::Content).empty(),
+                          channel_text(tail_output, infernix::OutputChannel::Content).empty(),
                       "a marker followed by a quote was treated as a reasoning close");
 
-    std::vector<ninfer::TokenId> spaced = {kFixtureThinkCloseToken};
+    std::vector<infernix::TokenId> spaced = {kFixtureThinkCloseToken};
     const auto prose                    = fixture_tokens(" tag ends reasoning.\n");
     spaced.insert(spaced.end(), prose.begin(), prose.end());
-    const auto spaced_decision = session.preview_model(spaced, 64, ninfer::FinishReason::OutputLimit);
+    const auto spaced_decision = session.preview_model(spaced, 64, infernix::FinishReason::OutputLimit);
     const auto spaced_output   = session.commit_preview();
     failures += check(!spaced_decision.finished() &&
-                          channel_text(spaced_output, ninfer::OutputChannel::Reasoning) ==
+                          channel_text(spaced_output, infernix::OutputChannel::Reasoning) ==
                               "</think> tag ends reasoning.\n" &&
-                          channel_text(spaced_output, ninfer::OutputChannel::Content).empty(),
+                          channel_text(spaced_output, infernix::OutputChannel::Content).empty(),
                       "a marker quoted in prose and followed by a space closed reasoning");
 
-    std::vector<ninfer::TokenId> close = {kFixtureThinkCloseToken};
+    std::vector<infernix::TokenId> close = {kFixtureThinkCloseToken};
     const auto answer                  = fixture_tokens("\n\nreal answer");
     close.insert(close.end(), answer.begin(), answer.end());
-    const auto close_decision = session.preview_model(close, 64, ninfer::FinishReason::OutputLimit);
+    const auto close_decision = session.preview_model(close, 64, infernix::FinishReason::OutputLimit);
     const auto close_output   = session.commit_preview();
     failures +=
-        check(channel_text(close_output, ninfer::OutputChannel::Reasoning).empty() &&
-                  channel_text(close_output, ninfer::OutputChannel::Content) == "real answer",
+        check(channel_text(close_output, infernix::OutputChannel::Reasoning).empty() &&
+                  channel_text(close_output, infernix::OutputChannel::Content) == "real answer",
               "the real close did not open the content channel");
     return failures;
 }
@@ -2212,18 +2212,18 @@ int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
     auto prompt  = thinking_prompt(frontend);
     auto session = frontend.make_output_session(prompt, {});
 
-    std::vector<ninfer::TokenId> tokens = fixture_tokens("done thinking");
+    std::vector<infernix::TokenId> tokens = fixture_tokens("done thinking");
     tokens.push_back(kFixtureThinkCloseToken);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
-                                                ninfer::FinishReason::OutputLimit);
+                                                infernix::FinishReason::OutputLimit);
     const auto output   = session.commit_preview();
 
     int failures = 0;
     failures += check(decision.accepted_tokens == tokens.size() &&
-                          decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                          decision.finish_reason == infernix::FinishReason::OutputLimit,
                       "the implicit terminal close changed the round decision");
-    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "done thinking" &&
-                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) == "done thinking" &&
+                          channel_text(output, infernix::OutputChannel::Content).empty(),
                       "the implicit terminal close was published into reasoning");
     return failures;
 }
@@ -2231,19 +2231,19 @@ int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
 int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     auto session =
-        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 3});
+        frontend.make_output_session(prompt, {}, {}, infernix::ThinkingControlOptions{.budget = 3});
 
-    const std::vector<ninfer::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
-    const auto decision = session.preview_model(tokens, 10, ninfer::FinishReason::OutputLimit);
+    const std::vector<infernix::TokenId> tokens{0, kFixtureThinkCloseToken, 0};
+    const auto decision = session.preview_model(tokens, 10, infernix::FinishReason::OutputLimit);
     const auto output   = session.commit_preview();
 
     int failures = 0;
     failures +=
         check(!decision.finished() &&
-                  decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                  decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
               "a quoted close marker suppressed the thinking budget control");
-    failures += check(channel_text(output, ninfer::OutputChannel::Reasoning) == "x</think>x" &&
-                          channel_text(output, ninfer::OutputChannel::Content).empty(),
+    failures += check(channel_text(output, infernix::OutputChannel::Reasoning) == "x</think>x" &&
+                          channel_text(output, infernix::OutputChannel::Content).empty(),
                       "a quoted close marker was not preserved in the reasoning channel");
     return failures;
 }
@@ -2251,18 +2251,18 @@ int test_thinking_budget_ignores_quoted_close(const Frontend& frontend) {
 int test_tool_marker_after_quoted_marker() {
     const Frontend frontend = make_frontend(resources());
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
     auto prompt = frontend.prepare(std::move(input));
     auto session =
-        frontend.make_output_session(prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        frontend.make_output_session(prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64});
 
     const std::string quoted =
         "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
@@ -2271,14 +2271,14 @@ int test_tool_marker_after_quoted_marker() {
                                   "\nThen the real call:\n"
                                   "<tool_call>\n<function=bash>\n<parameter=command>\necho ok\n"
                                   "</parameter>\n</function>\n</tool_call>";
-    const std::vector<ninfer::TokenId> tokens = fixture_tokenizer().encode(generated);
+    const std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
-                                                ninfer::FinishReason::OutputLimit);
+                                                infernix::FinishReason::OutputLimit);
     const auto output   = session.commit_preview();
-    const std::vector<ninfer::GeneratedToolCall> calls = session.take_tool_calls();
+    const std::vector<infernix::GeneratedToolCall> calls = session.take_tool_calls();
 
     int failures = 0;
-    failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+    failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit &&
                           calls.size() == 1 && calls.front().name == "bash",
                       "a quoted malformed marker demoted the following real tool call");
     if (calls.size() == 1) {
@@ -2286,7 +2286,7 @@ int test_tool_marker_after_quoted_marker() {
         failures += check(arguments.at("command") == "echo ok",
                           "the recovered tool call lost its arguments");
     }
-    failures += check(channel_text(output, ninfer::OutputChannel::Content) ==
+    failures += check(channel_text(output, infernix::OutputChannel::Content) ==
                           "The failure looked like " + quoted + "\nThen the real call:",
                       "the quoted marker was not preserved as ordinary content");
     return failures;
@@ -2309,20 +2309,20 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
         looping += "Wait, let me double-check the case where the list is empty. Then the function returns "
                    "zero, which matches the expected output, so that case is fine. ";
     }
-    const std::vector<ninfer::TokenId> loop_tokens   = fixture_tokenizer().encode(looping);
-    const std::vector<ninfer::TokenId> varied_tokens = fixture_tokenizer().encode(varied + varied);
+    const std::vector<infernix::TokenId> loop_tokens   = fixture_tokenizer().encode(looping);
+    const std::vector<infernix::TokenId> varied_tokens = fixture_tokenizer().encode(varied + varied);
     constexpr std::size_t kRound = 200;
 
     // Feeds `tokens` in rounds until a decision ends or asks for control; returns that decision.
-    const auto run = [&](auto& session, const std::vector<ninfer::TokenId>& tokens, std::uint32_t budget) {
-        ninfer::runtime::OutputDecision last{};
+    const auto run = [&](auto& session, const std::vector<infernix::TokenId>& tokens, std::uint32_t budget) {
+        infernix::runtime::OutputDecision last{};
         for (std::size_t at = 0; at < tokens.size(); at += kRound) {
             const std::size_t n = std::min(kRound, tokens.size() - at);
-            last = session.preview_model(std::span<const ninfer::TokenId>(tokens.data() + at, n), budget,
-                                         ninfer::FinishReason::OutputLimit);
+            last = session.preview_model(std::span<const infernix::TokenId>(tokens.data() + at, n), budget,
+                                         infernix::FinishReason::OutputLimit);
             (void)session.commit_preview();
             budget -= last.accepted_tokens;
-            if (last.finished() || last.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl) {
+            if (last.finished() || last.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl) {
                 break;
             }
         }
@@ -2332,46 +2332,46 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
     int failures = 0;
     {
         auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
-                                                    ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Stop});
+                                                    infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Stop});
         const auto decision = run(session, loop_tokens, 1'000'000);
         const auto stats    = session.thinking_stats();
-        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit && stats.loop_detected &&
+        failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit && stats.loop_detected &&
                               stats.loop_coverage >= 0.25F && stats.loop_thinking_tokens >= 512 &&
                               !stats.applied,
                           "Stop did not end a looping reasoning at a check");
     }
     {
         auto session = frontend.make_output_session(
-            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+            thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Conclude});
         const auto decision = run(session, loop_tokens, 1'000'000);
         failures += check(!decision.finished() &&
-                              decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                              decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl &&
                               session.model_token_budget_remaining(1'000'000) == 0,
                           "Conclude did not request the thinking-close control");
-        const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
-        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        const std::span<const infernix::TokenId> pending = session.pending_control_tokens();
+        const std::vector<infernix::TokenId> control(pending.begin(), pending.end());
         failures += check(!control.empty(), "Conclude exposed no control span");
         if (!control.empty()) {
             (void)session.preview_control(control, 1'000'000);
             (void)session.commit_preview();
-            (void)session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1'000'000, ninfer::FinishReason::OutputLimit);
+            (void)session.preview_model(std::array<infernix::TokenId, 1>{0}, 1'000'000, infernix::FinishReason::OutputLimit);
             const auto answer = session.commit_preview();
             const auto stats  = session.thinking_stats();
-            failures += check(channel_text(answer, ninfer::OutputChannel::Content) == "x" && stats.applied &&
+            failures += check(channel_text(answer, infernix::OutputChannel::Content) == "x" && stats.applied &&
                                   stats.loop_detected && stats.injected_tokens == control.size(),
                               "Conclude did not close the thinking and answer in content");
         }
     }
     {
         auto session = frontend.make_output_session(
-            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+            thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Conclude});
         const auto decision = run(session, varied_tokens, 1'000'000);
-        failures += check(!decision.finished() && decision.continuation == ninfer::runtime::ContinuationAction::Decode &&
+        failures += check(!decision.finished() && decision.continuation == infernix::runtime::ContinuationAction::Decode &&
                               !session.thinking_stats().loop_detected,
                           "the guard fired on varied reasoning");
     }
     {
-        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{});
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{});
         const auto decision = run(session, loop_tokens, 1'000'000);
         failures += check(!decision.finished() && !session.thinking_stats().loop_detected,
                           "the guard fired while Off");
@@ -2380,20 +2380,20 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
         // Exactly the looping tokens as the output limit: when the guard fires, fewer tokens than the
         // control span plus one remain only if the limit is tight, so size it from a probe run.
         auto probe = frontend.make_output_session(
-            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+            thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Conclude});
         std::uint32_t fired_after = 0;
         for (std::size_t at = 0; at < loop_tokens.size(); at += kRound) {
             const std::size_t n = std::min(kRound, loop_tokens.size() - at);
-            const auto d = probe.preview_model(std::span<const ninfer::TokenId>(loop_tokens.data() + at, n), 1'000'000,
-                                               ninfer::FinishReason::OutputLimit);
+            const auto d = probe.preview_model(std::span<const infernix::TokenId>(loop_tokens.data() + at, n), 1'000'000,
+                                               infernix::FinishReason::OutputLimit);
             (void)probe.commit_preview();
             fired_after += d.accepted_tokens;
-            if (d.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl) { break; }
+            if (d.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl) { break; }
         }
         auto session = frontend.make_output_session(
-            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+            thinking_prompt(frontend), {}, {}, infernix::ThinkingControlOptions{.loop = infernix::ReasoningLoopAction::Conclude});
         const auto decision = run(session, loop_tokens, fired_after + 1U);
-        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+        failures += check(decision.finish_reason == infernix::FinishReason::OutputLimit &&
                               session.thinking_stats().loop_detected && !session.thinking_stats().applied,
                           "Conclude without room for the control did not stop");
     }
@@ -2402,11 +2402,11 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
 
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
-    ninfer::StopPolicy stop;
+    infernix::StopPolicy stop;
     stop.strings.push_back(
-        ninfer::StopString{.text = "limited", .channel = ninfer::OutputChannel::Reasoning});
+        infernix::StopString{.text = "limited", .channel = infernix::OutputChannel::Reasoning});
     auto session =
-        frontend.make_output_session(prompt, stop, {}, ninfer::ThinkingControlOptions{.budget = 2});
+        frontend.make_output_session(prompt, stop, {}, infernix::ThinkingControlOptions{.budget = 2});
     int failures = check(session.model_token_budget_remaining(20) == 2,
                          "thinking budget did not clamp the model round license");
     // An output limit at or below the budget ends thinking first, so the budget takes no effect
@@ -2417,21 +2417,21 @@ int test_thinking_budget_control(const Frontend& frontend) {
                       }),
                       "planning rejected an output limit that the thinking budget never reaches");
 
-    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    const std::array<infernix::TokenId, 2> model_tokens{0, 0};
     const auto boundary =
-        session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+        session.preview_model(model_tokens, 20, infernix::FinishReason::OutputLimit);
     failures +=
         check(boundary.accepted_tokens == model_tokens.size() && !boundary.finished() &&
-                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                  boundary.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
               "thinking boundary did not request target control");
     const auto model_output = session.commit_preview();
-    failures += check(channel_text(model_output, ninfer::OutputChannel::Reasoning) == "xx",
+    failures += check(channel_text(model_output, infernix::OutputChannel::Reasoning) == "xx",
                       "model-origin thinking output was not published before control");
 
-    const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+    const std::span<const infernix::TokenId> pending = session.pending_control_tokens();
     failures += check(pending.size() > 1,
                       "thinking boundary did not expose a multi-token canonical control span");
-    const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+    const std::vector<infernix::TokenId> control(pending.begin(), pending.end());
     failures += check(
         throws_invalid_argument([&] {
             session.validate_generation_capacity(static_cast<std::uint32_t>(2 + control.size()));
@@ -2445,32 +2445,32 @@ int test_thinking_budget_control(const Frontend& frontend) {
                   control_decision.prefix_execution_split_after == control.size(),
               "canonical thinking control was not accepted atomically");
     const auto control_output = session.commit_preview();
-    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+    failures += check(channel_text(control_output, infernix::OutputChannel::Reasoning) ==
                               kThinkingControlGuidance &&
-                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                          channel_text(control_output, infernix::OutputChannel::Content).empty(),
                       "thinking control was truncated by caller stops or published to content");
-    const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
+    const infernix::ThinkingBudgetStats stats = session.thinking_stats();
     failures += check(stats.configured_budget == 2 && stats.model_thinking_tokens == 2 &&
                           stats.injected_tokens == control.size() && stats.applied &&
                           session.pending_control_tokens().empty() &&
                           session.model_token_budget_remaining(17) == 17,
                       "thinking control accounting or post-close license is incorrect");
 
-    const auto content_decision = session.preview_model(std::array<ninfer::TokenId, 1>{0}, 17,
-                                                        ninfer::FinishReason::OutputLimit);
+    const auto content_decision = session.preview_model(std::array<infernix::TokenId, 1>{0}, 17,
+                                                        infernix::FinishReason::OutputLimit);
     failures +=
         check(!content_decision.finished(), "post-control model token unexpectedly terminated");
     const auto content_output = session.commit_preview();
-    failures += check(channel_text(content_output, ninfer::OutputChannel::Content) == "x",
+    failures += check(channel_text(content_output, infernix::OutputChannel::Content) == "x",
                       "post-control model output did not enter the content channel");
 
     auto natural_prompt  = thinking_prompt(frontend);
     auto natural_session = frontend.make_output_session(
-        natural_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
-    const auto natural = natural_session.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 20,
-                                                       ninfer::FinishReason::OutputLimit);
+        natural_prompt, {}, {}, infernix::ThinkingControlOptions{.budget = 2});
+    const auto natural = natural_session.preview_model(std::array<infernix::TokenId, 2>{3, 4}, 20,
+                                                       infernix::FinishReason::OutputLimit);
     failures += check(!natural.finished() &&
-                          natural.continuation == ninfer::runtime::ContinuationAction::Decode,
+                          natural.continuation == infernix::runtime::ContinuationAction::Decode,
                       "natural thinking close at the budget boundary requested control");
     (void)natural_session.commit_preview();
     failures += check(natural_session.pending_control_tokens().empty() &&
@@ -2479,11 +2479,11 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     auto terminal_prompt  = thinking_prompt(frontend);
     auto terminal_session = frontend.make_output_session(
-        terminal_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
-    const auto terminal = terminal_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 10,
-                                                         ninfer::FinishReason::OutputLimit);
-    failures += check(terminal.finish_reason == ninfer::FinishReason::StopToken &&
-                          terminal.continuation == ninfer::runtime::ContinuationAction::Decode,
+        terminal_prompt, {}, {}, infernix::ThinkingControlOptions{.budget = 1});
+    const auto terminal = terminal_session.preview_model(std::array<infernix::TokenId, 1>{6}, 10,
+                                                         infernix::FinishReason::OutputLimit);
+    failures += check(terminal.finish_reason == infernix::FinishReason::StopToken &&
+                          terminal.continuation == infernix::runtime::ContinuationAction::Decode,
                       "terminal token at the thinking boundary did not take priority");
     (void)terminal_session.commit_preview();
     failures += check(terminal_session.pending_control_tokens().empty(),
@@ -2491,35 +2491,35 @@ int test_thinking_budget_control(const Frontend& frontend) {
 
     auto limit_prompt  = thinking_prompt(frontend);
     auto limit_session = frontend.make_output_session(limit_prompt, {}, {},
-                                                      ninfer::ThinkingControlOptions{.budget = 1});
-    const auto limited = limit_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1,
-                                                     ninfer::FinishReason::ContextCapacity);
-    failures += check(limited.finish_reason == ninfer::FinishReason::ContextCapacity &&
-                          limited.continuation == ninfer::runtime::ContinuationAction::Decode,
+                                                      infernix::ThinkingControlOptions{.budget = 1});
+    const auto limited = limit_session.preview_model(std::array<infernix::TokenId, 1>{0}, 1,
+                                                     infernix::FinishReason::ContextCapacity);
+    failures += check(limited.finish_reason == infernix::FinishReason::ContextCapacity &&
+                          limited.continuation == infernix::runtime::ContinuationAction::Decode,
                       "total capacity did not take priority at the thinking boundary");
     (void)limit_session.commit_preview();
 
     auto raw_prompt = thinking_prompt(frontend);
     auto raw_session =
-        frontend.make_output_session(raw_prompt, {}, ninfer::OutputOptions{.raw = true},
-                                     ninfer::ThinkingControlOptions{.budget = 1});
-    const auto raw_boundary = raw_session.preview_model(std::array<ninfer::TokenId, 1>{0}, 10,
-                                                        ninfer::FinishReason::OutputLimit);
+        frontend.make_output_session(raw_prompt, {}, infernix::OutputOptions{.raw = true},
+                                     infernix::ThinkingControlOptions{.budget = 1});
+    const auto raw_boundary = raw_session.preview_model(std::array<infernix::TokenId, 1>{0}, 10,
+                                                        infernix::FinishReason::OutputLimit);
     failures +=
-        check(raw_boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+        check(raw_boundary.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
               "raw presentation disabled semantic thinking control");
     (void)raw_session.commit_preview();
-    const std::vector<ninfer::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
+    const std::vector<infernix::TokenId> raw_tokens(raw_session.pending_control_tokens().begin(),
                                                   raw_session.pending_control_tokens().end());
     (void)raw_session.preview_control(raw_tokens, 9);
     const auto raw_output = raw_session.commit_preview();
-    failures += check(channel_text(raw_output, ninfer::OutputChannel::Content) == kThinkingControl,
+    failures += check(channel_text(raw_output, infernix::OutputChannel::Content) == kThinkingControl,
                       "raw output did not preserve the inserted control representation");
     return failures;
 }
 
 int test_thinking_budget_message() {
-    ninfer::models::qwen3_5::FrontendOptions message_options;
+    infernix::models::qwen3_5::FrontendOptions message_options;
     message_options.vision_enabled = false;
     message_options.thinking_budget_message = "Time to act now:";
     const std::string expected_control =
@@ -2527,15 +2527,15 @@ int test_thinking_budget_message() {
     const Frontend message_frontend = make_frontend(resources(), message_options);
     int failures                     = 0;
     auto session = message_frontend.make_output_session(
-        thinking_prompt(message_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
-    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
-    const auto boundary = session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+        thinking_prompt(message_frontend), {}, {}, infernix::ThinkingControlOptions{.budget = 2});
+    const std::array<infernix::TokenId, 2> model_tokens{0, 0};
+    const auto boundary = session.preview_model(model_tokens, 20, infernix::FinishReason::OutputLimit);
     failures +=
         check(!boundary.finished() &&
-                  boundary.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                  boundary.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
               "custom message thinking boundary did not request target control");
     (void)session.commit_preview();
-    const std::vector<ninfer::TokenId> control(session.pending_control_tokens().begin(),
+    const std::vector<infernix::TokenId> control(session.pending_control_tokens().begin(),
                                                session.pending_control_tokens().end());
     const std::string control_text = fixture_tokenizer().decode(
         control, fi::DecodeOptions{.skip_special_tokens = false});
@@ -2550,22 +2550,22 @@ int test_thinking_budget_message() {
     // The reasoning channel keeps the message plus the leading newline of the canonical close
     // (the serialization "\n</think>\n\n" starts with a newline); the trailing newlines after
     // </think> are stripped from the content channel.
-    failures += check(channel_text(control_output, ninfer::OutputChannel::Reasoning) ==
+    failures += check(channel_text(control_output, infernix::OutputChannel::Reasoning) ==
                           "Time to act now:\n" &&
-                          channel_text(control_output, ninfer::OutputChannel::Content).empty(),
+                          channel_text(control_output, infernix::OutputChannel::Content).empty(),
                       "custom thinking control was truncated or published to content");
     failures += check(session.thinking_stats().injected_tokens == control.size() &&
                           session.thinking_stats().applied,
                       "custom thinking control accounting is incorrect");
 
-    ninfer::models::qwen3_5::FrontendOptions exact_options = message_options;
+    infernix::models::qwen3_5::FrontendOptions exact_options = message_options;
     exact_options.thinking_budget_message = expected_control;
     const Frontend exact_frontend = make_frontend(resources(), exact_options);
     auto exact_session = exact_frontend.make_output_session(
-        thinking_prompt(exact_frontend), {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
-    (void)exact_session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+        thinking_prompt(exact_frontend), {}, {}, infernix::ThinkingControlOptions{.budget = 2});
+    (void)exact_session.preview_model(model_tokens, 20, infernix::FinishReason::OutputLimit);
     (void)exact_session.commit_preview();
-    const std::vector<ninfer::TokenId> exact_tokens(
+    const std::vector<infernix::TokenId> exact_tokens(
         exact_session.pending_control_tokens().begin(),
         exact_session.pending_control_tokens().end());
     const std::string exact_text = fixture_tokenizer().decode(
@@ -2573,7 +2573,7 @@ int test_thinking_budget_message() {
     failures += check(exact_text == expected_control,
                       "canonical close was appended to a message that already had it");
 
-    ninfer::models::qwen3_5::FrontendOptions terminal_options = message_options;
+    infernix::models::qwen3_5::FrontendOptions terminal_options = message_options;
     terminal_options.thinking_budget_message = "<eos>";
     failures += check(
         throws_invalid_argument([&] { (void)make_frontend(resources(), terminal_options); }),
@@ -2586,9 +2586,9 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     auto session            = frontend.make_output_session(prompt, {});
     int failures            = 0;
     std::uint32_t remaining = 4;
-    for (const ninfer::TokenId token : {10, 11}) {
-        const auto decision = session.preview_model(std::array<ninfer::TokenId, 1>{token},
-                                                    remaining, ninfer::FinishReason::OutputLimit);
+    for (const infernix::TokenId token : {10, 11}) {
+        const auto decision = session.preview_model(std::array<infernix::TokenId, 1>{token},
+                                                    remaining, infernix::FinishReason::OutputLimit);
         failures += check(decision.accepted_tokens == 1 && !decision.finished(),
                           "partial UTF-8 token unexpectedly ended generation");
         const auto output = session.commit_preview();
@@ -2596,38 +2596,38 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
         failures += check(output.empty(), "partial UTF-8 codepoint was published");
     }
     const auto complete_decision = session.preview_model(
-        std::array<ninfer::TokenId, 1>{12}, remaining, ninfer::FinishReason::OutputLimit);
+        std::array<infernix::TokenId, 1>{12}, remaining, infernix::FinishReason::OutputLimit);
     failures += check(complete_decision.accepted_tokens == 1 && !complete_decision.finished(),
                       "complete UTF-8 token unexpectedly ended generation");
     const auto complete = session.commit_preview();
-    failures += check(channel_text(complete, ninfer::OutputChannel::Content) == "中",
+    failures += check(channel_text(complete, infernix::OutputChannel::Content) == "中",
                       "UTF-8 codepoint was not published when complete");
 
-    const auto decode_generated = [&](const std::vector<ninfer::TokenId>& tokens,
+    const auto decode_generated = [&](const std::vector<infernix::TokenId>& tokens,
                                       bool one_token_per_round) {
         auto generated_prompt  = frontend.prepare_tokens({0});
         auto generated_session = frontend.make_output_session(generated_prompt, {});
         std::string text;
         std::uint32_t budget = static_cast<std::uint32_t>(tokens.size());
         if (one_token_per_round) {
-            for (const ninfer::TokenId token : tokens) {
+            for (const infernix::TokenId token : tokens) {
                 const auto decision =
-                    generated_session.preview_model(std::array<ninfer::TokenId, 1>{token}, budget,
-                                                    ninfer::FinishReason::OutputLimit);
+                    generated_session.preview_model(std::array<infernix::TokenId, 1>{token}, budget,
+                                                    infernix::FinishReason::OutputLimit);
                 budget -= decision.accepted_tokens;
                 text += channel_text(generated_session.commit_preview(),
-                                     ninfer::OutputChannel::Content);
+                                     infernix::OutputChannel::Content);
             }
         } else {
             (void)generated_session.preview_model(tokens, budget,
-                                                  ninfer::FinishReason::OutputLimit);
-            text = channel_text(generated_session.commit_preview(), ninfer::OutputChannel::Content);
+                                                  infernix::FinishReason::OutputLimit);
+            text = channel_text(generated_session.commit_preview(), infernix::OutputChannel::Content);
         }
         return text;
     };
 
     struct Utf8Case {
-        std::vector<ninfer::TokenId> tokens;
+        std::vector<infernix::TokenId> tokens;
         std::string expected;
         const char* label;
     };
@@ -2663,52 +2663,52 @@ int test_utf8_and_hidden_eos(const Frontend& frontend) {
     }
 
     auto repaired_stop_prompt = frontend.prepare_tokens({0});
-    ninfer::StopPolicy repaired_stop;
-    repaired_stop.strings.push_back(ninfer::StopString{.text = "STOP"});
+    infernix::StopPolicy repaired_stop;
+    repaired_stop.strings.push_back(infernix::StopString{.text = "STOP"});
     auto repaired_stop_session = frontend.make_output_session(repaired_stop_prompt, repaired_stop);
     const auto repaired_stop_decision = repaired_stop_session.preview_model(
-        std::array<ninfer::TokenId, 3>{10, 1, 2}, 3, ninfer::FinishReason::OutputLimit);
-    failures += check(repaired_stop_decision.finish_reason == ninfer::FinishReason::StopString,
+        std::array<infernix::TokenId, 3>{10, 1, 2}, 3, infernix::FinishReason::OutputLimit);
+    failures += check(repaired_stop_decision.finish_reason == infernix::FinishReason::StopString,
                       "UTF-8 recovery hid a following stop string");
     const auto repaired_stop_output = repaired_stop_session.commit_preview();
-    failures += check(channel_text(repaired_stop_output, ninfer::OutputChannel::Content) ==
+    failures += check(channel_text(repaired_stop_output, infernix::OutputChannel::Content) ==
                           replacement + "hello",
                       "UTF-8 recovery changed stop-string publication");
 
     auto repaired_reasoning_prompt  = thinking_prompt(frontend);
     auto repaired_reasoning_session = frontend.make_output_session(repaired_reasoning_prompt, {});
     const auto repaired_reasoning_decision = repaired_reasoning_session.preview_model(
-        std::array<ninfer::TokenId, 3>{10, 3, 4}, 3, ninfer::FinishReason::OutputLimit);
+        std::array<infernix::TokenId, 3>{10, 3, 4}, 3, infernix::FinishReason::OutputLimit);
     failures +=
-        check(repaired_reasoning_decision.finish_reason == ninfer::FinishReason::OutputLimit,
+        check(repaired_reasoning_decision.finish_reason == infernix::FinishReason::OutputLimit,
               "UTF-8 recovery changed reasoning termination");
     const auto repaired_reasoning_output = repaired_reasoning_session.commit_preview();
-    failures += check(channel_text(repaired_reasoning_output, ninfer::OutputChannel::Reasoning) ==
+    failures += check(channel_text(repaired_reasoning_output, infernix::OutputChannel::Reasoning) ==
                               replacement + "thought" &&
-                          channel_text(repaired_reasoning_output, ninfer::OutputChannel::Content) ==
+                          channel_text(repaired_reasoning_output, infernix::OutputChannel::Content) ==
                               "answer",
                       "UTF-8 recovery changed reasoning/content channel routing");
 
     auto eos_prompt         = frontend.prepare_tokens({0});
     auto eos_session        = frontend.make_output_session(eos_prompt, {});
-    const auto eos_decision = eos_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                        ninfer::FinishReason::OutputLimit);
+    const auto eos_decision = eos_session.preview_model(std::array<infernix::TokenId, 1>{6}, 2,
+                                                        infernix::FinishReason::OutputLimit);
     failures += check(eos_decision.accepted_tokens == 1 &&
-                          eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                          eos_decision.finish_reason == infernix::FinishReason::StopToken,
                       "default EOS token did not end generation");
     const auto eos = eos_session.commit_preview();
     failures += check(eos.empty(), "default EOS token was published");
 
     auto raw_prompt  = frontend.prepare_tokens({0});
     auto raw_session = frontend.make_output_session(
-        raw_prompt, {}, ninfer::OutputOptions{.raw = true, .preserve_special_tokens = false});
-    const auto raw_eos_decision = raw_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 2,
-                                                            ninfer::FinishReason::OutputLimit);
+        raw_prompt, {}, infernix::OutputOptions{.raw = true, .preserve_special_tokens = false});
+    const auto raw_eos_decision = raw_session.preview_model(std::array<infernix::TokenId, 1>{6}, 2,
+                                                            infernix::FinishReason::OutputLimit);
     failures += check(raw_eos_decision.accepted_tokens == 1 &&
-                          raw_eos_decision.finish_reason == ninfer::FinishReason::StopToken,
+                          raw_eos_decision.finish_reason == infernix::FinishReason::StopToken,
                       "raw EOS token did not end generation");
     const auto raw_eos = raw_session.commit_preview();
-    failures += check(channel_text(raw_eos, ninfer::OutputChannel::Content) == "<eos>",
+    failures += check(channel_text(raw_eos, infernix::OutputChannel::Content) == "<eos>",
                       "raw output did not preserve the terminal special token");
     return failures;
 }
@@ -2723,11 +2723,11 @@ int test_disabled_vision() {
     failures += check(throws_invalid_argument([&] { (void)frontend.count_tokens(image_input()); }),
                       "Vision-disabled frontend accepted media during token counting");
 
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     message.parts.push_back(
-        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
-    ninfer::PromptInput input;
+        infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = "x", .media = {}});
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     failures += check(frontend.prepare(std::move(input)).summary().prompt_tokens != 0,
                       "Vision-disabled frontend rejected a text prompt");
@@ -2737,7 +2737,7 @@ int test_disabled_vision() {
 int test_invalid_media_classification() {
     const Frontend frontend = make_frontend(resources());
     auto invalid_image      = [] {
-        ninfer::PromptInput input                    = image_input();
+        infernix::PromptInput input                    = image_input();
         input.messages[0].parts[0].media.bytes       = {0x00, 0x01, 0x02};
         input.messages[0].parts[0].media.source_name = "invalid-image.bin";
         return input;
@@ -2745,8 +2745,8 @@ int test_invalid_media_classification() {
     auto is_invalid_media = [](const auto& operation) {
         try {
             operation();
-        } catch (const ninfer::RequestError& error) {
-            return error.kind() == ninfer::RequestErrorKind::InvalidMedia;
+        } catch (const infernix::RequestError& error) {
+            return error.kind() == infernix::RequestErrorKind::InvalidMedia;
         }
         return false;
     };
@@ -2776,7 +2776,7 @@ int test_media_cache_reuses_immutable_payload() {
         check(first_data.media_payloads.size() == 1 && second_data.media_payloads.size() == 1 &&
                   first_data.media_payloads.front() == second_data.media_payloads.front(),
               "cache hit did not share the immutable per-item patch payload");
-    const ninfer::MediaCacheSummary cache = frontend.media_cache_summary();
+    const infernix::MediaCacheSummary cache = frontend.media_cache_summary();
     failures += check(cache.entries == 1 && cache.misses == 1 && cache.hits == 1 &&
                           cache.retained_bytes == 16 * 1536 * sizeof(std::uint16_t) &&
                           cache.live_bytes == cache.retained_bytes &&
@@ -2786,7 +2786,7 @@ int test_media_cache_reuses_immutable_payload() {
 }
 
 int test_media_payload_outlives_frontend_cache() {
-    ninfer::models::qwen3_5::PreparedPrompt survivor;
+    infernix::models::qwen3_5::PreparedPrompt survivor;
     {
         const Frontend frontend = make_frontend(resources());
         survivor                = frontend.prepare(image_input());
@@ -2899,19 +2899,19 @@ int test_media_cache_runs_independent_misses_in_parallel() {
 
 int test_many_images_prepare_in_one_parallel_batch() {
     const Frontend frontend = make_frontend(resources());
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
     for (int index = 0; index < 19; ++index) {
-        ninfer::MessagePart image;
-        image.kind               = ninfer::MessagePartKind::Media;
-        image.media.kind         = ninfer::MediaKind::Image;
+        infernix::MessagePart image;
+        image.kind               = infernix::MessagePartKind::Media;
+        image.media.kind         = infernix::MediaKind::Image;
         image.media.bytes        = gradient_ppm();
         image.media.bytes.back() = static_cast<std::uint8_t>(index);
         image.media.media_type   = "image/x-portable-pixmap";
         image.media.source_name  = "parallel-" + std::to_string(index) + ".ppm";
         message.parts.push_back(std::move(image));
     }
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages.push_back(std::move(message));
     const auto prepared = frontend.prepare(std::move(input));
     const auto& data    = FrontendFactory::inspect(prepared);
@@ -2923,14 +2923,14 @@ int test_many_images_prepare_in_one_parallel_batch() {
 
 int test_media_preparation_cancellation() {
     const Frontend frontend = make_frontend(resources());
-    ninfer::PreparationControl control{
+    infernix::PreparationControl control{
         .deadline     = {},
-        .cancellation = ninfer::CancellationView([] { return true; }),
+        .cancellation = infernix::CancellationView([] { return true; }),
     };
     try {
         (void)frontend.prepare(image_input(), control);
-    } catch (const ninfer::RequestError& error) {
-        return check(error.kind() == ninfer::RequestErrorKind::Cancelled &&
+    } catch (const infernix::RequestError& error) {
+        return check(error.kind() == infernix::RequestErrorKind::Cancelled &&
                          frontend.media_cache_summary().entries == 0,
                      "cancelled media preparation published a cache entry");
     }
@@ -2938,21 +2938,21 @@ int test_media_preparation_cancellation() {
 }
 
 int test_ngram_proposal_only_sources() {
-    ninfer::models::qwen3_5::FrontendOptions options;
+    infernix::models::qwen3_5::FrontendOptions options;
     options.vision_enabled        = false;
     options.max_context           = 8192;
     const Frontend plain          = make_frontend(resources(), options);
     options.ngram_sources_enabled = true;
     const Frontend enhanced       = make_frontend(resources(), options);
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
+    user.parts.push_back({.kind = infernix::MessagePartKind::Text,
                           .text = "1: user text\n2: must not\n3: become a shadow\n"});
     input.messages.push_back(user);
-    ninfer::ChatMessage tool;
-    tool.role = ninfer::ChatRole::Tool;
-    tool.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+    infernix::ChatMessage tool;
+    tool.role = infernix::ChatRole::Tool;
+    tool.parts.push_back({.kind = infernix::MessagePartKind::Text,
                           .text = "40: def f():\n41:     x = 1\n42:     return x\n"});
     input.messages.push_back(tool);
     auto a             = plain.prepare(input);
@@ -2973,15 +2973,15 @@ int test_ngram_proposal_only_sources() {
     const Frontend retaining                 = make_frontend(resources(), options);
     auto retained_input                      = input;
     retained_input.options.preserve_thinking = true;
-    ninfer::ChatMessage assistant;
-    assistant.role              = ninfer::ChatRole::Assistant;
+    infernix::ChatMessage assistant;
+    assistant.role              = infernix::ChatRole::Assistant;
     assistant.reasoning_content = "Private reasoning about the edit.";
     assistant.parts.push_back(
-        {.kind = ninfer::MessagePartKind::Text, .text = "Final code goes here."});
+        {.kind = infernix::MessagePartKind::Text, .text = "Final code goes here."});
     retained_input.messages.push_back(assistant);
     auto retained_prompt = retaining.prepare(retained_input);
     const auto& retained = FrontendFactory::inspect(retained_prompt);
-    using namespace ninfer::models::qwen3_5;
+    using namespace infernix::models::qwen3_5;
     const auto has_source = [&](std::string_view text, NgramSourceKind kind) {
         const auto expected = retaining.tokenize_text(text);
         return std::any_of(retained.ngram_archive_sources.begin(),
@@ -3024,15 +3024,15 @@ int test_ngram_proposal_only_sources() {
     failures += check(throws_context_length([&] { (void)bounded.prepare(input); }),
                       "proposal sources bypassed the target context limit");
     std::atomic<unsigned> checks{0};
-    ninfer::PreparationControl control{
+    infernix::PreparationControl control{
         .deadline     = {},
-        .cancellation = ninfer::CancellationView([&] { return checks.fetch_add(1) >= 3; }),
+        .cancellation = infernix::CancellationView([&] { return checks.fetch_add(1) >= 3; }),
     };
     try {
         (void)bounded.prepare(input, control);
         failures += check(false, "cancelled shadow-source tokenization completed");
-    } catch (const ninfer::RequestError& error) {
-        failures += check(error.kind() == ninfer::RequestErrorKind::Cancelled && checks.load() == 4,
+    } catch (const infernix::RequestError& error) {
+        failures += check(error.kind() == infernix::RequestErrorKind::Cancelled && checks.load() == 4,
                           "shadow-source cancellation lost priority to the target context error");
     }
     return failures;

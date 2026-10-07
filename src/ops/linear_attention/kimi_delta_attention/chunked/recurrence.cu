@@ -2,7 +2,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 
-namespace ninfer::ops::detail::kimi_delta_attention {
+namespace infernix::ops::detail::kimi_delta_attention {
 namespace {
 
 template <int DV>
@@ -369,4 +369,4 @@ void launch_chunk_recurrence(const Arguments& args, const Chunk* workspace,
     }
 }
 
-} // namespace ninfer::ops::detail::kimi_delta_attention
+} // namespace infernix::ops::detail::kimi_delta_attention

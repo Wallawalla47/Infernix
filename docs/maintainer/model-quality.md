@@ -38,10 +38,10 @@ and the chunk size only picks the scatter. So:
 
 | Tool | Measures |
 |---|---|
-| `ninfer-perplexity --prefill-chunk N` | perplexity at a chosen prefill pass size ([guide](../perplexity.md)) |
-| `ninfer-perplexity --a16-activations --save-top-tokens FILE` | the 16-bit-activation reference distribution |
-| `ninfer-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
-| `ninfer_decode_quality_gen` / `ninfer_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference ([benchmarks](../../bench/README.md#decode-quality)) |
+| `infernix-perplexity --prefill-chunk N` | perplexity at a chosen prefill pass size ([guide](../perplexity.md)) |
+| `infernix-perplexity --a16-activations --save-top-tokens FILE` | the 16-bit-activation reference distribution |
+| `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
+| `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference ([benchmarks](../../bench/README.md#decode-quality)) |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
 need the decode-quality pair. The generator uses only Engine API that upstream also has, so the
@@ -91,7 +91,7 @@ kernels are as accurate as upstream's within this resolution.
 32 corpus segments of 1,536 tokens, 384 greedy tokens each (12,288 tokens per build), DFlash2 with
 7 drafts and the proposal head, INT8 KV, judged on each build's own prefixes. The same generated
 tokens were judged twice: by the study's reference (4-bit sites at 16 bits) and by the committed
-`ninfer_decode_quality_judge` (`a16_activations`, every site at 16 bits):
+`infernix_decode_quality_judge` (`a16_activations`, every site at 16 bits):
 
 | Build | Agreement, 4-bit sites lifted | Regret | Agreement, `a16_activations` | Regret |
 |---|---|---|---|---|
@@ -111,7 +111,7 @@ Each 16-value activation block chooses the scale that maps its largest magnitude
 whichever reconstructs the block with less squared error. On the official artifact, over seven
 chunk sizes, KL to the reference fell 4.3 % (not significant) and top-1 agreement rose 0.10
 points at all seven, with perplexity unchanged. On the production NVIDIA artifact KL rose 12 %
-(0.0191 to 0.0214) and perplexity 0.6 %. With `ninfer_bench` (3 alternating passes, INT8 KV,
+(0.0191 to 0.0214) and perplexity 0.6 %. With `infernix_bench` (3 alternating passes, INT8 KV,
 DFlash2), prefill was 0.4-0.75 % slower at 16K, 64K and 2K prompts in every pass and decode about
 0.4 % slower per round. Not adopted: `quantize_nvfp4_k16` keeps the single amax-to-6 scale.
 
@@ -121,21 +121,21 @@ not NVFP4's E4M3 scales per 16.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
 
-Recorded 2026-10-05/06. This compares NInfer's Flash-Next artifacts, which import NVIDIA's NVFP4
+Recorded 2026-10-05/06. This compares Infernix's Flash-Next artifacts, which import NVIDIA's NVFP4
 checkpoint bit-exactly
 ([design §6.1](qwen3_8-flash-next-design.md#61-recipes-qwen3_8_flash_next_nvfp4-a-and-qwen3_8_flash_next_nvfp4_dense8-b)),
 with `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL`. That GGUF is the file the Strata engine runs
 on this machine. The quality figures were measured. The speed figures are **estimates, not
-measurements**: no UD-Q4_K_XL support exists in NInfer.
+measurements**: no UD-Q4_K_XL support exists in Infernix.
 
 ### 4.1 Measured quality
 
 Teacher-forced on identical token ids
 ([design §16.5](qwen3_8-flash-next-design.md#165-precision-boundaries-and-measured-quality-2026-10-04-rtx-5090)).
-NInfer ran recipe A with INT8 KV; Strata ran UD-Q4_K_XL with INT8 KV. The texts were 2,557
+Infernix ran recipe A with INT8 KV; Strata ran UD-Q4_K_XL with INT8 KV. The texts were 2,557
 positions of code, a document and a chat transcript, all ≤ 1,024 tokens.
 
-| | Perplexity | ΔNLL (NInfer − Strata) |
+| | Perplexity | ΔNLL (Infernix − Strata) |
 |---|---:|---:|
 | Code | 1.9052 / 1.9051 | +0.000 ± 0.016 |
 | Document | 9.5874 / 9.7671 | −0.019 ± 0.017 |
@@ -146,10 +146,10 @@ Recipe B (8-bit dense) costs +0.008 ± 0.010 nats against recipe A. It therefore
 lead over Strata.
 
 **This compares engines as well as weights.** Several of Strata's numerical choices differ from
-NInfer's:
+Infernix's:
 - It rounds 195 of the file's Q8_0 tensors to BF16 when it packs them: every hyper-connection
   up/down matrix, `output_hc_*` and the PLE value projection (`--compat-bf16`).
-- It keeps an FP32 residual stream. In NInfer that measured +0.030 ± 0.009 nats worse.
+- It keeps an FP32 residual stream. In Infernix that measured +0.030 ± 0.009 nats worse.
 - It quantizes expert activations to Q8_1.
 
 How much of the chat gap comes from the weights alone has not been measured.
@@ -158,7 +158,7 @@ How much of the chat gap comes from the weights alone has not been measured.
 
 These facts come from the GGUF headers (4 shards, 111.3 GB).
 
-| Tensor class | GGUF format | NInfer recipe B |
+| Tensor class | GGUF format | Infernix recipe B |
 |---|---|---|
 | Routed experts | Q4_K gate/up (Q5_K in layer 2); Q5_1 down (Q8_0 in layers 2, 4, 30, 46, 47). 71.73 GiB | NVFP4, 63.3 GiB |
 | Bytes per expert | 3,072,000; 3,584,000 in the Q8_0-down layers; 3,993,600 in layer 2. **+13 %** on average | 2,764,800 |
@@ -173,8 +173,8 @@ artifacts. The differences are the larger down projections, plus the format of t
 
 ### 4.3 Conclusion
 
-- **Quality.** A bit-exact UD-Q4_K_XL artifact in NInfer would likely land near Strata's quality,
-  perhaps slightly above it, because NInfer can run every Q8_0 tensor exactly. It would likely
+- **Quality.** A bit-exact UD-Q4_K_XL artifact in Infernix would likely land near Strata's quality,
+  perhaps slightly above it, because Infernix can run every Q8_0 tensor exactly. It would likely
   stay below the NVFP4 artifacts, particularly on chat. This is unmeasured. Before such an
   artifact could be adopted, it would have to pass the same §16.5 comparison.
 - **Speed** (estimates, against recipe B on the RTX 5090; nothing measured). Offloading narrows
@@ -222,7 +222,7 @@ Neither path below is built.
   - Frame-pool size classes for the three record sizes.
   - IQ4_NL row decoding in the PLE gather.
   - About 72.4 GiB of pinned RAM instead of 64.5 GiB. About 77 GiB must be free at startup, or
-    81 GiB with `ninfer-serve`. Alternatively, the SSD expert tier.
+    81 GiB with `infernix-serve`. Alternatively, the SSD expert tier.
   - Rough size of the work: 2-3 weeks, mostly the expert kernels.
 - **Native GGUF loading.**
   - Loading this one file in place, as Strata does, is feasible. It is an explicit product change:
@@ -239,10 +239,10 @@ Neither path below is built.
 
 ```bat
 rem 16-bit reference, one pass per window
-ninfer-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype bf16 ^
+infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype bf16 ^
   --prefill-chunk 14336 --a16-activations --save-top-tokens ref.top
 rem a build or setting under test, at several chunk sizes
-ninfer-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype int8 ^
+infernix-perplexity model.ninfer --text corpus.txt --context 14336 --stride 7168 --kv-dtype int8 ^
   --prefill-chunk 4096 --kl-reference ref.top
 ```
 

@@ -69,7 +69,7 @@ Concurrency has two levels:
 - optional job `max_concurrency` caps how many target slots one job may reserve.
 
 For EvalScope, the granted job slots become `eval_batch_size`. Multiple jobs sharing a target can
-never reserve more slots than the target capacity. For `ninfer-serve`, match the target capacity to
+never reserve more slots than the target capacity. For `infernix-serve`, match the target capacity to
 the server's startup `--max-concurrency`; an individual long-output job may set a lower concurrency
 when its KV entitlement requires it.
 
@@ -87,14 +87,14 @@ export PYTHONPATH="$PWD/eval"
 Validate configuration and installed runtime dependencies:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval validate \
+eval/.venv/bin/python -m infernix_eval validate \
   --config eval/configs/capability-suite.yaml --suite smoke
 ```
 
 Show expected work without making model requests:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval plan \
+eval/.venv/bin/python -m infernix_eval plan \
   --config eval/configs/capability-suite.yaml --suite reasoning
 ```
 
@@ -104,24 +104,24 @@ packages.
 Run the network-free coordinator check:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval run \
+eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/mock-suite.yaml --suite all
 ```
 
 Run the small real-endpoint matrix before a formal evaluation:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval run \
+eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/capability-suite.yaml --suite smoke
 ```
 
 Then run the full reasoning and BFCL suites independently:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval run \
+eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/capability-suite.yaml --suite reasoning
 
-SERPAPI_API_KEY=... eval/.venv/bin/python -m ninfer_eval run \
+SERPAPI_API_KEY=... eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/capability-suite.yaml --suite bfcl_full
 ```
 
@@ -179,7 +179,7 @@ The Qwen3.8-27B groupwise-int profile runs the same protocol through
 `eval/run_qwen3_8_27b_groupwise_reasoning.sh`. Its 16.96 GiB artifact leaves more GPU memory, so the
 text step uses the full 262,144-token context and both steps run at concurrency four (run
 directories `eval/runs/20260819T031655Z-078bd8e0` and `eval/runs/20260819T141750Z-531a236a`; the
-multimodal step was resumed with `ninfer_eval resume` after a local proxy change interrupted
+multimodal step was resumed with `infernix_eval resume` after a local proxy change interrupted
 RealWorldQA at 618/765 samples):
 
 | Benchmark | Accuracy | Correct / total |
@@ -202,9 +202,9 @@ print(dataset_snapshot_download(
     allow_file_pattern=['PaulGraham_Essays.txt', 'Journey_to_the_West.txt'],
 ))
 PY
-eval/.venv/bin/python -m ninfer_eval plan \
+eval/.venv/bin/python -m infernix_eval plan \
   --config eval/configs/qwen3_6_35b_needle_haystack.yaml --suite standard --check-runtime
-eval/.venv/bin/python -m ninfer_eval plan \
+eval/.venv/bin/python -m infernix_eval plan \
   --config eval/configs/qwen3_6_35b_needle_haystack.yaml --suite native_long --check-runtime
 ```
 
@@ -218,9 +218,9 @@ model, which the example explicitly acknowledges with `allow_network_downloads: 
 Inspect and resume a run:
 
 ```bash
-eval/.venv/bin/python -m ninfer_eval status --run eval/runs/<run-id>
-eval/.venv/bin/python -m ninfer_eval resume --run eval/runs/<run-id>
-eval/.venv/bin/python -m ninfer_eval summarize --run eval/runs/<run-id>
+eval/.venv/bin/python -m infernix_eval status --run eval/runs/<run-id>
+eval/.venv/bin/python -m infernix_eval resume --run eval/runs/<run-id>
+eval/.venv/bin/python -m infernix_eval summarize --run eval/runs/<run-id>
 ```
 
 Resume rejects a changed effective configuration or backend version. Completed jobs are skipped;
@@ -260,7 +260,7 @@ reproduces the workload on the selected environment, not the historical score au
 The NVFP4 serving command was:
 
 ```bash
-build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
+build/apps/infernix-serve out/qwen3_6_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 18080 \
   --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
   --spec mtp --draft-tokens 3 --lm-head-draft
@@ -269,7 +269,7 @@ build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
 Run the configured reasoning suite in a separate shell using the evaluation environment above:
 
 ```bash
-PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+PYTHONPATH=eval eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/qwen3_6_27b_reasoning.yaml \
   --suite reasoning_full
 ```
@@ -307,7 +307,7 @@ An ordinary EvalScope dataset needs only another configured job:
 ```
 
 An evaluator that does not use EvalScope implements the four-method backend protocol in
-`ninfer_eval/backends/base.py`, registers one stable name in `backends/registry.py`, retains its raw
+`infernix_eval/backends/base.py`, registers one stable name in `backends/registry.py`, retains its raw
 artifacts, and returns the normalized `DatasetResult`. The coordinator and summary writer do not
 need benchmark-specific changes.
 
@@ -325,8 +325,8 @@ need benchmark-specific changes.
 ## Verification
 
 ```bash
-PYTHONPATH=eval eval/.venv/bin/python -m py_compile $(rg --files eval/ninfer_eval -g '*.py')
+PYTHONPATH=eval eval/.venv/bin/python -m py_compile $(rg --files eval/infernix_eval -g '*.py')
 PYTHONPATH=eval eval/.venv/bin/python -m unittest discover -s eval/tests -p 'test_*.py'
-PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
+PYTHONPATH=eval eval/.venv/bin/python -m infernix_eval run \
   --config eval/configs/mock-suite.yaml --suite all
 ```

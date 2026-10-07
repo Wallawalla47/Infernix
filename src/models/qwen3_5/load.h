@@ -6,12 +6,12 @@
 #include <memory>
 #include <span>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 class Reader;
 struct ParameterReference;
-} // namespace ninfer::artifact
+} // namespace infernix::artifact
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 // Cold load plan borrows its Reader until materialization. Its selected Host bytes and parsed
 // resources already have owners; no Program or device allocation is needed for plan_load.
@@ -49,4 +49,4 @@ private:
                                                 LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

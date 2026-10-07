@@ -5,11 +5,11 @@
 #include <filesystem>
 #include <memory>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 class Reader;
 }
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 // Cold load plan; it borrows its Reader until materialization.
 class LoadPlan {
@@ -51,4 +51,4 @@ private:
                                                 LoadOptions options, DeviceContext& device,
                                                 const StartupObserver* observer = nullptr);
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

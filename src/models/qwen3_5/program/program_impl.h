@@ -4,9 +4,9 @@
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
-#include "ninfer/ops/gdn_replay.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/gdn_replay.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_tree.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 
@@ -41,7 +41,7 @@
 #include <variant>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 using execution::dimension;
 using PreparedPromptData = qwen3_5::PreparedPromptData;
 
@@ -851,4 +851,4 @@ public:
     void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
     void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 };
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

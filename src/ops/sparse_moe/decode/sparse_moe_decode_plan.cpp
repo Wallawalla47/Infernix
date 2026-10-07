@@ -5,7 +5,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 // The D4 epilogue warms at most this many bytes of the next consumer's weights: far below the
 // 96 MiB L2, so the warmed block cannot evict what it was meant to help.
@@ -41,4 +41,4 @@ SparseMoeDecodePlan resolve_sparse_moe_decode_plan(QType routed_gate_up, QType r
     return plan;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

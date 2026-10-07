@@ -5,7 +5,7 @@
 #include "ops/linear/q8/q8_schedule.cuh"
 #include "ops/linear/q8/q8_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool FullRows, class Output, class Epilogue>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_a16_gemv_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue) {
@@ -61,4 +61,4 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                           1);
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

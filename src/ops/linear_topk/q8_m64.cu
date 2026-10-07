@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kGroupsPerRow = kLinearTopKHidden / 32;
@@ -370,4 +370,4 @@ void linear_topk_q8_m64_launch(const Tensor& hidden, const Weight& head, std::in
     }
     throw std::invalid_argument("invalid linear_topk MMA tile");
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

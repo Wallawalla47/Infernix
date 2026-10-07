@@ -9,7 +9,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 // Evictable ranks: higher ranks sit closer to the arena end and are evicted first, so the
 // low-traffic endpoints (MTP, draft head, embedding, LM head) form the borrowable tail that
@@ -201,4 +201,4 @@ std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions
     return materialize_model(plan_load(reader, options), device, observer);
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr std::int32_t kInt8FastPromptMaxSplits = 8;
 
@@ -63,4 +63,4 @@ inline std::size_t int8_fast_prompt_workspace_bytes(std::int32_t q_heads, std::i
     return maximum;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

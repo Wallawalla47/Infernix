@@ -7,7 +7,7 @@ ever disagree, §19.1 wins. Update §19.1 as work proceeds.
 
 ## 1. Goal and requirements
 
-Add `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, ~180B MoE) to NInfer and beat Strata's 72-80 tok/s
+Add `Qwen4ExpForCausalLM` (Qwen3.8-Flash-Next, ~180B MoE) to Infernix and beat Strata's 72-80 tok/s
 decode on the target machine. The target is one RTX 5090 (32 GB), 96 GB DDR5 and one NVMe SSD.
 The user's requirements, all reflected in the design:
 
@@ -15,7 +15,7 @@ The user's requirements, all reflected in the design:
   imported **bit-exactly**, with **NVIDIA's activation formats** (A4 with ModelOpt `input_scale`).
 - Routed experts live in pinned host RAM, with a VRAM expert cache. Misses are served by the CPU in
   place or by DMA. The PLE n-gram table lives on NVMe.
-- Every NInfer KV profile is supported. **262K context with `int8` KV is the primary configuration**;
+- Every Infernix KV profile is supported. **262K context with `int8` KV is the primary configuration**;
   optimize for it first, then the others.
 - BF16 tensors move to 8 bits only where that helps significantly (recipe B). Recipe A keeps them BF16.
 - The work must be original: ninfer-ext and other projects are sources of facts and ideas only, with
@@ -63,7 +63,7 @@ configured there with a stub `libcuda.so`.
 | Canonical arithmetic | Encoders vs grid enumeration; BF16 rounding; `exp_c`/SiLU exhaustive over BF16 vs FP64; exact int64 vs FP64 | Device execution |
 | CPU expert kernels | Bit equality across ISAs, batch, split and compilers; golden hashes `kGolden1=0x8e4b822b07293949`, `kGolden4=0x947202285aeb28bd` | Speed on the target CPU |
 | CPU worker team | Equals `expert_forward` for 1-40 workers; TSan clean in `--quick` mode | Latency, pinning and CCD split on the target |
-| GPU narrow route | Compiles for `sm_120a` | **Never run.** `ninfer_offloaded_moe_cuda_test` must pass |
+| GPU narrow route | Compiles for `sm_120a` | **Never run.** `infernix_offloaded_moe_cuda_test` must pass |
 | Formats and loader | Python round trips are word-exact; C++ geometry equals Python; Python writer to C++ reader interop | A real converted artifact |
 | Expert cache | Victims identical to the replay tool on 1,200 groups; agent simulation shows no early frame reuse | The transfer agent around it (copy stream, `cuStreamWriteValue32`, loans) |
 | n-gram row ids | Python equals an independent tensor form; C++ equals the fixture (800 positions) | Real config values; device kernel |
@@ -99,7 +99,7 @@ configured there with a stub `libcuda.so`.
    /home/neroued/miniconda3/envs/py311/bin/python -m pytest -q tests/artifact tests/convert \
      tests/test_flash_next_tools.py tests/test_flash_next_ngram.py
    ```
-   `ninfer_offloaded_moe_cuda_test` is the key one. It must reproduce the golden hashes, match the
+   `infernix_offloaded_moe_cuda_test` is the key one. It must reproduce the golden hashes, match the
    CPU engine bit for bit (device and mapped-host records), and match the canonical scalar functions.
    If it fails, fix the GPU side: the CPU side is the qualified reference.
 2. **M0: run the probes and inspector**, then record the facts in the design (§4, §6.1, §8.3, §10,

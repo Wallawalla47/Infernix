@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "ninfer/ops/position.h"
+#include "infernix/ops/position.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -8,8 +8,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

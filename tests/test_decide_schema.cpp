@@ -13,7 +13,7 @@
 
 namespace {
 
-using namespace ninfer::serve;
+using namespace infernix::serve;
 using Json = RequestJson;
 
 int failures = 0;
@@ -30,22 +30,22 @@ bool near(double a, double b, double tolerance = 1e-9) { return std::fabs(a - b)
 // labels split into one token per byte and the given aliases share one id with another label.
 struct FixtureTokenizer {
     std::vector<std::string> split;
-    std::map<std::string, ninfer::TokenId> aliases;
+    std::map<std::string, infernix::TokenId> aliases;
 
-    std::vector<ninfer::TokenId> operator()(std::string_view text) const {
+    std::vector<infernix::TokenId> operator()(std::string_view text) const {
         const std::string key(text);
         if (const auto alias = aliases.find(key); alias != aliases.end()) {
             return {alias->second};
         }
-        if (text.size() == 1) { return {static_cast<ninfer::TokenId>(text[0])}; }
+        if (text.size() == 1) { return {static_cast<infernix::TokenId>(text[0])}; }
         for (const std::string& label : split) {
             if (label == text) {
-                return {static_cast<ninfer::TokenId>(text[0]),
-                        static_cast<ninfer::TokenId>(text[1])};
+                return {static_cast<infernix::TokenId>(text[0]),
+                        static_cast<infernix::TokenId>(text[1])};
             }
         }
         // Bigrams are single tokens above the byte range.
-        return {static_cast<ninfer::TokenId>(1000 + (text[0] - 'A') * 26 + (text[1] - 'A'))};
+        return {static_cast<infernix::TokenId>(1000 + (text[0] - 'A') * 26 + (text[1] - 'A'))};
     }
 };
 
@@ -165,8 +165,8 @@ void test_messages() {
     const DecideRequest request = parse_decide_request(body, 300);
     const std::vector<DecideLabel> labels{{"A", 10}, {"B", 11}};
     const std::vector<ChatTurn> messages = decide_messages(request, request.questions[0], labels);
-    check(messages.size() == 2 && messages[0].role == ninfer::ChatRole::System &&
-              messages[1].role == ninfer::ChatRole::User,
+    check(messages.size() == 2 && messages[0].role == infernix::ChatRole::System &&
+              messages[1].role == infernix::ChatRole::User,
           "a JSON state is asked as a system and a user turn");
     check(messages[0].content.size() == 1 &&
               messages[0].content[0].text ==
@@ -262,16 +262,16 @@ void test_answers() {
           "labels with no probability have no mass");
 }
 
-ninfer::TokenId token(char c) { return static_cast<ninfer::TokenId>(c) + 1000; }
+infernix::TokenId token(char c) { return static_cast<infernix::TokenId>(c) + 1000; }
 
 // The Qwen tokenizer's merges that the scalar schedule depends on: `":` and `":-` are one token
 // each (a sign after a colon merges into it).
-constexpr ninfer::TokenId kColon        = 5000;
-constexpr ninfer::TokenId kColonNegated = 5001;
+constexpr infernix::TokenId kColon        = 5000;
+constexpr infernix::TokenId kColonNegated = 5001;
 
 // One token per character, offset so a digit's id is never its value, except the merged colons.
-std::vector<ninfer::TokenId> qwen_like(std::string_view text) {
-    std::vector<ninfer::TokenId> ids;
+std::vector<infernix::TokenId> qwen_like(std::string_view text) {
+    std::vector<infernix::TokenId> ids;
     for (std::size_t i = 0; i < text.size();) {
         if (text.substr(i, 3) == "\":-") {
             ids.push_back(kColonNegated);
@@ -288,13 +288,13 @@ std::vector<ninfer::TokenId> qwen_like(std::string_view text) {
 }
 
 // A run whose step i drew the i-th token of `text` with the given probability of the drawn token.
-std::vector<ninfer::ConstrainedDraw> run_of(const DecideSchedule& schedule, std::string_view text,
+std::vector<infernix::ConstrainedDraw> run_of(const DecideSchedule& schedule, std::string_view text,
                                             float probability = 0.9F) {
-    const std::vector<ninfer::TokenId> tokens = qwen_like(text);
-    std::vector<ninfer::ConstrainedDraw> run;
+    const std::vector<infernix::TokenId> tokens = qwen_like(text);
+    std::vector<infernix::ConstrainedDraw> run;
     for (std::size_t i = 0; i < tokens.size(); ++i) {
         const auto& step = schedule.constraint.steps[i];
-        ninfer::ConstrainedDraw draw{.token = tokens[i], .probabilities = {}, .mass = 0.99F};
+        infernix::ConstrainedDraw draw{.token = tokens[i], .probabilities = {}, .mass = 0.99F};
         draw.probabilities.assign(step.size(), 0.0F);
         const auto slot = std::find(step.begin(), step.end(), draw.token) - step.begin();
         if (slot < static_cast<std::ptrdiff_t>(step.size())) {
@@ -383,7 +383,7 @@ void test_schedules_and_answers() {
           "a run the engine cut short is an error, not a number");
 
     const DecideSchedule point = decide_schedule(generated(DecideKind::Point, 3), encode);
-    const std::vector<ninfer::MediaGeometry> media{{1600, 900}};
+    const std::vector<infernix::MediaGeometry> media{{1600, 900}};
     const Json located = decide_generated_answer(generated(DecideKind::Point, 3), point,
                                                  run_of(point, "{\"x\":500,\"y\":999"), media);
     check(located.at("type") == "point" && located.at("normalized").at("x") == 500 &&
@@ -394,11 +394,11 @@ void test_schedules_and_answers() {
     // {"value is seven forced tokens; then the colon (positive or merged with the sign), a first
     // digit, and room for the other three digits, the point and the brace, plus one.
     const auto& steps = scalar.constraint.steps;
-    const auto permits = [](const std::vector<ninfer::TokenId>& step, ninfer::TokenId id) {
+    const auto permits = [](const std::vector<infernix::TokenId>& step, infernix::TokenId id) {
         return std::find(step.begin(), step.end(), id) != step.end();
     };
     check(scalar.terminator == token('}') && steps.size() == 7 + 1 + 1 + 5 &&
-              steps[7] == std::vector<ninfer::TokenId>{kColon, kColonNegated} &&
+              steps[7] == std::vector<infernix::TokenId>{kColon, kColonNegated} &&
               steps[8].size() == 10 && !permits(steps[8], token('-')) &&
               !permits(steps[8], token('}')) && permits(steps[9], token('}')) &&
               permits(steps[9], token('.')),

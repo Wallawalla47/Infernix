@@ -18,11 +18,11 @@
 #include <unordered_set>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 using Json    = nlohmann::json;
-namespace uni = ninfer::text::unicode_internal;
+namespace uni = infernix::text::unicode_internal;
 
 constexpr std::int64_t kMaxTokenId = 1'000'000;
 
@@ -997,4 +997,4 @@ bool Tokenizer::has_exact_token_domain(std::size_t size) const noexcept {
                valid_token_ids_.end();
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

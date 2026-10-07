@@ -5,7 +5,7 @@
 
 #include "media/decode/decode.h"
 
-namespace ninfer::media::decode {
+namespace infernix::media::decode {
 
 // True when the first 8 bytes are the PNG file signature.
 bool is_png(std::span<const std::uint8_t> bytes);
@@ -21,4 +21,4 @@ ImageInfo png_image_info(std::span<const std::uint8_t> bytes, std::uint64_t max_
 // when the pixel budget is exceeded.
 Image decode_png(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels);
 
-} // namespace ninfer::media::decode
+} // namespace infernix::media::decode

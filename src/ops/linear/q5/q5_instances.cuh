@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/q5/q5_schedule.cuh"
 
-namespace ninfer::ops::detail::q5_instances {
+namespace infernix::ops::detail::q5_instances {
 
 using MmaR64T128 = Q5A16MmaSchedule<64, 128, 64, 64, 32, 2, 1, Q5MmaFragmentPipeline::Serial,
                                     Cache::cg, Cache::cg, Q5ScaleLoad::Pair32>;
@@ -43,4 +43,4 @@ using SlicedR32T32W2S2  = Q5A16SlicedKMmaSchedule<32, 32, 2, 2, Cache::cg, Cache
 using DirectR2T4W4G4B4  = Q5A16DirectSimtSchedule<2, 4, 4, 4, 4>;
 using MmaR32T32K128S2A2 = Q5A16MmaSchedule<32, 32, 128, 16, 16, 2, 2, Q5MmaFragmentPipeline::Serial,
                                            Cache::cg, Cache::cg, Q5ScaleLoad::Pair32, 2>;
-} // namespace ninfer::ops::detail::q5_instances
+} // namespace infernix::ops::detail::q5_instances

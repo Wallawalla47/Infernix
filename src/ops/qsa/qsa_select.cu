@@ -21,7 +21,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using bf16   = __nv_bfloat16;
@@ -911,4 +911,4 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

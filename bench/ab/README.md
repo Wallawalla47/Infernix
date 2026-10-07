@@ -1,6 +1,6 @@
 # A/B serve benchmark: upstream + Windows port vs this fork
 
-Black-box A/B benchmark of two `ninfer-serve` builds serving the **same official NInfer
+Black-box A/B benchmark of two `infernix-serve` builds serving the **same official Infernix
 Qwen3.8-27B NVFP4 artifact** (`qwen3_8_27b_nvfp4-official.ninfer`) over the OpenAI chat
 completions API, replaying a synthesized agentic workload and comparing avg TTFT,
 prefix-cache hit statistics, cold prefill tok/s and output tok/s. It is the pre-merge
@@ -31,7 +31,7 @@ Outputs (written next to this script): `ab_report.md`, `arm_control.jsonl`,
 1. **Build both arms** (Windows/MSVC here; any platform works if you adjust the build
    driver): the control arm from a checkout of the upstream + Windows-port branch into
    `control\src` via `control_build.bat`; the treatment arm from your fork's normal
-   build. The runner only needs the two `ninfer-serve.exe` paths.
+   build. The runner only needs the two `infernix-serve.exe` paths.
 2. **Set the flags** you want to compare in `BAT_FLAGS` in `ab_runner.py` (the list the
    published benchmark used is committed as-is: the production launcher bat with
    `--prefill-chunk 2048` and `--ngram-min-match 12`). Flag fairness is automatic: the
@@ -53,7 +53,7 @@ your own configuration without editing code:
 | Variable | Default |
 |---|---|
 | `AB_MODEL` | `<AB_DEPLOY>\qwen3_8_27b_nvfp4-official.ninfer` |
-| `AB_CONTROL_EXE` | this directory's `control\build\apps\Release\ninfer-serve.exe` (falls back to the machine-specific build location) |
+| `AB_CONTROL_EXE` | this directory's `control\build\apps\Release\infernix-serve.exe` (falls back to the machine-specific build location) |
 | `AB_TREATMENT_EXE` | the fork's Windows build |
 | `AB_DEPLOY` / `AB_PRODUCTION_BAT` | the deploy directory and its production launcher bat |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` (same override in runner and watchdog) |

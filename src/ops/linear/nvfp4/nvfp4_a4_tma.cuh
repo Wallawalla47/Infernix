@@ -20,7 +20,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct alignas(128) Nvfp4A4TmaDescriptors {
     CUtensorMap a_codes;
@@ -445,4 +445,4 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
         CUDA_CHECK(cudaGetLastError());
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

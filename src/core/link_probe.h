@@ -6,7 +6,7 @@
 
 #include <cstddef>
 
-namespace ninfer {
+namespace infernix {
 
 // Copies `bytes` from `source` (pinned host memory) to `destination` (device memory) on a private
 // stream, once to warm up and then `repetitions` times, and returns the best rate in bytes per
@@ -14,4 +14,4 @@ namespace ninfer {
 [[nodiscard]] double measure_h2d_bytes_per_second(const void* source, void* destination, std::size_t bytes,
                                                   int repetitions);
 
-} // namespace ninfer
+} // namespace infernix

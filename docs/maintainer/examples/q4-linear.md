@@ -12,7 +12,7 @@ cleanup, as a reference for evaluating this shape and for further tuning.
 | Input, output and policy | BF16 input, BF16 output, `A16Only` |
 | GPU / driver | NVIDIA GeForce RTX 5090; 617.14 |
 | Build / CUDA | Release, `sm_120a`; runtime 13.4, benchmark compiled with `CUDART_VERSION=13010` |
-| Timing entry point | `ninfer::ops::linear`; each CUDA Graph contains one complete Op call |
+| Timing entry point | `infernix::ops::linear`; each CUDA Graph contains one complete Op call |
 | Cache / sampling | 256 MiB L2 flush before each sample; 5 warmups, 30 measurements, median reported |
 | Input fixture | The public bench's Q4 packed-weight and BF16 activation fixtures; numerical validation separately uses non-uniform weights and scales |
 | Coverage | Every integer T=1–128, plus 512 and 1024; 130 points in total |
@@ -99,7 +99,7 @@ in-CTA sliced-K and ordinary MMA; the source is authoritative for the exact conf
   This round remeasured only the two large-T anchors; 129–511 and other large-T boundaries were not
   remeasured.
 
-Numerical qualification reuses `ninfer_linear_q4_a16_test`, which passed in this phase: it independently
+Numerical qualification reuses `infernix_linear_q4_a16_test`, which passed in this phase: it independently
 decodes the packed Q4 codes and FP16 scales, uses an FP64 matrix multiply as the oracle, and checks the
 public routes, representative boundaries, output guards, input preservation and CUDA Graph replay after
 the input changes against the existing A16 criteria. This run only refreshed the timings and the
@@ -108,14 +108,14 @@ documentation; the numerical test was not rerun.
 ## Reproduction
 
 ```bash
-cmake --build build -j --target ninfer_linear_bench
+cmake --build build -j --target infernix_linear_bench
 
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 6144 --k 5120 \
   --sweep 1:128:1 --execution graph --graph-calls 1 \
   --warmup 5 --repeat 30 --flush-mib 256 \
   --csv-out profiles/bench/q4_report_20260926/hot.csv
-./build/bench/ninfer_linear_bench \
+./build/bench/infernix_linear_bench \
   --qtype q4 --policy a16 --n 6144 --k 5120 \
   --sweep 512:1024:512 --execution graph --graph-calls 1 \
   --warmup 5 --repeat 30 --flush-mib 256 \

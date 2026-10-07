@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemv.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_plan.cpp"
@@ -19,6 +19,6 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_swiglu.cpp"
 )
 
-target_sources(ninfer_nvfp4_non_rdc PRIVATE
+target_sources(infernix_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4_tma.cu"
 )

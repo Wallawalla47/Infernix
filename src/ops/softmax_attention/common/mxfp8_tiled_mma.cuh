@@ -10,7 +10,7 @@
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/q_terms.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // E4M3 row-scaled keys (FP8 and K8V4 KV): an E4M3 Q row with an FP32 scale, MXFP8 QK.
 struct Fp8TiledKeys {
@@ -266,7 +266,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                 }
             }
         }
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
     };
 
     auto issue_kv_tile = [&](int tile_k0, int cooperative_tid, int cooperative_threads) {
@@ -275,7 +275,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
     };
 
     if (key_blocks > 0) issue_kv_tile(first_owned_tile * Bc, tid, Schedule::kThreads);
-    ninfer::ops::cp_wait<0>();
+    infernix::ops::cp_wait<0>();
     __syncthreads();
 
     float acc[PVNtPerWarp][4]{};
@@ -590,7 +590,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                                     acc[2 * c + 1][3], p8[step][0], p8[step][1], p8[step][2],
                                     p8[step][3], odd0, odd1, 0x7FU, sfb);
             }
-            if (kb + 1 < key_blocks) ninfer::ops::cp_wait<0>();
+            if (kb + 1 < key_blocks) infernix::ops::cp_wait<0>();
             __syncthreads();
             return;
         }
@@ -652,7 +652,7 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
             }
         }
 
-        if (kb + 1 < key_blocks) ninfer::ops::cp_wait<0>();
+        if (kb + 1 < key_blocks) infernix::ops::cp_wait<0>();
         __syncthreads();
     };
     const int full_blocks =
@@ -710,4 +710,4 @@ __global__ __maxnreg__(Schedule::kMaxRegisters) void mxfp8_kv_tiled_mma_kernel(
                 acc[n][2], acc[n][3]);
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

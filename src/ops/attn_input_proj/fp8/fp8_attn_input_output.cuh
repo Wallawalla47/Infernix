@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr std::int32_t kFp8AttnInputQueryRows = 6144;
 inline constexpr std::int32_t kFp8AttnInputKeyRows   = 1024;
@@ -22,4 +22,4 @@ static_assert((kFp8AttnInputGateRows % 8) == 0);
 
 using Fp8AttentionInputOutput = LinearBf16SegmentedOutput<6144, 1024, 6144, 1024>;
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -6,9 +6,9 @@ import unittest
 import os
 from pathlib import Path
 
-from ninfer_eval.backends.base import BackendRun, RunContext, WorkPlan
-from ninfer_eval.backends.evalscope import EvalScopeBackend
-from ninfer_eval.config import JobConfig
+from infernix_eval.backends.base import BackendRun, RunContext, WorkPlan
+from infernix_eval.backends.evalscope import EvalScopeBackend
+from infernix_eval.config import JobConfig
 
 
 class EvalScopeBackendTest(unittest.TestCase):
@@ -297,8 +297,8 @@ class EvalScopeBackendTest(unittest.TestCase):
         os.environ["TEST_SERP_KEY"] = "secret-serp-value"
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                from ninfer_eval.config import RequestConfig, TargetConfig
-                from ninfer_eval.secrets import ResolvedTarget
+                from infernix_eval.config import RequestConfig, TargetConfig
+                from infernix_eval.secrets import ResolvedTarget
 
                 target = ResolvedTarget(
                     TargetConfig(

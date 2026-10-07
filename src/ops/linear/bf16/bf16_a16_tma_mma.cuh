@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct alignas(128) Bf16TmaDescriptors {
     CUtensorMap weight;
@@ -239,4 +239,4 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
     });
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

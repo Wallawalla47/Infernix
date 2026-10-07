@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Launch       = void (*)(const Tensor&, const Weight&, const Tensor&, Tensor&, const Tensor&,
@@ -106,4 +106,4 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                             conv_record, query, key, value, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

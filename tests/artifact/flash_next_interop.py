@@ -34,7 +34,7 @@ def main() -> int:
     fp8 = encode_fp8_block128(
         torch.randint(0, 0x7E, (2, 200, 130), generator=g, dtype=torch.uint8),
         torch.rand((2, 2, 2), generator=g), (2, 200, 130))
-    with tempfile.TemporaryDirectory(prefix="ninfer-flash-next-interop-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="infernix-flash-next-interop-") as temporary:
         path = Path(temporary) / "flash_next.ninfer"
         with ArtifactWriter(
             path,

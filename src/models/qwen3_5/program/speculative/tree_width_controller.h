@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <array>
 #include <cstddef>
@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 // Automatic DFlash2 tree verification: chooses each all-neural round's width among the chain and
 // the tree widths captured for its batch size.
@@ -84,4 +84,4 @@ private:
     std::uint32_t chain_columns_ = 0;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

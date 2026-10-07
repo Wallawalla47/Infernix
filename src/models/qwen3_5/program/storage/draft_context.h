@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 struct DFlashPersistentState {
     CyclicKVCache& local;
@@ -26,4 +26,4 @@ struct DFlashPersistentState {
                                  cudaStream_t stream);
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

@@ -31,8 +31,8 @@
 
 namespace {
 
-using ninfer::models::qwen4_exp::ExpertStore;
-using ninfer::models::qwen4_exp::HostExpertTier;
+using infernix::models::qwen4_exp::ExpertStore;
+using infernix::models::qwen4_exp::HostExpertTier;
 
 constexpr std::uint32_t kLayers = 3, kExperts = 40, kKeys = kLayers * kExperts;
 constexpr std::uint64_t kRecord = 8192; // two 4 KiB blocks
@@ -69,8 +69,8 @@ struct Files {
 Files make_files() {
     Files f;
     const auto dir = std::filesystem::temp_directory_path();
-    f.a = dir / "ninfer_host_tier_a.bin";
-    f.b = dir / "ninfer_host_tier_b.bin";
+    f.a = dir / "infernix_host_tier_a.bin";
+    f.b = dir / "infernix_host_tier_b.bin";
     std::ofstream a(f.a, std::ios::binary | std::ios::trunc), b(f.b, std::ios::binary | std::ios::trunc);
     std::vector<char> header(4096, 0x11);
     a.write(header.data(), static_cast<std::streamsize>(header.size()));
@@ -142,7 +142,7 @@ std::vector<const std::uint8_t*> serve(HostExpertTier& tier, const std::vector<s
 
 // The device's half of the fetch protocol, played on the channel's mapped words.
 struct DeviceSide {
-    ninfer::ops::MoeFetchChannel channel;
+    infernix::ops::MoeFetchChannel channel;
     std::uint32_t sequence = 0;
 
     void publish(std::uint32_t layer, const std::vector<std::int32_t>& experts) {
@@ -156,7 +156,7 @@ struct DeviceSide {
     // Waits (up to 5 s) until record i of the current request has landed: its address, or null once
     // the request failed (`status`) or the wait timed out.
     const std::uint8_t* wait(std::uint32_t i, std::uint32_t& status) const {
-        const auto* response = reinterpret_cast<const volatile ninfer::ops::offloaded_moe::FetchResponse*>(channel.response);
+        const auto* response = reinterpret_cast<const volatile infernix::ops::offloaded_moe::FetchResponse*>(channel.response);
         const auto until     = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (std::chrono::steady_clock::now() < until) {
             if (response->sequence == sequence) {
@@ -179,7 +179,7 @@ struct DeviceSide {
 };
 
 void test_fetch(const ExpertStore& store) {
-    ninfer::ops::offloaded_moe::FetchChannel channel;
+    infernix::ops::offloaded_moe::FetchChannel channel;
     auto o  = options();
     o.fetch = &channel;
     HostExpertTier tier(store, o);

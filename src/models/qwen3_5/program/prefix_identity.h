@@ -11,7 +11,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 class ResidentPrefixIdentity {
 public:
@@ -71,4 +71,4 @@ private:
                                   const ResidentPrefixIdentity& resident_identity,
                                   std::size_t count);
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

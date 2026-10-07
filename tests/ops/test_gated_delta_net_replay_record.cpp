@@ -1,4 +1,4 @@
-#include "ninfer/ops/gated_delta_net.h"
+#include "infernix/ops/gated_delta_net.h"
 
 #include "core/device.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -18,8 +18,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

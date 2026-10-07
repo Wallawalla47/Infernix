@@ -1,15 +1,15 @@
-"""Teacher-forced quality of NInfer against Strata on the same token ids.
+"""Teacher-forced quality of Infernix against Strata on the same token ids.
 
     python -m tools.flash_next.strata_compare --texts DIR [--names code,doc,chat]
 
-DIR holds, per text NAME: NAME.ids (comma-separated ids), ninfer-NAME.bin (the --dump-logits output of
-ninfer_qwen4_exp_forward_real_test: int32 vocabulary, int32 rows, FP32 rows) and strata.logpos (one
+DIR holds, per text NAME: NAME.ids (comma-separated ids), infernix-NAME.bin (the --dump-logits output of
+infernix_qwen4_exp_forward_real_test: int32 vocabulary, int32 rows, FP32 rows) and strata.logpos (one
 Strata session over the texts in order with STRATA_LOGPOS and STRATA_LOGPOS_TOPK=20; positions restart
 at 0 for each request).
 
 Per text: each engine's perplexity of the actual next tokens, the paired mean NLL difference
-(NInfer - Strata) with its standard error, how often each engine's top token is the actual next
-token, how often the two top tokens agree, and KL(Strata || NInfer) over Strata's top 20 plus one
+(Infernix - Strata) with its standard error, how often each engine's top token is the actual next
+token, how often the two top tokens agree, and KL(Strata || Infernix) over Strata's top 20 plus one
 bucket for the remaining mass (the method of Strata's docs/UNSLOTH_Q4.md).
 """
 
@@ -37,7 +37,7 @@ def read_logpos(path: Path) -> list[list[dict]]:
     return groups
 
 
-def ninfer_rows(path: Path):
+def infernix_rows(path: Path):
     header = np.fromfile(path, dtype=np.int32, count=2)
     vocab, rows = int(header[0]), int(header[1])
     return np.memmap(path, dtype=np.float32, mode="r", offset=8, shape=(rows, vocab))
@@ -71,17 +71,17 @@ def compare(ids: list[int], logits, strata: list[dict]) -> dict:
     diff = np.array(nll_n) - np.array(nll_s)
     return {
         "positions": n,
-        "ppl_ninfer": math.exp(np.mean(nll_n)),
+        "ppl_infernix": math.exp(np.mean(nll_n)),
         "ppl_strata": math.exp(np.mean(nll_s)),
         "nll_diff": float(diff.mean()),
         "nll_diff_se": float(diff.std(ddof=1) / math.sqrt(n)),
-        "top1_next_ninfer": top_n / n,
+        "top1_next_infernix": top_n / n,
         "top1_next_strata": top_s / n,
         "top1_agree": agree / n,
         "kl_mean": float(np.mean(kl)),
         "kl_median": float(np.median(kl)),
         "kl_p99": float(np.percentile(kl, 99)),
-        "nll_ninfer": np.array(nll_n),
+        "nll_infernix": np.array(nll_n),
         "nll_strata": np.array(nll_s),
     }
 
@@ -95,21 +95,21 @@ def main() -> int:
     groups = read_logpos(args.texts / "strata.logpos")
     if len(groups) != len(names):
         raise ValueError(f"strata.logpos holds {len(groups)} requests for {len(names)} texts")
-    print(f"{'text':<6}{'pos':>6}{'ppl NInfer':>12}{'ppl Strata':>12}{'dNLL (N-S)':>18}"
+    print(f"{'text':<6}{'pos':>6}{'ppl Infernix':>12}{'ppl Strata':>12}{'dNLL (N-S)':>18}"
           f"{'top1 N':>8}{'top1 S':>8}{'agree':>7}{'KL mean':>9}{'KL p50':>8}{'KL p99':>8}")
     all_n, all_s = [], []
     for name, strata in zip(names, groups):
         ids = [int(x) for x in (args.texts / f"{name}.ids").read_text().split(",") if x]
-        r = compare(ids, ninfer_rows(args.texts / f"ninfer-{name}.bin"), strata)
-        all_n.append(r["nll_ninfer"])
+        r = compare(ids, infernix_rows(args.texts / f"infernix-{name}.bin"), strata)
+        all_n.append(r["nll_infernix"])
         all_s.append(r["nll_strata"])
-        print(f"{name:<6}{r['positions']:>6}{r['ppl_ninfer']:>12.4f}{r['ppl_strata']:>12.4f}"
-              f"{r['nll_diff']:>+10.4f} ±{r['nll_diff_se']:.4f}{100 * r['top1_next_ninfer']:>7.1f}%"
+        print(f"{name:<6}{r['positions']:>6}{r['ppl_infernix']:>12.4f}{r['ppl_strata']:>12.4f}"
+              f"{r['nll_diff']:>+10.4f} ±{r['nll_diff_se']:.4f}{100 * r['top1_next_infernix']:>7.1f}%"
               f"{100 * r['top1_next_strata']:>7.1f}%{100 * r['top1_agree']:>6.1f}%{r['kl_mean']:>9.4f}"
               f"{r['kl_median']:>8.4f}{r['kl_p99']:>8.3f}")
     n, s = np.concatenate(all_n), np.concatenate(all_s)
     d = n - s
-    print(f"all {len(d)} positions: ppl NInfer {math.exp(n.mean()):.4f}, Strata {math.exp(s.mean()):.4f}, "
+    print(f"all {len(d)} positions: ppl Infernix {math.exp(n.mean()):.4f}, Strata {math.exp(s.mean()):.4f}, "
           f"mean dNLL {d.mean():+.4f} ± {d.std(ddof=1) / math.sqrt(len(d)):.4f} nats")
     return 0
 

@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 inline constexpr int kNvfp4ScaleTileGroups = 16;
 enum class Nvfp4ScaleLayout : std::uint8_t { RowMajor, Tiled128, Tiled256 };
 template <Nvfp4ScaleLayout Layout>
@@ -20,4 +20,4 @@ inline constexpr int nvfp4_a4_padded_tokens(int tokens,
     const int tile = nvfp4_scale_tile_tokens(layout);
     return ((tokens + tile - 1) / tile) * tile;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

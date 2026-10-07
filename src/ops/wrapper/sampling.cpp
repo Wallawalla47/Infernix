@@ -1,5 +1,5 @@
-// ninfer::ops - sample wrapper: public api validation and dispatch.
-#include "ninfer/ops/sampling.h"
+// infernix::ops - sample wrapper: public api validation and dispatch.
+#include "infernix/ops/sampling.h"
 
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/sampling.h" // detail::sample_batch_launch
@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 std::size_t sampling_workspace_capacity_bytes(std::int32_t token_domain, std::int32_t min_lanes,
                                               std::int32_t max_lanes) {
@@ -75,4 +75,4 @@ void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaS
     detail::increment_token_counts_launch(token_ids, token_counts, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

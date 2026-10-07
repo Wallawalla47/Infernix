@@ -1,6 +1,6 @@
 #include "models/qwen4_exp/program/program_impl.h"
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 RequestBasePlan::RequestBasePlan(std::unique_ptr<detail::BasePlanImpl> impl) noexcept : impl_(std::move(impl)) {}
 RequestBasePlan::RequestBasePlan(RequestBasePlan&&) noexcept            = default;
@@ -125,4 +125,4 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->u
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

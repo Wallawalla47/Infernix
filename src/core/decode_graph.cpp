@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -148,4 +148,4 @@ bool DecodeGraphExecutable::ready() const noexcept { return exec_ != nullptr; }
 
 void DecodeGraphExecutable::reset() noexcept { destroy_graph_exec(exec_); }
 
-} // namespace ninfer
+} // namespace infernix

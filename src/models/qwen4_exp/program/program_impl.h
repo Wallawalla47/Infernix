@@ -39,14 +39,14 @@
 #include "models/qwen4_exp/program/vram_monitor.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
-#include "ninfer/ops/argmax.h"
-#include "ninfer/ops/cast.h"
-#include "ninfer/ops/gdn_replay.h"
-#include "ninfer/ops/ple.h"
-#include "ninfer/ops/qsa.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/token_constraint.h"
+#include "infernix/ops/argmax.h"
+#include "infernix/ops/cast.h"
+#include "infernix/ops/gdn_replay.h"
+#include "infernix/ops/ple.h"
+#include "infernix/ops/qsa.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/token_constraint.h"
 
 #include <cuda_runtime.h>
 
@@ -63,7 +63,7 @@
 #include <string>
 #include <system_error>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace detail {
 
 // A prompt with media: its items' control plan and the encode window it needs (design §19.3.2).
@@ -602,7 +602,7 @@ public:
     // The startup failure for device allocations the driver placed in system memory.
     static std::string spill_message(std::uint64_t bytes) {
         return std::to_string(bytes >> 20) +
-               " MiB of NInfer's VRAM allocations were placed in shared system memory by the driver's sysmem "
+               " MiB of Infernix's VRAM allocations were placed in shared system memory by the driver's sysmem "
                "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
                "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
                "this fail at allocation instead.";
@@ -2075,7 +2075,7 @@ private:
             const std::uint64_t short_by = headroom > snapshot.device_free ? headroom - snapshot.device_free : 0;
             diagnostic("free VRAM is " + std::to_string(snapshot.device_free >> 20) + " MiB, below the " +
                        std::to_string(headroom >> 20) + " MiB headroom by " + std::to_string(short_by >> 20) +
-                       " MiB; the expert cache cannot shrink on this system, so NInfer memory may move to system "
+                       " MiB; the expert cache cannot shrink on this system, so Infernix memory may move to system "
                        "memory and slow down. Raise --vram-headroom-mib to " +
                        std::to_string((headroom + short_by + (256ULL << 20)) >> 20), DiagnosticLevel::Warning);
         }
@@ -4052,4 +4052,4 @@ private:
 };
 
 } // namespace detail
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

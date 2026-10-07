@@ -5,7 +5,7 @@
 #include "ops/linear/q4/q4_a16_simt.cuh"
 #include "ops/linear/q4/q4_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool Full, bool FullK, bool TriggerPdl, bool JoinPdl, bool Dependent,
           class Output, class Epilogue>
 void launch_q4_a16_simt_slice(const Q4LinearOperands& operands, Output output, Epilogue epilogue,
@@ -54,4 +54,4 @@ void launch_q4_a16_simt(const Q4LinearOperands& operands, Output output, Epilogu
                 operands, output, epilogue, offset, count, stream);
     });
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

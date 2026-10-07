@@ -4,7 +4,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <int BlockRows>
 struct Q4IdentityRows {
@@ -278,4 +278,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sli
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -3,15 +3,15 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
-#include "ninfer/ops/linear.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/linear.h"
+#include "infernix/ops/speculative_tree.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 [[nodiscard]] std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
                                                                     std::int32_t batch_size,
@@ -49,4 +49,4 @@ void fp8_gdn_record_dispatch(const Tensor* tree_rows, const Tensor& x, const Wei
                              Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                              cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

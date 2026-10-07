@@ -1,4 +1,4 @@
-#include "ninfer/ops/softmax_attention.h"
+#include "infernix/ops/softmax_attention.h"
 
 #include "core/layout.h"
 #include "ops/softmax_attention/dense/packed/launch.h"
@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim = 72;
@@ -130,4 +130,4 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     detail::packed_attention_uniform_launch(q, k, v, segment_length, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

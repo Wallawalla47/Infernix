@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct GenerationOutcome;
 
@@ -53,10 +53,10 @@ public:
                      bool usage_chunk_choice = false);
 
     std::string start();
-    void note_start(const ninfer::GenerationStart& start);
+    void note_start(const infernix::GenerationStart& start);
     std::string initial_prompt_progress();
-    std::string prompt_progress(const ninfer::PromptProgress& progress);
-    void note_timing(const ninfer::GenerationTimingObservation& timing);
+    std::string prompt_progress(const infernix::PromptProgress& progress);
+    void note_timing(const infernix::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
     std::string content_delta(const std::string& text);
     std::vector<std::string> finish(const GenerationOutcome& outcome);
@@ -67,7 +67,7 @@ private:
     OpenAIChatResponseIdentity identity_;
     std::string reasoning_;
     std::string content_;
-    std::optional<ninfer::GenerationTimingObservation> live_timing_;
+    std::optional<infernix::GenerationTimingObservation> live_timing_;
     std::uint32_t prompt_tokens_            = 0;
     std::uint32_t cached_tokens_            = 0;
     std::uint32_t last_progress_tokens_     = 0;
@@ -83,4 +83,4 @@ private:
     bool finished_                          = false;
 };
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

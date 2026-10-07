@@ -6,7 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_template_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                    cudaStream_t stream) {
@@ -21,4 +21,4 @@ void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor
         LinearIdentityEpilogue{}, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

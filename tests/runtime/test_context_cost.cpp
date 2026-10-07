@@ -45,39 +45,39 @@ void expect_throw(Function&& function, const char* message) {
     expect(false, message);
 }
 
-std::array<ninfer::runtime::ContextTransferCost, 3> transfer(std::uint64_t batch_ns = 10) {
-    std::array<ninfer::runtime::ContextTransferCost, 3> result;
+std::array<infernix::runtime::ContextTransferCost, 3> transfer(std::uint64_t batch_ns = 10) {
+    std::array<infernix::runtime::ContextTransferCost, 3> result;
     for (auto& direction : result) {
         direction = {.batch_ns        = batch_ns,
                      .operation_ns    = 3,
-                     .ns_per_byte_q32 = ninfer::runtime::kContextCostQ32One / 2};
+                     .ns_per_byte_q32 = infernix::runtime::kContextCostQ32One / 2};
     }
     return result;
 }
 
-ninfer::runtime::ContextPrefillCost prefill(std::uint64_t chunk_ns = 3) {
+infernix::runtime::ContextPrefillCost prefill(std::uint64_t chunk_ns = 3) {
     return {
         .chunk_ns              = chunk_ns,
-        .token_ns_q32          = ninfer::runtime::kContextCostQ32One / 2,
-        .attention_pair_ns_q32 = ninfer::runtime::kContextCostQ32One / 4,
+        .token_ns_q32          = infernix::runtime::kContextCostQ32One / 2,
+        .attention_pair_ns_q32 = infernix::runtime::kContextCostQ32One / 4,
         .vision_item_ns        = 5,
-        .vision_patch_ns_q32   = 2 * ninfer::runtime::kContextCostQ32One,
+        .vision_patch_ns_q32   = 2 * infernix::runtime::kContextCostQ32One,
     };
 }
 
-Json direction_json(const ninfer::runtime::ContextTransferCost& value) {
+Json direction_json(const infernix::runtime::ContextTransferCost& value) {
     return Json{{"batch_ns", value.batch_ns},
                 {"operation_ns", value.operation_ns},
                 {"ns_per_byte_q32", value.ns_per_byte_q32}};
 }
 
-Json transfer_json(const std::array<ninfer::runtime::ContextTransferCost, 3>& value) {
+Json transfer_json(const std::array<infernix::runtime::ContextTransferCost, 3>& value) {
     return Json{{"d2h", direction_json(value[0])},
                 {"h2d", direction_json(value[1])},
                 {"d2d", direction_json(value[2])}};
 }
 
-Json prefill_json(const ninfer::runtime::ContextPrefillCost& value) {
+Json prefill_json(const infernix::runtime::ContextPrefillCost& value) {
     return Json{{"chunk_ns", value.chunk_ns},
                 {"token_ns_q32", value.token_ns_q32},
                 {"attention_pair_ns_q32", value.attention_pair_ns_q32},
@@ -97,7 +97,7 @@ Json machine(std::string hardware, Json transfer_value, Json prefill_values) {
                 {"prefill", std::move(prefill_values)}};
 }
 
-Json prefill_entry(std::string signature, const ninfer::runtime::ContextPrefillCost& value) {
+Json prefill_entry(std::string signature, const infernix::runtime::ContextPrefillCost& value) {
     return Json{{"prefill_signature", std::move(signature)}, {"coefficients", prefill_json(value)}};
 }
 
@@ -107,46 +107,46 @@ std::string read_file(const std::filesystem::path& path) {
 }
 
 void test_exact_evaluation() {
-    expect(ninfer::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
+    expect(infernix::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
                "nvidia-geforce-rtx-5090-sm120",
            "hardware class duplicated or lost the NVIDIA vendor");
-    expect(ninfer::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
+    expect(infernix::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
                "nvidia-example-accelerator-sm90",
            "hardware class did not canonicalize a vendorless CUDA device name");
 
-    ninfer::runtime::ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
-    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+    infernix::runtime::ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
+    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
                              {.payload_bytes = 4, .copy_operations = 2}) == 16,
            "transfer operation roofline changed");
-    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
                              {.payload_bytes = 100, .copy_operations = 1}) == 50,
            "transfer bandwidth roofline changed");
-    expect(model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost, {}) == 0,
+    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost, {}) == 0,
            "empty transfer has a nonzero cost");
-    const ninfer::runtime::PrefillWork work = ninfer::runtime::make_prefill_work(100, 10, 2, 7, 8);
+    const infernix::runtime::PrefillWork work = infernix::runtime::make_prefill_work(100, 10, 2, 7, 8);
     expect(work.chunks == 2 && work.tokens == 10 && work.attention_pairs == 1055 &&
                work.vision_items == 2 && work.vision_patches == 7,
            "prefill feature construction changed");
-    expect(ninfer::runtime::make_prefill_work(std::numeric_limits<std::uint64_t>::max(),
+    expect(infernix::runtime::make_prefill_work(std::numeric_limits<std::uint64_t>::max(),
                                               std::numeric_limits<std::uint64_t>::max(), 0, 0, 1)
                    .attention_pairs == std::numeric_limits<std::uint64_t>::max(),
            "prefill attention work did not saturate");
     expect(model.prefill_ns(work) == 299, "prefill formula or Q32 rounding changed");
 
     std::array requirements{
-        ninfer::runtime::ContextTransferRequirement{
-            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+        infernix::runtime::ContextTransferRequirement{
+            .direction = infernix::runtime::ContextTransferDirection::DeviceToHost,
             .work      = {.payload_bytes = 4, .copy_operations = 1},
         },
-        ninfer::runtime::ContextTransferRequirement{
-            .direction = ninfer::runtime::ContextTransferDirection::DeviceToHost,
+        infernix::runtime::ContextTransferRequirement{
+            .direction = infernix::runtime::ContextTransferDirection::DeviceToHost,
             .work      = {.payload_bytes = 4, .copy_operations = 1},
         },
     };
-    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 16,
+    expect(infernix::runtime::price_context_transfer_requirements(model, requirements) == 16,
            "capture transfer requirements were not coalesced before pricing");
-    requirements[1].direction = ninfer::runtime::ContextTransferDirection::HostToDevice;
-    expect(ninfer::runtime::price_context_transfer_requirements(model, requirements) == 26,
+    requirements[1].direction = infernix::runtime::ContextTransferDirection::HostToDevice;
+    expect(infernix::runtime::price_context_transfer_requirements(model, requirements) == 26,
            "independent transfer directions were incorrectly coalesced");
 
     model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
@@ -159,7 +159,7 @@ void test_schema_validation() {
     entries.push_back(prefill_entry("config-and-formats", prefill()));
     const Json valid =
         document(Json::array({machine("machine", transfer_json(transfer()), entries)}));
-    const auto parsed = ninfer::runtime::parse_context_cost_presets(valid.dump(), "test");
+    const auto parsed = infernix::runtime::parse_context_cost_presets(valid.dump(), "test");
     expect(parsed.size() == 1 && parsed[0].transfer == transfer() &&
                parsed[0].prefill.size() == 1 && parsed[0].prefill[0].cost == prefill(),
            "valid layered preset did not parse");
@@ -168,7 +168,7 @@ void test_schema_validation() {
     duplicate_machine["machines"].push_back(duplicate_machine["machines"][0]);
     expect_throw(
         [&] {
-            (void)ninfer::runtime::parse_context_cost_presets(duplicate_machine.dump(),
+            (void)infernix::runtime::parse_context_cost_presets(duplicate_machine.dump(),
                                                               "duplicate-machine");
         },
         "duplicate hardware entry was accepted");
@@ -178,7 +178,7 @@ void test_schema_validation() {
         duplicate_prefill["machines"][0]["prefill"][0]);
     expect_throw(
         [&] {
-            (void)ninfer::runtime::parse_context_cost_presets(duplicate_prefill.dump(),
+            (void)infernix::runtime::parse_context_cost_presets(duplicate_prefill.dump(),
                                                               "duplicate-prefill");
         },
         "duplicate model prefill entry was accepted");
@@ -186,90 +186,90 @@ void test_schema_validation() {
     Json invalid                                              = valid;
     invalid["machines"][0]["transfer"]["d2h"]["operation_ns"] = -1;
     expect_throw(
-        [&] { (void)ninfer::runtime::parse_context_cost_presets(invalid.dump(), "negative"); },
+        [&] { (void)infernix::runtime::parse_context_cost_presets(invalid.dump(), "negative"); },
         "negative transfer coefficient was accepted");
 
     Json prefill_only                       = valid;
     prefill_only["machines"][0]["transfer"] = nullptr;
     expect(
-        ninfer::runtime::parse_context_cost_presets(prefill_only.dump(), "prefill-only").size() ==
+        infernix::runtime::parse_context_cost_presets(prefill_only.dump(), "prefill-only").size() ==
             1,
         "independent prefill-only machine entry was rejected");
     prefill_only["machines"][0]["prefill"] = Json::array();
     expect_throw(
-        [&] { (void)ninfer::runtime::parse_context_cost_presets(prefill_only.dump(), "empty"); },
+        [&] { (void)infernix::runtime::parse_context_cost_presets(prefill_only.dump(), "empty"); },
         "empty machine cost entry was accepted");
 }
 
 void test_resolution_and_atomic_upserts() {
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() /
-        ("ninfer-context-cost-test-" + std::to_string(test_process_id()));
+        ("infernix-context-cost-test-" + std::to_string(test_process_id()));
     std::filesystem::create_directories(directory);
     const std::filesystem::path path = directory / "presets.json";
     try {
-        const ninfer::runtime::ContextCostIdentity compiled_identity{
+        const infernix::runtime::ContextCostIdentity compiled_identity{
             .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
             .prefill_signature = "unmeasured-config-and-formats",
         };
-        const auto compiled = ninfer::runtime::resolve_context_machine_cost(compiled_identity);
+        const auto compiled = infernix::runtime::resolve_context_machine_cost(compiled_identity);
         expect(
-            compiled.summary.transfer_source == ninfer::ContextCostPresetSource::CompiledDefault &&
-                compiled.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault,
+            compiled.summary.transfer_source == infernix::ContextCostPresetSource::CompiledDefault &&
+                compiled.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault,
             "compiled transfer and prefill defaults did not resolve independently");
 
-        const auto measured = ninfer::runtime::resolve_context_machine_cost({
+        const auto measured = infernix::runtime::resolve_context_machine_cost({
             .hardware_class    = compiled_identity.hardware_class,
             .prefill_signature = "e6eae48276e11c15c932cb90d258b51b81e144dc13fb461e7ffa202d2caa440a",
         });
         expect(measured.summary.prefill_source ==
-                       ninfer::ContextCostPresetSource::CompiledDefault &&
+                       infernix::ContextCostPresetSource::CompiledDefault &&
                    measured.model.prefill.token_ns_q32 == 375'800'765'711'778,
                "measured bindings did not select their compiled prefill cost");
 
-        const ninfer::runtime::ContextCostIdentity unknown{
+        const infernix::runtime::ContextCostIdentity unknown{
             .hardware_class    = "unmeasured-machine",
             .prefill_signature = "unmeasured-config-and-formats",
         };
-        const auto generic = ninfer::runtime::resolve_context_machine_cost(unknown);
+        const auto generic = infernix::runtime::resolve_context_machine_cost(unknown);
         expect(
-            generic.summary.transfer_source == ninfer::ContextCostPresetSource::GenericDefault &&
-                generic.summary.prefill_source == ninfer::ContextCostPresetSource::GenericDefault &&
-                generic.model.transfer_ns(ninfer::runtime::ContextTransferDirection::DeviceToHost,
+            generic.summary.transfer_source == infernix::ContextCostPresetSource::GenericDefault &&
+                generic.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault &&
+                generic.model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
                                           {.payload_bytes = 1024, .copy_operations = 1}) > 0 &&
                 generic.model.prefill_ns({.tokens = 1}) > 0,
             "unknown identity did not retain a numerical cost model");
 
-        ninfer::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
+        infernix::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
                                                              transfer(77), R"({"run":1})");
-        auto resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
+        auto resolved = infernix::runtime::resolve_context_machine_cost(unknown, path);
         expect(resolved.model.transfer[0].batch_ns == 77 &&
-                   resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
+                   resolved.summary.transfer_source == infernix::ContextCostPresetSource::External &&
                    resolved.summary.prefill_source ==
-                       ninfer::ContextCostPresetSource::GenericDefault,
+                       infernix::ContextCostPresetSource::GenericDefault,
                "external transfer did not layer over generic prefill");
 
-        ninfer::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(91),
+        infernix::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(91),
                                                             R"({"run":2})");
-        resolved = ninfer::runtime::resolve_context_machine_cost(unknown, path);
+        resolved = infernix::runtime::resolve_context_machine_cost(unknown, path);
         expect(resolved.model.transfer[0].batch_ns == 77 && resolved.model.prefill.chunk_ns == 91 &&
-                   resolved.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
-                   resolved.summary.prefill_source == ninfer::ContextCostPresetSource::External,
+                   resolved.summary.transfer_source == infernix::ContextCostPresetSource::External &&
+                   resolved.summary.prefill_source == infernix::ContextCostPresetSource::External,
                "independent external transfer/prefill entries did not compose");
 
-        const ninfer::runtime::ContextCostIdentity other_model{
+        const infernix::runtime::ContextCostIdentity other_model{
             .hardware_class    = unknown.hardware_class,
             .prefill_signature = "other-config-and-formats",
         };
-        const auto layered_miss = ninfer::runtime::resolve_context_machine_cost(other_model, path);
-        expect(layered_miss.summary.transfer_source == ninfer::ContextCostPresetSource::External &&
+        const auto layered_miss = infernix::runtime::resolve_context_machine_cost(other_model, path);
+        expect(layered_miss.summary.transfer_source == infernix::ContextCostPresetSource::External &&
                    layered_miss.summary.prefill_source ==
-                       ninfer::ContextCostPresetSource::GenericDefault,
+                       infernix::ContextCostPresetSource::GenericDefault,
                "external model miss incorrectly discarded the matching machine transfer");
 
-        ninfer::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
+        infernix::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
                                                              transfer(123), R"({"run":3})");
-        const auto parsed = ninfer::runtime::parse_context_cost_presets(read_file(path), "file");
+        const auto parsed = infernix::runtime::parse_context_cost_presets(read_file(path), "file");
         expect(parsed.size() == 1 && parsed[0].transfer->at(0).batch_ns == 123 &&
                    parsed[0].prefill.size() == 1 && parsed[0].prefill[0].cost.chunk_ns == 91,
                "transfer replacement did not preserve the model prefill list");
@@ -277,7 +277,7 @@ void test_resolution_and_atomic_upserts() {
         const std::string before = read_file(path);
         expect_throw(
             [&] {
-                ninfer::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(),
+                infernix::runtime::upsert_context_prefill_cost_atomic(path, unknown, prefill(),
                                                                     "not-json");
             },
             "invalid provenance was accepted");

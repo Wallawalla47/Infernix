@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 class VmmArena {
 public:
@@ -74,4 +74,4 @@ private:
     std::vector<CUmemGenericAllocationHandle> handles_; // 0: unmapped
 };
 
-} // namespace ninfer
+} // namespace infernix

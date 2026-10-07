@@ -14,7 +14,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 struct SyncSchedule {
@@ -30,12 +30,12 @@ constexpr SyncSchedule kSyncSchedules[] = {
 };
 
 unsigned int sync_schedule_from_environment() {
-    const char* value = std::getenv("NINFER_CUDA_SYNC");
+    const char* value = std::getenv("INFERNIX_CUDA_SYNC");
     if (value == nullptr) { return cudaDeviceScheduleSpin; }
     for (const auto& schedule : kSyncSchedules) {
         if (schedule.name == value) { return schedule.flags; }
     }
-    throw std::invalid_argument("NINFER_CUDA_SYNC must be spin, blocking, yield, or auto");
+    throw std::invalid_argument("INFERNIX_CUDA_SYNC must be spin, blocking, yield, or auto");
 }
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
@@ -417,4 +417,4 @@ void upload_pinned(void* device_dst, const void* pinned_src, std::size_t bytes, 
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer
+} // namespace infernix

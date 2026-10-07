@@ -2,7 +2,7 @@
 
 #include <string_view>
 
-namespace ninfer::models {
+namespace infernix::models {
 
 enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp };
 
@@ -10,4 +10,4 @@ enum class Architecture { Qwen3_5, Qwen3_5Moe, Qwen4Exp };
                                                 std::string_view model_type);
 [[nodiscard]] std::string_view architecture_name(Architecture architecture) noexcept;
 
-} // namespace ninfer::models
+} // namespace infernix::models

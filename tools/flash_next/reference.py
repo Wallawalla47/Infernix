@@ -2,9 +2,9 @@
 
     python -m tools.flash_next.reference --model PATH --tokens 248045,9707,11 --out ref.npz
 
-This is the model-level oracle for NInfer's Qwen4Exp implementation (AGENTS.md "Verification"). It
+This is the model-level oracle for Infernix's Qwen4Exp implementation (AGENTS.md "Verification"). It
 is written from the upstream ``qwen4_exp`` definitions (transformers ``modular_qwen4_exp.py`` and
-the Qwen3.5 / Qwen3-Next blocks it reuses) and reads the checkpoint directly, never NInfer's
+the Qwen3.5 / Qwen3-Next blocks it reuses) and reads the checkpoint directly, never Infernix's
 artifact or converter:
 
 - every dense and BF16 tensor is widened exactly and every product is formed in binary64;
@@ -13,7 +13,7 @@ artifact or converter:
 - the PLE n-gram rows are the checkpoint's FP8 codes times its BF16 scale, rounded to BF16.
 
 ``--bf16-boundaries`` (default on) rounds the activations that deployed BF16 runtimes store in
-BF16 -- the residual streams, every block input and output -- so differences against NInfer are
+BF16 -- the residual streams, every block input and output -- so differences against Infernix are
 kernel arithmetic, not storage precision. QSA selection is evaluated exactly; for prompts up to
 ``indexer_budget + compress_ratio - 1`` tokens every token is selected and QSA equals causal
 attention, which the script checks.
@@ -285,7 +285,7 @@ class Reference:
                 pooled = rope(pooled[:, None, :], starts, self.theta, self.rotary)[:, 0]
                 scores = torch.relu(q[t] @ pooled.T).sum(0) / math.sqrt(d)
                 count = min(budget, blocks)
-                # Ties are resolved toward the lower block id (the order NInfer implements).
+                # Ties are resolved toward the lower block id (the order Infernix implements).
                 order = sorted(range(blocks), key=lambda b: (-float(scores[b]), b))[:count]
                 for b in sorted(order):
                     chosen.extend(range(b * ratio, b * ratio + ratio))
@@ -297,7 +297,7 @@ class Reference:
     def moe(self, layer: int, x: torch.Tensor) -> torch.Tensor:
         c, w = self.c, self.w
         p = f"layers.{layer}.mlp."
-        # Router logits are not rounded: NInfer keeps them FP32 (as its Qwen3.5 sparse MoE and
+        # Router logits are not rounded: Infernix keeps them FP32 (as its Qwen3.5 sparse MoE and
         # llama.cpp-derived engines do), so near-boundary experts do not collapse into BF16 ties.
         # Exact ties go to the lower expert id.
         logits = x @ w.text(p + "gate.weight").T

@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/append/kv_cache_append.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/append/launch.cu"
   "${CMAKE_CURRENT_LIST_DIR}/append/nvfp4_launch.cu"

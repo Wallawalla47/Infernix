@@ -17,7 +17,7 @@
 #include <string>
 #endif
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 #ifndef _WIN32
@@ -109,4 +109,4 @@ bool reserve_process_working_set(std::uint64_t bytes) noexcept {
 #endif
 }
 
-} // namespace ninfer
+} // namespace infernix

@@ -6,7 +6,7 @@
 #include <memory>
 #include <string_view>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 
 // Byte views borrow the model's Host backing. Tokenizer owns its decoded vocabulary and tables;
 // loading and request preparation share this one immutable interpretation.
@@ -23,4 +23,4 @@ struct FrontendResources {
 
 void parse_resources(FrontendResources& resources, const Config& config);
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

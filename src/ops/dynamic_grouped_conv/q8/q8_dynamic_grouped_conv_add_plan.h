@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 std::size_t q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
@@ -24,4 +24,4 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
                                                  const Tensor& finish_delta, Tensor& residual,
                                                  WorkspaceArena& workspace, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

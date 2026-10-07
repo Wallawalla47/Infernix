@@ -11,7 +11,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kIntermediate = 6144;
@@ -105,4 +105,4 @@ void q8_linear_swiglu_decode_pair_r16_launch(const Tensor& x, const Weight& w, T
     launch_decode<16>(x, w, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

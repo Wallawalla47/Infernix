@@ -12,9 +12,9 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/execution/expert_stream.h"
 #include "models/qwen4_exp/execution/parameters.h"
-#include "ninfer/ops/offloaded_sparse_moe.h"
-#include "ninfer/ops/qsa.h"
-#include "ninfer/ops/rope.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/qsa.h"
+#include "infernix/ops/rope.h"
 
 #include <array>
 #include <cstdint>
@@ -22,7 +22,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp::execution {
+namespace infernix::models::qwen4_exp::execution {
 
 // Columns of one MTP call inside a prefill chunk (bounds the drafter's share of the workspace);
 // the Program stages the chunk's RoPE positions per sub-chunk of this many cells.
@@ -303,4 +303,4 @@ public:
     [[nodiscard]] SplitStats split_stats() const noexcept { return {split_cpu_experts_, split_streamed_experts_}; }
 };
 
-} // namespace ninfer::models::qwen4_exp::execution
+} // namespace infernix::models::qwen4_exp::execution

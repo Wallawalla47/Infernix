@@ -29,7 +29,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::product {
+namespace infernix::product {
 namespace {
 
 spdlog::level::level_enum to_spdlog_level(LogLevel level) {
@@ -177,7 +177,7 @@ media::decode::LibraryLogHandler media_log_handler(std::shared_ptr<spdlog::logge
 void report_logging_error(const std::string& message) noexcept {
     static std::atomic_flag reported = ATOMIC_FLAG_INIT;
     if (reported.test_and_set(std::memory_order_relaxed)) { return; }
-    std::fprintf(stderr, "ninfer logging failure: %s\n", message.c_str());
+    std::fprintf(stderr, "infernix logging failure: %s\n", message.c_str());
     std::fflush(stderr);
 }
 
@@ -601,4 +601,4 @@ void LoggingRuntime::flush() noexcept {
     }
 }
 
-} // namespace ninfer::product
+} // namespace infernix::product

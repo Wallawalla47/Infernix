@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <optional>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 // Host tier geometry of the hybrid prefix cache (docs/maintainer/hybrid-prefix-cache-spec.md
 // §5.4). The whole Host budget is one pinned pool of equal slabs. One slab holds one KV block
@@ -35,4 +35,4 @@ struct HybridHostLayout {
 [[nodiscard]] std::uint32_t hybrid_host_slabs(const HybridHostLayout& layout,
                                               std::uint64_t budget_bytes);
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

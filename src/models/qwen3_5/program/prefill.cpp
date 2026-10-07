@@ -4,13 +4,13 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
 #include "core/device.h"
-#include "ninfer/ops/gdn_replay.h"
-#include "ninfer/ops/sampling.h"
-#include "ninfer/ops/scalar.h"
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/target_logprobs.h"
-#include "ninfer/ops/top_logprobs.h"
+#include "infernix/ops/gdn_replay.h"
+#include "infernix/ops/sampling.h"
+#include "infernix/ops/scalar.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/target_logprobs.h"
+#include "infernix/ops/top_logprobs.h"
 
 #include <algorithm>
 #include <array>
@@ -24,7 +24,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::models::qwen3_5::execution {
+namespace infernix::models::qwen3_5::execution {
 namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
@@ -183,9 +183,9 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     state.execution.work.reset();
 }
 
-} // namespace ninfer::models::qwen3_5::execution
+} // namespace infernix::models::qwen3_5::execution
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 namespace {
 
@@ -910,4 +910,4 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 }
 
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

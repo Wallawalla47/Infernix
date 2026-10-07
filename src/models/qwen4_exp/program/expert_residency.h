@@ -45,7 +45,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 class HostExpertTier;
 
@@ -262,4 +262,4 @@ private:
     std::vector<std::uint8_t> demoting_; // per key
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

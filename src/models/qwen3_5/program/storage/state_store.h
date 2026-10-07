@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 class StateImageStore;
 
@@ -787,4 +787,4 @@ struct ActiveStateBinding {
     bool fork_pending = false;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

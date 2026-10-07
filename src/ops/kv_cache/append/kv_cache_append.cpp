@@ -1,4 +1,4 @@
-#include "ninfer/ops/kv_cache_append.h"
+#include "infernix/ops/kv_cache_append.h"
 
 #include "core/paged_kv_storage.h"
 #include "ops/kv_cache/append/launch.h"
@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 constexpr std::int32_t kHeadDim       = 128;
@@ -271,4 +271,4 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

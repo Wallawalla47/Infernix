@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::runtime::prefix_cache;
+using namespace infernix;
+using namespace infernix::runtime::prefix_cache;
 
 namespace {
 

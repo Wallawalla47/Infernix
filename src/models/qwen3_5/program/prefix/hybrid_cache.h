@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 // Physical binding of the hybrid prefix index (docs/maintainer/hybrid-prefix-cache-spec.md) to
 // the Program's KV page stores, StateImage store and pinned Host slab pool. The index decides;
@@ -326,4 +326,4 @@ private:
     std::optional<runtime::prefix_cache::PrefixCacheIndex> index_;
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

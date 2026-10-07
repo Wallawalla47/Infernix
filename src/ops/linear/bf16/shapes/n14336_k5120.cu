@@ -2,7 +2,7 @@
 #include "ops/linear/bf16/bf16_shapes.h"
 #include "ops/linear/bf16/bf16_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Gemv = Bf16A16GemvSchedule<4, 1, 8, 8, 4, Bf16ActivationAccess::Direct,
                                  Bf16WeightCache::Default, Bf16PhaseOrder::RowSwizzled, 1, 1, 1, 2>;
@@ -27,4 +27,4 @@ Bf16Launch select_bf16_n14336_k5120(std::int32_t tokens) {
         return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T64K64S3, 5120>>;
     return launch_bf16_tma_mma<Bf16ScheduleInstance<Bf16A16TmaR64T128K64S2, 5120>>;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

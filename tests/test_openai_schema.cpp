@@ -15,8 +15,8 @@
 
 namespace {
 
-using Json = ninfer::serve::RequestJson;
-using namespace ninfer::serve;
+using Json = infernix::serve::RequestJson;
+using namespace infernix::serve;
 
 int check(bool condition, const std::string& label) {
     if (condition) { return 0; }
@@ -54,11 +54,11 @@ ResolvedPromptSemantics semantics(const GenerationRequest& request) {
     return resolve_prompt_semantics(request, server);
 }
 
-ninfer::PromptInput prompt(const GenerationRequest& request) {
+infernix::PromptInput prompt(const GenerationRequest& request) {
     return to_prompt_input(request, semantics(request), {});
 }
 
-ninfer::RequestOptions options(const GenerationRequest& request) {
+infernix::RequestOptions options(const GenerationRequest& request) {
     ServeOptions server;
     return to_request_options(request, server, semantics(request), true);
 }
@@ -100,7 +100,7 @@ int test_request_envelope_and_sampling() {
     failures +=
         check(request.generation.sampling.top_k == 17 && request.generation.sampling.min_p == 0.05,
               "compatible sampler extensions parsed");
-    const ninfer::RequestOptions translated = options(request.generation);
+    const infernix::RequestOptions translated = options(request.generation);
     failures +=
         check(translated.execution.sampling.top_k == 17, "top_k reaches Engine request options");
     failures +=
@@ -187,8 +187,8 @@ int test_standard_field_policy() {
 }
 
 int test_prompt_cache_boundaries() {
-    using Location = ninfer::PromptCacheMarkerLocation;
-    using Evidence = ninfer::SharedCandidateEvidence;
+    using Location = infernix::PromptCacheMarkerLocation;
+    using Evidence = infernix::SharedCandidateEvidence;
     int failures   = 0;
     for (const char* role : {"user", "system", "developer"}) {
         Json body = base_request();
@@ -235,12 +235,12 @@ int test_prompt_cache_boundaries() {
         failures += check(
             marker.location == Location::MessagePartBoundary &&
                 marker.after_message_part_count == index + 1 &&
-                ninfer::has_shared_candidate_evidence(marker.evidence, Evidence::ExplicitBoundary),
+                infernix::has_shared_candidate_evidence(marker.evidence, Evidence::ExplicitBoundary),
             "explicit part locations survive automatic merging");
     }
     failures +=
         check(merged.context_cache.markers.size() == 4 &&
-                  ninfer::has_shared_candidate_evidence(
+                  infernix::has_shared_candidate_evidence(
                       merged.context_cache.markers.back().evidence, Evidence::DefaultAutomatic),
               "the final explicit part also carries the automatic opportunity");
     marked["messages"][0]["content"].push_back(Json{{"type", "text"}, {"text", "new tail"}});
@@ -513,18 +513,18 @@ int test_tools() {
                    {"type", "function"},
                    {"function", Json{{"name", "inspect"}, {"arguments", R"({"path":"a"})"}}}}})}}});
     const GenerationRequest mixed_request  = parse(mixed_assistant).generation;
-    const ninfer::PromptInput mixed_prompt = prompt(mixed_request);
+    const infernix::PromptInput mixed_prompt = prompt(mixed_request);
     failures += check(mixed_request.messages[1].cache_boundary_after &&
                           !mixed_request.messages[1].content[0].cache_boundary_after &&
                           !mixed_prompt.context_cache.markers.empty() &&
                           mixed_prompt.context_cache.markers.back().location ==
-                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                              infernix::PromptCacheMarkerLocation::MessageBoundary &&
                           mixed_prompt.context_cache.markers.back().after_message_count == 2,
                       "automatic caching stops after a complete assistant text/tool-call turn");
 
     const Json ordered = Json::parse(
         R"({"model":"qwen","messages":[{"role":"user","content":"probe"}],"tools":[{"type":"function","function":{"name":"probe","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}}}]})");
-    const ninfer::PromptInput ordered_prompt = prompt(parse(ordered).generation);
+    const infernix::PromptInput ordered_prompt = prompt(parse(ordered).generation);
     failures += check(
         ordered_prompt.options.tool_jsons.size() == 1 &&
             ordered_prompt.options.tool_jsons.front() ==
@@ -538,7 +538,7 @@ int test_messages_and_media() {
     Json body                      = base_request();
     body["messages"][0]["content"] = Json::array(
         {Json{{"type", "text"}, {"text", "alpha"}}, Json{{"type", "text"}, {"text", "beta"}}});
-    const ninfer::PromptInput translated = prompt(parse(body).generation);
+    const infernix::PromptInput translated = prompt(parse(body).generation);
     failures += check(translated.messages[0].parts.size() == 2 &&
                           translated.messages[0].parts[0].text == "alpha" &&
                           translated.messages[0].parts[1].text == "beta",
@@ -587,7 +587,7 @@ int test_messages_and_media() {
                                  {"image_url", Json{{"url", "https://example.test/capture.png"},
                                                     {"detail", "auto"}}}}})}}});
     const GenerationRequest tool_image = parse(body).generation;
-    failures += check(tool_image.messages.back().role == ninfer::ChatRole::Tool &&
+    failures += check(tool_image.messages.back().role == infernix::ChatRole::Tool &&
                           tool_image.messages.back().tool_call_id == "call_capture" &&
                           tool_image.messages.back().content.size() == 2 &&
                           tool_image.messages.back().content[0].kind == ContentKind::Text &&
@@ -626,7 +626,7 @@ int test_messages_and_media() {
         {"role", "tool"}, {"name", "get_status"}, {"tool_call_id", "call_1"}, {"content", "ok"}});
     const GenerationRequest named_tool_history = parse(body).generation;
     const ChatTurn& named_tool                 = named_tool_history.messages.back();
-    failures += check(named_tool.role == ninfer::ChatRole::Tool &&
+    failures += check(named_tool.role == infernix::ChatRole::Tool &&
                           named_tool.tool_call_id == "call_1" && !named_tool.tool_result_name &&
                           named_tool.content.size() == 1 && named_tool.content[0].text == "ok",
                       "tool message name is an ignored compatibility extension");
@@ -667,7 +667,7 @@ int test_messages_and_media() {
     const GenerationRequest legacy = parse(body).generation;
     failures += check(legacy.messages[1].tool_calls.size() == 1 &&
                           legacy.messages[1].tool_calls[0].name == "legacy" &&
-                          legacy.messages[2].role == ninfer::ChatRole::Tool,
+                          legacy.messages[2].role == infernix::ChatRole::Tool,
                       "legacy function-call history lowers to Engine tool history");
 
     body["messages"] = Json::array(
@@ -755,11 +755,11 @@ int test_stops_and_ranges() {
     int failures                            = 0;
     Json body                               = base_request();
     body["stop"]                            = Json::array({"A", "B"});
-    const ninfer::RequestOptions translated = options(parse(body).generation);
+    const infernix::RequestOptions translated = options(parse(body).generation);
     failures += check(translated.stop.strings.size() == 4,
                       "each stop string applies to Content and Reasoning");
-    failures += check(translated.stop.strings[0].channel == ninfer::OutputChannel::Content &&
-                          translated.stop.strings[1].channel == ninfer::OutputChannel::Reasoning,
+    failures += check(translated.stop.strings[0].channel == infernix::OutputChannel::Content &&
+                          translated.stop.strings[1].channel == infernix::OutputChannel::Reasoning,
                       "stop channel ordering is explicit");
 
     body["stop"] = Json::array({"1", "2", "3", "4", "5"});
@@ -789,7 +789,7 @@ GenerationOutcome sample_outcome() {
     outcome.prompt_tokens                       = 20;
     outcome.completion_tokens                   = 7;
     outcome.reasoning_tokens                    = 3;
-    outcome.finish_reason                       = ninfer::FinishReason::StopToken;
+    outcome.finish_reason                       = infernix::FinishReason::StopToken;
     outcome.metrics.prefix_cache_hit_tokens     = 12;
     outcome.metrics.prompt_wall_seconds         = 0.04;
     outcome.metrics.generation_wall_seconds     = 0.03;
@@ -826,7 +826,7 @@ int test_aggregate_response() {
         "aggregate timings use exact cache and N-1 generation intervals");
 
     outcome.text.clear();
-    outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
         .name = "Edit",
         .arguments_json =
             R"({"file_path":"/tmp/probe.cpp","old_string":"old","new_string":"new"})"});
@@ -893,9 +893,9 @@ int test_stream_response() {
     OpenAIChatStream tool_stream(identity(), false);
     (void)tool_stream.start();
     GenerationOutcome tool_outcome;
-    tool_outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
+    tool_outcome.tool_calls.push_back(infernix::GeneratedToolCall{
         .name = "Edit", .arguments_json = R"({"file_path":"/tmp/probe.cpp"})"});
-    tool_outcome.finish_reason                 = ninfer::FinishReason::StopToken;
+    tool_outcome.finish_reason                 = infernix::FinishReason::StopToken;
     const std::vector<std::string> tool_events = tool_stream.finish(tool_outcome);
     const Json tool_delta                      = parse_sse(tool_events[0]);
     failures += check(
@@ -915,7 +915,7 @@ int test_stream_observations() {
                       "transport role chunk precedes Engine observations");
 
     stream.note_start(
-        ninfer::GenerationStart{.prompt = {.prompt_tokens = 32}, .reused_prompt_tokens = 12});
+        infernix::GenerationStart{.prompt = {.prompt_tokens = 32}, .reused_prompt_tokens = 12});
     const Json initial = parse_sse(stream.initial_prompt_progress());
     failures +=
         check(initial["choices"][0]["delta"].empty() && initial["prompt_progress"]["total"] == 32 &&
@@ -924,7 +924,7 @@ int test_stream_observations() {
                   initial["prompt_progress"]["time_ms"] == 0,
               "initial prompt progress begins at the admitted cache frontier");
 
-    const Json middle = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
+    const Json middle = parse_sse(stream.prompt_progress(infernix::PromptProgress{
         .total_prompt_tokens     = 32,
         .reused_prompt_tokens    = 12,
         .processed_prompt_tokens = 20,
@@ -933,7 +933,7 @@ int test_stream_observations() {
     failures += check(middle["prompt_progress"]["processed"] == 20 &&
                           middle["prompt_progress"]["time_ms"] == 57,
                       "prompt progress exposes a cumulative completed frontier");
-    const Json complete = parse_sse(stream.prompt_progress(ninfer::PromptProgress{
+    const Json complete = parse_sse(stream.prompt_progress(infernix::PromptProgress{
         .total_prompt_tokens     = 32,
         .reused_prompt_tokens    = 12,
         .processed_prompt_tokens = 32,
@@ -943,9 +943,9 @@ int test_stream_observations() {
         check(complete["prompt_progress"]["processed"] == complete["prompt_progress"]["total"],
               "final prompt progress reaches the complete prompt");
 
-    stream.note_timing(ninfer::GenerationTimingObservation{
+    stream.note_timing(infernix::GenerationTimingObservation{
         .generated_tokens = 1, .prompt_elapsed_ns = 110000000, .generation_elapsed_ns = 0});
-    stream.note_timing(ninfer::GenerationTimingObservation{
+    stream.note_timing(infernix::GenerationTimingObservation{
         .generated_tokens      = 3,
         .prompt_elapsed_ns     = 110000000,
         .generation_elapsed_ns = 20000000,
@@ -966,7 +966,7 @@ int test_stream_observations() {
 
 int test_common_objects() {
     int failures = 0;
-    const ninfer::ModelMetadata metadata{
+    const infernix::ModelMetadata metadata{
         .model_id       = "qwen3.8-27b",
         .weights_id     = "nvfp4",
         .vocab_size     = 248077,
@@ -995,7 +995,7 @@ int test_common_objects() {
                           model["meta"]["n_embd"] == 5120 && model["meta"]["ftype"] == "nvfp4",
                       "model lookup exposes the llama.cpp-compatible model meta");
     const Json empty = Json::parse(
-        make_models_list("qwen", 7, 240000, ninfer::ModelMetadata{}));
+        make_models_list("qwen", 7, 240000, infernix::ModelMetadata{}));
     failures += check(empty["data"][0]["meta"]["n_ctx"] == 240000 &&
                           empty["data"][0]["meta"]["n_ctx_train"] == 0,
                       "empty model metadata still renders the configured context");
@@ -1019,7 +1019,7 @@ int test_assistant_continuation_mode() {
                       Json{{"role", "user"}, {"content", "second question"}}})}};
     const auto normal_req = parse(normal);
     failures +=
-        check(normal_req.generation.continuation == ninfer::PromptContinuationMode::NewAssistantTurn,
+        check(normal_req.generation.continuation == infernix::PromptContinuationMode::NewAssistantTurn,
               "conversation ending with user was not NewAssistantTurn");
 
     // A trailing assistant turn is an assistant prefill, so the Engine continues it in place.
@@ -1030,11 +1030,11 @@ int test_assistant_continuation_mode() {
                                   Json{{"role", "assistant"}, {"content", "partial answer..."}}})}};
     const auto cont_req = parse(trailing_assistant);
     failures += check(cont_req.generation.continuation ==
-                          ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                          infernix::PromptContinuationMode::ContinueFinalAssistant,
                       "conversation ending with assistant was not ContinueFinalAssistant");
     const auto cont_prompt = prompt(cont_req.generation);
     failures += check(cont_prompt.options.continuation ==
-                          ninfer::PromptContinuationMode::ContinueFinalAssistant,
+                          infernix::PromptContinuationMode::ContinueFinalAssistant,
                       "continuation mode did not reach PromptInput options");
 
     // With thinking left to the server default the resolution must be concretely enabled, so
@@ -1047,7 +1047,7 @@ int test_assistant_continuation_mode() {
     explicit_no_thinking["enable_thinking"] = false;
     const auto no_thinking_req = parse(explicit_no_thinking);
     failures += check(no_thinking_req.generation.continuation ==
-                          ninfer::PromptContinuationMode::ContinueFinalAssistant &&
+                          infernix::PromptContinuationMode::ContinueFinalAssistant &&
                       semantics(no_thinking_req.generation).enable_thinking == false,
                       "explicit thinking-disable did not remain a valid text-only continuation");
 

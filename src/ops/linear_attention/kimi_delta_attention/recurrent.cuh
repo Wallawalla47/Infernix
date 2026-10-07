@@ -10,7 +10,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail::kimi_delta_attention {
+namespace infernix::ops::detail::kimi_delta_attention {
 
 inline constexpr int kDvPerWarp = 4;
 inline constexpr int kNumWarps  = 4;
@@ -213,4 +213,4 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2) recurrent_batch_updat
     store_state(state, states + state_offset, dv_base, dqk_base);
 }
 
-} // namespace ninfer::ops::detail::kimi_delta_attention
+} // namespace infernix::ops::detail::kimi_delta_attention

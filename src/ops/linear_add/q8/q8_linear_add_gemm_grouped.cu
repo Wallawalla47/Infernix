@@ -4,7 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int K>
@@ -31,4 +31,4 @@ void q8_linear_add_grouped_launch(const Tensor& x, const Weight& w, Tensor& resi
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

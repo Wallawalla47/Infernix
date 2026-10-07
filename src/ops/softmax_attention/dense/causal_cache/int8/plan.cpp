@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 constexpr int kGroupedPrefillMaxWidth = 256;
 } // namespace
@@ -68,4 +68,4 @@ std::size_t int8_kv_workspace_bytes(int heads, int batch, int min_width, int max
     return maximum;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

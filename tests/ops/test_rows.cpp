@@ -1,4 +1,4 @@
-#include "ninfer/ops/rows.h"
+#include "infernix/ops/rows.h"
 #include "ops/op_tester.h"
 
 #include <cstddef>
@@ -7,8 +7,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

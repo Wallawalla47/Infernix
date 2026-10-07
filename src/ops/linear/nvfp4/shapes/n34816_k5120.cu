@@ -2,7 +2,7 @@
 #include "ops/linear/nvfp4/nvfp4_launch.cuh"
 #include "ops/linear/nvfp4/nvfp4_instances.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<34816, 5120>;
 using Gemv =
@@ -47,4 +47,4 @@ bool uses_a4(std::int32_t, std::int32_t) { return true; }
 
 const Nvfp4LinearShape kNvfp4N34816K5120{34816, 5120, launch_a16, launch_nvfp4_a4<select_a4>,
                                          uses_a4};
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

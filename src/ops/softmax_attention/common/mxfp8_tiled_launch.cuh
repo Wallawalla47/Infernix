@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/common/mxfp8_tiled_plan.h"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // pv8 selects the 8-bit PV form (Values with E4M3 decode only).
 template <class G, class S, class Keys, class Values, class View>
@@ -49,4 +49,4 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
                                            cache.table_stride});
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

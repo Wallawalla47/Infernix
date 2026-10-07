@@ -15,7 +15,7 @@
 #include <xmmintrin.h>
 #endif
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 // A bounded, position-indexed proposal corpus. It never owns target state.
 // Absolute positions make overwritten ring entries rejectable before a read.
@@ -237,4 +237,4 @@ private:
     }
 };
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

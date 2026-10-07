@@ -5,7 +5,7 @@
 
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // One warp owns one represented BF16 D256 head. Lane l carries the pairs l, l+32, l+64, l+96, the
 // layout rmsnorm_warp_bf16x2_kernel uses, so the sum of squares accumulates in the same order and
@@ -65,4 +65,4 @@ __device__ __forceinline__ __nv_bfloat162 rmsnorm_rope_d256_rotate(__nv_bfloat16
     return __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

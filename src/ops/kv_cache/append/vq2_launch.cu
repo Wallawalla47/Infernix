@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kBlock = 256;
@@ -198,4 +198,4 @@ void kv_cache_vq_window_commit_launch(const KVCacheVqStaging& staging, const Ten
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -1,4 +1,4 @@
-"""Audited request graphs for black-box ninfer-serve TTFT measurement."""
+"""Audited request graphs for black-box infernix-serve TTFT measurement."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from tools.bench.ttft.execution import (
     FailedCondition,
     RequestHandle,
 )
-from tools.ninfer_serve.anthropic import anthropic_request
-from tools.ninfer_serve.openai_chat import chat_request
-from tools.ninfer_serve.openai_responses import responses_request
+from tools.infernix_serve.anthropic import anthropic_request
+from tools.infernix_serve.openai_chat import chat_request
+from tools.infernix_serve.openai_responses import responses_request
 
 
 CaseFunction = Callable[[CaseContext, Corpus], None]
@@ -1938,7 +1938,7 @@ def run_case(
 ) -> dict[str, Any]:
     if profile_label != definition.profile:
         return {
-            "artifact_type": "ninfer_serve_ttft_run",
+            "artifact_type": "infernix_serve_ttft_run",
             "schema_version": 1,
             "case": definition.name,
             "protocol": definition.protocol,
@@ -2009,7 +2009,7 @@ def run_case(
         failures=len(context.failures),
     )
     return {
-        "artifact_type": "ninfer_serve_ttft_run",
+        "artifact_type": "infernix_serve_ttft_run",
         "schema_version": 1,
         "case": definition.name,
         "protocol": definition.protocol,

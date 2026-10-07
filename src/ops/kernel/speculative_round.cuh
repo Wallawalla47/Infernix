@@ -1,9 +1,9 @@
 #pragma once
-#include "ninfer/ops/speculative_round.h"
-#include "ninfer/ops/speculative_tree.h"
+#include "infernix/ops/speculative_round.h"
+#include "infernix/ops/speculative_tree.h"
 #include "core/pdl.cuh"
 
-// Implements: include/ninfer/ops/speculative_round.h
+// Implements: include/infernix/ops/speculative_round.h
 // Match: contiguous request-major state and BF16 verification logits.
 // Algorithm assumptions: small vocabularies use one cooperative block; the
 // registered full-vocabulary stochastic route uses the sampling partial/group
@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 
 __global__ void speculative_prepare_verify_inputs_kernel(const std::int32_t* anchors,
@@ -725,7 +725,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
 }
 
 // ---------------------------------------------------------------------------------------------
-// Speculative verification tree (ninfer/ops/speculative_tree.h). Every row carries the topology
+// Speculative verification tree (infernix/ops/speculative_tree.h). Every row carries the topology
 // its builder wrote this round. A chain row (tree == 0) is verified as the chain prefix of its
 // first extent+1 columns; the drafts stride is the round width W - 1 for every row.
 
@@ -1227,4 +1227,4 @@ __global__ void proposal_remap_token_ids_kernel(std::int32_t* proposal_tokens,
     if (idx >= 0 && idx < n) { proposal_tokens[i] = id_map[idx]; }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

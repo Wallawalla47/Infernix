@@ -23,8 +23,8 @@
 
 namespace {
 
-namespace q36   = ninfer::models::qwen3_5;
-namespace store = ninfer::models::qwen3_5::detail;
+namespace q36   = infernix::models::qwen3_5;
+namespace store = infernix::models::qwen3_5::detail;
 
 int failures = 0;
 
@@ -38,9 +38,9 @@ bool cuda_unavailable(cudaError_t error) {
     return error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver;
 }
 
-std::vector<std::int32_t> read_block_table(const ninfer::KVExecutionTablePool& tables,
+std::vector<std::int32_t> read_block_table(const infernix::KVExecutionTablePool& tables,
                                            std::int32_t row, std::size_t count) {
-    const ninfer::Tensor source = tables.matrix().slice(1, row, 1).view(
+    const infernix::Tensor source = tables.matrix().slice(1, row, 1).view(
         {static_cast<std::int32_t>(tables.logical_page_capacity())});
     std::vector<std::int32_t> values(count);
     CUDA_CHECK(cudaMemcpy(values.data(), source.data, values.size() * sizeof(std::int32_t),
@@ -48,7 +48,7 @@ std::vector<std::int32_t> read_block_table(const ninfer::KVExecutionTablePool& t
     return values;
 }
 
-void test_state_store(ninfer::DeviceContext& device) {
+void test_state_store(infernix::DeviceContext& device) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -59,17 +59,17 @@ void test_state_store(ninfer::DeviceContext& device) {
                 .value_head_dim = 4,
                 .key_head_dim   = 4,
                 .slot_count     = 4,
-                .conv_dtype     = ninfer::DType::BF16,
+                .conv_dtype     = infernix::DType::BF16,
             },
         .hidden = 8,
         .dflash_local =
             q36::DFlashLocalStateSpec{.layers = 1, .capacity = 8, .kv_heads = 2, .head_dim = 4},
     };
-    ninfer::LayoutBuilder builder;
+    infernix::LayoutBuilder builder;
     const q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
-    ninfer::DeviceArena arena(builder.finish(256));
+    infernix::DeviceArena arena(builder.finish(256));
     q36::StateImageDevicePool physical({arena.base(), arena.capacity()}, layout);
-    ninfer::HostContextArena host_backing(layout.host.image_bytes * 2, layout.host.image_bytes);
+    infernix::HostContextArena host_backing(layout.host.image_bytes * 2, layout.host.image_bytes);
     q36::HostStatePool host(host_backing, layout.host);
     store::StateImageStore images(
         physical, &host, static_cast<std::uint32_t>(physical.slot_count()) + host.capacity());
@@ -255,30 +255,30 @@ void test_state_store(ninfer::DeviceContext& device) {
            "State Host/Device replica ownership closes without leaked slots");
 }
 
-void test_kv_store(ninfer::DeviceContext& device) {
-    ninfer::LayoutBuilder builder;
-    ninfer::DeviceKVPagePoolSpec page_spec{
+void test_kv_store(infernix::DeviceContext& device) {
+    infernix::LayoutBuilder builder;
+    infernix::DeviceKVPagePoolSpec page_spec{
         .page_group_count = 8,
         .geometry =
             {
-                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
-                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
-                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+                .page_tokens        = static_cast<std::uint32_t>(infernix::kPagedKVPageSize),
+                .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = infernix::DType::BF16, .leading_extent = 8, .head_extent = 2}},
             },
     };
-    const ninfer::DeviceKVPagePoolLayout page_layout =
-        ninfer::plan_device_kv_page_pool(builder, page_spec);
-    const ninfer::KVExecutionTableLayout table_layout =
-        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
-    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
-    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
-    const ninfer::HostKVPageLayout host_layout =
-        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const infernix::DeviceKVPagePoolLayout page_layout =
+        infernix::plan_device_kv_page_pool(builder, page_spec);
+    const infernix::KVExecutionTableLayout table_layout =
+        infernix::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    infernix::DeviceArena arena(builder.finish(256));
+    const infernix::DeviceSpan backing{arena.base(), arena.capacity()};
+    infernix::DeviceKVPagePool physical_pages(backing, page_layout);
+    infernix::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const infernix::HostKVPageLayout host_layout =
+        infernix::plan_host_kv_page_layout(physical_pages.geometry());
     const std::array host_layouts{host_layout};
-    ninfer::HostContextArena host_backing(host_layout.page_stride * 8, host_layout.page_stride);
-    ninfer::HostKVArena host_arena(host_backing, host_layouts);
+    infernix::HostContextArena host_backing(host_layout.page_stride * 8, host_layout.page_stride);
+    infernix::HostKVArena host_arena(host_backing, host_layouts);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
@@ -348,7 +348,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "cancelled KV reservation releases destination bytes without publishing replicas");
     auto host_backup = extents.prepare(pages, logical_pages);
     expect(host_backup.has_value(), "Host KV extent reservation");
-    const std::vector<ninfer::DeviceKVPageHandle> sources = extents.device_sources(*host_backup);
+    const std::vector<infernix::DeviceKVPageHandle> sources = extents.device_sources(*host_backup);
     physical_pages.copy_to_host(sources, extents.writable_view(*host_backup),
                                 device.transfer_stream);
     expect(!pages.host_resident(logical_pages[0]) && !pages.host_resident(logical_pages[1]),
@@ -375,7 +375,7 @@ void test_kv_store(ninfer::DeviceContext& device) {
 
     auto second_host_backup = extents.prepare(pages, logical_pages);
     expect(second_host_backup.has_value(), "second Host KV extent reservation");
-    const std::vector<ninfer::DeviceKVPageHandle> second_sources =
+    const std::vector<infernix::DeviceKVPageHandle> second_sources =
         extents.device_sources(*second_host_backup);
     physical_pages.copy_to_host(second_sources, extents.writable_view(*second_host_backup),
                                 device.transfer_stream);
@@ -830,25 +830,25 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "retained fork failure and retry close all logical and physical ownership");
 }
 
-void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
-    constexpr std::uint32_t page_tokens = ninfer::kPagedKVPageSize;
-    ninfer::LayoutBuilder builder;
-    const ninfer::DeviceKVPagePoolLayout page_layout = ninfer::plan_device_kv_page_pool(
+void test_cancel_alias_during_prefix_fork(infernix::DeviceContext& device) {
+    constexpr std::uint32_t page_tokens = infernix::kPagedKVPageSize;
+    infernix::LayoutBuilder builder;
+    const infernix::DeviceKVPagePoolLayout page_layout = infernix::plan_device_kv_page_pool(
         builder,
         {.page_group_count = 4,
          .geometry         = {
                      .page_tokens        = page_tokens,
-                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
-                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
-    const ninfer::KVExecutionTableLayout table_layout =
-        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 3, .table_rows = 2});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
-    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
-    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+                     .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = infernix::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const infernix::KVExecutionTableLayout table_layout =
+        infernix::plan_kv_execution_tables(builder, {.logical_page_capacity = 3, .table_rows = 2});
+    infernix::DeviceArena arena(builder.finish(256));
+    const infernix::DeviceSpan backing{arena.base(), arena.capacity()};
+    infernix::DeviceKVPagePool physical_pages(backing, page_layout);
+    infernix::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages());
     store::KVAddressSpaceStore addresses(pages, physical_tables, 3, 3);
-    const ninfer::Tensor& plane = physical_pages.plane(0);
+    const infernix::Tensor& plane = physical_pages.plane(0);
     const auto page_data        = [&](std::int32_t index) {
         return static_cast<unsigned char*>(plane.data) + index * plane.nb[3];
     };
@@ -939,24 +939,24 @@ void test_cancel_alias_during_prefix_fork(ninfer::DeviceContext& device) {
     }
 }
 
-void test_shared_kv_directory(ninfer::DeviceContext& device) {
-    constexpr std::uint32_t page_tokens = ninfer::kPagedKVPageSize;
+void test_shared_kv_directory(infernix::DeviceContext& device) {
+    constexpr std::uint32_t page_tokens = infernix::kPagedKVPageSize;
     constexpr std::uint32_t full_pages  = 65;
     constexpr std::uint32_t frontier    = full_pages * page_tokens + 1;
-    ninfer::LayoutBuilder builder;
-    const ninfer::DeviceKVPagePoolLayout page_layout = ninfer::plan_device_kv_page_pool(
+    infernix::LayoutBuilder builder;
+    const infernix::DeviceKVPagePoolLayout page_layout = infernix::plan_device_kv_page_pool(
         builder,
         {.page_group_count = 72,
          .geometry         = {
                      .page_tokens        = page_tokens,
-                     .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
-                     .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
-    const ninfer::KVExecutionTableLayout table_layout =
-        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 68, .table_rows = 1});
-    ninfer::DeviceArena arena(builder.finish(256));
-    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
-    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
-    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+                     .device_plane_order = infernix::PagedKVPlaneOrder::PageMajor,
+                     .planes = {{.dtype = infernix::DType::BF16, .leading_extent = 8, .head_extent = 2}}}});
+    const infernix::KVExecutionTableLayout table_layout =
+        infernix::plan_kv_execution_tables(builder, {.logical_page_capacity = 68, .table_rows = 1});
+    infernix::DeviceArena arena(builder.finish(256));
+    const infernix::DeviceSpan backing{arena.base(), arena.capacity()};
+    infernix::DeviceKVPagePool physical_pages(backing, page_layout);
+    infernix::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
     store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages());
     store::KVAddressSpaceStore addresses(pages, physical_tables, 3, 68);
 
@@ -1066,12 +1066,12 @@ void test_shared_kv_directory(ninfer::DeviceContext& device) {
            "last long-directory reference releases every logical and physical page");
 }
 
-std::vector<std::vector<unsigned char>> fill_device_pool(ninfer::DeviceKVPagePool& pool,
+std::vector<std::vector<unsigned char>> fill_device_pool(infernix::DeviceKVPagePool& pool,
                                                          cudaStream_t stream) {
     std::vector<std::vector<unsigned char>> bytes;
     bytes.reserve(pool.plane_count());
     for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
-        const ninfer::Tensor& plane = pool.plane(plane_index);
+        const infernix::Tensor& plane = pool.plane(plane_index);
         std::vector<unsigned char> host(plane.bytes());
         for (std::size_t index = 0; index < host.size(); ++index) {
             host[index] =
@@ -1089,19 +1089,19 @@ std::vector<std::vector<unsigned char>> fill_device_pool(ninfer::DeviceKVPagePoo
 }
 
 std::vector<std::byte>
-expected_host_records(const ninfer::DeviceKVPagePool& pool,
+expected_host_records(const infernix::DeviceKVPagePool& pool,
                       std::span<const std::int32_t> physical_pages,
-                      const ninfer::HostKVPageLayout& host_layout,
+                      const infernix::HostKVPageLayout& host_layout,
                       const std::vector<std::vector<unsigned char>>& device_planes) {
     std::vector<std::byte> out(host_layout.page_stride * physical_pages.size(), std::byte{0});
     for (std::size_t logical = 0; logical < physical_pages.size(); ++logical) {
         const std::int32_t physical = physical_pages[logical];
         for (std::size_t plane_index = 0; plane_index < pool.plane_count(); ++plane_index) {
-            const ninfer::Tensor& plane                 = pool.plane(plane_index);
-            const ninfer::HostKVPlaneLayout& host_plane = host_layout.planes[plane_index];
+            const infernix::Tensor& plane                 = pool.plane(plane_index);
+            const infernix::HostKVPlaneLayout& host_plane = host_layout.planes[plane_index];
             std::byte* destination =
                 out.data() + logical * host_layout.page_stride + host_plane.offset;
-            if (pool.geometry().device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor) {
+            if (pool.geometry().device_plane_order == infernix::PagedKVPlaneOrder::PageMajor) {
                 const unsigned char* source = device_planes[plane_index].data() +
                                               static_cast<std::size_t>(physical) * plane.nb[3];
                 std::memcpy(destination, source, host_plane.page_payload_bytes);
@@ -1120,22 +1120,22 @@ expected_host_records(const ninfer::DeviceKVPagePool& pool,
     return out;
 }
 
-void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPlaneOrder order) {
-    constexpr auto page_size = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize);
+void test_history_prefix_view(infernix::DeviceContext& context, infernix::PagedKVPlaneOrder order) {
+    constexpr auto page_size = static_cast<std::uint32_t>(infernix::kPagedKVPageSize);
     constexpr auto rewrite   = page_size + 13U;
     constexpr auto endpoint  = 3U * page_size + 11U;
-    const ninfer::KVPageGeometry geometry{
+    const infernix::KVPageGeometry geometry{
         .device_plane_order = order,
-        .planes             = {{ninfer::DType::I8, 8, 2, 256}, {ninfer::DType::FP16, 1, 2, 256}},
+        .planes             = {{infernix::DType::I8, 8, 2, 256}, {infernix::DType::FP16, 1, 2, 256}},
     };
-    ninfer::LayoutBuilder builder;
+    infernix::LayoutBuilder builder;
     const auto page_layout =
-        ninfer::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
+        infernix::plan_device_kv_page_pool(builder, {.page_group_count = 8, .geometry = geometry});
     const auto table_layout =
-        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 6, .table_rows = 1});
-    ninfer::DeviceArena arena(builder.finish(256));
-    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, page_layout);
-    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
+        infernix::plan_kv_execution_tables(builder, {.logical_page_capacity = 6, .table_rows = 1});
+    infernix::DeviceArena arena(builder.finish(256));
+    infernix::DeviceKVPagePool pool({arena.base(), arena.capacity()}, page_layout);
+    infernix::KVExecutionTablePool tables({arena.base(), arena.capacity()}, table_layout, pool);
     store::LogicalKVPageStore pages(pool, 12);
     store::KVAddressSpaceStore addresses(pages, tables, 4, 6);
     const auto source      = addresses.create_active(5, 0, context.stream).value();
@@ -1197,10 +1197,10 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
                pages.writer_references(addresses.logical_page(destination, 1)) == 0,
            "prefix view did not share full pages and isolate its immutable tail");
 
-    const auto host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    const auto host_layout = infernix::plan_host_kv_page_layout(geometry);
     const std::array layouts{host_layout};
-    ninfer::HostContextArena host_backing(host_layout.page_stride * 6, host_layout.page_stride);
-    ninfer::HostKVArena host_arena(host_backing, layouts);
+    infernix::HostContextArena host_backing(host_layout.page_stride * 6, host_layout.page_stride);
+    infernix::HostKVArena host_arena(host_backing, layouts);
     auto host            = host_arena.allocate(host_layout, 6).value();
     const auto host_view = host_arena.writable_view(host);
     std::memset(host_view.data(), 0, host_layout.page_stride * 6);
@@ -1228,7 +1228,7 @@ void test_history_prefix_view(ninfer::DeviceContext& context, ninfer::PagedKVPla
         const auto& plane = pool.plane(i);
         for (std::uint32_t head = 0; head < geometry.planes[i].head_extent; ++head) {
             const auto offset =
-                order == ninfer::PagedKVPlaneOrder::PageMajor
+                order == infernix::PagedKVPlaneOrder::PageMajor
                     ? static_cast<std::size_t>(physical_tail) * plane.nb[3] + head * plane.nb[2]
                     : head * plane.nb[3] + static_cast<std::size_t>(physical_tail) * plane.nb[2];
             const auto error =
@@ -1262,13 +1262,13 @@ int main() {
     CUDA_CHECK(count_err);
 
     try {
-        ninfer::DeviceContext device(0);
+        infernix::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
         test_cancel_alias_during_prefix_fork(device);
         test_shared_kv_directory(device);
-        test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::PageMajor);
-        test_history_prefix_view(device, ninfer::PagedKVPlaneOrder::HeadMajor);
+        test_history_prefix_view(device, infernix::PagedKVPlaneOrder::PageMajor);
+        test_history_prefix_view(device, infernix::PagedKVPlaneOrder::HeadMajor);
         device.synchronize();
     } catch (const std::exception& error) {
         std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';

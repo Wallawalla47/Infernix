@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 // Pinned byte placement (offset, size) for each object, from the materialization plan.
@@ -116,4 +116,4 @@ VisionOverlayLayout compute_vision_overlay_layout(const ModelWeights& weights,
                  vision.merger_fc2, vision.merger_fc2_bias}));
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

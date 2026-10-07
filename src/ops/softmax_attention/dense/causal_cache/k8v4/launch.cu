@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/dense/causal_cache/k8v4/tiled_launch.h"
 #include "ops/kv_cache/append/launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class G, int Tokens, class Input, bool Writable>
@@ -36,18 +36,18 @@ void grouped_instance(const CausalAttentionOperands& p, K8V4KvCacheView<Writable
                       Input input, CausalKvPartition partition, CausalPartialView partial,
                       cudaStream_t stream) {
     switch (p.width) {
-#define NINFER_K8V4_GROUPED(T)                                                                     \
+#define INFERNIX_K8V4_GROUPED(T)                                                                     \
     case T:                                                                                        \
         return grouped<G, T>(p, cache, input, partition, partial, stream)
-        NINFER_K8V4_GROUPED(1);
-        NINFER_K8V4_GROUPED(2);
-        NINFER_K8V4_GROUPED(3);
-        NINFER_K8V4_GROUPED(4);
-        NINFER_K8V4_GROUPED(5);
-        NINFER_K8V4_GROUPED(6);
-        NINFER_K8V4_GROUPED(7);
-        NINFER_K8V4_GROUPED(8);
-#undef NINFER_K8V4_GROUPED
+        INFERNIX_K8V4_GROUPED(1);
+        INFERNIX_K8V4_GROUPED(2);
+        INFERNIX_K8V4_GROUPED(3);
+        INFERNIX_K8V4_GROUPED(4);
+        INFERNIX_K8V4_GROUPED(5);
+        INFERNIX_K8V4_GROUPED(6);
+        INFERNIX_K8V4_GROUPED(7);
+        INFERNIX_K8V4_GROUPED(8);
+#undef INFERNIX_K8V4_GROUPED
     }
     throw std::logic_error("K8V4 grouped plan exceeds the selected token tile");
 }
@@ -102,14 +102,14 @@ void execute_parallel(const CausalAttentionOperands& p, K8V4KvReadView cache,
                                                   plan.partition.capacity, plan.batch);
     const auto invoke  = [&]<class G>() {
         switch (plan.query_tile) {
-#define NINFER_K8V4_PARALLEL(T)                                                                    \
+#define INFERNIX_K8V4_PARALLEL(T)                                                                    \
     case T:                                                                                        \
         return parallel_grouped<G, T>(p, cache, plan.partition, partial.view(), stream)
-            NINFER_K8V4_PARALLEL(5);
-            NINFER_K8V4_PARALLEL(6);
-            NINFER_K8V4_PARALLEL(7);
-            NINFER_K8V4_PARALLEL(8);
-#undef NINFER_K8V4_PARALLEL
+            INFERNIX_K8V4_PARALLEL(5);
+            INFERNIX_K8V4_PARALLEL(6);
+            INFERNIX_K8V4_PARALLEL(7);
+            INFERNIX_K8V4_PARALLEL(8);
+#undef INFERNIX_K8V4_PARALLEL
         }
         throw std::logic_error("K8V4 parallel plan exceeds its query tiles");
     };
@@ -173,4 +173,4 @@ void k8v4_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                         plan, workspace, out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

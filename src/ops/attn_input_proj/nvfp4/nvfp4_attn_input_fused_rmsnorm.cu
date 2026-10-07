@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry                = Nvfp4N14336K5120;
@@ -144,4 +144,4 @@ void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor&
                                   static_cast<__nv_bfloat16*>(v.data), stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

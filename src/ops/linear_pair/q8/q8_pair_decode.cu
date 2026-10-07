@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 constexpr int kRows          = 1024;
@@ -132,4 +132,4 @@ void q8_pair_decode_r16_launch(const Tensor& x, const Weight& first_weight,
     launch_decode<16>(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

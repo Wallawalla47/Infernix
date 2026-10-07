@@ -21,7 +21,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 union alignas(16) Q8Bf16x8Bits {
     uint4 raw;
@@ -133,7 +133,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             } else {
                 const int valid =
                     nn < n && (FullK || kk < k) ? (FullK ? 16 : min(8, k - kk) * 2) : 0;
-                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                infernix::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst,
                     &x[static_cast<std::int64_t>(nn < n ? nn : 0) * k + (FullK || kk < k ? kk : 0)],
                     valid);
@@ -157,7 +157,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             } else {
                 const bool valid_row  = (grow < m);
                 const std::int64_t gi = static_cast<std::int64_t>(valid_row ? grow : 0) * kg + g0;
-                ninfer::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
+                infernix::ops::cp_async_zfill<16, Cfg::kPredicatedCache>(
                     dst, &codes[gi * 32 + chunk * 16], valid_row ? 16 : 0);
             }
         }
@@ -228,12 +228,12 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
     const int nkt = padded_k / BK;
     stage_x(0, 0);
     stage_w(0);
-    ninfer::ops::cp_commit();
+    infernix::ops::cp_commit();
 
 #pragma unroll 4
     for (int kt = 0; kt < nkt; ++kt) {
         const int stage = kt % Cfg::kStages;
-        ninfer::ops::cp_wait<0>();
+        infernix::ops::cp_wait<0>();
         __syncthreads();
 
         dequant_w(kt);
@@ -245,7 +245,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
                 stage_x(next % Cfg::kStages, next);
             }
             stage_w(next);
-            ninfer::ops::cp_commit();
+            infernix::ops::cp_commit();
         }
 
         unsigned af[2][MT][4];
@@ -294,7 +294,7 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
             if (next < nkt) {
                 __syncthreads();
                 stage_x(0, next);
-                ninfer::ops::cp_commit();
+                infernix::ops::cp_commit();
             }
         }
     }
@@ -325,4 +325,4 @@ __global__ __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocksPerSm) void q8_a16_mm
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

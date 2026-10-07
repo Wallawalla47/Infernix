@@ -1,10 +1,10 @@
 // Cold-cache benchmark for the two registered public Q8 LinearPair geometries.
 
 #include "core/weight.h"
-#include "ninfer/ops/linear_pair.h"
+#include "infernix/ops/linear_pair.h"
 
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 #include "quantized_weight.cuh"
 
 #include <cuda_runtime.h>
@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "ninfer_linear_pair_bench: %s\n", error.what());
+        std::fprintf(stderr, "infernix_linear_pair_bench: %s\n", error.what());
         return 1;
     }
 }

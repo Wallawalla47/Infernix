@@ -3,7 +3,7 @@
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 // The TMA route reads a whole [128 or 256 tokens, kNvfp4ScaleTileGroups groups] tile of
 // activation scales per request. Row-major by token that tile is 16 bytes per row at the plane's
 // row stride, so one stage would require a small request for each token. Writing the same bytes
@@ -72,4 +72,4 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

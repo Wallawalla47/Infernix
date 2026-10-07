@@ -1,7 +1,7 @@
-# FindFFMPEG.cmake — bridge for NInfer's `find_package(FFMPEG)` on native Windows.
+# FindFFMPEG.cmake — bridge for Infernix's `find_package(FFMPEG)` on native Windows.
 #
 # The ffmpeg vcpkg port (unlike curl) installs no CMake package config. On Windows
-# NInfer consumes a prebuilt vcpkg triplet tree (VCPKG_ROOT + VCPKG_TARGET_TRIPLET
+# Infernix consumes a prebuilt vcpkg triplet tree (VCPKG_ROOT + VCPKG_TARGET_TRIPLET
 # environment variables, exported by build_native.bat) that provides av* import
 # libs + headers + DLLs. This module assembles the standard FFMPEG_* variables from
 # that tree so the top-level CMakeLists.txt (which consumes FFMPEG_INCLUDE_DIRS /

@@ -4,17 +4,17 @@
 // §19.3.7). Host RAM: what the experts may take once a reserve stays free for the system and every
 // other allocation the engine will make is planned; one reserve covers every pinned allocation.
 // Device memory: what the expert frames may take once the fixed allocations, a reserve for
-// NInfer's own later allocations and a headroom for the display and other programs are left.
+// Infernix's own later allocations and a headroom for the display and other programs are left.
 
 #include "core/host_memory.h"
 #include "core/vram_budget.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstdint>
 #include <optional>
 #include <string>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 inline constexpr std::uint64_t kLedgerGiB = 1ULL << 30;
 
@@ -103,7 +103,7 @@ struct VramSizing {
     VramSnapshot snapshot;
     VramDemand demand;
     std::uint64_t headroom = 0; // left free for the display and other programs
-    std::uint64_t reserve  = 0; // for NInfer's own allocations after sizing (graph executables)
+    std::uint64_t reserve  = 0; // for Infernix's own allocations after sizing (graph executables)
     // What the frames may take; negative when the fixed allocations alone do not fit.
     std::int64_t frame_bytes = 0;
     bool budget_limited      = false; // the OS budget, not free memory, bounded frame_bytes
@@ -130,7 +130,7 @@ struct VramSizing {
 
 // The runtime law of an elastic frame pool (design §19.3.7): from the latest snapshot, the pool's
 // size and the time, the frame count it should have. Pure and single-threaded; the Program guards
-// it. The reserve is spent only by NInfer's own allocations after sizing (graph executables): with
+// it. The reserve is spent only by Infernix's own allocations after sizing (graph executables): with
 // an OS budget, the growth of this process's usage other than the pool's.
 class VramControl {
 public:
@@ -171,4 +171,4 @@ private:
     double grow_since_ = -1.0; // when the target first stood two chunks above the pool; < 0: not now
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

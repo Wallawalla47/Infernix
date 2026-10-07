@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 /**
  * Fixed cyclic BF16-K/FP16-V storage with absolute-position addressing.
@@ -91,4 +91,4 @@ private:
     std::int32_t lane_capacity_    = 0;
 };
 
-} // namespace ninfer
+} // namespace infernix

@@ -15,7 +15,7 @@
 #include <string_view>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 namespace {
 
 using Json        = nlohmann::json;
@@ -41,7 +41,7 @@ std::string event(const char* type, Json payload) {
 std::vector<ToolCall> materialize_tool_calls(const GenerationOutcome& outcome) {
     std::vector<ToolCall> result;
     result.reserve(outcome.tool_calls.size());
-    for (const ninfer::GeneratedToolCall& call : outcome.tool_calls) {
+    for (const infernix::GeneratedToolCall& call : outcome.tool_calls) {
         result.push_back(ToolCall{.id             = random_identifier("toolu_"),
                                   .name           = call.name,
                                   .arguments_json = call.arguments_json});
@@ -66,28 +66,28 @@ StopPresentation stop_presentation(const GenerationOutcome& outcome) {
     // A truncated answer reports as truncated even when it also emitted a tool call: the call can
     // be cut mid-argument, and "tool_use" would tell the client to act on it. The matching switch
     // cases below stay so the switch keeps covering every FinishReason.
-    if (outcome.finish_reason == ninfer::FinishReason::OutputLimit) {
+    if (outcome.finish_reason == infernix::FinishReason::OutputLimit) {
         return StopPresentation{.reason = "max_tokens"};
     }
-    if (outcome.finish_reason == ninfer::FinishReason::ContextCapacity) {
+    if (outcome.finish_reason == infernix::FinishReason::ContextCapacity) {
         return StopPresentation{.reason = "model_context_window_exceeded"};
     }
     if (!outcome.tool_calls.empty()) { return StopPresentation{.reason = "tool_use"}; }
     switch (outcome.finish_reason) {
-    case ninfer::FinishReason::OutputLimit:
+    case infernix::FinishReason::OutputLimit:
         return StopPresentation{.reason = "max_tokens"};
-    case ninfer::FinishReason::ContextCapacity:
+    case infernix::FinishReason::ContextCapacity:
         return StopPresentation{.reason = "model_context_window_exceeded"};
-    case ninfer::FinishReason::StopString:
+    case infernix::FinishReason::StopString:
         if (!outcome.matched_stop_string) {
             throw std::logic_error("stop-string terminal result has no matched declaration");
         }
         return StopPresentation{.reason   = "stop_sequence",
                                 .sequence = *outcome.matched_stop_string};
-    case ninfer::FinishReason::StopToken:
-    case ninfer::FinishReason::None:
+    case infernix::FinishReason::StopToken:
+    case infernix::FinishReason::None:
         return StopPresentation{.reason = "end_turn"};
-    case ninfer::FinishReason::Cancelled:
+    case infernix::FinishReason::Cancelled:
         throw std::logic_error("cancelled generation cannot be serialized as an Anthropic message");
     }
     throw std::logic_error("unknown Engine finish reason");
@@ -292,7 +292,7 @@ AnthropicMessagesStream::AnthropicMessagesStream(AnthropicResponseIdentity ident
 
 std::string AnthropicMessagesStream::start() { return start_with_cache(std::nullopt); }
 
-std::string AnthropicMessagesStream::start(const ninfer::GenerationStart& generation) {
+std::string AnthropicMessagesStream::start(const infernix::GenerationStart& generation) {
     if (generation.prompt.prompt_tokens != static_cast<std::uint32_t>(input_tokens_)) {
         throw std::logic_error("Anthropic stream prompt count differs from Engine start");
     }
@@ -433,4 +433,4 @@ std::string AnthropicMessagesStream::error(const ApiError& api_error) const {
     return make_anthropic_sse_error(api_error, identity_.request_id);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

@@ -1,6 +1,6 @@
 #include "ops/linear/q5/q5_instance_launch.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 void launch_q5_a16_direct_r1_t1_w4_k17408(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream) {
     launch_q5_a16_direct_simt_instance<q5_instances::DirectR1T1W4K17408>(x, w, out, stream);
@@ -60,4 +60,4 @@ void launch_q5_a16_direct_r2_t4_w4_g4_b4(const Tensor& x, const Weight& w, Tenso
                                          cudaStream_t stream) {
     launch_q5_a16_direct_simt_instance<q5_instances::DirectR2T4W4G4B4>(x, w, out, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

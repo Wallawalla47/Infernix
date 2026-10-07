@@ -1,4 +1,4 @@
-# NInfer Resource Scheduling and Context Cache
+# Infernix Resource Scheduling and Context Cache
 
 This document explains how Generation coordinates request execution, context reuse and preemption
 recovery within limited device memory and Host RAM, and it is the design authority for these
@@ -8,7 +8,7 @@ constraints are in [Paged KV](paged-kv-cache.md).
 
 ## 1. Core idea
 
-NInfer runs on a single GPU with a single resident model and 1–8 execution slots fixed at startup.
+Infernix runs on a single GPU with a single resident model and 1–8 execution slots fixed at startup.
 For a Hybrid model to reuse a prefix, it needs the complete recurrent state at that position and
 contiguous KV coverage. KV can be shared page by page, while recurrent state is a complete restore
 image of one position. Cache management therefore uses three units at once:

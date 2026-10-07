@@ -16,7 +16,7 @@
 #include "models/qwen3_5/ngram.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/memory_plan.h"
-#include "ninfer/types.h"
+#include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
 #include "runtime/contract/resources.h"
@@ -35,11 +35,11 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 struct DeviceContext;
 }
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 namespace execution {
 class Parameters;
@@ -585,4 +585,4 @@ struct RuntimeTypes {
     using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

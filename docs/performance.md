@@ -1,6 +1,6 @@
 # Single-GPU serving performance
 
-Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
+Published measurements use one NVIDIA GeForce RTX 5090 through Infernix's public HTTP serving route.
 Choose a model below for its detailed results, run conditions, output limitations, and reproduction
 commands. These are recorded measurements; a model/backend being supported does not
 mean every workload or concurrency has a published measurement.

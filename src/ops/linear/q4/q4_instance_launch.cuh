@@ -6,7 +6,7 @@
 #include "ops/linear/q4/q4_instances.cuh"
 #include "ops/linear/q4/q4_launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule>
 void launch_q4_a16_gemv_instance(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
@@ -38,4 +38,4 @@ void launch_q4_a16_sliced_instance(const Tensor& x, const Weight& w, Tensor& out
         q4_linear_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
         LinearIdentityEpilogue{}, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

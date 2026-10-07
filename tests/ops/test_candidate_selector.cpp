@@ -1,4 +1,4 @@
-#include "ninfer/ops/candidate_selector.h"
+#include "infernix/ops/candidate_selector.h"
 
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
@@ -16,8 +16,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

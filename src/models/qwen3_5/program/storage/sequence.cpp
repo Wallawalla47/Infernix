@@ -6,7 +6,7 @@
 #include <array>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::detail {
+namespace infernix::models::qwen3_5::detail {
 
 SequenceHandle ProgramImpl::sequence_handle(std::uint32_t lane) const noexcept {
     return ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
@@ -181,4 +181,4 @@ void ProgramImpl::ordered_reset(SequenceState& state) {
     work.reset();
 }
 
-} // namespace ninfer::models::qwen3_5::detail
+} // namespace infernix::models::qwen3_5::detail

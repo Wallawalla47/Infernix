@@ -6,7 +6,7 @@
 #include <cuda_bf16.h>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 struct Fp8A16Operands {
     const __nv_bfloat16* x;
     const std::uint8_t* codes;
@@ -59,4 +59,4 @@ inline void validate_fp8_operands(const Operands& p) {
             throw std::invalid_argument("FP8 template static K does not match operands");
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

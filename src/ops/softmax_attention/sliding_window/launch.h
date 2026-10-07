@@ -1,8 +1,8 @@
 #pragma once
 
-#include "ninfer/ops/sliding_window_attention.h"
+#include "infernix/ops/sliding_window_attention.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr std::int32_t kSlidingWindowMaxSplits = 32;
 
@@ -35,4 +35,4 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

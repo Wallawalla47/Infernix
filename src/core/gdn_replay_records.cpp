@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 constexpr std::size_t kRecordAlignment        = 256;
@@ -174,4 +174,4 @@ GdnReplayRecordLayer GdnReplayRecords::layer(std::int32_t layer_index, std::int3
     };
 }
 
-} // namespace ninfer
+} // namespace infernix

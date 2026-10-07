@@ -5,7 +5,7 @@
 #include <cstdio>
 #include <stdexcept>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 namespace {
 
 std::uint64_t with_lock_overhead(std::uint64_t pinned, double fraction) {
@@ -207,4 +207,4 @@ std::string VramSizing::describe() const {
     return line;
 }
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

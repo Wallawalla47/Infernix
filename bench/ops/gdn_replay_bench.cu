@@ -4,13 +4,13 @@
 // initialization, and L2 eviction are outside the timed interval. Fold deliberately uses an
 // ordinary eager launch; host submission time is reported separately from CUDA-event GPU latency.
 
-#include "ninfer/ops/gated_delta_net.h"
-#include "ninfer/ops/gdn_replay.h"
+#include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gdn_replay.h"
 
 #include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -28,7 +28,7 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
+using namespace infernix;
 
 namespace {
 

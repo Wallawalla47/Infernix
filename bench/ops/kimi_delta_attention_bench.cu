@@ -1,7 +1,7 @@
 // Public KDA timing and production-stage attribution. Head counts/grouping remain runtime data.
-#include "ninfer/ops/kimi_delta_attention.h"
+#include "infernix/ops/kimi_delta_attention.h"
 #include "ops/linear_attention/kimi_delta_attention/launch.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -14,9 +14,9 @@
 #include <string_view>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
-namespace kda = ninfer::ops::detail::kimi_delta_attention;
+using namespace infernix;
+using namespace infernix::bench;
+namespace kda = infernix::ops::detail::kimi_delta_attention;
 
 namespace {
 constexpr int D       = 128;

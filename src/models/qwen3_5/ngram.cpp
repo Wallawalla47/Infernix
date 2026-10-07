@@ -13,7 +13,7 @@
 #include <xmmintrin.h>
 #endif
 
-namespace ninfer::models::qwen3_5 {
+namespace infernix::models::qwen3_5 {
 namespace {
 
 constexpr std::size_t allocation_overhead = 128;
@@ -646,4 +646,4 @@ NgramArchiveStats NgramArchive::stats(std::string_view key) const noexcept {
     return out;
 }
 
-} // namespace ninfer::models::qwen3_5
+} // namespace infernix::models::qwen3_5

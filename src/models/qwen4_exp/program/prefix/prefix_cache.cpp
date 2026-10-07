@@ -8,7 +8,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::models::qwen4_exp::prefix {
+namespace infernix::models::qwen4_exp::prefix {
 
 namespace pc = runtime::prefix_cache;
 
@@ -552,4 +552,4 @@ void PrefixCache::drop_snapshot_device_image(pc::SnapshotRef) noexcept {
     // Snapshots are Host-born; there are no Device images to drop.
 }
 
-} // namespace ninfer::models::qwen4_exp::prefix
+} // namespace infernix::models::qwen4_exp::prefix

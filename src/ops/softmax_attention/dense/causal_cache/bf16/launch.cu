@@ -3,7 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/plan.h"
 #include "ops/kv_cache/append/launch.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class G, Bf16KvInstance Instance, bool Writable, class Input>
@@ -123,4 +123,4 @@ void bf16_kv_cached_attention(const Tensor& q, const Tensor& positions, float sc
                         plan, workspace, out, stream);
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

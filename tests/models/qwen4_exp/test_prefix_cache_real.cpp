@@ -1,6 +1,6 @@
-// Qwen4Exp prefix cache on the real artifact (design §19.3.1). Skips unless NINFER_QWEN4_ARTIFACT
-// names a Qwen4Exp artifact (NINFER_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
-// NINFER_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
+// Qwen4Exp prefix cache on the real artifact (design §19.3.1). Skips unless INFERNIX_QWEN4_ARTIFACT
+// names a Qwen4Exp artifact (INFERNIX_QWEN4_NGRAM: its n-gram volume, default <artifact>.ngram).
+// INFERNIX_QWEN4_KV selects the KV storage (bf16, int8, fp8, nvfp4, k8v4, vq2, k4v2; default int8).
 // One Engine per drafter mode serves every scenario, so the 64.5 GiB model loads once per mode:
 //
 //   tap resume   (E3) A request resumes from another's flexible tap at a prefill-chunk boundary; its
@@ -19,10 +19,10 @@
 //   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
 //
-//   ninfer_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
+//   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
 #include "kv_cache_storage.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -38,19 +38,19 @@ namespace {
 
 constexpr std::uint32_t kChunk = 512;
 
-std::vector<ninfer::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
-    std::vector<ninfer::TokenId> tokens;
+std::vector<infernix::TokenId> synthetic_tokens(std::size_t count, std::uint32_t seed) {
+    std::vector<infernix::TokenId> tokens;
     tokens.reserve(count);
     std::uint32_t state = seed * 2654435761U + 1U;
     for (std::size_t i = 0; i < count; ++i) {
         state = state * 1664525U + 1013904223U;
-        tokens.push_back(static_cast<ninfer::TokenId>(1000U + (state >> 8U) % 30000U));
+        tokens.push_back(static_cast<infernix::TokenId>(1000U + (state >> 8U) % 30000U));
     }
     return tokens;
 }
 
-ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
-    ninfer::RequestOptions options;
+infernix::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = reuse;
@@ -59,12 +59,12 @@ ninfer::RequestOptions greedy(std::uint32_t outputs, bool reuse) {
 }
 
 struct Run {
-    std::vector<ninfer::TokenId> tokens;
+    std::vector<infernix::TokenId> tokens;
     std::uint32_t reused = 0;
 };
 
-Run generate(ninfer::Engine& engine, const std::vector<ninfer::TokenId>& prompt, std::uint32_t outputs, bool reuse) {
-    const ninfer::GenerationResult result = engine.generate(engine.prepare_tokens(prompt), greedy(outputs, reuse));
+Run generate(infernix::Engine& engine, const std::vector<infernix::TokenId>& prompt, std::uint32_t outputs, bool reuse) {
+    const infernix::GenerationResult result = engine.generate(engine.prepare_tokens(prompt), greedy(outputs, reuse));
     return Run{result.generated_token_ids, result.reused_prompt_tokens};
 }
 
@@ -73,27 +73,27 @@ int check(bool ok, const std::string& what) {
     return ok ? 0 : 1;
 }
 
-std::string first_difference(const std::vector<ninfer::TokenId>& a, const std::vector<ninfer::TokenId>& b) {
+std::string first_difference(const std::vector<infernix::TokenId>& a, const std::vector<infernix::TokenId>& b) {
     for (std::size_t i = 0; i < a.size() && i < b.size(); ++i) {
         if (a[i] != b[i]) { return "first difference at " + std::to_string(i); }
     }
     return a.size() == b.size() ? "identical" : "lengths differ";
 }
 
-ninfer::EngineOptions base_options(const char* artifact, const char* ngram) {
-    ninfer::EngineOptions options;
+infernix::EngineOptions base_options(const char* artifact, const char* ngram) {
+    infernix::EngineOptions options;
     options.artifact_path = artifact;
     if (ngram != nullptr) { options.ngram_volume_path = ngram; }
     options.max_context          = 4096;
     // 72 pages (+1 copy-on-write page): a 3,900-token pressure prompt evicts nearly every block.
-    options.kv_capacity          = ninfer::KvCapacityPolicy::explicit_capacity(4608);
+    options.kv_capacity          = infernix::KvCapacityPolicy::explicit_capacity(4608);
     options.prefill_chunk        = kChunk;
-    const char* kv               = std::getenv("NINFER_QWEN4_KV");
-    options.kv_cache             = kv != nullptr ? ninfer::test::parse_kv_cache_storage(kv)
-                                                 : ninfer::KvCacheStorage::Int8Group64;
+    const char* kv               = std::getenv("INFERNIX_QWEN4_KV");
+    options.kv_cache             = kv != nullptr ? infernix::test::parse_kv_cache_storage(kv)
+                                                 : infernix::KvCacheStorage::Int8Group64;
     options.max_concurrency      = 1;
     options.max_pending_requests = 1;
-    options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;
+    options.context_cache.mode                    = infernix::ContextCacheMode::Hybrid;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     return options;
 }
@@ -118,37 +118,37 @@ std::string user_context() {
     return context;
 }
 
-ninfer::ChatMessage message(ninfer::ChatRole role, std::string text) {
-    ninfer::ChatMessage m;
+infernix::ChatMessage message(infernix::ChatRole role, std::string text) {
+    infernix::ChatMessage m;
     m.role = role;
-    m.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = std::move(text)});
+    m.parts.push_back(infernix::MessagePart{.kind = infernix::MessagePartKind::Text, .text = std::move(text)});
     return m;
 }
 
-ninfer::GenerationResult chat_on(ninfer::Engine& engine, std::vector<ninfer::ChatMessage> messages,
+infernix::GenerationResult chat_on(infernix::Engine& engine, std::vector<infernix::ChatMessage> messages,
                                  std::uint32_t outputs) {
-    ninfer::PromptInput input;
+    infernix::PromptInput input;
     input.messages                = std::move(messages);
     input.options.enable_thinking = false;
-    ninfer::RequestOptions request      = greedy(outputs, true);
+    infernix::RequestOptions request      = greedy(outputs, true);
     request.stop.include_model_defaults = true;
     return engine.generate(engine.prepare(std::move(input)), request);
 }
 
 int run_mode(const char* artifact, const char* ngram, bool mtp) {
     std::printf("== %s\n", mtp ? "MTP drafter (--spec mtp, 3 drafts)" : "plain decode");
-    ninfer::EngineOptions options = base_options(artifact, ngram);
+    infernix::EngineOptions options = base_options(artifact, ngram);
     if (mtp) {
-        options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
         options.speculative.draft_tokens = 3;
     }
-    ninfer::Engine engine(std::move(options));
+    infernix::Engine engine(std::move(options));
     int failures = 0;
 
     // tap resume: A leaves a flexible tap at the start of its final call (1024); B shares 1,400
     // tokens, so it resumes at 1024 and prefills 1024..1536..1700 as a cold run does.
-    const std::vector<ninfer::TokenId> a = synthetic_tokens(1500, 11);
-    std::vector<ninfer::TokenId> b(a.begin(), a.begin() + 1400);
+    const std::vector<infernix::TokenId> a = synthetic_tokens(1500, 11);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 1400);
     const auto suffix = synthetic_tokens(300, 12);
     b.insert(b.end(), suffix.begin(), suffix.end());
     const Run cold_b = generate(engine, b, 48, false);
@@ -160,7 +160,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
 
     // host blocks: pressure evicts the Device copies; B now resumes from its own prompt-tail tap
     // (1536) through Host block restores.
-    const std::vector<ninfer::TokenId> pressure = synthetic_tokens(3900, 13);
+    const std::vector<infernix::TokenId> pressure = synthetic_tokens(3900, 13);
     (void)generate(engine, pressure, 4, true);
     const Run host_b = generate(engine, b, 48, true);
     failures += check(host_b.reused >= 1024, "Host resume reuses " + std::to_string(host_b.reused) + " tokens");
@@ -168,9 +168,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                                                           first_difference(host_b.tokens, cold_b.tokens) + ")");
 
     // endpoint: turn 2 echoes turn 1 and its output; the lane still holds turn 1's endpoint.
-    const std::vector<ninfer::TokenId> t1 = synthetic_tokens(700, 14);
+    const std::vector<infernix::TokenId> t1 = synthetic_tokens(700, 14);
     const Run turn1 = generate(engine, t1, 96, true);
-    std::vector<ninfer::TokenId> t2 = t1;
+    std::vector<infernix::TokenId> t2 = t1;
     t2.insert(t2.end(), turn1.tokens.begin(), turn1.tokens.end());
     const auto more = synthetic_tokens(64, 15);
     t2.insert(t2.end(), more.begin(), more.end());
@@ -188,23 +188,23 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                                                               first_difference(restored.tokens, resident.tokens) + ")");
 
     // Chat prompts carry the structural (end of the system block) and generation-opener taps.
-    const auto chat = [&](std::vector<ninfer::ChatMessage> messages, std::uint32_t outputs) {
+    const auto chat = [&](std::vector<infernix::ChatMessage> messages, std::uint32_t outputs) {
         return chat_on(engine, std::move(messages), outputs);
     };
-    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules_text());
+    const infernix::ChatMessage system = message(infernix::ChatRole::System, rules_text());
     const std::string context        = user_context();
     const auto user = [&](const std::string& question) {
-        return message(ninfer::ChatRole::User, context + question);
+        return message(infernix::ChatRole::User, context + question);
     };
 
     // X5 chat no-echo: turn 2 re-renders turn 1's reply without its reasoning block; it resumes at
     // least at turn 1's generation opener (a few tokens before turn 1's prompt end).
-    const ninfer::GenerationResult s1 =
+    const infernix::GenerationResult s1 =
         chat({system, user("Which shelf takes colour 4?")}, 32);
     const std::uint32_t n1 = s1.prompt.prompt_tokens;
-    const ninfer::GenerationResult x5 =
-        chat({system, user("Which shelf takes colour 4?"), message(ninfer::ChatRole::Assistant, s1.content),
-              message(ninfer::ChatRole::User, "And colour 5?")},
+    const infernix::GenerationResult x5 =
+        chat({system, user("Which shelf takes colour 4?"), message(infernix::ChatRole::Assistant, s1.content),
+              message(infernix::ChatRole::User, "And colour 5?")},
              32);
     std::printf("        X5: turn 1 prompt %u, turn 2 prompt %u reused %u\n", n1, x5.prompt.prompt_tokens,
                 x5.reused_prompt_tokens);
@@ -214,9 +214,9 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
 
     // X6 shared preamble: sessions 2 and 3 share only the system block; they resume at its
     // structural tap, an exact split the first session made.
-    const ninfer::GenerationResult s2 =
+    const infernix::GenerationResult s2 =
         chat({system, user("Summarise rule 12 in one sentence.")}, 32);
-    const ninfer::GenerationResult s3 = chat({system, user("How many rules send items to shelf 0?")}, 32);
+    const infernix::GenerationResult s3 = chat({system, user("How many rules send items to shelf 0?")}, 32);
     std::printf("        X6: sessions 2 and 3 reused %u and %u of %u and %u\n", s2.reused_prompt_tokens,
                 s3.reused_prompt_tokens, s2.prompt.prompt_tokens, s3.prompt.prompt_tokens);
     failures += check(s2.reused_prompt_tokens >= 1024 && s2.reused_prompt_tokens + 8U < s2.prompt.prompt_tokens &&
@@ -225,7 +225,7 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
 
     // X3 split equivalence at an exact off-grid tap: session 2 again resumes at its own generation
     // opener; the run that captured it split its prefill there, so the resume repeats its computation.
-    const ninfer::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
+    const infernix::GenerationResult again = chat({system, user("Summarise rule 12 in one sentence.")}, 32);
     failures += check(again.reused_prompt_tokens + 16U >= s2.prompt.prompt_tokens &&
                           again.reused_prompt_tokens < s2.prompt.prompt_tokens,
                       "X3 the repeat resumes at the opener (reused " + std::to_string(again.reused_prompt_tokens) + ")");
@@ -238,27 +238,27 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
 // X12: the Host tier saved at an Engine's stop and loaded by the next Engine.
 int run_persistence(const char* artifact, const char* ngram) {
     std::printf("== persistence (X12)\n");
-    const std::filesystem::path file = std::filesystem::temp_directory_path() / "ninfer_qwen4_exp_x12.cache";
+    const std::filesystem::path file = std::filesystem::temp_directory_path() / "infernix_qwen4_exp_x12.cache";
     std::error_code ignored;
     std::filesystem::remove(file, ignored);
     const auto options = [&] {
-        ninfer::EngineOptions o                       = base_options(artifact, ngram);
+        infernix::EngineOptions o                       = base_options(artifact, ngram);
         o.context_cache.hybrid.persistent_file     = file;
         o.context_cache.hybrid.persistent_identity = "x12";
         return o;
     };
-    const ninfer::ChatMessage system = message(ninfer::ChatRole::System, rules_text());
+    const infernix::ChatMessage system = message(infernix::ChatRole::System, rules_text());
     const std::string context        = user_context();
-    const std::vector<ninfer::ChatMessage> turn1{system, message(ninfer::ChatRole::User, context + "Which shelf takes colour 2?")};
+    const std::vector<infernix::ChatMessage> turn1{system, message(infernix::ChatRole::User, context + "Which shelf takes colour 2?")};
     int failures = 0;
-    std::vector<ninfer::ChatMessage> turn2 = turn1;
-    ninfer::GenerationResult before;
+    std::vector<infernix::ChatMessage> turn2 = turn1;
+    infernix::GenerationResult before;
     {
-        ninfer::Engine engine(options());
+        infernix::Engine engine(options());
         failures += check(!engine.load_summary().prefix_cache.restored, "Engine 1 starts without a saved file");
-        const ninfer::GenerationResult r1 = chat_on(engine, turn1, 32);
-        turn2.push_back(message(ninfer::ChatRole::Assistant, r1.content));
-        turn2.push_back(message(ninfer::ChatRole::User, context + "And colour 3?"));
+        const infernix::GenerationResult r1 = chat_on(engine, turn1, 32);
+        turn2.push_back(message(infernix::ChatRole::Assistant, r1.content));
+        turn2.push_back(message(infernix::ChatRole::User, context + "And colour 3?"));
         before = chat_on(engine, turn2, 32);
     } // the stop saves the Host tier
     std::error_code size_error;
@@ -266,15 +266,15 @@ int run_persistence(const char* artifact, const char* ngram) {
     failures += check(!size_error && saved_bytes > 0, "the stop saved the Host tier (" +
                                                           std::to_string(size_error ? 0U : saved_bytes) + " bytes)");
     {
-        ninfer::Engine engine(options());
-        const ninfer::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
+        infernix::Engine engine(options());
+        const infernix::LoadSummary::PrefixCacheRestore restore = engine.load_summary().prefix_cache;
         std::printf("        restored %llu blocks and %llu snapshots (%s)\n",
                     static_cast<unsigned long long>(restore.blocks), static_cast<unsigned long long>(restore.snapshots),
                     restore.message.c_str());
         failures += check(restore.restored && restore.snapshots > 0, "Engine 2 restores the saved snapshots");
         // Turn 2 again: Engine 1 left a snapshot at its own generation opener, so the restarted
         // Engine resumes there and repeats Engine 1's computation of turn 2.
-        const ninfer::GenerationResult after = chat_on(engine, turn2, 32);
+        const infernix::GenerationResult after = chat_on(engine, turn2, 32);
         failures += check(after.reused_prompt_tokens + 16U >= before.prompt.prompt_tokens,
                           "after the restart turn 2 resumes at its opener (reused " +
                               std::to_string(after.reused_prompt_tokens) + " of " +
@@ -291,12 +291,12 @@ int run_persistence(const char* artifact, const char* ngram) {
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* artifact = std::getenv("NINFER_QWEN4_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
     if (artifact == nullptr) {
-        std::printf("SKIP: set NINFER_QWEN4_ARTIFACT\n");
+        std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
         return 77;
     }
-    const char* ngram = std::getenv("NINFER_QWEN4_NGRAM");
+    const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
     bool plain = true, mtp = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];

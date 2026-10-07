@@ -14,7 +14,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 template <typename Geometry>
 __device__ __forceinline__ void
@@ -461,4 +461,4 @@ __global__ void kv_cache_append_prefix_paged_kernel(
     }
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <int Capacity, class Schedule>
@@ -298,4 +298,4 @@ void linear_topk_q8_launch(const Tensor& hidden, const Weight& head, std::int32_
         linear_topk_q8_m64_launch(hidden, head, valid_rows, workspace, stream);
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

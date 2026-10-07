@@ -4,9 +4,9 @@
 // greedy token it stages, survive a repeat served from either prefix cache (the hybrid cache's
 // snapshot restore, and the original cache's zero-suffix route that samples from the cached tail
 // hidden), and cost nothing on requests that name no tokens.
-// Requires NINFER_TEST_ARTIFACT.
+// Requires INFERNIX_TEST_ARTIFACT.
 
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +22,7 @@
 namespace {
 
 constexpr std::uint32_t kMaxContext = 2048;
-constexpr auto kKvStorage           = ninfer::KvCacheStorage::BFloat16;
+constexpr auto kKvStorage           = infernix::KvCacheStorage::BFloat16;
 // BF16 logits quantize near |logit| ~ 30 in steps of 0.125; two routes over the same weights
 // differ by accumulation order only.
 constexpr float kOracleTolerance = 0.2F;
@@ -32,9 +32,9 @@ int fail(const std::string& message) {
     return 1;
 }
 
-ninfer::RequestOptions readout_request(std::vector<ninfer::TokenId> tokens,
+infernix::RequestOptions readout_request(std::vector<infernix::TokenId> tokens,
                                        std::uint32_t outputs = 1) {
-    ninfer::RequestOptions options;
+    infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = true;
@@ -43,12 +43,12 @@ ninfer::RequestOptions readout_request(std::vector<ninfer::TokenId> tokens,
     return options;
 }
 
-std::vector<ninfer::TokenId> prompt_tokens(ninfer::Engine& engine) {
+std::vector<infernix::TokenId> prompt_tokens(infernix::Engine& engine) {
     std::string text;
     const std::string paragraph =
         "Ticket: my payouts have failed for three days and support has not answered.\n"
         "Which queue should it go to? Options: A) payouts B) billing C) fraud. Answer: ";
-    std::vector<ninfer::TokenId> tokens;
+    std::vector<infernix::TokenId> tokens;
     while (tokens.size() < 700) {
         text += paragraph;
         tokens = engine.tokenize_text(text);
@@ -59,15 +59,15 @@ std::vector<ninfer::TokenId> prompt_tokens(ninfer::Engine& engine) {
 } // namespace
 
 int main() {
-    const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
-        std::cout << "SKIP: NINFER_TEST_ARTIFACT is not set\n";
+        std::cout << "SKIP: INFERNIX_TEST_ARTIFACT is not set\n";
         return 77;
     }
 
-    std::vector<ninfer::TokenId> prompt;
-    std::vector<ninfer::TokenId> candidates;
-    std::vector<std::pair<std::string, ninfer::PromptReadout>> readouts;
+    std::vector<infernix::TokenId> prompt;
+    std::vector<infernix::TokenId> candidates;
+    std::vector<std::pair<std::string, infernix::PromptReadout>> readouts;
     // Hybrid keeps at least one prompt token to prefill: with 256-token chunks and ladder the
     // repeat restores a ladder snapshot at a chunk boundary and prefills the rest. The original cache claims the whole
     // prompt and samples from the cached tail hidden (the zero-suffix route).
@@ -78,19 +78,19 @@ int main() {
     // The readout itself is exact against a one-pass prefill, so the chunked configuration checks
     // that a restored repeat reads what its own cold run read.
     struct Configuration {
-        ninfer::ContextCacheMode mode;
+        infernix::ContextCacheMode mode;
         std::uint32_t prefill_chunk;
     };
     for (const Configuration configuration :
-         {Configuration{ninfer::ContextCacheMode::Original, 1024},
-          Configuration{ninfer::ContextCacheMode::Hybrid, 256}}) {
-        const bool hybrid      = configuration.mode == ninfer::ContextCacheMode::Hybrid;
+         {Configuration{infernix::ContextCacheMode::Original, 1024},
+          Configuration{infernix::ContextCacheMode::Hybrid, 256}}) {
+        const bool hybrid      = configuration.mode == infernix::ContextCacheMode::Hybrid;
         const std::string name = std::string(hybrid ? "hybrid" : "original") + " chunk " +
                                  std::to_string(configuration.prefill_chunk);
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path      = artifact;
         options.max_context        = kMaxContext;
-        options.kv_capacity        = ninfer::KvCapacityPolicy::explicit_capacity(
+        options.kv_capacity        = infernix::KvCapacityPolicy::explicit_capacity(
             (hybrid ? 4U : 2U) * kMaxContext);
         options.kv_cache           = kKvStorage;
         options.max_concurrency    = 2;
@@ -100,12 +100,12 @@ int main() {
             options.context_cache.hybrid.tap_ladder_tokens  = 256;
             options.context_cache.hybrid.tap_min_gap_tokens = 256;
         }
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
 
         if (prompt.empty()) {
             prompt = prompt_tokens(engine);
             for (const char* label : {"A", "B", "C", "a", "0", " A", "payouts", "\n"}) {
-                const std::vector<ninfer::TokenId> ids = engine.tokenize_text(label);
+                const std::vector<infernix::TokenId> ids = engine.tokenize_text(label);
                 if (ids.size() == 1 &&
                     std::find(candidates.begin(), candidates.end(), ids[0]) == candidates.end()) {
                     candidates.push_back(ids[0]);
@@ -114,15 +114,15 @@ int main() {
             if (candidates.size() < 4) { return fail("the fixture labels did not tokenize"); }
         }
 
-        const auto run = [&](ninfer::RequestOptions request) {
+        const auto run = [&](infernix::RequestOptions request) {
             return engine.generate(engine.prepare_tokens(prompt), std::move(request));
         };
-        ninfer::GenerationResult cold = run(readout_request(candidates));
+        infernix::GenerationResult cold = run(readout_request(candidates));
         if (!cold.readout || cold.readout->logprobs.size() != candidates.size() ||
             cold.generated_token_ids.size() != 1) {
             return fail(name + ": a readout request returned no readout or the wrong output count");
         }
-        const ninfer::PromptReadout& readout = *cold.readout;
+        const infernix::PromptReadout& readout = *cold.readout;
         for (std::size_t i = 0; i < candidates.size(); ++i) {
             const float value = readout.logprobs[i];
             if (!std::isfinite(value) || value > 0.0F || value > readout.top_logprob) {
@@ -137,7 +137,7 @@ int main() {
         }
         if (configuration.prefill_chunk >= prompt.size()) { readouts.emplace_back(name, readout); }
 
-        ninfer::GenerationResult warm = run(readout_request(candidates));
+        infernix::GenerationResult warm = run(readout_request(candidates));
         std::cout << name << ": repeat reused " << warm.reused_prompt_tokens << " of "
                   << prompt.size() << " prompt tokens\n";
         if (!warm.readout || warm.reused_prompt_tokens == 0 ||
@@ -150,20 +150,20 @@ int main() {
             }
         }
 
-        ninfer::RequestOptions plain = readout_request({}, 4);
+        infernix::RequestOptions plain = readout_request({}, 4);
         if (run(std::move(plain)).readout) {
             return fail(name + ": a request that named no readout tokens returned a readout");
         }
 
-        const auto rejects = [&](ninfer::RequestOptions invalid) {
+        const auto rejects = [&](infernix::RequestOptions invalid) {
             try {
                 (void)run(std::move(invalid));
             } catch (const std::invalid_argument&) { return true; }
             return false;
         };
-        std::vector<ninfer::TokenId> wide(ninfer::kMaximumReadoutTokens + 1);
+        std::vector<infernix::TokenId> wide(infernix::kMaximumReadoutTokens + 1);
         for (std::size_t i = 0; i < wide.size(); ++i) {
-            wide[i] = static_cast<ninfer::TokenId>(i);
+            wide[i] = static_cast<infernix::TokenId>(i);
         }
         if (!rejects(readout_request(wide)) ||
             !rejects(readout_request({candidates[0], candidates[0]})) ||
@@ -173,16 +173,16 @@ int main() {
     }
 
     // The oracle: CausalScoring scores the token after the prompt over the same weights.
-    ninfer::EngineOptions scoring;
+    infernix::EngineOptions scoring;
     scoring.artifact_path = artifact;
-    scoring.purpose       = ninfer::EnginePurpose::CausalScoring;
+    scoring.purpose       = infernix::EnginePurpose::CausalScoring;
     scoring.max_context   = kMaxContext;
     scoring.kv_cache      = kKvStorage;
-    ninfer::Engine oracle(scoring);
-    std::vector<ninfer::TokenId> scored = prompt;
+    infernix::Engine oracle(scoring);
+    std::vector<infernix::TokenId> scored = prompt;
     scored.push_back(readouts.front().second.top_token);
     const auto count = static_cast<std::uint32_t>(candidates.size());
-    const ninfer::ScoreResult expected = oracle.score_tokens(
+    const infernix::ScoreResult expected = oracle.score_tokens(
         scored, static_cast<std::uint32_t>(prompt.size()),
         {.top_k = 1, .candidates_per_position = count, .candidates = candidates});
     int failed = 0;

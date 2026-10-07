@@ -5,7 +5,7 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by NInfer's own later allocations.
+// cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
 
 #include "models/qwen4_exp/memory_plan.h"
 
@@ -14,8 +14,8 @@
 #include <stdexcept>
 #include <string>
 
-using namespace ninfer;
-using namespace ninfer::models::qwen4_exp;
+using namespace infernix;
+using namespace infernix::models::qwen4_exp;
 
 namespace {
 
@@ -278,9 +278,9 @@ void test_spill() {
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
 
     // The test seam replaces the sources opened afterwards.
-    ninfer::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
+    infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
     const VramSnapshot faked = open_vram_budget_source(0)->query();
-    ninfer::testing::set_vram_budget_source({});
+    infernix::testing::set_vram_budget_source({});
     require(faked.device_free == 5 * kGiB && faked.display == DisplayState::Headless, "the seam's source answers");
 }
 
@@ -360,7 +360,7 @@ void test_control_law() {
     require(plugged.headroom(DisplayState::Attached) == 512 * kMiB, "elastic headroom with a display");
     require(plugged.decide(display, pool, frames, 0.0, false).shrink, "a display appearing shrinks the pool");
 
-    // NInfer's own later allocations (graph executables, 64 MiB) spend the reserve, not the frames:
+    // Infernix's own later allocations (graph executables, 64 MiB) spend the reserve, not the frames:
     // the target falls by what remains of the reserve's use, and growth never eats into it.
     VramControl reserve(d, kChunk, pool + other, pool);
     const VramSnapshot graphs = wddm(pool, other + 64 * kMiB);

@@ -1,11 +1,11 @@
-#include "ninfer/ops/mtp_round.h"
+#include "infernix/ops/mtp_round.h"
 #include "ops/launcher/mtp_round.h"
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 void require_contiguous_nonnull(const Tensor& t, const char* op, const char* name) {
@@ -86,4 +86,4 @@ void mtp_prepare_next_round(const Tensor& verify_ids, const Tensor& next_anchors
         max_context, next_k, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

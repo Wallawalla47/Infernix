@@ -1,14 +1,14 @@
 #pragma once
 
-// Shared implementation primitives for include/ninfer/ops/sampling.h and
-// include/ninfer/ops/speculative_round.h. The ordering key is exact for finite BF16
+// Shared implementation primitives for include/infernix/ops/sampling.h and
+// include/infernix/ops/speculative_round.h. The ordering key is exact for finite BF16
 // logits (including numeric-zero ties); candidate storage is bounded by the
 // semantic top-20 cap and all global staging is supplied by the caller.
 
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/common/score_id_order.cuh"
-#include "ninfer/ops/sampling.h"
+#include "infernix/ops/sampling.h"
 
 #include <cub/block/block_merge_sort.cuh>
 #include <cub/warp/warp_merge_sort.cuh>
@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <math_constants.h>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 
 using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
@@ -438,4 +438,4 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

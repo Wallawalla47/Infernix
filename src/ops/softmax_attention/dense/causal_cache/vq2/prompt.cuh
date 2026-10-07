@@ -42,7 +42,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Key tiles of the prompt kernel: 32 keys, or 64 when the call sees kVqPromptWideTileKeys keys
 // (measured: short chunks without a prefix, whose tiles are all exact rows, prefer 32).
@@ -928,4 +928,4 @@ __global__ __launch_bounds__(VqPromptShape<KeyCodec, Warps, Bc>::Threads,
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

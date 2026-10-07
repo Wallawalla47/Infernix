@@ -1,7 +1,7 @@
-// ninfer::ops - sigmoid_mul wrapper: implements the public api, validates parameters,
+// infernix::ops - sigmoid_mul wrapper: implements the public api, validates parameters,
 // and dispatches to the launcher. Host-compiled; never includes the kernel header.
 // See docs/op-development.md §2.
-#include "ninfer/ops/sigmoid_mul.h"
+#include "infernix/ops/sigmoid_mul.h"
 
 #include "ops/launcher/sigmoid_gate_mul.h" // detail::sigmoid_gate_mul_launch
 
@@ -9,7 +9,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t numel_allow_zero(const Tensor& t) {
@@ -49,4 +49,4 @@ void sigmoid_mul(const Tensor& gate, Tensor& x, cudaStream_t stream) {
     detail::sigmoid_gate_mul_launch(gate, x, stream); // single variant -> direct dispatch
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

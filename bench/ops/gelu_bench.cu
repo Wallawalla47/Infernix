@@ -1,5 +1,5 @@
-#include "ninfer/ops/gelu.h"
-#include "ninfer_bench_common.h"
+#include "infernix/ops/gelu.h"
+#include "infernix_bench_common.h"
 #include "ops/common/bf16_vector.cuh"
 
 #include <cuda_bf16.h>
@@ -11,8 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

@@ -1,7 +1,7 @@
 #include "ops/linear/q8/q8_launch.h"
 #include "ops/linear/q8/q8_shapes.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Qwen3.8-Flash-Next GDN and QSA output projections: the SIMT route up to 8 columns (the register-streamed
 // route measured 16-29 % slower, M1 sweep), the MMA tiles beyond.
@@ -17,4 +17,4 @@ Q8Launch select_q8_n2560_k6144(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

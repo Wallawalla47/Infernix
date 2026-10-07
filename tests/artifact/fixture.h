@@ -23,7 +23,7 @@
 #    include <unistd.h>
 #endif
 
-namespace ninfer::test::artifact_fixture {
+namespace infernix::test::artifact_fixture {
 
 using Json = nlohmann::json;
 
@@ -31,7 +31,7 @@ inline void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-template <class Error = ninfer::artifact::ArtifactError, class Fn>
+template <class Error = infernix::artifact::ArtifactError, class Fn>
 void rejects(Fn&& fn, const char* message) {
     try {
         fn();
@@ -60,7 +60,7 @@ struct Fixture {
         const long long process = static_cast<long long>(::getpid());
 #endif
         const std::string name =
-            "ninfer-artifact-" + std::to_string(process) + "-" + std::to_string(counter.fetch_add(1));
+            "infernix-artifact-" + std::to_string(process) + "-" + std::to_string(counter.fetch_add(1));
         directory = std::filesystem::temp_directory_path() / name;
         std::error_code create_error;
         std::filesystem::create_directories(directory, create_error);
@@ -165,4 +165,4 @@ struct Fixture {
     }
 };
 
-} // namespace ninfer::test::artifact_fixture
+} // namespace infernix::test::artifact_fixture

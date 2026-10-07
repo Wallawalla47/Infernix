@@ -1,12 +1,12 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "infernix/types.h"
 
 #include <cstdint>
 #include <span>
 #include <vector>
 
-namespace ninfer::runtime::prefix_cache {
+namespace infernix::runtime::prefix_cache {
 
 // Hybrid prefix cache block geometry. It equals the paged KV page size so one tree node owns
 // exactly one page group per enabled pool.
@@ -26,4 +26,4 @@ inline constexpr std::uint64_t kRootLookupHash = 0x6e696e6665722d68ULL;
 [[nodiscard]] std::vector<std::uint64_t> block_lookup_hashes(std::span<const TokenId> tokens,
                                                              std::span<const std::uint64_t> extras);
 
-} // namespace ninfer::runtime::prefix_cache
+} // namespace infernix::runtime::prefix_cache

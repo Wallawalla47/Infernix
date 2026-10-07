@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace ninfer::runtime {
+namespace infernix::runtime {
 
 // Policy owns bounded logical continuations. Native owns checkpoint contents and every byte.
 template <class Model>
@@ -1275,4 +1275,4 @@ private:
     std::uint64_t clock_   = 0;
     std::uint64_t ordinal_ = 0;
 };
-} // namespace ninfer::runtime
+} // namespace infernix::runtime

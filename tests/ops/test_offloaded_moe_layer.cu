@@ -11,7 +11,7 @@
 // FP64 qualification is test_offloaded_moe_wide), equals the first configuration's: neither the record's
 // location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
 // moe_dispatch has its own exact oracle (test_dispatch).
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_service.h"
@@ -31,11 +31,11 @@
 #include <thread>
 #include <vector>
 
-namespace moe      = ninfer::ops::offloaded_moe;
-namespace fixtures = ninfer::test::offloaded_moe;
-using ninfer::DType;
-using ninfer::Tensor;
-using ninfer::test::cuda_check;
+namespace moe      = infernix::ops::offloaded_moe;
+namespace fixtures = infernix::test::offloaded_moe;
+using infernix::DType;
+using infernix::Tensor;
+using infernix::test::cuda_check;
 
 namespace {
 
@@ -100,7 +100,7 @@ public:
         thread_.join();
         cudaFreeHost(ring_);
     }
-    [[nodiscard]] ninfer::ops::MoeFetchChannel channel(int layer) const { return channel_.channel(layer); }
+    [[nodiscard]] infernix::ops::MoeFetchChannel channel(int layer) const { return channel_.channel(layer); }
     // Before a call, with no request open.
     void set(Mode mode, std::uint32_t fail_at = 0) {
         fail_at_.store(fail_at);
@@ -232,14 +232,14 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
     cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
     cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
-    ninfer::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
                                     Tensor(d_weights, DType::FP32, {top_k, columns}),
                                     Tensor(d_shared_gate, DType::FP32, {columns})};
-    ninfer::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
+    infernix::ops::moe_route(Tensor(d_logits, DType::FP32, {experts + 1, columns}), top_k, routing, nullptr);
     void* d_dispatch = nullptr;
-    cuda_check(cudaMalloc(&d_dispatch, ninfer::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
-    auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
 
     const auto x  = fixtures::random_activations(rng, columns);
     auto* d_x     = device_copy(x);
@@ -260,7 +260,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, ninfer::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns)),
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
@@ -438,10 +438,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                        .fetch = Responder::Mode::kSilent, .fetched = true}}) {
         const int slots = config.slots;
         // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
-        ninfer::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
         cuda_check(cudaMemset(d_out, 0xFF, expected.size() * sizeof(std::uint16_t)), "cudaMemset");
         cuda_check(cudaMemset(d_staging, 0, stride * 64), "cudaMemset");
-        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
                                             .record_stride = stride,
@@ -449,7 +449,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
                                             .staging_base  = slots > 0 ? d_staging : nullptr,
                                             .staging_slots = slots,
                                             .cpu = config.service != nullptr ? config.service->channel(0)
-                                                                             : ninfer::ops::MoeCpuChannel{}};
+                                                                             : infernix::ops::MoeCpuChannel{}};
         if (config.service != nullptr) {
             // The CPU wait warms these into L2 while the host works; no output may change.
             source.l2_warm.ptr[0]   = d_frame_base;
@@ -492,7 +492,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
-        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         if (config.service != nullptr) {
             // The service counts after answering, so its count may trail the device by a moment.
@@ -615,7 +615,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         std::uint32_t* sequence = nullptr;
         cuda_check(cudaMalloc(&sequence, sizeof(std::uint32_t)), "cudaMalloc");
         cuda_check(cudaMemset(sequence, 0, sizeof(std::uint32_t)), "cudaMemset");
-        ninfer::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
                                             .frames        = d_frames,
                                             .host_records  = host_device,
                                             .record_stride = stride,
@@ -629,7 +629,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed) {
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
         const auto start = std::chrono::steady_clock::now();
-        ninfer::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         const cudaError_t status = cudaDeviceSynchronize();
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         const std::uint32_t error = *reinterpret_cast<volatile std::uint32_t*>(error_host);
@@ -687,14 +687,14 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     std::int32_t* d_ids = nullptr;
     std::int32_t* d_log = nullptr;
     void* d_dispatch    = nullptr;
-    const std::size_t bytes = ninfer::ops::moe_dispatch_bytes(experts, entries);
+    const std::size_t bytes = infernix::ops::moe_dispatch_bytes(experts, entries);
     cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * entries), "cudaMalloc");
     cuda_check(cudaMalloc(&d_log, sizeof(std::int32_t) * entries), "cudaMalloc");
     cuda_check(cudaMalloc(&d_dispatch, bytes), "cudaMalloc");
     cuda_check(cudaMemset(d_dispatch, 0x5A, bytes), "cudaMemset");
     cuda_check(cudaMemset(d_log, 0xFF, sizeof(std::int32_t) * entries), "cudaMemset");
-    auto dispatch = ninfer::ops::carve_moe_dispatch(d_dispatch, experts, entries);
-    ninfer::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {entries, 1}), Tensor{}, Tensor{}};
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, entries);
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {entries, 1}), Tensor{}, Tensor{}};
 
     const auto verify = [&](const std::vector<std::int32_t>& ids, const char* phase) {
         std::vector<std::int32_t> counts(experts), offsets(experts + 1), jobs(experts), got_entries(entries), log(entries);
@@ -742,7 +742,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
 
     const auto first = random_ids();
     cuda_check(cudaMemcpy(d_ids, first.data(), sizeof(std::int32_t) * entries, cudaMemcpyHostToDevice), "copy");
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, nullptr);
     cuda_check(cudaDeviceSynchronize(), "dispatch");
     verify(first, "eager");
 
@@ -751,7 +751,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaGraphExec_t exec = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
     cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
-    ninfer::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
+    infernix::ops::moe_dispatch(routing, experts, dispatch, d_log, stream);
     cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
     for (int replay = 0; replay < 2; ++replay) {
@@ -775,7 +775,7 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
 } // namespace
 
 int main() {
-    if (ninfer::test::cuda_unavailable()) {
+    if (infernix::test::cuda_unavailable()) {
         std::printf("SKIP: no usable CUDA device\n");
         return 77;
     }

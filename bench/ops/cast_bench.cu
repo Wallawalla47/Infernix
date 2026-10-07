@@ -1,6 +1,6 @@
-#include "ninfer/ops/cast.h"
+#include "infernix/ops/cast.h"
 #include "core/device.h"
-#include "ninfer_bench_common.h"
+#include "infernix_bench_common.h"
 
 #include <cuda_runtime.h>
 
@@ -11,8 +11,8 @@
 #include <cstring>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::bench;
+using namespace infernix;
+using namespace infernix::bench;
 
 namespace {
 

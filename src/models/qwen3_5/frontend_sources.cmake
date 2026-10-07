@@ -1,4 +1,4 @@
-target_sources(ninfer_model_runtime PRIVATE
+target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/frontend.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/output_session.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/reasoning_loop.cpp"

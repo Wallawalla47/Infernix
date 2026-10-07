@@ -1,4 +1,4 @@
-add_library(ninfer_jinja STATIC
+add_library(infernix_jinja STATIC
   jinja/json.cpp
   jinja/lexer.cpp
   jinja/parser.cpp
@@ -7,5 +7,5 @@ add_library(ninfer_jinja STATIC
   jinja/value.cpp
   jinja/unicode.cpp
 )
-target_include_directories(ninfer_jinja
+target_include_directories(infernix_jinja
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

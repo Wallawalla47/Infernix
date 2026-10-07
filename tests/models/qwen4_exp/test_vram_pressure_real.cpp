@@ -5,13 +5,13 @@
 //      back after the (shortened) grow delay, and the token ids equal an undisturbed run;
 //   2. while the engine is idle: the monitor wakes the engine, which shrinks and grows the cache
 //      outside any round (maintain()).
-// Skips (77) unless NINFER_QWEN4_ARTIFACT names a Qwen4Exp artifact.
+// Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
 //
-//   NINFER_QWEN4_ARTIFACT=out.ninfer [NINFER_QWEN4_NGRAM=out.ninfer.ngram] ninfer_qwen4_exp_vram_pressure_real_test
+//   INFERNIX_QWEN4_ARTIFACT=out.ninfer [INFERNIX_QWEN4_NGRAM=out.ninfer.ngram] infernix_qwen4_exp_vram_pressure_real_test
 
 #include "core/vram_budget.h"
 #include "models/qwen4_exp/program/vram_monitor.h"
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <atomic>
 #include <chrono>
@@ -56,19 +56,19 @@ struct Diagnostics {
     }
 };
 
-ninfer::PromptInput story() {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage message;
-    message.role = ninfer::ChatRole::User;
-    message.parts.push_back({.kind = ninfer::MessagePartKind::Text,
+infernix::PromptInput story() {
+    infernix::PromptInput input;
+    infernix::ChatMessage message;
+    message.role = infernix::ChatRole::User;
+    message.parts.push_back({.kind = infernix::MessagePartKind::Text,
                              .text = "Write a long story about a lighthouse keeper who befriends a seagull."});
     input.messages.push_back(std::move(message));
     input.options.enable_thinking = false;
     return input;
 }
 
-ninfer::RequestOptions greedy(std::uint32_t tokens) {
-    ninfer::RequestOptions request;
+infernix::RequestOptions greedy(std::uint32_t tokens) {
+    infernix::RequestOptions request;
     request.execution.requested_output_tokens = tokens;
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
@@ -86,35 +86,35 @@ void check(bool ok, const std::string& what) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* artifact = std::getenv("NINFER_QWEN4_ARTIFACT");
+    const char* artifact = std::getenv("INFERNIX_QWEN4_ARTIFACT");
     if (artifact == nullptr) {
-        std::printf("SKIP: set NINFER_QWEN4_ARTIFACT\n");
+        std::printf("SKIP: set INFERNIX_QWEN4_ARTIFACT\n");
         return 77;
     }
-    const char* ngram = std::getenv("NINFER_QWEN4_NGRAM");
+    const char* ngram = std::getenv("INFERNIX_QWEN4_NGRAM");
     try {
         // The real source first, then the fake that every engine source becomes.
-        auto real = ninfer::open_vram_budget_source(0);
+        auto real = infernix::open_vram_budget_source(0);
         std::atomic<std::uint64_t> taken{0};
-        ninfer::testing::set_vram_budget_source([&] {
-            ninfer::VramSnapshot s = real->query();
+        infernix::testing::set_vram_budget_source([&] {
+            infernix::VramSnapshot s = real->query();
             const std::uint64_t t  = taken.load();
             s.device_free          = s.device_free > t ? s.device_free - t : 0;
             if (s.has_budget) { s.local_budget = s.local_budget > t ? s.local_budget - t : 0; }
             return s;
         });
-        ninfer::models::qwen4_exp::testing::set_vram_grow_delay(1.0);
+        infernix::models::qwen4_exp::testing::set_vram_grow_delay(1.0);
 
         Diagnostics diagnostics;
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path = artifact;
         options.context_cache.enabled = false; // no prefix cache (Qwen4Exp has no Legacy cache)
         if (ngram != nullptr) { options.ngram_volume_path = ngram; }
         options.max_context = 4096;
-        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-        options.kv_cache    = ninfer::KvCacheStorage::Int8Group64;
-        options.diagnostic_observer.callback = [&](const ninfer::Diagnostic& d) { diagnostics.add(d.message); };
-        ninfer::Engine engine(options);
+        options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
+        options.kv_cache    = infernix::KvCacheStorage::Int8Group64;
+        options.diagnostic_observer.callback = [&](const infernix::Diagnostic& d) { diagnostics.add(d.message); };
+        infernix::Engine engine(options);
 
         constexpr std::uint32_t kTokens = 700;
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
@@ -156,7 +156,7 @@ int main() {
               "an idle engine grows the cache back");
         const auto after = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(after == baseline, "ids after the idle resizes equal the undisturbed run");
-        ninfer::testing::set_vram_budget_source({});
+        infernix::testing::set_vram_budget_source({});
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

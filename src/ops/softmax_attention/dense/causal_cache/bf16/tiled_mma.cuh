@@ -5,7 +5,7 @@
 #include "ops/softmax_attention/dense/causal_cache/bf16/epilogue.cuh"
 #include <math_constants.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Online attention, one CTA per (query tile, query head), with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
@@ -129,10 +129,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     int physical_page    = block_table[0];
 
     // Prologue: commit Q, then kick off K(0). The loop's wait<0> below drains both.
-    ninfer::ops::cp_commit();
+    infernix::ops::cp_commit();
     bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, 0, max_query_abs, physical_page,
                                            tid);
-    ninfer::ops::cp_commit();
+    infernix::ops::cp_commit();
 
     const auto step = [&]<bool FullTile>(int kb) {
         const int k0                 = kb * Bc;
@@ -140,13 +140,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                                            ? block_table[((kb + 1) * Bc) >> kPagedKVPageShift]
                                            : physical_page;
 
-        ninfer::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
+        infernix::ops::cp_wait<0>(); // K(kb) landed (also publishes q_s / prev PV done)
         __syncthreads();
 
         // Preserve the global FP16 V load/QK overlap.
         bf16_kv_stage_tile<Geometry, Schedule>(v_s, cache_v, kv_head, k0, max_query_abs,
                                                physical_page, tid);
-        ninfer::ops::cp_commit();
+        infernix::ops::cp_commit();
 
         // S = Q Kᵀ for this warp's 16 rows over all Bc keys, in registers.
         // Software-pipelined like cute's gemm: issue the ldmatrix for contraction
@@ -194,7 +194,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             }
         }
 
-        ninfer::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s.
+        infernix::ops::cp_wait<0>(); // V(kb) landed; QK done reading k_s.
         __syncthreads();
 
         // Prefetch K(kb+1) into the (now-free) K buffer, overlapping the PV MMA.
@@ -202,7 +202,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
             physical_page = next_physical_page;
             bf16_kv_stage_tile<Geometry, Schedule>(k_s, cache_k, kv_head, (kb + 1) * Bc,
                                                    max_query_abs, physical_page, tid);
-            ninfer::ops::cp_commit();
+            infernix::ops::cp_commit();
         }
 
         const int row0  = warp_row0 + gid;
@@ -360,4 +360,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
 }
 
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

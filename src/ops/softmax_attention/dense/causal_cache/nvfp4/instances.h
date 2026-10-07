@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/schedule.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class G, int Tokens>
 struct Nvfp4KvGroupedInstance {
     static_assert(Tokens > 0 && Tokens * G::GroupSize <= 64);
@@ -13,4 +13,4 @@ struct Nvfp4KvGroupedInstance {
 };
 
 using Nvfp4KvTiledInstance = Nvfp4KvTiledMmaSchedule<64, 12>;
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

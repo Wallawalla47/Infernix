@@ -9,7 +9,7 @@
 #include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 using Geometry = Fp8N16384K5120;
@@ -69,4 +69,4 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
     return launch_gemm<Fp8A16MmaSchedule<64, 128, 64, 32, 16, 2, 2>>(x, weight, qkv, z, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

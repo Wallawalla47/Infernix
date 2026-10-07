@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // The Attention epilogue owns its measured crossover independently of pure Linear.
 inline constexpr std::int32_t kBf16AttnInputSmallTMinTokens   = 2;
@@ -24,4 +24,4 @@ void bf16_attn_input_mma_launch(const Tensor& x, const Weight& weight, Tensor& q
 void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

@@ -213,16 +213,16 @@ per profile; each category has fifteen. All output-limit samples remain in the r
 
 Run from the repository root using Python 3.11 and the explicit artifact above.
 Campaign reports: `profiles/bench/qwen3_6_35b_a3b_retest_20260907_130244/`.
-Select an unused `NINFER_PERF_OUTPUT` directory for a new run.
+Select an unused `INFERNIX_PERF_OUTPUT` directory for a new run.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j --target ninfer-serve
+cmake --build build -j --target infernix-serve
 
-NINFER_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
-NINFER_PERF_OUTPUT=profiles/bench/qwen3_6_35b_a3b_performance
-NINFER_PERF_COMMON=(
-  --serve build/apps/ninfer-serve
+INFERNIX_BENCH_PYTHON=/home/neroued/miniconda3/envs/py311/bin/python
+INFERNIX_PERF_OUTPUT=profiles/bench/qwen3_6_35b_a3b_performance
+INFERNIX_PERF_COMMON=(
+  --serve build/apps/infernix-serve
   --artifact qwen3_6_35b_a3b=out/qwen3_6_35b_a3b.ninfer
   --kv-capacity auto --prefill-chunk 1024 --device 0 --port 18080
 )
@@ -233,12 +233,12 @@ NINFER_PERF_COMMON=(
 Report subdirectory: `mtp0_context/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  "${NINFER_PERF_COMMON[@]}" \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  "${INFERNIX_PERF_COMMON[@]}" \
   --mode mtp0 --sampling stochastic --suite corpus-makespan \
   --concurrency 1 \
   --max-context 262144 \
-  --output "$NINFER_PERF_OUTPUT/mtp0_context"
+  --output "$INFERNIX_PERF_OUTPUT/mtp0_context"
 ```
 
 ### M3
@@ -246,12 +246,12 @@ Report subdirectory: `mtp0_context/`.
 Report subdirectory: `mtp3_corpus/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  "${NINFER_PERF_COMMON[@]}" \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  "${INFERNIX_PERF_COMMON[@]}" \
   --mode mtp3 --sampling stochastic --suite corpus-makespan \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
   --max-context 262144 \
-  --output "$NINFER_PERF_OUTPUT/mtp3_corpus"
+  --output "$INFERNIX_PERF_OUTPUT/mtp3_corpus"
 ```
 
 ### DS
@@ -259,12 +259,12 @@ Report subdirectory: `mtp3_corpus/`.
 Report subdirectory: `dflash7_stochastic/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  "${NINFER_PERF_COMMON[@]}" \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  "${INFERNIX_PERF_COMMON[@]}" \
   --mode dflash7 --sampling stochastic --suite corpus-makespan \
   --concurrency 1 \
   --max-context 262144 \
-  --output "$NINFER_PERF_OUTPUT/dflash7_stochastic"
+  --output "$INFERNIX_PERF_OUTPUT/dflash7_stochastic"
 ```
 
 ### DG
@@ -272,12 +272,12 @@ Report subdirectory: `dflash7_stochastic/`.
 Report subdirectory: `dflash7_greedy/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  "${NINFER_PERF_COMMON[@]}" \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  "${INFERNIX_PERF_COMMON[@]}" \
   --mode dflash7 --sampling greedy --suite corpus-makespan \
   --concurrency 1 \
   --max-context 262144 \
-  --output "$NINFER_PERF_OUTPUT/dflash7_greedy"
+  --output "$INFERNIX_PERF_OUTPUT/dflash7_greedy"
 ```
 
 ### S3
@@ -285,12 +285,12 @@ Report subdirectory: `dflash7_greedy/`.
 Report subdirectory: `mtp3_saturation/`.
 
 ```bash
-"$NINFER_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
-  "${NINFER_PERF_COMMON[@]}" \
+"$INFERNIX_BENCH_PYTHON" tools/bench/run_serve_concurrency.py \
+  "${INFERNIX_PERF_COMMON[@]}" \
   --mode mtp3 --sampling stochastic --suite decode-saturation \
   --concurrency 1 --concurrency 2 --concurrency 4 --concurrency 8 \
   --max-context 16384 --decode-tokens 8192 \
-  --output "$NINFER_PERF_OUTPUT/mtp3_saturation"
+  --output "$INFERNIX_PERF_OUTPUT/mtp3_saturation"
 ```
 
 Each group contains `summary.json`, `summary.csv`, `summary.md`, `points/`, and `server/`.

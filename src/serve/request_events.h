@@ -8,7 +8,7 @@
 #include <optional>
 #include <string>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct RequestLogContext {
     std::uint64_t id = 0;
@@ -29,9 +29,9 @@ struct RequestLogContext {
     std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;
-    ninfer::ResolvedSamplingParameters sampling;
+    infernix::ResolvedSamplingParameters sampling;
     double acquisition_seconds = 0.0;
-    ninfer::PromptPreparationStats preparation;
+    infernix::PromptPreparationStats preparation;
 };
 
 struct RequestLogMetadata {
@@ -100,8 +100,8 @@ struct ThroughputReport {
     std::uint64_t committed_decode_tokens = 0;
     std::uint64_t decode_rounds           = 0;
     std::uint64_t decode_row_rounds       = 0;
-    ninfer::RuntimeStats previous;
-    ninfer::RuntimeStats current;
+    infernix::RuntimeStats previous;
+    infernix::RuntimeStats current;
     bool final_interval = false;
 };
 
@@ -121,4 +121,4 @@ RequestRejectionLogContext make_request_rejection_log_context(std::uint64_t id,
                                                            std::string machine_message);
 [[nodiscard]] RequestFailure make_client_disconnected_failure(RequestFailurePhase phase);
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

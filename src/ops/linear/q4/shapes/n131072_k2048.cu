@@ -1,6 +1,6 @@
 #include "ops/linear/q4/q4_shapes.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 Q4Launch select_q4_n131072_k2048(std::int32_t tokens) {
     // Selected with complete-Op cold CUDA Graph measurements on RTX 5090.
     if (tokens <= 1) return launch_q4_a16_simt_r4_t1_w2_g8_s2;
@@ -16,4 +16,4 @@ Q4Launch select_q4_n131072_k2048(std::int32_t tokens) {
     if (tokens <= 120) return launch_q4_a16_mma_r64_t120;
     return launch_q4_a16_mma_r64_t128;
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

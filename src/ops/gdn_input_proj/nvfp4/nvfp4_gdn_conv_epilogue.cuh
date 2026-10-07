@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <int Tokens>
 struct Nvfp4GdnConvEpilogue {
     [[maybe_unused]] static constexpr int kRowTokens = Tokens;
@@ -12,4 +12,4 @@ struct Nvfp4GdnConvEpilogue {
         output.store_row(row, values);
     }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

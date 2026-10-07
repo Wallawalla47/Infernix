@@ -10,7 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 // Record layout `nvfp4_expert_rg16_v1` (design §6.2).
 inline constexpr int kHidden           = 2560;
@@ -29,7 +29,7 @@ inline constexpr std::size_t kRecordBytes = kGateUpBytes + kDownBytes;      // 2
 inline constexpr int kMaxColumns          = 8;                              // narrow route: n <= 8
 
 // Software prefetch distance in bytes along a matrix's unit stream (0 disables it). The best value
-// depends on the host's memory latency and core speed; ninfer-calibrate measures it on the target
+// depends on the host's memory latency and core speed; infernix-calibrate measures it on the target
 // (design §14.2). This default is only a starting point, not a tuned value.
 inline constexpr int kDefaultPrefetchBytes = 2048;
 
@@ -81,4 +81,4 @@ void expert_forward(CpuIsa isa, const std::uint8_t* record, const ExpertScales& 
                     const std::uint16_t* const* x, std::uint16_t* const* y,
                     int prefetch_bytes = kDefaultPrefetchBytes);
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

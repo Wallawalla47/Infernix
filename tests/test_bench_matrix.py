@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import pytest
 
-from tools.bench.run_ninfer_bench_matrix import BenchCase, load_bench_report, report_rows
+from tools.bench.run_infernix_bench_matrix import BenchCase, load_bench_report, report_rows
 
 
 @pytest.mark.parametrize("ngram_enabled", [False, True])
@@ -13,8 +13,8 @@ def test_schema_v16_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
         json.dumps(
             {
                 "schema_version": 16,
-                "artifact_type": "ninfer_bench_report",
-                "tool": "ninfer_bench",
+                "artifact_type": "infernix_bench_report",
+                "tool": "infernix_bench",
                 "artifact": {"path": "model.ninfer"},
                 "environment": {"gpu_name": "RTX 5090"},
                 "load": {
@@ -132,7 +132,7 @@ def test_schema_v16_report_is_flattened_for_matrix_summary(tmp_path, ngram_enabl
 def test_matrix_rejects_different_report_schema(tmp_path, version) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(json.dumps({"schema_version": version,
-                                       "artifact_type": "ninfer_bench_report",
-                                       "tool": "ninfer_bench"}), encoding="utf-8")
+                                       "artifact_type": "infernix_bench_report",
+                                       "tool": "infernix_bench"}), encoding="utf-8")
     with pytest.raises(ValueError, match="unsupported benchmark report identity"):
         load_bench_report(report_path)

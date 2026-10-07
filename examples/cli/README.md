@@ -14,7 +14,7 @@ also live beside them when they deliberately have no frozen output oracle.
 Run from the repository root because media paths in the JSON files are repository-relative:
 
 ```bash
-CLI=./build/apps/ninfer
+CLI=./build/apps/infernix
 MODEL=models/qwen3_6_27b.ninfer
 
 $CLI "$MODEL" \
@@ -40,7 +40,7 @@ python3 -m examples.cli.send_to_serve \
   --model qwen3.6-27b --no-thinking --max-tokens 64
 ```
 
-Start `ninfer-serve` with `--vision` for media fixtures. Relative media paths use the current
+Start `infernix-serve` with `--vision` for media fixtures. Relative media paths use the current
 working directory by default; pass `--media-root` when invoking the command elsewhere. `--dry-run`
 prints the exact converted request without contacting a server.
 

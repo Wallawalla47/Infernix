@@ -2,7 +2,7 @@
 // weights and activations, within the documented FP32 accumulation bound
 // sum_k |w x| * K * 2^-24, plus its column invariance: a column's bits do not depend on the batch
 // width or the column's position.
-#include "ninfer/ops/projection_fp32.h"
+#include "infernix/ops/projection_fp32.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <cuda_bf16.h>
@@ -20,9 +20,9 @@
 #include <vector>
 
 namespace {
-using namespace ninfer::test::linear;
-using ninfer::DType;
-using ninfer::Tensor;
+using namespace infernix::test::linear;
+using infernix::DType;
+using infernix::Tensor;
 
 int g_failures = 0;
 
@@ -99,13 +99,13 @@ void verify(const std::string& tag, const std::vector<float>& out, const WeightA
     check(bad == 0, tag + " within the FP32 accumulation bound");
 }
 
-std::vector<float> run_q8(const ninfer::Weight& weight, const std::vector<std::uint16_t>& xbits, std::int32_t k,
+std::vector<float> run_q8(const infernix::Weight& weight, const std::vector<std::uint16_t>& xbits, std::int32_t k,
                           std::int32_t t) {
     auto* dx = device(xbits);
     float* dout = nullptr;
     cudaMalloc(&dout, sizeof(float) * weight.n * t);
     Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {weight.n, t});
-    ninfer::ops::projection_fp32(x, weight, out, nullptr);
+    infernix::ops::projection_fp32(x, weight, out, nullptr);
     if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection q8 failed"); }
     std::vector<float> host(static_cast<std::size_t>(weight.n) * t);
     cudaMemcpy(host.data(), dout, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
@@ -114,13 +114,13 @@ std::vector<float> run_q8(const ninfer::Weight& weight, const std::vector<std::u
     return host;
 }
 
-void quantized_case(ninfer::QType qtype, std::int32_t n, std::int32_t k, std::uint32_t seed, bool sampled) {
-    const bool q4     = qtype == ninfer::QType::Q4_G64_FP16;
+void quantized_case(infernix::QType qtype, std::int32_t n, std::int32_t k, std::uint32_t seed, bool sampled) {
+    const bool q4     = qtype == infernix::QType::Q4_G64_FP16;
     const auto packed = q4 ? make_q4_g64_fp16_weight(n, k, seed) : make_q8_g32_fp16_weight(n, k, seed);
     void* payload     = nullptr;
     cudaMalloc(&payload, packed.payload.size());
     cudaMemcpy(payload, packed.payload.data(), packed.payload.size(), cudaMemcpyHostToDevice);
-    const ninfer::Weight weight = packed.device_weight(payload);
+    const infernix::Weight weight = packed.device_weight(payload);
     // The patterned fixture holds no dequantized matrix: decode the payload with its stored scales.
     const std::int32_t padded_k = static_cast<std::int32_t>(weight.padded_shape[1]);
     const int group_size = q4 ? 64 : 32;
@@ -136,7 +136,7 @@ void quantized_case(ninfer::QType qtype, std::int32_t n, std::int32_t k, std::ui
             code = static_cast<std::int8_t>(packed.payload[static_cast<std::size_t>(r) * padded_k + i]);
         }
         const float scale =
-            ninfer::test::quantized_weight::detail::f16_to_f32(ninfer::test::quantized_weight::detail::load_u16_le(
+            infernix::test::quantized_weight::detail::f16_to_f32(infernix::test::quantized_weight::detail::load_u16_le(
                 packed.payload, static_cast<std::size_t>(packed.scale_plane_offset) + group * 2));
         return static_cast<double>(code) * static_cast<double>(scale);
     };
@@ -198,7 +198,7 @@ void bf16_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::uint3
         float* dout = nullptr;
         cudaMalloc(&dout, sizeof(float) * n * t);
         Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
-        ninfer::ops::projection_fp32(x, weights, out, nullptr);
+        infernix::ops::projection_fp32(x, weights, out, nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 failed"); }
         std::vector<float> host(static_cast<std::size_t>(n) * t);
         cudaMemcpy(host.data(), dout, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
@@ -246,7 +246,7 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
     const auto run = [&](std::int32_t first, std::int32_t width) {
         Tensor x(dx + static_cast<std::size_t>(first) * k, DType::BF16, {k, width});
         Tensor out(dout + static_cast<std::size_t>(first) * n, DType::FP32, {n, width});
-        ninfer::ops::projection_fp32(x, weights, out, nullptr);
+        infernix::ops::projection_fp32(x, weights, out, nullptr);
         if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 wide failed"); }
         std::vector<float> host(static_cast<std::size_t>(n) * width);
         cudaMemcpy(host.data(), out.data, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
@@ -259,7 +259,7 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
         cudaEventCreate(&begin);
         cudaEventCreate(&end);
         cudaEventRecord(begin);
-        for (int i = 0; i < 20; ++i) { ninfer::ops::projection_fp32(x, weights, out, nullptr); }
+        for (int i = 0; i < 20; ++i) { infernix::ops::projection_fp32(x, weights, out, nullptr); }
         cudaEventRecord(end);
         cudaEventSynchronize(end);
         float ms = 0;
@@ -309,10 +309,10 @@ int main() {
         bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
-        quantized_case(ninfer::QType::Q8_G32_FP16, 1000, 2560, 17, false);
-        quantized_case(ninfer::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
-        quantized_case(ninfer::QType::Q4_G64_FP16, 1000, 2560, 23, false);
-        quantized_case(ninfer::QType::Q4_G64_FP16, 131072, 2560, 29, true); // the proposal head, sampled rows
+        quantized_case(infernix::QType::Q8_G32_FP16, 1000, 2560, 17, false);
+        quantized_case(infernix::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
+        quantized_case(infernix::QType::Q4_G64_FP16, 1000, 2560, 23, false);
+        quantized_case(infernix::QType::Q4_G64_FP16, 131072, 2560, 29, true); // the proposal head, sampled rows
     } catch (const std::exception& e) {
         std::cerr << "FAIL: " << e.what() << "\n";
         return 1;

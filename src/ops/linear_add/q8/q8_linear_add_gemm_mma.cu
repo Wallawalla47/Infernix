@@ -8,7 +8,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 
 template <class Schedule>
@@ -147,4 +147,4 @@ void q8_linear_add_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor&
     launch_variant<Schedule>(x, w, residual_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

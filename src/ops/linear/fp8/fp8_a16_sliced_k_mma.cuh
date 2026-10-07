@@ -19,7 +19,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 template <class Schedule, class Output, class Epilogue, class RowPolicy>
 __global__
@@ -284,4 +284,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_sl
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

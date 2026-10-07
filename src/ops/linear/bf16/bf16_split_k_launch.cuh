@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <limits>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 struct Bf16SplitKWorkspace {
     float* partials;
@@ -63,4 +63,4 @@ void launch_bf16_a16_split_k_mma(const Bf16A16Operands& p, Output output, Epilog
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

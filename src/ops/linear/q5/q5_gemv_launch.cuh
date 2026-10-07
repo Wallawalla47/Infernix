@@ -4,7 +4,7 @@
 #include "ops/linear/q5/q5_a16_gemv.cuh"
 #include "ops/linear/q5/q5_operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 template <class Schedule, bool TriggerPdl = false, bool JoinPdl = false, bool Dependent = false,
           class Output, class Epilogue>
 void launch_q5_a16_gemv(const Q5LinearOperands& operands, Output output, Epilogue epilogue,
@@ -46,4 +46,4 @@ void launch_q5_a16_gemv(const Q5LinearOperands& operands, Output output, Epilogu
     else
         launch.template operator()<false>();
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

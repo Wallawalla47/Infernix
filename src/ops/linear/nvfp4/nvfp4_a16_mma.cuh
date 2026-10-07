@@ -16,7 +16,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 // Keep restricted pointers in the device ABI. Putting them in an aggregate loses
 // NVCC alias information and increases register pressure in the K128 mainloop.
@@ -263,4 +263,4 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     }
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

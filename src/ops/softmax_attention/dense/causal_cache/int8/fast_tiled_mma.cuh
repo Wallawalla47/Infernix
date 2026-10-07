@@ -54,7 +54,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 inline constexpr int kCausalPromptI8FastBc     = 64;
 inline constexpr int kCausalPromptI8FastGroups = kCausalPromptHeadDim / kKVCacheInt8Group;
@@ -701,4 +701,4 @@ __global__ __launch_bounds__(
     }
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

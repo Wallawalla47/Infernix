@@ -8,7 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::models::qwen3_5::frontend {
+namespace infernix::models::qwen3_5::frontend {
 namespace {
 
 constexpr std::array<std::uint32_t, 64> kRound{
@@ -131,4 +131,4 @@ std::string sha256_hex(const Sha256Digest& digest) {
     return result;
 }
 
-} // namespace ninfer::models::qwen3_5::frontend
+} // namespace infernix::models::qwen3_5::frontend

@@ -48,7 +48,7 @@ suites:
           top_k: 20
           presence_penalty: 0.0
           frequency_penalty: 0.0
-          # NInfer has no repetition_penalty field; the recommended 1.0 is the identity operation.
+          # Infernix has no repetition_penalty field; the recommended 1.0 is the identity operation.
           # The 262,144-token context resolves a 324,224-token KV pool. Four full AIME budgets
           # would need 502,740 tokens, so an extreme wave queues later requests under admission
           # rather than truncating earlier ones.

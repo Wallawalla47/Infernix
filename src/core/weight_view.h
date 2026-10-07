@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer {
+namespace infernix {
 
 // Existing dense Op ABI uses Weight axes directly; callers establish BF16/FP32 and layout.
 inline Tensor as_dense(const Weight& weight) {
@@ -129,4 +129,4 @@ struct Block128Planes {
 };
 [[nodiscard]] Block128Planes block128_planes(const WeightParent& parent);
 
-} // namespace ninfer
+} // namespace infernix

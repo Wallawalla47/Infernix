@@ -3,7 +3,7 @@
 #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_kernels.h"
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 namespace {
 struct Plan {
     Q8DynamicConvAddSchedule schedule;
@@ -53,4 +53,4 @@ void q8_linear_dynamic_grouped_conv_add_dispatch(const Tensor& x, const Weight& 
     q8_dynamic_grouped_conv_add_materialized_launch(plan.schedule, x, weight, base, delta, residual,
                                                     projected, stream);
 }
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

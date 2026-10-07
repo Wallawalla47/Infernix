@@ -1,16 +1,16 @@
 # Compile policy is owned here; each semantic family explicitly contributes sources.
-add_library(ninfer_ops STATIC)
-ninfer_internal_includes(ninfer_ops)
-ninfer_cuda_archive(ninfer_ops)
-target_link_libraries(ninfer_ops PUBLIC ninfer_core PRIVATE ninfer_nvfp4_non_rdc)
+add_library(infernix_ops STATIC)
+infernix_internal_includes(infernix_ops)
+infernix_cuda_archive(infernix_ops)
+target_link_libraries(infernix_ops PUBLIC infernix_core PRIVATE infernix_nvfp4_non_rdc)
 
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
 # self-contained kernels therefore use a non-RDC archive and host launchers.
-add_library(ninfer_nvfp4_non_rdc STATIC)
-ninfer_internal_includes(ninfer_nvfp4_non_rdc)
-ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
-target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core ninfer_cuda_runtime CUDA::cuda_driver)
+add_library(infernix_nvfp4_non_rdc STATIC)
+infernix_internal_includes(infernix_nvfp4_non_rdc)
+infernix_cuda_non_rdc_archive(infernix_nvfp4_non_rdc)
+target_link_libraries(infernix_nvfp4_non_rdc PRIVATE infernix_core infernix_cuda_runtime CUDA::cuda_driver)
 
 include(basic_sources.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")

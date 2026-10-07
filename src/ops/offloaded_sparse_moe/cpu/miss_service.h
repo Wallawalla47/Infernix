@@ -9,7 +9,7 @@
 // The service owns the mapped channel buffers and the device sequence counter. It must outlive
 // every call that uses its channels, and its destructor must run only when no call is pending.
 
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_sparse_moe/cpu/expert_team.h"
 #include "ops/offloaded_sparse_moe/cpu/miss_request.h"
 #include "ops/offloaded_sparse_moe/cpu/record_provider.h"
@@ -19,7 +19,7 @@
 #include <thread>
 #include <vector>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 class CpuMissService {
 public:
@@ -71,4 +71,4 @@ private:
     std::thread thread_;
 };
 
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe

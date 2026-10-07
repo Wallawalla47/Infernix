@@ -1,5 +1,5 @@
-#include "ninfer/ops/scatter.h"
-#include "ninfer/ops/speculative_round.h"
+#include "infernix/ops/scatter.h"
+#include "infernix/ops/speculative_round.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include <algorithm>
@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

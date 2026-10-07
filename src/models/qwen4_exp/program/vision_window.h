@@ -13,7 +13,7 @@
 #include <span>
 #include <vector>
 
-namespace ninfer::models::qwen4_exp {
+namespace infernix::models::qwen4_exp {
 
 // Design estimates until the tower is measured (VM2): tensor-core GEMM and attention rates, and the
 // longest step one admission call may take (other lanes wait for it; VM7 tunes it).
@@ -63,4 +63,4 @@ struct VisualSlice {
 VisualSlice visual_slice(std::span<const std::uint32_t> visual, std::uint32_t a, std::uint32_t b,
                          std::uint32_t base, std::span<std::int32_t> columns);
 
-} // namespace ninfer::models::qwen4_exp
+} // namespace infernix::models::qwen4_exp

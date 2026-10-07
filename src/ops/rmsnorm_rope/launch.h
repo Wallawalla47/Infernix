@@ -7,7 +7,7 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 void rmsnorm_rope_pair_launch(const Tensor& positions, const Tensor& q_norm_weight,
                               const Tensor& k_norm_weight, Tensor& q, Tensor& k,
@@ -25,4 +25,4 @@ void rmsnorm_rope_text_launch(const Tensor& positions, const Tensor& q_norm_weig
                               Tensor& q_out, Tensor& k_out, std::int32_t tokens,
                               cudaStream_t stream);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

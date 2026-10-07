@@ -18,7 +18,7 @@
 // produces such experts (24,576 of 24,576 share the scale in Qwen3.8-Flash-Next-NVFP4), and the
 // narrow route computes them exactly.
 
-#include "ninfer/ops/offloaded_sparse_moe.h"
+#include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -28,16 +28,16 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace ninfer::ops::offloaded_moe {
+namespace infernix::ops::offloaded_moe {
 
 #if defined(__CUDACC__)
-#    define NINFER_WIDE_HD __host__ __device__ __forceinline__
+#    define INFERNIX_WIDE_HD __host__ __device__ __forceinline__
 #else
-#    define NINFER_WIDE_HD inline
+#    define INFERNIX_WIDE_HD inline
 #endif
 
 // The route of one expert in one call: a function of its column count and its stored scales only.
-NINFER_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
+INFERNIX_WIDE_HD bool wide_route(int columns, const ExpertScales& scales) {
     return columns > kMaxColumns && scales.input_gate == scales.input_up;
 }
 
@@ -63,7 +63,7 @@ static_assert(kHRowStride % 16 == 0 && kHRowStride >= kHCodeBytes + kHScaleMapBy
 // 144-byte units read for one K step fall in distinct shared-memory banks. Its eight code bytes
 // pair elements j and j + 4 of each half block (byte i: code[8(i/4) + i%4] | code[8(i/4) + 4 + i%4]
 // << 4), the order in which the record's row-group nibbles enter an MMA register.
-NINFER_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) << 1) | ((b & 2) >> 1); }
+INFERNIX_WIDE_HD constexpr int plane_block(int b) { return (b & ~3) | ((b & 1) << 1) | ((b & 2) >> 1); }
 
 // The layout of moe_experts' workspace, the single place that defines it.
 struct ExpertsWorkspace {
@@ -108,6 +108,6 @@ struct Call {
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream);
 
 } // namespace wide
-} // namespace ninfer::ops::offloaded_moe
+} // namespace infernix::ops::offloaded_moe
 
-#undef NINFER_WIDE_HD
+#undef INFERNIX_WIDE_HD

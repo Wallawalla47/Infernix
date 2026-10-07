@@ -9,10 +9,10 @@
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/nvfp4/operands.h"
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 __device__ __forceinline__ int nvfp4_kv_code_swizzle(int row, int byte) {
     return (((byte >> 4) ^ (row & 7)) << 4) | (byte & 15);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

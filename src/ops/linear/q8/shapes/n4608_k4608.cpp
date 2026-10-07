@@ -2,7 +2,7 @@
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 Q8Launch select_q8_n4608_k4608(std::int32_t tokens) {
     if (tokens > 32768) throw std::invalid_argument("q8 linear: column extent exceeds 32768");
@@ -11,4 +11,4 @@ Q8Launch select_q8_n4608_k4608(std::int32_t tokens) {
     return launch_q8_a16_mma_r64_t128;
 }
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

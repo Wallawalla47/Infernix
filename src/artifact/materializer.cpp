@@ -20,7 +20,7 @@
 #include <string>
 #include <tuple>
 
-namespace ninfer::artifact {
+namespace infernix::artifact {
 namespace {
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
@@ -508,4 +508,4 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     return out;
 }
 
-} // namespace ninfer::artifact
+} // namespace infernix::artifact

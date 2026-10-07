@@ -12,10 +12,10 @@
 #include <random>
 #include <vector>
 
-namespace ninfer::test::offloaded_moe {
+namespace infernix::test::offloaded_moe {
 
-namespace canon = ninfer::ops::canon;
-namespace moe   = ninfer::ops::offloaded_moe;
+namespace canon = infernix::ops::canon;
+namespace moe   = infernix::ops::offloaded_moe;
 
 inline std::uint16_t to_bf16(float x) { return canon::f32_to_bf16_rn(x); }
 
@@ -116,4 +116,4 @@ inline std::uint64_t output_hash(const std::vector<std::uint16_t>& y) {
     return h;
 }
 
-} // namespace ninfer::test::offloaded_moe
+} // namespace infernix::test::offloaded_moe

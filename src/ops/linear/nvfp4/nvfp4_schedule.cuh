@@ -4,7 +4,7 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 enum class Nvfp4ScaleAccess : std::uint8_t {
     StagedRaw,
     Direct,
@@ -262,4 +262,4 @@ struct Nvfp4IdentityRows {
 
     __device__ __forceinline__ int weight_row(int begin, int row, int) const { return begin + row; }
 };
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

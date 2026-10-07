@@ -20,8 +20,8 @@ int check(bool condition, const char* message) {
 
 int main() {
     int failures = 0;
-    using ninfer::serve::api_route_pattern;
-    using ninfer::serve::canonical_api_path;
+    using infernix::serve::api_route_pattern;
+    using infernix::serve::canonical_api_path;
 
     // An Anthropic SDK given a base URL ending in /v1 adds one more /v1; only that one is removed.
     failures += check(canonical_api_path("/v1/v1/messages") == "/v1/messages" &&
@@ -34,13 +34,13 @@ int main() {
                       "only a single doubled /v1 prefix may be removed");
 
     // Errors on a doubled path keep the envelope and request-id header of the endpoint it names.
-    ninfer::serve::ServeOptions options;
+    infernix::serve::ServeOptions options;
     httplib::Request missing_messages;
     missing_messages.path = "/v1/v1/messages/missing";
     httplib::Response missing_response;
     missing_response.status = 404;
     const auto missing_result =
-        ninfer::serve::handle_unrendered_http_error(options, missing_messages, missing_response);
+        infernix::serve::handle_unrendered_http_error(options, missing_messages, missing_response);
     failures += check(missing_result == httplib::Server::HandlerResponse::Handled &&
                           !missing_response.body.empty() &&
                           Json::parse(missing_response.body).at("type") == "error" &&
@@ -51,7 +51,7 @@ int main() {
     oversized_responses.path = "/v1/v1/responses";
     httplib::Response oversized_response;
     oversized_response.status = 413;
-    const auto oversized_result = ninfer::serve::handle_unrendered_http_error(
+    const auto oversized_result = infernix::serve::handle_unrendered_http_error(
         options, oversized_responses, oversized_response);
     failures += check(oversized_result == httplib::Server::HandlerResponse::Handled &&
                           Json::parse(oversized_response.body).at("error").at("code") ==

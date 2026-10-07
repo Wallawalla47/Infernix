@@ -4,7 +4,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer {
+namespace infernix {
 namespace {
 
 std::uint64_t add(std::uint64_t a, std::uint64_t b) {
@@ -372,4 +372,4 @@ Block128Planes block128_planes(const WeightParent& parent) {
     return out;
 }
 
-} // namespace ninfer
+} // namespace infernix

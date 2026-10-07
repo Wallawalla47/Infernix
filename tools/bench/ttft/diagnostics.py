@@ -334,7 +334,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
                 event = json.loads(line)
                 if not isinstance(event, dict):
                     raise ValueError(f"line {line_number} is not an object")
-                if event.get("artifact_type") != "ninfer_serve_request_log":
+                if event.get("artifact_type") != "infernix_serve_request_log":
                     raise ValueError(f"line {line_number} has an unknown artifact type")
                 server = event.get("server_instance_id")
                 runtime_events.append(event)

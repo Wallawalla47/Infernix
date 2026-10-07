@@ -7,7 +7,7 @@
 #include <memory>
 #include <span>
 
-namespace ninfer {
+namespace infernix {
 
 // Whether a ReadOnlyFile maps the whole file. A file read only through read_direct* must not be
 // mapped: on Windows, every unbuffered read of a file with a mapped data section pays the cache
@@ -49,4 +49,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace ninfer
+} // namespace infernix

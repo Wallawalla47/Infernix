@@ -1,4 +1,4 @@
-#include "ninfer/engine.h"
+#include "infernix/engine.h"
 
 #include <algorithm>
 #include <charconv>
@@ -19,8 +19,8 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
 }
 
-ninfer::RequestOptions request(unsigned count, bool reuse) {
-    ninfer::RequestOptions result;
+infernix::RequestOptions request(unsigned count, bool reuse) {
+    infernix::RequestOptions result;
     result.execution.requested_output_tokens    = count;
     result.execution.allow_prefix_reuse         = reuse;
     result.execution.sampling.temperature       = 0;
@@ -31,13 +31,13 @@ ninfer::RequestOptions request(unsigned count, bool reuse) {
     return result;
 }
 
-ninfer::PromptInput prompt(const std::string& source,
+infernix::PromptInput prompt(const std::string& source,
                            const std::optional<std::string>& continuation = std::nullopt) {
-    ninfer::PromptInput input;
-    ninfer::ChatMessage user;
-    user.role = ninfer::ChatRole::User;
-    user.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text,
+    infernix::PromptInput input;
+    infernix::ChatMessage user;
+    user.role = infernix::ChatRole::User;
+    user.parts.push_back(infernix::MessagePart{
+        .kind = infernix::MessagePartKind::Text,
         .text = "Repeat the following Python file exactly. Output only the file, with no "
                 "explanation or Markdown fences. Preserve every space and newline.\n\n" +
                 source,
@@ -45,20 +45,20 @@ ninfer::PromptInput prompt(const std::string& source,
     input.messages.push_back(std::move(user));
     input.options.enable_thinking   = false;
     input.options.preserve_thinking = true;
-    ninfer::ChatMessage assistant;
-    assistant.role = ninfer::ChatRole::Assistant;
+    infernix::ChatMessage assistant;
+    assistant.role = infernix::ChatRole::Assistant;
     assistant.parts.push_back(
-        ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+        infernix::MessagePart{.kind  = infernix::MessagePartKind::Text,
                             .text  = kAssistantPrefix + continuation.value_or(""),
                             .media = {}});
     input.messages.push_back(std::move(assistant));
-    input.options.continuation = ninfer::PromptContinuationMode::ContinueFinalAssistant;
+    input.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     return input;
 }
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto* artifact = std::getenv("NINFER_NGRAM_TEST_WEIGHTS");
+    const auto* artifact = std::getenv("INFERNIX_NGRAM_TEST_WEIGHTS");
     if (!artifact || !*artifact) { return 77; }
     try {
         const std::string backend         = argc > 1 ? argv[1] : "mtp";
@@ -80,30 +80,30 @@ int main(int argc, char** argv) {
                 throw std::invalid_argument("invalid or duplicate test option");
             }
         }
-        ninfer::EngineOptions options;
+        infernix::EngineOptions options;
         options.artifact_path   = artifact;
         options.max_context     = 4096;
-        options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+        options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4096);
         options.max_concurrency = 1;
         options.prefill_chunk   = 1024;
         options.enable_vision   = false;
         options.use_cuda_graph  = graphs;
-        options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
+        options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
         if (backend == "mtp") {
-            options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.backend = infernix::SpeculativeBackend::Mtp;
         } else if (backend == "dflash") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash;
         } else if (backend == "dflash2") {
-            options.speculative.backend = ninfer::SpeculativeBackend::DFlash2;
+            options.speculative.backend = infernix::SpeculativeBackend::DFlash2;
         } else {
             throw std::invalid_argument("unsupported backend");
         }
         options.speculative.draft_tokens                        = 5;
         options.speculative.ngram_draft_tokens                  = ngram;
-        options.speculative.proposal_head                       = ninfer::ProposalHead::Optimized;
+        options.speculative.proposal_head                       = infernix::ProposalHead::Optimized;
         options.context_cache.device_state_slots                = 1;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
-        ninfer::Engine engine(options);
+        infernix::Engine engine(options);
         std::string source;
         for (unsigned i = 0; i < 20; ++i) {
             source += "def transform_" + std::to_string(i) +
@@ -117,9 +117,9 @@ int main(int argc, char** argv) {
         const auto reference_count = reference.generated_token_ids.size();
         const bool reference_budget =
             reference_count > 16 && reference_count <= 256 &&
-            ((reference.finish_reason == ninfer::FinishReason::OutputLimit &&
+            ((reference.finish_reason == infernix::FinishReason::OutputLimit &&
               reference_count == 256) ||
-             reference.finish_reason == ninfer::FinishReason::StopToken);
+             reference.finish_reason == infernix::FinishReason::StopToken);
         if (!reference_budget || !source.starts_with(reference_text)) {
             const auto mismatch = std::mismatch(reference_text.begin(), reference_text.end(),
                                                 source.begin(), source.end());
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
             auto stop = request(256, true);
             stop.stop.token_ids.push_back(token);
             const auto stopped = engine.generate(engine.prepare(prompt(source)), stop);
-            require(stopped.finish_reason == ninfer::FinishReason::StopToken &&
+            require(stopped.finish_reason == infernix::FinishReason::StopToken &&
                         stopped.generated_token_ids.size() == i + 1 &&
                         std::equal(stopped.generated_token_ids.begin(),
                                    stopped.generated_token_ids.end(),
@@ -218,9 +218,9 @@ int main(int argc, char** argv) {
                 }
                 const auto count = result->generated_token_ids.size();
                 require(count > 0 && count <= 16 &&
-                            ((result->finish_reason == ninfer::FinishReason::OutputLimit &&
+                            ((result->finish_reason == infernix::FinishReason::OutputLimit &&
                               count == 16) ||
-                             result->finish_reason == ninfer::FinishReason::StopToken),
+                             result->finish_reason == infernix::FinishReason::StopToken),
                         "continuation violated its output budget or finish contract");
                 require(source.starts_with(kAssistantPrefix + stopped.content + result->content),
                         "continuation is not an exact source prefix");

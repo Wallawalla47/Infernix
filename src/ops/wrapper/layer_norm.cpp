@@ -1,4 +1,4 @@
-#include "ninfer/ops/layer_norm.h"
+#include "infernix/ops/layer_norm.h"
 
 #include "ops/launcher/layer_norm.h"
 
@@ -7,7 +7,7 @@
 #include <limits>
 #include <stdexcept>
 
-namespace ninfer::ops {
+namespace infernix::ops {
 namespace {
 
 std::int64_t checked_numel(const Tensor& t) {
@@ -62,4 +62,4 @@ void layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias, float
     detail::layer_norm_launch(x, weight, bias, eps, out, stream);
 }
 
-} // namespace ninfer::ops
+} // namespace infernix::ops

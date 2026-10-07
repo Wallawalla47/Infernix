@@ -12,7 +12,7 @@
 #include <string>
 #include <utility>
 
-namespace ninfer::serve {
+namespace infernix::serve {
 
 struct RequestCapacity {
     explicit RequestCapacity(std::size_t limit) : maximum(limit) {}
@@ -38,47 +38,47 @@ struct RequestLifetime {
     std::chrono::steady_clock::time_point deadline;
 };
 
-ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
+ApiError request_error_to_api_error(const infernix::RequestError& exception) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
-    case ninfer::RequestErrorKind::ContextLengthExceeded:
+    case infernix::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
         break;
-    case ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
+    case infernix::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
         error.param.clear();
         error.status = 400;
         error.code   = "thinking_budget_capacity_insufficient";
         break;
-    case ninfer::RequestErrorKind::MediaBudgetExceeded:
+    case infernix::RequestErrorKind::MediaBudgetExceeded:
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
-    case ninfer::RequestErrorKind::InvalidMedia:
+    case infernix::RequestErrorKind::InvalidMedia:
         error.status = 400;
         error.code   = "invalid_media";
         break;
-    case ninfer::RequestErrorKind::Overloaded:
+    case infernix::RequestErrorKind::Overloaded:
         error.param.clear();
         error.status = 429;
         error.type   = "rate_limit_error";
         error.code   = "server_overloaded";
         break;
-    case ninfer::RequestErrorKind::QueueTimeout:
+    case infernix::RequestErrorKind::QueueTimeout:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
         break;
-    case ninfer::RequestErrorKind::Cancelled:
+    case infernix::RequestErrorKind::Cancelled:
         error.param.clear();
         error.status = 499;
         error.type   = "request_cancelled";
         error.code   = "client_disconnected";
         break;
-    case ninfer::RequestErrorKind::Unavailable:
+    case infernix::RequestErrorKind::Unavailable:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
@@ -94,32 +94,32 @@ using Clock = std::chrono::steady_clock;
 
 [[noreturn]] void throw_preparation_cancelled();
 
-[[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
+[[noreturn]] void throw_media_error(const infernix::product::media_acquire::Error& exception) {
     ApiError error;
     error.param   = "messages";
     error.message = exception.what();
     switch (exception.kind()) {
-    case ninfer::product::media_acquire::ErrorKind::BudgetExceeded:
+    case infernix::product::media_acquire::ErrorKind::BudgetExceeded:
         error.status = 400;
         error.code   = "media_budget_exceeded";
         break;
-    case ninfer::product::media_acquire::ErrorKind::RemoteUnavailable:
+    case infernix::product::media_acquire::ErrorKind::RemoteUnavailable:
         error.status = 502;
         error.type   = "server_error";
         error.code   = "media_fetch_failed";
         break;
-    case ninfer::product::media_acquire::ErrorKind::RemoteTimeout:
+    case infernix::product::media_acquire::ErrorKind::RemoteTimeout:
         error.status = 504;
         error.type   = "server_error";
         error.code   = "media_fetch_timeout";
         break;
-    case ninfer::product::media_acquire::ErrorKind::DeadlineExceeded:
+    case infernix::product::media_acquire::ErrorKind::DeadlineExceeded:
         error.param.clear();
         error.status = 503;
         error.type   = "server_error";
         error.code   = "request_queue_timeout";
         break;
-    case ninfer::product::media_acquire::ErrorKind::Cancelled:
+    case infernix::product::media_acquire::ErrorKind::Cancelled:
         throw_preparation_cancelled();
     }
     throw ApiException(std::move(error));
@@ -143,41 +143,41 @@ using Clock = std::chrono::steady_clock;
     throw ApiException(std::move(error));
 }
 
-ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
+infernix::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point deadline,
                                  const std::function<bool()>& is_cancelled,
                                  std::size_t& remaining_bytes) {
     if (remaining_bytes == 0) {
-        throw_media_error(ninfer::product::media_acquire::Error(
-            ninfer::product::media_acquire::ErrorKind::BudgetExceeded,
+        throw_media_error(infernix::product::media_acquire::Error(
+            infernix::product::media_acquire::ErrorKind::BudgetExceeded,
             "request media exceeds aggregate byte limit"));
     }
-    ninfer::product::media_acquire::Policy policy;
+    infernix::product::media_acquire::Policy policy;
     policy.max_bytes    = std::min(policy.max_bytes, remaining_bytes);
     policy.deadline     = deadline;
     policy.is_cancelled = is_cancelled;
     std::vector<std::uint8_t> source_bytes;
     try {
-        source_bytes = ninfer::product::media_acquire::acquire_bytes(part.source, policy);
-    } catch (const ninfer::product::media_acquire::Error& exception) {
+        source_bytes = infernix::product::media_acquire::acquire_bytes(part.source, policy);
+    } catch (const infernix::product::media_acquire::Error& exception) {
         throw_media_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_media");
     }
 
     remaining_bytes -= source_bytes.size();
-    ninfer::OwnedMedia media;
+    infernix::OwnedMedia media;
     media.kind =
-        part.kind == ContentKind::Image ? ninfer::MediaKind::Image : ninfer::MediaKind::Video;
+        part.kind == ContentKind::Image ? infernix::MediaKind::Image : infernix::MediaKind::Video;
     media.media_type = part.source.media_type;
     switch (part.source.kind) {
-    case ninfer::product::media_acquire::SourceKind::Path:
-    case ninfer::product::media_acquire::SourceKind::Url:
+    case infernix::product::media_acquire::SourceKind::Path:
+    case infernix::product::media_acquire::SourceKind::Url:
         media.source_name = part.source.value;
         break;
-    case ninfer::product::media_acquire::SourceKind::Data:
+    case infernix::product::media_acquire::SourceKind::Data:
         media.source_name = "inline-data";
         break;
-    case ninfer::product::media_acquire::SourceKind::Bytes:
+    case infernix::product::media_acquire::SourceKind::Bytes:
         media.source_name = "inline-bytes";
         break;
     }
@@ -186,7 +186,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     return media;
 }
 
-[[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
+[[noreturn]] void throw_request_error(const infernix::RequestError& exception) {
     throw ApiException(request_error_to_api_error(exception));
 }
 
@@ -194,37 +194,37 @@ void check_preparation_control(Clock::time_point deadline,
                                const std::function<bool()>& is_cancelled) {
     if (is_cancelled && is_cancelled()) { throw_preparation_cancelled(); }
     if (Clock::now() >= deadline) {
-        throw_request_error(ninfer::RequestError(RequestErrorKind::QueueTimeout,
+        throw_request_error(infernix::RequestError(RequestErrorKind::QueueTimeout,
                                                  "inference request expired during preparation"));
     }
 }
 
-class ServiceOutputSink final : public ninfer::OutputSink {
+class ServiceOutputSink final : public infernix::OutputSink {
 public:
     explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
 
-    void start(ninfer::GenerationStart start) override {
+    void start(infernix::GenerationStart start) override {
         deliver([&] {
             if (sink_->on_start) { sink_->on_start(start); }
         });
     }
 
-    void progress(ninfer::PromptProgress progress) override {
+    void progress(infernix::PromptProgress progress) override {
         deliver([&] {
             if (sink_->on_progress) { sink_->on_progress(progress); }
         });
     }
 
-    void timing(ninfer::GenerationTimingObservation timing) override {
+    void timing(infernix::GenerationTimingObservation timing) override {
         deliver([&] {
             if (sink_->on_timing) { sink_->on_timing(timing); }
         });
     }
 
-    void publish(ninfer::OutputDelta delta) override {
+    void publish(infernix::OutputDelta delta) override {
         if (delta.text.empty()) { return; }
         deliver([&] {
-            if (delta.channel == ninfer::OutputChannel::Reasoning) {
+            if (delta.channel == infernix::OutputChannel::Reasoning) {
                 if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
             } else {
                 if (sink_->on_content) { sink_->on_content(delta.text); }
@@ -252,7 +252,7 @@ private:
 GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
                                      DiagnosticObserver diagnostic_observer)
     : options_(std::move(options)) {
-    ninfer::EngineOptions engine_options;
+    infernix::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.ngram_volume_path        = options_.ngram_volume_path;
@@ -289,7 +289,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_options.diagnostic_observer      = std::move(diagnostic_observer);
-    engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    engine_           = std::make_unique<infernix::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
@@ -309,7 +309,7 @@ GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capa
     {
         std::lock_guard lock(capacity->mutex);
         if (capacity->active >= capacity->maximum) {
-            throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded, full_message));
+            throw_request_error(infernix::RequestError(RequestErrorKind::Overloaded, full_message));
         }
         ++capacity->active;
     }
@@ -328,7 +328,7 @@ GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capa
 
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            GenerationConsumerMode consumer_mode,
-                                           ninfer::GenerationObservationOptions observation,
+                                           infernix::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
@@ -340,14 +340,14 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
 PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request,
                                                 GenerationConsumerMode consumer_mode,
-                                                ninfer::GenerationObservationOptions observation,
+                                                infernix::GenerationObservationOptions observation,
                                                 std::function<bool()> is_cancelled,
                                                 ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
-    ninfer::RequestOptions request_options  = to_request_options(
+    infernix::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
     request_options.ngram_session = request.ngram_session;
     prepared.thinking_budget      = request_options.execution.thinking.budget;
@@ -363,8 +363,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
     try {
         const auto acquisition_started = Clock::now();
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
-        ninfer::PromptInput input =
+            std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        infernix::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
@@ -386,7 +386,7 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
             .deadline     = prepared.lifetime->deadline,
             .cancellation = CancellationView(is_cancelled),
         };
-        ninfer::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
+        infernix::PreparedPrompt prompt = engine_->prepare(std::move(input), control);
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
         prepared.enable_thinking = prompt.summary().starts_in_reasoning;
         if (!prepared.enable_thinking) {
@@ -401,18 +401,18 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
         if (observation.first_token) {
             observation.first_token = [callback = std::move(observation.first_token),
                                        seconds  = prepared.prepare_seconds](
-                                          ninfer::GenerationFirstTokenObservation first) {
+                                          infernix::GenerationFirstTokenObservation first) {
                 first.prepare_seconds = seconds;
                 callback(first);
             };
         }
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
                                               consumer_mode == GenerationConsumerMode::Streaming
-                                                  ? ninfer::OutputConsumerMode::Streaming
-                                                  : ninfer::OutputConsumerMode::Aggregate,
+                                                  ? infernix::OutputConsumerMode::Streaming
+                                                  : infernix::OutputConsumerMode::Aggregate,
                                               std::move(observation), prepared.lifetime->deadline);
         prepared.sampling   = prepared.generation.resolved_sampling();
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
+    } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
@@ -433,8 +433,8 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     try {
         std::size_t remaining_media_bytes =
-            std::min(options_.max_request_bytes, ninfer::kMaximumPromptMediaBytes);
-        ninfer::PromptInput input =
+            std::min(options_.max_request_bytes, infernix::kMaximumPromptMediaBytes);
+        infernix::PromptInput input =
             to_prompt_input(request, semantics, [&](const ContentPart& part) {
                 return acquire_media(part, deadline, is_cancelled, remaining_media_bytes);
             });
@@ -447,7 +447,7 @@ int GenerationService::count_prompt_tokens(const GenerationRequest& request,
             static_cast<int>(engine_->count_tokens(std::move(input), control));
         check_preparation_control(deadline, is_cancelled);
         return prompt_tokens;
-    } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
+    } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
@@ -458,20 +458,20 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
     if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
-    ninfer::OutputSink* public_sink = output_sink.get();
-    ninfer::CancellationView cancellation;
+    infernix::OutputSink* public_sink = output_sink.get();
+    infernix::CancellationView cancellation;
     if (is_cancelled || sink != nullptr) {
-        cancellation = ninfer::CancellationView(
+        cancellation = infernix::CancellationView(
             [external = std::move(is_cancelled), sink, observed = output_sink.get()]() {
                 return (observed && observed->disconnected()) || (external && external()) ||
                        (sink != nullptr && sink->is_cancelled && sink->is_cancelled());
             });
     }
 
-    ninfer::GenerationResult result;
+    infernix::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
-    } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    } catch (const infernix::RequestError& exception) { throw_request_error(exception); }
     GenerationOutcome outcome;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
@@ -552,4 +552,4 @@ void GenerationService::warmup() {
     run(prepared, nullptr);
 }
 
-} // namespace ninfer::serve
+} // namespace infernix::serve

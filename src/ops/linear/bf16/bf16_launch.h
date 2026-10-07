@@ -7,8 +7,8 @@
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace infernix::ops::detail {
 
 using Bf16Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-} // namespace ninfer::ops::detail
+} // namespace infernix::ops::detail

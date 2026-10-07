@@ -19,8 +19,8 @@
 #include <string>
 #include <vector>
 
-namespace pc = ninfer::runtime::prefix_cache;
-namespace q4 = ninfer::models::qwen4_exp::prefix;
+namespace pc = infernix::runtime::prefix_cache;
+namespace q4 = infernix::models::qwen4_exp::prefix;
 
 namespace {
 

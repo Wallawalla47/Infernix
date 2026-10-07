@@ -1,4 +1,4 @@
-target_sources(ninfer_ops PRIVATE
+target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q5_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n6144_k5120.cu"

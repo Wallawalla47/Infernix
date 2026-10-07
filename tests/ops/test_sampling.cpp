@@ -5,7 +5,7 @@
 // distribution oracle built from the BF16 values represented at the public
 // input.  The test never reproduces the device RNG algorithm or uses another
 // production path as a golden.
-#include "ninfer/ops/sampling.h"
+#include "infernix/ops/sampling.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -18,8 +18,8 @@
 #include <utility>
 #include <vector>
 
-using namespace ninfer;
-using namespace ninfer::test;
+using namespace infernix;
+using namespace infernix::test;
 
 namespace {
 

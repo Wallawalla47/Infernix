@@ -19,7 +19,7 @@
 #include <sys/syscall.h>
 #endif
 
-namespace ninfer {
+namespace infernix {
 
 struct ReadOnlyFile::Impl {
     int fd                = -1;
@@ -201,4 +201,4 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
     return static_cast<std::size_t>(bytes);
 }
 
-} // namespace ninfer
+} // namespace infernix
