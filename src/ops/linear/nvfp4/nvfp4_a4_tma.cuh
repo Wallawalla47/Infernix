@@ -352,13 +352,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             output, shared_bytes, accumulators, row_begin, token_begin, output_rows, token_count);
     };
     static_assert(!Rows::kPaired || collective, "paired TMA rows require a collective epilogue");
+    // Scale with an explicit rounded multiply: the residual add after it must not contract into one
+    // FMA in the FullTokens instance only, or a column's bits would depend on whether its tile is
+    // full (upstream Neroued/ninfer#374). Every A4 route rounds the product, then the sum.
     if constexpr (collective) {
 #pragma unroll
         for (int mt = 0; mt < Schedule::kMmaTokens; ++mt)
 #pragma unroll
             for (int mr = 0; mr < Schedule::kMmaRows; ++mr)
 #pragma unroll
-                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] *= alpha;
+                for (int v = 0; v < 4; ++v) accumulators[mt][mr][v] = __fmul_rn(accumulators[mt][mr][v], alpha);
         epilogue.template finish_tile<Schedule, false>(
             output, shared_bytes, accumulators, row_begin, token_begin, output_rows, token_count);
     } else {
@@ -371,8 +374,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 #pragma unroll
             for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
                 const int row = warp_n * Schedule::kWarpRows + mr * 8 + ac;
-                float a = accumulators[mt][mr][0] * alpha, b = accumulators[mt][mr][1] * alpha;
-                float c = accumulators[mt][mr][2] * alpha, d = accumulators[mt][mr][3] * alpha;
+                float a = __fmul_rn(accumulators[mt][mr][0], alpha), b = __fmul_rn(accumulators[mt][mr][1], alpha);
+                float c = __fmul_rn(accumulators[mt][mr][2], alpha), d = __fmul_rn(accumulators[mt][mr][3], alpha);
                 if (token_begin + t0 < token_count) {
                     a = epilogue.apply(row_begin + row, token_begin + t0, a);
                     b = epilogue.apply(row_begin + row + 1, token_begin + t0, b);
