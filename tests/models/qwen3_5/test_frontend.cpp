@@ -2292,6 +2292,114 @@ int test_tool_marker_after_quoted_marker() {
     return failures;
 }
 
+// The reasoning-loop guard through a real output session: thinking that keeps rewriting one
+// verification pass fires the guard at a check boundary (Stop ends the request; Conclude requests
+// the thinking-close control, after which the model answers in content); varied thinking and Off
+// never fire; Conclude without room for the control and one more token stops instead.
+int test_reasoning_loop_guard(const Frontend& frontend) {
+    std::string varied;
+    unsigned state = 7;
+    for (int s = 0; s < 260; ++s) {
+        state = state * 1103515245U + 12345U;
+        varied += "step " + std::to_string(s) + " checks value " + std::to_string((state >> 8) % 9973) +
+                  " against bound " + std::to_string((state >> 4) % 811) + ". ";
+    }
+    std::string looping = varied;
+    for (int i = 0; i < 60; ++i) {
+        looping += "Wait, let me double-check the case where the list is empty. Then the function returns "
+                   "zero, which matches the expected output, so that case is fine. ";
+    }
+    const std::vector<ninfer::TokenId> loop_tokens   = fixture_tokenizer().encode(looping);
+    const std::vector<ninfer::TokenId> varied_tokens = fixture_tokenizer().encode(varied + varied);
+    constexpr std::size_t kRound = 200;
+
+    // Feeds `tokens` in rounds until a decision ends or asks for control; returns that decision.
+    const auto run = [&](auto& session, const std::vector<ninfer::TokenId>& tokens, std::uint32_t budget) {
+        ninfer::runtime::OutputDecision last{};
+        for (std::size_t at = 0; at < tokens.size(); at += kRound) {
+            const std::size_t n = std::min(kRound, tokens.size() - at);
+            last = session.preview_model(std::span<const ninfer::TokenId>(tokens.data() + at, n), budget,
+                                         ninfer::FinishReason::OutputLimit);
+            (void)session.commit_preview();
+            budget -= last.accepted_tokens;
+            if (last.finished() || last.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl) {
+                break;
+            }
+        }
+        return last;
+    };
+
+    int failures = 0;
+    {
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {},
+                                                    ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Stop});
+        const auto decision = run(session, loop_tokens, 1'000'000);
+        const auto stats    = session.thinking_stats();
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit && stats.loop_detected &&
+                              stats.loop_coverage >= 0.25F && stats.loop_thinking_tokens >= 512 &&
+                              !stats.applied,
+                          "Stop did not end a looping reasoning at a check");
+    }
+    {
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+        const auto decision = run(session, loop_tokens, 1'000'000);
+        failures += check(!decision.finished() &&
+                              decision.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl &&
+                              session.model_token_budget_remaining(1'000'000) == 0,
+                          "Conclude did not request the thinking-close control");
+        const std::span<const ninfer::TokenId> pending = session.pending_control_tokens();
+        const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
+        failures += check(!control.empty(), "Conclude exposed no control span");
+        if (!control.empty()) {
+            (void)session.preview_control(control, 1'000'000);
+            (void)session.commit_preview();
+            (void)session.preview_model(std::array<ninfer::TokenId, 1>{0}, 1'000'000, ninfer::FinishReason::OutputLimit);
+            const auto answer = session.commit_preview();
+            const auto stats  = session.thinking_stats();
+            failures += check(channel_text(answer, ninfer::OutputChannel::Content) == "x" && stats.applied &&
+                                  stats.loop_detected && stats.injected_tokens == control.size(),
+                              "Conclude did not close the thinking and answer in content");
+        }
+    }
+    {
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+        const auto decision = run(session, varied_tokens, 1'000'000);
+        failures += check(!decision.finished() && decision.continuation == ninfer::runtime::ContinuationAction::Decode &&
+                              !session.thinking_stats().loop_detected,
+                          "the guard fired on varied reasoning");
+    }
+    {
+        auto session = frontend.make_output_session(thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{});
+        const auto decision = run(session, loop_tokens, 1'000'000);
+        failures += check(!decision.finished() && !session.thinking_stats().loop_detected,
+                          "the guard fired while Off");
+    }
+    {
+        // Exactly the looping tokens as the output limit: when the guard fires, fewer tokens than the
+        // control span plus one remain only if the limit is tight, so size it from a probe run.
+        auto probe = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+        std::uint32_t fired_after = 0;
+        for (std::size_t at = 0; at < loop_tokens.size(); at += kRound) {
+            const std::size_t n = std::min(kRound, loop_tokens.size() - at);
+            const auto d = probe.preview_model(std::span<const ninfer::TokenId>(loop_tokens.data() + at, n), 1'000'000,
+                                               ninfer::FinishReason::OutputLimit);
+            (void)probe.commit_preview();
+            fired_after += d.accepted_tokens;
+            if (d.continuation == ninfer::runtime::ContinuationAction::ApplyTargetControl) { break; }
+        }
+        auto session = frontend.make_output_session(
+            thinking_prompt(frontend), {}, {}, ninfer::ThinkingControlOptions{.loop = ninfer::ReasoningLoopAction::Conclude});
+        const auto decision = run(session, loop_tokens, fired_after + 1U);
+        failures += check(decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                              session.thinking_stats().loop_detected && !session.thinking_stats().applied,
+                          "Conclude without room for the control did not stop");
+    }
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -2978,6 +3086,7 @@ int main() {
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);
+    failures += test_reasoning_loop_guard(frontend);
     failures += test_thinking_budget_message();
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

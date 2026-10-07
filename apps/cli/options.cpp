@@ -96,6 +96,7 @@ std::string usage_text(const char* argv0) {
            "       [--chat-template FILE] [--ngram-volume FILE] [--expert-state FILE|off]\n"
            "       [--ram-headroom-mib N] [--expert-ram-mib N|auto]\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking] [--thinking-budget N]\n"
+           "       [--reasoning-loop off|stop|conclude]\n"
            "       [--reasoning-effort none|minimal|low|medium|high|xhigh|max]\n"
            "       [--vision] [--vision-offload auto|on|off] [--vision-max-merged N]\n"
            "       [--no-cuda-graph]\n"
@@ -193,6 +194,9 @@ std::string usage_text(const char* argv0) {
            "  --reasoning-effort E     none | minimal | low | medium | high | xhigh | max\n"
            "  --no-thinking            disable the thinking mode\n"
            "  --thinking-budget N      cap model-origin thinking tokens\n"
+           "  --reasoning-loop MODE    off (default) | stop | conclude: when the thinking keeps\n"
+           "                           repeating whole passages, end the reply or close the\n"
+           "                           thinking and let the model answer\n"
            "  --raw-output             emit raw content without framing\n"
            "  --print-token-ids        also print generated token ids\n"
            "\n"
@@ -318,6 +322,17 @@ Options parse_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--thinking-budget") {
             options.thinking_budget = parse_u32(value(arg), "thinking-budget");
+        } else if (arg == "--reasoning-loop") {
+            const std::string mode = value(arg);
+            if (mode == "off") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Off;
+            } else if (mode == "stop") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Stop;
+            } else if (mode == "conclude") {
+                options.reasoning_loop = ninfer::ReasoningLoopAction::Conclude;
+            } else {
+                throw std::invalid_argument("--reasoning-loop must be off, stop or conclude");
+            }
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {

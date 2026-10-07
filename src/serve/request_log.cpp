@@ -514,6 +514,7 @@ std::string format_server_start_json(
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
              {"default_thinking_budget", std::move(default_thinking_budget)},
+             {"reasoning_loop", reasoning_loop_name(options.reasoning_loop)},
              {"default_preserve_thinking",
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
@@ -678,6 +679,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
              {"thinking_control_tokens", outcome.thinking.injected_tokens},
              {"thinking_control_applied", outcome.thinking.applied},
+             {"reasoning_loop_detected", outcome.thinking.loop_detected},
+             {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
+             {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

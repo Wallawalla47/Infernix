@@ -309,6 +309,23 @@ post-close model token, preparation is rejected with HTTP 400 code
 `thinking_budget_capacity_insufficient` rather than partially inserting control. The server does
 not promise that the model will emit nonempty content or a tool call after the marker.
 
+`--reasoning-loop off|stop|conclude` (default `off`) guards thinking-enabled requests without a token
+constraint against a model that keeps rewriting the same passages in its thinking, which token
+penalties do not catch because every pass varies a little.
+- **Check.** Every 512 model-origin thinking tokens, at the end of a decode round, the thinking is
+  split into words (letters, digits and non-ASCII bytes; ASCII case folded) and punctuation marks.
+  The guard fires when at least 25 % of the last 2,000 words lie inside a 12-word passage that
+  occurs at least three times in the last 30,000 words. A passage repeated twice (a recap) does not
+  count. The thresholds are those of Strata's measured `reasoning_loop_recovery`.
+- **`stop`** ends the reply there with `finish_reason` `length` (Anthropic `max_tokens`).
+- **`conclude`** commits the same control span a reached thinking budget does (Qwen's early-close
+  guidance, or `--thinking-budget-message`, plus `</think>`), so the model answers from the thinking
+  it has; no prompt is read again. When the remaining output budget cannot hold the span and one
+  more token, it stops instead.
+- The console line and the request log (`reasoning_loop_detected`, `reasoning_loop_thinking_tokens`,
+  `reasoning_loop_coverage`) record each firing. It can mistake a long, deliberately repeated
+  checklist for a loop; keep it off where the thinking legitimately repeats whole passages.
+
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The selected template
 interprets the other standard values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 Conflicting explicit `enable_thinking` and effort values return `conflicting_template_option`.
@@ -1060,6 +1077,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--thinking-budget-message S` | text committed when a thinking budget ends thinking, replacing Qwen's early-close guidance; the close marker is appended when `S` lacks it | Qwen guidance |
+| `--reasoning-loop MODE` | `off`, `stop` or `conclude`: reasoning-loop guard for thinking requests without a token constraint (details under [OpenAI Chat Completions](#openai-chat-completions)) | `off` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |

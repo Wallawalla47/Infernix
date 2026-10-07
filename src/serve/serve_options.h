@@ -81,6 +81,9 @@ struct ServeOptions {
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
+    // --reasoning-loop off|stop|conclude: the reasoning-loop guard for thinking requests without a
+    // token constraint (off by default).
+    ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     bool log_colours       = false; // --log-colours on|off: colour the console stats lines
@@ -102,6 +105,8 @@ struct ServeOptions {
 };
 
 ServeOptions parse_serve_options(int argc, char** argv);
+// "off", "stop" or "conclude".
+const char* reasoning_loop_name(ninfer::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);

@@ -62,6 +62,12 @@ close, stop condition, cancellation, or total output/context limit at the bounda
 and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
 combined with `--reasoning-effort`.
 
+`--reasoning-loop off|stop|conclude` (default `off`) ends the reply (`stop`) or closes the thinking
+with the same control span and lets the model answer (`conclude`) when the open thinking keeps
+repeating whole passages: every 512 thinking tokens, 25 % of the last 2,000 words inside a 12-word
+passage seen three times. The check and its limits are described in
+[serving](serving.md), under `--reasoning-loop`.
+
 `--max-new` counts every committed generated token, including internally inserted control tokens.
 When the effective output capacity extends beyond the thinking budget, it must have room for the
 complete tokenizer-derived control suffix plus one post-close model token; an undersized request is
@@ -239,6 +245,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
+| `--reasoning-loop off\|stop\|conclude` | end the reply or close the thinking when it keeps repeating whole passages | `off` |
 | `--reasoning-effort none\|minimal\|low\|medium\|high\|xhigh\|max` | pass an effort value to the selected template | template default |
 | `--greedy` | exact argmax decoding | off |
 | `--temperature F` | sampling temperature override | registered model/mode default |
