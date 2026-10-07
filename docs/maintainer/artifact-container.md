@@ -142,7 +142,7 @@ The entry header is a fixed 32 bytes.
 
 | Offset | Bytes | Field | Encoding and meaning |
 |---:|---:|---|---|
-| 0 | 8 | magic | `4e 49 4e 46 45 52 00 03`, i.e. `INFERNIX`, a zero byte, version 3 |
+| 0 | 8 | magic | `4e 49 4e 46 45 52 00 03`, i.e. `NINFER`, a zero byte, version 3 |
 | 8 | 8 | json_bytes | Little-endian PositiveU64; length of the complete UTF-8 JSON text |
 | 16 | 16 | artifact_id | Raw bytes of the file set identifier |
 

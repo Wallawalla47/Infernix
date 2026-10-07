@@ -121,8 +121,8 @@ not NVFP4's E4M3 scales per 16.
 
 ## 4. Qwen3.8-Flash-Next: NVFP4 artifact against the Unsloth UD-Q4_K_XL GGUF
 
-Recorded 2026-10-05/06. This compares Infernix's Flash-Next artifacts, which import NVIDIA's NVFP4
-checkpoint bit-exactly
+Recorded 2026-10-05/06. This compares Infernix's Flash-Next artifacts, which import RadixArk's NVFP4
+checkpoint (NVIDIA Model Optimizer experts) bit-exactly
 ([design §6.1](qwen3_8-flash-next-design.md#61-recipes-qwen3_8_flash_next_nvfp4-a-and-qwen3_8_flash_next_nvfp4_dense8-b)),
 with `unsloth/Qwen3.8-Flash-Next-GGUF` `UD-Q4_K_XL`. That GGUF is the file the Strata engine runs
 on this machine. The quality figures were measured. The speed figures are **estimates, not

@@ -1,6 +1,8 @@
 # Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`)
 
-Infernix runs NVIDIA's NVFP4 checkpoint of Qwen3.8-Flash-Next on one RTX 5090 (32 GB). The 24,576
+Infernix runs the NVFP4 checkpoint of Qwen3.8-Flash-Next
+([RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4),
+routed experts quantized with NVIDIA Model Optimizer) on one RTX 5090 (32 GB). The 24,576
 routed experts (63 GiB) live in pinned host RAM. A VRAM expert cache holds the hot ones, and the
 CPU computes part of each layer's misses. The 52 GB PLE n-gram table lives on an NVMe volume. The
 design, measurements and open work are in the
@@ -34,7 +36,7 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 
 ## Convert
 
-Recipe B is recommended. It is recipe A, which imports every NVIDIA tensor bit-exactly, with the
+Recipe B is recommended. It is recipe A, which imports every checkpoint tensor bit-exactly, with the
 BF16 dense projections and `lm_head` stored in `q8_g32_fp16`. Its measured quality cost is
 +0.008 ± 0.010 nats (not significant), and it decodes ~22 % faster. Its MTP drafter is stored in
 `q8_g32_fp16` with `q4_g64_fp16` routed experts. The drafter only proposes tokens, so its

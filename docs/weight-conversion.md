@@ -529,8 +529,19 @@ python3 -m tools.artifact.inspect models/my_qwen.ninfer --objects --bindings
 python3 -m tools.artifact.inspect models/my_qwen.ninfer --json
 ```
 
-Inspection reads directory facts without running inference. Conversion rejects missing logical
-coverage, invalid source geometry, unsupported encodings and invalid method output. Actual Op
+Inspection reads directory facts without running inference.
+
+```bash
+python3 -m tools.artifact.rename models/my_qwen.ninfer my_qwen.infernix
+```
+
+Renaming moves a whole file set in place, for example a `.ninfer` artifact to `.infernix`: the parts
+take the new entry's names and the entry's file table is rewritten inside its existing directory
+space, so no payload moves. The conversion report follows; other sidecars (an n-gram volume, a
+saved expert state) are listed and keep their names.
+
+Conversion rejects missing logical coverage, invalid source geometry, unsupported encodings and
+invalid method output. Actual Op
 support is checked by consumers during preparation, resource queries, warmup or execution. A
 valid file may need additional Op support before its chosen combination can run. Exercise the
 phases and optional components you intend to use through the normal [CLI](cli.md) or
