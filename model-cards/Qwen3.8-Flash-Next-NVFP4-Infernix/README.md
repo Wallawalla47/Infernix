@@ -40,14 +40,14 @@ table is read from an NVMe drive.
 
 | File | Bytes | What it is |
 |---|---:|---|
-| `qwen3_8_flash_next_nvfp4_dense8m.infernix` | 32,000,000,000 | entry: header, directory and the first payload segment |
-| `qwen3_8_flash_next_nvfp4_dense8m.infernix.part-0001` | 32,000,000,000 | continuation volume |
-| `qwen3_8_flash_next_nvfp4_dense8m.infernix.part-0002` | 12,867,265,280 | continuation volume |
-| `qwen3_8_flash_next_nvfp4_dense8m.infernix.ngram` | 52,429,058,048 | PLE n-gram volume (read in random 4 KiB blocks) |
-| `qwen3_8_flash_next_nvfp4_dense8m.infernix.conversion.json` | 914,141 | conversion report: sources, methods and formats per object |
+| `qwen3_8_flash_next_nvfp4_dense8m-00001-of-00003.infernix` | 32,000,000,000 | model, part 1 of 3 (also holds the table of contents) |
+| `qwen3_8_flash_next_nvfp4_dense8m-00002-of-00003.infernix` | 32,000,000,000 | model, part 2 of 3 |
+| `qwen3_8_flash_next_nvfp4_dense8m-00003-of-00003.infernix` | 12,867,265,280 | model, part 3 of 3 |
+| `qwen3_8_flash_next_nvfp4_dense8m.ngram` | 52,429,058,048 | PLE n-gram volume (read in random 4 KiB blocks) |
+| `qwen3_8_flash_next_nvfp4_dense8m.conversion.json` | 914,141 | conversion report: sources, methods and formats per object |
 
-Keep the entry and its two parts in one directory and open the entry. The n-gram volume can sit
-anywhere (`--ngram-volume`); beside the entry under this name it is found without the flag.
+Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
+n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
 
 ## Contents
 
@@ -78,8 +78,8 @@ proposal head):
 ## Run
 
 ```text
-infernix-serve qwen3_8_flash_next_nvfp4_dense8m.infernix \
-  --ngram-volume <nvme>/qwen3_8_flash_next_nvfp4_dense8m.infernix.ngram \
+infernix-serve qwen3_8_flash_next_nvfp4_dense8m-00001-of-00003.infernix \
+  --ngram-volume <nvme>/qwen3_8_flash_next_nvfp4_dense8m.ngram \
   --max-context 262144 --kv-dtype int8 --prefill-chunk 4096 \
   --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
 ```
@@ -120,8 +120,9 @@ flight, two seeds), Infernix averaged 5.5 s to the first token against Strata's 
 
 The conversion report and the artifact's own provenance record the paths of the machine that
 converted it. `artifact_id` `c7d4b790549443fb9db6ef9c13a3b92d`. The artifact was written as
-`.ninfer` and renamed to `.infernix` in place with `python -m tools.artifact.rename` (the same
-bytes; only the recorded part names changed). The n-gram volume was written by the same conversion.
+`.ninfer` and renamed to these three files in place with
+`python -m tools.artifact.rename --numbered` (the same bytes; only the recorded part names
+changed). The n-gram volume was written by the same conversion.
 
 ## License
 

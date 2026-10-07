@@ -537,8 +537,10 @@ python3 -m tools.artifact.rename models/my_qwen.ninfer my_qwen.infernix
 
 Renaming moves a whole file set in place, for example a `.ninfer` artifact to `.infernix`: the parts
 take the new entry's names and the entry's file table is rewritten inside its existing directory
-space, so no payload moves. The conversion report follows; other sidecars (an n-gram volume, a
-saved expert state) are listed and keep their names.
+space, so no payload moves. `--numbered` names the files as numbered shards instead,
+`my_qwen-00001-of-00003.infernix` (the entry, the file to open) to `my_qwen-00003-of-00003.infernix`.
+The conversion report follows; other sidecars (an n-gram volume, a saved expert state) are listed
+and keep their names.
 
 Conversion rejects missing logical coverage, invalid source geometry, unsupported encodings and
 invalid method output. Actual Op
