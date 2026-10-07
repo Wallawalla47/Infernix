@@ -146,10 +146,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     // A small reserve trims other programs' working sets; keep Infernix's own pageable memory
     // resident so its heap and driver pages never hard-fault from the page file.
-    if (!reserve_process_working_set(demand.process_growth)) {
+    if (const auto refused = reserve_process_working_set(demand.process_growth); !refused.empty()) {
         report(options, DiagnosticLevel::Warning,
-               "could not reserve a minimum working set; under memory pressure the engine's pageable memory may "
-               "be paged out");
+               "Windows would not guarantee Infernix " + std::to_string(demand.process_growth >> 20) +
+                   " MiB of resident working memory (" + refused +
+                   "); everything still works, but if RAM runs short Windows may move some of it to the "
+                   "page file and responses slow down");
     }
     plan.set_host_reserve(options.ram_headroom_bytes, demand.later_pinned);
 
