@@ -98,7 +98,6 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
         walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
         walk_prefetch_ = WalkPrefetch{};
     }
-    walk_.waits = prefix_waits(lane);
     walk_.active = true;
 
     auto* io        = static_cast<std::byte*>(io_device_.p);
@@ -239,7 +238,10 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
     fb.host_table_rows = fb.host_slots;
     fb.mtp_chunk       = walk_.mtp[c] ? &*walk_.mtp[c] : nullptr;
     fb.vision          = walk_.vision[c] ? &*walk_.vision[c] : nullptr;
-    if (c == 0) { fb.layer_waits = walk_.waits; }
+    // Chunk 0 waits per layer for the lane's restore and in-flight capture. Resolved here, not at the
+    // walk's start: the walk spans engine steps, and a poll between them retires a landed batch and
+    // frees its events (a landed batch needs no wait).
+    if (c == 0) { fb.layer_waits = prefix_waits(lanes_[walk_.lane]); }
     fb.stream         = true;
     fb.release_stream = c + 1 == n;
     Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),

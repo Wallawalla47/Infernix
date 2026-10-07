@@ -3859,7 +3859,6 @@ private:
         std::uint32_t layers_per_step = 1;
         std::size_t io_stride = 0, residual_bytes = 0;
         std::int32_t host_slot = 0; // the lane's state slot as the Forward reads it on the host
-        std::array<std::span<const cudaEvent_t>, 2> waits{}; // the span's per-layer waits (chunk 0)
         std::vector<std::optional<execution::MtpChunk>> mtp;
         std::vector<std::optional<execution::VisionInput>> vision;
         std::vector<std::vector<execution::VisionInput>> mtp_vision;
