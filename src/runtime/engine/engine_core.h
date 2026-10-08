@@ -87,6 +87,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          queue_holds_(options.context_cache.enabled && options.context_cache.hybrid.queue_holds),
           resources_(options.context_cache.enabled, std::move(context_cost)) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -1752,6 +1753,30 @@ private:
         }
     }
 
+    // Hybrid prefix cache: the sources of the requests waiting for admission are evicted last, the
+    // request furthest back first (hybrid-prefix-cache-spec §9.6). Paused requests restore before
+    // fresh ones, so they come first. A request no admission pass has planned yet is skipped.
+    void hold_queued_sources() {
+        if constexpr (!std::is_same_v<Manager, ResourceManager<ModelContract>>) {
+            if (!queue_holds_) { return; }
+            std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
+            {
+                std::lock_guard lock(queue_mutex_);
+                queue.insert(queue.end(), pending_.begin(), pending_.end());
+            }
+            std::vector<std::uint64_t> ids;
+            std::vector<const typename ModelContract::RequestBasePlan*> bases;
+            for (const auto& request : queue) {
+                if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
+                    continue;
+                }
+                ids.push_back(request->id);
+                bases.push_back(&*request->base_plan);
+            }
+            resources_.hold_queue(*instance_.program, ids, bases);
+        }
+    }
+
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
         const auto lane = free_lane();
@@ -2425,6 +2450,7 @@ private:
                         (void)try_admit_one(false);
                     }
                 }
+                hold_queued_sources();
                 if (instance_.program->has_context_transaction()) {
                     executed |= progress_context_transaction(boundary);
                     if (!instance_.program->has_context_transaction()) { reserve_resident_units(); }
@@ -2544,6 +2570,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const bool queue_holds_;
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
     DiagnosticObserver diagnostics_;

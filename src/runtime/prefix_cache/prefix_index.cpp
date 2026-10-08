@@ -263,6 +263,44 @@ bool PrefixCacheIndex::shared_below(const Snapshot& snapshot) const noexcept {
     return false;
 }
 
+// ---- queue holds -------------------------------------------------------------------------------
+
+void PrefixCacheIndex::set_queue_holds(std::span<const SnapshotRef> holds) {
+    std::vector<std::uint32_t> previous;
+    previous.swap(holds_);
+    for (const std::uint32_t index : previous) {
+        if (index == kNoId) { continue; }
+        snapshots_[index].hold = kNoHold;
+        refresh_tail(index);
+    }
+    for (const SnapshotRef ref : holds) {
+        if (holds_.size() == kMaxQueueHolds) { break; }
+        if (!valid(ref) || snapshots_[ref.index].hold != kNoHold) { continue; }
+        snapshots_[ref.index].hold = static_cast<std::uint8_t>(holds_.size());
+        holds_.push_back(ref.index);
+        refresh_tail(ref.index);
+    }
+    refresh_holds();
+}
+
+void PrefixCacheIndex::refresh_holds() {
+    std::vector<std::uint32_t> previous;
+    previous.swap(held_nodes_);
+    for (const std::uint32_t index : previous) { nodes_[index].hold = kNoHold; }
+    // Ranks in admission order: a node already marked lies on a lower rank's path, and so does
+    // every node above it.
+    for (std::uint32_t rank = 0; rank < holds_.size(); ++rank) {
+        if (holds_[rank] == kNoId) { continue; }
+        for (std::uint32_t current = snapshots_[holds_[rank]].anchor;
+             current != kNoId && nodes_[current].hold == kNoHold; current = nodes_[current].parent) {
+            nodes_[current].hold = static_cast<std::uint8_t>(rank);
+            held_nodes_.push_back(current);
+        }
+    }
+    for (const std::uint32_t index : previous) { refresh_node(index); }
+    for (const std::uint32_t index : held_nodes_) { refresh_node(index); }
+}
+
 void PrefixCacheIndex::supersede(SnapshotRef snapshot) {
     Snapshot& entry = require(snapshot);
     // A boundary serves the conversations that share it, so it is superseded only while the tree
@@ -347,11 +385,16 @@ void PrefixCacheIndex::unpin_snapshot(SnapshotRef snapshot) {
 
 // ---- membership maintenance ------------------------------------------------------------------
 
+std::uint8_t PrefixCacheIndex::lru_list(bool backed, std::uint8_t hold) noexcept {
+    const std::uint8_t kind = backed ? kBacked : kUnbacked;
+    return hold == kNoHold ? kind : static_cast<std::uint8_t>(2U + 2U * hold + kind);
+}
+
 void PrefixCacheIndex::refresh_node(std::uint32_t index) {
     const Node& node = nodes_[index];
     const bool lru   = node.occupied && node.device == CopyState::Resident && node.pins == 0;
     const std::uint8_t list =
-        lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
+        lru ? lru_list(node.host == CopyState::Resident, node.hold) : kNoList;
     if (lru_links_[index].list != list) {
         if (lru_links_[index].list != kNoList) { lru_remove(index); }
         if (list != kNoList) { lru_append(index, list); }
@@ -373,7 +416,7 @@ void PrefixCacheIndex::refresh_tail(std::uint32_t index) {
     const bool lru    = snapshot.occupied && snapshot.tail_len != 0 &&
                         snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0;
     const bool backed = config_.host_blocks && snapshot.host == CopyState::Resident;
-    const std::uint8_t list = lru ? (backed ? kBacked : kUnbacked) : kNoList;
+    const std::uint8_t list = lru ? lru_list(backed, snapshot.hold) : kNoList;
     if (lru_links_[entry].list != list) {
         if (lru_links_[entry].list != kNoList) { lru_remove(entry); }
         if (list != kNoList) { lru_append(entry, list); }
@@ -395,6 +438,7 @@ void PrefixCacheIndex::lru_remove(std::uint32_t entry) {
         list.tail = link.prev;
     }
     --list.count;
+    --(link.list % 2 == 0 ? lru_backed_ : lru_unbacked_);
     link = LruLink{};
 }
 
@@ -411,12 +455,29 @@ void PrefixCacheIndex::lru_append(std::uint32_t entry, std::uint8_t list_id) {
     }
     list.tail = entry;
     ++list.count;
+    ++(list_id % 2 == 0 ? lru_backed_ : lru_unbacked_);
 }
 
 std::uint32_t PrefixCacheIndex::lru_pop(std::uint8_t list_id) {
     const std::uint32_t entry = lru_[list_id].head;
     if (entry != kNoId) { lru_remove(entry); }
     return entry;
+}
+
+std::uint32_t PrefixCacheIndex::lru_pop_victim(bool unbacked) {
+    for (const bool backed : {true, false}) {
+        if (!backed && !unbacked) { break; }
+        const std::uint8_t unheld = lru_list(backed, kNoHold);
+        if (lru_[unheld].count != 0) { return lru_pop(unheld); }
+        for (std::uint32_t rank = kMaxQueueHolds; rank-- > 0;) {
+            const std::uint8_t list = lru_list(backed, static_cast<std::uint8_t>(rank));
+            if (lru_[list].count != 0) {
+                ++counters_.held_device_evictions;
+                return lru_pop(list);
+            }
+        }
+    }
+    return kNoId;
 }
 
 void PrefixCacheIndex::dead_remove(std::uint32_t index) {
@@ -517,6 +578,7 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     node.pins           = 1;
     node.live_below     = 0;
     node.retained_below = 0;
+    node.hold           = kNoHold;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
     } else {
@@ -557,11 +619,11 @@ void PrefixCacheIndex::abort_device_fill(NodeRef ref) {
 }
 
 std::uint32_t PrefixCacheIndex::device_evictable_blocks() const noexcept {
-    return lru_[kBacked].count + lru_[kUnbacked].count;
+    return lru_backed_ + lru_unbacked_;
 }
 
 std::uint32_t PrefixCacheIndex::device_backed_evictable_blocks() const noexcept {
-    return lru_[kBacked].count;
+    return lru_backed_;
 }
 
 void PrefixCacheIndex::drop_node_device_copy(std::uint32_t index) {
@@ -595,8 +657,7 @@ std::uint32_t PrefixCacheIndex::evict_backed_device_blocks(std::uint32_t blocks)
 std::uint32_t PrefixCacheIndex::evict_device_entries(std::uint32_t blocks, bool unbacked) {
     std::uint32_t released = 0;
     while (released < blocks) {
-        std::uint32_t entry = lru_pop(kBacked);
-        if (entry == kNoId && unbacked) { entry = lru_pop(kUnbacked); }
+        const std::uint32_t entry = lru_pop_victim(unbacked);
         if (entry == kNoId) { break; }
         if (entry < config_.max_nodes) {
             Node& node = nodes_[entry];
@@ -669,7 +730,15 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
             continue;
         }
         const std::uint32_t victim = pick_victim(true, protect_snapshot);
-        if (victim == kNoId) { return false; }
+        if (victim == kNoId) {
+            // A held snapshot's slabs serve a queued request sooner than anything new would.
+            if (std::any_of(holds_.begin(), holds_.end(), [&](std::uint32_t held) {
+                    return held != kNoId && snapshots_[held].host == CopyState::Resident;
+                })) {
+                ++counters_.held_host_refusals;
+            }
+            return false;
+        }
         Snapshot& chosen = snapshots_[victim];
         // A retained snapshot only yields its slabs to something worth at least as much: GDSF
         // never inserts what it would evict next.
@@ -829,6 +898,8 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
         if (slot_state_[slot] != SlotState::Owned) { continue; }
         const Snapshot& owner = snapshots_[slot_owner_[slot]];
         if (owner.pins != 0) { continue; }
+        // A held owner without a Host copy would be lost with its slot.
+        if (owner.hold != kNoHold && owner.host != CopyState::Resident) { continue; }
         if (owner.superseded) {
             if (superseded == kNoId ||
                 owner.superseded_tick < snapshots_[slot_owner_[superseded]].superseded_tick) {
@@ -1020,6 +1091,8 @@ PublishResult PrefixCacheIndex::publish_image(NodeRef anchor, std::uint32_t fron
     snapshot.priority_base   = inflation_;
     snapshot.superseded      = false;
     snapshot.superseded_tick = 0;
+    snapshot.hold            = kNoHold;
+    ++snapshot_epoch_;
     if (device_slot != kNoId) {
         set_slot(device_slot, SlotState::Owned);
         slot_owner_[device_slot] = index;
@@ -1195,7 +1268,7 @@ std::uint32_t PrefixCacheIndex::pick_victim(bool host_resident, std::uint32_t pr
     std::uint32_t retained   = kNoId;
     for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
         const Snapshot& snapshot = snapshots_[i];
-        if (!snapshot.occupied || i == protect || snapshot.pins != 0 ||
+        if (!snapshot.occupied || i == protect || snapshot.pins != 0 || snapshot.hold != kNoHold ||
             (host_resident ? snapshot.host != CopyState::Resident
                            : snapshot.host == CopyState::Filling)) {
             continue;
@@ -1229,6 +1302,14 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     unlink_snapshot(index);
     snapshot.superseded      = false;
     snapshot.superseded_tick = 0;
+    ++snapshot_epoch_;
+    const bool held = snapshot.hold != kNoHold;
+    if (held) {
+        // Every unheld victim was gone: the queued request resumes from an earlier source.
+        holds_[snapshot.hold] = kNoId;
+        snapshot.hold         = kNoHold;
+        ++counters_.held_snapshot_losses;
+    }
     backend_->release_snapshot(ref_of_snapshot(index));
     std::vector<std::uint32_t>& anchored =
         snapshot.anchor != kNoId ? nodes_[snapshot.anchor].snapshots : root_snapshots_;
@@ -1256,6 +1337,7 @@ void PrefixCacheIndex::remove_snapshot(std::uint32_t index) {
     if (release_tail) { backend_->release_device_block(tail_device); }
     for (const std::uint32_t other : dependents) { update_priority(other); }
     if (retained_above != kNoId) { update_priority(retained_above); }
+    if (held) { refresh_holds(); }
 }
 
 void PrefixCacheIndex::release_node_storage(std::uint32_t index) {
@@ -1306,6 +1388,7 @@ void PrefixCacheIndex::remove_subtree(std::uint32_t root) {
         node.parent         = kNoId;
         node.live_below     = 0;
         node.retained_below = 0;
+        node.hold           = kNoHold;
         ++node.generation;
         free_nodes_.push_back(index);
         --node_count_;
@@ -1432,6 +1515,7 @@ std::optional<RestoredBlock> PrefixCacheIndex::restore_host_block(NodeRef parent
     node.pins           = 0;
     node.live_below     = 0;
     node.retained_below = 0;
+    node.hold           = kNoHold;
     if (parent.valid()) {
         nodes_[parent_index].children.push_back(index);
     } else {
@@ -1492,6 +1576,8 @@ std::optional<SnapshotRef> PrefixCacheIndex::restore_host_snapshot(NodeRef ancho
     snapshot.priority_base    = inflation_;
     snapshot.superseded       = false;
     snapshot.superseded_tick  = 0;
+    snapshot.hold             = kNoHold;
+    ++snapshot_epoch_;
     anchored.push_back(index);
     ++snapshot_count_;
     if (anchor.valid()) {
@@ -1595,6 +1681,8 @@ PrefixIndexStats PrefixCacheIndex::stats() const noexcept {
     stats.device_evictable_blocks = device_evictable_blocks();
     stats.device_resident_blocks  = device_resident_;
     stats.free_device_slots       = free_slots_;
+    stats.held_snapshots          = static_cast<std::uint32_t>(
+        std::count_if(holds_.begin(), holds_.end(), [](std::uint32_t held) { return held != kNoId; }));
     return stats;
 }
 
@@ -1627,7 +1715,7 @@ void PrefixCacheIndex::check_invariants() const {
         }
         const bool lru = node.device == CopyState::Resident && node.pins == 0;
         const std::uint8_t list =
-            lru ? (node.host == CopyState::Resident ? kBacked : kUnbacked) : kNoList;
+            lru ? lru_list(node.host == CopyState::Resident, node.hold) : kNoList;
         if (lru_links_[i].list != list) { invariant("node LRU membership is inconsistent"); }
         const bool dead =
             node.host == CopyState::Resident && node.live_below == 0 && node.pins == 0;
@@ -1700,13 +1788,51 @@ void PrefixCacheIndex::check_invariants() const {
     for (const std::uint32_t uses : slab_uses) {
         if (uses != 1) { invariant("host slab is leaked or shared"); }
     }
-    std::array<std::uint32_t, 2> counted{};
-    for (std::uint8_t list = 0; list < 2; ++list) {
+    std::array<std::uint32_t, 2> kinds{};
+    for (std::size_t list = 0; list < kLruLists; ++list) {
+        std::uint32_t counted = 0;
         for (std::uint32_t entry = lru_[list].head; entry != kNoId;
              entry               = lru_links_[entry].next) {
-            ++counted[list];
+            ++counted;
         }
-        if (counted[list] != lru_[list].count) { invariant("LRU count mismatch"); }
+        if (counted != lru_[list].count) { invariant("LRU count mismatch"); }
+        kinds[list % 2] += counted;
+    }
+    if (kinds[kBacked] != lru_backed_ || kinds[kUnbacked] != lru_unbacked_) {
+        invariant("LRU totals mismatch");
+    }
+    // Queue holds: each held snapshot names its rank, and each node carries the lowest rank of a
+    // held snapshot on whose anchor path it lies.
+    std::vector<std::uint8_t> holds(nodes_.size(), kNoHold);
+    for (std::uint32_t rank = 0; rank < holds_.size(); ++rank) {
+        const std::uint32_t held = holds_[rank];
+        if (held == kNoId) { continue; }
+        if (!snapshots_[held].occupied || snapshots_[held].hold != rank) {
+            invariant("held snapshot does not carry its rank");
+        }
+        for (std::uint32_t current = snapshots_[held].anchor; current != kNoId;
+             current               = nodes_[current].parent) {
+            holds[current] = std::min(holds[current], static_cast<std::uint8_t>(rank));
+        }
+    }
+    for (std::uint32_t i = 0; i < snapshots_.size(); ++i) {
+        const Snapshot& snapshot = snapshots_[i];
+        if (snapshot.hold != kNoHold &&
+            (!snapshot.occupied || snapshot.hold >= holds_.size() || holds_[snapshot.hold] != i)) {
+            invariant("snapshot hold is not in the queue holds");
+        }
+        const std::uint32_t entry = config_.max_nodes + i;
+        const bool lru            = snapshot.occupied && snapshot.tail_len != 0 &&
+                         snapshot.tail_device_copy == CopyState::Resident && snapshot.pins == 0;
+        const bool backed = config_.host_blocks && snapshot.host == CopyState::Resident;
+        if (lru_links_[entry].list != (lru ? lru_list(backed, snapshot.hold) : kNoList)) {
+            invariant("snapshot tail LRU membership is inconsistent");
+        }
+    }
+    for (std::uint32_t i = 0; i < nodes_.size(); ++i) {
+        if (nodes_[i].occupied && nodes_[i].hold != holds[i]) {
+            invariant("node hold is inconsistent");
+        }
     }
 }
 

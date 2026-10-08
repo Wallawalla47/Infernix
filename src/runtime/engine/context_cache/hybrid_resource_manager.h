@@ -5,6 +5,7 @@
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/resource_manager.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -185,6 +186,27 @@ public:
         out.hybrid_host_snapshot_evictions = hybrid.host_snapshot_evictions;
         out.hybrid_host_dead_reclaims      = hybrid.host_dead_reclaims;
         out.hybrid_unbacked_node_losses    = hybrid.unbacked_node_losses;
+        out.hybrid_held_snapshots          = hybrid.held_snapshots;
+        out.hybrid_held_device_evictions   = hybrid.held_device_evictions;
+        out.hybrid_held_snapshot_losses    = hybrid.held_snapshot_losses;
+        out.hybrid_held_host_refusals      = hybrid.held_host_refusals;
+    }
+
+    // Holds the sources of the requests waiting for admission, in admission order
+    // (hybrid-prefix-cache-spec §9.6). `ids` names `queue`'s requests; matching walks every
+    // queued prompt's path, so the holds are recomputed only when the queue or the tree's
+    // snapshots changed.
+    void hold_queue(Program& program, std::span<const std::uint64_t> ids,
+                    std::span<const Base* const> queue) {
+        const std::uint64_t epoch = program.hybrid_cache_epoch();
+        if (hold_valid_ && epoch == hold_epoch_ &&
+            std::equal(ids.begin(), ids.end(), hold_ids_.begin(), hold_ids_.end())) {
+            return;
+        }
+        program.hybrid_hold_queue(queue);
+        hold_ids_.assign(ids.begin(), ids.end());
+        hold_epoch_ = epoch;
+        hold_valid_ = true;
     }
 
 private:
@@ -192,6 +214,10 @@ private:
     std::uint64_t prefetch_order_ = 0;
     bool prefetch_retry_          = false;
     std::uint32_t prefetch_room_  = 0;
+    // The queue and snapshot epoch the current holds were computed for.
+    std::vector<std::uint64_t> hold_ids_;
+    std::uint64_t hold_epoch_ = 0;
+    bool hold_valid_          = false;
 };
 
 } // namespace infernix::runtime

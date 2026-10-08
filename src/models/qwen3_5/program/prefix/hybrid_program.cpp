@@ -418,6 +418,39 @@ std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
     return room;
 }
 
+// The snapshot each queued request would resume from now, as hybrid_sources would choose it, is
+// held in admission order (§9.6). A block landing for another admission does not change what the
+// request needs, so filling candidates stay eligible.
+void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+    if (!hybrid_) { return; }
+    pc::PrefixCacheIndex& index = hybrid_->index();
+    std::vector<pc::SnapshotRef> holds;
+    for (const RequestBasePlan* base : queue) {
+        if (holds.size() == pc::kMaxQueueHolds) { break; }
+        if (base == nullptr || base->impl_ == nullptr || !base->impl_->prompt ||
+            !base->impl_->allow_prefix_reuse || !base->impl_->prompt->identity.reusable) {
+            continue;
+        }
+        const PreparedPromptData& prompt = *base->impl_->prompt;
+        const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
+        if (n == 0 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
+        pc::MatchResult match =
+            index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        const std::vector<VisionTokenRange> ranges =
+            prompt.vision_items.empty() ? std::vector<VisionTokenRange>{} : vision_ranges(prompt);
+        std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
+            return candidate.frontier >= n || inside_vision(candidate.frontier, ranges);
+        });
+        const pc::AdmissionChoice choice = index.choose(match, n);
+        if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
+    }
+    index.set_queue_holds(holds);
+}
+
+std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
+    return hybrid_ ? hybrid_->index().snapshot_epoch() : 0U;
+}
+
 bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::uint32_t reuse) {
     if (hybrid_coalesce_wait_seconds_ <= 0.0) { return false; }
     const auto n = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -1317,6 +1350,10 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.host_snapshot_evictions         = index.host_snapshot_evictions;
     out.host_dead_reclaims              = index.host_dead_reclaims;
     out.unbacked_node_losses            = index.unbacked_node_losses;
+    out.held_snapshots                  = index.held_snapshots;
+    out.held_device_evictions           = index.held_device_evictions;
+    out.held_snapshot_losses            = index.held_snapshot_losses;
+    out.held_host_refusals              = index.held_host_refusals;
     return out;
 }
 

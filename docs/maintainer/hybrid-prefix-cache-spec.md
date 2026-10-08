@@ -51,6 +51,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's binding transaction | implemented: staging reserves the first unit's Device pages and the state slot, Host restores run on a dedicated restore stream, and completion forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1). Later units reserve incrementally; preemption recovers by Replay (§9.5) |
 | §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
+| §9.6 queue holds | implemented (default on, `--no-queue-holds`): waiting requests' resume snapshots and paths are evicted last, the back of the queue first; host-only unit tests. End-to-end effect not yet measured |
 | §7.1 taps | implemented: exact taps (explicit, generation opener, structural) split the chunk; flexible taps (prompt tail, ladder) are realized at chunk boundaries at no extra forward pass |
 | §7.4 tap publication | implemented: deferred until the anchoring blocks commit (a frontier inside a block, or an MTP backend one token behind); exact-frontier tails are copied into cache-owned pages |
 | §7.6 block publication, write-through | implemented: blocks join the tree at every commit; a lane's blocks are written to Host in one batch when it releases them |
@@ -822,6 +823,8 @@ struct SourceCandidate {                    // the binding source shared with ch
 [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);                // §9.5
 [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan&);       // §6.6
 [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);                   // §9.6
+[[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;                         // §9.6
 void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel&);                       // §6.2
 void set_hybrid_coalesce_wait_limit(double seconds);                                     // §12.2
 [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(...);                      // §5.5
@@ -851,8 +854,10 @@ orchestration are shared by both modes. Retention policy lives in the Program's 
   Program keeps no Host context arena, so a paused request recovers by Replay, from the deepest
   source the tree then holds.
 - While the FIFO head waits, the Engine asks for a prefetch of its Host-only path (§6.6).
+- After each admission pass the Engine passes the queue to `hold_queue`, which recomputes the
+  Program's queue holds when the queue or the snapshot epoch changed (§9.6).
 - A waiting request retains no source: `retain_source`, `binding_started` and `release_source`
-  hold nothing, and a lane that frees quotes the tree again. A stale quote binds as an invalid
+  hold nothing (queue holds only order eviction), and a lane that frees quotes the tree again. A stale quote binds as an invalid
   source (`BindingReservation::source_valid` false), so the Engine moves to its next candidate;
   a shortage the pools could hold at all lets the request wait for resident progress.
 - `HybridPrefixCacheStats` feed the `throughput` record's `context_cache.hybrid` object.
@@ -989,6 +994,47 @@ the subtree size.
   (`hybrid_reclaim`), so active growth always wins over cache. Only when nothing is evictable does
   the Engine pause a younger request (Replay recovery).
 - Nothing active is ever evicted.
+
+### 9.6 Queue holds
+
+LRU and GDSF know nothing about the queue, which says exactly which conversations run next. When
+several long conversations take turns through fewer lanes and their contexts together exceed the
+cache, plain LRU evicts the conversation that has waited longest, which is the one admitted next:
+every request then loses part of its path while it waits, and a single missing block sends it back
+to a shallow snapshot. Each such miss re-prefills its whole context, and that allocation evicts the
+next queued conversation, so the cache stays in this state. The production agent log of 2026-10-08
+(Flash-Next, two lanes, about six subagents at 120-210K tokens, a 7.3 GB Host tier): when first
+considered for admission 84-98 % of each prompt was cached, at admission 9-21 %, and 32 M of 36 M
+prefilled tokens (about 6,200 GPU-seconds of 7,200) recomputed context that had been cached.
+
+Holds use the queue as the eviction policy's lookahead:
+
+- After each admission pass, the Engine gives the Program the base plans of the paused requests
+  (they restore first) and then the pending ones, in admission order; a request no admission pass
+  has planned yet is skipped. The Program matches each prompt and takes the snapshot admission
+  would choose now (`choose`, Vision exclusions; a filling candidate stays eligible), and the index
+  holds those snapshots with their queue rank, at most `kMaxQueueHolds` (32). Matching walks every
+  queued prompt, so the holds are recomputed only when the queue or the index's snapshot epoch
+  (bumped by every publication and removal) changed.
+- **Host:** a held snapshot is never a slab or snapshot-table victim. Its path stays live, so the
+  dead-KV sweep never takes it either. A snapshot image, tail or block write that would need its
+  slabs is refused (`held_host_refusals`): by the queue, anything newly written is used after every
+  waiting request. The new snapshot stays Device-only where it can, and a refused block stays
+  unbacked.
+- **Device:** held path nodes and held tails move to per-rank LRU lists. Eviction takes unheld
+  host-backed entries, then held host-backed entries (highest rank first: dropping a backed copy
+  costs only a later restore), then unheld unbacked entries, then held unbacked ones (highest rank
+  first). Pins still come first, so active growth always wins (§9.5) and a hold can never block an
+  admission or a unit reservation.
+- A held snapshot that is removed anyway (its path lost its last copy) counts as
+  `held_snapshot_losses`; Device copies of held entries evicted count as `held_device_evictions`.
+- A paused request (Qwen3.5; Qwen3.8-Flash-Next never pauses) recovers by Replay from what the
+  tree holds, so its source is held like a queued request's, ahead of them.
+
+Holds cannot make room that does not exist: with more queued context than the cache holds, the
+requests at the back of the queue still lose theirs. They change who loses it, from every waiting
+request partly to the furthest-back requests wholly, and they remove the miss cascade.
+`--no-queue-holds` restores plain LRU/GDSF eviction for comparison.
 
 ---
 
@@ -1240,6 +1286,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
     std::filesystem::path persistent_file;                  // --prefix-cache-file (§5.5)
     std::string persistent_identity;                        // set by the product binary
     PrefixCacheSaveControl persistent_save;                 // abandons the save (§5.5)
+    bool queue_holds = true;                                // --no-queue-holds turns off (§9.6)
 };
 
 struct ContextCacheOptions {

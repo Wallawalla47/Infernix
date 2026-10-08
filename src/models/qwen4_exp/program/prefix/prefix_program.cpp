@@ -317,6 +317,33 @@ std::uint32_t ProgramImpl::hybrid_prefetch_room() const noexcept {
     return pool_->available_pages() + prefix_->index().device_backed_evictable_blocks();
 }
 
+// The snapshot each queued request would resume from now, as prefix_select would choose it, is
+// held in admission order (hybrid-prefix-cache-spec §9.6). A block landing for another admission
+// does not change what the request needs, so filling candidates stay eligible.
+void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+    if (!prefix_) { return; }
+    pc::PrefixCacheIndex& index = prefix_->index();
+    std::vector<pc::SnapshotRef> holds;
+    for (const RequestBasePlan* base : queue) {
+        if (holds.size() == pc::kMaxQueueHolds) { break; }
+        if (base == nullptr || base->impl_ == nullptr || !base->impl_->reuse || !base->impl_->prompt) { continue; }
+        const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base->impl_->prompt);
+        const auto n       = static_cast<std::uint32_t>(prompt.token_ids.size());
+        if (n <= 1 || prompt.block_hashes.size() != n / kBlock) { continue; }
+        pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+        const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
+        std::erase_if(match.candidates,
+                      [&](const pc::MatchCandidate& c) { return prefix::inside_exclusion(c.frontier, spans); });
+        const pc::AdmissionChoice choice = index.choose(match, n);
+        if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
+    }
+    index.set_queue_holds(holds);
+}
+
+std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
+    return prefix_ ? prefix_->index().snapshot_epoch() : 0U;
+}
+
 // A fresh request whose prompt shares a prefix with a lane still prefilling waits for that lane's
 // snapshot at the divergence instead of prefilling the shared part again (the coalescing of the
 // Qwen3.5 hybrid cache, hybrid-prefix-cache-spec): a /v1/decide fan-out's questions over one state,
@@ -597,6 +624,10 @@ HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
     out.host_snapshot_evictions = index.host_snapshot_evictions;
     out.host_dead_reclaims      = index.host_dead_reclaims;
     out.unbacked_node_losses    = index.unbacked_node_losses;
+    out.held_snapshots          = index.held_snapshots;
+    out.held_device_evictions   = index.held_device_evictions;
+    out.held_snapshot_losses    = index.held_snapshot_losses;
+    out.held_host_refusals      = index.held_host_refusals;
     return out;
 }
 

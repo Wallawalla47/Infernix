@@ -276,6 +276,11 @@ struct HybridPrefixCacheOptions {
     std::string persistent_identity;
     // Lets the product abandon the save at shutdown (infernix-serve: Ctrl+C during the stop).
     PrefixCacheSaveControl persistent_save;
+    // Queue holds: the snapshot each queued request would resume from, and its path, are evicted
+    // after every other cache entry, the request furthest back in the queue first; new snapshots
+    // and Host block writes that would need a held snapshot's slabs are skipped instead. False
+    // restores plain LRU/GDSF eviction.
+    bool queue_holds = true;
 };
 
 struct ContextCacheOptions {
@@ -1492,6 +1497,13 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_snapshot_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;
     std::uint64_t hybrid_unbacked_node_losses    = 0;
+    // Queue holds (HybridPrefixCacheOptions::queue_holds): the snapshots held for queued
+    // requests now, held entries whose Device copy was evicted, held snapshots lost, and Host
+    // writes refused because only held snapshots were left to evict.
+    std::uint32_t hybrid_held_snapshots          = 0;
+    std::uint64_t hybrid_held_device_evictions   = 0;
+    std::uint64_t hybrid_held_snapshot_losses    = 0;
+    std::uint64_t hybrid_held_host_refusals      = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

@@ -255,6 +255,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             (default max(4096, 2x prefill chunk))\n"
            "  --cache-tap-min-gap N      minimum tokens between ladder snapshots\n"
            "                             (default max(1024, prefill chunk))\n"
+           "  --no-queue-holds           do not keep waiting requests' cached prefixes\n"
+           "                             ahead of other cache entries (default on: what a\n"
+           "                             queued request resumes from is evicted last, the\n"
+           "                             request furthest back first)\n"
            "\n"
            "ORIGINAL PREFIX CACHING SYSTEM (NInfer's continuation/checkpoint cache;\n"
            "Qwen3.5 artifacts only)\n"
@@ -551,6 +555,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
             hybrid_option_flag = "--prefix-cache-file";
+        } else if (arg == "--no-queue-holds") {
+            options.context_cache.hybrid.queue_holds = false;
+            hybrid_option_flag                       = "--no-queue-holds";
         } else if (arg == "--cache-tap-min-gap") {
             options.context_cache.hybrid.tap_min_gap_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));

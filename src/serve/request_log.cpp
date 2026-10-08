@@ -940,7 +940,11 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"evicted_blocks", delta(&RuntimeStats::hybrid_evicted_blocks)},
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
-                 {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+                 {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)},
+                 {"held_snapshots", current.hybrid_held_snapshots},
+                 {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
+                 {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
+                 {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)}};
     }
     return record.dump();
 }
