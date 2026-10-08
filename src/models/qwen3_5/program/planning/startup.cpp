@@ -347,6 +347,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
+        out.grammar_masks =
+            add_tensor(builder, DType::I32,
+                       {dimension((parameters.model.resources().public_token_count + 31) / 32),
+                        static_cast<std::int32_t>(plan.draft_window + 1),
+                        static_cast<std::int32_t>(plan.max_concurrency)},
+                       "grammar token masks");
         out.token_counts        = add_tensor(builder, DType::I32,
                                              {dimension(parameters.model.resources().public_token_count),
                                               static_cast<std::int32_t>(plan.max_concurrency)},
@@ -1064,26 +1070,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                           impl->max_concurrency;
         } else {
             // Each speculative round family's profiles are captured at the family's own width for
-            // every batch size, on the one frame viewed at that width.
+            // every batch size, on the one frame viewed at that width, as a Forward/Finish pair.
+            // MTP Finish keeps the Forward profiles; DFlash Finish has one executable per exact B.
             // Every MTP round proposes the next round's drafts at the configured neural depth.
+            const bool mtp               = impl->speculative_backend == SpeculativeBackend::Mtp;
             const std::uint32_t ar_depth = impl->neural_draft_window;
             for (const SpeculativeRoundShape& shape : impl->round_shapes) {
                 const auto profiles =
-                    impl->speculative_backend == SpeculativeBackend::Mtp
-                        ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
+                    mtp ? mtp_graph_profiles(impl->capacity, shape.verify_drafts, ar_depth)
                         : dflash_graph_profiles(impl->speculative_backend, impl->capacity,
                                                 shape.verify_drafts);
-                // A tree family serves only the batch sizes that may verify its width, and the
-                // plain neural family only those that may verify a chain.
+                // A tree family serves only the batch sizes that may verify its width. Chain
+                // families serve every batch size: a round with a constrained row verifies the
+                // chain whatever the tree table selects.
                 std::uint32_t batch_sizes = 0;
                 for (std::uint32_t b = 1; b <= impl->max_concurrency; ++b) {
-                    batch_sizes += shape.kind == SpeculativeRoundKind::Tree
-                                       ? impl->tree_widths.tree(b, shape.verify_drafts + 1U)
-                                       : shape.kind == SpeculativeRoundKind::Ngram ||
-                                             impl->tree_widths.chain(b);
+                    batch_sizes += shape.kind != SpeculativeRoundKind::Tree ||
+                                   impl->tree_widths.tree(b, shape.verify_drafts + 1U);
                 }
-                executables +=
-                    static_cast<std::uint64_t>(graph_topology_classes(profiles)) * batch_sizes;
+                const std::uint64_t forward = graph_topology_classes(profiles);
+                executables += (forward + (mtp ? forward : 1U)) * batch_sizes;
             }
         }
         impl->graph_allowance_bytes = checked_add(

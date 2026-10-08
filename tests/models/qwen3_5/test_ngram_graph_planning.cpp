@@ -97,7 +97,8 @@ std::size_t family_executables(unsigned capacity, unsigned verify, unsigned neur
 // The CUDA Graph allowance at max concurrency 1: a fixed driver share plus a fixed share for each
 // executable. MTP captures its neural family at the neural window and, with ngram drafting, copy
 // families at 7, 15 and 31 drafts strictly between the two windows and at the ngram window; every
-// round drafts at the neural depth.
+// round drafts at the neural depth. Each family is a Forward/Finish pair whose Finish keeps the
+// Forward profiles, so every class counts twice.
 std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngram) {
     std::size_t executables = family_executables(capacity, neural, neural);
     if (ngram != 0) {
@@ -108,7 +109,7 @@ std::size_t expected_allowance(unsigned capacity, unsigned neural, unsigned ngra
         }
         executables += family_executables(capacity, ngram, neural);
     }
-    return (64ULL << 20) + executables * (4ULL << 20);
+    return (64ULL << 20) + 2 * executables * (4ULL << 20);
 }
 
 void verify_real_plan(const char* artifact) {

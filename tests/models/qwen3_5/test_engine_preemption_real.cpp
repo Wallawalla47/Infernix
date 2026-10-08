@@ -1,4 +1,5 @@
 #include "infernix/engine.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,12 @@ infernix::SpeculativeBackend backend(std::string_view name) {
     throw std::invalid_argument("INFERNIX_TEST_BACKEND must be none, mtp, dflash or dflash2");
 }
 
+std::string grammar_prefix() {
+    std::string prefix;
+    for (char c = 'a'; c <= 'z'; ++c) prefix.append(17 + c - 'a', c);
+    return prefix;
+}
+
 infernix::RequestOptions request(std::uint32_t outputs) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
@@ -57,6 +64,26 @@ infernix::RequestOptions request(std::uint32_t outputs) {
     options.execution.allow_prefix_reuse      = false;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
+    if (setting("INFERNIX_TEST_CONSTRAINT", "none") != "none") {
+        std::string source = "root ::= ";
+        for (char c = 'a'; c <= 'z'; ++c) {
+            source += "\"" + std::string(1, c) + "\"{" + std::to_string(17 + c - 'a') + "} ";
+        }
+        if (setting("INFERNIX_TEST_CONSTRAINT", "none") == "json_schema") {
+            std::string pattern = "^";
+            for (char c = 'a'; c <= 'z'; ++c)
+                pattern += std::string(1, c) + "{" + std::to_string(17 + c - 'a') + "}";
+            pattern += "z{65536}$";
+            options.constraint = infernix::OutputConstraint::json_schema(
+                nlohmann::json{{"type", "string"}, {"pattern", pattern}}.dump());
+        } else {
+            require(setting("INFERNIX_TEST_CONSTRAINT", "none") == "grammar",
+                    "unknown test constraint");
+            options.constraint = infernix::OutputConstraint::grammar(source + "\"z\"{65536}");
+        }
+        options.stop.include_model_defaults = true;
+        options.output.raw                  = false;
+    }
     return options;
 }
 
@@ -174,6 +201,19 @@ public:
                                      result.finish_reason == infernix::FinishReason::OutputLimit),
                 "resumed request did not honor its original output budget");
         // Compare only the two publication views of this request, never different math paths.
+        if (setting("INFERNIX_TEST_CONSTRAINT", "none") != "none") {
+            const auto expected =
+                (setting("INFERNIX_TEST_CONSTRAINT", "none") == "json_schema" ? std::string("\"")
+                                                                            : std::string{}) +
+                grammar_prefix();
+            require(!content_.empty() && reasoning_.empty() &&
+                        (content_.size() <= expected.size()
+                             ? expected.starts_with(content_)
+                             : content_.starts_with(expected) &&
+                                   content_.find_first_not_of('z', expected.size()) ==
+                                       std::string::npos),
+                    "recovery or cancellation changed the grammar position");
+        }
         require(content_ == result.content && reasoning_ == result.reasoning,
                 "stream and terminal response disagree after recovery");
         require(result.reused_prompt_tokens == 0 &&

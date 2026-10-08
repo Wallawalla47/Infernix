@@ -6,9 +6,8 @@
 
 namespace infernix::models::qwen3_5::execution {
 
-void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_store,
-                          TextContext& card, TargetVerifyFrameView frame,
-                          ops::CausalAttentionExecutionEnvelope envelope) {
+void target_verify_forward(ExecutionCore& execution, TextContext& card, TargetVerifyFrameView frame,
+                           ops::CausalAttentionExecutionEnvelope envelope) {
     if (frame.replay_records == nullptr) {
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
@@ -37,8 +36,13 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         execution.io, frame.target_logits, &frame.target_tokens,
         dimension(execution.parameters.model.resources().public_token_count),
         execution.device.stream);
-    if (tree) {
-        card.set_verification_tree(nullptr, nullptr);
+    if (tree) { card.set_verification_tree(nullptr, nullptr); }
+}
+
+void target_accept(ExecutionCore& execution, Tensor& continuation_hidden_store, TextContext& card,
+                   TargetVerifyFrameView frame) {
+    if (frame.tree_rows.data != nullptr) {
+        // Tree rounds verify only unconstrained rows: grammar masks follow one proposal chain.
         const cudaStream_t stream = execution.device.stream;
         ops::speculative_accept_sparse_tree(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
@@ -90,5 +94,6 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     ops::scatter(frame.selected_hidden, frame.state_destination_slots, continuation_hidden_store,
                  execution.device.stream);
 }
+
 
 } // namespace infernix::models::qwen3_5::execution

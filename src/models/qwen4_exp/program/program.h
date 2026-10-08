@@ -149,8 +149,24 @@ struct SourceCandidate {
     runtime::PrefillWork remaining_work;
     std::vector<runtime::ContextTransferRequirement> transfers;
     std::vector<CheckpointHandle> private_points; // never set
+    bool consume_source = false;                  // never set: no checkpoint is transferred
+    bool take_private   = false;                  // never set
+    std::vector<CheckpointHandle> retired_points; // never set: no checkpoint is retired
     std::shared_ptr<const detail::QuoteImpl> hybrid;
     PrefixReusePath reuse_path = PrefixReusePath::Root;
+};
+
+// A binding's outcome for the Engine's admission (the shape Qwen3.5's binding returns). The prefix
+// cache quotes from its own tree, so the source is always valid and a shortage is capacity alone.
+struct BindingReservation {
+    bool reserved          = false;
+    bool source_valid      = true;
+    bool capacity_possible = true;
+    runtime::ContextResourceUsage shortage;
+    std::vector<CheckpointHandle> retired_points;    // never set
+    std::optional<CheckpointHandle> consumed_source; // never set
+
+    explicit operator bool() const noexcept { return reserved; }
 };
 
 // A paused request (design §19.3.13): its ledger, frontier and request-level state. The state at
@@ -194,7 +210,7 @@ public:
           rows_(other.rows_), row_count_(std::exchange(other.row_count_, 0)),
           tokens_(std::exchange(other.tokens_, {})), row_counts_(std::exchange(other.row_counts_, {})),
           row_stride_(std::exchange(other.row_stride_, 0)),
-          timing_(std::exchange(other.timing_, {})) {}
+          timing_(std::exchange(other.timing_, {})), constraint_failed_(other.constraint_failed_) {}
     PendingBatch& operator=(PendingBatch&&)      = delete;
     PendingBatch(const PendingBatch&)            = delete;
     PendingBatch& operator=(const PendingBatch&) = delete;
@@ -205,6 +221,8 @@ public:
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
+    // The row's emitted tokens reach a position where its grammar admits no token.
+    [[nodiscard]] bool constraint_failed(std::size_t row) const { return constraint_failed_.at(row); }
 
 private:
     const void* owner_         = nullptr;
@@ -215,6 +233,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> constraint_failed_{};
 
     friend struct detail::ContractAccess;
 };
@@ -474,11 +493,11 @@ public:
     // Reserves the KV pages of the request's prompt plus one round on `lane` and stages its prefix
     // restore; a shortage reports the pages missing. With `resume`, binds the paused request's
     // ledger instead: the deepest cached state up to its paused frontier, then replay to it.
-    [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
-                                                             const SourceCandidate& source,
-                                                             ResumeState* resume           = nullptr,
-                                                             ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
-                                                             std::uint32_t resume_tokens   = 1);
+    [[nodiscard]] BindingReservation start_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                                   const SourceCandidate& source,
+                                                   ResumeState* resume           = nullptr,
+                                                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
+                                                   std::uint32_t resume_tokens   = 1);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
@@ -523,10 +542,13 @@ public:
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle) { return std::nullopt; }
     void skip_capture(SequenceHandle) {}
 
-    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // `masks` (null when no row is constrained) supplies the rows' grammar masks for this call.
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr,
+                                                  runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing = nullptr);
+                                      runtime::ExecutionTiming* failed_timing = nullptr,
+                                      runtime::TokenMaskProvider* masks       = nullptr);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences, std::span<const TokenId> row_major_tokens,
                          std::uint32_t row_stride,

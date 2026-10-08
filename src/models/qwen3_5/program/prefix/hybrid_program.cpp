@@ -537,7 +537,7 @@ bool ProgramImpl::hybrid_make_room(std::uint32_t text_pages, std::uint32_t backe
     return true;
 }
 
-runtime::ResourceReservation
+BindingReservation
 ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
                                   const SourceCandidate& candidate, ResumeState* resume,
                                   ExecutionUnitKind resume_kind, std::uint32_t resume_tokens) {
@@ -554,14 +554,14 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     const std::uint32_t reuse        = quote.reuse_frontier;
     const std::uint32_t full         = reuse / kBlock;
     const std::uint32_t tail         = reuse % kBlock;
-    if (reuse >= n || (resume && reuse > resume->frontier())) { return {}; }
+    if (reuse >= n || (resume && reuse > resume->frontier())) { return {.source_valid = false}; }
     pc::PrefixCacheIndex& index = hybrid_->index();
 
     // The quote may have gone stale since it was made; the Engine then tries its next source.
     std::vector<pc::NodeRef> path;
     pc::SnapshotView snapshot;
     if (reuse != 0) {
-        if (!index.valid(quote.snapshot)) { return {}; }
+        if (!index.valid(quote.snapshot)) { return {.source_valid = false}; }
         snapshot = index.snapshot(quote.snapshot);
         if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
             throw std::logic_error("prepared prompt carries no hybrid block keys");
@@ -570,12 +570,14 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         if (snapshot.frontier != reuse || match.path.size() < full ||
             (full != 0 ? !(snapshot.anchor == match.path[full - 1U]) : snapshot.anchor.valid())) {
-            return {};
+            return {.source_valid = false};
         }
         path.assign(match.path.begin(), match.path.begin() + full);
         for (const pc::NodeRef node : path) {
             const pc::CopyState device = index.node(node).device;
-            if (device != pc::CopyState::Absent && device != pc::CopyState::Resident) { return {}; }
+            if (device != pc::CopyState::Absent && device != pc::CopyState::Resident) {
+                return {.source_valid = false};
+            }
         }
     }
 
@@ -640,7 +642,12 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         }
         if (shortage.main_kv_pages || shortage.backend_kv_pages) {
             unwind();
-            return {.shortage = shortage};
+            // Waiting helps only when the binding fits the pools at all.
+            const auto usage = physical_usage();
+            const bool capacity_possible =
+                text_need <= usage.capacity.main_kv_pages &&
+                (!backend_kv_pages || backend_need <= usage.capacity.backend_kv_pages);
+            return {.capacity_possible = capacity_possible, .shortage = shortage};
         }
         transaction.reserved_state = state_store->reserve_destination();
         if (!transaction.reserved_state) {

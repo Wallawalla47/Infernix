@@ -41,7 +41,9 @@ public:
     // prefilling sibling is about to publish the snapshot this request should resume from.
     [[nodiscard]] std::vector<SourceChoice> candidates(Program& program, const Base& base,
                                                        std::uint32_t maximum_frontier = UINT32_MAX,
-                                                       std::optional<OwnerToken> = std::nullopt) {
+                                                       std::optional<OwnerToken> = std::nullopt,
+                                                       std::uint64_t             = 0,
+                                                       std::uint64_t = UINT64_MAX) {
         std::vector<SourceChoice> out;
         for (auto& source : program.hybrid_sources(base, maximum_frontier)) {
             out.push_back(SourceChoice{.source = std::move(source)});
@@ -49,7 +51,32 @@ public:
         return out;
     }
 
-    [[nodiscard]] bool prepare_source(Program&, const Base&, SourceChoice&) { return true; }
+    [[nodiscard]] bool prepare_source(Program&, const Base&, SourceChoice&, std::uint64_t = 0,
+                                      std::optional<ReclaimRights> = std::nullopt) {
+        return true;
+    }
+
+    // A quote holds no checkpoint, so a waiting request retains nothing: when a lane frees, its
+    // source is quoted again from whatever the tree then holds.
+    void retain_source(Program&, std::uint64_t, const SourceChoice&) {}
+
+    [[nodiscard]] std::optional<SourceChoice> retained_source(std::uint64_t) const {
+        return std::nullopt;
+    }
+
+    [[nodiscard]] bool has_source_record(std::uint64_t) const { return false; }
+
+    [[nodiscard]] bool can_transfer_private(OwnerToken, std::uint64_t) const { return true; }
+
+    [[nodiscard]] std::uint32_t source_revocations(std::uint64_t) const { return 0; }
+
+    void binding_started(std::uint64_t, std::span<const Handle> retired, std::optional<Handle>) {
+        if (!retired.empty()) {
+            throw std::logic_error("hybrid binding retired checkpoint recovery points");
+        }
+    }
+
+    void release_source(Program&, std::uint64_t) {}
 
     [[nodiscard]] OwnerToken adopt(Program&, const SourceChoice&, const Base&, std::uint64_t,
                                    std::span<const Handle> carried, std::span<const Handle>) {
@@ -79,9 +106,11 @@ public:
     }
 
     [[nodiscard]] ReclaimCursor begin_reclaim(Program&,
-                                              std::optional<Admission> admission = std::nullopt) {
+                                              std::optional<Admission> admission = std::nullopt,
+                                              ReclaimRights rights               = {}) {
         ReclaimCursor cursor;
         cursor.admission = admission;
+        cursor.rights    = rights;
         return cursor;
     }
 
@@ -89,13 +118,13 @@ public:
     [[nodiscard]] std::optional<std::vector<Handle>>
     host_victims(Program&, std::size_t, std::optional<Handle>, std::span<const Handle> = {},
                  std::span<const Handle> = {}, std::optional<Admission> = std::nullopt,
-                 const ReclaimCursor* = nullptr) {
+                 const ReclaimCursor* = nullptr, ReclaimRights = {}) {
         return std::nullopt;
     }
 
     void commit_host_victims(Program&, std::span<const Handle>, ReclaimCursor&) {}
 
-    bool erase(Program&, Handle) { return false; }
+    bool erase(Program&, Handle, ReclaimRights = {}) { return false; }
 
     [[nodiscard]] ReclaimProgress reclaim(Program& program, ContextResourceUsage shortage,
                                           std::span<const Handle> = {}) {

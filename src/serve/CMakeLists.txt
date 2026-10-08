@@ -29,4 +29,4 @@ add_library(infernix_serve STATIC
 infernix_internal_includes(infernix_serve)
 target_link_libraries(infernix_serve
   PUBLIC infernix_engine Threads::Threads infernix::json infernix::httplib
-  PRIVATE infernix_media_acquire infernix_product_logging infernix_cuda_runtime)
+  PRIVATE infernix_media_acquire infernix_product_logging infernix_grammar infernix_cuda_runtime)

@@ -67,7 +67,15 @@ infernix_add_test(infernix_qwen3_5_prefix_real_test
 
 infernix_add_test(infernix_qwen3_5_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_preemption_real.cpp"
-  LIBRARIES infernix_engine)
+  LIBRARIES infernix_engine infernix::json)
+
+infernix_add_test(infernix_qwen3_5_grammar_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_grammar_real.cpp"
+  LIBRARIES infernix_engine infernix::json)
+
+infernix_add_test(infernix_qwen3_5_tools_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_tools_real.cpp"
+  LIBRARIES infernix_engine infernix::json)
 
 infernix_add_test(infernix_qwen3_5_hybrid_prefix_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_hybrid_prefix_real.cpp"
@@ -161,6 +169,8 @@ set(infernix_qwen3_5_real_tests
   infernix_qwen3_5_prefix_real_test
   infernix_qwen3_5_agent_continuation_real_test
   infernix_qwen3_5_preemption_real_test
+  infernix_qwen3_5_grammar_real_test
+  infernix_qwen3_5_tools_real_test
   infernix_qwen3_5_score_real_test
   infernix_qwen3_5_vision_workspace_test
   infernix_qwen3_5_dflash2_real_test
@@ -177,6 +187,15 @@ set_tests_properties(
   infernix_qwen3_5_context_store_test
   infernix_qwen3_5_visual_scatter_test
   PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu")
+
+infernix_add_test(infernix_qwen3_5_tool_constraints_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_constraints.cpp"
+  LIBRARIES infernix_model_runtime infernix_grammar infernix::json)
+
+add_test(NAME infernix_qwen3_5_tool_schema_oracle_test
+  COMMAND ${CMAKE_COMMAND} -E env
+    "INFERNIX_TOOL_PROBE=$<TARGET_FILE:infernix_qwen3_5_tool_constraints_test>"
+    ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/test_tool_schema.py")
 
 infernix_add_test(infernix_qwen3_5_text_qk_norm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_qk_norm_rope.cpp"

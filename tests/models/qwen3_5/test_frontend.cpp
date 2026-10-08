@@ -2056,6 +2056,104 @@ int test_terminal_flush(const Frontend& frontend) {
     return failures;
 }
 
+int test_tools_and_json_output() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.options.enable_thinking = false;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"record","strict":true,"parameters":{"type":"object","properties":{"x":{"type":"string","const":"ready"}},"required":["x"],"additionalProperties":false}}})");
+    auto prompt     = frontend.prepare(input);
+    const auto body = infernix::OutputConstraint::json_schema(
+        R"({"type":"object","properties":{"text":{"const":"<tool_call>"}},"required":["text"],"additionalProperties":false})");
+    const std::string json = R"({"text":"<tool_call>"})";
+    const std::string call = "<tool_call>\n<function=record>\n<parameter=x>\nready\n</"
+                             "parameter>\n</function>\n</tool_call>";
+    infernix::ToolChoice choice;
+    choice.constraints = infernix::ToolConstraintMode::Automatic;
+    int failures       = 0;
+    for (const auto& text : {json, call}) {
+        auto session = frontend.make_output_session(prompt, {}, {}, {}, body, choice);
+        // A discarded alternative must not select the publication branch.
+        const auto alternative = fixture_tokenizer().encode(text == json ? call : json);
+        (void)session.preview_model(alternative, alternative.size() + 1,
+                                    infernix::FinishReason::OutputLimit);
+        session.discard_preview();
+        failures += check(session.constraint_observation()->branch ==
+                              infernix::ConstraintOutputBranch::Undecided,
+                          "discarded output selected a constraint branch");
+        const auto branch = text == json ? infernix::ConstraintOutputBranch::Content
+                                         : infernix::ConstraintOutputBranch::Tools;
+        std::string visible;
+        for (auto token : fixture_tokenizer().encode(text)) {
+            (void)session.preview_model(std::span(&token, 1), 1000,
+                                        infernix::FinishReason::OutputLimit);
+            visible += channel_text(session.commit_preview(), infernix::OutputChannel::Content);
+            failures += check(session.constraint_observation()->branch == branch,
+                              "committed incomplete output lost its branch");
+        }
+        auto complete = session.constraint_observation();
+        failures += check(complete && complete->complete && !complete->terminated &&
+                              complete->branch == branch,
+                          "combined output lost complete-before-EOS state");
+        const auto eos = frontend.default_stop_policy().token_ids.front();
+        (void)session.preview_model(std::span(&eos, 1), 1, infernix::FinishReason::OutputLimit);
+        visible += channel_text(session.commit_preview(), infernix::OutputChannel::Content);
+        const auto observed = session.constraint_observation();
+        const auto calls    = session.take_tool_calls();
+        failures +=
+            check(observed->terminated &&
+                      observed->branch == (text == json ? infernix::ConstraintOutputBranch::Content
+                                                        : infernix::ConstraintOutputBranch::Tools),
+                  "combined output published the discarded branch");
+        failures +=
+            check(text == json ? visible == json && calls.empty()
+                               : visible.empty() && calls.size() == 1 && calls[0].name == "record",
+                  "JSON tool marker was parsed or actual tool framing leaked");
+    }
+    auto thinking_input                    = input;
+    thinking_input.options.enable_thinking = true;
+    auto thinking       = frontend.make_output_session(frontend.prepare(thinking_input), {}, {},
+                                                       {.budget = 1}, body, choice);
+    const auto thought  = frontend.tokenize_text("x");
+    const auto boundary = thinking.preview_model(thought, 1000, infernix::FinishReason::OutputLimit);
+    failures +=
+        check(boundary.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
+              "combined output lost the thinking budget");
+    (void)thinking.commit_preview();
+    failures += check(thinking.constraint_observation()->branch ==
+                              infernix::ConstraintOutputBranch::Undecided &&
+                          !thinking.constraint_observation()->complete,
+                      "reasoning selected or completed the JSON/tool branch");
+    const auto control = thinking.pending_control_tokens();
+    (void)thinking.preview_control(control, 1000);
+    thinking.discard_preview();
+    (void)thinking.preview_control(control, 1000);
+    (void)thinking.commit_preview();
+    const auto answer = fixture_tokenizer().encode(json);
+    (void)thinking.preview_model(answer, answer.size(), infernix::FinishReason::OutputLimit);
+    failures += check(
+        channel_text(thinking.commit_preview(), infernix::OutputChannel::Content) == json &&
+            thinking.constraint_observation()->complete &&
+            thinking.constraint_observation()->branch == infernix::ConstraintOutputBranch::Content,
+        "thinking control changed the combined output language");
+    input.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
+    input.messages.push_back(
+        {.role  = infernix::ChatRole::Assistant,
+         .parts = {{.kind = infernix::MessagePartKind::Text, .text = "{\"text\":\""}}});
+    auto continued    = frontend.prepare(input);
+    auto session      = frontend.make_output_session(continued, {}, {}, {}, body, choice);
+    const auto suffix = fixture_tokenizer().encode("<tool_call>\"}");
+    (void)session.preview_model(suffix, suffix.size(), infernix::FinishReason::OutputLimit);
+    const auto visible = channel_text(session.commit_preview(), infernix::OutputChannel::Content);
+    failures += check(visible == "<tool_call>\"}" && session.take_tool_calls().empty() &&
+                          session.constraint_observation()->complete &&
+                          !session.constraint_observation()->terminated,
+                      "combined JSON continuation changed literal marker or length completion");
+    return failures;
+}
+
 int test_structured_tool_output() {
     const Frontend frontend = make_frontend(resources());
 
@@ -2074,7 +2172,7 @@ int test_structured_tool_output() {
 
     const std::string generated =
         "Calling.  \n<tool_call>\n<function=TaskUpdate>\n<parameter=taskId>\n1\n"
-        "</parameter>\n<parameter=enabled>\n</parameter>\n<parameter=count>\nmany\n"
+        "</parameter>\n<parameter=enabled>\n\n</parameter>\n<parameter=count>\nmany\n"
         "</parameter>\n</function>\n</tool_call>";
     const std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
     const auto decision = session.preview_model(tokens, static_cast<std::uint32_t>(tokens.size()),
@@ -2155,6 +2253,31 @@ infernix::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& fronte
     input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
     input.options.enable_thinking = true;
     return frontend.prepare(std::move(input));
+}
+
+int test_constrained_thinking_control(const Frontend& frontend) {
+    auto prompt           = thinking_prompt(frontend);
+    const auto bare_close = frontend.tokenize_text("</think>");
+    auto session          = frontend.make_output_session(
+        prompt, {}, {}, {.budget = static_cast<std::uint32_t>(bare_close.size())},
+        infernix::OutputConstraint::grammar("root ::= \" yes\""));
+    const auto decision = session.preview_model(bare_close, 512, infernix::FinishReason::OutputLimit);
+    int failures =
+        check(decision.continuation == infernix::runtime::ContinuationAction::ApplyTargetControl,
+              "noncanonical close disabled the constrained thinking budget");
+    (void)session.commit_preview();
+    const auto control = session.pending_control_tokens();
+    if (control.empty()) return failures + check(false, "constrained thinking control is missing");
+    (void)session.preview_control(control, 512);
+    auto closed = session.commit_preview();
+    failures += check(channel_text(closed, infernix::OutputChannel::Content).empty(),
+                      "thinking framing leaked into constrained content");
+    (void)session.preview_model(frontend.tokenize_text(" yes"), 512,
+                                infernix::FinishReason::OutputLimit);
+    failures +=
+        check(channel_text(session.commit_preview(), infernix::OutputChannel::Content) == " yes",
+              "constrained content lost its leading space after thinking");
+    return failures;
 }
 
 int test_reasoning_close_requires_boundary(const Frontend& frontend) {
@@ -2261,8 +2384,11 @@ int test_tool_marker_after_quoted_marker() {
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
     auto prompt = frontend.prepare(std::move(input));
-    auto session =
-        frontend.make_output_session(prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64});
+    // Free tool output: a constrained call could not quote a malformed marker first.
+    infernix::ToolChoice free_calls;
+    free_calls.constraints = infernix::ToolConstraintMode::Automatic;
+    auto session           = frontend.make_output_session(
+        prompt, {}, infernix::OutputOptions{.tool_name_max_length = 64}, {}, {}, free_calls);
 
     const std::string quoted =
         "<tool_call>\\n<function=shell>\\n<function=command>\\nbroken\\n</parameter>\\n"
@@ -3081,12 +3207,14 @@ int main() {
     failures += test_same_token_stop_priority(frontend);
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
+    failures += test_tools_and_json_output();
     failures += test_tool_marker_after_quoted_marker();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
+    failures += test_constrained_thinking_control(frontend);
     failures += test_thinking_budget_message();
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_utf8_and_hidden_eos(frontend);

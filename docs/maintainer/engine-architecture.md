@@ -84,6 +84,13 @@ output boundary semantics that can be reconstructed exactly from the template hi
 The Frontend can preview the semantic effect of one model output; it is published only after the
 Engine commits. Wait order and the physical cache are both owned by lower layers.
 
+Compiled grammars for GBNF, JSON, JSON Schema, choice, regex and tool constraints are shared per
+vocabulary in the Frontend; each request's OutputSession holds its matcher. The Engine compiles on
+the submitting thread before queueing; the Program borrows the round's mask provider and passes the
+masks to GPU sampling and speculative acceptance. The matcher previews and commits with the output,
+and preemption and Replay keep its committed state. Timing and semantics are in the
+[constrained decoding design](constrained-decoding.md).
+
 ### 2.2 EngineCore and Scheduler
 
 EngineCore owns the request record, wait queue, resident slots, paused queue, cancellation, deadline,
@@ -365,6 +372,9 @@ boundary. Consumers receive only non-owning typed views.
 CUDA Graphs are built per legal exact-`B` topology; page IDs, request identity and state selectors are
 inputs, not graph keys. Ops own Graph update compatibility within their declared execution scope, and
 the Program captures complete units and validates same-kind updates at startup.
+A speculative unit runs as two Graphs, Forward and Finish: the CPU prepares the constraint masks
+between them, overlapping the target forward, and both share one resource reservation and commit
+boundary.
 Length buckets bound the resource scope; the Program does not duplicate the dispatch boundaries of
 the Attention Op's private kernels.
 

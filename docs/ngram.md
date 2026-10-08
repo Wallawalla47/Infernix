@@ -59,6 +59,11 @@ MTP follows the same rule: an all-neural round verifies at `--draft-tokens`, a r
 least one copy proposal at the ngram window, and in a multi-request copy round a row without a
 copy verifies its MTP proposal. Every MTP round drafts the next round at `--draft-tokens`.
 
+Copy rounds keep output constraints ([Constrained decoding](maintainer/constrained-decoding.md)):
+a constrained row's grammar masks are built from the drafts its round verifies, copied or neural,
+for every position up to the widest 63-draft window and its bonus column. A DFlash round hands
+its verified drafts to the Host after the copy overlay, before the target model runs.
+
 Larger widths can reduce target rounds on long copy spans but increase per-round attention,
 projection, replay and workspace costs, so measure both short and long contexts; the longest
 supported width need not be fastest. Copy rounds therefore verify at the narrowest captured

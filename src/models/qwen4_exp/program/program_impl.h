@@ -189,6 +189,9 @@ struct ContractAccess {
         out.timing_     = timing;
         return out;
     }
+    static void set_constraint_failed(PendingBatch& p, std::size_t row, bool failed) noexcept {
+        p.constraint_failed_[row] = failed;
+    }
     static const void* owner(const PendingBatch& p) noexcept { return p.owner_; }
     static std::uint64_t transaction(const PendingBatch& p) noexcept { return p.transaction_; }
     static std::span<const SequenceHandle> rows(const PendingBatch& p) noexcept {
@@ -547,7 +550,8 @@ public:
                   (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0);
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
-               4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W);
+               4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W) +
+               grammar_mask_bytes(d.token_domain, lanes, W);
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
@@ -683,6 +687,8 @@ public:
         allocate(gate_stats_, kGateStatsBytes * lanes, allocated);
         gate_stats_.fill(0);
         allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
+        allocate(grammar_masks_, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
+        grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
         constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
         publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
 
@@ -1403,7 +1409,7 @@ public:
         if (!lanes_[index].replay || lanes_[index].phase != Phase::Prefill) {
             throw std::logic_error("Qwen4Exp: replay on a lane that is not replaying");
         }
-        const PrefillProgress progress = advance_prefill(sequence);
+        const PrefillProgress progress = advance_prefill(sequence, nullptr); // replay samples nothing
         ReplayProgress out;
         out.processed_tokens = progress.processed_prompt_tokens;
         out.complete         = progress.complete;
@@ -1522,7 +1528,8 @@ public:
     }
 
     // ---------------------------------------------------------------- execution
-    PrefillProgress advance_prefill(SequenceHandle sequence) {
+    PrefillProgress advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks) {
+        const GrammarScope grammar(*this, masks);
         const auto start  = Clock::now();
         const auto index  = lane_of(sequence);
         Lane& lane        = lanes_[index];
@@ -1636,6 +1643,7 @@ public:
             lane.prefill_ns += out.timing.submit_host_ns;
             out.pending.emplace(ContractAccess::make_pending(this, ++next_transaction_, rows,
                                                              {pending_tokens_.data(), 1}, out.timing));
+            mark_grammar_failures(*out.pending, {});
             plain_round_ = false;
             pending_transaction_ = next_transaction_;
         } else {
@@ -1649,7 +1657,9 @@ public:
     // must not change it).
     const runtime::BeginSummary& prefill_summary(const Lane& lane) const noexcept { return lane.begin; }
 
-    PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets) {
+    PendingBatch decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
+                        runtime::TokenMaskProvider* masks) {
+        const GrammarScope grammar(*this, masks);
         const auto start = Clock::now();
         const auto batch = static_cast<std::int32_t>(sequences.size());
         if (batch <= 0 || batch > static_cast<std::int32_t>(options_.max_concurrency)) {
@@ -1777,8 +1787,10 @@ public:
             lanes_[lanes[b]].decode_share_ns += timing.submit_host_ns / static_cast<std::uint64_t>(batch);
         }
         pending_transaction_  = ++next_transaction_;
-        return ContractAccess::make_pending(this, pending_transaction_, sequences,
-                                            {pending_tokens_.data(), static_cast<std::size_t>(batch)}, timing);
+        auto pending = ContractAccess::make_pending(this, pending_transaction_, sequences,
+                                                    {pending_tokens_.data(), static_cast<std::size_t>(batch)}, timing);
+        mark_grammar_failures(pending, {});
+        return pending;
     }
 
     runtime::ExecutionTiming append_forced(std::span<const SequenceHandle> sequences, std::span<const TokenId> tokens,
@@ -3114,7 +3126,10 @@ private:
         const bool constrained = stage_constraints(lanes, W);
         if (constrained) { constrain(narrow, &target); }
         auto* configs = static_cast<ops::SamplingConfig*>(host_configs_.data());
-        for (std::int32_t b = 0; b < batch; ++b) { configs[b] = lanes_[lanes[b]].sampling; }
+        for (std::int32_t b = 0; b < batch; ++b) {
+            configs[b]      = lanes_[lanes[b]].sampling;
+            configs[b].mask = grammar_mask(static_cast<std::size_t>(b), drafts_[b]);
+        }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
         Tensor drafts(spec_device(spec_layout_.drafts), DType::I32, {K, batch});
         Tensor extents(spec_device(spec_layout_.extents), DType::I32, {batch});
@@ -3191,10 +3206,12 @@ private:
             lanes_[lanes[b]].decode_share_ns += timing.submit_host_ns / static_cast<std::uint64_t>(batch);
         }
         pending_transaction_ = ++next_transaction_;
-        return ContractAccess::make_pending(this, pending_transaction_, sequences,
-                                            {pending_tokens_.data(), static_cast<std::size_t>(batch * W)}, timing,
-                                            {pending_counts_.data(), static_cast<std::size_t>(batch)},
-                                            static_cast<std::uint32_t>(W));
+        auto pending = ContractAccess::make_pending(this, pending_transaction_, sequences,
+                                                    {pending_tokens_.data(), static_cast<std::size_t>(batch * W)},
+                                                    timing, {pending_counts_.data(), static_cast<std::size_t>(batch)},
+                                                    static_cast<std::uint32_t>(W));
+        mark_grammar_failures(pending, {pending_counts_.data(), static_cast<std::size_t>(batch)});
+        return pending;
     }
 
     // Commits a verification round: each row keeps its first accepted_tokens licensed tokens, so
@@ -3582,6 +3599,7 @@ private:
         auto* sample_positions = reinterpret_cast<std::int32_t*>(host_io() + io_layout_.positions);
         for (std::int32_t b = 0; b < batch; ++b) {
             configs[b]          = lanes_[lanes[b]].sampling;
+            configs[b].mask     = grammar_mask(static_cast<std::size_t>(b), {});
             sample_positions[b] = positions[b];
         }
         upload_pinned(configs_.p, configs, sizeof(ops::SamplingConfig) * batch, s);
@@ -3888,6 +3906,53 @@ private:
     static void commit_constraint_draws(Lane& lane, std::size_t accepted);
     // The readout of the lane's prompt from its last prefill call's logits (column 0).
     [[nodiscard]] PromptReadout read_prompt_frontier(const Lane& lane);
+    // ---- Constrained decoding (GBNF, JSON, JSON Schema, choice, regex, tool calls) ----
+    // The Engine's grammar matchers fill packed vocabulary masks for a row's positions 0..drafts
+    // (TokenMaskProvider); the sampler and draft acceptance read them through the row's sampling
+    // config. Sampling and acceptance run on the host-launched path after each forward, where every
+    // row's drafts are known, so no graph split is needed.
+    static std::size_t grammar_mask_bytes(std::int32_t token_domain, std::int32_t lanes, std::int32_t width) noexcept {
+        return 4ULL * ((static_cast<std::size_t>(token_domain) + 31) / 32) * static_cast<std::size_t>(width) *
+               static_cast<std::size_t>(lanes);
+    }
+    // Row `row`'s masks for positions 0..drafts.size(), uploaded; an empty mask when the row is
+    // unconstrained. Records which positions are dead ends (no legal token).
+    ops::SamplingMask grammar_mask(std::size_t row, std::span<const TokenId> drafts) {
+        grammar_dead_[row] = 0;
+        if (grammar_ == nullptr || !grammar_->constrained(row)) { return {}; }
+        if (drafts.size() + 1 > static_cast<std::size_t>(max_width_)) {
+            throw std::logic_error("Qwen4Exp: a constrained row verifies more positions than its mask holds");
+        }
+        const std::size_t words  = (static_cast<std::size_t>(token_domain_) + 31) / 32;
+        const std::size_t offset = row * static_cast<std::size_t>(max_width_) * words;
+        std::span<std::uint32_t> host(static_cast<std::uint32_t*>(grammar_host_.data()) + offset,
+                                      (drafts.size() + 1) * words);
+        grammar_dead_[row] = grammar_->fill(row, drafts, host);
+        auto* device_words = static_cast<std::uint32_t*>(grammar_masks_.p) + offset;
+        CUDA_CHECK(cudaMemcpyAsync(device_words, host.data(), host.size_bytes(), cudaMemcpyHostToDevice,
+                                   device_.stream));
+        grammar_->uploaded(row, host.size_bytes());
+        return {device_words, static_cast<std::int32_t>(words)};
+    }
+    // A row fails when the tokens it emits reach a dead-end position (one mask position per token).
+    void mark_grammar_failures(PendingBatch& pending, std::span<const std::int32_t> counts) const noexcept {
+        for (std::size_t row = 0; row < pending.row_count(); ++row) {
+            const auto count = counts.empty() ? 1 : counts[row];
+            const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
+            ContractAccess::set_constraint_failed(pending, row, (grammar_dead_[row] & reached) != 0);
+        }
+    }
+    // Set for the duration of one decode or prefill call.
+    struct GrammarScope {
+        ProgramImpl& impl;
+        GrammarScope(ProgramImpl& owner, runtime::TokenMaskProvider* masks) : impl(owner) { impl.grammar_ = masks; }
+        ~GrammarScope() { impl.grammar_ = nullptr; }
+    };
+    DeviceBuffer grammar_masks_;
+    PinnedHostBuffer grammar_host_{1};
+    runtime::TokenMaskProvider* grammar_ = nullptr;
+    std::array<std::uint64_t, kMaximumConcurrency> grammar_dead_{};
+
     DeviceBuffer constraint_;
     std::vector<std::int32_t> constraint_host_;
     std::int32_t constraint_columns_ = 0; // the staged round's columns

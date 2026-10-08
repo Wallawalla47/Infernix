@@ -211,6 +211,8 @@ int exercise_stream_observations(infernix::Engine& engine) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     const infernix::GenerationObservationOptions observation{
         .phase_timings = true, .live_timings = true, .prompt_progress = true};
 
@@ -259,6 +261,8 @@ int exercise_full_prefill_chunk(infernix::Engine& engine) {
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = false;
     options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     const infernix::GenerationResult result =
         engine.generate(engine.prepare_tokens(std::move(prompt)), options);
@@ -277,6 +281,8 @@ int exercise_abandoned_handle_capacity(infernix::Engine& engine) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = false;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     {
         auto abandoned = engine.submit(engine.prepare_tokens(prompt), request);
@@ -318,6 +324,8 @@ int exercise_zero_suffix_reuse(infernix::Engine& engine, const std::vector<infer
     baseline_options.execution.sampling.temperature    = 0.0F;
     baseline_options.execution.allow_prefix_reuse      = true;
     baseline_options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    baseline_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     const infernix::GenerationResult baseline =
         engine.generate(engine.prepare_tokens(prompt), baseline_options);
     if (baseline.generated_token_ids.size() != 8) {
@@ -334,6 +342,8 @@ int exercise_zero_suffix_reuse(infernix::Engine& engine, const std::vector<infer
     reuse_options.execution.sampling.temperature    = 0.0F;
     reuse_options.execution.allow_prefix_reuse      = true;
     reuse_options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    reuse_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     const infernix::GenerationResult reused =
         engine.generate(engine.prepare_tokens(exact_frontier), reuse_options);
     if (reused.reused_prompt_tokens != exact_frontier.size()) {
@@ -354,6 +364,8 @@ int exercise_prefix(infernix::Engine& engine) {
     first_options.execution.requested_output_tokens = 5;
     first_options.execution.sampling.temperature    = 0.0F;
     first_options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    first_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     const std::vector<infernix::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
     const infernix::GenerationResult first =
@@ -373,6 +385,8 @@ int exercise_prefix(infernix::Engine& engine) {
     reuse_options.execution.sampling.temperature    = 0.0F;
     reuse_options.execution.allow_prefix_reuse      = true;
     reuse_options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    reuse_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     const infernix::GenerationResult reused =
         engine.generate(engine.prepare_tokens(continuation), reuse_options);
 
@@ -401,6 +415,8 @@ int exercise_semantic_captures(const char* artifact) {
     request.execution.requested_output_tokens = 2;
     request.execution.sampling.temperature    = 0.0F;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     // Both inputs span several chunks. Raw input retains P; Chat retains its typed R.
     // Each fresh Engine has room for that one recovery state and its active writer.
@@ -451,6 +467,8 @@ int exercise_host_restore(const char* artifact) {
         request.execution.sampling.temperature    = 0.0F;
         request.execution.allow_prefix_reuse      = reuse;
         request.stop.include_model_defaults       = false;
+        // Cache scenarios exercise free model output; constrained tools need model stops.
+        request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
         return request;
     };
 
@@ -523,6 +541,8 @@ int exercise_explicit_prefix(const char* artifact) {
     request.execution.requested_output_tokens = 3;
     request.execution.sampling.temperature    = 0.0F;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     std::string description;
     for (std::uint32_t index = 0; index < 120; ++index) { description += "stable-schema "; }
@@ -618,6 +638,8 @@ int exercise_nested_tool_markers(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     // A single source creates both markers. Each probe changes the user suffix so the
     // private response/endpoint cannot satisfy the shared-prefix conformance check.
@@ -990,6 +1012,8 @@ int exercise_explicit_anchor_branch(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
     constexpr std::string_view stable =
         "This is the stable conversation prefix retained for a later branch.";
@@ -1092,6 +1116,8 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
         result.stop.include_model_defaults       = false;
+        // Cache scenarios exercise free model output; constrained tools need model stops.
+        result.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
         return result;
     };
 
@@ -1197,6 +1223,8 @@ int exercise_agent_continuation(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     const auto opener_tokens =
         static_cast<std::uint32_t>(engine.tokenize_text("<|im_start|>assistant\n<think>\n").size());
     const auto closing_tokens =
@@ -1348,6 +1376,8 @@ int exercise_rewrite_branch(const char* artifact) {
         value.execution.sampling.temperature    = 0.0F;
         value.execution.allow_prefix_reuse      = reuse;
         value.stop.include_model_defaults       = false;
+        // Cache scenarios exercise free model output; constrained tools need model stops.
+        value.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
         return value;
     };
 
@@ -1404,6 +1434,8 @@ int exercise_late_instructions(const char* artifact) {
     request.execution.sampling.temperature    = 0.0F;
     request.execution.allow_prefix_reuse      = true;
     request.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     auto previous                             = engine.generate(engine.prepare(input), request);
     if (previous.generated_token_ids.size() != 16 ||
         previous.prefix_reuse_path != infernix::PrefixReusePath::Root || previous.content.empty()) {
@@ -1516,6 +1548,8 @@ int exercise_vision(infernix::Engine& engine) {
         result.execution.sampling.temperature    = 0.0F;
         result.execution.allow_prefix_reuse      = reuse;
         result.stop.include_model_defaults       = false;
+        // Cache scenarios exercise free model output; constrained tools need model stops.
+        result.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
         return result;
     };
 
@@ -1673,6 +1707,8 @@ infernix::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     options.execution.sampling.temperature    = 0.0F;
     options.execution.allow_prefix_reuse      = reuse;
     options.stop.include_model_defaults       = false;
+    // Cache scenarios exercise free model output; constrained tools need model stops.
+    options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
     return options;
 }
 
@@ -1948,7 +1984,7 @@ int exercise_attention_integration(const char* artifact) {
     return 0;
 }
 
-int main() {
+int run_scenarios() {
     const char* artifact = std::getenv("INFERNIX_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
         std::cout << "skip: INFERNIX_TEST_ARTIFACT is not set\n";
@@ -2001,4 +2037,14 @@ int main() {
     }
     if (result == 0) { std::cout << "ok\n"; }
     return result;
+}
+
+int main() {
+    // A scenario failure reports its reason instead of terminating the process.
+    try {
+        return run_scenarios();
+    } catch (const std::exception& error) {
+        std::cerr << "prefix integration failed: " << error.what() << '\n';
+        return 1;
+    }
 }

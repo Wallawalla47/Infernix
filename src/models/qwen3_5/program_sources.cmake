@@ -14,6 +14,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/decode.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/grammar_masks.cpp"
 
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/startup.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/graph_profiles.cpp"

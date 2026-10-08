@@ -40,7 +40,7 @@ GenerationRequest question_request(const DecideRequest& request, const DecideQue
     // Only the declared tokens may end the run; the checkpoint's EOS is never among them.
     generation.ignore_eos = true;
     if (schedule) {
-        generation.constraint = schedule->constraint;
+        generation.token_constraint = schedule->constraint;
         generation.max_tokens = static_cast<int>(schedule->constraint.steps.size());
         if (schedule->terminator >= 0) { generation.stop_token_ids = {schedule->terminator}; }
         return generation;

@@ -12,8 +12,9 @@ namespace infernix::ops {
 inline constexpr int kSparseSpeculativeCandidates = 16;
 
 struct SpeculativeAcceptExecutionEnvelope {
-    // Execution promise: every row has temperature<=0 and both penalties disabled. When false,
-    // the general route remains valid for any supported mixture of greedy and stochastic rows.
+    // Execution promise: every row has temperature<=0, both penalties disabled and no token mask.
+    // When false, the general route remains valid for any supported mixture of greedy and
+    // stochastic rows.
     bool all_rows_greedy_without_penalties = false;
 };
 
