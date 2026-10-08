@@ -133,29 +133,31 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
     }
 }
 
-// FullRows = false guards rows >= `rows` (tail-capable schedules whose last row tile is partial).
-template <bool FullTokens, bool FullRows = true, class Output, class Epilogue>
+template <bool FullTokens, class Output, class Epilogue, bool FullRows = true>
 __device__ __forceinline__ void bf16_finish_fragment(const Output& output, const Epilogue& epilogue,
                                                      int row, int token, float4 value, int rows,
                                                      int tokens) {
     if constexpr (requires { epilogue.store_fragment(output, row, token, value, rows, tokens); }) {
-        static_assert(FullRows, "BF16 fragment consumers require complete row tiles");
+        static_assert(FullRows, "row-tail MMA requires a scalar epilogue");
         // A fragment consumer receives the atom origin and owns its token-tail predicates.
         epilogue.store_fragment(output, row, token, value, rows, tokens);
     } else {
-        const bool low = FullRows || row < rows, high = FullRows || row + 8 < rows;
         if (FullTokens || token < tokens) {
-            if (low) output.store(row, token, epilogue.apply(row, token, value.x));
-            if (high) output.store(row + 8, token, epilogue.apply(row + 8, token, value.z));
+            if (FullRows || row < rows)
+                output.store(row, token, epilogue.apply(row, token, value.x));
+            if (FullRows || row + 8 < rows)
+                output.store(row + 8, token, epilogue.apply(row + 8, token, value.z));
         }
         if (FullTokens || token + 1 < tokens) {
-            if (low) output.store(row, token + 1, epilogue.apply(row, token + 1, value.y));
-            if (high) output.store(row + 8, token + 1, epilogue.apply(row + 8, token + 1, value.w));
+            if (FullRows || row < rows)
+                output.store(row, token + 1, epilogue.apply(row, token + 1, value.y));
+            if (FullRows || row + 8 < rows)
+                output.store(row + 8, token + 1, epilogue.apply(row + 8, token + 1, value.w));
         }
     }
 }
 
-template <class Schedule, bool FullTokens, bool FullRows = true, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, class Output, class Epilogue>
 __device__ __forceinline__ void
 bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned char* scratch,
                      float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
@@ -165,7 +167,7 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                       epilogue.template finish_tile<Schedule, FullTokens>(
                           destination, scratch, accum, row_begin, token_begin, rows, tokens);
                   }) {
-        static_assert(FullRows, "collective BF16 epilogues require complete row tiles");
+        static_assert(!bf16_predicated_rows<Schedule>, "row-tail MMA requires a scalar epilogue");
         // All staging reads must have finished before a collective consumer reuses scratch.
         __syncthreads();
         epilogue.template finish_tile<Schedule, FullTokens>(destination, scratch, accum, row_begin,
@@ -180,9 +182,10 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                 const int token =
                     token_begin + wn * Schedule::kWarpTokens + ni * 8 + 2 * (lane & 3);
                 const auto& v = accum[mi][ni];
-                bf16_finish_fragment<FullTokens, FullRows>(destination, epilogue, row, token,
-                                                           make_float4(v[0], v[1], v[2], v[3]),
-                                                           rows, tokens);
+                bf16_finish_fragment<FullTokens, decltype(destination), Epilogue,
+                                     !bf16_predicated_rows<Schedule>>(
+                    destination, epilogue, row, token, make_float4(v[0], v[1], v[2], v[3]), rows,
+                    tokens);
             }
         }
     }
