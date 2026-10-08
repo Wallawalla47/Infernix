@@ -44,7 +44,7 @@ infernix_add_op_test(infernix_linear_fp8_a8_test
 
 infernix_add_op_test(infernix_linear_bf16_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_bf16_a16.cpp"
-  LIBRARIES infernix_ops)
+  LIBRARIES infernix_linear_test_support)
 
 # FP32 projections (router and lm_head logits), BF16 and q8_g32_fp16 weights, against FP64.
 infernix_add_op_test(infernix_projection_fp32_test

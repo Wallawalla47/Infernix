@@ -5,9 +5,14 @@
 #include "core/device.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/op_tester.h"
+#include "ops/linear/linear_test_common.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <initializer_list>
+#include <limits>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include <exception>
@@ -488,16 +493,159 @@ int run_bf16_linear() {
     return failures;
 }
 
+// NInfer's text geometries. Infernix's BF16 selectors serve any column count, the vision shapes too
+// (run_vision_bf16_linear covers those against the oracle), so no geometry has a restricted domain.
+struct Geometry {
+    int n, k;
+    std::initializer_list<int> boundaries;
+};
+
+constexpr std::array kNewGeometries{
+    Geometry{48, 2560, {1, 8, 12, 16, 128}},
+    Geometry{96, 2560, {1, 4, 16, 128, 512}},
+    Geometry{1664, 2560, {1, 16, 48, 64, 96, 128, 512}},
+    Geometry{324, 10240, {1, 8, 48, 96, 128, 512}},
+    Geometry{320, 10240, {1, 8, 48, 96, 128, 512}},
+    Geometry{10240, 320, {1, 16, 48, 64, 128}},
+    Geometry{12800, 2560, {1, 8, 16, 32, 48, 64, 96, 128, 512}},
+    Geometry{248320, 2560, {1, 8, 16, 32, 64, 96}},
+    Geometry{13952, 2560, {1, 8, 16, 32, 48, 64, 96, 128, 512}},
+    Geometry{2560, 6144, {1, 8, 16, 32, 64, 96, 128, 512}},
+    Geometry{2560, 2560, {1, 8, 32, 48, 64, 96, 128, 512, 2048}},
+    // Infernix's Qwen3.8-Flash-Next shapes.
+    Geometry{16384, 2560, {1, 8, 32, 64, 128, 256, 512}},
+    Geometry{1280, 2560, {1, 8, 64, 128, 384, 512}},
+    Geometry{2560, 640, {1, 8, 32, 192, 384, 512}},
+};
+
+infernix::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {
+    auto result = infernix::test::linear::make_bf16_weight(n, k, seed);
+    for (int row = 0; row < n; ++row) {
+        for (int column = 0; column < k; column += 2) {
+            const auto offset = (static_cast<std::size_t>(row) * k + column) * 2;
+            auto value =
+                infernix::test::quantized_weight::detail::load_u16_le(result.payload, offset);
+            if (column == k - 2 && (value & 0x7fff) == 0) value = 0x3d80;
+            infernix::test::quantized_weight::detail::store_u16_le(result.payload, offset, value);
+            infernix::test::quantized_weight::detail::store_u16_le(result.payload, offset + 2, value);
+        }
+    }
+    return result;
+}
+
+int run_new_bf16_geometry(const Geometry& shape) {
+    using namespace infernix::test::linear;
+    const int step    = 1;
+    const int maximum = std::numeric_limits<int>::max();
+    const bool wide   = shape.n == 2560 && shape.k == 2560;
+    int failures      = 0;
+    for (const auto policy :
+         {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8, ops::LinearPolicy::AllowA4}) {
+        if (ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy, step,
+                                                 maximum) != 0) {
+            std::cerr << "BF16: expected zero workspace across the admitted column domain\n";
+            ++failures;
+        }
+        const std::vector<std::pair<int, int>> invalid{{0, step}, {-1, step}, {8, 4}};
+        for (auto [lo, hi] : invalid) {
+            try {
+                (void)ops::linear_workspace_capacity_bytes(QType::BF16, shape.n, shape.k, policy,
+                                                           lo, hi);
+                std::cerr << "BF16: accepted an invalid column domain\n";
+                ++failures;
+            } catch (const std::invalid_argument&) {}
+        }
+    }
+    failures += verify_workspace_envelopes(QType::BF16, shape.n, shape.k);
+    std::set<int> points;
+    if (shape.n <= 640) {
+        for (int t = step; t <= 128; t += step) points.insert(t);
+    } else {
+        for (int t : {1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128})
+            points.insert(t);
+    }
+    points.insert({129, 256, 512, 1024, 1025});
+    if (wide) points.insert({2048, 4096});
+    for (int end : shape.boundaries)
+        for (int t : {end - step, end, end + step})
+            if (t >= step && t <= maximum && t % step == 0) points.insert(t);
+    std::vector<Invocation> calls;
+    for (int t : points) calls.push_back({t});
+    std::set<int> anchors{step, 4, 8, 128, 512, 1024};
+    if (wide) anchors.insert({2048, 4096});
+    for (int t : anchors) {
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        calls.push_back({t, CallForm::A16Convenience});
+    }
+    for (int end : shape.boundaries) {
+        for (int t : {end, end + step})
+            if (t >= step && t <= maximum && t % step == 0)
+                calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        if (end >= step && end % step == 0) calls.push_back({end, CallForm::A16Convenience});
+    }
+    calls.push_back({17, CallForm::Policy, ops::LinearPolicy::AllowA8});
+    calls.push_back({64, CallForm::Policy, ops::LinearPolicy::AllowA4});
+    const std::uint32_t seed = static_cast<std::uint32_t>(shape.n + shape.k + 431);
+    failures += run_shape("BF16_A16", ActivationCompute::A16, make_bf16_weight,
+                          {shape.n, shape.k, seed,
+                           shape.n <= 640 ? Comparison::Full : Comparison::Sampled, true, calls});
+    if (shape.n > 640) {
+        std::set<int> full_points{step, 4, 8};
+        std::vector<Invocation> full;
+        for (int t : full_points) full.push_back({t});
+        failures += run_shape("BF16_A16 full", ActivationCompute::A16, make_bf16_weight,
+                              {shape.n, shape.k, seed + 1, Comparison::Full, true, full});
+    }
+    if (shape.n <= 640 || shape.k == 320 || shape.k % 64 != 0) {
+        std::set<int> tail_points{step, 4, 8, 128};
+        std::vector<Invocation> tail;
+        for (int t : tail_points) tail.push_back({t});
+        tail.push_back({128, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+        failures += run_shape("BF16_A16 K tail", ActivationCompute::A16, make_bf16_weight,
+                              {shape.n, shape.k, seed + 2,
+                               shape.n <= 640 ? Comparison::Full : Comparison::Sampled, true, tail,
+                               ActivationPattern::KTail});
+    }
+    if (shape.n <= 96) {
+        const std::array cancel{Invocation{1}, Invocation{4}, Invocation{8}, Invocation{128},
+                                Invocation{8, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+        failures += run_shape("BF16_A16 cancellation", ActivationCompute::A16, cancellation_weight,
+                              {shape.n, shape.k, seed + 3, Comparison::Full, true, cancel,
+                               ActivationPattern::Cancellation});
+    }
+    return failures;
+}
+
+int run_new_bf16(int selected_n = 0, int selected_k = 0) {
+    int failures = 0;
+    bool found   = selected_n == 0;
+    for (const auto& shape : kNewGeometries) {
+        if (selected_n && (shape.n != selected_n || shape.k != selected_k)) continue;
+        found = true;
+        failures += run_new_bf16_geometry(shape);
+    }
+    if (!found) throw std::invalid_argument("BF16 test: unknown geometry");
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (infernix::test::cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     try {
-        const int failures = run_bf16_linear();
+        int n = 0, k = 0;
+        if (argc == 4 && std::string_view(argv[1]) == "--shape") {
+            n = std::stoi(argv[2]);
+            k = std::stoi(argv[3]);
+            if (n <= 0 || k <= 0) throw std::invalid_argument("BF16 test: positive N/K required");
+        } else if (argc != 1) {
+            throw std::invalid_argument("usage: infernix_linear_bf16_a16_test [--shape N K]");
+        }
+        const int failures = (n == 0 ? run_bf16_linear() : 0) + run_new_bf16(n, k);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -166,7 +166,7 @@ template <int BlockRows, int BlockTokens, int KWarps, int WarpK = 64, int Stages
 struct Bf16A16SlicedKMmaSchedule {
     static_assert(BlockRows > 0 && BlockRows % 16 == 0);
     static_assert(BlockTokens > 0 && BlockTokens % 8 == 0);
-    static_assert(KWarps == 2 || KWarps == 4 || KWarps == 8 || KWarps == 16);
+    static_assert(KWarps > 0 && KWarps <= 32);
     static_assert(WarpK > 0 && WarpK % 64 == 0);
     static_assert(Stages >= 1 && Stages <= 8 && MinBlocksPerSm > 0);
     static constexpr int kStaticK            = 0;
@@ -193,7 +193,7 @@ struct Bf16A16SlicedKMmaSchedule {
 
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens, int Stages,
           int MinBlocksPerSm = 1, Bf16MmaRaster Raster = Bf16MmaRaster::TokenFast,
-          int RasterGroupRows = 1>
+          int RasterGroupRows = 1, int ConsumerKUnroll = 1>
 struct Bf16A16TmaMmaSchedule
     : Bf16A16MmaSchedule<BlockRows, BlockTokens, BlockK, WarpRows, WarpTokens, Stages,
                          MinBlocksPerSm, Cache::cg, Cache::cg, Bf16MmaFragmentPipeline::PingPong,
@@ -204,21 +204,50 @@ struct Bf16A16TmaMmaSchedule
     static constexpr int kTensorBytes     = Stages * (BlockRows + BlockTokens) * BlockK * 2;
     static constexpr int kBarrierBytes    = Stages * 2 * sizeof(std::uint64_t);
     static constexpr int kSharedBytes     = kTensorBytes + kBarrierBytes;
+    static constexpr int kConsumerKUnroll = ConsumerKUnroll;
     static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
     static_assert(BlockRows <= 256 && BlockTokens <= 256 && BlockK <= 16384);
+    static_assert(ConsumerKUnroll > 0);
 };
 
-// Tail-capable TMA form for problems whose N or K is not a tile multiple (the vision MLP's 4304).
-// Both operands are read through 2-D tensor maps in one 64-element K box per stage; out-of-bounds
-// box elements zero-fill, so a partial K tile adds nothing and a partial row tile computes rows
-// that the store discards.
+// Row predicates preserve the compact physical matrix; full-tile schedules keep their fast path.
+template <class Schedule>
+struct Bf16RowTailSchedule : Schedule {
+    static constexpr bool kPredicatedRows = true;
+};
+
+template <class Schedule>
+inline constexpr bool bf16_predicated_rows = [] {
+    if constexpr (requires { Schedule::kPredicatedRows; })
+        return Schedule::kPredicatedRows;
+    else
+        return false;
+}();
+
+// K predicates zero-fill the final vector/tile without padding the compact physical rows.
+template <class Schedule>
+struct Bf16KTailSchedule : Schedule {
+    static constexpr bool kPredicatedK = true;
+};
+
+template <class Schedule>
+inline constexpr bool bf16_predicated_k = [] {
+    if constexpr (requires { Schedule::kPredicatedK; })
+        return Schedule::kPredicatedK;
+    else
+        return false;
+}();
+
+// Infernix's name for a TMA schedule over problems whose N or K is not a tile multiple (the vision
+// MLP's 4304): one 64-element K box per stage with NInfer's row and K predicates.
 template <int BlockRows, int BlockTokens, int WarpRows, int WarpTokens, int Stages,
           int MinBlocksPerSm = 1, Bf16MmaRaster Raster = Bf16MmaRaster::TokenFast,
           int RasterGroupRows = 1>
 struct Bf16A16TmaTailMmaSchedule
     : Bf16A16TmaMmaSchedule<BlockRows, BlockTokens, 64, WarpRows, WarpTokens, Stages,
                             MinBlocksPerSm, Raster, RasterGroupRows> {
-    static constexpr bool kTail = true;
+    static constexpr bool kPredicatedRows = true;
+    static constexpr bool kPredicatedK    = true;
 };
 
 // Static K and optional whole-call token specialization do not restrict the generic template.
