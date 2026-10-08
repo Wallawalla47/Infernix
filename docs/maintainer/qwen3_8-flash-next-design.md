@@ -7425,7 +7425,19 @@ the drive's knee) remains open.
     layer per chunk.
 - **Interactions.**
   - An abort inside a span leaves no endpoint: the layers are at different positions.
-  - Another lane's prefill calls run without the ring while a walk holds it.
+  - Another lane's prefill waits while a walk runs (`context_blocks`).
+  - **Two prompts at once (2026-10-08).** A walk first started only when no other lane was
+    prefilling, so two long prompts prefilling together both ran chunk-major, re-streaming every
+    expert per call: ~2.2K tok/s each, against ~6.9K for one (31 of 244 busy minutes of the
+    2026-10-08 serve log were in that state). A walk now starts beside another prefilling lane,
+    which waits for its span, and the spans of the two prompts alternate; a held lease without a
+    walk area for the span (the other lane's chunk-major calls lent it) goes back and is lent again
+    with one, between calls. Measured (`fn/rigs/trim/walk_ab.py`, deployed launcher settings,
+    pairs of fresh ~90K prompts sent together, ABBA, two arms each): a pair that prefills together
+    takes 26.1 s instead of 72.5-73.1 s (each prompt 6.9-7.0K tok/s instead of 2.3-2.6K); pairs
+    whose prompts did not overlap are unchanged; greedy text equal in all 6 prompts of every arm.
+    The two prompts finish together (TTFT ~25 s each) where finishing the older first would give
+    ~13 and ~26 s; the scheduler's round-robin decides that order.
   - A Vision window cannot take the lease back from a walk.
   - The LFRU state is credited once per span (from the last chunk's routes) instead of once per
     call; every chunk routes nearly every expert, so the credited set is about the same.
