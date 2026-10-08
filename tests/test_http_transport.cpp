@@ -339,6 +339,12 @@ int test_inherited_socket_liveness() {
         socket_option_equals<DWORD>(accepted.get(), IPPROTO_TCP, TCP_MAXRTMS, 15000),
         "accepted HTTP socket did not inherit TCP_MAXRTMS");
 #    else
+#        if defined(__linux__)
+    // Both reuse options, so a server setting either one binds the port right after a stop.
+    failures += check(socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEADDR, 1) &&
+                          socket_option_equals(listener.get(), SOL_SOCKET, SO_REUSEPORT, 1),
+                      "HTTP listener lacks SO_REUSEADDR or SO_REUSEPORT");
+#        endif
     failures += check(socket_option_equals(accepted.get(), SOL_SOCKET, SO_KEEPALIVE, 1),
                       "accepted HTTP socket did not inherit SO_KEEPALIVE");
     failures += check(socket_option_equals(accepted.get(), IPPROTO_TCP, TCP_KEEPIDLE, 10),

@@ -203,6 +203,12 @@ void configure_http_server_socket(socket_t socket) noexcept {
     httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // cpp-httplib sets only SO_REUSEPORT. The listener's options pass to the connections it
+    // accepts, and Linux binds over their TIME_WAIT remnants only when both sides share a reuse
+    // option, so another server that sets just SO_REUSEADDR (llama.cpp, vLLM, uvicorn) could not
+    // bind this port for about a minute after Infernix stops, nor Infernix after it (upstream
+    // #341). With both set, either kind binds at once.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
