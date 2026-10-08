@@ -145,20 +145,20 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
         return;
     }
     // Budgeted admission: best candidates first, each only if it outranks the victim it replaces.
-    std::vector<std::uint32_t> candidates = *misses;
-    std::sort(candidates.begin(), candidates.end(), [this](std::uint32_t a, std::uint32_t b) {
+    ranked_.assign(misses->begin(), misses->end());
+    std::sort(ranked_.begin(), ranked_.end(), [this](std::uint32_t a, std::uint32_t b) {
         const double sa = score(a), sb = score(b);
         return sa != sb ? sa > sb : a < b;
     });
-    for (std::uint32_t k : candidates) {
+    for (std::uint32_t k : ranked_) {
         if (out.admitted.size() >= admission_budget) { break; }
         if (residents_.size() >= capacity_) {
-            std::vector<std::uint32_t> v;
-            select_victims(1, group, v);
-            if (v.empty() || !(score(k) > score(v[0]))) { break; }
-            if (evictable != nullptr && !(*evictable)(v[0])) { break; } // the tier's demotion allowance is spent
-            erase(v[0]);
-            out.victims.push_back(v[0]);
+            victim_.clear();
+            select_victims(1, group, victim_);
+            if (victim_.empty() || !(score(k) > score(victim_[0]))) { break; }
+            if (evictable != nullptr && !(*evictable)(victim_[0])) { break; } // the tier's demotion allowance is spent
+            erase(victim_[0]);
+            out.victims.push_back(victim_[0]);
         }
         insert(k);
         out.admitted.push_back(k);
@@ -169,11 +169,11 @@ std::optional<std::uint32_t> LfruPolicy::promote(std::uint32_t key, std::span<co
     if (resident(key)) { return std::nullopt; }
     std::optional<std::uint32_t> victim;
     if (residents_.size() >= capacity_) {
-        std::vector<std::uint32_t> v;
-        select_victims(1, protect, v);
-        if (v.empty()) { throw std::logic_error("LFRU: every resident is protected"); }
-        erase(v[0]);
-        victim = v[0];
+        victim_.clear();
+        select_victims(1, protect, victim_);
+        if (victim_.empty()) { throw std::logic_error("LFRU: every resident is protected"); }
+        erase(victim_[0]);
+        victim = victim_[0];
     }
     insert(key);
     return victim;

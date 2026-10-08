@@ -112,6 +112,8 @@ private:
     std::vector<std::pair<double, std::uint32_t>> scratch_;
     std::vector<double> scores_;           // scratch: residents' scores, in residents_ order
     std::vector<std::uint32_t> candidates_;
+    std::vector<std::uint32_t> ranked_; // scratch: budgeted admission's candidates, best first
+    std::vector<std::uint32_t> victim_; // scratch: one victim at a time
 };
 
 // What a warm start needs (design §19.3.5 S4b): every key's LFRU count, and the resident keys,
