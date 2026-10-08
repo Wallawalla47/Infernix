@@ -48,9 +48,10 @@ import workload
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-DEPLOY = os.environ.get("AB_DEPLOY", r"E:\NInfer-Deploy-V3")
-LAUNCH_BAT = os.environ.get("AB_LAUNCH_BAT",
-                            os.path.join(DEPLOY, "LaunchQwen3.8-27B-official-dflash2-ngram.bat"))
+# Machine-specific locations come from the environment (main() refuses to start without them).
+DEPLOY = os.environ.get("AB_DEPLOY")
+LAUNCH_BAT = os.environ.get("AB_LAUNCH_BAT") or (
+    os.path.join(DEPLOY, "LaunchQwen3.8-27B-official-dflash2-ngram.bat") if DEPLOY else None)
 MODEL = os.environ.get("AB_MODEL")  # default: the model path in the launch bat
 TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
                                os.path.join(REPO, "build-windows", "apps", "Release",
@@ -70,9 +71,9 @@ ALT_LABEL = os.environ.get("AB_ALT_LABEL", "")
 CONTROL_LABEL = os.environ.get("AB_CONTROL_LABEL", "")
 # AB_CONTROL_KIND=strata runs the control arm as a Strata server (StrataServe) instead of a serve build.
 CONTROL_KIND = os.environ.get("AB_CONTROL_KIND", "serve")
-STRATA_DIR = os.environ.get("AB_STRATA_DIR", r"E:\Strata\Strata")
-STRATA_CONFIG = os.environ.get("AB_STRATA_CONFIG",
-                               os.path.join(STRATA_DIR, "strata-unsloth-ud-q4_k_xl.json"))
+STRATA_DIR = os.environ.get("AB_STRATA_DIR")
+STRATA_CONFIG = os.environ.get("AB_STRATA_CONFIG") or (
+    os.path.join(STRATA_DIR, "strata-unsloth-ud-q4_k_xl.json") if STRATA_DIR else None)
 STRATA_EXTRA_ARGS = os.environ.get("AB_STRATA_EXTRA_ARGS", "").split()
 TREATMENT_LABEL = os.environ.get("AB_TREATMENT_LABEL", "")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
@@ -894,6 +895,10 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
     if not seeds or len(set(seeds)) != len(seeds):
         raise SystemExit("--seeds needs distinct integers")
+    if not LAUNCH_BAT:
+        raise SystemExit("set AB_LAUNCH_BAT (the launch .bat whose model and flags the arms use) or AB_DEPLOY")
+    if CONTROL_KIND == "strata" and "control" in arms and not STRATA_DIR:
+        raise SystemExit("AB_CONTROL_KIND=strata needs AB_STRATA_DIR (the Strata checkout)")
 
     out_dir = args.out or os.path.join(OUT_ROOT, time.strftime("%Y%m%d-%H%M%S"))
     os.makedirs(out_dir, exist_ok=True)

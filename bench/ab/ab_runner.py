@@ -32,24 +32,21 @@ import ab_workloads
 
 # Outputs (report, arm logs, done marker) are written next to this script.
 AB_DIR = os.path.dirname(os.path.abspath(__file__))
-# Every path below defaults to this machine's layout; override with the matching
-# AB_* environment variable to run the same rig against your own builds/machine:
-#   AB_DEPLOY, AB_MODEL, AB_CONTROL_EXE, AB_TREATMENT_EXE, AB_PRODUCTION_BAT,
-#   AB_HOST, AB_PORT
-DEPLOY = os.environ.get("AB_DEPLOY", r"E:\NInfer-Deploy-V3")
+# Paths come from AB_* environment variables (see README.md):
+#   AB_DEPLOY (required: the deploy directory the servers run in), AB_MODEL, AB_CONTROL_EXE,
+#   AB_TREATMENT_EXE, AB_PRODUCTION_BAT, AB_HOST, AB_PORT
+DEPLOY = os.environ.get("AB_DEPLOY")
+if not DEPLOY:
+    raise SystemExit("set AB_DEPLOY to the deploy directory holding the model and the production launcher")
 MODEL = os.environ.get("AB_MODEL",
                        os.path.join(DEPLOY, "qwen3_8_27b_nvfp4-official.ninfer"))
-# Control = NInfer + Windows port (f2406102), built from a control worktree via
-# control_build.bat. Prefer this directory's own control build; fall back to the
-# machine-specific build location.
-_control_default = os.path.join(AB_DIR, "control", "build", "apps", "Release",
-                                "infernix-serve.exe")
-if not os.path.exists(_control_default):
-    _control_default = r"E:\NInfer-V3\deploy-working\ab\control\build\apps\Release\infernix-serve.exe"
-CONTROL_EXE = os.environ.get("AB_CONTROL_EXE", _control_default)
-# Treatment = Infernix's current master, the existing Windows build.
+# Control = NInfer + Windows port (f2406102), built from a control worktree via control_build.bat.
+CONTROL_EXE = os.environ.get("AB_CONTROL_EXE",
+                             os.path.join(AB_DIR, "control", "build", "apps", "Release", "infernix-serve.exe"))
+# Treatment = this checkout's Windows build.
 TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE",
-                               r"E:\NInfer-V3\build-windows\apps\Release\infernix-serve.exe")
+                               os.path.join(AB_DIR, "..", "..", "build-windows", "apps", "Release",
+                                            "infernix-serve.exe"))
 PRODUCTION_BAT = os.environ.get(
     "AB_PRODUCTION_BAT", os.path.join(DEPLOY, "LaunchQwen3.8-27B-official-dflash2-ngram.bat"))
 REPORT = os.path.join(AB_DIR, "ab_report.md")

@@ -65,7 +65,6 @@ other references own narrower contracts:
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
 | [Qwen3.8-Flash-Next design](maintainer/qwen3_8-flash-next-design.md) | temporary design proposal (partly implemented; status in §19.1): bit-exact import of NVIDIA's NVFP4 checkpoint with exact W4A4 expert arithmetic, host-resident experts with CPU miss service and a VRAM expert cache, NVMe n-gram table, QSA over every KV profile (262K `int8` first), performance model and milestones |
-| [Qwen3.8-Flash-Next handoff](maintainer/qwen3_8-flash-next-handoff.md) | temporary note for continuing the work on the GPU machine: file map, verification status, next steps |
 
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config

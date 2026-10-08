@@ -42,7 +42,9 @@ defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserv
 the exact 64K, 128K, and safe 260K prompt profiles at eleven depths in both languages (66 samples).
 The 260K profile uses the exact local 35B tokenizer and leaves more than 2K native context tokens
 for chat framing and its bounded 512-token answer. All profiles use rule scoring and explicitly
-disable thinking so the observable answer is the retrieved needle.
+disable thinking so the observable answer is the retrieved needle. Its `local_path` (the ModelScope
+`Needle-in-a-Haystack-Corpus` snapshot) and `tokenizer_path` (the Qwen3.6-35B-A3B checkpoint) are
+placeholders: set them to your copies first.
 
 A target defines the model service:
 
