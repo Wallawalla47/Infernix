@@ -476,10 +476,16 @@ Documentation: [CLI](docs/cli.md), [serving](docs/serving.md), [perplexity](docs
 Issues and pull requests of any kind are very welcome: bug reports, questions, measurements on
 other GPUs and machines (PCIe x16 results especially), fixes, features and documentation.
 
+## Support
+
+Infernix is developed with Claude Code. If you would like to help pay for that subscription, you can
+[sponsor me on GitHub](https://github.com/sponsors/Wallawalla47).
+
 ## Thanks
 
 Infernix exists because of **[Neroued](https://github.com/Neroued)**, who created NInfer and built
-the engine, artifact format and kernels this project grew from — thank you. A particular thank you
+the engine, artifact format and kernels this project grew from — thank you. Please support the
+creator of the original NInfer [on Ko-fi](https://ko-fi.com/neroued). A particular thank you
 also to the creator of **[Strata](https://github.com/Niko1221/Strata)** ([Niko1221](https://github.com/Niko1221)),
 whose engine set the bar for Qwen3.8-Flash-Next on a single GPU, whose transcription of the model's
 mathematics and published measurements guided this implementation, and whose community's ideas
