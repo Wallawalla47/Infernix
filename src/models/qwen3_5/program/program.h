@@ -167,17 +167,33 @@ struct SourceCandidate {
     std::uint32_t reused_tokens = 0;
     runtime::PrefillWork remaining_work;
     std::vector<runtime::ContextTransferRequirement> transfers;
-    bool consume_private = false;
-    bool move_state      = false;
-    bool move_history    = false;
-    bool split_state     = false;
-    bool backup_state    = false;
+    bool consume_source = false;
+    bool take_private   = false;
+    bool move_state     = false;
+    bool move_history   = false;
+    bool split_state    = false;
+    bool backup_state   = false;
+    // Compatible carry intent. Binding may consume the selected point if its State slot
+    // is necessary for execution and no preservation destination can be obtained.
     std::vector<CheckpointHandle> private_points;
+    // Authorized retirement, applied only after binding capacity has been checked.
+    std::vector<CheckpointHandle> retired_points;
     // Hybrid prefix cache source (docs/maintainer/hybrid-prefix-cache-spec.md §6): a quote of
     // the block-tree path and snapshot to resume from, or of a root start. A binding started from
     // it activates the lane from cached blocks instead of a checkpoint.
     std::shared_ptr<const detail::HybridQuoteImpl> hybrid;
     PrefixReusePath reuse_path = PrefixReusePath::Checkpoint;
+};
+
+struct BindingReservation {
+    bool reserved          = false;
+    bool source_valid      = true;
+    bool capacity_possible = true;
+    runtime::ContextResourceUsage shortage;
+    std::vector<CheckpointHandle> retired_points;
+    std::optional<CheckpointHandle> consumed_source;
+
+    explicit operator bool() const noexcept { return reserved; }
 };
 
 // Outcome of saving or restoring the hybrid prefix cache's Host tier.
@@ -309,7 +325,8 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_),
+          constraint_failed_(other.constraint_failed_) {
         other.tokens_     = {};
         other.row_counts_ = {};
         other.row_stride_ = 0;
@@ -328,6 +345,10 @@ public:
 
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
+    [[nodiscard]] bool constraint_failed(std::size_t row) const {
+        return constraint_failed_.at(row);
+    }
+
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
 
 private:
@@ -339,6 +360,7 @@ private:
     std::span<const std::int32_t> row_counts_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
+    std::array<bool, kMaximumConcurrency> constraint_failed_{};
 
     friend struct detail::ContractAccess;
 };
@@ -447,8 +469,9 @@ public:
                                            const ScoreOptions& options);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                   bool consume_private                             = false,
-                   std::span<const CheckpointHandle> private_points = {}) const;
+                   bool consume_source                              = false,
+                   std::span<const CheckpointHandle> private_points = {},
+                   std::span<const CheckpointHandle> retired_points = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
         checkpoint_footprint(std::span<const CheckpointHandle>) const;
@@ -477,7 +500,7 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
-    [[nodiscard]] runtime::ResourceReservation
+    [[nodiscard]] BindingReservation
     start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                   ResumeState* resume           = nullptr,
                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
@@ -502,13 +525,15 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle sequence) const noexcept;
     // A resumed binding retains its complete recovery capacity until committed new progress.
     [[nodiscard]] bool recovery_pending(SequenceHandle sequence) const noexcept;
-    [[nodiscard]] PrefillProgress
-    advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
+                                                  runtime::ExecutionTiming* failed_timing = nullptr,
+                                                  runtime::TokenMaskProvider* masks = nullptr);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle sequence,
                                                 runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle> sequences,
                                       std::span<const runtime::RoundBudget> budgets,
-                                      runtime::ExecutionTiming* failed_timing = nullptr);
+                                      runtime::ExecutionTiming* failed_timing = nullptr,
+                                      runtime::TokenMaskProvider* masks       = nullptr);
     // Forced control contributes to counts once. Replay does not call this operation.
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle> sequences,

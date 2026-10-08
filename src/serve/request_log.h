@@ -20,7 +20,7 @@ class logger;
 
 namespace infernix::serve {
 
-inline constexpr int kRequestLogSchemaVersion        = 25;
+inline constexpr int kRequestLogSchemaVersion        = 26;
 inline constexpr const char* kRequestLogArtifactType = "infernix_serve_request_log";
 
 struct ServerLogEnvironment {

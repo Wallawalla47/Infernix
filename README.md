@@ -366,6 +366,10 @@ writes either, and `python -m tools.artifact.rename` renames an existing one in 
   decisions read from probabilities (yes/no, choice, score, number, point, box), streaming,
   bounded FIFO admission with one to eight concurrent requests, a request log with rotation, a
   console statistics panel and a categorised `--help`.
+- **Constrained decoding** (from NInfer, October 2026): JSON object and JSON Schema response
+  formats, strict tool arguments and tool choice, and GBNF, regex and choice through the CLI and
+  the `structured_outputs` extension, on every model and speculative round type, Qwen3.8-Flash-Next
+  included.
 - **Speculative decoding**: MTP, DFlash, DFlash2 (chain and tree verification) and n-gram copy
   drafting, with exact sampling.
 - **Thinking control**: thinking budgets with a custom wrap-up message, reasoning effort levels, and

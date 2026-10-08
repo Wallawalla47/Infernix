@@ -178,21 +178,18 @@ The endpoint supports:
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
 - up to four non-empty stop strings, applied to both reasoning and answer output;
-- `n:1`, text-only `modalities`, and `response_format` (`{"type":"text"}`, `{"type":"json_object"}`, or `{"type":"json_schema"}`; the type is accepted so clients that always send one are not refused, but Infernix does not constrain generation to it);
+- `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
   parsers;
 - llama.cpp-compatible terminal `timings`, plus opt-in `timings_per_token` and
   streaming `return_progress` observations;
-- function tools and free-form `custom` tools, the latter served to the model as a
-  single-string-input function under the caller's own tool name so callers that dispatch by name
-  keep working;
-- `tool_choice` `auto`/`none`, and `required`, named-function, `custom`, or function-only
-  `allowed_tools` selections, which are accepted and treated as advisory narrowing because the
-  Engine cannot force a call;
-- `strict:true` and `parallel_tool_calls:false` as advisory flags: the Engine does not enforce JSON
-  Schema through constrained decoding and cannot limit the model to one call;
-- assistant tool-call history, tool-result messages, and legacy function-call history;
+- function tools with optional `strict:true` argument schemas, and free-form `custom` tools, the
+  latter served to the model as a single-string-input function under the caller's own tool name so
+  callers that dispatch by name keep working;
+- `tool_choice` `auto`/`none`/`required`, named function or `custom` selection, `allowed_tools`, and
+  `parallel_tool_calls`; assistant tool-call history, tool-result messages, and legacy
+  function-call history;
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
@@ -204,9 +201,75 @@ behavior. This includes nonzero `logit_bias`, requested log probabilities, audio
 audio output, explicit low/high image detail, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
-Known constrained-decoding aliases (`grammar`, `structured_outputs`, `guided_json`, `guided_regex`,
-`guided_choice`, and `guided_grammar`) receive the same explicit rejection instead of being treated
-as unknown hints.
+
+JSON mode and JSON Schema use the standard protocol fields:
+
+| Endpoint | Field |
+|---|---|
+| Chat Completions | `response_format: {"type":"json_object"}` or `{"type":"json_schema","json_schema":{"name":"answer","schema":{...},"strict":true}}` |
+| Responses | `text.format: {"type":"json_object"}` or `{"type":"json_schema","name":"answer","schema":{...},"strict":true}` |
+| Anthropic Messages | `output_config.format: {"type":"json_schema","schema":{...}}` |
+
+`json_object` requires an object root. Schema mode follows the supplied root type and enforces the
+[supported assertions](maintainer/constrained-decoding.md#42-the-json-and-schema-execution-contract), including when
+`strict` is omitted or false. Unsupported assertions return HTTP 400 before generation. OpenAI
+errors distinguish `invalid_json_schema`, `unsupported_json_schema` and `unsatisfiable_json_schema`;
+`param` identifies the request field followed by the schema JSON Pointer. Anthropic uses its
+`invalid_request_error` envelope with the schema location in the message. Responses echoes the
+selected `text.format` in aggregate responses and SSE response objects.
+
+JSON output uses compact separators and declared property order. State the desired content in the
+prompt; the schema is not inserted into it. Only one output constraint may be supplied.
+
+Schemas support positional arrays (`prefixItems` plus tail `items`) and inclusive/exclusive
+`number` ranges. Bounded numbers use exact int64 integers or finite binary64-compatible decimal
+and scientific notation with up to 17 significant digits. Bounds must retain their value when the
+schema is parsed; numbers requiring greater precision receive `unsupported_json_schema`.
+These capabilities also apply to strict tool parameters.
+
+GBNF, choice and regex are available through the Infernix extension `structured_outputs`
+on Chat Completions, Responses and Anthropic Messages. Supply exactly one member:
+
+```json
+{"structured_outputs": {"grammar": "root ::= \"yes\" | \"no\""}}
+```
+
+```json
+{"structured_outputs": {"choice": ["positive", "neutral", "negative"]}}
+```
+
+```json
+{"structured_outputs": {"regex": "(BUG|TASK)-[0-9]{4}"}}
+```
+
+Choice returns one literal string, preserving case and whitespace. The list must be nonempty;
+duplicate entries have no extra weight, and an empty-string entry permits empty content.
+Regex matches the complete content. It supports character classes, groups, alternatives and
+repetition; `.` excludes line terminators, `\d`/`\w` use ASCII ranges, and `\s` includes Unicode
+whitespace. Empty regex permits only empty content. Anchors are supported at the ends of top-level
+alternatives. Lookaround, backreferences, word boundaries, Unicode properties, flags and unknown
+escapes return HTTP 400. See the [language contract](maintainer/constrained-decoding.md#41-gbnf--regex--choice).
+Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the request field in `param`.
+
+These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
+Unicode and repetition. All modes support streaming and all speculative backends, including
+Qwen3.8-Flash-Next MTP and n-gram copy rounds. For assistant
+continuation, the grammar covers the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
+output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
+active tools; GBNF, choice and regex require no active tools or `tool_choice:"none"`.
+Output constraints reject custom stops. OpenAI errors use
+`invalid_grammar` for invalid grammars and `constraint_dead_end` for a reachable prefix without a
+legal next token. Anthropic reports these through its `invalid_request_error` envelope.
+The `grammar` and `guided_*` aliases are not accepted.
+
+Constrained responses include a Infernix `constraint` observation. `branch` is `undecided`, `content`,
+or `tools`; `complete` means the committed language can end, and `terminated` means it accepted EOS.
+A complete JSON value can therefore have `complete:true`, `terminated:false` and a length finish
+reason. The observation also includes `cache` (`hit`, `built`, `waited`), `mask_positions`,
+`mask_upload_bytes`, and `timings_seconds` for preparation, CPU mask work and matcher work.
+These times are parts of existing request time and can overlap GPU execution.
+Streaming sends the observation once: the Chat finish/usage chunk, the Responses terminal response
+object, or Anthropic `message_delta`. Unconstrained responses omit it.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
@@ -234,7 +297,7 @@ The request `model` must equal the public model ID: the artifact `metadata.name`
 (falling back to its architecture name when absent), or the explicit `--model-id` override.
 Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
 
-Across Chat Completions, Responses, and Anthropic Messages, a direct top-level tool-parameter
+For non-strict tools, a direct top-level tool-parameter
 `type`, or an `anyOf`/`oneOf` composed entirely of explicit primitive types, guides conversion of
 Qwen's untyped parameter text. It does not decide whether structurally complete markup is a tool
 call. String-admitting values remain strings, including the empty string. An empty block for a
@@ -243,9 +306,9 @@ case-insensitive boolean text is normalized to `true` or `false`. A nonempty sch
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas without a
 supported explicit type retain untyped inference. Infernix does not apply defaults, enforce required
-properties, perform recursive JSON Schema validation, or use constrained decoding.
+properties, or perform recursive JSON Schema validation on this route.
 
-String parameters preserve function/tool-call markers and balanced nested
+On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
 so a standalone `</parameter>` ends a value only when whitespace and then another parameter, the
 function's closer, or the end of the output follow it; any other one is value text, such as a shell
@@ -258,12 +321,70 @@ followed by a line break or the end of the turn, so a marker the model quotes wh
 by a space, punctuation or an escaped `
 `) stays in the reasoning channel.
 
-By default the parser keeps that all-or-nothing behaviour. With `--tolerant-tool-calls` the server
-recovers a call instead when the model adds a suffix after a complete call, a second call is
-malformed, a single final call is cut by the output budget before its closing tags, or the closing
-bracket after the function name is missing: the recovered call is reported structurally with a
-`truncated_tail` diagnostic (logged at Info severity) rather than demoted to text, and an
-undeclared tool name stays structured for the consumer to judge.
+By default the unconstrained parser keeps that all-or-nothing behaviour. With
+`--tolerant-tool-calls` the server recovers a call instead when the model adds a suffix after a
+complete call, a second call is malformed, a single final call is cut by the output budget before
+its closing tags, or the closing bracket after the function name is missing: the recovered call is
+reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
+demoted to text, and an undeclared tool name stays structured for the consumer to judge. Constrained
+tool output (below) is well formed by construction and does not use this recovery.
+
+### Tool constraints
+
+The three protocols share one constrained tool implementation:
+
+| Choice | Generated calls |
+|---|---|
+| `auto` | Text or calls; zero to many |
+| `none` | No tool calls; declarations remain in the prompt |
+| OpenAI `required` / Anthropic `any` | One or more calls |
+| OpenAI named function | Exactly one call to that function |
+| Anthropic named `tool` | One or more calls to that tool |
+| OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
+
+OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generation permissions,
+while all declarations retain their original order in the prompt. Requests with tools enable
+**basic structural constraints by default**, including ordinary `auto` calls without `strict`.
+The model can answer normally or start a tool call; a call must use the model's tool framing and a
+declared function name.
+
+Non-strict parameter names and order remain open. Their schema supplies the existing value
+normalization hints; it is not compiled as a strict constraint. Open objects, root unions, and
+unsupported schema assertions therefore remain usable. Repeated parameter names use the last
+value, retaining the first key position; the published JSON object contains each key once.
+`strict:true` additionally enforces the parameter contract below.
+
+Top-level `tool_constraints:"auto"` opts into request-driven constraints: ordinary non-strict
+`tool_choice:"auto"` then uses free generation. Strict tools, selection/count restrictions, and
+`tool_choice:"none"` still enforce their requirements. `tool_constraints:"basic"` is the default.
+
+With JSON object/schema output, `auto` permits either a JSON answer or a complete tool-call sequence.
+Required/named choices permit calls for that turn; after supplying the tool result, use `auto` for
+the final JSON answer. `none` permits only JSON. The JSON schema is validated on every turn.
+This combination enforces tool framing even with `tool_constraints:"auto"`; `strict` continues to
+control argument-value validation. Tool markers inside JSON strings remain ordinary string data.
+
+A function's `strict:true` also constrains its argument values against its schema. Its parameter
+root must reduce to a `type:"object"` schema with `additionalProperties:false`, including supported
+`allOf` and local-reference combinations.
+Properties are emitted in declaration order; optional properties may be omitted. Root
+const/enum/unions are not supported. Values use the supported JSON Schema subset described above.
+Top-level pure string parameters use raw text and preserve whitespace. Other values use JSON;
+a top-level string/non-string union (such as string/null) is rejected because the Qwen parameter
+format cannot distinguish those branches. Such unions inside JSON objects or arrays are supported.
+Raw values cannot contain the delimiter `\n</parameter>`; unsatisfiable required values are rejected.
+Integer arguments use signed 64-bit values; number arguments use finite binary64-compatible
+representations. Unsupported schemas fail with HTTP 400 before generation.
+
+For `auto` without JSON output, text can precede the first call. Required/named choices start directly with calls
+(after thinking, if enabled). Once a constrained call starts, the suffix consists of complete calls
+and model EOS. Active tool constraints require model EOS and reject custom stop strings.
+For ordinary non-strict auto calls that need custom stops, select `tool_constraints:"auto"`.
+Token limits and cancellation can still stop generation: only completed calls are published.
+A later call truncated by the token limit keeps `length`/`max_tokens`/Responses `incomplete` as the
+terminal status. Streaming publishes each completed call in the terminal event sequence;
+arguments are not streamed incrementally.
+Assistant continuation may finish a partial call; a prefix containing a completed call is rejected.
 
 Messages enter the selected template in their input order. The maintained Qwen templates keep
 system/developer messages at their original positions. A final assistant message is an assistant
@@ -278,6 +399,7 @@ retain that member order in aggregate and streaming responses, so an unmodified 
 the same ordered tool call. Infernix does not canonicalize semantically equivalent JSON: if a client
 reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
 does not match the model-held endpoint and can reuse only an earlier exact checkpoint.
+Generated token segmentation can also differ from re-encoding the same text, limiting prefix reuse.
 
 `--chat-template FILE` selects a local Jinja template; by default, the server uses the template
 stored in the artifact. See the [CLI guide](cli.md#text-input) for an example.
@@ -543,10 +665,10 @@ wire response contains typed `output` Items.
 | `reasoning.summary` | omitted, `null`, or any string; every string requests the same fixed protocol placeholder without changing model execution, and the original value is echoed in the response |
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
-| `text.format` | omitted or `{"type":"text"}` only |
+| `text.format` | `text` (default), `json_object`, or `json_schema`; see output constraints above |
 | `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, or function-only `allowed_tools` with mode `auto`; a namespaced selection carries both `namespace` and `name` |
-| `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
+| `tool_choice` | `auto`, `none`, `required`, a named function, or function-only `allowed_tools` with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
+| `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
 | `top_logprobs` | omitted or `0` |
@@ -616,9 +738,10 @@ nested `function` object:
   "parameters": {
     "type": "object",
     "properties": {"city": {"type": "string"}},
-    "required": ["city"]
+    "required": ["city"],
+    "additionalProperties": false
   },
-  "strict": false
+  "strict": true
 }
 ```
 
@@ -641,15 +764,10 @@ client-executed functions; this does not add a remote MCP executor.
 Infernix renders these definitions in the Qwen prompt and parses model output into separate
 `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
-a later request. Only functions in the current effective tool set can become structured calls;
-undeclared model output remains ordinary text. `allowed_tools` with mode `auto` filters that set
-without changing declaration order, while `tool_choice:"none"` disables structured tool output even
-when the history contains earlier calls.
+a later request. Selection and strict argument enforcement follow the common tool contract above.
 
-Infernix does not execute functions or enforce JSON Schema through constrained decoding, so
-`strict:true`, required or named tool choice, hosted tools, remote MCP tools, and custom free-form
-tools are rejected. Deferred loading, output schemas, and caller restrictions that exclude direct
-invocation are also rejected because their semantics cannot be honored.
+Hosted tools, remote MCP tools, custom free-form tools, deferred loading, output schemas, and
+caller restrictions that exclude direct invocation remain unsupported.
 
 ### Response object and usage
 
@@ -725,7 +843,7 @@ Function arguments use `response.function_call_arguments.delta` and `.done`. IDs
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
 does not emit the Chat Completions `[DONE]` sentinel. With tools enabled, ordinary answer text still
 streams immediately; only an ambiguous `<tool_call>` suffix or the structured tool region is held.
-Malformed tool markup is flushed back as ordinary text without losing bytes.
+On the unconstrained route, malformed tool markup is flushed back as ordinary text without losing bytes.
 
 ### Local response state and resources
 
@@ -787,10 +905,10 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 ```
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
-moderation, Structured Outputs/JSON mode, `include` values other than
-`reasoning.encrypted_content`, background execution, compaction, files/audio, and
-OpenAI-hosted/MCP/custom tools. Except for the two explicitly documented placeholders,
-these are compatibility boundaries rather than silently accepted approximations.
+moderation, `include` values other than `reasoning.encrypted_content`, background execution,
+compaction, files/audio, and OpenAI-hosted/MCP/custom tools. Except for the two explicitly
+documented placeholders, these are compatibility boundaries rather than silently accepted
+approximations.
 
 ## Anthropic Messages
 
@@ -853,16 +971,13 @@ trusted server, and the value is the same reasoning text `summarized` display sh
 ignores `display`. `preserve_thinking` remains a Infernix extension for closed-turn reasoning
 history. `output_config.effort` passes its protocol-validated value to the
 selected template, substituting the nearest value the template accepts as described above.
+`output_config.format` accepts JSON Schema output as described above.
 
-User-defined tools support `name`, `description`, object `input_schema`, and `input_examples`.
-`tool_choice:auto` and `none` are executable. As on the OpenAI endpoints, `tool_choice` `any` and
-named `tool`, `strict:true`, and `disable_parallel_tool_use:true` are accepted as advisory: the
-Engine cannot force a call, constrain arguments to the schema, or limit the model to one call, so
-the tools stay offered under automatic selection. A named choice must name a declared tool, and
-`any` requires tools. Qwen Code sends `any` for its JSON side queries (permission classifier,
-session title, next-speaker check). Deferred tools, tools that exclude direct model calls,
-Anthropic-provided/server tools, toolsets, MCP, and containers are rejected because their executor
-is absent. `tool_result` preserves text/image order and marks
+User-defined tools support `name`, `description`, object `input_schema`, `input_examples`, and
+`strict`. `tool_choice` accepts `auto`, `none`, `any`, or named `tool`; `disable_parallel_tool_use`
+enforces a single-call limit. See the common tool contract above for schema and framing details.
+Deferred tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets,
+MCP, and containers remain unsupported. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated
@@ -1197,6 +1312,9 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
 | `infernix_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
+| `infernix_constraint_requests_total{outcome}`, `infernix_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
+| `infernix_constraint_{prepare,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
+| `infernix_constraint_draft_wait_seconds_total` | Live draft-ready wait counted once per batch; a subset of device wait |
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
@@ -1234,7 +1352,7 @@ because another process holds `FILE` open without delete sharing on Windows, the
 warning, keeps appending to `FILE`, and tries again after another `N` MiB. Rotated names are also
 checked against the model artifact path.
 
-Every line is one `infernix_serve_request_log` schema-v25 JSON object. All events carry
+Every line is one `infernix_serve_request_log` schema-v26 JSON object. All events carry
 `timestamp_unix_ms` and a process-unique `server_instance_id`; request IDs are monotonic only within
 that server instance. Successful request-start records include request-scoped acquisition,
 media-preprocessing wall/work, tokenizer, cache hit/miss/single-flight, and payload-size fields;
@@ -1267,12 +1385,22 @@ into structured calls: a recovered `truncated_tail`, or a kept call whose opener
 keyword, a missing `>` after the name) was repaired or whose name is not a declared tool. These
 counters contain no tool arguments or generated text.
 
+`request_done.constraint` carries the same constraint observation as the HTTP terminal result,
+or `null` for unconstrained requests. Preparation failures and execution errors use the existing
+rejection/error records rather than successful constraint outcomes.
+
 `request_done.timings_seconds` contains `prepare`, `ttft`, `vision`, `prefill`, `decode`, and `total`
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
 `generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
 and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.
+
+`generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`,
+`revoked_checkpoints`, and `fallback_reason`. Source waiting is a subset of initial queue time;
+selecting or retaining a checkpoint does not itself count as a cache hit. Revocations count retained
+checkpoint references removed under resource pressure. Fallback reasons are `none`, `source_invalid`,
+`source_revoked`, `cost_changed`, `capacity_limit`, and `isolated_capacity`.
 
 `request_scheduling` records `pause_started`, `paused`, `restore_started`, `restored`,
 `replay_complete`, `recovery_complete`, `snapshot_revoked`, and a `terminal` boundary for preempted
@@ -1333,6 +1461,9 @@ wait. The nested `decode` object reports the request's decode-class Host exposur
 round count; `units` reports its prefill/control unit counts. In a compact batch every participating
 request is delayed by the full round, so these values explain request latency but **must not be
 summed across concurrent requests**.
+`constraint_draft_wait_exposed_seconds` is the request's exposure to the batch's draft-ready wait,
+already included in `device_wait_exposed_seconds`. The `throughput.host_work.constraint_draft_wait_seconds`
+interval and Prometheus counter count each batch once.
 
 `request_done.first_output_timing` freezes observations immediately before Engine publishes its
 first nonempty output delta. It is `null` when no such output exists. This boundary differs from the
@@ -1449,11 +1580,12 @@ with the hybrid prefix cache and follows `--max-context` with `--use-original-pr
 CUDA Graph driver-state allowance reserved against that budget is 64 MiB plus 4 MiB for every
 decode-graph executable the engine instantiates: one per topology class of each captured family,
 for every batch size up to `--max-concurrency` (DFlash and DFlash2 capture a second family when
-n-gram drafting is enabled). Measured on an RTX 5090 an executable takes 2.2-2.9 MiB, and up to
-4.1 MiB when MTP verifies a 15-wide n-gram window at batch 4-8, so DFlash2 with
-`--max-concurrency 2` reserves 112 MiB and uses about 30 MiB. The startup log and `server_start`
-report both the allowance and the memory the graphs actually used, and the log warns when the
-second exceeds the first.
+n-gram drafting is enabled). A speculative family is a Forward/Finish pair: MTP's Finish keeps
+the Forward topology classes, a DFlash Finish adds one executable per batch size. Measured on an
+RTX 5090 before that split, an executable took 2.2-2.9 MiB, and up to 4.1 MiB when MTP verified a
+15-wide n-gram window at batch 4-8; DFlash2 with `--max-concurrency 2` now reserves 120 MiB. The
+startup log and `server_start` report both the allowance and the memory the graphs actually
+used, and the log warns when the second exceeds the first.
 Capacity resolves once at startup.
 
 Before each prefill, decode or replay unit, the runtime reserves the additional pages and temporary
@@ -1503,8 +1635,7 @@ a following compatible turn can reuse it. Output-limit and context-capacity fini
 `length`/ `max_tokens`; ordinary model or string stops map to `stop`/ `end_turn`.
 
 Function tools are rendered into the model prompt and generated calls are parsed into protocol
-responses. Infernix does not execute tools and does not enforce client JSON Schema through constrained
-decoding.
+responses. Infernix does not execute tools or enforce tool-argument schemas through constrained decoding.
 
 Prompt-token usage includes chat-template and expanded media tokens. Generated-token usage comes
 from accepted output token IDs, including a stop token whose decoded text may be withheld.

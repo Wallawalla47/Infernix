@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 17;
+inline constexpr int kSchemaVersion                   = 20;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -59,6 +59,10 @@ struct BenchOptions {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     bool vram_past_budget = false;
     std::string corpus_path{kDefaultCorpusPath};
+    std::string constraint_file;
+    std::optional<OutputConstraint> constraint;
+    std::uint32_t concurrency = 1;
+    bool mixed_constraints    = false;
     std::vector<int> n_prompt;
     std::vector<int> n_gen;
     std::vector<std::pair<int, int>> prompt_gen;
@@ -85,11 +89,16 @@ struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    std::optional<ConstraintObservation> constraint;
+    double constraint_draft_wait_exposed_seconds = 0.0;
 };
 
 struct TestResult {
     BenchTest test;
+    // Request samples are repetition-major. Wall times cover all requests in each repetition.
+    std::uint32_t concurrency = 1;
     std::vector<RepTiming> reps;
+    std::vector<double> repetition_wall_seconds;
     std::size_t workspace_peak_bytes           = 0;
     std::size_t workspace_allocator_peak_bytes = 0;
 };
@@ -127,6 +136,10 @@ struct BenchEnvironment {
     int warmup                                     = 0;
     std::string corpus_path;
     std::size_t corpus_tokens = 0;
+    std::uint32_t concurrency = 1;
+    std::string constraint_file;
+    std::optional<OutputConstraint> constraint;
+    bool mixed_constraints = false;
 };
 
 BenchOptions parse_args(int argc, char** argv);
@@ -148,6 +161,7 @@ Stats compute_stats(const std::vector<double>& values);
 std::vector<double> prefill_tok_s_series(const TestResult& result);
 std::vector<double> decode_output_tok_s_series(const TestResult& result);
 std::vector<double> decode_engine_tok_s_series(const TestResult& result);
+std::vector<double> output_tok_s_series(const TestResult& result);
 std::vector<double> prepare_time_series(const TestResult& result);
 std::vector<double> prefill_time_series(const TestResult& result);
 std::vector<double> decode_time_series(const TestResult& result);

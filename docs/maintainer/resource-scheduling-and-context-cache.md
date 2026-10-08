@@ -40,7 +40,7 @@ resource among the finite physical actions Native offers.
 | Frontend | Template rendering, token/position/media identity, typed rewrite and the actual input restore position, exact boundaries of shared markers |
 | Engine request record | Original ticket, input and output objects, budget, cancellation, first-time stamps, continuation relationship across pauses |
 | Scheduler | Execution membership, fresh scans and bounded bypass, prefill/replay rotation, preemption and resume gating |
-| ResourceManager | Private continuations and public entries, prefix index, demand evidence, candidate ordering and cache admission |
+| ResourceManager | Private continuations and public entries, prefix index, waiting references, demand evidence, source selection and reclaim permission |
 | Native Program | Model ledger, backend frontiers, complete restore points, work-unit demand, state commit and restore |
 | Stores inside the Program | Actual occupancy of State, KV, Host backing, references, reader leases, reservations and replicas |
 
@@ -265,8 +265,9 @@ Fork is needed; they do not require keeping an extra private parent record.
 
 The E, input points and anchors of one history reference one KV directory, each with its own coverage.
 Saving an internal input point does not copy the whole KV set, nor does it copy an extra tail page
-because the point falls inside a partial page. When recomputing from an earlier input point, the deeper
-private points it supersedes are retired first and then trimmed to the remaining protected range.
+because the point falls inside a partial page. When recomputing from an earlier input point, binding first checks
+the resources actually available after retirement, then, once admitted, retires the deeper private
+points it may replace and trims to the remaining protected range.
 An independent branch or public view shares full pages and copies the partial tail page when needed,
 keeping one writable history isolated from external immutable content.
 
@@ -275,7 +276,8 @@ the source must be kept, a Fork can let the next computation perform the state t
 backend's necessary local copy still runs. When Device slots are tight and a Host replica exists, the
 old identity's Host content can be kept and the Device slot handed to the new active identity; with only
 a Device replica, D2H completes first. When saving and execution cannot both be satisfied, the optional
-restore point may be abandoned; reader leases are always kept.
+restore point may be abandoned; reader leases are always kept. Host space that binding frees by
+retiring old points can also hold the saved input point.
 
 A normal finish freezes the legal execution state into a new E. Cancellation can make optional old
 cache that this request took over disappear, while other independent owners remain valid. A session is
@@ -301,18 +303,49 @@ transfer and artifact prefill calibration affect ordering but do not decide whet
 restorable. Cache reclaim uses the actual lost restore coverage instead and does not estimate the
 probability of future requests; the actual permit is requested by Native.
 
-Only after a candidate is selected are the takeover prepared, the replaceable deeper private positions
-retired and the destination space requested. One decision fixes the logical range it may reclaim; if
-the candidate becomes invalid or resources are insufficient, it advances to the next candidate. Actual
-reclaim results are not rolled back, and later attempts read the new facts. Binding installs the state
-after preparation, transfers and dependencies complete, then reports the logical source adopted; the
-ResourceManager records the use and takes over the record at this irreversible commit point. A
-cancellation before that point does not produce a successful hit.
+Source evaluation is read-only. Native computes the source's Move/Fork, the compatible carried
+points and the old points it may retire, and checks State, missing KV, growth pages and tail pages
+against the first legal unit. Resuming a pause still checks the complete restore permission. Actual
+reclaim can change replicas and capacity, after which the facts are read again; a failed binding
+attempt does not retire the old points tied to its candidate.
 
-Fresh admission does not preempt resident requests for its own entry. Waiting must have a real
-execution, transfer or release event; when no other resident work exists and no candidate can acquire
-the first unit, the specific shortfall is reported. When resuming its own complete Snapshot, a request
-redeems that snapshot first and does not proactively replace it with another cheaper source.
+When a valuable source is temporarily blocked by resident or in-flight work, the request keeps the
+source and waits. A small first Root chunk is no reason to give up an existing restore position. The
+request may choose again when the source becomes invalid or is revoked, when the actual cost order
+changes, or when the binding path needs more pages than the physical pool holds. With no real releaser
+and legal reclaim still short, it tries other sources; if even an isolated request's root cannot obtain
+a legal first unit, a capacity-contract error is reported. A request's own complete Snapshot is
+redeemed first and is not dropped because another source is cheaper; a Snapshot builds its binding
+directly from its own checkpoint and the request's carried points.
+
+A waiting request references one Native checkpoint and carries the compatible input restore point and
+a bounded set of anchors. Waiting allocates no new State or KV and holds no lane or later execution
+permission, but it extends the lifetime of resources that already exist. After the directory is
+replaced, waiting references keep their integrity; points kept only by waiters do not become new public
+directory entries. Queries, holding and waiting produce no use heat or cache hits.
+
+Waiting protection allows Device/Host replica migration and is separate from the reader lease held
+during an actual read. An optional cache write cannot delete a complete point a waiter holds; fresh
+admission can revoke only the protection of younger waiters, never a paused snapshot. When ordinary
+reclaim falls short, the necessary progress and legal restore of admitted requests may revoke waiting
+protection. Reclaim first picks complete physical actions that cover the actual shortfall and checks
+every holder; shared references are not charged twice. When revocation is needed, younger waiters are
+considered first, and the revocation record makes the affected requests choose again.
+
+Binding separates the logical takeover from the physical consumption. A request's own waiting
+reference can be handed over directly; other waiters remain external holders. The waiting-revocation
+permission a Move grants is redeemed only when the complete binding can succeed. When the original
+owner has advanced or been replaced, the old waiter builds an independent branch; a new query cannot
+take over a record whose publication order is later than the request's. Its exclusively held old
+checkpoint can still be Moved.
+
+Before committing, Native prepares the request metadata, checks and uses the real resources that
+retiring old points can free, then takes read protection and reservations and performs the ownership
+handover. After a successful admission no other source is tried; the state is installed once transfers
+and dependencies complete, and only then does the ResourceManager record the actual use and the takeover.
+Waiting references are released on adoption, a new choice, cancellation, timeout or shutdown. In-flight
+readers are released when the Native transaction completes or aborts. A request cancelled after
+admission may still lose optional old cache entries that were already retired.
 
 <a id="retention"></a>
 ## 7. Retention and reclaim
@@ -457,14 +490,16 @@ profile.
 
 The fresh queue keeps FIFO tickets, and each blocked request can be successfully bypassed by at most C
 younger requests. Each scan checks the queue head and at most C following candidates; failed checks do
-not consume the allowance, and an incomplete scan continues in ticket order. Queue or capacity changes
-trigger a scan; ordinary decode does not keep redoing decisions that already failed. A paused request's
+not consume the allowance, and an incomplete scan continues in ticket order. Without a free lane the
+chosen restore source can still be held. Queue changes, actual capacity releases, completed transfers
+and reference revocations trigger a scan; a request that already failed under the same event is not
+quoted again, and ordinary decode does not reopen a scan. A paused request's
 wait constrains only itself; idle lanes and capacity can serve fresh requests that are able to enter.
 
 ### 8.2 Pressure and complete resume
 
 ```text
-unit shortfall → reclaim optional reservations and cache → revoke pause snapshots if needed
+unit shortfall → reclaim optional reservations and ordinary cache → revoke waiting protection and pause snapshots if needed
               → take back younger residents for the oldest necessary work, or pause a young row that cannot advance itself
 ```
 

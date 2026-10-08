@@ -659,6 +659,7 @@ enum class ToolSelectionKind {
 struct ToolSelection {
     ToolSelectionKind kind = ToolSelectionKind::Auto;
     std::string name;
+    bool disable_parallel = false;
 };
 
 ToolSelection parse_tool_choice(const Json& body) {
@@ -681,7 +682,7 @@ ToolSelection parse_tool_choice(const Json& body) {
     } else {
         bad_request("unsupported tool_choice type: " + type, "tool_choice");
     }
-    (void)optional_bool(choice, "disable_parallel_tool_use", false);
+    result.disable_parallel = optional_bool(choice, "disable_parallel_tool_use", false);
     return result;
 }
 
@@ -704,9 +705,12 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return result; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
     std::unordered_set<std::string> names;
+    std::size_t source_index = 0;
     for (const Json& item : body.at("tools")) {
         if (!item.is_object()) { bad_request("tools entries must be objects", "tools"); }
         ParsedTool parsed;
+        parsed.definition.schema_param =
+            "tools/" + std::to_string(source_index++) + "/input_schema";
         if (item.contains("type") && !item.at("type").is_null()) {
             if (!item.at("type").is_string()) {
                 bad_request("tool type must be a string or null", "tools");
@@ -753,6 +757,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
             if (!item.at("strict").is_boolean()) {
                 bad_request("tool strict must be a boolean", "tools");
             }
+            parsed.definition.strict = item.at("strict").get<bool>();
         }
         if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
             if (!item.at("defer_loading").is_boolean()) {
@@ -788,19 +793,21 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         return tool.definition.name == selection.name;
     };
 
-    // Forced choices are advisory, as on the OpenAI endpoints: the Engine cannot force a call, so a
-    // named choice is checked against the declared tools and automatic selection proceeds. Qwen
-    // Code, for one, sends tool_choice any for every JSON side query (docs/serving.md).
-    if (selection.kind == ToolSelectionKind::Named &&
-        std::none_of(definitions.begin(), definitions.end(), named)) {
-        bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
+    if (selection.kind == ToolSelectionKind::Named) {
+        if (std::none_of(definitions.begin(), definitions.end(), named)) {
+            bad_request("tool_choice references unknown tool: " + selection.name, "tool_choice");
+        }
+        request.tool_choice.allowed_names = std::vector<std::string>{selection.name};
     }
-    if (selection.kind == ToolSelectionKind::Any && definitions.empty()) {
-        bad_request("tool_choice requires tools", "tool_choice");
+    if (selection.kind == ToolSelectionKind::Any) {
+        if (definitions.empty()) { bad_request("tool_choice requires tools", "tool_choice"); }
     }
 
-    request.tool_choice.mode =
-        selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None : ToolChoiceMode::Auto;
+    request.tool_choice.mode     = selection.kind == ToolSelectionKind::None ? ToolChoiceMode::None
+                                   : selection.kind == ToolSelectionKind::Auto
+                                       ? ToolChoiceMode::Auto
+                                       : ToolChoiceMode::Required;
+    request.tool_choice.parallel = !selection.disable_parallel;
     if (selection.kind == ToolSelectionKind::None) {
         for (ParsedTool& tool : definitions) {
             if (tool.source == ToolSource::UserDefined) {
@@ -821,7 +828,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
                             "Infernix does not provide",
                         "tools", "anthropic_tools_not_supported");
         }
-        // strict=true is advisory: generation is not constrained to the declared JSON Schema.
         if (tool.defer_loading) {
             bad_request("defer_loading=true requires a deferred tool loader that Infernix does not "
                         "provide",
@@ -836,7 +842,6 @@ void lower_tools(const Json& body, GenerationRequest& request) {
         }
         request.tools.push_back(std::move(tool.definition));
     }
-    // disable_parallel_tool_use=true is advisory: the model may still emit several calls.
 }
 
 void parse_thinking(const Json& body, GenerationRequest& request) {
@@ -891,9 +896,8 @@ void parse_effort(const Json& body, GenerationRequest& request, ParsePurpose pur
     if (!config.is_object()) { bad_request("output_config must be an object", "output_config"); }
     if (purpose == ParsePurpose::Messages && config.contains("format") &&
         !config.at("format").is_null()) {
-        bad_request("output_config.format requires constrained decoding, which Infernix does not "
-                    "provide",
-                    "output_config.format", "output_config_format_not_supported");
+        parse_json_output_format(config["format"], request, "output_config.format",
+                                 JsonFormatProtocol::Anthropic);
     }
     if (!config.contains("effort") || config.at("effort").is_null()) { return; }
     if (!config.at("effort").is_string()) {
@@ -1059,6 +1063,7 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     parse_common_prompt(body, result.generation, ParsePurpose::Messages);
     result.hide_thinking = thinking_display_omitted(body);
     parse_generation_fields(body, result.generation);
+    parse_structured_outputs(body, result.generation);
     return result;
 }
 

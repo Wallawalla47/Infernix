@@ -34,6 +34,8 @@ constexpr std::array kGeometries{
     Geometry{16384, 2560, 313U}, Geometry{2560, 6144, 317U},  Geometry{1280, 2560, 337U},
     Geometry{2560, 640, 347U},   Geometry{12800, 2560, 349U}, Geometry{13952, 2560, 353U},
     Geometry{2560, 2560, 359U},
+    // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
+    Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
 

@@ -191,6 +191,7 @@ struct PreparedPromptData {
     PreparedTapHints tap_hints;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
+    std::string continuation_content;
     PrepareStats prepare;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;

@@ -60,19 +60,11 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     staged.base = staged.cursor = base;
     staged.prompt_tokens        = plan.summary.prompt_tokens;
     staged.prepare_mtp          = speculative_backend == SpeculativeBackend::Mtp;
-    staged.initial_mtp_extent =
-        staged.prepare_mtp
-            ? std::min(
-                  {neural_draft_window,
-                   plan.summary.effective_output_tokens > 1
-                       ? plan.summary.effective_output_tokens - 2U
-                       : 0U,
-                   capacity > staged.prompt_tokens ? capacity - staged.prompt_tokens - 1U : 0U})
-            : 0;
-    staged.reuse      = base ? PrefixReusePath::Checkpoint : PrefixReusePath::Root;
-    staged.mtp_bridge = !staged.prepare_mtp || !base   ? MtpBridgeMode::None
-                        : base == staged.prompt_tokens ? MtpBridgeMode::AfterExactHit
-                                                       : MtpBridgeMode::BeforeSuffix;
+    staged.initial_mtp_extent   = initial_mtp_extent(plan);
+    staged.reuse                = base ? PrefixReusePath::Checkpoint : PrefixReusePath::Root;
+    staged.mtp_bridge           = !staged.prepare_mtp || !base   ? MtpBridgeMode::None
+                                  : base == staged.prompt_tokens ? MtpBridgeMode::AfterExactHit
+                                                                 : MtpBridgeMode::BeforeSuffix;
     initialize_captures(lane, base, plan.summary.prompt_tokens);
     if (plan.vision_control_plan) {
         auto& vision        = staged.vision_plan.emplace();
@@ -98,6 +90,8 @@ void ProgramImpl::initialize_prefill(std::uint32_t lane, std::uint32_t base) {
     }
 }
 
+// Stages a hybrid binding's request state and unit demands before its capacity check. A failed
+// check resets requests[lane]; the ordinary path stages this state only after its check passes.
 void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePlan& base,
                                      ResumeState* resume, ExecutionUnitKind resume_kind,
                                      std::uint32_t resume_tokens) {
@@ -111,7 +105,8 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     initialize_prefill(lane, tx.reuse_frontier);
     UnitDemand first;
     if (!resume) {
-        first = next_unit(state, request, ExecutionUnitKind::Prefill, 0);
+        first = prefill_unit(base.summary().prompt_tokens, tx.reuse_frontier,
+                             initial_mtp_extent(*base.impl_));
     } else if (!own_snapshot) {
         first = {.kind          = ExecutionUnitKind::Replay,
                  .main_frontier = std::min(tx.reuse_frontier + prefill_chunk, resume->frontier())};
@@ -137,10 +132,10 @@ void ProgramImpl::plan_binding_units(ContextTransaction& tx, const RequestBasePl
     }
 }
 
-runtime::ResourceReservation
-ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
-                           const SourceCandidate& candidate, ResumeState* resume,
-                           ExecutionUnitKind resume_kind, std::uint32_t resume_tokens) {
+BindingReservation ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
+                                              const SourceCandidate& candidate, ResumeState* resume,
+                                              ExecutionUnitKind resume_kind,
+                                              std::uint32_t resume_tokens) {
     const auto lane = lane_id.value;
     if (context_transaction_ || lane >= max_concurrency ||
         requests[lane].lifecycle != Lifecycle::Empty || !base.impl_) {
@@ -155,7 +150,7 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         (!valid_checkpoint(*source) ||
          (!own_snapshot && (!checkpoint_matches(*source, base) ||
                             (resume && checkpoint(*source).frontier > resume->frontier()))))) {
-        return {};
+        return {.source_valid = false};
     }
     ContextTransaction transaction;
     transaction.kind               = ContextOperationKind::Bind;
@@ -164,33 +159,36 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
     transaction.base               = base.impl_;
     transaction.resume             = resume;
     transaction.source             = source;
-    transaction.source_history     = source ? checkpoint(*source).kv : nullptr;
     transaction.reuse_frontier     = source ? checkpoint(*source).frontier : 0;
     transaction.backend_frontier   = source ? checkpoint(*source).backend_frontier : 0;
     transaction.source_tail_hidden = source && checkpoint(*source).tail_hidden_valid;
     transaction.resume_snapshot    = own_snapshot;
-    transaction.retired_points.reserve(1);
-    if (!own_snapshot && source) {
-        const auto actual =
-            inspect_source(base, source, candidate.consume_private, candidate.private_points);
-        if (!actual) { return {}; }
-        // A resumed request keeps ownership of its own recovery points even when its
-        // execution resumes from somebody else's cached prefix.
-        transaction.take_private   = actual->consume_private || resume != nullptr;
-        transaction.carried_points = actual->private_points;
+    transaction.retired_points.reserve(candidate.retired_points.size() + 1);
+    const auto select_source = [&](const SourceCandidate& actual) {
+        transaction.take_private   = candidate.take_private;
+        transaction.carried_points = actual.private_points;
+        // Keep semantic carry intent in the query, so space released by retirement can
+        // still preserve the selected input point. An actual Move consumes that point.
+        if (actual.move_state) { std::erase(transaction.carried_points, *source); }
         transaction.consume_source =
-            actual->consume_private &&
-            std::find(actual->private_points.begin(), actual->private_points.end(), *source) ==
-                actual->private_points.end();
-        transaction.borrow_state = actual->move_state;
-        transaction.split_state  = actual->split_state;
-        transaction.backup_state = actual->backup_state;
-        transaction.borrow_text  = actual->move_history;
+            actual.consume_source &&
+            std::find(transaction.carried_points.begin(), transaction.carried_points.end(),
+                      *source) == transaction.carried_points.end();
+        transaction.borrow_state = actual.move_state;
+        transaction.split_state  = actual.split_state;
+        transaction.backup_state = actual.backup_state;
+        transaction.borrow_text  = actual.move_history;
         transaction.borrow_backend =
-            actual->move_history && checkpoint(*source).kv->backend.has_value();
+            actual.move_history && checkpoint(*source).kv->backend.has_value();
+    };
+    if (!own_snapshot && source) {
+        const auto actual = inspect_source(base, source, candidate.consume_source,
+                                           candidate.private_points, candidate.retired_points);
+        if (!actual) { return {.source_valid = false}; }
+        select_source(*actual);
     } else if (own_snapshot) {
         transaction.consume_source = true;
-        transaction.take_private   = true;
+        transaction.take_private   = candidate.take_private;
         for (const auto point : candidate.private_points) {
             if (valid_checkpoint(point) &&
                 checkpoint(point).frontier <= checkpoint(*source).frontier) {
@@ -231,8 +229,35 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         transaction.reuse_frontier) {
         transaction.backend_frontier = transaction.reuse_frontier - 1U;
     }
-    plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
-    auto& request             = requests[lane];
+    auto& request = requests[lane];
+    UnitDemand first;
+    if (!resume) {
+        first = prefill_unit(base.summary().prompt_tokens, transaction.reuse_frontier,
+                             initial_mtp_extent(*base.impl_));
+    } else if (!own_snapshot) {
+        first                  = {.kind = ExecutionUnitKind::Replay,
+                                  .main_frontier =
+                                      std::min(transaction.reuse_frontier + prefill_chunk, resume->frontier())};
+        first.backend_frontier = backend_kv_cache() ? first.main_frontier : 0;
+    } else {
+        first =
+            next_unit(resume->impl_->sequence, resume->impl_->control, resume_kind, resume_tokens);
+    }
+    transaction.first_unit         = first;
+    transaction.reservation_demand = first;
+    if (resume) {
+        const auto& resumed_sequence = resume->impl_->sequence;
+        auto coverage =
+            next_unit(resumed_sequence, resume->impl_->control, resume_kind, resume_tokens);
+        coverage.main_frontier = std::max(coverage.main_frontier, resume->frontier());
+        if (backend_kv_cache()) {
+            coverage.backend_frontier = std::max(coverage.backend_frontier, resume->frontier());
+        }
+        transaction.recovery           = RecoveryPermit{.coverage      = coverage,
+                                                        .frontier      = resume->frontier(),
+                                                        .ledger_tokens = resumed_sequence.ledger.size()};
+        transaction.reservation_demand = coverage;
+    }
     const auto& coverage      = transaction.reservation_demand;
     const auto main_prefix    = kv_pages_for_frontier(transaction.reuse_frontier);
     const auto backend_prefix = kv_pages_for_frontier(transaction.backend_frontier);
@@ -293,10 +318,49 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         shortage.backend_kv_pages = difference(backend_missing + backend_growth + backend_tail,
                                                backend_kv_pages->physical_pool().available_pages());
     }
-    if (shortage.state_slots || shortage.main_kv_pages || shortage.backend_kv_pages) {
-        request = {};
-        return {.shortage = shortage};
+    if (!candidate.retired_points.empty() &&
+        (shortage.state_slots || shortage.main_kv_pages || shortage.backend_kv_pages)) {
+        const auto credit = checkpoint_release_resources(candidate.retired_points, shortage);
+        if (!credit) { return {.source_valid = false}; }
+        shortage.state_slots      = difference(shortage.state_slots, credit->state_slots);
+        shortage.main_kv_pages    = difference(shortage.main_kv_pages, credit->main_kv_pages);
+        shortage.backend_kv_pages = difference(shortage.backend_kv_pages, credit->backend_kv_pages);
     }
+    if (shortage.state_slots || shortage.main_kv_pages || shortage.backend_kv_pages) {
+        const bool capacity_possible =
+            main_prefix + main_growth + main_tail <= usage.capacity.main_kv_pages &&
+            (!backend_kv_pages ||
+             backend_prefix + backend_growth + backend_tail <= usage.capacity.backend_kv_pages);
+        return {.capacity_possible = capacity_possible, .shortage = shortage};
+    }
+    // No ordinary capacity failure follows this point. Prepare allocating request metadata
+    // before the retirement/ownership handoff; failed attempts above have no side effects.
+    BindingReservation result{.reserved       = true,
+                              .retired_points = candidate.retired_points,
+                              .consumed_source =
+                                  transaction.consume_source ? source : std::nullopt};
+    request.base      = base.impl_;
+    request.lifecycle = Lifecycle::Prefilling;
+    initialize_prefill(lane, transaction.reuse_frontier);
+    sequences[lane].lane = lane;
+    for (const auto point : candidate.retired_points) {
+        if (!release_checkpoint(point)) {
+            throw std::logic_error("binding retirement changed after capacity check");
+        }
+        transaction.retired_points.push_back(point);
+    }
+    if (source && !own_snapshot && transaction.borrow_state && !candidate.retired_points.empty() &&
+        std::find(candidate.private_points.begin(), candidate.private_points.end(), *source) !=
+            candidate.private_points.end()) {
+        // Retirement may create a contiguous Host destination. Preserve the input image
+        // when that now permits a backup/split instead of consuming it for its Device slot.
+        const auto actual =
+            inspect_source(base, source, candidate.consume_source, candidate.private_points);
+        if (!actual) { throw std::logic_error("accepted binding lost its selected source"); }
+        select_source(*actual);
+        result.consumed_source = transaction.consume_source ? source : std::nullopt;
+    }
+    transaction.source_history = source ? checkpoint(*source).kv : nullptr;
     context_transaction_.emplace(std::move(transaction));
     auto& tx = *context_transaction_;
     if (source) { ++checkpoints[source->index].pins; }
@@ -378,7 +442,7 @@ ProgramImpl::start_binding(const RequestBasePlan& base, runtime::LaneId lane_id,
         }
         enqueue_context_transfers(tx);
         request.lifecycle = Lifecycle::Binding;
-        return {.reserved = true};
+        return result;
     } catch (...) {
         abort_context();
         throw;

@@ -11,3 +11,10 @@ target_sources(infernix_jinja PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/jinja.cpp)
 infernix_internal_includes(infernix_jinja)
 target_include_directories(infernix_jinja PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(infernix_jinja PRIVATE infernix_text infernix::json)
+
+add_library(infernix_grammar STATIC grammar.cpp json_schema.cpp schema_composition.cpp json_input.cpp)
+infernix_internal_includes(infernix_grammar)
+target_include_directories(infernix_grammar PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
+target_include_directories(infernix_grammar SYSTEM PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/xgrammar/3rdparty/picojson)
+target_link_libraries(infernix_grammar PRIVATE infernix_xgrammar infernix_text infernix::json)

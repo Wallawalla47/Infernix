@@ -171,12 +171,29 @@ struct DecodeGraphTopology {
 struct DecodeGraphFamily {
     std::vector<DecodeGraphProfile> profiles;
     std::vector<DecodeGraphTopology> topologies;
+    DecodeGraphProfile& select(std::uint32_t batch_size, std::uint32_t frontier);
+    DecodeGraphExecutable& install(DecodeGraphProfile& profile);
 };
 
-// A speculative round family (see SpeculativeRoundShape) and its captured graphs.
+// A Forward stage publishes these IDs before target execution finishes. Program owns the
+// pinned storage and external event together; both outlive the graphs that reference them.
+struct DFlashDraftHandoff {
+    PinnedHostBuffer ids;
+    CudaCompletionEvent ready;
+
+    DFlashDraftHandoff(const DeviceContext& device, std::size_t count)
+        : ids(count * sizeof(TokenId)), ready(device) {}
+
+    [[nodiscard]] std::span<TokenId> tokens() const noexcept {
+        return {static_cast<TokenId*>(ids.data()), ids.size() / sizeof(TokenId)};
+    }
+};
+
+// A speculative round family (see SpeculativeRoundShape) and its captured Forward/Finish graphs.
 struct SpeculativeRoundFamily {
     SpeculativeRoundShape shape;
-    DecodeGraphFamily graphs;
+    DecodeGraphFamily forward;
+    DecodeGraphFamily finish;
 };
 
 // ReplaySSM records viewed densely at a width narrower than the frame's, with the fold bound to
@@ -359,6 +376,7 @@ public:
                                            const ScoreOptions& options);
     [[nodiscard]] std::optional<SourceCandidate>
     inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
+                   std::span<const CheckpointHandle> = {},
                    std::span<const CheckpointHandle> = {}) const;
     [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
     [[nodiscard]] runtime::ContextResourceUsage
@@ -371,6 +389,10 @@ public:
                                                              std::uint32_t target) const;
     [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
                                                          std::span<const CheckpointHandle>) const;
+    [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
+    [[nodiscard]] std::optional<runtime::ContextResourceUsage>
+        checkpoint_release_resources(std::span<const CheckpointHandle>,
+                                     runtime::ContextResourceUsage) const;
     [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
     void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
     [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
@@ -385,10 +407,9 @@ public:
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
     [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle>) noexcept;
-    [[nodiscard]] runtime::ResourceReservation start_binding(const RequestBasePlan&,
-                                                             runtime::LaneId,
-                                                             const SourceCandidate&, ResumeState*,
-                                                             ExecutionUnitKind, std::uint32_t);
+    [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
+                                                   const SourceCandidate&, ResumeState*,
+                                                   ExecutionUnitKind, std::uint32_t);
     [[nodiscard]] bool start_capture(SequenceHandle);
     [[nodiscard]] bool capture_is_input(SequenceHandle) const;
     [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
@@ -410,11 +431,12 @@ public:
     [[nodiscard]] bool context_blocks(SequenceHandle) const noexcept;
     [[nodiscard]] bool recovery_pending(SequenceHandle) const noexcept;
 
-    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*);
+    [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle, runtime::ExecutionTiming*,
+                                                  runtime::TokenMaskProvider*);
     [[nodiscard]] ReplayProgress advance_replay(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] PendingBatch decode(std::span<const SequenceHandle>,
                                       std::span<const runtime::RoundBudget>,
-                                      runtime::ExecutionTiming*);
+                                      runtime::ExecutionTiming*, runtime::TokenMaskProvider*);
     [[nodiscard]] runtime::ExecutionTiming
     append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>, std::uint32_t,
                          std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
@@ -506,6 +528,13 @@ public:
     Tensor prefill_hidden;
     std::optional<Tensor> score_hidden;
     Tensor sampling_config;
+    Tensor grammar_masks_device;
+    std::optional<PinnedHostBuffer> grammar_masks_host;
+    std::optional<DFlashDraftHandoff> dflash_draft_handoff;
+    std::array<std::uint64_t, kMaximumConcurrency> grammar_dead_positions{};
+    ops::SamplingMask bind_grammar_mask(runtime::TokenMaskProvider*, std::size_t row);
+    ops::SamplingMask fill_grammar_mask(runtime::TokenMaskProvider*, std::size_t row,
+                                        std::span<const TokenId> drafts);
     Tensor token_counts;
 
     VisionHandoffState vision_handoff;
@@ -519,11 +548,6 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
     std::vector<CheckpointSlot> checkpoints;
-
-    DecodeGraphFamily ordinary_graphs;
-    // Speculative round families in plan order; fixed after construction, so references into it
-    // stay valid.
-    std::vector<SpeculativeRoundFamily> round_families;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -636,6 +660,16 @@ public:
     std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 
+    // Captured transfers and external events reference the buffers and events declared above.
+    // Families are destroyed first, including when startup throws.
+    DecodeGraphFamily ordinary_graphs;
+    // Speculative round families in plan order; fixed after construction, so references into it
+    // stay valid.
+    std::vector<SpeculativeRoundFamily> round_families;
+
+    [[nodiscard]] std::uint32_t initial_mtp_extent(const RequestBasePlanImpl&) const;
+    [[nodiscard]] UnitDemand prefill_unit(std::uint32_t prompt, std::uint32_t cursor,
+                                          std::uint32_t mtp_extent) const;
     [[nodiscard]] UnitDemand next_unit(const SequenceState&, const RequestControl&,
                                        ExecutionUnitKind, std::uint32_t tokens) const;
     void require_unit(std::uint32_t lane, ExecutionUnitKind, std::uint32_t tokens = 0) const;
@@ -708,7 +742,8 @@ public:
                                      std::uint64_t) const;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_raw(std::span<const std::uint32_t>,
                                                             std::span<const runtime::RoundBudget>,
-                                                            runtime::ExecutionTiming*);
+                                                            runtime::ExecutionTiming*,
+                                                            runtime::TokenMaskProvider*);
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
@@ -776,18 +811,17 @@ public:
                                                          const runtime::RoundBudget& budget);
     // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
     static void take_ngram_index(RequestControl& request, const RequestBasePlanImpl& base);
-    [[nodiscard]] runtime::BatchedGeneratedRound
-    decode_ordinary_batch(std::span<const std::uint32_t> lanes,
-                          std::span<const runtime::RoundBudget> budgets,
-                          runtime::ExecutionTiming* failed_timing);
+    [[nodiscard]] runtime::BatchedGeneratedRound decode_ordinary_batch(
+        std::span<const std::uint32_t> lanes, std::span<const runtime::RoundBudget> budgets,
+        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_mtp_batch(std::span<const std::uint32_t> lanes,
                      std::span<const runtime::RoundBudget> budgets,
-                     runtime::ExecutionTiming* failed_timing);
+                     runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
     [[nodiscard]] runtime::BatchedGeneratedRound
     decode_dflash_batch(std::span<const std::uint32_t> lanes,
                         std::span<const runtime::RoundBudget> budgets,
-                        runtime::ExecutionTiming* failed_timing);
+                        runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
 
     // ---- hybrid prefix cache (null unless ContextCacheMode::Hybrid) ----------------------------
     std::unique_ptr<HybridPrefixCache> hybrid_;
@@ -802,7 +836,7 @@ public:
     // Stages a binding from a hybrid source: pins the quoted path and snapshot, makes room by
     // evicting unpinned cached blocks, submits the Host restores the source needs and reserves
     // the forks. Returns the remaining shortage when room cannot be made from the cache.
-    [[nodiscard]] runtime::ResourceReservation
+    [[nodiscard]] BindingReservation
     start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
                          const SourceCandidate& candidate, ResumeState* resume,
                          ExecutionUnitKind resume_kind, std::uint32_t resume_tokens);

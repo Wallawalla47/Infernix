@@ -48,10 +48,14 @@ std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base
     return impl_->hybrid_sources(base, maximum_frontier);
 }
 
-runtime::ResourceReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
-                                                    const SourceCandidate& source, ResumeState* resume,
-                                                    ExecutionUnitKind, std::uint32_t) {
-    return impl_->start_binding(base, lane, source, resume);
+BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
+                                          const SourceCandidate& source, ResumeState* resume,
+                                          ExecutionUnitKind, std::uint32_t) {
+    const runtime::ResourceReservation reserved = impl_->start_binding(base, lane, source, resume);
+    BindingReservation out;
+    out.reserved = static_cast<bool>(reserved);
+    out.shortage = reserved.shortage;
+    return out;
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation) {
@@ -78,13 +82,14 @@ ReplayProgress Program::advance_replay(SequenceHandle sequence, runtime::Executi
     return impl_->advance_replay(sequence);
 }
 
-PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*) {
-    return impl_->advance_prefill(sequence);
+PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*,
+                                         runtime::TokenMaskProvider* masks) {
+    return impl_->advance_prefill(sequence, masks);
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,
-                             runtime::ExecutionTiming*) {
-    return impl_->decode(sequences, budgets);
+                             runtime::ExecutionTiming*, runtime::TokenMaskProvider* masks) {
+    return impl_->decode(sequences, budgets, masks);
 }
 
 runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceHandle> sequences,

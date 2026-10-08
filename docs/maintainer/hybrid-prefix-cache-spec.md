@@ -851,6 +851,10 @@ orchestration are shared by both modes. Retention policy lives in the Program's 
   Program keeps no Host context arena, so a paused request recovers by Replay, from the deepest
   source the tree then holds.
 - While the FIFO head waits, the Engine asks for a prefetch of its Host-only path (§6.6).
+- A waiting request retains no source: `retain_source`, `binding_started` and `release_source`
+  hold nothing, and a lane that frees quotes the tree again. A stale quote binds as an invalid
+  source (`BindingReservation::source_valid` false), so the Engine moves to its next candidate;
+  a shortage the pools could hold at all lets the request wait for resident progress.
 - `HybridPrefixCacheStats` feed the `throughput` record's `context_cache.hybrid` object.
 
 ### 8.3 Frontend and protocol mapping

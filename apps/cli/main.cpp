@@ -14,6 +14,8 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <fstream>
+#include <iterator>
 #include <iomanip>
 #include <iostream>
 #include <optional>
@@ -184,7 +186,7 @@ private:
 void print_generation_summary(const infernix::GenerationResult& result,
                               const infernix::ResolvedSamplingParameters& sampling,
                               const infernix::MemorySummary& memory) {
-    print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
+    print_stage("prepare", "request preparation", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
     print_stage("generate", "decode", result.timings.decode_seconds);
@@ -308,6 +310,22 @@ int main(int argc, char** argv) {
         input.options.reasoning_effort = cli.reasoning_effort;
 
         infernix::RequestOptions request;
+        if (cli.json_object)
+            request.constraint = infernix::OutputConstraint::json_object();
+        else if (cli.regex)
+            request.constraint = infernix::OutputConstraint::regex(*cli.regex);
+        else if (!cli.choices.empty())
+            request.constraint = infernix::OutputConstraint::choice(cli.choices);
+        else if (!cli.grammar_path.empty() || !cli.json_schema_path.empty()) {
+            const auto& path = cli.grammar_path.empty() ? cli.json_schema_path : cli.grammar_path;
+            std::ifstream file(path, std::ios::binary);
+            if (!file) throw std::invalid_argument("cannot open constraint file: " + path.string());
+            std::string source(std::istreambuf_iterator<char>(file), {});
+            if (file.bad()) throw std::runtime_error("failed to read constraint file");
+            request.constraint = cli.grammar_path.empty()
+                                     ? infernix::OutputConstraint::json_schema(std::move(source))
+                                     : infernix::OutputConstraint::grammar(std::move(source));
+        }
         request.execution.sampling                = cli.sampling;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;

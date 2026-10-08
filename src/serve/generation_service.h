@@ -14,6 +14,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,6 +44,7 @@ struct GenerationMetrics {
     infernix::GenerationEngineTiming engine_timing;
     std::optional<infernix::GenerationFirstOutputTiming> first_output_timing;
     infernix::GenerationSchedulingStats scheduling;
+    infernix::GenerationAdmissionStats admission;
 
     SpeculativeBackend speculative_backend    = SpeculativeBackend::None;
     std::uint32_t speculative_draft_window    = 0;
@@ -76,6 +78,7 @@ struct GenerationOutcome {
     int completion_tokens = 0;
     int reasoning_tokens  = 0;
     infernix::ThinkingBudgetStats thinking;
+    std::optional<infernix::ConstraintObservation> constraint;
     infernix::FinishReason finish_reason = infernix::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     std::optional<infernix::PromptReadout> readout;
@@ -105,15 +108,21 @@ enum class GenerationConsumerMode : std::uint8_t {
 };
 
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
-ApiError request_error_to_api_error(const infernix::RequestError& exception);
+ApiError
+request_error_to_api_error(const infernix::RequestError& exception,
+                           std::string_view constraint_param = "structured_outputs.grammar",
+                           std::span<const std::string> tool_schema_params = {});
 
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::string constraint_param;
+    std::vector<std::string> tool_schema_params;
     infernix::GenerationHandle generation;
     infernix::ResolvedSamplingParameters sampling;
-    double prepare_seconds     = 0.0;
+    // Service input acquisition/bookkeeping; Engine timings own prompt and constraint preparation.
+    double service_prepare_seconds = 0.0;
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;

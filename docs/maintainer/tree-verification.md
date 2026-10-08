@@ -62,7 +62,8 @@ and not its per-column work, so a column costs more of each row's share of the r
 grows, and every column of a verification block wider than 8 costs attention time that grows with
 the context ([Measurements](#measurements)). The useful width therefore shrinks with the batch
 size and the context length, which automatic widths measure and a fixed table cannot follow. One
-CUDA Graph family is captured per distinct width, for the batch sizes that may use it.
+CUDA Graph family is captured per distinct width, for the batch sizes that may use it; the chain
+family serves every batch size (a constrained round verifies the chain).
 
 ## Automatic widths
 
@@ -242,6 +243,11 @@ and records beyond the committed prefix are unreachable, as for rejected chain d
   `F + W <= capacity`): it gets extent W-1 and KV mapped through `F+W`, and its RoPE positions are
   the anchor's (the device adds depths). Any other row (budget tail, capacity) is a chain row with
   its chain prefix and the chain's positions.
+- A round with a grammar-constrained row verifies the chain whatever the table or controller
+  would select: grammar masks follow one proposal chain
+  ([Constrained decoding](constrained-decoding.md)), and tree acceptance reads no masks. The
+  neural chain family is therefore captured for every batch size, also where the table selects
+  only trees. Each family is a Forward/Finish graph pair; tree compaction runs in Finish.
 - The drafter proposes K+1 columns at its own width in its narrow frame view; the builder writes
   the tree straight into the round's W-wide frame, with the tree rows and masks in device-only
   frame storage. Record width, pending-feature width and workspace plans use W.
