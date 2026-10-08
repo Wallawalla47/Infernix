@@ -30,9 +30,11 @@ n-gram embedding table from an NVMe drive.
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata)).
 - **Quality at least Strata's**: teacher-forced perplexity 4.654 against Strata's 4.844 on the same
   texts (lower is better); every optimisation was held to that bar.
-- **Two conversions of NVIDIA's checkpoint**: one bit-exact in every weight the model computes with
-  (perplexity 4.666), and Dense8, with the dense projections in 8 bits, at the same measured
-  quality and ~22 % faster decode ([models](#models)).
+- **Two conversions of NVIDIA's checkpoint** on Hugging Face:
+  [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
+  (**recommended**: the dense projections in 8 bits, ~22 % faster decode, perplexity 4.654) and
+  [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)
+  (bit-exact in every weight the model computes with, perplexity 4.666); see [models](#models).
 - **Long context**: 262K tokens natively, up to 1M with YaRN (`--rope-yarn-factor`); a 250K-token
   prompt prefills at ~7.3K tok/s (34 s), and decoding with MTP stayed at 136-164 tok/s from 8K to
   250K tokens.
@@ -408,8 +410,15 @@ the Linux filesystem first (reads through `/mnt/` are slow).
   [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), each
   with the MTP drafter, a proposal head for `--lm-head-draft` and the same 52 GB n-gram volume
   (see the [Flash-Next guide](docs/qwen3_8-flash-next.md#convert)):
+  - **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
+    (recommended)**: NVIDIA's NVFP4 experts and n-gram table bit-exact, the dense projections and
+    `lm_head` in 8 bits. It decodes ~22 % faster than the bit-exact conversion at the same measured
+    quality, and it is the artifact the benchmarks above use.
+  - **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)**
+    (bit-exact): every weight of the main model and vision tower exactly as NVIDIA stores it. Choose
+    it when the weights must be NVIDIA's unchanged; it is slower.
 
-  | | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) (bit-exact, recipe A) | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) (recipe B) |
+  | | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) (bit-exact, recipe A) | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) (recipe B, **recommended**) |
   |---|---|---|
   | Routed experts (24,576, NVFP4) | bit-exact | bit-exact |
   | PLE n-gram table (FP8) | bit-exact | bit-exact |
