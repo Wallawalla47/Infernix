@@ -40,8 +40,10 @@ approval requirements beyond the user's instructions and the actual execution en
 
 Infernix is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. The implementation targets `sm_120a` and
-is tuned on NVIDIA GeForce RTX 5090.
+use the same architecture, binding and execution path. It also implements `Qwen4ExpForCausalLM`
+(Qwen3.8-Flash-Next, model family `qwen4_exp`), whose routed experts are offloaded to host memory or
+the SSD behind a VRAM expert cache. The implementation targets `sm_120a` and is tuned on NVIDIA
+GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Snapshot/Replay recovery,
