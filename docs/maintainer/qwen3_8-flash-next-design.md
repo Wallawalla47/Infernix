@@ -6565,7 +6565,15 @@ measured results are under "Status" at the end of this section.
   slots ← the artifact on SSD read in place with unbuffered I/O (U3: no SSD cache and no writes;
   eviction from RAM is a discard). Residency is exclusive under pressure, the RAM tier is ranked by decayed LFU (the
   user's "least frequently used"; the half-life, or LRU/CLOCK on a ≥ 5 % win, is chosen by replay),
-  and RAM and VRAM are pre-filled from the saved expert state shared with concurrency S4b.
+  and RAM and VRAM are pre-filled from the saved expert state shared with concurrency S4b. The
+  pre-fill is exclusive too (2026-10-08): RAM is read in the order saved ranking, then the saved
+  use counts, then the unused keys interleaved across layers; the frames' warm start loads its
+  seeds from RAM, whose copies are then released and refilled with the next keys of that order.
+  The tier's decayed LFU is seeded with the saved counts (capped at 16), and the demotion list is
+  refilled at every boundary. Before, the seeds stayed in RAM as shadows (10.9 of 36.8 GiB on
+  2026-10-07), the first victims were the best-ranked pre-filled keys (equal zero scores, lowest
+  slot first), and the never-refilled demotion list made every VRAM victim without a host copy an
+  SSD drop after the first 32 demotions.
   SSD-only experts in decode and verification calls become CPU jobs, so their reads overlap all of
   the layer's GPU work; prefill and overflow use a device fetch channel. A failed read fails only
   the affected requests.
