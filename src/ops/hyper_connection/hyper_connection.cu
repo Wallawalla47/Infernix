@@ -1,6 +1,6 @@
 #include "infernix/ops/hyper_connection.h"
 
-#include "ops/hyper_connection/hyper_connection_mix_q8.h"
+#include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
 #include <cuda_bf16.h>
 
@@ -220,9 +220,9 @@ void hyper_connection_mix(const Tensor& residual, const Tensor& norm_weight, con
     }
     require(eps > 0, "mix epsilon must be positive");
     auto scope = workspace.scope();
-    if (detail::hc_mix_q8_supported(down, up, hidden, streams, rank, T)) {
-        const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_q8_workspace_bytes(down.n, streams, T));
-        detail::hc_mix_q8(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
+    if (detail::hc_mix_fused_supported(down, up, hidden, streams, rank, T)) {
+        const DeviceSpan partials = workspace.alloc_bytes(detail::hc_mix_fused_workspace_bytes(down.n, streams, T));
+        detail::hc_mix_fused(residual, norm_weight, down, up, streams, rank, eps, x, inject, partials.data, stream);
         return;
     }
     Tensor normalized = workspace.alloc(DType::BF16, {residual.ne[0], T});
@@ -242,7 +242,7 @@ std::size_t hyper_connection_mix_workspace_capacity_bytes(const Weight& down, co
     require(max_tokens > 0 && streams > 0 && rank > 0, "mix workspace needs positive T, streams and rank");
     std::size_t bytes = composed_bytes(down, up, policy, streams, rank, max_tokens);
     for (std::int32_t T = 1; T <= std::min(max_tokens, detail::kHcMixFusedMaxColumns); ++T) {
-        bytes = std::max(bytes, detail::hc_mix_q8_workspace_bytes(down.n, streams, T) + 256);
+        bytes = std::max(bytes, detail::hc_mix_fused_workspace_bytes(down.n, streams, T) + 256);
     }
     return bytes;
 }

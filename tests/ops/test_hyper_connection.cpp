@@ -1,6 +1,7 @@
 // hyper_connection_mix against an FP64 oracle (docs/maintainer/qwen3_8-flash-next-design.md §8.3,
-// §19.3.3 Phase 1b). The oracle evaluates the closed formula in FP64 from the represented BF16
-// residual and norm weight and the Q8 weights decoded independently from their payload:
+// §19.3.3 Phase 1b), for Q8_G32_FP16 weights (Dense8) and BF16 weights (the bit-exact artifact). The
+// oracle evaluates the closed formula in FP64 from the represented BF16 residual and norm weight and
+// the weights decoded independently from their payload:
 //
 //   Rn = R * (mean R^2 + eps)^-1/2 * (1 + w) per stream; z = W_down Rn; m = SiLU(z[:rank] / S);
 //   inject = 2 sigmoid(z[rank:] / S); u = W_up m; x = (1/S) sum_s sigmoid(u[sH + d]) Rn[sH + d].
@@ -168,6 +169,33 @@ void randomize_q8(infernix::test::quantized_weight::PackedWeight& w, std::uint32
     }
 }
 
+// BF16 weights of the same scale as randomize_q8's: per 32-element group a gain g in [2, 6), values
+// uniform in (-1, 1) * g / sqrt(K), rounded to BF16 (the oracle reads the rounded values).
+void randomize_bf16(infernix::test::quantized_weight::PackedWeight& w, std::uint32_t seed) {
+    const int n = w.weight.n, k = w.weight.k;
+    std::uint32_t state = seed;
+    for (int r = 0; r < n; ++r) {
+        double gain = 0;
+        for (int c = 0; c < k; ++c) {
+            if (c % 32 == 0) { gain = 2.0 + 4.0 * static_cast<double>(next(state) >> 8) / static_cast<double>(1 << 24); }
+            const auto bits = t::f32_to_bf16(static_cast<float>(uniform(state) * gain / std::sqrt(static_cast<double>(k))));
+            const std::size_t at = (static_cast<std::size_t>(r) * k + c) * 2;
+            w.payload[at]        = static_cast<std::uint8_t>(bits & 0xFFU);
+            w.payload[at + 1]    = static_cast<std::uint8_t>(bits >> 8);
+        }
+    }
+}
+
+std::vector<float> decode_bf16(const infernix::test::quantized_weight::PackedWeight& w) {
+    std::vector<float> out(static_cast<std::size_t>(w.weight.n) * w.weight.k);
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i] = t::bf16_to_f32(static_cast<std::uint16_t>(w.payload[2 * i] | (w.payload[2 * i + 1] << 8)));
+    }
+    return out;
+}
+
+enum class Codec { Q8, Bf16 };
+
 struct Problem {
     int down_rows = 0;
     infernix::test::quantized_weight::PackedWeight down, up;
@@ -178,15 +206,24 @@ struct Problem {
     std::unique_ptr<Device> norm_device;
 };
 
-Problem make_problem(bool inject) {
+Problem make_problem(bool inject, Codec codec) {
     Problem p;
-    p.down_rows    = kRank + (inject ? kS : 0);
-    p.down         = t::linear::make_q8_g32_fp16_weight(p.down_rows, kW, inject ? 501U : 503U);
-    p.up           = t::linear::make_q8_g32_fp16_weight(kW, kRank, 509U);
-    randomize_q8(p.down, inject ? 601U : 603U);
-    randomize_q8(p.up, 607U);
-    p.down_values  = decode_q8(p.down);
-    p.up_values    = decode_q8(p.up);
+    p.down_rows = kRank + (inject ? kS : 0);
+    if (codec == Codec::Q8) {
+        p.down = t::linear::make_q8_g32_fp16_weight(p.down_rows, kW, inject ? 501U : 503U);
+        p.up   = t::linear::make_q8_g32_fp16_weight(kW, kRank, 509U);
+        randomize_q8(p.down, inject ? 601U : 603U);
+        randomize_q8(p.up, 607U);
+        p.down_values = decode_q8(p.down);
+        p.up_values   = decode_q8(p.up);
+    } else {
+        p.down = t::linear::make_bf16_weight(p.down_rows, kW, inject ? 511U : 513U);
+        p.up   = t::linear::make_bf16_weight(kW, kRank, 519U);
+        randomize_bf16(p.down, inject ? 611U : 613U);
+        randomize_bf16(p.up, 617U);
+        p.down_values = decode_bf16(p.down);
+        p.up_values   = decode_bf16(p.up);
+    }
     p.down_payload = std::make_unique<Device>(p.down.payload.size());
     p.up_payload   = std::make_unique<Device>(p.up.payload.size());
     t::cuda_check(cudaMemcpy(p.down_payload->p, p.down.payload.data(), p.down.payload.size(), cudaMemcpyHostToDevice), "down");
@@ -294,12 +331,13 @@ int main() {
         }
         cudaStream_t stream = nullptr;
         t::cuda_check(cudaStreamCreate(&stream), "stream");
+        for (const Codec codec : {Codec::Q8, Codec::Bf16})
         for (const bool inject : {true, false}) {
-            Problem p = make_problem(inject);
+            Problem p = make_problem(inject, codec);
             const std::size_t capacity = infernix::ops::hyper_connection_mix_workspace_capacity_bytes(
                 p.down_w, p.up_w, infernix::ops::LinearPolicy::A16Only, kS, kRank, 64);
             infernix::WorkspaceArena ws(capacity);
-            const std::string tag = inject ? "inject" : "no inject";
+            const std::string tag = std::string(codec == Codec::Q8 ? "q8 " : "bf16 ") + (inject ? "inject" : "no inject");
             for (const int T : {1, 4, 5, 8, 9, 16, 17, 64}) {
                 const auto r     = residual(T, 1000U + static_cast<std::uint32_t>(T));
                 const Result got = run(p, r, T, inject, ws, stream);
@@ -328,7 +366,7 @@ int main() {
         }
         // Shapes that disagree are refused.
         {
-            Problem p = make_problem(true);
+            Problem p = make_problem(true, Codec::Q8);
             infernix::WorkspaceArena ws(1 << 20);
             Device rd(static_cast<std::size_t>(kW) * 2), xd(kH * 2);
             const Tensor R(rd.p, DType::BF16, {kW, 1});
