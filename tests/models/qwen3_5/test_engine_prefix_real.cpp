@@ -134,13 +134,53 @@ infernix::PromptInput chinese_chat(bool enable_thinking) {
     return input;
 }
 
+// Whether the artifact's chat template accepts a `role` message after the conversation's first
+// message. Qwen's official template renders a late System or Developer instruction in place;
+// NVIDIA's raises "System message must be at the beginning." for any system message that is not
+// first, so such an input is invalid for that artifact and its scenario step is skipped.
+bool accepts_late_instruction(const infernix::Engine& engine, infernix::ChatRole role) {
+    const auto message = [](infernix::ChatRole message_role, std::string text) {
+        infernix::ChatMessage out;
+        out.role = message_role;
+        out.parts.push_back(infernix::MessagePart{
+            .kind = infernix::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        return out;
+    };
+    infernix::PromptInput input;
+    input.messages.push_back(message(infernix::ChatRole::User, "Hello."));
+    input.messages.push_back(message(infernix::ChatRole::Assistant, "Hello."));
+    input.messages.push_back(message(role, "Answer briefly."));
+    input.messages.push_back(message(infernix::ChatRole::User, "Again."));
+    try {
+        (void)engine.count_tokens(std::move(input));
+        return true;
+    } catch (const std::exception& error) {
+        std::cout << "skip: the artifact's chat template rejects a late "
+                  << (role == infernix::ChatRole::System ? "system" : "developer")
+                  << " message (" << std::string_view(error.what()).substr(0, 200) << ")\n";
+        return false;
+    }
+}
+
 int exercise_artifact_frontend(const infernix::Engine& engine) {
-    if (engine.count_tokens(chinese_chat(true)) != 16) {
-        std::cerr << "artifact tokenizer/chat template changed the thinking prompt golden\n";
+    // Thinking-prompt goldens of the supported chat templates: Qwen3.6 opens the assistant turn
+    // with "<think>\n" (16 tokens); Qwen3.8 also inserts its default system message ("Reasoning
+    // effort is set to xhigh. ...", 40 more tokens) whenever thinking is on. Both close an empty
+    // thinking block without it (18 tokens).
+    constexpr std::uint32_t kThinkingQwen36 = 16;
+    constexpr std::uint32_t kThinkingQwen38 = 58;
+    constexpr std::uint32_t kNoThinking     = 18;
+    const std::uint32_t thinking            = engine.count_tokens(chinese_chat(true));
+    if (thinking != kThinkingQwen36 && thinking != kThinkingQwen38) {
+        std::cerr << "artifact tokenizer/chat template changed the thinking prompt golden: "
+                  << thinking << " tokens, expected " << kThinkingQwen36 << " (Qwen3.6) or "
+                  << kThinkingQwen38 << " (Qwen3.8)\n";
         return 1;
     }
-    if (engine.count_tokens(chinese_chat(false)) != 18) {
-        std::cerr << "artifact tokenizer/chat template changed the no-thinking prompt golden\n";
+    const std::uint32_t plain = engine.count_tokens(chinese_chat(false));
+    if (plain != kNoThinking) {
+        std::cerr << "artifact tokenizer/chat template changed the no-thinking prompt golden: "
+                  << plain << " tokens, expected " << kNoThinking << '\n';
         return 1;
     }
     return 0;
@@ -1202,6 +1242,8 @@ int exercise_agent_continuation(const char* artifact) {
     configured.context_cache.host_capacity_bytes = 0;
     configured.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
     infernix::Engine engine(std::move(configured));
+    const bool late_system    = accepts_late_instruction(engine, infernix::ChatRole::System);
+    const bool late_developer = accepts_late_instruction(engine, infernix::ChatRole::Developer);
     const auto text_message = [](infernix::ChatRole role, std::string text) {
         infernix::ChatMessage message;
         message.role = role;
@@ -1296,10 +1338,10 @@ int exercise_agent_continuation(const char* artifact) {
             text_message(infernix::ChatRole::Tool, "{\"value\":" + std::to_string(round * 17) + '}');
         tool.tool_call_id = call_id;
         input.messages.push_back(std::move(tool));
-        if (round == 5) {
+        if (round == 5 && late_system) {
             input.messages.push_back(text_message(
                 infernix::ChatRole::System, "Keep using the established diagnostic sequence."));
-        } else if (round == 11) {
+        } else if (round == 11 && late_developer) {
             input.messages.push_back(text_message(
                 infernix::ChatRole::Developer, "Preserve prior results and inspect the next step."));
         }
@@ -1450,6 +1492,7 @@ int exercise_late_instructions(const char* artifact) {
     const auto recovery_suffix_tokens = static_cast<std::uint32_t>(
         engine.tokenize_text("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n").size());
     for (const auto role : {infernix::ChatRole::System, infernix::ChatRole::Developer}) {
+        if (!accepts_late_instruction(engine, role)) { continue; }
         auto assistant              = text_message(infernix::ChatRole::Assistant, previous.content);
         assistant.reasoning_content = previous.reasoning;
         input.messages.push_back(std::move(assistant));
