@@ -275,10 +275,29 @@ def qwen3_8_27b_nvfp4_orcarouter(model, recipe, sources):
         )
 
 
+def _flash_next_drafter(model, recipe):
+    """The MTP drafter of both Qwen3.8-Flash-Next recipes. It only proposes tokens that the main
+    model verifies, so its precision changes acceptance, never output (design §11.2). Its
+    projections are ``q8_g32_fp16`` except the router and shared-expert gate (BF16, as NVIDIA stores
+    them), and its 512 routed experts, block-FP8 in NVIDIA's checkpoint, ``q4_g64_fp16`` with
+    MSE-chosen group scales (1.34 GB, all VRAM-resident; Strata keeps them at 2.25 bits)."""
+    for name, parameter in model.parameters.items():
+        if not name.startswith("mtp/") or not parameter.projection:
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")):
+            continue
+        if "/moe/experts/" in name:
+            _assign(recipe, name, Q4, method=grouped_mse)
+        else:
+            _assign(recipe, name, Q8)
+
+
 def qwen3_8_flash_next_nvfp4(model, recipe, sources):
-    """Recipe A of Qwen3.8-Flash-Next (design §6.1): every NVIDIA-quantized tensor bit-exact, every
-    BF16 tensor BF16. Routed experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1``
-    with each matrix's own ModelOpt input scale; the n-gram table is written to its own volume."""
+    """Recipe A of Qwen3.8-Flash-Next (design §6.1): the main model and the vision tower bit-exact to
+    NVIDIA's checkpoint. Every NVIDIA-quantized tensor keeps its codes and scales (the routed
+    experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1`` with each matrix's own
+    ModelOpt input scale; the FP8 n-gram table is written to its own volume) and every BF16 or FP32
+    tensor keeps its dtype. Only the MTP drafter is re-quantized (``_flash_next_drafter``)."""
     from .qwen4_exp import import_expert_bank
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
@@ -293,6 +312,7 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
                 activation_policy="AllowA4",
             )
             recipe.group(name, shape=parameter.shape)
+    _flash_next_drafter(model, recipe)
 
 
 def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
@@ -302,12 +322,7 @@ def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
     PLE projections and ``lm_head``. ``q8_g32_fp16`` is used for every class rather than FP8 rows: a
     32-element group scale and an 8-bit integer give far finer resolution at 1.06 bytes per weight.
     The router, shared-expert gate, GDN a/b, the QSA query/gate/key/value/indexer group and the
-    embedding stay as recipe A has them.
-
-    The MTP drafter only proposes tokens that the main model verifies, so its precision changes
-    acceptance, never output (design §11.2). Its projections are ``q8_g32_fp16`` except the
-    router and shared-expert gate, and its 512 routed experts ``q4_g64_fp16`` with MSE-chosen
-    group scales (1.34 GB, all VRAM-resident; Strata keeps them at 2.25 bits)."""
+    embedding stay as recipe A has them, and so does the drafter."""
 
     qwen3_8_flash_next_nvfp4(model, recipe, sources)
     dense8 = (
@@ -323,15 +338,6 @@ def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
             _assign(recipe, name, Q8)
     for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
         _assign(recipe, name, Q8)
-    for name, parameter in model.parameters.items():
-        if not name.startswith("mtp/") or not parameter.projection:
-            continue
-        if name.endswith(("/moe/router", "/moe/shared_score")):
-            continue
-        if "/moe/experts/" in name:
-            _assign(recipe, name, Q4, method=grouped_mse)
-        else:
-            _assign(recipe, name, Q8)
 
 
 RECIPES = {

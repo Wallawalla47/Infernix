@@ -1,14 +1,18 @@
-"""Recipe A qualification of a Qwen3.8-Flash-Next artifact (design §16.3): word equality.
+"""Word-equality qualification of a Qwen3.8-Flash-Next artifact against NVIDIA's checkpoint (design §6.1, §16.3).
 
-    python -m tools.flash_next.verify_artifact --model CHECKPOINT --artifact OUT.ninfer \
-        [--ngram OUT.ninfer.ngram] [--ngram-rows all|N]
+    python -m tools.flash_next.verify_artifact --model CHECKPOINT --artifact OUT.infernix \
+        [--ngram OUT.ngram] [--ngram-rows all|N]
 
-Every logical parameter's stored words must equal the checkpoint's:
+Every logical parameter the recipe stores as the checkpoint has it must equal the checkpoint's words:
 
 - each routed expert's E2M1 codes, E4M3 block scales and FP32 ``weight_scale_2`` (decoded from the
   ``nvfp4_expert_rg16_v1`` record), and its gate/up/down ``input_scale`` words;
 - every BF16 tensor bit for bit, and every FP32 widening of a BF16 tensor exactly;
 - the n-gram volume's header, geometry and id, and its FP8 rows (all of them, or a sample).
+
+Parameters the recipe re-quantizes (``q8_g32_fp16``/``q4_g64_fp16``: both recipes' MTP drafter, recipe
+B's dense classes) are listed per component, not compared. Recipe A passes with only the drafter
+re-quantized.
 
 Source names and axes come from the converter's logical model, so this proves the writer, the
 recipe and the bindings; the model's semantics are proven by tools/flash_next/reference.py.
@@ -32,6 +36,12 @@ from tools.convert.sources.modelopt import nvfp4_matrix_words
 from tools.convert.sources.safetensors import SafetensorsSource
 
 _WORD = {"bf16": (torch.bfloat16, 2), "fp32": (torch.float32, 4), "int32": (torch.int32, 4)}
+_REQUANTIZED = {"q8_g32_fp16", "q4_g64_fp16"}
+
+
+def _binding_formats(artifact: Artifact, binding: dict) -> set[str]:
+    parts = binding["parts"] if "parts" in binding else [{"object": binding["object"]}]
+    return {artifact.object(part["object"]).format for part in parts}
 
 
 def _binding_values(artifact: Artifact, binding: dict) -> tuple[str, torch.Tensor]:
@@ -130,12 +140,14 @@ def main() -> int:
     args = parser.parse_args()
     start = time.time()
     report = {"experts": 0, "expert_mismatches": 0, "tensors": 0, "tensor_mismatches": [],
-              "input_scale_mismatches": 0}
+              "input_scale_mismatches": 0, "requantized": {}}
     with SafetensorsSource(args.model) as store, Artifact(args.artifact) as artifact:
         text = artifact.directory.components["text"]["config"]
         components = tuple(artifact.directory.components)
         model = qwen4_exp.build_model(store, components=components)
-        bindings = artifact.directory.bindings
+        # The proposal head (--lm-head-draft) is built from a frequency ranking, outside the logical model.
+        bindings = {k: v for k, v in artifact.directory.bindings.items() if not k.startswith("proposal/")}
+        report["proposal_bindings"] = len(artifact.directory.bindings) - len(bindings)
         if set(bindings) != set(model.parameters):
             missing = sorted(set(model.parameters) - set(bindings))[:5]
             extra = sorted(set(bindings) - set(model.parameters))[:5]
@@ -147,6 +159,10 @@ def main() -> int:
                 report["expert_mismatches"] += verify_bank(artifact, store, binding, source.prefix, source.shape)
                 report["experts"] += source.shape[0]
                 print(f"{name}: {source.shape[0]} experts verified ({time.time() - start:.0f}s)", flush=True)
+                continue
+            if _binding_formats(artifact, binding) & _REQUANTIZED:
+                component = name.split("/", 1)[0]
+                report["requantized"][component] = report["requantized"].get(component, 0) + 1
                 continue
             fmt, stored = _binding_values(artifact, binding)
             expected = parameter.source.values()
