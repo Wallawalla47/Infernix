@@ -3,6 +3,7 @@
 // sum_k |w x| * K * 2^-24, plus its column invariance: a column's bits do not depend on the batch
 // width or the column's position.
 #include "infernix/ops/projection_fp32.h"
+#include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/linear/linear_test_common.h"
 
 #include <cuda_bf16.h>
@@ -148,7 +149,7 @@ void quantized_case(infernix::QType qtype, std::int32_t n, std::int32_t k, std::
     std::vector<std::uint16_t> wide_bits;
     std::vector<float> wide_values;
     random_activations(k, 17, seed + 1, wide_bits, wide_values);
-    for (const std::int32_t t : {1, 3, 8, 9, 17}) {
+    for (const std::int32_t t : {1, 3, 8, 9, 16, 17}) {
         std::vector<std::uint16_t> bits(wide_bits.begin(), wide_bits.begin() + static_cast<std::ptrdiff_t>(k) * t);
         std::vector<float> values(wide_values.begin(), wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
         const auto out = run_q8(weight, bits, k, t);
@@ -295,6 +296,61 @@ void bf16_wide_case(const std::vector<std::int32_t>& rows, std::int32_t k, std::
 
 } // namespace
 
+// Tall BF16 projections (vocabulary heads) at verification widths take the tall mapping: every column
+// must equal the narrow mapping's bit for bit (both routes forced), sampled rows meet the FP64 bound,
+// and column 0 equals the single-column call.
+void bf16_tall_case(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> d(0.0F, 0.05F);
+    std::vector<std::uint16_t> bits(static_cast<std::size_t>(n) * k);
+    for (auto& v : bits) { v = bf16_bits(d(rng)); }
+    auto* dw = device(bits);
+    const Tensor weight(dw, DType::BF16, {k, n});
+    const Tensor* weights[] = {&weight};
+    const WeightAt w = [&](std::int32_t r, std::int32_t i) {
+        return static_cast<double>(bf16_value(bits[static_cast<std::size_t>(r) * k + i]));
+    };
+    std::vector<std::int32_t> rows;
+    for (std::int32_t r = 0; r < n; r += 977) { rows.push_back(r); }
+    rows.push_back(n - 1);
+    std::vector<std::uint16_t> wide_bits;
+    std::vector<float> wide_values;
+    random_activations(k, 16, seed + 5, wide_bits, wide_values);
+    const auto run = [&](std::int32_t t, infernix::ops::detail::ProjectionRoute route) {
+        auto* dx    = device(std::vector<std::uint16_t>(wide_bits.begin(), wide_bits.begin() + static_cast<std::ptrdiff_t>(k) * t));
+        float* dout = nullptr;
+        cudaMalloc(&dout, sizeof(float) * n * t);
+        Tensor x(dx, DType::BF16, {k, t}), out(dout, DType::FP32, {n, t});
+        infernix::ops::detail::projection_fp32_route(x, weights, out, route, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess) { throw std::runtime_error("projection bf16 tall failed"); }
+        std::vector<float> host(static_cast<std::size_t>(n) * t);
+        cudaMemcpy(host.data(), dout, host.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(dx);
+        cudaFree(dout);
+        return host;
+    };
+    const auto single     = run(1, infernix::ops::detail::ProjectionRoute::Narrow);
+    const auto single_mma = run(1, infernix::ops::detail::ProjectionRoute::Mma);
+    for (const std::int32_t t : {1, 2, 5, 6, 8, 9, 12, 16}) {
+        const auto tall   = run(t, infernix::ops::detail::ProjectionRoute::Tall);
+        const auto narrow = run(t, infernix::ops::detail::ProjectionRoute::Narrow);
+        const std::vector<float> values(wide_values.begin(), wide_values.begin() + static_cast<std::ptrdiff_t>(k) * t);
+        verify("bf16 tall N=" + std::to_string(n) + " T=" + std::to_string(t), tall, w, values, n, k, t, rows);
+        check(tall == narrow, "bf16 tall equals narrow bit for bit, T=" + std::to_string(t));
+        check(std::memcmp(single.data(), tall.data(), sizeof(float) * n) == 0,
+              "bf16 tall column invariance T=" + std::to_string(t));
+        // The tensor-core mapping, what Automatic selects for a one-weight vocabulary head at 1..16
+        // columns: the same bound, and column-invariant across those widths.
+        const auto mma = run(t, infernix::ops::detail::ProjectionRoute::Mma);
+        verify("bf16 mma N=" + std::to_string(n) + " T=" + std::to_string(t), mma, w, values, n, k, t, rows);
+        check(run(t, infernix::ops::detail::ProjectionRoute::Automatic) == mma,
+              "bf16 automatic takes the tensor-core mapping at T=" + std::to_string(t));
+        check(std::memcmp(single_mma.data(), mma.data(), sizeof(float) * n) == 0,
+              "bf16 tensor-core column invariance T=" + std::to_string(t));
+    }
+    cudaFree(dw);
+}
+
 int main() {
     if (!cuda_available()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -309,6 +365,7 @@ int main() {
         bf16_wide_case({512, 1}, 2560, 4096, 37);  // a 4096-token prefill chunk's router
         bf16_wide_case({7, 300, 1, 64}, 3072, 301, 41); // K at its limit, partial CTA range and pass
         bf16_wide_case({129}, 1024, 135, 43);
+        bf16_tall_case(40000, 2560, 47);  // the tall mapping (a vocabulary head's width)
         quantized_case(infernix::QType::Q8_G32_FP16, 1000, 2560, 17, false);
         quantized_case(infernix::QType::Q8_G32_FP16, 248320, 2560, 19, true); // the 8-bit lm_head, sampled rows
         quantized_case(infernix::QType::Q4_G64_FP16, 1000, 2560, 23, false);
