@@ -411,6 +411,9 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
+          collect_open_reasoning(split_reasoning && output.tolerant_tool_calls &&
+                                 tool_call_output_ != nullptr &&
+                                 !tool_call_output_->constrained && grammar_ == nullptr),
           tool_call_output(output.raw ? nullptr : std::move(tool_call_output_),
                            output.tool_name_max_length, output.tolerant_tool_calls),
           grammar(std::move(grammar_)), combined(combined_) {
@@ -469,6 +472,10 @@ public:
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
     bool preserve_special = false;
     bool split_reasoning  = false;
+    // Tolerant tool output keeps the open thinking so a turn that ends inside it can still return
+    // the calls stranded there; the text is dropped once the thinking closes.
+    bool collect_open_reasoning = false;
+    std::string open_reasoning;
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -840,12 +847,22 @@ PublishedOutput OutputSession::commit_preview() {
                                                           : ConstraintOutputBranch::Content;
             if (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)
                 delta.text = impl_->tool_call_output.feed(delta.text);
+        } else if (impl_->collect_open_reasoning) {
+            impl_->open_reasoning.append(delta.text);
         }
+    }
+    if (impl_->collect_open_reasoning && !impl_->state.in_reasoning) {
+        impl_->collect_open_reasoning = false;
+        impl_->open_reasoning         = {};
     }
     if (impl_->state.terminal &&
         (!impl_->combined || impl_->branch == ConstraintOutputBranch::Tools)) {
+        // The reasoning channel is still open only when the model ended the turn without closing
+        // its thinking.
+        const std::string_view open_reasoning =
+            impl_->state.in_reasoning ? std::string_view(impl_->open_reasoning) : std::string_view{};
         fi::ToolCallOutputDecoder::Terminal terminal =
-            impl_->tool_call_output.finish(impl_->preview_finish_reason);
+            impl_->tool_call_output.finish(impl_->preview_finish_reason, open_reasoning);
         impl_->tool_calls      = std::move(terminal.tool_calls);
         impl_->tool_call_parse = terminal.diagnostics;
         if (!terminal.content.empty()) {

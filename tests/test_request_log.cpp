@@ -714,6 +714,26 @@ int main() {
             !render_tool_call_fallback(context, normalized_tool_outcome),
         "successful tool-call normalization diagnostics are incomplete or noisy");
 
+    GenerationOutcome reasoning_tool_outcome = normalized_tool_outcome;
+    reasoning_tool_outcome.tool_call_parse = {
+        .marker_seen              = true,
+        .structured_call_count    = 2,
+        .recovered_from_reasoning = true,
+    };
+    const Json reasoning_tool_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, reasoning_tool_outcome));
+    const std::optional<OperationalRecord> reasoning_tool_note =
+        render_tool_call_fallback(context, reasoning_tool_outcome);
+    failures += check(
+        reasoning_tool_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") ==
+                true &&
+            normalized_tool_done.at("result").at("tool_call_parse").at(
+                "recovered_from_reasoning") == false &&
+            reasoning_tool_note && reasoning_tool_note->severity == OperationalSeverity::Info &&
+            reasoning_tool_note->message ==
+                "req#7 tool calls recovered from unclosed thinking | calls=2",
+        "a reasoning-stream tool-call recovery is not logged");
+
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
           .marker_seen               = true,

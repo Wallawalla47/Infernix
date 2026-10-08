@@ -2526,6 +2526,71 @@ int test_reasoning_loop_guard(const Frontend& frontend) {
     return failures;
 }
 
+// Free tool output in tolerant mode recovers calls the model stranded in thinking it never closed;
+// a closed thinking, a quoted marker or a turn cut by its budget keeps everything as reasoning.
+int test_open_reasoning_tool_recovery() {
+    const Frontend frontend = make_frontend(resources());
+    infernix::PromptInput input;
+    input.messages.push_back({.role  = infernix::ChatRole::User,
+                              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "x"}}});
+    input.options.continuation    = infernix::PromptContinuationMode::NewAssistantTurn;
+    input.options.enable_thinking = true;
+    input.options.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}}}}})");
+    const auto prompt = frontend.prepare(std::move(input));
+    infernix::ToolChoice free_calls;
+    free_calls.constraints = infernix::ToolConstraintMode::Automatic;
+    const infernix::TokenId eos = frontend.default_stop_policy().token_ids.front();
+
+    const std::string planning = "The listing answers this, so I will run it.\n";
+    const std::string call =
+        "<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n"
+        "</tool_call>";
+    struct Turn {
+        PublishedOutput output;
+        std::vector<infernix::GeneratedToolCall> calls;
+        infernix::ToolCallParseDiagnostics diagnostics;
+    };
+    const auto run = [&](const std::string& generated, bool end_with_eos, bool tolerant = true) {
+        auto session = frontend.make_output_session(
+            prompt, {},
+            infernix::OutputOptions{.tool_name_max_length = 64, .tolerant_tool_calls = tolerant}, {},
+            {}, free_calls);
+        std::vector<infernix::TokenId> tokens = fixture_tokenizer().encode(generated);
+        if (end_with_eos) { tokens.push_back(eos); }
+        const auto budget = static_cast<std::uint32_t>(tokens.size() + (end_with_eos ? 8U : 0U));
+        (void)session.preview_model(tokens, budget, infernix::FinishReason::OutputLimit);
+        Turn turn{.output = session.commit_preview()};
+        turn.calls       = session.take_tool_calls();
+        turn.diagnostics = session.tool_call_parse_diagnostics();
+        return turn;
+    };
+
+    int failures = 0;
+    {
+        const Turn turn = run(planning + call, true);
+        failures += check(turn.calls.size() == 1 && turn.calls[0].name == "bash" &&
+                              turn.calls[0].arguments_json == R"({"command":"ls"})" &&
+                              turn.diagnostics.recovered_from_reasoning &&
+                              channel_text(turn.output, infernix::OutputChannel::Content).empty() &&
+                              channel_text(turn.output, infernix::OutputChannel::Reasoning) ==
+                                  planning + call,
+                          "a call stranded in unclosed thinking was not recovered");
+    }
+    const auto rejected = [&](const Turn& turn, const std::string& label) {
+        return check(turn.calls.empty() && !turn.diagnostics.recovered_from_reasoning &&
+                         channel_text(turn.output, infernix::OutputChannel::Content).empty(),
+                     ("open-thinking recovery fired or leaked content for " + label).c_str());
+    };
+    failures += rejected(run(planning + call + "\n</think>\n\n", true),
+                         "a closed thinking with no content");
+    failures += rejected(run("I could emit <tool_call> now, but the question needs no tool.\n", true),
+                         "a quoted marker");
+    failures += rejected(run(planning + call, false), "a turn cut by its output budget");
+    failures += rejected(run(planning + call, true, false), "strict tool output");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     infernix::StopPolicy stop;
@@ -3209,6 +3274,7 @@ int main() {
     failures += test_structured_tool_output();
     failures += test_tools_and_json_output();
     failures += test_tool_marker_after_quoted_marker();
+    failures += test_open_reasoning_tool_recovery();
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);

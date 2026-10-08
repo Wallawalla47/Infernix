@@ -347,6 +347,14 @@ OperationalRecord render_request_done(const RequestLogContext& context,
 std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogContext& context,
                                                            const GenerationOutcome& outcome) {
     const infernix::ToolCallParseFallbackReason reason = outcome.tool_call_parse.fallback_reason;
+    if (outcome.tool_call_parse.recovered_from_reasoning) {
+        return OperationalRecord{
+            .severity = OperationalSeverity::Info,
+            .message  = "req#" + std::to_string(context.id) +
+                        " tool calls recovered from unclosed thinking | calls=" +
+                        std::to_string(outcome.tool_call_parse.structured_call_count),
+        };
+    }
     if (!outcome.tool_call_parse.marker_seen ||
         reason == infernix::ToolCallParseFallbackReason::None) {
         return std::nullopt;

@@ -909,6 +909,43 @@ ParsedToolCallOutput fallback(const std::string& text, ToolCallParseDiagnostics 
     return out;
 }
 
+// Normalizes an accepted region's calls into the structured turn.
+void publish_structured_calls(ParsedToolCallOutput& out, const std::vector<RawToolCall>& raw_calls,
+                              std::uint32_t duplicate_repairs, const Contract& contract) {
+    out.tool_calls.reserve(raw_calls.size());
+    for (const RawToolCall& raw : raw_calls) {
+        out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
+    }
+    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
+    out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
+    out.is_tool_call_response             = true;
+}
+
+// A turn that ended inside its thinking can hold the calls it meant to make. Accept the earliest
+// marker from which the rest of the thinking is nothing but complete, declared calls, parsed
+// strictly: prose after a call, a quoted marker or a cut call leaves the thinking as reasoning.
+// The prose before the accepted region is never returned.
+ParsedToolCallOutput parse_open_reasoning_calls(std::string_view reasoning,
+                                                std::size_t max_tool_name_length,
+                                                const Contract& contract) {
+    std::size_t candidate = find_first_tool_marker(reasoning);
+    while (candidate != std::string_view::npos) {
+        std::vector<RawToolCall> calls;
+        QwenToolRegionParser parser(reasoning.substr(candidate), max_tool_name_length, contract,
+                                    false);
+        if (parser.parse(calls) == FallbackReason::None) {
+            ParsedToolCallOutput out;
+            out.diagnostics.marker_seen              = true;
+            out.diagnostics.recovered_from_reasoning = true;
+            publish_structured_calls(out, calls, parser.duplicate_parameters_repaired(), contract);
+            return out;
+        }
+        const std::size_t next = find_first_tool_marker(reasoning.substr(candidate + 1));
+        candidate = next == std::string_view::npos ? next : candidate + 1 + next;
+    }
+    return {};
+}
+
 } // namespace
 
 ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
@@ -968,14 +1005,7 @@ ParsedToolCallOutput parse_qwen_tool_call_output(const std::string& text,
                     [](const RawToolCall& call) { return call.repaired; });
 
     out.content = rtrim_format_whitespace(source.substr(0, accepted));
-    out.tool_calls.reserve(raw_calls.size());
-    for (const RawToolCall& raw : raw_calls) {
-        out.tool_calls.push_back(normalize_raw_tool_call(raw, contract, out.diagnostics));
-    }
-
-    out.diagnostics.duplicate_parameters_repaired = duplicate_repairs;
-    out.diagnostics.structured_call_count = static_cast<std::uint32_t>(out.tool_calls.size());
-    out.is_tool_call_response             = true;
+    publish_structured_calls(out, raw_calls, duplicate_repairs, contract);
     return out;
 }
 
@@ -988,6 +1018,7 @@ std::string ToolCallOutputDecoder::feed(std::string_view text) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     if (text.empty()) { return {}; }
     if (!contract_) { return std::string(text); }
+    fed_content_ = true;
     if (saw_tool_marker_) {
         tool_region_.append(text);
         return {};
@@ -1057,10 +1088,24 @@ void ToolCallOutputDecoder::initialize_continuation(std::string_view prefix) {
         trailing_whitespace_.size() + pending_tag_.size() + tool_region_.size();
 }
 
-ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason) {
+ToolCallOutputDecoder::Terminal ToolCallOutputDecoder::finish(FinishReason reason,
+                                                              std::string_view open_reasoning) {
     if (finished_) { throw std::logic_error("tool-call output decoder is already finished"); }
     finished_ = true;
     if (!contract_) { return {}; }
+
+    // Only a turn the model ended itself recovers calls from its open thinking; an output,
+    // context or cancellation cut leaves a call it was still deliberating over unexecuted.
+    if (tolerant_ && !contract_->constrained && reason == FinishReason::StopToken &&
+        !open_reasoning.empty() && !fed_content_) {
+        ParsedToolCallOutput recovered =
+            parse_open_reasoning_calls(open_reasoning, max_tool_name_length_, *contract_);
+        if (recovered.is_tool_call_response) {
+            return Terminal{.content     = {},
+                            .tool_calls  = std::move(recovered.tool_calls),
+                            .diagnostics = recovered.diagnostics};
+        }
+    }
 
     if (contract_->constrained && saw_tool_marker_) {
         Terminal result;

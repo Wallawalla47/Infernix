@@ -326,8 +326,16 @@ By default the unconstrained parser keeps that all-or-nothing behaviour. With
 complete call, a second call is malformed, a single final call is cut by the output budget before
 its closing tags, or the closing bracket after the function name is missing: the recovered call is
 reported structurally with a `truncated_tail` diagnostic (logged at Info severity) rather than
-demoted to text, and an undeclared tool name stays structured for the consumer to judge. Constrained
-tool output (below) is well formed by construction and does not use this recovery.
+demoted to text, and an undeclared tool name stays structured for the consumer to judge.
+
+Tolerant mode also recovers calls the model wrote inside its thinking when it ends the turn with
+its stop token without closing the thinking, so no call reached the answer. If, from some marker to
+the end of that thinking, there is nothing but complete calls to declared tools (parsed strictly),
+those calls become the structured turn (logged at Info severity). The thinking before them stays
+reasoning and is never published as content. Nothing is recovered when the thinking was closed,
+when the turn published any content, when it ended at the output limit, context capacity or a
+cancellation, or when prose or a cut call follows the last call. Constrained tool output (below) is
+well formed by construction and does not use either recovery.
 
 ### Tool constraints
 
@@ -1208,7 +1216,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | original: extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text | off |
+| `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
@@ -1387,8 +1395,9 @@ with a nonzero `structured_call_count` the recovered calls were returned structu
 suffix or a call cut at the region end), and with none the region was returned as text.
 `tolerant_recovered` is true when `--tolerant-tool-calls` turned output the strict parser rejects
 into structured calls: a recovered `truncated_tail`, or a kept call whose opener (a dropped `<` or
-keyword, a missing `>` after the name) was repaired or whose name is not a declared tool. These
-counters contain no tool arguments or generated text.
+keyword, a missing `>` after the name) was repaired or whose name is not a declared tool.
+`recovered_from_reasoning` is true when the calls came from a turn that ended inside its thinking.
+These counters contain no tool arguments or generated text.
 
 `request_done.constraint` carries the same constraint observation as the HTTP terminal result,
 or `null` for unconstrained requests. Preparation failures and execution errors use the existing
