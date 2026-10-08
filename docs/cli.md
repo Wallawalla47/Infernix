@@ -295,7 +295,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
 | `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
-| `--presence-penalty F` | presence-penalty override | registered model/mode default |
+| `--presence-penalty F` | presence-penalty override | registered model/mode default; `0` with an output constraint |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
 | `--log-colours on\|off` | colour the statistics output on stderr | on when stderr is a terminal |

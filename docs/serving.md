@@ -1230,9 +1230,14 @@ selected source.
 Engine selects sampling defaults from the loaded architecture and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
 temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
-Frequency penalty is `0` for all registered presets. Process flags override registered values,
-request fields override process flags, and `--greedy` finally forces temperature `0`.
+non-thinking mode; Qwen3.8-Flash-Next uses the same values. Qwen3.6-35B-A3B differs only in its
+thinking presence penalty, which is `1.5`. Frequency penalty is `0` for all registered presets.
+Process flags override registered values, request fields override process flags, and `--greedy`
+finally forces temperature `0`. A request with an output constraint (JSON mode, JSON Schema, GBNF,
+regex or choice) does not take the registered presence and frequency penalties: the constrained
+format repeats its quotes, separators and keys by construction, and a penalty on them made sampled
+answers pick legal neighbouring tokens that change the content (a JSON string opened by `",`, so
+the value starts with a comma). A penalty from a process flag or the request still applies.
 
 For `C=--max-concurrency`, total Device StateImage capacity is `C+H`, where `H` is
 `--device-snapshot-slots` with the hybrid cache and `--device-state-slots` with the original one.

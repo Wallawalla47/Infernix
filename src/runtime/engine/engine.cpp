@@ -90,7 +90,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
-        runtime::resolve_sampling(defaults, mode, options.execution.sampling);
+        runtime::resolve_sampling(defaults, mode, options.execution.sampling, options.constraint.has_value());
     resolved.execution.requested_output_tokens = options.execution.requested_output_tokens;
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;

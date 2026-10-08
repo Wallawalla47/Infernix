@@ -637,7 +637,12 @@ the CPU never ends the whole request directly.
 
 ### 7.3 Ordinary sampling
 
-Logits are read over the vocabulary with the existing presence/frequency penalties. Illegal tokens take
+Logits are read over the vocabulary with the existing presence/frequency penalties. The Engine resolves a
+content-constrained request without the model's registered penalties (`runtime::resolve_sampling`): the
+language repeats its structure by construction, and Qwen's non-thinking presence penalty of 1.5 on those
+repeated tokens made 14 of 20 sampled schema answers start a string value with a comma, through legal
+merged tokens such as `",` (0 of 20 without the penalty; Qwen3.8-Flash-Next, 2026-10-08; the 27B shares the preset).
+Penalties the caller sets still apply. Illegal tokens take
 no part in argmax, top-k or later normalization; legal candidates follow the existing temperature,
 min-p, top-p, tie-break and counter-based RNG contracts.
 
