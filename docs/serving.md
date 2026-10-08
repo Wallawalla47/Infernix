@@ -1280,6 +1280,7 @@ more than ten have completed, one over the last ten:
 |---|---|
 | TTFT | mean time to first token |
 | cached | prefix-cache hit tokens / prompt tokens |
+| experts | Qwen3.8-Flash-Next: routed experts the VRAM expert cache served / routed-expert lookups (the rest ran from RAM on the CPU or GPU, or from the SSD tier), shown once a request reported them |
 | prefill | computed (non-cached) prompt tokens / prefill seconds, in tok/s |
 | decode | aggregate decode throughput in tok/s: output tokens after the first / decode seconds, where each batched decode round's time is split across the requests in it, so concurrent requests add up rather than each showing its per-stream rate |
 | batch | mean decode batch size, each decode round weighted by its duration; decode / batch is the per-stream rate. The throughput record's `batch` counts rounds equally over its interval instead |
@@ -1289,7 +1290,7 @@ more than ten have completed, one over the last ten:
 
 The table is 66 columns wide without n-gram drafting, and 84 with it (93 with the archive column),
 so it fits a console window snapped to half of a 1920-pixel screen; a narrower window cuts the rows
-at its edge.
+at its edge. The experts column adds 8 (74 without n-gram drafting).
 
 Ratios and rates divide summed tokens by summed seconds, so each request weighs by its size. The
 title counts completed, failed, cancelled, and rejected requests and, while throughput reporting is

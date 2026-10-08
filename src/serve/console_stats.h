@@ -44,6 +44,9 @@ struct ConsoleRequestSample {
     std::uint64_t ngram_accepted_tokens    = 0;
     std::uint64_t archive_drafted_tokens   = 0;
     std::uint64_t archive_accepted_tokens  = 0;
+    // Qwen3.8-Flash-Next: routed-expert lookups and those the VRAM expert cache served.
+    std::uint64_t routed_experts           = 0;
+    std::uint64_t vram_expert_hits         = 0;
 };
 
 [[nodiscard]] ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcome);

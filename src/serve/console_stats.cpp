@@ -51,9 +51,13 @@ struct Column {
 // The row label is left-aligned; every value column is right-aligned under its heading. The
 // table is 84 columns wide (93 with the archive column), so it fits a console window snapped to
 // half of a 1920-pixel screen. The n-gram columns come last and appear only when the server runs
-// n-gram drafting, which leaves 66 columns.
+// n-gram drafting, which leaves 66 columns. A model with a VRAM expert cache (Qwen3.8-Flash-Next)
+// adds the expert hit column after "cached" once a request reported it (74 columns without n-gram
+// drafting).
 constexpr std::size_t kLabelWidth   = 7;
 constexpr std::size_t kArchiveWidth = 9;
+constexpr std::size_t kExpertWidth  = 8;
+constexpr std::size_t kExpertAfter  = 1; // the "cached" column
 constexpr Column kColumns[]         = {
     {"TTFT", 8},  {"cached", 8},  {"prefill", 9}, {"decode", 8},   {"batch", 7},
     {"draft", 9}, {"acc/rnd", 9}, {"ngram", 8},   {"ng rnds", 10},
@@ -86,7 +90,7 @@ std::string drafter_heading(SpeculativeBackend backend) {
 }
 
 std::string render_row(std::string_view label, const ConsoleStatsTotals& totals, bool ngram,
-                       bool show_archive) {
+                       bool show_archive, bool show_experts) {
     const ConsoleRequestSample& sum       = totals.sum;
     const std::string cells[kColumnCount] = {
         totals.requests == 0 ? std::string(kNone)
@@ -106,6 +110,9 @@ std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
     append_left(row, label, kLabelWidth);
     for (std::size_t index = 0; index < visible_columns(ngram); ++index) {
         append_right(row, cells[index], kColumns[index].width);
+        if (show_experts && index == kExpertAfter) {
+            append_right(row, ratio_cell(sum.vram_expert_hits, sum.routed_experts), kExpertWidth);
+        }
     }
     if (show_archive) {
         append_right(row, ratio_cell(sum.archive_accepted_tokens, sum.archive_drafted_tokens),
@@ -120,6 +127,7 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
     const GenerationMetrics& metrics = outcome.metrics;
     const auto prompt_tokens = static_cast<std::uint64_t>(std::max(outcome.prompt_tokens, 0));
     const std::uint64_t cache_hit_tokens = metrics.prefix_cache_hit_tokens;
+    const std::optional<infernix::ExpertCacheStats>& experts = metrics.expert_cache;
     const SpeculativeBackend backend =
         metrics.speculative_draft_tokens > metrics.ngram_drafted_tokens
             ? metrics.speculative_backend
@@ -151,6 +159,8 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
         .ngram_accepted_tokens   = metrics.ngram_accepted_tokens,
         .archive_drafted_tokens  = metrics.ngram_archive_drafted_tokens,
         .archive_accepted_tokens = metrics.ngram_archive_accepted_tokens,
+        .routed_experts          = experts ? experts->routed : 0,
+        .vram_expert_hits        = experts ? experts->hits : 0,
     };
 }
 
@@ -178,13 +188,17 @@ void ConsoleStatsTotals::add(const ConsoleRequestSample& sample) noexcept {
     sum.ngram_accepted_tokens += sample.ngram_accepted_tokens;
     sum.archive_drafted_tokens += sample.archive_drafted_tokens;
     sum.archive_accepted_tokens += sample.archive_accepted_tokens;
+    sum.routed_experts += sample.routed_experts;
+    sum.vram_expert_hits += sample.vram_expert_hits;
 }
 
 std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& snapshot) {
     const bool ngram        = snapshot.ngram_enabled;
     const bool show_archive = ngram && snapshot.session.sum.archive_drafted_tokens != 0;
+    const bool show_experts = snapshot.session.sum.routed_experts != 0;
     const std::size_t columns = visible_columns(ngram);
-    std::size_t table_width   = 1 + kLabelWidth + (show_archive ? kArchiveWidth : 0);
+    std::size_t table_width   = 1 + kLabelWidth + (show_archive ? kArchiveWidth : 0) +
+                              (show_experts ? kExpertWidth : 0);
     for (std::size_t index = 0; index < columns; ++index) { table_width += kColumns[index].width; }
 
     std::string title = "-- session stats, rates in tok/s | " +
@@ -211,6 +225,7 @@ std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& 
                      index == kDrafterColumn ? drafter_heading(snapshot.speculative_backend)
                                              : std::string(column.heading),
                      column.width);
+        if (show_experts && index == kExpertAfter) { append_right(headings, "experts", kExpertWidth); }
     }
     if (show_archive) { append_right(headings, "archive", kArchiveWidth); }
 
@@ -218,11 +233,11 @@ std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& 
     lines.reserve(4);
     lines.push_back(std::string(kBold) + title + std::string(kReset));
     lines.push_back(std::string(kDim) + headings + std::string(kReset));
-    lines.push_back(render_row("session", snapshot.session, ngram, show_archive));
+    lines.push_back(render_row("session", snapshot.session, ngram, show_archive, show_experts));
     // Until the session outgrows the window, the recent row would repeat the session row.
     if (snapshot.completed > snapshot.recent_window) {
         lines.push_back(render_row("last " + std::to_string(snapshot.recent.requests),
-                                   snapshot.recent, ngram, show_archive));
+                                   snapshot.recent, ngram, show_archive, show_experts));
     }
     return lines;
 }
