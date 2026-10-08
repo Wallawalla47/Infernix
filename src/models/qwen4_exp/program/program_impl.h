@@ -123,6 +123,10 @@ struct LanePrefix {
     std::optional<runtime::prefix_cache::SnapshotRef> resume;
     std::optional<prefix::RestoreTicket> restore;     // the first call waits on it per layer
     std::uint64_t capture          = 0;               // its copy-out gates the next call per layer
+    // The current request's latest capture: its snapshot is the one the next capture supersedes.
+    // `capture` may still name an earlier request's capture on this slot (its copy-out must land
+    // before the slot is rewritten), which belongs to another lineage.
+    std::uint64_t lineage_capture  = 0;
     std::uint64_t resident_capture = 0;               // the endpoint the slot still holds
     std::vector<runtime::prefix_cache::PlannedTap> taps;
     std::vector<runtime::prefix_cache::TapHint> hints;

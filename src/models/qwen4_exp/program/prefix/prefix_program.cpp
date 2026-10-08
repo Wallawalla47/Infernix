@@ -546,6 +546,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     // The slot no longer holds the endpoint image once anything is admitted into it.
     prefix_->forget_capture(lane.prefix.resident_capture);
     lane.prefix.resident_capture = 0;
+    lane.prefix.lineage_capture  = 0;
     if (!s.snapshot) { reset_slot(index); }
     // The block table: shared cache pages, then the private leases.
     std::vector<DeviceKVPageHandle> handles;
@@ -745,8 +746,11 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
     c.meta.mtp_accept = lane.mtp_accept;
-    // The lineage's previous snapshot serves only requests diverging before this one.
-    if (const auto previous = prefix_->capture_result(lane.prefix.capture); previous && previous->snapshot.valid()) {
+    // The lineage's previous snapshot serves only requests diverging before this one: this request's
+    // last capture, else the snapshot it resumed from (never an earlier request's capture on the slot).
+    if (const auto previous = lane.prefix.lineage_capture != 0 ? prefix_->capture_result(lane.prefix.lineage_capture)
+                                                               : std::nullopt;
+        previous && previous->snapshot.valid()) {
         c.supersedes = previous->snapshot;
     } else if (lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
@@ -754,8 +758,9 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     const std::uint64_t id = c.id;
     if (prefix_->capture(index, std::move(c), device_.stream)) {
         prefix_->forget_capture(lane.prefix.capture);
-        lane.prefix.capture = id;
-        lane.prefix.deepest = F;
+        lane.prefix.capture         = id;
+        lane.prefix.lineage_capture = id;
+        lane.prefix.deepest         = F;
     }
 }
 
