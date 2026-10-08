@@ -46,7 +46,11 @@ public:
     }
     [[nodiscard]] std::string feed(std::string_view text);
     void initialize_continuation(std::string_view prefix);
-    [[nodiscard]] Terminal finish(FinishReason reason = FinishReason::StopToken);
+    // `open_reasoning` is the thinking of a turn that ended without closing it. For free tool
+    // output in tolerant mode, when the turn ended on a stop token and no content was fed,
+    // complete calls stranded at the end of that thinking become the structured turn.
+    [[nodiscard]] Terminal finish(FinishReason reason             = FinishReason::StopToken,
+                                  std::string_view open_reasoning = {});
 
 private:
     std::shared_ptr<const ToolCallOutputContract> contract_;
@@ -56,6 +60,7 @@ private:
     std::size_t max_tool_name_length_        = 0;
     bool tolerant_                           = false;
     bool saw_tool_marker_                    = false;
+    bool fed_content_                        = false;
     bool finished_                           = false;
     std::size_t continuation_withheld_bytes_ = 0;
 };

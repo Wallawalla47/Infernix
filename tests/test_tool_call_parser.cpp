@@ -1314,6 +1314,102 @@ int test_tolerant_undeclared_and_value_cut() {
     return failures;
 }
 
+// A turn that ends inside its thinking can strand the calls it meant to make there. Tolerant mode
+// returns them when the rest of the thinking from some marker is nothing but complete calls.
+int test_open_reasoning_recovery() {
+    const std::vector<std::string> definitions = {
+        tool_definition("delete_file", Json{{"filePath", Json{{"type", "string"}}}}),
+        tool_definition("read_file", Json{{"filePath", Json{{"type", "string"}}}})};
+    const auto contract  = contract_from_definitions(definitions);
+    const auto remove    = tool_call("delete_file", {{"filePath", "/tmp/stale.cfg"}});
+    const auto read      = tool_call("read_file", {{"filePath", "/tmp/notes.md"}});
+    const auto planning  = std::string("The stale config should go, so I'll call delete_file.\n");
+    const auto recovered = [&](std::string_view reasoning,
+                               infernix::FinishReason reason = infernix::FinishReason::StopToken,
+                               bool tolerant = true, std::string_view content = {}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64, tolerant);
+        std::string visible = decoder.feed(content);
+        auto terminal       = decoder.finish(reason, reasoning);
+        terminal.content    = visible + terminal.content;
+        return terminal;
+    };
+
+    int failures = 0;
+    {
+        const auto terminal = recovered(planning + remove);
+        failures += check(terminal.tool_calls.size() == 1 && terminal.content.empty() &&
+                              terminal.diagnostics.recovered_from_reasoning &&
+                              terminal.diagnostics.marker_seen &&
+                              terminal.diagnostics.structured_call_count == 1 &&
+                              !terminal.diagnostics.tolerant_recovered,
+                          "a call stranded in open thinking was not recovered on its own");
+        if (terminal.tool_calls.size() == 1) {
+            failures += check(terminal.tool_calls[0].name == "delete_file" &&
+                                  terminal.tool_calls[0].arguments_json ==
+                                      R"({"filePath":"/tmp/stale.cfg"})",
+                              "the recovered stranded call lost its name or argument");
+        }
+    }
+    {
+        const auto terminal = recovered(planning + read + "\n" + remove + "\n");
+        failures += check(terminal.tool_calls.size() == 2 && terminal.content.empty() &&
+                              terminal.tool_calls[0].name == "read_file" &&
+                              terminal.tool_calls[1].name == "delete_file",
+                          "parallel calls stranded in open thinking were not all recovered");
+    }
+    {
+        // A complete call quoted in planning prose is not part of the final call run.
+        const auto terminal =
+            recovered("Earlier I wrote " + read + " but that was wrong.\n" + planning + remove);
+        failures += check(terminal.tool_calls.size() == 1 && terminal.content.empty() &&
+                              terminal.tool_calls[0].name == "delete_file",
+                          "a call quoted earlier in the thinking joined the stranded call");
+    }
+
+    // Thinking that only quotes a marker, keeps deliberating after a call, cuts a call off or
+    // names an undeclared tool keeps everything as reasoning and publishes nothing.
+    const std::vector<std::pair<std::string, std::string>> rejected = {
+        {"I could emit <tool_call> here, but the user only asked a question.\n",
+         "a quoted marker"},
+        {planning + remove + "\nOn second thought, I should ask first.", "trailing deliberation"},
+        {planning + "<tool_call>\n<function=delete_file>\n<parameter=filePath>\n/tmp/stale.cfg\n",
+         "a cut call"},
+        {planning + tool_call("rename_file", {{"filePath", "/tmp/a"}}), "an undeclared tool"},
+    };
+    for (const auto& [reasoning, label] : rejected) {
+        const auto terminal = recovered(reasoning);
+        failures += check(terminal.tool_calls.empty() && terminal.content.empty() &&
+                              !terminal.diagnostics.recovered_from_reasoning,
+                          "open thinking with " + label + " produced a call or leaked content");
+    }
+
+    // Only a turn the model ended itself, with tolerant mode, free tools and no content fed.
+    for (const infernix::FinishReason reason :
+         {infernix::FinishReason::OutputLimit, infernix::FinishReason::ContextCapacity,
+          infernix::FinishReason::Cancelled, infernix::FinishReason::StopString}) {
+        failures += check(recovered(planning + remove, reason).tool_calls.empty(),
+                          "a call was recovered from thinking cut by a limit, stop string or "
+                          "cancellation");
+    }
+    failures += check(recovered(planning + remove, infernix::FinishReason::StopToken, false)
+                          .tool_calls.empty(),
+                      "strict mode recovered a call from open thinking");
+    {
+        const auto terminal =
+            recovered(planning + remove, infernix::FinishReason::StopToken, true, "Answer.");
+        failures += check(terminal.tool_calls.empty() && terminal.content == "Answer.",
+                          "open thinking overrode a turn that fed content");
+    }
+    {
+        const auto constrained = fi::select_tool_call_contract(contract, infernix::ToolChoice{});
+        fi::ToolCallOutputDecoder decoder(constrained, 64, true);
+        failures += check(decoder.finish(infernix::FinishReason::StopToken, planning + remove)
+                              .tool_calls.empty(),
+                          "constrained tool output recovered a call from open thinking");
+    }
+    return failures;
+}
+
 int main() {
     int failures = 0;
     failures += test_free_tool_continuation();
@@ -1350,6 +1446,7 @@ int main() {
     failures += test_tolerant_truncated_final_call();
     failures += test_tolerant_missing_function_close_bracket();
     failures += test_tolerant_undeclared_and_value_cut();
+    failures += test_open_reasoning_recovery();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

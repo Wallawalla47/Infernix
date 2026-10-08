@@ -664,6 +664,8 @@ struct ToolCallParseDiagnostics {
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
     bool tolerant_recovered = false;
+    // Tolerant tool-call mode took the structured calls from a turn that ended inside its thinking.
+    bool recovered_from_reasoning = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
