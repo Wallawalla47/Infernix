@@ -51,7 +51,9 @@ Setup, conversion and tuning: [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next
   42 % fewer tokens and halves the average time to first token
   ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
 - **Tool calling for agent clients**: the XML call forms Claude Code and other agents emit,
-  tolerant recovery of broken calls (`--tolerant-tool-calls`), Anthropic and OpenAI options used by
+  tolerant recovery of broken calls (`--tolerant-tool-calls`, which also returns complete calls a
+  model strands in thinking it never closed; from Woesch-Nich's fix with Hundsbuah's review),
+  Anthropic and OpenAI options used by
   Claude Code, Qwen Code, Codex, Zed and GitHub Copilot, and correct handling of reasoning output.
 - **Faster prefill**: FlashAttention-2 style INT8 prompt attention, FP4/FP8 Tensor Core paths for
   NVFP4, FP8 and K8V4 KV, wave-aligned chunks — a third to two thirds less prompt-attention time
@@ -351,6 +353,9 @@ build_native.bat configure
 build_native.bat build
 ```
 
+Sources compile as UTF-8 (`/utf-8`), so the build works under any Windows system code page
+(reported by Woesch-Nich).
+
 The server is `build-windows\apps\Release\infernix-serve.exe`, with the FFmpeg, curl and zlib DLLs
 copied next to it. The launch I use for Qwen3.8-27B on a single 32 GB RTX 5090 (stop any other
 resident model first):
@@ -429,7 +434,8 @@ writes either, and `python -m tools.artifact.rename` renames an existing one in 
 - **Serving**: OpenAI Chat Completions and Responses, Anthropic Messages, `/v1/decide` for
   decisions read from probabilities (yes/no, choice, score, number, point, box), streaming,
   bounded FIFO admission with one to eight concurrent requests, a request log with rotation, a
-  console statistics panel and a categorised `--help`.
+  console statistics panel (with the VRAM expert-cache hit rate for Qwen3.8-Flash-Next, and n-gram
+  columns only when n-gram drafting is on) and a categorised `--help`.
 - **Constrained decoding** (from NInfer, October 2026): JSON object and JSON Schema response
   formats, strict tool arguments and tool choice, and GBNF, regex and choice through the CLI and
   the `structured_outputs` extension, on every model and speculative round type, Qwen3.8-Flash-Next
@@ -480,6 +486,8 @@ Thank you as well to everyone whose issues, pull requests, forks and research In
 [adubkov](https://github.com/adubkov),
 [Gideon Zenz (gzenz)](https://github.com/gzenz),
 [cometkim (Hyeseong Kim)](https://github.com/cometkim),
+[Woesch-Nich](https://github.com/Woesch-Nich),
+[Hundsbuah](https://github.com/Hundsbuah),
 [gpillon](https://github.com/gpillon) (ignis),
 [CaptainArni](https://github.com/CaptainArni),
 David Oelfke, Fedor Suchkov, Yunado,
