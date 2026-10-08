@@ -596,15 +596,34 @@ and the tensor dtypes before the recipe is frozen.
 | Tensor class | Source form | Recipe A | Recipe B | Reason |
 |---|---|---|---|---|
 | Routed experts (48 × 512) | ModelOpt NVFP4: E2M1 codes, E4M3 per 16, FP32 `weight_scale_2` and FP32 `input_scale` per matrix | **Exact import** as `nvfp4_mul` (below), layout `nvfp4_expert_rg16_v1` (§6.2). Every expert's `input_scale` is kept per matrix as an FP32 model-role tensor. | Same | NVIDIA's weights and NVIDIA's activation calibration, with nothing re-derived |
-| MTP routed experts (512) | Qwen's block-scaled FP8 per expert: E4M3FN `{gate,up,down}_proj.weight` and an FP32 `weight_scale_inv` multiplier per 128 × 128 tile (`FP8_PB_WO`), in `model-fp8-mtp-ple.safetensors` | BF16 of the exact values (code × tile multiplier), as per-expert row ranges of two parents | **`q4_g64_fp16`, MSE-chosen group scales** (`grouped_mse`) from the exact values, 1.34 GB, all device-resident (§11.2) | MTP affects only acceptance, never output; Strata stores these experts at 2.25 bits. |
+| MTP routed experts (512) | Qwen's block-scaled FP8 per expert: E4M3FN `{gate,up,down}_proj.weight` and a multiplier per 128 × 128 tile (`FP8_PB_WO`; BF16 in NVIDIA's checkpoint, widened exactly), in `model-fp8-mtp-ple.safetensors` | **`q4_g64_fp16`, MSE-chosen group scales** (`grouped_mse`) from the exact values, 1.34 GB, all device-resident (§11.2) | Same | MTP affects only acceptance, never output; Strata stores these experts at 2.25 bits. The resident expert kernel reads Q4 or Q8 banks, so no format stores them exactly. |
 | N-gram table (128 shards) | FP8 E4M3 plus one BF16 scalar scale | **Exact import** into the NVMe volume of §12.2. One scalar scale, no per-row plane. | Same | One I/O per row instead of two |
 | GDN q/k/v/z projection and `out_proj`; QSA QKVG and `o_proj`; shared experts; HC mixers (down and up); PLE key/value projections; `lm_head` | BF16 | BF16 | **8-bit, W8A16.** `fp8_e4m3fn_row_bf16` (producer `fp8_row_maxabs`) per class; `q8_g32_fp16` (`grouped_absmax`) for a class where FP8 fails §16.3 and Q8 passes; BF16 for a class where neither passes. | 4.2 GB fewer dense bytes per token and ~1,520 more frames (§4.2). These classes are 97% of the dense bytes. |
 | Router, shared-expert gate, GDN `a`/`b`, QSA indexer projection | BF16 | BF16 | BF16 | Small (3% of dense bytes), and routing- or selection-sensitive |
-| MTP dense (its QSA block, HC, shared expert, projections) | BF16 | BF16 | `q8_g32_fp16` (option H13 adopted); router and shared-expert gate stay BF16 | Affects only acceptance; halves the drafter's dense bytes per step |
-| Proposal head (`--proposal`, for `--lm-head-draft`) | `lm_head` rows of the 131,072 most frequent tokens | — | `q4_g64_fp16`, 178 MB | Draft head of the MTP drafter only |
+| MTP dense (its QSA block, HC, shared expert, projections) | BF16 | `q8_g32_fp16` (option H13 adopted); router and shared-expert gate stay BF16 | Same | Affects only acceptance; halves the drafter's dense bytes per step |
+| Proposal head (`--proposal`, for `--lm-head-draft`) | `lm_head` rows of the 131,072 most frequent tokens | `q4_g64_fp16`, 178 MB | Same | Draft head of the MTP drafter only |
 | Token embedding | BF16 | BF16, **host-resident** (§6.3) | Same | Saves 1.27 GB of VRAM, about 480 frames |
 | Norms, `A_log`, `dt_bias`, conv weights | BF16 / FP32 | Direct | Direct | — |
 | Vision | BF16 | BF16 | BF16 | Not on the decode path; both deployed artifacts contain it. With `--vision-offload` (on by default for this model) the weights stay in pinned host RAM and stream per encode window; only the output handoff and oversize windows borrow frames (§9.2, §19.3.2). |
+
+Recipe A is the bit-exact artifact (`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix`) and recipe B the 8-bit
+dense one (`...-Dense8-Infernix`); both share the drafter, the proposal head and the n-gram volume.
+`python -m tools.flash_next.verify_artifact` checks an artifact against the checkpoint object by
+object (direct casts byte for byte, BF16 widened to FP32 by value, expert banks decoded back to their
+codes, scales and multipliers), the n-gram volume row by row, and lists the re-quantized parameters
+per component (proposal bindings are counted apart). On 2026-10-08 recipe A had 24,576 routed experts
+and 1,616 tensors with no mismatch, 320,001,536 identical n-gram rows, and only the 1,556 MTP
+parameters re-quantized; recipe B had 987 tensors with no mismatch and its 629 text-model
+parameters (`lm_head` included) re-quantized as well. The PLE hash tables (`layer_multipliers`, `ngram_heads_*`) are derived from the
+config, which conversion checks against the checkpoint's buffers.
+
+Recipe A runs its BF16 dense classes on the BF16 linear routes (`src/ops/linear/bf16`; NInfer's tuned selectors
+where they measured fastest, the sweep's tiles elsewhere; at T ≤ 8 one bit-identical route family
+per shape, so a column's bits do not depend on the decode width), the fused hyper-connection mixer
+with a BF16 codec, a register-streamed BF16 SwiGLU for the shared expert at 1..16 columns, and the
+tensor-core FP32 projection for `lm_head` at 1..16 columns (701-710 µs against a ~709 µs DRAM floor).
+It decodes ~18 % slower than recipe B end to end (README, "Bit-exact against Dense8") at the same
+measured quality.
 
 **Two new weight formats** are needed, each defined in [tensor formats](tensor-formats.md) with an
 exact decode oracle:
