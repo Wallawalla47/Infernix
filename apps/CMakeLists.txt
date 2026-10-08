@@ -1,16 +1,3 @@
-add_executable(infernix
-  cli/main.cpp
-  cli/options.cpp)
-infernix_internal_includes(infernix)
-target_link_libraries(infernix PRIVATE
-  infernix_engine
-  infernix_product_logging
-  infernix_product_prompt_input)
-add_dependencies(infernix infernix_build_id_stamp)
-target_sources(infernix PRIVATE ${INFERNIX_BUILD_ID_HEADER})
-target_include_directories(infernix PRIVATE ${CMAKE_BINARY_DIR}/generated)
-infernix_stage_runtime_dlls(infernix)
-
 # Build id is stamped at BUILD time (see cmake/GenerateBuildId.cmake) into a
 # generated header, so it always reflects the tree actually being compiled -- not
 # a stale configure-time value. Every product binary records it in its startup
@@ -26,6 +13,19 @@ add_custom_target(infernix_build_id_stamp ALL
   BYPRODUCTS ${INFERNIX_BUILD_ID_HEADER}
   COMMENT "Stamping INFERNIX build id from git (build-time)"
   VERBATIM)
+
+add_executable(infernix
+  cli/main.cpp
+  cli/options.cpp)
+infernix_internal_includes(infernix)
+target_link_libraries(infernix PRIVATE
+  infernix_engine
+  infernix_product_logging
+  infernix_product_prompt_input)
+add_dependencies(infernix infernix_build_id_stamp)
+target_sources(infernix PRIVATE ${INFERNIX_BUILD_ID_HEADER})
+target_include_directories(infernix PRIVATE ${CMAKE_BINARY_DIR}/generated)
+infernix_stage_runtime_dlls(infernix)
 
 add_executable(infernix-serve serve/main.cpp)
 add_dependencies(infernix-serve infernix_build_id_stamp)
