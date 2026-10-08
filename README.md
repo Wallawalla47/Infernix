@@ -134,6 +134,12 @@ Strata runs with its configuration on this machine (`strata-unsloth-ud-q4_k_xl.j
 engines run with MTP: Strata refuses to start this model pack without speculation (`--spec` 2 or
 more).
 
+This compares each engine as it is run in practice, each with its own conversion of the model and
+its own drafter, so it does not separate engine speed from weight format; the quality rows below
+cover the formats. Each engine ran in its own server sessions, one engine after the other rather
+than interleaved, so drift between sessions is not controlled beyond the discarded warm-up request
+and the saved expert-cache state.
+
 The two engines run different quantizations of the same model: Strata cannot run NVFP4, and
 Infernix cannot run the GGUF. Neither file is uniformly higher precision. The GGUF is smaller
 overall (111 GB, against about 127 GB for the Infernix artifact with its n-gram volume) but stores
