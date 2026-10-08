@@ -38,8 +38,15 @@ table is read from an NVMe drive.
 **The main model and the vision tower are bit-exact to NVIDIA's checkpoint**: every weight the
 full model computes with is NVIDIA's, word for word. Only the MTP drafter, which proposes tokens
 for the full model to verify, is quantized further.
-[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
-stores the dense projections in 8 bits instead and decodes faster at the same measured quality.
+
+> **Faster alternative:**
+> [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
+> keeps the same NVFP4 experts and n-gram table bit-exact but stores the dense projections and
+> `lm_head` in 8 bits. On the same machine and build it decodes about **22 % faster** (136-160
+> against 108-131 tok/s from 8K to 250K tokens of context), reaches the first token up to 7 % sooner
+> at 8K, and measured the same quality (perplexity 4.654 against this artifact's 4.666). Choose this
+> artifact when the weights must be NVIDIA's unchanged; otherwise Dense8 is the faster choice. See
+> [Performance](#performance).
 
 Until 2026-10-08 this repository held the 8-bit dense conversion under this name; it is now the
 Dense8 repository above.
