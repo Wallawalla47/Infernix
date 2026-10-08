@@ -36,26 +36,39 @@ drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), an
 
 ## Convert
 
-Recipe B is recommended. It is recipe A, which imports NVIDIA's NVFP4 experts and the FP8 n-gram
-table bit-exactly and keeps the BF16 tensors BF16, with the dense projections and `lm_head` stored
-in `q8_g32_fp16`. Its quality cost against recipe A was +0.008 ± 0.010 nats (not significant),
-measured on a checkpoint with the same BF16 dense weights but other expert calibration
-(`RadixArk/Qwen3.8-Flash-Next-NVFP4`), and it decodes ~22 % faster. Its MTP drafter is stored in
-`q8_g32_fp16` with `q4_g64_fp16` routed experts. The drafter only proposes tokens, so its
-precision changes speed, never output. `--proposal` adds the smaller draft head that
-`--lm-head-draft` uses.
+Two recipes convert NVIDIA's checkpoint. Both import the NVFP4 routed experts (codes, block scales,
+per-matrix multipliers and input scales) and the FP8 n-gram table bit-exactly, and both store the
+MTP drafter in `q8_g32_fp16` with `q4_g64_fp16` routed experts: the drafter only proposes tokens
+that the full model verifies, so its precision changes speed, never output.
+
+| | Recipe A, `qwen3_8_flash_next_nvfp4` | Recipe B, `qwen3_8_flash_next_nvfp4_dense8` |
+|---|---|---|
+| Published as | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix` | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix` |
+| Main model and vision | **bit-exact**: every tensor as NVIDIA stores it (BF16 stays BF16) | dense projections and `lm_head` (629 tensors, 97 % of the dense bytes) in `q8_g32_fp16`; everything else bit-exact |
+| Model files | 80.4 GB | 76.9 GB |
+| Dense weights read per token | ~8.6 GB (BF16) | ~5.1 GB |
+
+The two measured level on quality (teacher-forced perplexity 4.666 and 4.654 on the frozen texts
+below, both 0.037-0.040 nats per token better than Strata's). Recipe B leaves more VRAM for the
+expert cache and reads fewer bytes per token, so it decodes faster; see
+[Performance](#performance). Use recipe A where outputs must come from NVIDIA's weights unchanged.
+`--proposal` adds the smaller draft head that `--lm-head-draft` uses, to either.
 
 ```text
 python -m tools.convert --model <nvidia/Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_flash_next_nvfp4_dense8 \
-  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix \
-  --out <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix --ngram-out <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram
-python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.infernix --numbered
+  --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix \
+  --out <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix --ngram-out <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram
+python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix --numbered
 ```
 
 The second command names the three files as numbered parts
-(`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix` and so on); Infernix opens part 1.
+(`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix` and so on); Infernix
+opens part 1.
 
-- **Recipe A.** Use `--recipe qwen3_8_flash_next_nvfp4` instead.
+- **Recipe A.** Use `--recipe qwen3_8_flash_next_nvfp4` and the name without `-Dense8`.
+- **Verification.** `python -m tools.flash_next.verify_artifact --model <checkpoint> --artifact
+  <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
+  checkpoint and lists the re-quantized parameters per component.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
   `--ngram-reuse <volume>` instead of `--ngram-out`.
 - **Duration.** A conversion takes ~11 minutes from a warm disk cache; the MTP experts' MSE
@@ -253,6 +266,8 @@ The speed figures in this guide were measured before 2026-10-07 on an artifact c
 `RadixArk/Qwen3.8-Flash-Next-NVFP4` instead of NVIDIA's checkpoint. Re-measured on NVIDIA's, the
 README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
 [README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata) are the current figures.
+Recipe A (bit-exact) decodes about 18 % slower than recipe B and reaches the first token 6-8 %
+later at 8K, level from 128K ([README](../README.md#bit-exact-against-dense8)).
 
 | Workload | tok/s |
 |---|---:|
@@ -273,5 +288,5 @@ length follows the measured acceptance, so prose mostly drafts one token and sta
 fast as plain decode (design §19.2).
 
 **Quality.** Teacher-forced perplexity over three frozen texts (2,557 positions, INT8 KV): recipe
-B 4.664. For comparison, Strata 0.1.40 with UD-Q4_K_XL and INT8 KV gives 4.844 on the same token ids
+B 4.654 and recipe A 4.666 (2026-10-08 kernels; recipe B measured 4.664 before them). For comparison, Strata 0.1.40 with UD-Q4_K_XL and INT8 KV gives 4.844 on the same token ids
 (−0.038 ± 0.011 nats for Infernix; level on code and documents, better on chat).

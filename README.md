@@ -28,8 +28,11 @@ n-gram embedding table from an NVMe drive.
   replayed agentic coding workload under a quarter of Strata's average time to first token (5.4 s
   against 25.3 s) and less than half its wall time
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata)).
-- **Quality at least Strata's**: teacher-forced perplexity 4.664 against Strata's 4.844 on the same
+- **Quality at least Strata's**: teacher-forced perplexity 4.654 against Strata's 4.844 on the same
   texts (lower is better); every optimisation was held to that bar.
+- **Two conversions of NVIDIA's checkpoint**: one bit-exact in every weight the model computes with
+  (perplexity 4.666), and Dense8, with the dense projections in 8 bits, at the same measured
+  quality and ~22 % faster decode ([models](#models)).
 - **Long context**: 262K tokens natively, up to 1M with YaRN (`--rope-yarn-factor`); a 250K-token
   prompt prefills at ~7.3K tok/s (34 s), and decoding with MTP stayed at 136-164 tok/s from 8K to
   250K tokens.
@@ -115,7 +118,7 @@ by the same client, so all engines are measured the same way.
 | | Infernix | Strata |
 |---|---|---|
 | Version | branch `Infernix` at `3b35ccf9` (artifact converted at `e3be72cd`) | 0.1.40 (release engine; server `82f46a8`, 0.1.40.1) |
-| Model | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) converted with recipe B: NVIDIA's NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
+| Model | [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) as the Dense8 conversion (recipe B): NVIDIA's NVFP4 experts bit-exact, dense projections and `lm_head` in Q8 (group 32), MTP drafter in Q8 with Q4 experts, proposal head ([Hugging Face](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)) | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` GGUF (four shards) as Strata's native pack, with Strata's Q2_0 MTP drafter |
 | KV cache and context | INT8, 262,144 tokens | INT8, 262,144 tokens (32,768 cells per layer resident in VRAM) |
 | Speculation | MTP, `--draft-tokens 4 --lm-head-draft` | MTP, `--spec 4 --spec-min-p 0.70` |
 | Other settings | n-gram volume on NVMe, `--prefill-chunk 4096` | `--expert-cache auto --prefill auto --resident-budget-gib 68 --pool-workers 15 --pcie-frac 0.00` |
@@ -131,7 +134,8 @@ overall (111 GB, against about 127 GB for the Infernix artifact with its n-gram 
 the routed experts, which dominate the bytes read per token, at about 5.1 bits per weight against
 NVFP4's 4.5, so Strata reads slightly more expert data per token. Infernix keeps the dense layers
 (8-bit and BF16) and the n-gram table (8-bit) at higher precision. On the same token ids Infernix's
-quality is slightly better (perplexity 4.664 against 4.844).
+quality is slightly better (perplexity 4.664 at the measured version and 4.654 with the
+2026-10-08 kernels, against 4.844).
 
 **Context length** (one request at a time):
 
@@ -201,6 +205,50 @@ against 4.600, both below Strata's).
 The agentic replay found two crashes, both fixed on the `Infernix` branch: `c9ee0445` (a long
 prompt's layer walk outlived the prefix-cache events it waited on) and `9061adb8` (with the SSD
 expert tier, which this machine uses only when the experts do not fit in RAM).
+
+### Bit-exact against Dense8
+
+The two Qwen3.8-Flash-Next conversions ([models](#models)) on the same build (`Infernix` with the
+2026-10-08 BF16 kernels), the context-length test's prompts and settings, three interleaved
+sessions per artifact. Cells are means over the prompts of each request's median.
+
+| Context | Artifact | TTFT (s) | Prefill tok/s | Decode tok/s | Tokens per round | Rounds/s |
+|---|---|---:|---:|---:|---:|---:|
+| ~8K | Dense8 | **1.92** | **4,204** | **140.1** | 2.74 | 54.9 |
+| ~8K | Bit-exact | 2.07 | 3,905 | 116.1 | 2.06 | 56.6 |
+| ~128K | Dense8 | 17.96 | 7,130 | **136.3** | 2.47 | 55.5 |
+| ~128K | Bit-exact | 17.91 | 7,152 | 107.5 | 2.29 | 47.6 |
+| ~250K | Dense8 | 34.22 | 7,311 | **159.9** | 3.47 | 47.4 |
+| ~250K | Bit-exact | 34.01 | 7,358 | 130.7 | 3.05 | 44.1 |
+
+Per request, the bit-exact artifact decoded 18 % slower (geometric mean of ten requests; 11-25 %),
+reached the first token 2.5 % later (6-8 % at 8K, level from 128K) and scored the same quality
+(4.666 against 4.654). It reads ~8.6 GB of BF16 dense weights per token against ~5.1 GB, and its
+dense weights take 3.5 GB more VRAM, which leaves about 1,270 fewer expert-cache frames. Tokens
+per round differ because the two write different text; one 8K prompt sent Dense8 into a repetitive
+answer (3.86 tokens per round), which lifts its 8K mean.
+
+Before the BF16 kernel work (`1df65d19`), the bit-exact artifact ran its BF16 projections on routes
+tuned for other models' shapes. The same prompts, settings and artifact on that build and on the
+current one, three interleaved sessions each:
+
+| Context | Build | TTFT (s) | Prefill tok/s | Decode tok/s | Tokens per round |
+|---|---|---:|---:|---:|---:|
+| ~8K | before | 4.70 | 1,718 | 116.3 | 2.01 |
+| ~8K | current | **2.05** | **3,944** | 115.9 | 2.06 |
+| ~128K | before | 73.35 | 1,746 | 111.1 | 2.80 |
+| ~128K | current | **17.89** | **7,158** | 107.6 | 2.29 |
+| ~250K | before | 145.05 | 1,724 | 136.5 | 3.74 |
+| ~250K | current | **33.97** | **7,366** | 131.0 | 3.05 |
+
+Prefill is 2.3× faster at 8K and 4.1-4.3× from 128K. Decode is level: −1.2 % per request
+(geometric mean of ten; −9 % to +7 %), within the spread that the two builds' different texts give
+(tokens per round moved by up to 0.7). The decode kernels save little against a ~20 ms round: with
+MTP's 4 drafts a round verifies at most 5 columns, where the old BF16 head already ran at the DRAM
+floor, and the tensor-core head pays from 6 columns (n-gram and tree rounds: 1,056 → 706 µs at 8
+columns, 1,502 → 707 µs at 9-16). The bit-exact artifact's remaining decode gap to Dense8 is its
+BF16 weight bytes, not kernel time. Dense8 on the same two builds measured level (decode +0.4 % per
+request, −7 % to +7 %; TTFT −0.2 %), so the Strata comparison above stands for the current build.
 
 ### Qwen3.8-27B: Infernix vs NInfer
 
@@ -314,7 +362,7 @@ infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --host 127.0.0.1 --port 8080 
 For Qwen3.8-Flash-Next, see the [Flash-Next guide](docs/qwen3_8-flash-next.md#run):
 
 ```bat
-infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 65536 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft
+infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 65536 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft
 ```
 
 Add `--prefix-cache-file PATH` to keep the prefix cache across restarts, and
@@ -351,11 +399,27 @@ the Linux filesystem first (reads through `/mnt/` are slow).
 - **[Qwen3.8-27B-Quasar-NinferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NinferV3)**:
   [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4),
   the QAT-trained NVFP4 checkpoint, with the same draft model and proposal head.
-- **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)**
-  (`.infernix`): [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-  converted with recipe B (NVIDIA's NVFP4 experts bit-exact, Q8 dense projections), with the MTP
-  drafter and a proposal head for `--lm-head-draft`; the 52 GB n-gram volume is built from the same
-  checkpoint (see the [Flash-Next guide](docs/qwen3_8-flash-next.md#convert)).
+- **Qwen3.8-Flash-Next**, two `.infernix` conversions of
+  [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), each
+  with the MTP drafter, a proposal head for `--lm-head-draft` and the same 52 GB n-gram volume
+  (see the [Flash-Next guide](docs/qwen3_8-flash-next.md#convert)):
+
+  | | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix) (bit-exact, recipe A) | [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix) (recipe B) |
+  |---|---|---|
+  | Routed experts (24,576, NVFP4) | bit-exact | bit-exact |
+  | PLE n-gram table (FP8) | bit-exact | bit-exact |
+  | Dense projections and `lm_head` (629 tensors, 97 % of the dense bytes) | bit-exact (BF16) | **8-bit** `q8_g32_fp16` from NVIDIA's BF16 |
+  | Router, gates, GDN `a`/`b`, QSA query/gate/key/value/indexer, embedding, norms, vision | bit-exact (BF16) | bit-exact (BF16) |
+  | MTP drafter (drafting only, never changes output) | `q8_g32_fp16`, experts `q4_g64_fp16` | same |
+  | Proposal head (drafting only, not in NVIDIA's checkpoint) | `q4_g64_fp16` | same |
+  | Model files | 80.4 GB | 76.9 GB |
+  | Perplexity, frozen texts (Strata 4.844) | 4.666 | 4.654 |
+  | Decode speed ([measured](#bit-exact-against-dense8)) | ~18 % below Dense8 | 136-160 tok/s from 8K to 250K |
+
+  "Bit-exact" was checked tensor by tensor against the checkpoint with
+  `python -m tools.flash_next.verify_artifact`: every stored word equal, nothing re-derived. The
+  two measured level on quality; Dense8 is the faster of the two because it reads fewer dense bytes
+  per token and leaves 3.5 GB more VRAM to the expert cache.
 
 Infernix loads `.infernix` and `.ninfer` artifacts (the same format); `python -m tools.convert`
 writes either, and `python -m tools.artifact.rename` renames an existing one in place.

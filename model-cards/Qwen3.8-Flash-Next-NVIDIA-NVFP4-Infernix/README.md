@@ -22,7 +22,7 @@ tags:
   - cuda
 ---
 
-# Qwen3.8-Flash-Next NVIDIA NVFP4 for Infernix
+# Qwen3.8-Flash-Next NVIDIA NVFP4 for Infernix (bit-exact)
 
 > **AI disclaimer:** this artifact, its conversion recipe, the engine that runs it and most of this
 > card were made with AI (mostly Claude Opus 5.5). It is hobby work and is likely to be neither
@@ -35,43 +35,68 @@ it on **one RTX 5090** (32 GB). The 24,576 routed experts (63 GiB) live in pinne
 cache holds the hot ones, the CPU computes part of each layer's misses, and the 52 GB PLE n-gram
 table is read from an NVMe drive.
 
+**The main model and the vision tower are bit-exact to NVIDIA's checkpoint**: every weight the
+full model computes with is NVIDIA's, word for word. Only the MTP drafter, which proposes tokens
+for the full model to verify, is quantized further.
+[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix)
+stores the dense projections in 8 bits instead and decodes faster at the same measured quality.
+
+Until 2026-10-08 this repository held the 8-bit dense conversion under this name; it is now the
+Dense8 repository above.
+
 ## Files
 
 | File | Bytes | What it is |
 |---|---:|---|
 | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix` | 32,000,000,000 | model, part 1 of 3 (also holds the table of contents) |
 | `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00002-of-00003.infernix` | 32,000,000,000 | model, part 2 of 3 |
-| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00003-of-00003.infernix` | 12,867,265,280 | model, part 3 of 3 |
-| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | PLE n-gram volume (read in random 4 KiB blocks) |
-| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.conversion.json` | 905,990 | conversion report: sources, methods and formats per object |
+| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00003-of-00003.infernix` | 16,370,610,944 | model, part 3 of 3 |
+| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram` | 52,429,058,048 | PLE n-gram volume (read in random 4 KiB blocks); the same file serves both conversions |
+| `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.conversion.json` | 901,847 | conversion report: sources, methods and formats per object |
 | `NVIDIA-Open-Model-License.txt`, `NOTICE`, `LICENSE` | | the NVIDIA Open Model License; NVIDIA's attribution notice; the Qwen Community License 1.0 |
 
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF. Put the
 n-gram volume on an NVMe drive and pass it with `--ngram-volume`.
 
-## Contents
+## What is bit-exact and what is quantized
 
 Converted from [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4)
-with Infernix's recipe B (components text, vision and MTP, plus a proposal head):
+with Infernix's recipe A, `qwen3_8_flash_next_nvfp4` (components text, vision and MTP, plus a
+proposal head). `python -m tools.flash_next.verify_artifact` compared the artifact with the
+checkpoint tensor by tensor: 24,576 experts, 1,616 tensors and 320,001,536 n-gram rows with no
+mismatch, and only the drafter's 1,556 parameters re-quantized.
 
-- **Routed experts:** NVIDIA's NVFP4 tensors (W4A4, E4M3 scale per 16, FP32 multiplier and input
-  scale per matrix), imported bit-exactly.
-- **PLE n-gram table:** NVIDIA's FP8 table, imported bit-exactly into the n-gram volume.
-- **Dense projections and `lm_head`:** `q8_g32_fp16` (8-bit, groups of 32, FP16 scales) from
-  NVIDIA's BF16. Against keeping them BF16 this measured +0.008 ± 0.010 nats per token (not
-  significant) and decodes about 22 % faster.
-- **Router, gates, norms, embedding, vision:** BF16 as NVIDIA stores them.
-- **MTP drafter:** dense parts `q8_g32_fp16`; its routed experts, block-scaled FP8 in NVIDIA's
-  checkpoint, `q4_g64_fp16` from their exact values. The drafter only proposes tokens; every draft is
-  verified by the full model, so its precision changes speed, not output.
-- **Proposal head** for `--lm-head-draft`, a smaller draft output head.
+**Bit-exact to NVIDIA's checkpoint** (the whole main model and vision):
+
+- **Routed experts** (24,576): NVIDIA's NVFP4 words (E2M1 codes, E4M3 scale per 16, FP32
+  multiplier and FP32 activation input scale per matrix), repacked into Infernix's expert layout
+  without changing a bit.
+- **PLE n-gram table:** every FP8 row byte-identical in the n-gram volume, with its scale.
+- **Every BF16 tensor, stored BF16:** the dense projections (GDN, QSA, shared experts,
+  hyper-connection mixers, PLE key/value projections), `lm_head`, router, gates, token embedding,
+  norms, convolution weights and the vision tower. The GDN `A_log` and `dt_bias` are widened from
+  BF16 to FP32, value for value.
+- The PLE hash tables are computed from the model's config, which conversion checks against the
+  checkpoint's buffers.
+
+**Drafting only** (never changes output, since the full model verifies every draft):
+
+- **MTP drafter** (1,556 parameters): projections `q8_g32_fp16` (8-bit, one FP16 scale per 32
+  weights; router and shared-expert gate BF16); its routed experts, block-scaled FP8 in NVIDIA's
+  checkpoint, `q4_g64_fp16` with MSE-chosen scales from their exact values.
+- **Proposal head** for `--lm-head-draft` (not in NVIDIA's checkpoint): `q4_g64_fp16` copies of
+  the `lm_head` rows of the 131,072 most frequent tokens.
+
+Bit-exact weights do not make the output bit-identical to another engine's: Infernix computes with
+BF16 activations and its own kernels' FP32 summation order, as every engine does in its own way.
 
 Average bits per weight of the text decoder (176.9 billion weights; scales counted; vision and the
 MTP drafter excluded, as Unsloth's GGUF holds neither):
 
 | | Routed experts | Dense and other | PLE n-gram table | All | Without the n-gram table |
 |---|---:|---:|---:|---:|---:|
-| This artifact (+ n-gram volume) | 4.50 | 10.34 | 8.19 | 5.73 | 4.73 |
+| This artifact (+ n-gram volume) | 4.50 | 16.00 | 8.19 | 5.89 | 4.95 |
+| The Dense8 conversion (+ n-gram volume) | 4.50 | 10.34 | 8.19 | 5.73 | 4.73 |
 | `nvidia/Qwen3.8-Flash-Next-NVFP4` | 4.50 | 16.00 | 8.00 | 5.83 | 4.95 |
 | Unsloth `Qwen3.8-Flash-Next-UD-Q4_K_XL` | 5.10 | 8.90 | 4.50 | 5.03 | 5.25 |
 
@@ -79,11 +104,13 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
 
 ## Requirements
 
-- **GPU:** NVIDIA RTX 5090 (Blackwell, `sm_120a`), all of its 32 GB.
+- **GPU:** NVIDIA RTX 5090 (Blackwell, `sm_120a`), all of its 32 GB. The BF16 dense weights take
+  3.5 GB more VRAM than the Dense8 conversion's, which leaves about 1,270 fewer expert-cache frames
+  (6,057 against 7,319 with 3.6 GB of INT8 KV allocated).
 - **RAM:** about 69.3 GiB available for the experts, 73.3 GiB for `infernix-serve` with its
   prefix cache. With less, Infernix's SSD expert tier keeps what fits in RAM and reads the rest
   from the artifact (slower).
-- **Disk:** ~77 GB for the artifact, plus the 52 GB n-gram volume on an NVMe drive. A fast
+- **Disk:** ~80 GB for the artifact, plus the 52 GB n-gram volume on an NVMe drive. A fast
   consumer drive is enough; a SATA SSD or a hard disk is far slower.
 - **Engine:** Infernix (Windows or Linux), branch `Infernix`.
 
@@ -104,43 +131,49 @@ and tuning.
 ## Quality
 
 Teacher-forced on the same token ids (2,557 positions of code, a document and a chat transcript;
-INT8 KV in both engines), against Strata 0.1.40 running Unsloth's UD-Q4_K_XL GGUF:
+INT8 KV in both engines), against Strata 0.1.40 running Unsloth's UD-Q4_K_XL GGUF, with the Dense8
+conversion beside it (Infernix at the 2026-10-08 kernels):
 
-| Text | Perplexity, this artifact | Perplexity, Strata | ΔNLL (Infernix − Strata) |
-|---|---:|---:|---:|
-| Code | 1.905 | 1.899 | +0.003 ± 0.013 |
-| Document | 9.781 | 9.721 | +0.006 ± 0.014 |
-| Chat | 3.477 | 3.852 | **−0.102 ± 0.023** |
-| All | **4.664** | 4.844 | **−0.038 ± 0.011** |
+| Text | Perplexity, this artifact | ΔNLL vs Strata | Perplexity, Dense8 | ΔNLL vs Strata | Perplexity, Strata |
+|---|---:|---:|---:|---:|---:|
+| Code | 1.917 | +0.009 ± 0.012 | 1.913 | +0.007 ± 0.013 | 1.899 |
+| Document | 9.707 | −0.001 ± 0.018 | 9.666 | −0.006 ± 0.016 | 9.721 |
+| Chat | 3.499 | **−0.096 ± 0.021** | 3.493 | **−0.098 ± 0.022** | 3.852 |
+| All | **4.666** | **−0.037 ± 0.011** | 4.654 | **−0.040 ± 0.011** | 4.844 |
+
+ΔNLL is the mean per-token difference in nats (negative: Infernix assigns the actual text higher
+probability) with its standard error. The two conversions are level within that error.
 
 ## Performance
 
 RTX 5090 in a PCIe Gen5 **x8** link (x16 is likely faster, most of all for this model, whose
 expert-cache misses cross PCIe on every token), Core i9-13900K, 96 GB DDR5, Windows 11; Infernix
-at `3b35ccf9`, INT8 KV, MTP with 4 drafts and the proposal head. Strata 0.1.40 on the same machine
-runs the Unsloth UD-Q4_K_XL GGUF with its own MTP drafter.
+`Infernix` branch with the 2026-10-08 BF16 kernels, INT8 KV, MTP with 4 drafts and the proposal
+head; one request at a time, greedy, 1,024 output tokens, means over two or three prompts of each
+request's median of three sessions. Beside it, the Dense8 conversion on the same build:
 
-| Context | TTFT, Infernix | TTFT, Strata | Decode tok/s, Infernix | Decode tok/s, Strata |
+| Context | TTFT, this artifact | TTFT, Dense8 | Decode tok/s, this artifact | Decode tok/s, Dense8 |
 |---|---:|---:|---:|---:|
-| ~8K | 1.93 s | 12.28 s | 138.8 | 86.4 |
-| ~128K | 17.86 s | 103.27 s | 136.2 | 77.2 |
-| ~250K | 34.24 s | 158.07 s | 153.3 | 95.8 |
+| ~8K | 2.07 s | 1.92 s | 116.1 | 140.1 |
+| ~128K | 17.91 s | 17.96 s | 107.5 | 136.3 |
+| ~250K | 34.01 s | 34.22 s | 130.7 | 159.9 |
 
-One request at a time, greedy, 1,024 output tokens, means over two or three prompts. Decode with
-speculation depends on how predictable the text is, so single prompts vary by up to ±20 %.
-
-In a replayed agentic coding workload (three sessions plus subagents, up to eight requests in
-flight, two seeds), Infernix averaged 5.4 s to the first token against Strata's 25.3 s, served
-83.7 % of prompt tokens from its prefix cache against 64.3 %, decoded one request at 129 tok/s
-against 86, and finished in 8.1 minutes against 18.3. Methods and the full tables are in the
+Per request this artifact decoded 18 % slower than Dense8 (11-25 %) and reached the first token
+2.5 % later (6-8 % at 8K, level from 128K): it reads ~8.6 GB of BF16 dense weights per token against
+~5.1 GB and holds fewer experts in VRAM. Decode with speculation depends on how predictable the
+text is, so single prompts vary by up to ±20 %. Against Strata 0.1.40 on the same machine (Unsloth
+UD-Q4_K_XL with its MTP drafter; 12.3 s, 103 s and 158 s to the first token and 86, 77 and 96
+tok/s at the same contexts, measured on 7 October), this artifact reaches the first token 4.6-5.9×
+sooner and decodes 1.3-1.4× faster. Methods are in the
 [Infernix README](https://github.com/Wallawalla47/ninfer-custom/blob/Infernix/README.md#benchmarks).
 
 ## Provenance
 
-Converted with `tools.convert` (recipe `qwen3_8_flash_next_nvfp4_dense8`) and renamed into numbered
-parts with `tools.artifact.rename --numbered`; `artifact_id` `c70f7dee5052435eb0425e06e1bdcc6c`. The
+Converted with `tools.convert` (recipe `qwen3_8_flash_next_nvfp4`) and renamed into numbered parts
+with `tools.artifact.rename --numbered`; `artifact_id` `86e6d1fd9f9048df810e766809552032`. The
 conversion report and the artifact's own provenance record the paths of the machine that converted
-it. The n-gram volume was written from the same FP8 table (byte-identical to NVIDIA's).
+it. The n-gram volume was written from the same FP8 table (byte-identical to NVIDIA's) and is the
+one the Dense8 conversion uses.
 
 ## License
 
