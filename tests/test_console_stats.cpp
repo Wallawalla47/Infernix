@@ -2,10 +2,12 @@
 #include "serve/console_stats.h"
 
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -180,6 +182,34 @@ int main() {
                       "a table without n-gram columns must be 66 columns wide");
         }
     }
+
+    // A model with a VRAM expert cache (Qwen3.8-Flash-Next): the experts column follows "cached" and
+    // weighs requests by their routed experts (900 of 1,000 and 1,500 of 3,000 hit: 60.0 %, not the
+    // 70.0 % mean of the two requests' rates); requests without the stats add nothing.
+    ConsoleStatsSnapshot experts;
+    experts.completed     = 3;
+    experts.recent_window = 10;
+    for (const auto& [routed, hits] : {std::pair<std::uint64_t, std::uint64_t>{1000, 900}, {3000, 1500}}) {
+        GenerationOutcome request    = outcome(1000, 0, 11, 0.1, 0.05, 0.5);
+        request.metrics.expert_cache = infernix::ExpertCacheStats{.routed = routed, .hits = hits};
+        experts.session.add(make_console_request_sample(request));
+    }
+    experts.session.add(make_console_request_sample(outcome(1000, 0, 11, 0.1, 0.05, 0.5)));
+    experts.recent                               = experts.session;
+    const std::vector<std::string> expert_lines = render_console_stats_panel(experts);
+    failures += check(experts.session.sum.routed_experts == 4000 && experts.session.sum.vram_expert_hits == 2400,
+                      "expert-cache lookups must be summed, requests without them adding nothing");
+    failures += check(expert_lines.size() == 3, "an expert-cache session lost its data row");
+    if (expert_lines.size() == 3) {
+        failures += check(contains(expert_lines[1], "cached experts") && contains(expert_lines[2], " 60.0% "),
+                          "the experts column must follow cached and weigh by routed experts");
+        for (std::size_t index = 1; index < expert_lines.size(); ++index) {
+            failures += check(infernix::product::terminal_display_width(expert_lines[index]) == 74,
+                              "a table with the experts column must be 74 columns wide");
+        }
+    }
+    failures += check(!contains(render_console_stats_panel(model_only)[1], "experts"),
+                      "a model without an expert cache must not show the experts column");
 
     // A session whose requests never decoded shows no decode rate and no batch, not a division by
     // zero: one request of a single output token has no decode tokens or decode time.
