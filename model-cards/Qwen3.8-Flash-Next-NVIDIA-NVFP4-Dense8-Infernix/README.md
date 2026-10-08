@@ -37,8 +37,16 @@ table is read from an NVMe drive.
 
 This is the faster of the two Infernix conversions: NVIDIA's NVFP4 experts and FP8 n-gram table
 are kept bit-exact, and the BF16 dense projections and `lm_head` are stored in 8 bits ("Dense8").
-[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)
-keeps the whole main model bit-exact instead.
+
+> **Bit-exact alternative:**
+> [Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)
+> keeps every weight of the main model and vision tower exactly as NVIDIA stores it (BF16 dense
+> projections and `lm_head` included). It is **slower**: on the same machine and build it decoded
+> about 18 % slower per request (108-131 against 136-160 tok/s from 8K to 250K tokens of context)
+> and reached the first token 6-8 % later at 8K (level from 128K), because it reads ~8.6 GB of dense
+> weights per token instead of ~5.1 GB and caches fewer experts in VRAM. Quality measured the same
+> (perplexity 4.666 against this artifact's 4.654), so choose it only when the weights must be
+> NVIDIA's unchanged.
 
 ## Files
 
