@@ -16,7 +16,6 @@ from typing import Sequence
 
 from .formats import (
     DirectFormat,
-    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
     Nvfp4MulFormat,
@@ -98,22 +97,6 @@ class ExpertBankGeometry:
     payload_bytes: int
 
 
-@dataclass(frozen=True, slots=True)
-class Block128Geometry:
-    """``block128_scale_v1``: row-major code matrices, then one FP32 multiplier per tile."""
-
-    batch: int
-    n: int
-    k: int
-    block: int
-    scale_rows: int
-    scale_cols: int
-    code_plane_bytes: int
-    scale_plane_offset: int
-    scale_plane_bytes: int
-    payload_bytes: int
-
-
 EXPERT_UNIT_BYTES = 144
 EXPERT_RECORD_ALIGNMENT = 4096
 
@@ -139,11 +122,6 @@ NVFP4_EXPERT_RG16_V1 = Layout(
     EXPERT_RECORD_ALIGNMENT,
     frozenset(("nvfp4_mul",)),
 )
-BLOCK128_SCALE_V1 = Layout(
-    "block128_scale_v1",
-    256,
-    frozenset(("fp8_e4m3fn_block128_f32",)),
-)
 
 LAYOUTS = MappingProxyType(
     {
@@ -154,7 +132,6 @@ LAYOUTS = MappingProxyType(
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
             NVFP4_EXPERT_RG16_V1,
-            BLOCK128_SCALE_V1,
         )
     }
 )
@@ -341,37 +318,6 @@ def expert_bank_geometry(
     )
 
 
-def block128_geometry(
-    format: str | Fp8BlockFormat, shape: Sequence[int]
-) -> Block128Geometry:
-    """Geometry of ``[..., N, K]`` block-scaled FP8 matrices (leading axes are a batch)."""
-
-    spec = _format(format)
-    if not isinstance(spec, Fp8BlockFormat):
-        raise ValueError("block128_scale_v1 requires a block-scaled FP8 format")
-    dims = _shape(shape)
-    if len(dims) < 2:
-        raise ValueError("block128_scale_v1 requires rank 2 or more")
-    batch, (n, k) = prod(dims[:-2]), dims[-2:]
-    scale_rows = -(-n // spec.block)
-    scale_cols = -(-k // spec.block)
-    code_plane_bytes = batch * n * k
-    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
-    scale_plane_bytes = batch * scale_rows * scale_cols * 4
-    return Block128Geometry(
-        batch=batch,
-        n=n,
-        k=k,
-        block=spec.block,
-        scale_rows=scale_rows,
-        scale_cols=scale_cols,
-        code_plane_bytes=code_plane_bytes,
-        scale_plane_offset=scale_plane_offset,
-        scale_plane_bytes=scale_plane_bytes,
-        payload_bytes=scale_plane_offset + scale_plane_bytes,
-    )
-
-
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -404,6 +350,4 @@ def encoded_size(
         return row_scale_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is NVFP4_EXPERT_RG16_V1:
         return expert_bank_geometry(numeric_spec, shape).payload_bytes
-    if layout_spec is BLOCK128_SCALE_V1:
-        return block128_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

@@ -112,7 +112,7 @@ void geometry_and_views() {
                 context.input_scale_divisor == 4 && nv_parent.weight_scale_divisor == 2,
             "per-use native parameters changed the parent");
 
-    // Flash-Next expert banks and block-FP8: sizes equal tools/artifact/layouts.py's.
+    // Flash-Next expert banks: sizes equal tools/artifact/layouts.py's.
     const auto bank = weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16,
                                       std::array<std::uint64_t, 3>{3, 64, 32});
     require(bank.record_bytes == 3456 && bank.record_stride == 4096 && bank.scale_offset == 12288 &&
@@ -135,16 +135,6 @@ void geometry_and_views() {
     rejects<std::invalid_argument>(
         [&] { (void)weight_geometry(QType::NVFP4_MUL, QuantLayout::ExpertRg16, std::array<std::uint64_t, 3>{3, 64, 40}); },
         "expert bank layout accepted an intermediate size that is not a multiple of 16");
-    const auto block = weight_geometry(QType::FP8_E4M3FN_BLOCK128_F32, QuantLayout::Block128Scale,
-                                       std::array<std::uint64_t, 3>{2, 200, 130});
-    require(block.scale_offset == 52224 && block.bytes == 52256, "block128 geometry differs from the Python layout");
-    std::vector<std::byte> block_bytes(block.bytes);
-    const WeightParent block_parent{block, block_bytes.data()};
-    const auto bp = block128_planes(block_parent);
-    require(bp.batch == 2 && bp.n == 200 && bp.k == 130 && bp.scale_rows == 2 && bp.scale_cols == 2,
-            "block128 planes lost their geometry");
-    rejects<std::invalid_argument>([&] { (void)weight_row_planes({&block_parent, 0, 130}); },
-                                   "block-scaled FP8 exposed per-row planes");
 }
 
 void invalid_directories() {

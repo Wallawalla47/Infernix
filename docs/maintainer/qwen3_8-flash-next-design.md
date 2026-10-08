@@ -636,9 +636,11 @@ exact decode oracle:
   - By the rule of [tensor formats §3.4](tensor-formats.md#34-fp8_e4m3fn_row_bf16), a multiplier
     coefficient is a different format, not a variant of `nvfp4`.
   - Its only producer is `import_encoded`.
-- **`fp8_e4m3fn_block128_f32`**: E4M3FN codes with one FP32 multiplier per 128×128 block, edge
-  blocks truncated: `W[n,k] = e4m3fn(c[n,k]) · s[⌊n/128⌋, ⌊k/128⌋]`. The represented weight is the
-  exact product, which binary64 represents exactly. Its only producer is `import_encoded`.
+- **The checkpoint's block-scaled FP8 MTP experts** (`W[n,k] = e4m3fn(c[n,k]) · s[⌊n/128⌋, ⌊k/128⌋]`,
+  edge blocks truncated) are decoded exactly by the converter (`dequantize_fp8_block128` in
+  `tools/convert/sources/modelopt.py`) and re-quantized by both recipes (§6.1, `q4_g64_fp16`). A stored
+  `fp8_e4m3fn_block128_f32` format with a `block128_scale_v1` layout was planned here and registered,
+  but no recipe produced it; it was removed on 2026-10-08 (audit M10).
 
 **Model-role tensors** beside each layer's expert bank:
 
@@ -2215,7 +2217,7 @@ Every new Op is qualified against a naive FP32/FP64 oracle at the real shapes, u
 | `offloaded_sparse_moe` (A4 quantizer) | **Exact**: a scalar implementation of the §16.2 rule | Zero blocks, saturating blocks (scale > 448), subnormal scales, E2M1 and E4M3 ties, every E4M3 scale word |
 | `offloaded_sparse_moe` (narrow, GPU and CPU) | **Exact**: an independent scalar implementation of §16.2 (integers and IEEE operations, no SIMD). Also the FP64 oracle with exactly decoded weights and the same A4 activations, which bounds the canonical rounding. | Every residency mix (all-frame, all-staging, all-CPU, random); n = 1-8; every CPU ISA variant; **bit-exact equality across routes** |
 | `offloaded_sparse_moe` (wide) | FP64, exactly decoded weights, canonical A4 activations | n = 9-8192 |
-| MTP experts (`fp8_e4m3fn_block128_f32`) | FP64 with exactly decoded block-scaled weights; activations per the declared scheme | Drafter shapes, T = 1-4 |
+| MTP experts (`q4_g64_fp16`, re-quantized from the checkpoint's block-scaled FP8) | FP64 with exactly decoded weights; activations per the declared scheme | Drafter shapes, T = 1-4 |
 | `hyper_connection` | FP64 | BF16 or 8-bit weights decoded exactly; grouped norm per stream; split-K partial order fixed |
 | `qsa_prep`, `qsa_select` | FP64 block scores | Near-tie allowance as in the existing selector contracts; dense equivalence while n ≤ 2051; pooled key completion at block boundaries; identical selection under every KV profile |
 | QSA attention | FP64 attention over each profile's decoded K/V | Every `--kv-dtype`, with that profile's existing decode criterion; VQ2/K4V2 exact-window positions |
@@ -8874,7 +8876,7 @@ When the implementation lands:
 - `docs/maintainer/expert-offload.md`: frame pool, MTP pool, residency state machine, epochs,
   policy, transfer agent, mailboxes, CPU engine, and the canonical routed-expert arithmetic. §8-§12
   and §16.2 of this file move there.
-- [Tensor formats](tensor-formats.md): `nvfp4_mul` and `fp8_e4m3fn_block128_f32`, with their decode
+- [Tensor formats](tensor-formats.md): `nvfp4_mul`, with its decode
   oracles.
 - [Storage layouts](storage-layouts.md): `nvfp4_expert_rg16_v1`.
 - [Engine architecture](engine-architecture.md): Program ownership of host agents and frames;

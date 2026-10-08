@@ -110,19 +110,6 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.bytes          = add(out.scale_offset, out.scale_bytes);
         return out;
     }
-    if (layout == QuantLayout::Block128Scale) {
-        if (format != QType::FP8_E4M3FN_BLOCK128_F32 || shape.size() < 2) {
-            throw std::invalid_argument("block128_scale_v1 requires fp8_e4m3fn_block128_f32 [..., N, K]");
-        }
-        const auto n = shape[shape.size() - 2], k = shape.back();
-        const auto batch  = out.elements / mul(n, k);
-        out.group_size    = 128;
-        out.code_bytes    = out.elements;
-        out.scale_offset  = aligned(out.code_bytes, 256);
-        out.scale_bytes   = mul(mul(batch, (n + 127) / 128), mul((k + 127) / 128, 4));
-        out.bytes         = add(out.scale_offset, out.scale_bytes);
-        return out;
-    }
     if (shape.size() != 2) { throw std::invalid_argument("quantized weight must be a matrix"); }
     const auto n       = shape[0];
     const auto k       = shape[1];
@@ -234,8 +221,8 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
     validate_region(region);
     const auto& parent = *region.parent;
     const auto& g      = parent.geometry;
-    if (g.layout == QuantLayout::ExpertRg16 || g.layout == QuantLayout::Block128Scale) {
-        throw std::invalid_argument("expert banks and block-scaled FP8 have no row planes");
+    if (g.layout == QuantLayout::ExpertRg16) {
+        throw std::invalid_argument("expert banks have no row planes");
     }
     if (!parent.data || g.shape.size() != 2 || region.begin % g.shape[1] ||
         region.end % g.shape[1]) {
@@ -280,8 +267,8 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (view.shape.size() != 2 || !region.parent->data) {
         throw std::invalid_argument("native Weight requires a resident logical matrix");
     }
-    if (g.layout == QuantLayout::ExpertRg16 || g.layout == QuantLayout::Block128Scale) {
-        throw std::invalid_argument("expert banks and block-scaled FP8 bind through their planes");
+    if (g.layout == QuantLayout::ExpertRg16) {
+        throw std::invalid_argument("expert banks bind through their planes");
     }
     Weight out;
     out.payload          = region.parent->data;
@@ -353,22 +340,6 @@ ExpertBankPlanes expert_bank_layout(const WeightGeometry& g, const float* multip
     out.hidden        = static_cast<std::uint32_t>(dimension(g.shape[1]));
     out.intermediate  = static_cast<std::uint32_t>(dimension(g.shape[2]));
     out.gate_up_bytes = 2ULL * out.intermediate / 16 * (out.hidden / 16) * 144;
-    return out;
-}
-
-Block128Planes block128_planes(const WeightParent& parent) {
-    const auto& g = parent.geometry;
-    if (g.layout != QuantLayout::Block128Scale || !parent.data) {
-        throw std::invalid_argument("block128 planes require a resident block128_scale_v1 parent");
-    }
-    Block128Planes out;
-    out.codes      = parent.data;
-    out.scales     = reinterpret_cast<const float*>(parent.data + g.scale_offset);
-    out.n          = g.shape[g.shape.size() - 2];
-    out.k          = g.shape.back();
-    out.batch      = g.elements / (out.n * out.k);
-    out.scale_rows = (out.n + 127) / 128;
-    out.scale_cols = (out.k + 127) / 128;
     return out;
 }
 

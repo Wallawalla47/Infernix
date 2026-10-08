@@ -18,8 +18,6 @@ enum class QType : std::uint16_t {
     FP8_E4M3FN_ROW_BF16 = 8,
     // ModelOpt NVFP4: E2M1 codes, E4M3FN scale per 16, FP32 *multiplier* per matrix.
     NVFP4_MUL = 9,
-    // E4M3FN codes with one FP32 multiplier per 128 x 128 tile.
-    FP8_E4M3FN_BLOCK128_F32 = 10,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -30,8 +28,6 @@ enum class QuantLayout : std::uint16_t {
     // nvfp4_expert_rg16_v1: [experts, hidden, intermediate] banks of 4 KiB-aligned expert
     // records in 144-byte row-group units, then an [experts, 3] FP32 multiplier plane.
     ExpertRg16 = 4,
-    // block128_scale_v1: [..., N, K] row-major codes, then FP32 tile multipliers.
-    Block128Scale = 5,
 };
 
 struct Weight {

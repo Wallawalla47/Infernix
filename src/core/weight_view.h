@@ -117,16 +117,4 @@ struct ExpertBankPlanes {
 // null and the multipliers are the caller's copy of the bank's scale tail.
 [[nodiscard]] ExpertBankPlanes expert_bank_layout(const WeightGeometry& geometry, const float* multipliers);
 
-// Block-scaled FP8 matrices in block128_scale_v1, leading axes flattened into a batch.
-struct Block128Planes {
-    const std::byte* codes   = nullptr; // [batch][n][k] E4M3FN
-    const float* scales      = nullptr; // [batch][scale_rows][scale_cols] FP32 multipliers
-    std::uint64_t batch      = 0;
-    std::uint64_t n          = 0;
-    std::uint64_t k          = 0;
-    std::uint64_t scale_rows = 0;
-    std::uint64_t scale_cols = 0;
-};
-[[nodiscard]] Block128Planes block128_planes(const WeightParent& parent);
-
 } // namespace infernix

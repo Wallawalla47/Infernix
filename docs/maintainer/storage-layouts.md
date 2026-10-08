@@ -16,7 +16,6 @@ The storage registry contains exactly these identities:
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `nvfp4_expert_rg16_v1` | tensor layout | `nvfp4_mul` | rank 3 `[E,H,I]`, `H % 16 == 0`, `I % 16 == 0` | 4096 bytes |
-| `block128_scale_v1` | tensor layout | `fp8_e4m3fn_block128_f32` | rank `>= 2` `[..., N, K]` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
 These format/layout pairs define the current codec support. Native consumer requirements are
@@ -365,26 +364,7 @@ The layout has no row views: a binding addresses the complete bank, and consumer
 and multiplier planes from `expert_bank_planes`. Activation input scales are separate model-role
 tensors.
 
-## 7. `block128_scale_v1`
-
-`block128_scale_v1` stores `fp8_e4m3fn_block128_f32` tensors `[..., N, K]`. Leading axes form a
-batch of `B` matrices, for example the experts of one layer. Let:
-
-```text
-B                  = product of the leading dimensions (1 for rank 2)
-scale_rows         = ceil_div(N, 128)       scale_cols = ceil_div(K, 128)
-code_plane_bytes   = B * N * K
-scale_plane_offset = align_up(code_plane_bytes, 256)
-scale_plane_bytes  = B * scale_rows * scale_cols * 4
-payload_bytes      = scale_plane_offset + scale_plane_bytes
-```
-
-The code plane is the C-order sequence of E4M3FN bytes. The scale plane holds little-endian FP32
-multipliers in C order `[B, scale_rows, scale_cols]`; tile `(r, c)` covers rows `128r ..` and
-columns `128c ..`, truncated at the matrix edge. Zero bytes fill the gap before the scale plane.
-Consumers obtain both planes from `block128_planes`; the layout has no per-row planes.
-
-## 8. `raw_bytes_v1`
+## 7. `raw_bytes_v1`
 
 `raw_bytes_v1` is a resource encoding, not a tensor layout. Its enclosing object payload is
 the resource byte string itself:
@@ -399,7 +379,7 @@ trailing padding. The resource object's JSON `bytes` is its exact nonzero length
 returns the complete span unchanged. A model contract assigns a resource name and interprets those
 bytes; the common encoding does not infer that meaning from the name.
 
-## 9. Decode boundary
+## 8. Decode boundary
 
 Layout decoding yields only persistent logical words:
 
@@ -413,7 +393,6 @@ Layout decoding yields only persistent logical words:
 - `nvfp4_expert_rg16_v1` yields, per expert, the gate, up and down E2M1 code words and E4M3FN
   scale words in natural `[rows, K]` order (undoing the unit packing and row interleave), and the
   three FP32 multipliers;
-- `block128_scale_v1` yields the E4M3FN code words and the FP32 tile multipliers;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 
 Dequantized values follow the reconstruction rule in `tensor-formats.md`. This document does
