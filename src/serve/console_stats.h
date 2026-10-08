@@ -67,6 +67,8 @@ struct ConsoleStatsSnapshot {
     std::size_t recent_window = 0;
     // Model drafter that produced the speculative columns; None until a request used one.
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    // The server runs n-gram drafting; without it the n-gram and archive columns are omitted.
+    bool ngram_enabled = false;
     ConsoleStatsTotals session;
     ConsoleStatsTotals recent;
 };
@@ -79,7 +81,7 @@ class ConsoleStatsPanel {
 public:
     static constexpr std::size_t kRecentRequests = 10;
 
-    explicit ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel);
+    ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel, bool ngram_enabled);
 
     void request_done(const GenerationOutcome& outcome);
     void request_failure(const RequestFailure& failure);

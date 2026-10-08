@@ -125,6 +125,7 @@ int main() {
     snapshot.waiting             = 0;
     snapshot.recent_window       = 10;
     snapshot.speculative_backend = infernix::SpeculativeBackend::DFlash2;
+    snapshot.ngram_enabled       = true;
     snapshot.session.add(sample);
     snapshot.recent                      = snapshot.session;
     const std::vector<std::string> lines = render_console_stats_panel(snapshot);
@@ -157,6 +158,29 @@ int main() {
         }
     }
 
+    // Without n-gram drafting the n-gram and archive columns are omitted and the table narrows.
+    ConsoleStatsSnapshot model_only = snapshot;
+    model_only.ngram_enabled        = false;
+    const std::vector<std::string> model_only_lines = render_console_stats_panel(model_only);
+    failures += check(model_only_lines.size() == 3, "a model-only session lost its data row");
+    if (model_only_lines.size() == 3) {
+        failures += check(contains(model_only_lines[1], "DFLASH2") &&
+                              contains(model_only_lines[1], "acc/rnd") &&
+                              !contains(model_only_lines[1], "ngram") &&
+                              !contains(model_only_lines[1], "ng rnds") &&
+                              !contains(model_only_lines[1], "archive"),
+                          "headings without n-gram drafting must omit the n-gram columns");
+        failures += check(contains(model_only_lines[2], "40.0%") &&
+                              !contains(model_only_lines[2], "70.0%") &&
+                              !contains(model_only_lines[2], "25.0%"),
+                          "rows without n-gram drafting must omit n-gram and archive acceptance");
+        for (std::size_t index = 1; index < model_only_lines.size(); ++index) {
+            failures +=
+                check(infernix::product::terminal_display_width(model_only_lines[index]) == 66,
+                      "a table without n-gram columns must be 66 columns wide");
+        }
+    }
+
     // A session whose requests never decoded shows no decode rate and no batch, not a division by
     // zero: one request of a single output token has no decode tokens or decode time.
     ConsoleStatsSnapshot undecoded;
@@ -174,7 +198,7 @@ int main() {
     // The recent row appears once the session outgrows the window and covers only its requests.
     const auto logging = std::make_unique<infernix::product::LoggingRuntime>(
         infernix::product::LoggingOptions{.logger_name = "console-stats-test"});
-    ConsoleStatsPanel panel(logging->terminal_panel());
+    ConsoleStatsPanel panel(logging->terminal_panel(), false);
     for (int index = 0; index < 12; ++index) {
         panel.request_done(outcome(100, 0, 2, index < 2 ? 5.0 : 0.5, 0.1, 0.1));
     }
