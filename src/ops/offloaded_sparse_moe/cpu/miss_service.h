@@ -16,6 +16,8 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -52,9 +54,14 @@ public:
     [[nodiscard]] MoeCpuChannel channel(int layer) const;
     [[nodiscard]] std::uint64_t served_requests() const noexcept { return served_.load(std::memory_order_relaxed); }
     [[nodiscard]] std::uint64_t served_experts() const noexcept { return experts_.load(std::memory_order_relaxed); }
+    // Why the service thread stopped serving; empty while it serves. The device's wait for an
+    // answer then times out (kErrorHostSilent) on every later call, so the caller treats a failed
+    // service as fatal and reports this cause.
+    [[nodiscard]] std::string failure() const;
 
 private:
     void serve();
+    void record_failure(std::string what) noexcept;
 
     std::vector<Layer> layers_;
     Options options_;
@@ -68,6 +75,8 @@ private:
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
     std::atomic<std::uint64_t> served_{0}, experts_{0};
+    mutable std::mutex failure_mutex_;
+    std::string failure_;
     std::thread thread_;
 };
 

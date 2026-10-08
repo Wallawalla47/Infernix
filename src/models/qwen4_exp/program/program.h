@@ -571,6 +571,10 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
 
     void fail_all_cleanup() noexcept;
+    // After a runtime::RecoverableExecutionError from a call: releases every lane without
+    // publishing, lets the prefix cache's transfers land and empties the cache when the failed
+    // round may have published into it. False when that fails (the Engine fails everything).
+    [[nodiscard]] bool recover_after_failure() noexcept;
     // Releases every lane, saves the expert cache's state and then the prefix cache's Host tier
     // when a file is attached.
     void shutdown_cleanup() noexcept;
@@ -616,5 +620,14 @@ struct RuntimeTypes {
     using Program           = qwen4_exp::Program;
     using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
+
+namespace testing {
+// Fault injection for engine-level tests: the `checks`-th later check of the expert error word (one
+// per prefill call or decode round, process-wide) reports a failed expert read, as a real one would.
+// 0 disarms.
+void set_expert_fault(std::uint32_t checks) noexcept;
+// Consumes one check; true on the armed one.
+[[nodiscard]] bool take_expert_fault() noexcept;
+} // namespace testing
 
 } // namespace infernix::models::qwen4_exp

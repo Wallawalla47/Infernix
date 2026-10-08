@@ -50,6 +50,14 @@ infernix_add_test(infernix_qwen4_exp_vram_pressure_real_test
   LIBRARIES infernix_engine infernix_model_runtime)
 set_tests_properties(infernix_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# Engine-level recovery from a failed expert read: the round's requests fail, the Engine keeps
+# serving, and a later request equals the run before the fault.
+infernix_add_test(infernix_qwen4_exp_expert_fault_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_fault_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_expert_fault_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+
 # The Vision encode window's placement and visual columns (host only).
 infernix_add_test(infernix_qwen4_exp_vision_window_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_window.cpp"

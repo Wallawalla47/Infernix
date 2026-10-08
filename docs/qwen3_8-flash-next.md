@@ -212,7 +212,10 @@ Records that follow each other in the artifact are read as one request (the star
 32 MiB, a prefill's fetched experts up to 12 MiB), which the drive serves faster than one request
 per expert. Outputs are the same bits as with every expert in RAM; only speed changes, with the share of routed
 experts read from disk. The tier needs at least 2.6 GiB (1,024 slots). A read that fails fails the
-requests of that round with an error and the server keeps serving.
+requests running in that round with an error and the server keeps serving; queued requests wait as
+usual, and the prefix cache is emptied (the failed round may have published state it never
+computed). If the tier's read thread or the CPU expert service itself stops, every later round
+would fail too, so the server stops with that cause.
 
 ## VRAM
 

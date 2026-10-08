@@ -55,6 +55,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdio>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -1970,6 +1971,30 @@ public:
         return out;
     }
 
+    // After a RecoverableExecutionError: every lane is released without publishing anything (the
+    // failed round's state is unknown), the cache's transfers in flight land, and a cache the
+    // failure may have published into is emptied. False when that fails (the device itself failed;
+    // the Engine then fails everything).
+    bool recover_after_failure() noexcept {
+        try {
+            for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+                if (lanes_[i].phase != Phase::Free) { release(i); }
+            }
+            transaction_lane_.reset();
+            pending_transaction_ = 0;
+            deferred_.pending    = false; // the failed round's cache update
+            device_.synchronize();
+            if (prefix_) {
+                prefix_->drain();
+                if (clear_prefix_on_release_) { prefix_->clear(); }
+            }
+            clear_prefix_on_release_ = false;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
     void release_all() noexcept {
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             if (lanes_[i].phase != Phase::Free) { release(i); }
@@ -2273,11 +2298,23 @@ public:
     // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the
     // round may have published are dropped when the lanes are released.
     void check_expert_error() {
-        auto* word                 = static_cast<volatile std::uint32_t*>(expert_error_.data());
-        const std::uint32_t value  = *word;
+        auto* word           = static_cast<volatile std::uint32_t*>(expert_error_.data());
+        std::uint32_t value  = *word;
+        if (value == 0 && testing::take_expert_fault()) { value = EIO; } // layer 0
         if (value == 0) { return; }
         *word                    = 0;
         clear_prefix_on_release_ = true;
+        // A stopped service or read agent fails every later call too: stop the Engine with its cause.
+        if (cpu_service_) {
+            if (const std::string why = cpu_service_->failure(); !why.empty()) {
+                throw std::runtime_error("Qwen3.8-Flash-Next: the CPU expert service stopped (" + why + ")");
+            }
+        }
+        if (tier_) {
+            if (const std::string why = tier_->failure(); !why.empty()) {
+                throw std::runtime_error("Qwen3.8-Flash-Next: the SSD expert tier's read agent stopped (" + why + ")");
+            }
+        }
         const std::uint32_t code = value & 0xFFFFU;
         std::string what         = code == ops::offloaded_moe::kErrorUnservedRecord ? "an SSD-only expert had no path to it"
                                    : code == ops::offloaded_moe::kErrorHostSilent   ? "the host expert service stopped answering"

@@ -198,9 +198,25 @@ void CpuMissService::serve() {
             last  = std::chrono::steady_clock::now();
             polls = 0;
         }
+    } catch (const std::exception& error) {
+        // A failed service never answers: the device wait ends after its timeout instead of hanging,
+        // and failure() tells the caller why.
+        record_failure(error.what());
     } catch (...) {
-        // A failed service never answers; the device wait traps after its timeout instead of hanging.
+        record_failure("unknown exception");
     }
+}
+
+void CpuMissService::record_failure(std::string what) noexcept {
+    try {
+        const std::lock_guard<std::mutex> lock(failure_mutex_);
+        failure_ = what.empty() ? std::string("unknown exception") : std::move(what);
+    } catch (...) {}
+}
+
+std::string CpuMissService::failure() const {
+    const std::lock_guard<std::mutex> lock(failure_mutex_);
+    return failure_;
 }
 
 } // namespace infernix::ops::offloaded_moe
