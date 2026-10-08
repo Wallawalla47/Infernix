@@ -21,6 +21,11 @@ not product support. C is configured request concurrency; K is the number of dra
 | Qwen3.8-27B / `groupwise-int` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 | Qwen3.8-27B / `nvfp4` | [8K–256K](performance/qwen3.8-27b.md#no-speculation-context-profile) | [MTP3; DFlash2 K=7](performance/qwen3.8-27b.md#single-request-speculative-decode) | [MTP3 C=1, 2, 4, 8; DFlash2 C=1](performance/qwen3.8-27b.md#corpus-makespan) | [C=1, 2, 4, 8](performance/qwen3.8-27b.md#decode-saturation) |
 
+Qwen3.8-Flash-Next has no row: its published figures are the README's
+[comparison with Strata](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata), measured with that
+section's client-side method rather than this page's, and its own guide's
+[performance notes](qwen3_8-flash-next.md#performance).
+
 Qwen3.8 and Qwen3.6-35B-A3B C=1 corpus points also supply their single-request phase tables.
 The Qwen3.6-27B NVFP4 MTP3 phase table comes from a corpus C=1 point whose full makespan is
 not published here. Qwen3.8 measurements use FP8 E4M3 row-256 KV; the Qwen3.6 measurements

@@ -357,6 +357,22 @@ ends pending context and model transactions, then releases resident/paused resou
 and finally completes every response. Internal state corruption must not be interpreted as a cache
 miss.
 
+One class of execution failure is recoverable: `runtime::RecoverableExecutionError`, which a Program
+raises after a stable boundary when a unit's inputs were unavailable rather than its state corrupted
+(Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that missed
+its heartbeat). The Engine fails the requests holding lanes with it, the Program releases those
+lanes without publishing anything and empties a prefix cache the failed round may have published
+into, and queued requests keep waiting; if the Engine is binding, materializing, capturing or holding
+a paused request at that moment it fails everything instead. A service or read thread that has itself
+stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
+its cause. CUDA errors are never recoverable: the context state is unknown.
+
+Release and cleanup paths are `noexcept`, and a broken ownership invariant or a throw inside one of
+them (a page, extent or reference that a release finds missing, a release that a destructor or abort
+cannot report) calls `std::terminate()` rather than continue with ownership it cannot trust. These
+sites are fail-fast by design and are not candidates for recovery; `grep -rn "std::terminate()" src`
+lists them.
+
 ## 7. Physical execution and CUDA Graphs
 
 The startup planner establishes State/KV, workspace and Graph resources from the per-layer Parameters,
