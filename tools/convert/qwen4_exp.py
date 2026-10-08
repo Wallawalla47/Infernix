@@ -553,11 +553,17 @@ def ngram_geometry(rows: int, row_bytes: int) -> dict:
     }
 
 
+NGRAM_REUSE_SAMPLES = 512
+
+
 def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
     """The volume id of an existing n-gram volume written from this checkpoint's table.
 
     Another recipe of the same checkpoint (recipe B) shares recipe A's volume: the rows are the
-    checkpoint's words in both. The header geometry and the file size must match this table.
+    checkpoint's words in both. The header geometry and the file size must match this table, and
+    NGRAM_REUSE_SAMPLES rows spread over the table (the first and last included) must equal this
+    checkpoint's rows byte for byte, so a volume written from another checkpoint with the same
+    geometry is refused instead of adopted (the runtime only compares the id the artifact stores).
     """
 
     row_bytes = store.describe(shards[0][0]).shape[1]
@@ -581,6 +587,22 @@ def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
         or path.stat().st_size != geometry["file_bytes"]
     ):
         raise ValueError(f"{path}: not an n-gram volume of this checkpoint's table")
+    samples = sorted({rows - 1, *(k * rows // NGRAM_REUSE_SAMPLES for k in range(NGRAM_REUSE_SAMPLES))})
+    starts = []
+    first = 0
+    for name, count in shards:
+        starts.append((first, name, count))
+        first += count
+    with path.open("rb") as stream:
+        for row in samples:
+            shard_first, name, _ = next(s for s in reversed(starts) if s[0] <= row)
+            local = row - shard_first
+            expected = store.read_flat(name, local * row_bytes, (local + 1) * row_bytes).view(torch.uint8)
+            per_block = geometry["rows_per_block"]
+            stream.seek(NGRAM_BLOCK_BYTES + (row // per_block) * NGRAM_BLOCK_BYTES + (row % per_block) * row_bytes)
+            if stream.read(row_bytes) != expected.numpy().tobytes():
+                raise ValueError(f"{path}: row {row} differs from this checkpoint's n-gram table "
+                                 "(a volume written from another checkpoint)")
     return volume_id
 
 
