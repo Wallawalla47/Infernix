@@ -71,7 +71,22 @@ PrefixCachePersistence ProgramImpl::attach_prefix_cache_file(const std::filesyst
     PrefixCachePersistence loaded = public_result(prefix_->load(path, fingerprint, observer));
     prefix_file_                  = path;
     prefix_fingerprint_           = std::move(fingerprint);
+    prefix_saved_writes_          = prefix_->counters().host_write_bytes;
     return loaded;
+}
+
+std::optional<PrefixCachePersistence> ProgramImpl::save_prefix_cache_now(const CancellationView& abandoned) {
+    if (!prefix_ || prefix_file_.empty() || prefix_->counters().host_write_bytes == prefix_saved_writes_) {
+        return std::nullopt;
+    }
+    // As at shutdown: Host writes and copy-outs land, then the save reads the slabs (lanes pinning a
+    // path do not matter, the save only reads).
+    device_.synchronize();
+    prefix_->drain();
+    const std::uint64_t written = prefix_->counters().host_write_bytes;
+    PrefixCachePersistence saved = public_result(prefix_->save(prefix_file_, prefix_fingerprint_, abandoned));
+    if (saved.ok) { prefix_saved_writes_ = written; }
+    return saved;
 }
 
 // After every lane is released: Host writes and copy-outs land, then the save reads the slabs.

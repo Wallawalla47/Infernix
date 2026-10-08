@@ -594,6 +594,10 @@ public:
                                                                   std::string fingerprint,
                                                                   const StartupObserver& observer);
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
+    // Between units (no unit's Device work in flight): writes the Host tier to the attached file
+    // when it has been written since the last save or load (Engine periodic save,
+    // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
+    [[nodiscard]] std::optional<HybridCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 private:

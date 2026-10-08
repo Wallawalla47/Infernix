@@ -470,6 +470,7 @@ public:
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;
     }
+    [[nodiscard]] std::optional<HybridCachePersistence> save_hybrid_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;
 
@@ -833,6 +834,7 @@ public:
     std::filesystem::path hybrid_file_;
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
+    std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
 
     void create_hybrid_prefix_cache(const StartupObserver& observer);
     // Stages a binding from a hybrid source: pins the quoted path and snapshot, makes room by

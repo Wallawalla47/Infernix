@@ -100,6 +100,11 @@ public:
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
         diagnostics_ = options.diagnostic_observer;
+        if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid &&
+            !options.context_cache.hybrid.persistent_file.empty()) {
+            prefix_save_interval_ = options.context_cache.hybrid.persistent_save_interval;
+            next_prefix_save_     = Clock::now() + prefix_save_interval_;
+        }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -2399,15 +2404,57 @@ private:
         publish_runtime_stats();
     }
 
+    // The periodic Host-tier save (HybridPrefixCacheOptions::persistent_save_interval): at the first
+    // worker boundary once the interval has passed, counted from the end of the previous save. The
+    // Program skips it when nothing was written since; stopping the Engine abandons it.
+    void save_prefix_cache_if_due() {
+        if constexpr (requires { instance_.program->save_prefix_cache_now(CancellationView{}); }) {
+            if (prefix_save_interval_.count() == 0 || Clock::now() < next_prefix_save_) { return; }
+            const auto started = Clock::now();
+            const auto saved   = instance_.program->save_prefix_cache_now(CancellationView([this] {
+                std::lock_guard lock(queue_mutex_);
+                return stopping_;
+            }));
+            next_prefix_save_ = Clock::now() + prefix_save_interval_;
+            if (!saved) { return; }
+            const double paused = std::chrono::duration<double>(Clock::now() - started).count();
+            if (saved->ok) {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                                   "prefix cache saved: %llu blocks and %llu snapshots (%.2f GiB) in %.1f s; "
+                                   "requests waited %.1f s",
+                                   static_cast<unsigned long long>(saved->blocks),
+                                   static_cast<unsigned long long>(saved->snapshots),
+                                   static_cast<double>(saved->bytes) / static_cast<double>(1ULL << 30),
+                                   saved->seconds, paused);
+            } else {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                   "periodic prefix cache save not written (%s); the previous file is kept",
+                                   saved->message.c_str());
+            }
+        }
+    }
+
     void worker_loop() noexcept {
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
                 if (!stopping_ && pending_.empty() && resident_empty() && paused_.empty() &&
                     !instance_.program->has_context_transaction()) {
-                    queue_cv_.wait(lock, [&] {
-                        return stopping_ || !pending_.empty() || maintenance_requested_;
-                    });
+                    const auto woken = [&] { return stopping_ || !pending_.empty() || maintenance_requested_; };
+                    if (prefix_save_interval_.count() == 0) {
+                        queue_cv_.wait(lock, woken);
+                    } else if (!queue_cv_.wait_until(lock, next_prefix_save_, woken)) {
+                        // The periodic save falls due while the Engine is idle.
+                        lock.unlock();
+                        std::scoped_lock execution_lock(execution_mutex_);
+                        try {
+                            save_prefix_cache_if_due();
+                        } catch (...) {
+                            fail_all_locked(std::current_exception());
+                            return;
+                        }
+                        continue;
+                    }
                     if (!stopping_ && pending_.empty() && maintenance_requested_) {
                         maintenance_requested_ = false;
                         lock.unlock();
@@ -2439,6 +2486,7 @@ private:
             std::unique_lock execution_lock(execution_mutex_);
             bool executed = false;
             try {
+                save_prefix_cache_if_due();
                 set_host_work_class(HostWorkClass::Control);
                 auto boundary = begin_host_phase();
                 (void)expire_pending_requests();
@@ -2618,6 +2666,8 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;
+    std::chrono::seconds prefix_save_interval_{0}; // zero: the Host tier is saved only at shutdown
+    Clock::time_point next_prefix_save_{};
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
     DiagnosticObserver diagnostics_;

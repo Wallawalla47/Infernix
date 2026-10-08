@@ -132,6 +132,10 @@ PrefixCachePersistence Program::attach_prefix_cache_file(const std::filesystem::
 
 std::optional<PrefixCachePersistence> Program::prefix_shutdown_save() const { return impl_->prefix_shutdown_save(); }
 
+std::optional<PrefixCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+    return impl_->save_prefix_cache_now(abandoned);
+}
+
 PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->usage(); }
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory(); }

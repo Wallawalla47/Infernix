@@ -341,6 +341,10 @@ HybridCachePersistence Program::attach_hybrid_cache_file(const std::filesystem::
     return impl_->attach_hybrid_cache_file(path, std::move(fingerprint), observer);
 }
 
+std::optional<HybridCachePersistence> Program::save_prefix_cache_now(const CancellationView& abandoned) {
+    return impl_->save_hybrid_cache_now(abandoned);
+}
+
 std::optional<HybridCachePersistence> Program::hybrid_shutdown_save() const {
     return impl_->hybrid_shutdown_save();
 }

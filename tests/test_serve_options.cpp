@@ -665,6 +665,21 @@ int main() {
     failures +=
         check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--host-context-mib", "0"}),
               "--prefix-cache-file was accepted without a Host tier to save");
+    // The periodic save: minutes, only with a cache file, never zero.
+    {
+        std::vector<std::string> arguments{"infernix-serve", "model.ninfer", "--prefix-cache-file", "file.cache",
+                                           "--prefix-cache-save-mins", "15"};
+        failures += check(parse(std::move(arguments)).context_cache.hybrid.persistent_save_interval ==
+                              std::chrono::seconds(15 * 60),
+                          "--prefix-cache-save-mins did not set the save interval in minutes");
+        failures += check(parse({"infernix-serve", "model.ninfer"}).context_cache.hybrid.persistent_save_interval ==
+                              std::chrono::seconds(0),
+                          "the periodic save is on by default");
+    }
+    failures += check(rejected_cache_file({"--prefix-cache-save-mins", "15"}),
+                      "--prefix-cache-save-mins was accepted without --prefix-cache-file");
+    failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "0"}),
+                      "--prefix-cache-save-mins accepted zero");
     for (const std::vector<std::string>& hybrid_flag :
          std::vector<std::vector<std::string>>{{"--prefix-cache-file", "file.cache"},
                                                {"--device-snapshot-slots", "2"},
