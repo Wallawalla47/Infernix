@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -114,6 +115,10 @@ public:
     static constexpr std::uint32_t kNoTicket = 0xFFFFFFFFU;
     // Every key can be demanded once per round (a layer call reads each of its experts once).
     [[nodiscard]] std::uint32_t ticket_capacity() const noexcept { return ticket_capacity_; }
+    // Why the agent thread stopped (an error of the read queue itself, not a failed read); empty
+    // while it runs. Its pending and later demands then fail at once instead of waiting, and the
+    // caller treats the tier as failed.
+    [[nodiscard]] std::string failure() const;
 
 private:
     struct Ticket {
@@ -133,7 +138,13 @@ private:
         std::uint64_t serial = 0;
     };
 
-    void agent_main();
+    // The agent thread: agent_loop, and agent_failed when it throws.
+    void agent_main() noexcept;
+    void agent_loop();
+    // Records the failure and fails every pending ticket and the startup fill (mutex_ not held).
+    void agent_failed(std::string what) noexcept;
+    // A pending ticket that will never be read (its request failed, or the agent stopped).
+    void fail_ticket(std::uint32_t t) noexcept;
     // Agent: submits the reads of `key` into `slot` with tags (kind, index, segment).
     void submit(std::uint32_t key, std::uint32_t slot, std::uint64_t tag_base);
     // Whether `key`'s record starts where `before`'s ends, each in one segment of the same file.
@@ -155,9 +166,10 @@ private:
     std::uint32_t per_chunk_ = 0;
 
     // Agent state. Guarded by mutex_: the queues of new work and the round's ring.
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable wake_;
     bool stop_ = false;
+    std::string agent_failure_; // non-empty once the agent thread has stopped on an error
     std::vector<std::uint32_t> new_demands_; // ticket indices
     std::vector<RingSlot> ring_;             // free ring slots of this round, taken from the back
     std::deque<std::uint32_t> holding_;      // tickets holding a ring slot, oldest first

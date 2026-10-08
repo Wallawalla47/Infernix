@@ -2309,6 +2309,46 @@ private:
         publish_runtime_stats();
     }
 
+    // A unit failed with a RecoverableExecutionError (an expert record that could not be read): the
+    // requests holding lanes fail with it, the Program discards their state, and queued requests
+    // keep waiting. False when this state is not one it handles (a binding, materialization,
+    // capture or paused request in flight) or the Program's cleanup failed; the caller then fails
+    // everything, as for any other worker error.
+    bool recover_locked(const std::exception_ptr& error) noexcept {
+        if constexpr (!requires { instance_.program->recover_after_failure(); }) {
+            return false;
+        } else {
+            try {
+                if (materializing_ || context_owner_ || !paused_.empty()) { return false; }
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (slots_[lane] != nullptr && slots_[lane]->capture_pending) { return false; }
+                }
+                if (!instance_.program->recover_after_failure()) { return false; }
+                admission_decision_.reset();
+                for (auto& decision : capture_decisions_) { decision.reset(); }
+                std::uint32_t failed = 0;
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (slots_[lane] == nullptr) { continue; }
+                    complete_error(slots_[lane], error);
+                    remove_completed_slot(lane);
+                    ++failed;
+                }
+                std::string what = "unknown error";
+                try {
+                    std::rethrow_exception(error);
+                } catch (const std::exception& e) { what = e.what(); } catch (...) {}
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "%s: failed %u running request(s); the Engine keeps serving",
+                                   what.c_str(), failed);
+                request_admission_check();
+                publish_runtime_stats();
+                return true;
+            } catch (...) {
+                return false;
+            }
+        }
+    }
+
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error, bool shutdown = false) noexcept {
@@ -2551,6 +2591,13 @@ private:
                     executed = true;
                 }
                 publish_runtime_stats();
+            } catch (const RecoverableExecutionError&) {
+                auto error = std::current_exception();
+                if (!recover_locked(error)) {
+                    fail_all_locked(error);
+                    return;
+                }
+                executed = true;
             } catch (...) {
                 auto error = std::current_exception();
                 fail_all_locked(error);

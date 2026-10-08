@@ -166,6 +166,7 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
     if (jobs.empty()) { return 0; }
     {
         std::unique_lock<std::mutex> lock(mutex_);
+        if (!agent_failure_.empty()) { throw std::runtime_error("SSD tier: the read agent stopped: " + agent_failure_); }
         prefill_jobs_.insert(prefill_jobs_.end(), jobs.begin(), jobs.end());
         prefill_pending_ += static_cast<std::uint32_t>(jobs.size());
         wake_.notify_all();
@@ -258,10 +259,56 @@ std::uint32_t HostExpertTier::demand(int layer, int expert) noexcept {
     if (t == kNoTicket || tickets_[t].resident) { return t; }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!agent_failure_.empty()) { // nothing will read it
+            fail_ticket(t);
+            return t;
+        }
         new_demands_.push_back(t);
     }
     wake_.notify_all();
     return t;
+}
+
+void HostExpertTier::fail_ticket(std::uint32_t t) noexcept {
+    Ticket& ticket          = tickets_[t];
+    std::uint32_t pending   = 0;
+    if (!ticket.state.compare_exchange_strong(pending, 2, std::memory_order_acq_rel)) { return; }
+    ticket.status.store(EIO, std::memory_order_relaxed);
+    ticket.done.store(true, std::memory_order_release);
+    in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+std::string HostExpertTier::failure() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return agent_failure_;
+}
+
+void HostExpertTier::agent_main() noexcept {
+    try {
+        agent_loop();
+    } catch (const std::exception& error) {
+        agent_failed(error.what());
+    } catch (...) {
+        agent_failed("unknown exception");
+    }
+}
+
+void HostExpertTier::agent_failed(std::string what) noexcept {
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        agent_failure_ = what.empty() ? std::string("unknown exception") : std::move(what);
+        // Reads in flight may still land in their slots; nothing admits a failed ticket's slot.
+        const std::uint32_t count = std::min(ticket_count_.load(std::memory_order_acquire), ticket_capacity_);
+        for (std::uint32_t t = 0; t < count; ++t) { fail_ticket(t); }
+        new_demands_.clear();
+        prefill_jobs_.clear();
+        if (prefill_pending_ != 0) {
+            prefill_failures_ += prefill_pending_;
+            prefill_pending_ = 0;
+            prefill_done_.notify_all();
+        }
+    } catch (...) {}
+    if (options_.fetch != nullptr) { options_.fetch->fail(EIO); }
 }
 
 bool HostExpertTier::take_slot(std::uint32_t t) {
@@ -319,7 +366,7 @@ void HostExpertTier::done(std::uint32_t t) noexcept {
     if (t < ticket_capacity_) { tickets_[t].done.store(true, std::memory_order_release); }
 }
 
-void HostExpertTier::agent_main() {
+void HostExpertTier::agent_loop() {
     struct PrefillEntry {
         std::uint32_t key, slot, remaining;
         bool failed;
@@ -416,19 +463,12 @@ void HostExpertTier::agent_main() {
         }
         waiting.insert(waiting.end(), demands.begin(), demands.end());
         demands.clear();
-        const auto fail_unread = [&](std::uint32_t t) { // its request failed: nothing will read it
-            Ticket& ticket = tickets_[t];
-            ticket.status.store(EIO, std::memory_order_relaxed);
-            ticket.done.store(true, std::memory_order_release);
-            ticket.state.store(2, std::memory_order_release);
-            in_flight_.fetch_sub(1, std::memory_order_acq_rel);
-        };
         while (!waiting.empty()) {
             const std::uint32_t t = waiting.front();
             Ticket& ticket        = tickets_[t];
-            if (ticket.fetch >= 0 && fetch_failed) {
+            if (ticket.fetch >= 0 && fetch_failed) { // its request failed: nothing will read it
                 waiting.pop_front();
-                fail_unread(t);
+                fail_ticket(t);
                 continue;
             }
             if (!take_slot(t)) { break; } // a slot frees up once the device or the CPU is done with one
