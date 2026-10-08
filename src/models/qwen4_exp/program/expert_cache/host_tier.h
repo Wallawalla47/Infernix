@@ -109,9 +109,19 @@ public:
     void take_dirty(std::vector<std::uint32_t>& keys);
 
     // ---- startup
-    // Places `key`'s record into a free resident slot (the warm pre-fill); false when none is left.
-    // The caller writes the bytes before the first round.
+    // Places `key`'s record into a free resident slot (the warm pre-fill); false when none is left
+    // or the key already has a host copy. The caller writes the bytes before the first round.
     bool prefill(std::uint32_t key, std::int32_t& slot);
+    [[nodiscard]] bool has_free_resident() const { return !free_resident_.empty(); }
+    // Seeds the decayed LFU at the current time with a saved session's use counts, each capped at
+    // `cap`, so the first admissions and demotions rank RAM residents by what that session used
+    // instead of comparing all-zero scores (where the lowest slot, the best-ranked pre-fill, goes
+    // first). The seeds decay like any use.
+    void seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap);
+    // Frees every unpinned shadow slot: its key stays readable in its VRAM frame, and a later VRAM
+    // eviction demotes it (T4) or drops it (T5) like any key without a host copy. Returns how many.
+    // The warm start uses it so RAM holds the keys ranked below the VRAM seeds, not copies of them.
+    std::uint32_t release_shadows();
 
     // ---- round boundaries (engine thread, no round in flight)
     // A new round begins: every Use pin is released and each ring slot gets a fresh serial (an

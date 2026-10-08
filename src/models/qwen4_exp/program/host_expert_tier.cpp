@@ -127,8 +127,9 @@ void HostExpertTier::submit(std::uint32_t key, std::uint32_t slot, std::uint64_t
 std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> jobs;
     for (const std::uint32_t key : ranked) {
+        if (!tier_.has_free_resident()) { break; }
         std::int32_t slot = -1;
-        if (!tier_.prefill(key, slot)) { break; }
+        if (!tier_.prefill(key, slot)) { continue; } // already has a host copy
         jobs.emplace_back(key, static_cast<std::uint32_t>(slot));
     }
     if (jobs.empty()) { return 0; }
@@ -165,6 +166,10 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     const std::size_t admitted = tier_.admit(landings, false);
     stats_.admitted += admitted;
     stats_.discarded += landings.size() - admitted;
+    // The demotion list refills at every boundary (design §19.3.7 §4.8): without it the first 32
+    // demotions used it up, after which every VRAM victim without a host copy was dropped to the
+    // SSD and the eviction gate refused demotion-worthy victims outright (T6).
+    tier_.replenish_demotion_list();
     stats_.demand_reads    = agent_reads_.load(std::memory_order_relaxed);
     stats_.demand_failures = agent_failures_.load(std::memory_order_relaxed);
     stats_.read_ns         = agent_read_ns_.load(std::memory_order_relaxed);

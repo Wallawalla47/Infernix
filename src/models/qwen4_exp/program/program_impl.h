@@ -2130,20 +2130,122 @@ public:
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request.
+    // Fills the frames from the saved state, before the first request. With the SSD tier, RAM is
+    // filled first (the frames load from it), then the seeds' RAM copies are released and their slots
+    // refilled with the next keys of the fill order, so the two levels hold different experts.
     void warm_start_experts() {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
         if (!options_.expert_state.empty() && options_.expert_cache) {
             load = expert_cache::load_expert_state(options_.expert_state, options_.expert_state_identity, keys);
         }
-        if (tier_) { prefill_tier(load.state ? &*load.state : nullptr); }
-        if (options_.expert_state.empty() || !options_.expert_cache) { return; }
+        const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
+        TierFill fill;
+        if (tier_) { fill = prefill_tier(state); }
+        const std::uint32_t seeded = warm_start_frames(load);
+        if (tier_) { finish_tier_fill(fill, seeded); }
+    }
+
+private:
+    // The SSD tier's startup fill: its key order, how many keys the first pass read, and its time.
+    struct TierFill {
+        std::vector<std::uint32_t> order;
+        std::uint32_t filled = 0;
+        double seconds       = 0;
+        bool saved           = false;
+    };
+
+    // The SSD tier's RAM fill order (design §19.3.7 §4.9): the saved state's ranking (the last
+    // session's VRAM residents, best first), then every other key that session used, most used
+    // first, then the keys it never used one expert of every layer in turn, so that no layer is left
+    // wholly on the SSD (file order filled the first layers and left the last ones on disk).
+    [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const expert_cache::SavedState* state) const {
+        const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
+        if (tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
+        // A key's place in the layer-interleaved order: expert e of every layer before expert e + 1.
+        const auto spread = [&](std::uint32_t key) { return (key % experts) * layers + key / experts; };
+        std::vector<std::uint32_t> order;
+        order.reserve(keys);
+        std::vector<std::uint8_t> listed(keys, 0);
+        if (state != nullptr) {
+            for (const std::uint32_t key : state->ranked) {
+                if (key < keys && listed[key] == 0) {
+                    order.push_back(key);
+                    listed[key] = 1;
+                }
+            }
+            if (state->counts.size() == keys) {
+                std::vector<std::uint32_t> used;
+                for (std::uint32_t key = 0; key < keys; ++key) {
+                    if (listed[key] == 0 && state->counts[key] != 0) { used.push_back(key); }
+                }
+                std::sort(used.begin(), used.end(), [&](std::uint32_t a, std::uint32_t b) {
+                    const std::uint32_t ca = state->counts[a], cb = state->counts[b];
+                    return ca != cb ? ca > cb : spread(a) < spread(b);
+                });
+                for (const std::uint32_t key : used) {
+                    order.push_back(key);
+                    listed[key] = 1;
+                }
+            }
+        }
+        for (std::uint32_t i = 0; i < keys; ++i) {
+            const std::uint32_t key = (i % layers) * experts + i / layers; // spread(key) == i
+            if (listed[key] == 0) { order.push_back(key); }
+        }
+        return order;
+    }
+
+    // The SSD tier's first RAM pass, before the frames' warm start reads from it.
+    TierFill prefill_tier(const expert_cache::SavedState* state) {
+        const auto start = std::chrono::steady_clock::now();
+        TierFill fill;
+        fill.saved = state != nullptr;
+        fill.order = tier_fill_order(state);
+        if (state != nullptr && state->counts.size() == tier_->keys()) {
+            tier_->controller().seed_uses(state->counts, kSeedCountCap);
+        }
+        fill.filled  = tier_->prefill(fill.order);
+        fill.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        return fill;
+    }
+
+    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) are
+    // released and their slots take the next keys of the fill order. A seed VRAM later evicts is
+    // demoted into RAM when it outranks the coldest resident (T4), as any key without a host copy.
+    void finish_tier_fill(const TierFill& fill, std::uint32_t seeded) {
+        const auto start        = std::chrono::steady_clock::now();
+        std::uint32_t released  = 0, refilled = 0;
+        if (seeded > 0) {
+            released = tier_->controller().release_shadows();
+            if (released > 0) {
+                refilled = tier_->prefill(std::span<const std::uint32_t>(fill.order).subspan(fill.filled));
+            }
+        }
+        const double seconds =
+            fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
+        const std::uint32_t slots = tier_->controller().config().slots;
+        const double gib          = static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
+        char line[400];
+        std::snprintf(line, sizeof(line),
+                      "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s, read in %.1f s; %u of %u "
+                      "experts are read from the artifact when used",
+                      slots, gib * slots, in_ram,
+                      fill.saved ? "the saved ranking, then the last session's use counts" : "spread across the layers",
+                      released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
+                      seconds, keys - in_ram - released, keys);
+        diagnostic(line);
+    }
+
+    // The frames' warm start from the saved state; returns how many experts it loaded.
+    std::uint32_t warm_start_frames(const expert_cache::ExpertStateLoad& load) {
+        if (options_.expert_state.empty() || !options_.expert_cache) { return 0; }
         if (!load.state) {
             diagnostic("expert cache: no saved state yet, so it starts empty and fills as requests arrive");
             diagnostic("expert cache starts empty: " + load.message, DiagnosticLevel::Debug);
             expert_state_saved_ = std::chrono::steady_clock::now();
-            return;
+            return 0;
         }
         const auto start           = std::chrono::steady_clock::now();
         const auto max_keys = static_cast<std::uint32_t>(kSeedShare * residency_->frames());
@@ -2162,39 +2264,10 @@ public:
         diagnostic(line, DiagnosticLevel::Debug);
         expert_state_saved_  = std::chrono::steady_clock::now();
         expert_state_routed_ = residency_->stats().routed;
+        return loaded;
     }
 
-    // The SSD tier's RAM pre-fill: the saved state's ranking first, then every other key in file
-    // order, until the resident slots are full (design §19.3.7 §4.9).
-    void prefill_tier(const expert_cache::SavedState* state) {
-        const auto start         = std::chrono::steady_clock::now();
-        const std::uint32_t keys = tier_->keys();
-        std::vector<std::uint32_t> ranked;
-        ranked.reserve(keys);
-        std::vector<std::uint8_t> listed(keys, 0);
-        if (state != nullptr) {
-            for (const std::uint32_t key : state->ranked) {
-                if (key < keys && listed[key] == 0) {
-                    ranked.push_back(key);
-                    listed[key] = 1;
-                }
-            }
-        }
-        for (std::uint32_t key = 0; key < keys; ++key) {
-            if (listed[key] == 0) { ranked.push_back(key); }
-        }
-        const std::uint32_t filled = tier_->prefill(ranked);
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        const double gib     = static_cast<double>(residency_->frame_stride()) / (1ULL << 30);
-        char line[320];
-        std::snprintf(line, sizeof(line),
-                      "SSD expert tier: %u RAM slots (%.1f GiB); pre-filled %u experts%s in %.1f s; %u of %u experts are "
-                      "read from the artifact when used",
-                      tier_->controller().config().slots, gib * tier_->controller().config().slots, filled,
-                      state != nullptr ? " (saved ranking first)" : "", seconds, keys - filled, keys);
-        diagnostic(line);
-    }
-
+public:
     // After every synchronization of a round with MoE layers: a call that could not serve an expert
     // (design §19.3.7: an unreadable record, a host service that stopped answering) left undefined
     // outputs, so the round's requests fail and the engine keeps serving. Prefix-cache entries the

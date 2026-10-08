@@ -167,6 +167,26 @@ bool HostTier::prefill(std::uint32_t key, std::int32_t& slot) {
     return true;
 }
 
+void HostTier::seed_uses(std::span<const std::uint32_t> counts, std::uint32_t cap) {
+    if (counts.size() != config_.num_keys) { throw std::invalid_argument("HostTier: the seed counts have another key count"); }
+    for (std::uint32_t key = 0; key < config_.num_keys; ++key) {
+        if (counts[key] != 0) { lfu_.use(key, static_cast<double>(std::min(counts[key], cap))); }
+    }
+    // Residents' heap entries carry their old values; peek_victim re-ranks them when it meets them.
+}
+
+std::uint32_t HostTier::release_shadows() {
+    std::uint32_t released = 0;
+    for (std::uint32_t s = 0; s < slots_.size(); ++s) {
+        const Slot& slot = slots_[s];
+        if (slot.state != SlotState::kShadow || slot.pins != 0 || slot.list != SlotList::kNone) { continue; }
+        evict(s);
+        free_resident_.push_back(s);
+        ++released;
+    }
+    return released;
+}
+
 void HostTier::mark_used(std::uint32_t slot) {
     if (!(slots_[slot].pins & kPinUse)) {
         slots_[slot].pins |= kPinUse;
