@@ -70,7 +70,8 @@ opens part 1.
   <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
   checkpoint and lists the re-quantized parameters per component.
 - **Second artifact of the same checkpoint.** It can share an existing n-gram volume: pass
-  `--ngram-reuse <volume>` instead of `--ngram-out`.
+  `--ngram-reuse <volume>` instead of `--ngram-out`. The converter checks the volume's geometry and
+  512 of its rows against the checkpoint, so a volume of another checkpoint is refused.
 - **Duration.** A conversion takes ~11 minutes from a warm disk cache; the MTP experts' MSE
   scale search accounts for several of them.
 
