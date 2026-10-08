@@ -883,10 +883,11 @@ int test_namespace_tools() {
     Json nested_custom                 = body;
     nested_custom["tool_choice"]       = "auto";
     nested_custom["tools"][0]["tools"] = Json::array({Json{{"type", "custom"}, {"name", "raw"}}});
-    failures += check(api_code([&] {
-                          (void)parse_openai_responses_create_request(nested_custom, limits());
-                      }) == "tool_type_not_supported",
-                      "namespace custom tools remain explicitly unsupported");
+    const OpenAIResponsesCreateRequest nested =
+        parse_openai_responses_create_request(nested_custom, limits());
+    failures += check(nested.tool_identities.at("mcp__clock__raw").custom &&
+                          nested.tools[0].at("tools")[0].at("type") == "custom",
+                      "a namespace custom tool is a custom Engine identity in its namespace");
 
     Json oversized           = body;
     oversized["tool_choice"] = "auto";
@@ -898,6 +899,122 @@ int test_namespace_tools() {
                           (void)parse_openai_responses_create_request(oversized, limits());
                       }) == "invalid_tool_name",
                       "flattened identities must fit the Engine tool-name contract");
+    return failures;
+}
+
+// Codex's free-form tools: a custom tool reaches the model as a function with one string `input`
+// (its grammar described, not enforced); a generated call returns as a custom_tool_call with the raw
+// input, in the aggregate response and in SSE; custom_tool_call / custom_tool_call_output history
+// replays as the same call and result; tool_choice and allowed_tools accept custom entries.
+int test_custom_tools() {
+    const std::string grammar = "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF";
+    const Json apply_patch    = {{"type", "custom"},
+                                 {"name", "apply_patch"},
+                                 {"description", "Edit files with a patch."},
+                                 {"format", Json{{"type", "grammar"}, {"syntax", "lark"}, {"definition", grammar}}}};
+    const Json body           = {{"model", "m"},
+                                 {"input", "fix the bug"},
+                                 {"tools", Json::array({apply_patch, Json{{"type", "function"}, {"name", "shell"}}})},
+                                 {"tool_choice", Json{{"type", "custom"}, {"name", "apply_patch"}}}};
+    const OpenAIResponsesCreateRequest request = parse_openai_responses_create_request(body, limits());
+
+    int failures = 0;
+    const auto& tool   = request.prompt.generation.tools.at(0);
+    const Json schema  = Json::parse(tool.input_schema_json);
+    failures += check(tool.name == "apply_patch" && tool.description == "Edit files with a patch." &&
+                          schema.at("required") == Json::array({"input"}) &&
+                          schema.at("properties").at("input").at("type") == "string" &&
+                          schema.at("properties").at("input").at("description").get<std::string>().find(grammar) !=
+                              std::string::npos &&
+                          request.tool_identities.at("apply_patch").custom &&
+                          !request.tool_identities.at("shell").custom,
+                      "a custom tool is one string input under its own name, its grammar described");
+    failures += check(request.tools[0].at("type") == "custom" &&
+                          request.tools[0].at("format").at("syntax") == "lark" &&
+                          request.prompt.generation.tool_choice.allowed_names ==
+                              std::vector<std::string>{"apply_patch"},
+                      "the custom tool echoes as declared and a named custom tool_choice forces it");
+
+    const std::string patch = "*** Begin Patch\n*** Update File: a.py\n@@\n-x = \"1\"\n+x = \"2\"\n*** End Patch";
+    GenerationOutcome outcome;
+    outcome.finish_reason = infernix::FinishReason::StopToken;
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{
+        .name = "apply_patch", .arguments_json = Json{{"input", patch}}.dump()});
+    outcome.tool_calls.push_back(infernix::GeneratedToolCall{.name = "shell", .arguments_json = "{}"});
+    const BuiltOpenAIResponse built = make_openai_response_object("resp_custom", 1, request, {}, outcome);
+    const Json& custom_item         = built.body.at("output").at(0);
+    failures += check(custom_item.at("type") == "custom_tool_call" && custom_item.at("name") == "apply_patch" &&
+                          custom_item.at("input") == patch && !custom_item.contains("arguments") &&
+                          custom_item.at("id").get<std::string>().starts_with("ctc_") &&
+                          built.body.at("output").at(1).at("type") == "function_call" &&
+                          built.output_history[0].tool_calls[0].arguments_json == Json{{"input", patch}}.dump(),
+                      "a custom call returns its raw input; stored history keeps the Engine call");
+
+    OpenAIResponsesCreateRequest stream_request = request;
+    stream_request.stream                       = true;
+    OpenAIResponsesEventStream stream("resp_custom_stream", 1, stream_request, {});
+    (void)stream.start();
+    std::string delta;
+    bool saw_added = false, saw_input_done = false, saw_item_done = false, saw_function_event = false;
+    for (const std::string& wire : stream.finish(outcome).events_before_terminal) {
+        const Json event = parse_event(wire);
+        const std::string type = event.at("type").get<std::string>();
+        if (type == "response.output_item.added" && event.at("item").at("type") == "custom_tool_call") {
+            saw_added = event.at("item").at("input") == "" && event.at("item").at("status") == "in_progress";
+        } else if (type == "response.custom_tool_call_input.delta") {
+            delta += event.at("delta").get<std::string>();
+        } else if (type == "response.custom_tool_call_input.done") {
+            saw_input_done = event.at("input") == patch;
+        } else if (type == "response.output_item.done" && event.at("item").at("type") == "custom_tool_call") {
+            saw_item_done = event.at("item").at("input") == patch;
+        } else if (type == "response.function_call_arguments.done") {
+            saw_function_event = event.at("name") == "shell";
+        }
+    }
+    failures += check(saw_added && delta == patch && saw_input_done && saw_item_done && saw_function_event,
+                      "SSE streams a custom call's input through the custom_tool_call_input events");
+
+    const Json history = {
+        {"model", "m"},
+        {"tools", Json::array({apply_patch})},
+        {"input", Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "fix the bug"}},
+                               Json{{"type", "custom_tool_call"},
+                                    {"call_id", "call_patch"},
+                                    {"name", "apply_patch"},
+                                    {"input", patch}},
+                               Json{{"type", "custom_tool_call_output"},
+                                    {"call_id", "call_patch"},
+                                    {"output", "Done!"}}})}};
+    const OpenAIResponsesCreateRequest replay = parse_openai_responses_create_request(history, limits());
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(replay.prompt, store, "resp_custom_replay", true);
+    failures += check(resolved.generation.messages[1].tool_calls[0].name == "apply_patch" &&
+                          resolved.generation.messages[1].tool_calls[0].arguments_json ==
+                              Json{{"input", patch}}.dump() &&
+                          resolved.generation.messages[2].tool_call_id == "call_patch" &&
+                          replay.prompt.input_items[1].at("type") == "custom_tool_call" &&
+                          replay.prompt.input_items[1].at("input") == patch &&
+                          replay.prompt.input_items[2].at("type") == "custom_tool_call_output",
+                      "custom call history replays as the Engine call and its result");
+
+    Json clash = body;
+    clash["tools"].push_back(Json{{"type", "function"}, {"name", "apply_patch"}});
+    failures += check(api_code([&] { (void)parse_openai_responses_create_request(clash, limits()); }) ==
+                          "duplicate_tool_name",
+                      "a custom and a function tool cannot share a name");
+    Json bad_syntax                              = body;
+    bad_syntax["tools"][0]["format"]["syntax"] = "ebnf";
+    failures += check(api_error([&] { (void)parse_openai_responses_create_request(bad_syntax, limits()); })
+                              .param == "tools",
+                      "an unknown grammar syntax is rejected");
+    Json allowed           = body;
+    allowed["tool_choice"] = Json{{"type", "allowed_tools"},
+                                  {"mode", "auto"},
+                                  {"tools", Json::array({Json{{"type", "custom"}, {"name", "apply_patch"}}})}};
+    failures += check(parse_openai_responses_create_request(allowed, limits())
+                              .prompt.generation.tool_choice.allowed_names == std::vector<std::string>{"apply_patch"},
+                      "allowed_tools accepts custom entries");
     return failures;
 }
 
@@ -1403,6 +1520,7 @@ int main() {
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
     failures += test_namespace_tools();
+    failures += test_custom_tools();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();
     failures += test_response_object();

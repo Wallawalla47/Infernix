@@ -677,8 +677,8 @@ wire response contains typed `output` Items.
 | `chat_template_kwargs` | template parameters as a JSON object; standard options merge with typed fields |
 | `preserve_thinking` | alias for `chat_template_kwargs.preserve_thinking`; conflicting values are rejected |
 | `text.format` | `text` (default), `json_object`, or `json_schema`; see output constraints above |
-| `tools` | direct function definitions or namespace groups containing function definitions; see below |
-| `tool_choice` | `auto`, `none`, `required`, a named function, or function-only `allowed_tools` with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
+| `tools` | direct function and free-form `custom` definitions, or namespace groups containing them; see below |
+| `tool_choice` | `auto`, `none`, `required`, a named function or `custom` tool, or `allowed_tools` of function and custom entries with mode `auto`/`required`; namespaced selection carries both `namespace` and `name` |
 | `parallel_tool_calls` | `true` by default; `false` enforces at most one call |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; Infernix does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
@@ -710,9 +710,11 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
+| `custom_tool_call` | completed assistant call of a custom tool with optional `id` and namespace, plus required `call_id`, `name`, and string `input` |
+| `custom_tool_call_output` | as `function_call_output`, for a custom tool's call |
 
 Contiguous assistant-owned Items form one assistant history turn in the representable order
-`reasoning` -> assistant message content -> `function_call`. Multiple message Items append their
+`reasoning` -> assistant message content -> `function_call` (or `custom_tool_call`). Multiple message Items append their
 content parts, multiple calls retain declaration order, and a reasoning-only turn is retained. A
 user, system, developer, or `function_call_output` Item ends the group; an order that would require
 rearranging assistant content fails with `invalid_assistant_history`. Results are validated by
@@ -777,8 +779,17 @@ Infernix renders these definitions in the Qwen prompt and parses model output in
 `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
 a later request. Selection and strict argument enforcement follow the common tool contract above.
 
-Hosted tools, remote MCP tools, custom free-form tools, deferred loading, output schemas, and
-caller restrictions that exclude direct invocation remain unsupported.
+Free-form `custom` tools (`{"type":"custom","name",...,"format"}`, as Codex declares
+`apply_patch`) are served as on the Chat Completions endpoint: the model sees a function with one
+string parameter, `input`, under the tool's own name, and the declared format (`text`, or a `grammar`
+with `syntax` `lark` or `regex` and its `definition`) is described in that parameter. The grammar is
+not enforced. A generated call returns as a `custom_tool_call` Item (`ctc_...`) whose `input` is the
+model's text exactly; streaming emits `response.output_item.added`, then
+`response.custom_tool_call_input.delta` and `.done`, then `response.output_item.done`. The client
+sends its result back as a `custom_tool_call_output` Item.
+
+Hosted tools, remote MCP tools, deferred loading, output schemas, and caller restrictions that
+exclude direct invocation remain unsupported.
 
 ### Response object and usage
 
@@ -917,7 +928,7 @@ curl http://127.0.0.1:8080/v1/responses/input_tokens \
 
 Unsupported Create fields include Conversations, prompt templates, context management, hosted
 moderation, `include` values other than `reasoning.encrypted_content`, background execution,
-compaction, files/audio, and OpenAI-hosted/MCP/custom tools. Except for the two explicitly
+compaction, files/audio, and OpenAI-hosted/MCP tools. Except for the two explicitly
 documented placeholders, these are compatibility boundaries rather than silently accepted
 approximations.
 
