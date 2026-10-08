@@ -30,7 +30,7 @@ tags:
 
 NVIDIA's [Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) — 48
 layers, 512 routed experts per layer (top-10), an MTP drafter and vision — packed for
-[Infernix](https://github.com/Wallawalla47/ninfer-custom/tree/Infernix), a C++/CUDA engine that runs
+[Infernix](https://github.com/Wallawalla47/Infernix), a C++/CUDA engine that runs
 it on **one RTX 5090** (32 GB). The 24,576 routed experts (63 GiB) live in pinned host RAM, a VRAM
 cache holds the hot ones, the CPU computes part of each layer's misses, and the 52 GB PLE n-gram
 table is read from an NVMe drive.
@@ -117,7 +117,7 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
   from the artifact (slower).
 - **Disk:** ~77 GB for the artifact, plus the 52 GB n-gram volume on an NVMe drive. A fast
   consumer drive is enough; a SATA SSD or a hard disk is far slower.
-- **Engine:** Infernix (Windows or Linux), branch `Infernix`.
+- **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) (Windows or Linux).
 
 ## Run
 
@@ -129,7 +129,7 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.in
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
-[Flash-Next guide](https://github.com/Wallawalla47/ninfer-custom/blob/Infernix/docs/qwen3_8-flash-next.md)
+[Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)
 covers the KV formats, YaRN beyond 262K, images and video, the prefix cache, the SSD expert tier
 and tuning.
 
@@ -170,20 +170,21 @@ Re-measured with the 2026-10-08 kernels on the same prompts, Dense8 was level wi
 than it on the same build.
 
 In a replayed agentic coding workload (three sessions plus subagents, up to eight requests in
-flight, two seeds), Infernix averaged 5.4 s to the first token against Strata's 25.3 s, served
-83.7 % of prompt tokens from its prefix cache against 64.3 %, decoded one request at 129 tok/s
-against 86, and finished in 8.1 minutes against 18.3. Methods and the full tables are in the
-[Infernix README](https://github.com/Wallawalla47/ninfer-custom/blob/Infernix/README.md#benchmarks).
+flight, two seeds, measured on 8-9 October against Strata 0.1.41), Infernix averaged 5.7 s to the
+first token against Strata's 33.9 s, served 84.8 % of prompt tokens from its prefix cache against
+54.8 %, decoded one request at 123 tok/s against 85 (draft acceptance level), and finished in 7.7
+minutes against 22.1. Methods and the full tables are in the
+[Infernix README](https://github.com/Wallawalla47/Infernix/blob/main/README.md#benchmarks).
 
 ## Provenance
 
 Converted with `tools.convert` (recipe `qwen3_8_flash_next_nvfp4_dense8`) and renamed into numbered
 parts with `tools.artifact.rename --numbered`; `artifact_id` `c70f7dee5052435eb0425e06e1bdcc6c`. The
 conversion report and the artifact's own provenance record the paths of the machine that converted
-it. The artifact was first published under the name `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix`
-and renamed with `-Dense8` on 2026-10-08, when the bit-exact conversion took that name; only the
-file names changed (no payload byte moved, and the `artifact_id` is the same). The n-gram volume was written from the same FP8 table (byte-identical to
-NVIDIA's).
+it. The artifact was first named `Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix` and renamed with
+`-Dense8` on 2026-10-08, when the bit-exact conversion took that name; only the file names changed
+(no payload byte moved, and the `artifact_id` is the same). The n-gram volume was written from the
+same FP8 table (byte-identical to NVIDIA's).
 
 ## License
 
