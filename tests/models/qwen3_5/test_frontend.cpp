@@ -2331,6 +2331,28 @@ int test_reasoning_close_requires_boundary(const Frontend& frontend) {
     return failures;
 }
 
+// The request log's model_thinking_tokens counts the model's thinking without a budget too
+// (upstream Neroued/ninfer#373): the thinking and its close, as the presentation decoder counts
+// reasoning tokens, never the whole answer.
+int test_thinking_tokens_without_budget(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+    const std::vector<infernix::TokenId> thought = fixture_tokens("weighing it up");
+    std::vector<infernix::TokenId> tokens        = thought;
+    const auto answer                            = fixture_tokens("\n\nanswer");
+    tokens.push_back(kFixtureThinkCloseToken);
+    tokens.insert(tokens.end(), answer.begin(), answer.end());
+    (void)session.preview_model(tokens, 64, infernix::FinishReason::OutputLimit);
+    (void)session.commit_preview();
+    const infernix::ThinkingBudgetStats stats = session.thinking_stats();
+    return check(!stats.configured_budget &&
+                     stats.model_thinking_tokens >= thought.size() + 1U &&
+                     stats.model_thinking_tokens < tokens.size() &&
+                     stats.model_thinking_tokens == session.reasoning_tokens() &&
+                     stats.injected_tokens == 0 && !stats.applied,
+                 "thinking tokens were not counted without a thinking budget");
+}
+
 int test_reasoning_close_resolves_at_terminal(const Frontend& frontend) {
     auto prompt  = thinking_prompt(frontend);
     auto session = frontend.make_output_session(prompt, {});
@@ -3278,6 +3300,7 @@ int main() {
     failures += test_reasoning_split(frontend);
     failures += test_reasoning_close_requires_boundary(frontend);
     failures += test_reasoning_close_resolves_at_terminal(frontend);
+    failures += test_thinking_tokens_without_budget(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_reasoning_loop_guard(frontend);
     failures += test_constrained_thinking_control(frontend);
