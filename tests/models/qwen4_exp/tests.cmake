@@ -27,14 +27,14 @@ infernix_add_test(infernix_qwen4_exp_ngram_volume_test
 infernix_add_test(infernix_qwen4_exp_forward_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_forward_real.cpp"
   LIBRARIES infernix_model_runtime)
-set_tests_properties(infernix_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_forward_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The SSD tier's in-place records on the real artifact (memory track R6, RT3/RT4): streamed records
 # read through DirectReadQueue equal the pinned load's bytes. Skips without INFERNIX_QWEN4_ARTIFACT.
 infernix_add_test(infernix_qwen4_exp_expert_store_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_store_real.cpp"
   LIBRARIES infernix_model_loading)
-set_tests_properties(infernix_qwen4_exp_expert_store_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_expert_store_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The internal route trace through the public Engine on the real artifact (memory track R0): ids
 # identical with the trace on, the trace consistent with the requests, and the graph executables'
@@ -42,13 +42,13 @@ set_tests_properties(infernix_qwen4_exp_expert_store_real_test PROPERTIES SKIP_R
 infernix_add_test(infernix_qwen4_exp_route_trace_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_route_trace_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime infernix::json)
-set_tests_properties(infernix_qwen4_exp_route_trace_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_route_trace_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # Engine-level VRAM pressure (memory RT13): the expert cache shrinks and grows under a fake source.
 infernix_add_test(infernix_qwen4_exp_vram_pressure_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vram_pressure_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime)
-set_tests_properties(infernix_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_vram_pressure_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # Engine-level recovery from a failed expert read: the round's requests fail, the Engine keeps
 # serving, and a later request equals the run before the fault.
@@ -56,7 +56,7 @@ infernix_add_test(infernix_qwen4_exp_expert_fault_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_expert_fault_real.cpp"
   LIBRARIES infernix_engine infernix_model_runtime)
 set_tests_properties(infernix_qwen4_exp_expert_fault_real_test
-  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The Vision encode window's placement and visual columns (host only).
 infernix_add_test(infernix_qwen4_exp_vision_window_test
@@ -82,21 +82,21 @@ infernix_add_test(infernix_qwen4_exp_memory_plan_test
 infernix_add_test(infernix_qwen4_exp_prefix_state_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_state_image.cpp"
   LIBRARIES infernix_model_runtime)
-set_tests_properties(infernix_qwen4_exp_prefix_state_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_prefix_state_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 # The prefix cache through the public Engine on the real artifact (INFERNIX_QWEN4_ARTIFACT): tap,
 # Host-block and endpoint resumes against cold and lane-resident runs, plain and MTP.
 infernix_add_test(infernix_qwen4_exp_prefix_cache_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_cache_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen4_exp_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_preemption_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_preemption_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
 infernix_add_test(infernix_qwen4_exp_decide_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_decide_real.cpp"
   LIBRARIES infernix_engine)
-set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(infernix_qwen4_exp_decide_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)

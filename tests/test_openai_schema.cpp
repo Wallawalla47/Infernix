@@ -534,6 +534,10 @@ int test_tools() {
             Json::parse(
                 prompt(parse(body).generation).options.tool_jsons[0])["function"]["strict"] == true,
         "strict survives prompt and request translation");
+    body["tools"][0]["function"]["strict"] = 1;
+    failures += check(api_error([&] { (void)parse(body); }).param == "tools[0].function.strict",
+                      "a non-boolean strict is refused");
+    body["tools"][0]["function"]["strict"] = true;
     body["tools"] = Json::array({Json{{"type", "custom"},
                                       {"custom",
                                        Json{{"name", "shell"},

@@ -204,7 +204,20 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R infernix_qwen3_5_moe_real_test --output-on-failure
 ```
 
-Without `INFERNIX_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Real-artifact targets
+The Qwen3.8-Flash-Next (`qwen4_exp`) artifact tests read `INFERNIX_QWEN4_ARTIFACT` instead (the first
+shard of a `.infernix` artifact) and, when the n-gram volume is not beside it,
+`INFERNIX_QWEN4_NGRAM`:
+
+```bash
+INFERNIX_QWEN4_ARTIFACT=D:/out/qwen3_8_flash_next-00001-of-00003.infernix \
+INFERNIX_QWEN4_NGRAM=G:/out/qwen3_8_flash_next.ninfer.ngram \
+  ctest --test-dir build -R "infernix_qwen4_exp_.*real" --output-on-failure
+```
+
+They cover the forward pass against the FP64 reference, the SSD tier's records, the route trace, VRAM
+pressure, the prefix cache, preemption, `/v1/decide` and recovery from a failed expert read.
+
+Without their artifact variable, CTest marks these real Engine tests as skipped. Real-artifact targets
 carry the `real` label and `RUN_SERIAL` so CTest runs them alone. Run directly invoked GPU
 integration tests serially. `INFERNIX_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as
 `vision`, `late-instructions` or `concurrent`; the default is `all`. These integration checks

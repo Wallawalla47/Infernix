@@ -244,7 +244,7 @@ void test_isa_equality() {
     }
     for (int trial = 0; trial < 4; ++trial) {
         const Expert e = random_expert(rng, trial == 3);
-        for (int ncols : {1, 2, 3, 4, 5, 8}) {
+        for (int ncols = 1; ncols <= moe::kMaxColumns; ++ncols) {
             const auto x   = random_activations(rng, ncols);
             const auto ref = run(moe::CpuIsa::kScalar, e, x, ncols);
             for (moe::CpuIsa isa : {moe::CpuIsa::kAvx2, moe::CpuIsa::kAvxVnni, moe::CpuIsa::kAvx512Vnni}) {
@@ -325,6 +325,32 @@ void test_fp64_oracle() {
     const canon::A4Block* hp_c[1] = {hq.data()};
     canon::A4Block* hp[1]         = {hq.data()};
     moe::gate_up_units(moe::CpuIsa::kScalar, e.record.data(), e.scales, xp, xp, 1, 0, moe::kHBlocks, hp);
+    // The down projection's int64 row sums are exact as well (its units, the quantized h).
+    std::vector<std::int64_t> sd(static_cast<std::size_t>(moe::kDownRowGroups) * 16);
+    moe::rg16_row_sums(moe::best_cpu_isa(), e.record.data() + moe::kGateUpBytes, moe::kDownBlocks, 0, moe::kDownRowGroups,
+                       hp_c, 1, sd.data());
+    int down_inexact = 0, down_checked = 0;
+    for (int row = 0; row < moe::kHidden; ++row) {
+        const int rg = row / 16, r = row % 16;
+        double sum = 0;
+        for (int b = 0; b < moe::kDownBlocks; ++b) {
+            const std::uint8_t* unit = &e.record[moe::kGateUpBytes + (static_cast<std::size_t>(rg) * moe::kDownBlocks + b) * moe::kUnitBytes];
+            for (int k = 0; k < 16; ++k) {
+                const std::uint8_t byte = unit[32 * (k / 4) + 4 * (r % 8) + k % 4];
+                const unsigned code     = r < 8 ? (byte & 15U) : (byte >> 4);
+                const double w = canon::e2m1_x2(code) / 2.0 * static_cast<double>(canon::e4m3_value(unit[128 + r]));
+                const double a = hq[b].c2[k] / 2.0 * static_cast<double>(canon::e4m3_value(hq[b].scale_word));
+                sum += w * a;
+            }
+        }
+        if (std::fabs(sum) < std::ldexp(1.0, 30)) {
+            ++down_checked;
+            if (sum != std::ldexp(static_cast<double>(sd[row]), -20)) { ++down_inexact; }
+        }
+    }
+    std::printf("int64 row sums checked: down %d of %d rows\n", down_checked, moe::kHidden);
+    check(down_checked > moe::kHidden * 3 / 4 && down_inexact == 0,
+          "down projection int64 row sums equal the exact decoded dot products");
     int bad = 0;
     for (int row = 0; row < moe::kHidden; ++row) {
         const int rg = row / 16, r = row % 16;
@@ -346,7 +372,6 @@ void test_fp64_oracle() {
         const double tol = std::ldexp(std::fabs(ref), -8) + mag * static_cast<double>(e.scales.alpha_down) * std::ldexp(1.0, -23) + 1e-30;
         if (std::fabs(got - ref) > tol) { ++bad; }
     }
-    (void)hp_c;
     check(bad == 0, "expert output within BF16 rounding of the FP64 oracle");
 }
 
