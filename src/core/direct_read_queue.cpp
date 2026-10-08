@@ -618,7 +618,11 @@ DirectReadQueue::DirectReadQueue(Options options) : impl_(std::make_unique<Impl>
 DirectReadQueue::~DirectReadQueue() {
     try {
         impl_->cancel_all();
-    } catch (...) {}
+    } catch (...) {
+        // Reads may still be in flight into the request records the Impl owns: keep them (a leak,
+        // after the completion port itself failed) rather than free memory the kernel still writes.
+        (void)impl_.release();
+    }
 }
 
 std::uint32_t DirectReadQueue::open(const std::filesystem::path& path) { return impl_->open_file(path); }
