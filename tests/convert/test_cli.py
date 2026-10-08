@@ -13,12 +13,12 @@ from tools.convert.__main__ import _recipe_parts
 
 def test_recipe_parts_keeps_path_colons():
     # A Windows drive colon is not the FILE[:function] separator.
-    assert _recipe_parts(r"C:\Users\Ian Ranson\temp\recipe.py") == (
-        r"C:\Users\Ian Ranson\temp\recipe.py",
+    assert _recipe_parts(r"C:\Users\Example User\temp\recipe.py") == (
+        r"C:\Users\Example User\temp\recipe.py",
         "configure",
     )
-    assert _recipe_parts(r"C:\Users\Ian Ranson\temp\recipe.py:custom") == (
-        r"C:\Users\Ian Ranson\temp\recipe.py",
+    assert _recipe_parts(r"C:\Users\Example User\temp\recipe.py:custom") == (
+        r"C:\Users\Example User\temp\recipe.py",
         "custom",
     )
     assert _recipe_parts("recipe.py") == ("recipe.py", "configure")

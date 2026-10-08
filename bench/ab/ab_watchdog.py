@@ -17,7 +17,9 @@ import time
 import datetime
 
 AB_DIR = os.path.dirname(os.path.abspath(__file__))
-DEPLOY = r"E:\NInfer-Deploy-V3"
+DEPLOY = os.environ.get("AB_DEPLOY")
+if not DEPLOY:
+    raise SystemExit("set AB_DEPLOY to the deploy directory (the runner needs it too)")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
 POLL_S = 5

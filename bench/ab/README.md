@@ -47,14 +47,14 @@ Outputs (written next to this script): `ab_report.md`, `arm_control.jsonl`,
    the production server; the watchdog fires the runner after the port has been closed
    ~20 s in a row.
 
-Machine-specific paths are environment-variable overridable so you can point the rig at
-your own configuration without editing code:
+Machine-specific paths come from environment variables, so the rig runs against your own
+configuration without editing code. `AB_DEPLOY` is required:
 
 | Variable | Default |
 |---|---|
 | `AB_MODEL` | `<AB_DEPLOY>\qwen3_8_27b_nvfp4-official.ninfer` |
-| `AB_CONTROL_EXE` | this directory's `control\build\apps\Release\infernix-serve.exe` (falls back to the machine-specific build location) |
-| `AB_TREATMENT_EXE` | Infernix's Windows build |
+| `AB_CONTROL_EXE` | this directory's `control\build\apps\Release\infernix-serve.exe` |
+| `AB_TREATMENT_EXE` | this checkout's `build-windows\apps\Release\infernix-serve.exe` |
 | `AB_DEPLOY` / `AB_PRODUCTION_BAT` | the deploy directory and its production launcher bat |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` (same override in runner and watchdog) |
 

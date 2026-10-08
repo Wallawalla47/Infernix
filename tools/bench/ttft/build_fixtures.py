@@ -20,9 +20,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_ROOT = REPO_ROOT / "bench" / "fixtures" / "ttft"
 TEXT_ROOT = FIXTURE_ROOT / "text"
 MEDIA_ROOT = FIXTURE_ROOT / "media"
-DEFAULT_TOKENIZER = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.8-27B/base-hf-bf16"
-)
 IMAGE_SIZE = 1024
 IMAGE_VISION_TOKENS = 1024
 MANY_IMAGE_COUNT = 28
@@ -814,13 +811,16 @@ def check() -> None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tokenizer", type=Path, default=DEFAULT_TOKENIZER)
+    parser.add_argument("--tokenizer", type=Path,
+                        help="the Qwen3.8-27B Hugging Face checkpoint directory (its tokenizer); needed to build")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
     if args.check:
         check()
         print("TTFT fixtures OK")
         return 0
+    if args.tokenizer is None:
+        parser.error("--tokenizer is required to build the fixtures")
     build(args.tokenizer.expanduser().resolve())
     check()
     print(f"wrote TTFT fixtures under {_relative(FIXTURE_ROOT)}")

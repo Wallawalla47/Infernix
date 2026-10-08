@@ -132,8 +132,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 
 | Variable | Default |
 |---|---|
-| `AB_LAUNCH_BAT` | `<AB_DEPLOY>\LaunchQwen3.8-27B-official-dflash2-ngram.bat` |
-| `AB_DEPLOY` | `E:\NInfer-Deploy-V3` |
+| `AB_LAUNCH_BAT` | `<AB_DEPLOY>\LaunchQwen3.8-27B-official-dflash2-ngram.bat`; one of the two is required |
+| `AB_DEPLOY` | none (the folder holding the launch .bat) |
 | `AB_MODEL` | the model path in the launch bat |
 | `AB_TREATMENT_EXE` | `build-windows\apps\Release\infernix-serve.exe` in this checkout |
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
@@ -142,7 +142,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
 | `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, original prefix cache") |
 | `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
-| `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | `E:\Strata\Strata` / its `strata-unsloth-ud-q4_k_xl.json` |
+| `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | none, required for a Strata control / its `strata-unsloth-ud-q4_k_xl.json` |
 | `AB_STRATA_EXTRA_ARGS` | none (engine arguments added to the Strata config's) |
 | `AB_REQUEST_TIMEOUT_S` | `1200` (per request; raise it for an engine that queues requests one at a time) |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |

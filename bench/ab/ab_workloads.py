@@ -1,6 +1,6 @@
 """Synthesized agentic workloads for the Infernix A/B benchmark.
 
-Mirrors the SHAPE and SCALE of the production request log (E:\\NInfer-Deploy-V3\\log.json,
+Mirrors the SHAPE and SCALE of a production request log (log.json of the maintainer's deploy,
 775 requests): long multi-turn OpenAI chat-completions sessions with ~33 tools,
 thinking on, streaming; median prompt ~100K tokens (p25 ~57K, p75 ~154K);
 completion median ~530 / p75 ~1800 tokens; overall prefix-cache hit rate ~91%.
