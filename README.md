@@ -499,6 +499,7 @@ Thank you as well to everyone whose issues, pull requests, forks and research In
 [cometkim (Hyeseong Kim)](https://github.com/cometkim),
 [Woesch-Nich](https://github.com/Woesch-Nich),
 [Hundsbuah](https://github.com/Hundsbuah),
+[lonelystarCX](https://github.com/lonelystarCX),
 [gpillon](https://github.com/gpillon) (ignis),
 [CaptainArni](https://github.com/CaptainArni),
 David Oelfke, Fedor Suchkov, Yunado,
