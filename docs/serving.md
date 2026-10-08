@@ -1212,6 +1212,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
 | `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
+| `--no-queue-holds` | hybrid: turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) | holds on |
 | `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
 | `--device-state-slots N` | original: extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
 | `--no-thinking` | disable thinking by default | thinking on |
@@ -1536,7 +1537,12 @@ Host-tier write-through and restores; `prefetched_blocks` counts the restored bl
 waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
-with no Host copy, which remove them and the blocks after them from the cache.
+with no Host copy, which remove them and the blocks after them from the cache. With queue holds
+(the default; `--no-queue-holds` turns them off), `held_snapshots` is the end-of-interval number of
+snapshots held for waiting requests, `held_device_evictions` counts Device copies of held blocks
+evicted anyway (Host-backed ones first), `held_snapshot_losses` held snapshots that were lost, and
+`held_host_refusals` Host snapshot or block writes skipped because only held snapshots were left to
+evict.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five

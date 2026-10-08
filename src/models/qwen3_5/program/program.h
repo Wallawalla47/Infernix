@@ -241,6 +241,10 @@ struct HybridPrefixCacheStats {
     std::uint64_t host_snapshot_evictions    = 0;
     std::uint64_t host_dead_reclaims         = 0;
     std::uint64_t unbacked_node_losses       = 0;
+    std::uint32_t held_snapshots             = 0;
+    std::uint64_t held_device_evictions      = 0;
+    std::uint64_t held_snapshot_losses       = 0;
+    std::uint64_t held_host_refusals         = 0;
 };
 
 struct ContextDemotion {
@@ -572,6 +576,11 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     // Device pages a prefetch could fill now: free ones and host-backed cached ones.
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    // Holds the snapshot each queued request would resume from now, in admission order
+    // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // Changes when a queued request's choice of snapshot may have changed.
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);

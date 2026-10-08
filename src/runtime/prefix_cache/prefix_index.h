@@ -27,6 +27,8 @@ namespace infernix::runtime::prefix_cache {
 // pins the path of the node it touches.
 
 inline constexpr std::uint32_t kNoId = std::numeric_limits<std::uint32_t>::max();
+// Queued requests whose resume snapshots set_queue_holds holds at most (§9.6).
+inline constexpr std::uint32_t kMaxQueueHolds = 32;
 
 struct NodeRef {
     std::uint32_t index      = kNoId;
@@ -193,6 +195,12 @@ struct PrefixIndexStats {
     std::uint64_t device_slot_evictions   = 0;
     std::uint64_t snapshot_hits           = 0;
     double gdsf_inflation                 = 0.0;
+    // Queue holds (§9.6): held snapshots now, held entries whose Device copy was evicted, held
+    // snapshots lost, and Host allocations refused because only held snapshots were left.
+    std::uint32_t held_snapshots          = 0;
+    std::uint64_t held_device_evictions   = 0;
+    std::uint64_t held_snapshot_losses    = 0;
+    std::uint64_t held_host_refusals      = 0;
 };
 
 class PrefixCacheIndex {
@@ -227,6 +235,20 @@ public:
     // retained ancestor. A Boundary snapshot is superseded only while no other conversation has
     // continued from it (the tree below it is a single chain).
     void supersede(SnapshotRef snapshot);
+
+    // ---- queue holds (§9.6) --------------------------------------------------------------------
+    // The snapshots queued requests will resume from, in admission order (rank 0 is admitted
+    // next). Replaces the previous holds; invalid references are skipped, a repeated snapshot
+    // keeps its first rank, and at most kMaxQueueHolds are held. A held snapshot is never a
+    // Host-allocation or snapshot-table victim, so new snapshots and block writes that would need
+    // its slabs are refused instead. Its anchor path's Device copies are evicted after every
+    // unheld entry of the same kind (host-backed copies before unbacked ones), the highest rank
+    // first, so the request furthest back in the queue gives way first. Pins still take
+    // precedence: a hold never blocks an active sequence's growth.
+    void set_queue_holds(std::span<const SnapshotRef> holds);
+    // Changes whenever a snapshot is published or removed, so the queue's holds are recomputed
+    // only when a queued request's choice of snapshot may have changed.
+    [[nodiscard]] std::uint64_t snapshot_epoch() const noexcept { return snapshot_epoch_; }
 
     // ---- pins -----------------------------------------------------------------------------
     // `path` is a root path (path[i] is the parent of path[i+1], path[0] a root child).
@@ -375,6 +397,8 @@ private:
         std::uint32_t dead_prev      = kNoId;
         std::uint32_t dead_next      = kNoId;
         bool in_dead                 = false;
+        // Lowest queue rank of a held snapshot whose anchor path holds this node (kNoHold: none).
+        std::uint8_t hold = kNoHold;
     };
 
     struct Snapshot {
@@ -401,15 +425,21 @@ private:
         // snapshots whose nearest one this is.
         std::uint32_t ancestor = kNoId;
         std::vector<std::uint32_t> dependents;
+        std::uint8_t hold = kNoHold; // queue rank while held (§9.6)
     };
 
     enum class SlotState : std::uint8_t { Free, Staging, Owned };
+
+    static constexpr std::uint8_t kNoHold = 0xff;
+    // Device LRU lists: 0 backed, 1 unbacked, then for each queue rank r a backed (2 + 2r) and an
+    // unbacked (3 + 2r) list of held entries. Even lists are backed.
+    static constexpr std::size_t kLruLists = 2 + 2 * static_cast<std::size_t>(kMaxQueueHolds);
 
     // Device LRU entries: node i is entry i, snapshot tail j is entry max_nodes + j.
     struct LruLink {
         std::uint32_t prev = kNoId;
         std::uint32_t next = kNoId;
-        std::uint8_t list  = 0xff; // 0 backed, 1 unbacked, 0xff absent
+        std::uint8_t list  = 0xff; // see kLruLists; 0xff absent
     };
 
     struct LruList {
@@ -440,6 +470,13 @@ private:
     void lru_remove(std::uint32_t entry);
     void lru_append(std::uint32_t entry, std::uint8_t list);
     [[nodiscard]] std::uint32_t lru_pop(std::uint8_t list);
+    // The list of an evictable entry: its residency kind and queue hold.
+    [[nodiscard]] static std::uint8_t lru_list(bool backed, std::uint8_t hold) noexcept;
+    // The next Device entry to evict: unheld backed, held backed (highest rank first), then with
+    // `unbacked` unheld unbacked and held unbacked. kNoId when none.
+    [[nodiscard]] std::uint32_t lru_pop_victim(bool unbacked);
+    // Recomputes every node's hold from holds_ and moves the affected LRU entries.
+    void refresh_holds();
 
     void dead_remove(std::uint32_t node);
     void dead_append(std::uint32_t node);
@@ -506,7 +543,14 @@ private:
     std::vector<std::uint32_t> free_snapshots_;
 
     std::vector<LruLink> lru_links_;
-    std::array<LruList, 2> lru_{};
+    std::array<LruList, kLruLists> lru_{};
+    std::uint32_t lru_backed_   = 0; // entries on even lists
+    std::uint32_t lru_unbacked_ = 0; // entries on odd lists
+
+    // Held snapshot indices by queue rank (§9.6), and the nodes refresh_holds marked.
+    std::vector<std::uint32_t> holds_;
+    std::vector<std::uint32_t> held_nodes_;
+    std::uint64_t snapshot_epoch_ = 0;
 
     std::uint32_t dead_head_ = kNoId;
     std::uint32_t dead_tail_ = kNoId;

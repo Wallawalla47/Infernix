@@ -581,8 +581,12 @@ int main() {
                           !hybrid_minimal.context_cache.hybrid.device_snapshot_slots &&
                           !hybrid_minimal.context_cache.hybrid.max_new_taps &&
                           !hybrid_minimal.context_cache.hybrid.tap_ladder_tokens &&
-                          !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens,
+                          !hybrid_minimal.context_cache.hybrid.tap_min_gap_tokens &&
+                          hybrid_minimal.context_cache.hybrid.queue_holds,
                       "the hybrid default must size KV automatically and leave tuning derived");
+    failures += check(!parse({"infernix-serve", "model.ninfer", "--no-queue-holds"})
+                           .context_cache.hybrid.queue_holds,
+                      "--no-queue-holds did not turn queue holds off");
     const ServeOptions hybrid_headroom =
         parse({"infernix-serve", "model.ninfer", "--vram-headroom-mib", "2048"});
     failures += check(hybrid_headroom.kv_capacity.mode == infernix::KvCapacityMode::Automatic &&
@@ -666,7 +670,8 @@ int main() {
                                                {"--device-snapshot-slots", "2"},
                                                {"--cache-taps-per-request", "2"},
                                                {"--cache-tap-ladder", "2048"},
-                                               {"--cache-tap-min-gap", "64"}}) {
+                                               {"--cache-tap-min-gap", "64"},
+                                               {"--no-queue-holds"}}) {
         for (const char* disabling : {"--use-original-prefix-caching", "--no-prefix-reuse"}) {
             std::vector<std::string> arguments{"infernix-serve", "model.ninfer", disabling};
             arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());

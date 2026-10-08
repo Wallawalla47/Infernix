@@ -968,6 +968,123 @@ void test_host_image_claims() {
     index.check_invariants();
 }
 
+// Queue holds (§9.6): a held snapshot is never a Host victim, so a write that would need its slabs
+// is refused; its path's Device copies go after every unheld entry of the same kind, host-backed
+// before unbacked, the highest rank first.
+void test_queue_holds() {
+    constexpr double kAny = std::numeric_limits<double>::infinity();
+    // Two conversations fill a 12-slab Host tier: 2 blocks and a 4-slab endpoint image each.
+    const auto host_scenario = [&](RecordingBackend& backend, PrefixCacheIndex& index) {
+        std::vector<SnapshotRef> out;
+        for (const std::uint32_t seed : {70U, 71U}) {
+            const auto path = insert_sequence(index, backend, make_tokens(128, seed));
+            for (const NodeRef node : path) { backup_node(index, node); }
+            auto image = index.reserve_host_image(false, kAny);
+            require(image.has_value(), "an endpoint image fits");
+            out.push_back(index.publish_host_snapshot(path[1], 128, {}, std::nullopt, std::move(*image),
+                                                      SnapshotKind::Endpoint)
+                              .snapshot);
+            index.release_path(path);
+        }
+        require(index.stats().host_free_slabs == 0, "the Host tier is full");
+        return out;
+    };
+    {
+        // Control: without holds the older of two equal GDSF values yields.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(12, 0), backend);
+        const auto snaps = host_scenario(backend, index);
+        auto image       = index.reserve_host_image(false, kAny);
+        require(image && !index.valid(snaps[0]) && index.valid(snaps[1]), "the older endpoint yields");
+        index.release_host_image(std::move(*image));
+        index.check_invariants();
+    }
+    {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(12, 0), backend);
+        const auto snaps = host_scenario(backend, index);
+        index.set_queue_holds(std::vector<SnapshotRef>{snaps[0], snaps[0], SnapshotRef{}});
+        index.check_invariants();
+        require(index.stats().held_snapshots == 1, "a repeated or invalid hold takes no rank");
+        auto first = index.reserve_host_image(false, kAny);
+        require(first && index.valid(snaps[0]) && !index.valid(snaps[1]),
+                "an unheld snapshot yields before a held one");
+        index.check_invariants();
+        // The 4 freed slabs went to `first`; b's 2 dead blocks remain, then only the held endpoint.
+        require(!index.reserve_host_image(false, kAny).has_value() && index.valid(snaps[0]) &&
+                    index.stats().held_host_refusals == 1 && index.stats().host_dead_reclaims == 2,
+                "a write is refused rather than evict a held snapshot");
+        index.check_invariants();
+        index.set_queue_holds({});
+        require(index.stats().held_snapshots == 0, "an empty queue releases every hold");
+        index.check_invariants();
+        auto second = index.reserve_host_image(false, kAny);
+        require(second && !index.valid(snaps[0]), "a released hold is an ordinary victim again");
+        index.release_host_image(std::move(*first));
+        index.release_host_image(std::move(*second));
+        index.check_invariants();
+    }
+    // Device: b's blocks are older, so plain LRU would evict them first.
+    const auto device_scenario = [&](RecordingBackend& backend, PrefixCacheIndex& index,
+                                     std::vector<std::vector<NodeRef>>& paths) {
+        std::vector<SnapshotRef> out;
+        for (const std::uint32_t seed : {72U, 73U}) {
+            paths.push_back(insert_sequence(index, backend, make_tokens(128, seed)));
+            out.push_back(publish_tap(index, paths.back()[1]));
+        }
+        index.release_path(paths[1]); // b
+        index.release_path(paths[0]); // a, most recently used
+        index.check_invariants();
+        return out; // a, b
+    };
+    {
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64, 4), backend);
+        std::vector<std::vector<NodeRef>> paths;
+        const auto snaps = device_scenario(backend, index, paths);
+        index.set_queue_holds(std::vector<SnapshotRef>{snaps[1]});
+        index.check_invariants();
+        require(index.evict_device_blocks(1) == 1 && !index.valid(snaps[0]) && index.valid(snaps[1]),
+                "an unheld unbacked block goes before a held one, whatever its recency");
+        require(index.evict_device_blocks(1) == 1 && index.valid(snaps[1]) &&
+                    index.stats().held_device_evictions == 0,
+                "the unheld path goes entirely before any held block");
+        require(index.evict_device_blocks(1) == 1 && !index.valid(snaps[1]) &&
+                    index.stats().held_device_evictions == 1 && index.stats().held_snapshot_losses == 1 &&
+                    index.stats().held_snapshots == 0,
+                "a held block is evicted only when nothing else is left, and its loss is counted");
+        index.check_invariants();
+    }
+    {
+        // Ranks: the request furthest back gives way first.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64, 4), backend);
+        std::vector<std::vector<NodeRef>> paths;
+        const auto snaps = device_scenario(backend, index, paths);
+        index.set_queue_holds(std::vector<SnapshotRef>{snaps[0], snaps[1]});
+        index.check_invariants();
+        require(index.evict_device_blocks(1) == 1 && index.valid(snaps[0]) && !index.valid(snaps[1]),
+                "the highest rank's block goes first");
+        index.check_invariants();
+    }
+    {
+        // A held host-backed copy goes before an unheld unbacked one: dropping it loses nothing.
+        RecordingBackend backend;
+        PrefixCacheIndex index(small_config(64, 4), backend);
+        std::vector<std::vector<NodeRef>> paths;
+        const auto snaps = device_scenario(backend, index, paths);
+        for (const NodeRef node : paths[1]) { backup_node(index, node); }
+        index.set_queue_holds(std::vector<SnapshotRef>{snaps[1]});
+        index.check_invariants();
+        require(index.evict_backed_device_blocks(8) == 2 && index.valid(snaps[0]) && index.valid(snaps[1]) &&
+                    index.node(paths[1][0]).device == CopyState::Absent &&
+                    index.node(paths[0][0]).device == CopyState::Resident &&
+                    index.stats().held_device_evictions == 2,
+                "backed-only eviction may take held copies but never an unbacked block");
+        index.check_invariants();
+    }
+}
+
 // insert_block without attach pins an identical Host-only child but leaves its Device copy absent:
 // the inserting sequence keeps its page private.
 void test_insert_without_attach() {
@@ -1148,6 +1265,13 @@ void test_random_stress() {
                         index.note_hit(snapshot);
                     }
                 }
+            } else if (rng() % 2U && !published_snapshots.empty()) {
+                // A queue of up to four waiting requests; stale references are skipped.
+                std::vector<SnapshotRef> queue;
+                for (std::uint32_t i = rng() % 5U; i > 0; --i) {
+                    queue.push_back(published_snapshots[rng() % published_snapshots.size()]);
+                }
+                index.set_queue_holds(queue);
             } else {
                 (void)index.evict_device_blocks(1 + rng() % 8U);
             }
@@ -1356,6 +1480,7 @@ int main() {
         test_image_only_host_tier();
         test_host_born_snapshots();
         test_host_image_claims();
+        test_queue_holds();
         test_insert_without_attach();
         test_cost_model();
         test_random_stress();

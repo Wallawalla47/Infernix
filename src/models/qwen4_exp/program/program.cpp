@@ -69,6 +69,8 @@ bool Program::context_blocks(SequenceHandle sequence) const noexcept { return im
 bool Program::hybrid_reclaim(runtime::ContextResourceUsage shortage) { return impl_->hybrid_reclaim(shortage); }
 std::optional<std::uint32_t> Program::hybrid_prefetch(const RequestBasePlan& base) { return impl_->hybrid_prefetch(base); }
 std::uint32_t Program::hybrid_prefetch_room() const noexcept { return impl_->hybrid_prefetch_room(); }
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) { impl_->hybrid_hold_queue(queue); }
+std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
 
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
     return impl_->reserve_units(units);

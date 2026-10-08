@@ -319,6 +319,12 @@ std::uint32_t Program::hybrid_prefetch_room() const noexcept {
     return impl_->hybrid_prefetch_room();
 }
 
+void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
+    impl_->hybrid_hold_queue(queue);
+}
+
+std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
+
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }
 
 void Program::set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost) {

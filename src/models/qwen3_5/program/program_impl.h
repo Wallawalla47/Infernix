@@ -454,6 +454,8 @@ public:
     [[nodiscard]] bool hybrid_reclaim(runtime::ContextResourceUsage shortage);
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
+    void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
 
