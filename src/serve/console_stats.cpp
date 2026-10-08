@@ -50,15 +50,21 @@ struct Column {
 
 // The row label is left-aligned; every value column is right-aligned under its heading. The
 // table is 84 columns wide (93 with the archive column), so it fits a console window snapped to
-// half of a 1920-pixel screen.
+// half of a 1920-pixel screen. The n-gram columns come last and appear only when the server runs
+// n-gram drafting, which leaves 66 columns.
 constexpr std::size_t kLabelWidth   = 7;
 constexpr std::size_t kArchiveWidth = 9;
 constexpr Column kColumns[]         = {
     {"TTFT", 8},  {"cached", 8},  {"prefill", 9}, {"decode", 8},   {"batch", 7},
     {"draft", 9}, {"acc/rnd", 9}, {"ngram", 8},   {"ng rnds", 10},
 };
-constexpr std::size_t kColumnCount   = std::size(kColumns);
-constexpr std::size_t kDrafterColumn = 5; // heading names the configured model drafter
+constexpr std::size_t kColumnCount      = std::size(kColumns);
+constexpr std::size_t kNgramColumnCount = 2;
+constexpr std::size_t kDrafterColumn    = 5; // heading names the configured model drafter
+
+std::size_t visible_columns(bool ngram) noexcept {
+    return ngram ? kColumnCount : kColumnCount - kNgramColumnCount;
+}
 
 void append_right(std::string& out, std::string_view text, std::size_t width) {
     if (text.size() < width) { out.append(width - text.size(), ' '); }
@@ -79,7 +85,7 @@ std::string drafter_heading(SpeculativeBackend backend) {
     return heading;
 }
 
-std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
+std::string render_row(std::string_view label, const ConsoleStatsTotals& totals, bool ngram,
                        bool show_archive) {
     const ConsoleRequestSample& sum       = totals.sum;
     const std::string cells[kColumnCount] = {
@@ -98,7 +104,7 @@ std::string render_row(std::string_view label, const ConsoleStatsTotals& totals,
     };
     std::string row = " ";
     append_left(row, label, kLabelWidth);
-    for (std::size_t index = 0; index < kColumnCount; ++index) {
+    for (std::size_t index = 0; index < visible_columns(ngram); ++index) {
         append_right(row, cells[index], kColumns[index].width);
     }
     if (show_archive) {
@@ -175,9 +181,11 @@ void ConsoleStatsTotals::add(const ConsoleRequestSample& sample) noexcept {
 }
 
 std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& snapshot) {
-    const bool show_archive = snapshot.session.sum.archive_drafted_tokens != 0;
-    std::size_t table_width = 1 + kLabelWidth + (show_archive ? kArchiveWidth : 0);
-    for (const Column& column : kColumns) { table_width += column.width; }
+    const bool ngram        = snapshot.ngram_enabled;
+    const bool show_archive = ngram && snapshot.session.sum.archive_drafted_tokens != 0;
+    const std::size_t columns = visible_columns(ngram);
+    std::size_t table_width   = 1 + kLabelWidth + (show_archive ? kArchiveWidth : 0);
+    for (std::size_t index = 0; index < columns; ++index) { table_width += kColumns[index].width; }
 
     std::string title = "-- session stats, rates in tok/s | " +
                         product::format_pretty_count(snapshot.completed) + " done";
@@ -197,7 +205,7 @@ std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& 
 
     std::string headings = " ";
     append_left(headings, "", kLabelWidth);
-    for (std::size_t index = 0; index < kColumnCount; ++index) {
+    for (std::size_t index = 0; index < columns; ++index) {
         const Column& column = kColumns[index];
         append_right(headings,
                      index == kDrafterColumn ? drafter_heading(snapshot.speculative_backend)
@@ -210,18 +218,20 @@ std::vector<std::string> render_console_stats_panel(const ConsoleStatsSnapshot& 
     lines.reserve(4);
     lines.push_back(std::string(kBold) + title + std::string(kReset));
     lines.push_back(std::string(kDim) + headings + std::string(kReset));
-    lines.push_back(render_row("session", snapshot.session, show_archive));
+    lines.push_back(render_row("session", snapshot.session, ngram, show_archive));
     // Until the session outgrows the window, the recent row would repeat the session row.
     if (snapshot.completed > snapshot.recent_window) {
         lines.push_back(render_row("last " + std::to_string(snapshot.recent.requests),
-                                   snapshot.recent, show_archive));
+                                   snapshot.recent, ngram, show_archive));
     }
     return lines;
 }
 
-ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel)
+ConsoleStatsPanel::ConsoleStatsPanel(std::shared_ptr<product::TerminalPanel> panel,
+                                     bool ngram_enabled)
     : panel_(std::move(panel)) {
     state_.recent_window = kRecentRequests;
+    state_.ngram_enabled = ngram_enabled;
 }
 
 void ConsoleStatsPanel::request_done(const GenerationOutcome& outcome) {

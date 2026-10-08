@@ -223,7 +223,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
       operational_log_(logger), request_jsonl_(options_.request_log_jsonl, options_.artifact_path,
                                                std::move(logger), options_.request_log_rotation) {
     if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
-        console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel));
+        console_stats_ = std::make_unique<ConsoleStatsPanel>(
+            std::move(panel), options_.speculative.ngram_draft_tokens != 0);
     }
     const std::size_t queued_requests =
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests;
