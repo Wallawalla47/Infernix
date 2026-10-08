@@ -17,8 +17,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr std::uint64_t kDemandTag  = 0;
-constexpr std::uint64_t kPrefillTag = 1;
+constexpr std::uint64_t kDemandTag     = 0;
+constexpr std::uint64_t kPrefillTag    = 1;
+constexpr std::uint64_t kDemandRunTag  = 2; // index: a run of tickets
+constexpr std::uint64_t kPrefillRunTag = 3; // index: a run of prefill entries
+// Records that follow each other in a file are read as one scatter read (Strata 0.1.41's batched
+// file-tier reads): on this machine's NVMe drive (Samsung 990 PRO), unbuffered 33 MB reads of
+// neighbouring records reached 7.1 GB/s, against 6.7 GB/s for separate 2.6 MB record reads at
+// depth 8 (RM0e). The startup fill takes long runs; a fetch request's runs stay short, so its
+// first record lands soon.
+constexpr std::size_t kFillRunBytes  = std::size_t{32} << 20;
+constexpr std::size_t kFetchRunBytes = std::size_t{12} << 20;
 // An open round with no work for this long (one that was abandoned without end_round) stops the
 // agent's spinning; it then polls about once per millisecond.
 constexpr auto kIdleSpin = std::chrono::seconds(2);
@@ -124,6 +133,28 @@ void HostExpertTier::submit(std::uint32_t key, std::uint32_t slot, std::uint64_t
     }
 }
 
+bool HostExpertTier::follows(std::uint32_t before, std::uint32_t key) const {
+    const auto a = store_.segments(before / store_.experts(), before % store_.experts());
+    const auto b = store_.segments(key / store_.experts(), key % store_.experts());
+    return a.size() == 1 && b.size() == 1 && a[0].file == b[0].file && a[0].offset + a[0].bytes == b[0].offset;
+}
+
+void HostExpertTier::submit_run(std::span<const std::pair<std::uint32_t, std::uint32_t>> run, std::uint64_t tag) {
+    DirectReadQueue::Read read;
+    const auto first = store_.segments(run.front().first / store_.experts(), run.front().first % store_.experts())[0];
+    read.file   = files_[first.file];
+    read.offset = first.offset;
+    read.tag    = tag;
+    for (const auto& [key, slot] : run) {
+        const auto s = store_.segments(key / store_.experts(), key % store_.experts())[0];
+        read.scatter.push_back({const_cast<std::uint8_t*>(slot_bytes(slot)) + s.at, s.bytes});
+        read.bytes += s.bytes;
+    }
+    queue_->submit(read);
+    agent_run_reads_.fetch_add(1, std::memory_order_relaxed);
+    agent_run_records_.fetch_add(run.size(), std::memory_order_relaxed);
+}
+
 std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> jobs;
     for (const std::uint32_t key : ranked) {
@@ -145,6 +176,8 @@ std::uint32_t HostExpertTier::prefill(std::span<const std::uint32_t> ranked) {
                                  " expert records could not be read from the artifact at startup");
     }
     stats_.prefill_reads += jobs.size();
+    stats_.run_reads   = agent_run_reads_.load(std::memory_order_relaxed);
+    stats_.run_records = agent_run_records_.load(std::memory_order_relaxed);
     return static_cast<std::uint32_t>(jobs.size());
 }
 
@@ -176,6 +209,8 @@ void HostExpertTier::begin_round(std::uint32_t allowance) {
     stats_.fetch_requests  = agent_fetch_requests_.load(std::memory_order_relaxed);
     stats_.fetch_records   = agent_fetch_records_.load(std::memory_order_relaxed);
     stats_.fetch_from_ram  = agent_fetch_from_ram_.load(std::memory_order_relaxed);
+    stats_.run_reads       = agent_run_reads_.load(std::memory_order_relaxed);
+    stats_.run_records     = agent_run_records_.load(std::memory_order_relaxed);
     tier_.begin_round(allowance);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -293,6 +328,8 @@ void HostExpertTier::agent_main() {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> prefills;
     std::vector<PrefillEntry> prefill_entries;
     std::uint32_t prefill_left = 0;
+    // The members of each scatter read in flight (tickets or prefill entries), by tag index.
+    std::vector<std::vector<std::uint32_t>> runs;
     std::vector<DirectReadQueue::Completion> done;
     std::size_t outstanding = 0;        // reads submitted and not completed
     std::deque<std::uint32_t> waiting;  // tickets of this round waiting for a ring slot, in order
@@ -379,15 +416,19 @@ void HostExpertTier::agent_main() {
         }
         waiting.insert(waiting.end(), demands.begin(), demands.end());
         demands.clear();
+        const auto fail_unread = [&](std::uint32_t t) { // its request failed: nothing will read it
+            Ticket& ticket = tickets_[t];
+            ticket.status.store(EIO, std::memory_order_relaxed);
+            ticket.done.store(true, std::memory_order_release);
+            ticket.state.store(2, std::memory_order_release);
+            in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+        };
         while (!waiting.empty()) {
             const std::uint32_t t = waiting.front();
             Ticket& ticket        = tickets_[t];
-            if (ticket.fetch >= 0 && fetch_failed) { // its request failed: nothing will read it
+            if (ticket.fetch >= 0 && fetch_failed) {
                 waiting.pop_front();
-                ticket.status.store(EIO, std::memory_order_relaxed);
-                ticket.done.store(true, std::memory_order_release);
-                ticket.state.store(2, std::memory_order_release);
-                in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+                fail_unread(t);
                 continue;
             }
             if (!take_slot(t)) { break; } // a slot frees up once the device or the CPU is done with one
@@ -395,50 +436,123 @@ void HostExpertTier::agent_main() {
             ticket.submitted_ns = now_ns();
             ticket.remaining    = static_cast<std::uint32_t>(
                 store_.segments(ticket.key / store_.experts(), ticket.key % store_.experts()).size());
-            submit(ticket.key, ticket.slot, tag_of(kDemandTag, t, 0));
-            outstanding += ticket.remaining;
+            // The next waiting tickets of the same request whose records follow this one in the file
+            // join it in one read while a ring slot is free for each.
+            std::vector<std::uint32_t> run{t};
+            std::size_t bytes = store_.record_bytes();
+            while (!waiting.empty() && ticket.remaining == 1 && ticket.fetch >= 0 && !fetch_failed &&
+                   run.size() < DirectReadQueue::kMaxTargets && bytes + store_.record_bytes() <= kFetchRunBytes) {
+                const std::uint32_t next = waiting.front();
+                if (tickets_[next].fetch < 0 || !follows(tickets_[run.back()].key, tickets_[next].key) ||
+                    !take_slot(next)) {
+                    break;
+                }
+                waiting.pop_front();
+                tickets_[next].submitted_ns = ticket.submitted_ns;
+                tickets_[next].remaining    = 1;
+                run.push_back(next);
+                bytes += store_.record_bytes();
+            }
+            if (run.size() == 1) {
+                submit(ticket.key, ticket.slot, tag_of(kDemandTag, t, 0));
+                outstanding += ticket.remaining;
+            } else {
+                std::vector<std::pair<std::uint32_t, std::uint32_t>> records;
+                for (const std::uint32_t member : run) { records.emplace_back(tickets_[member].key, tickets_[member].slot); }
+                const auto index = static_cast<std::uint32_t>(runs.size());
+                runs.push_back(std::move(run));
+                submit_run(records, tag_of(kDemandRunTag, index, 0));
+                ++outstanding;
+            }
             last_work = Clock::now();
         }
-        for (const auto& [key, slot] : prefills) {
-            const auto index = static_cast<std::uint32_t>(prefill_entries.size());
-            const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
-            prefill_entries.push_back({key, slot, n, false});
-            submit(key, slot, tag_of(kPrefillTag, index, 0));
-            outstanding += n;
-            ++prefill_left;
+        if (!prefills.empty()) {
+            // The startup fill lands whole before the first request, so its order is free: by file
+            // offset, records that follow each other are read as one run.
+            const auto offset_of = [&](std::uint32_t key) {
+                const auto s = store_.segments(key / store_.experts(), key % store_.experts())[0];
+                return std::pair<std::uint32_t, std::uint64_t>(s.file, s.offset);
+            };
+            std::sort(prefills.begin(), prefills.end(),
+                      [&](const auto& a, const auto& b) { return offset_of(a.first) < offset_of(b.first); });
+            for (std::size_t i = 0; i < prefills.size();) {
+                std::size_t end   = i + 1;
+                std::size_t bytes = store_.record_bytes();
+                while (end < prefills.size() && end - i < DirectReadQueue::kMaxTargets &&
+                       bytes + store_.record_bytes() <= kFillRunBytes && follows(prefills[end - 1].first, prefills[end].first)) {
+                    bytes += store_.record_bytes();
+                    ++end;
+                }
+                if (end - i == 1) {
+                    const auto [key, slot] = prefills[i];
+                    const auto index       = static_cast<std::uint32_t>(prefill_entries.size());
+                    const auto n = static_cast<std::uint32_t>(store_.segments(key / store_.experts(), key % store_.experts()).size());
+                    prefill_entries.push_back({key, slot, n, false});
+                    submit(key, slot, tag_of(kPrefillTag, index, 0));
+                    outstanding += n;
+                } else {
+                    std::vector<std::uint32_t> members;
+                    for (std::size_t k = i; k < end; ++k) {
+                        members.push_back(static_cast<std::uint32_t>(prefill_entries.size()));
+                        prefill_entries.push_back({prefills[k].first, prefills[k].second, 1, false});
+                    }
+                    const auto index = static_cast<std::uint32_t>(runs.size());
+                    runs.push_back(std::move(members));
+                    submit_run(std::span(prefills).subspan(i, end - i), tag_of(kPrefillRunTag, index, 0));
+                    ++outstanding;
+                }
+                prefill_left += static_cast<std::uint32_t>(end - i);
+                i = end;
+            }
         }
         prefills.clear();
         done.clear();
         // While a round is open the agent spins (a fetch request must not wait for a timer).
         queue_->poll(done, outstanding != 0 && !open ? std::chrono::microseconds(200) : std::chrono::microseconds(0));
+        const auto ticket_read = [&](std::uint32_t t, bool ok) {
+            Ticket& ticket = tickets_[t];
+            if (!ok) { ticket.status.store(EIO, std::memory_order_relaxed); }
+            if (--ticket.remaining == 0) {
+                const bool failed = ticket.status.load(std::memory_order_relaxed) != 0;
+                agent_read_ns_.fetch_add(now_ns() - ticket.submitted_ns, std::memory_order_relaxed);
+                (failed ? agent_failures_ : agent_reads_).fetch_add(1, std::memory_order_relaxed);
+                finish_ticket(ticket, t, failed);
+            }
+        };
+        const auto prefill_read = [&](std::uint32_t index, bool ok) {
+            PrefillEntry& entry = prefill_entries[index];
+            entry.failed        = entry.failed || !ok;
+            if (--entry.remaining == 0) {
+                if (entry.failed) { ++prefill_failures_; }
+                if (--prefill_left == 0) {
+                    prefill_entries.clear();
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    prefill_pending_ = 0;
+                    prefill_done_.notify_all();
+                }
+            }
+        };
         for (const auto& c : done) {
             --outstanding;
             const std::uint64_t kind = c.tag >> 62U;
             const auto index         = static_cast<std::uint32_t>((c.tag >> 8U) & ((1ULL << 54U) - 1U));
             const bool ok            = c.status == DirectReadQueue::Status::Ok;
             if (kind == kDemandTag) {
-                Ticket& ticket = tickets_[index];
-                if (!ok) { ticket.status.store(EIO, std::memory_order_relaxed); }
-                if (--ticket.remaining == 0) {
-                    const bool failed = ticket.status.load(std::memory_order_relaxed) != 0;
-                    agent_read_ns_.fetch_add(now_ns() - ticket.submitted_ns, std::memory_order_relaxed);
-                    (failed ? agent_failures_ : agent_reads_).fetch_add(1, std::memory_order_relaxed);
-                    finish_ticket(ticket, index, failed);
-                }
+                ticket_read(index, ok);
+            } else if (kind == kPrefillTag) {
+                prefill_read(index, ok);
             } else {
-                PrefillEntry& entry = prefill_entries[index];
-                entry.failed        = entry.failed || !ok;
-                if (--entry.remaining == 0) {
-                    if (entry.failed) { ++prefill_failures_; }
-                    if (--prefill_left == 0) {
-                        prefill_entries.clear();
-                        std::lock_guard<std::mutex> lock(mutex_);
-                        prefill_pending_ = 0;
-                        prefill_done_.notify_all();
+                for (const std::uint32_t member : runs[index]) {
+                    if (kind == kDemandRunTag) {
+                        ticket_read(member, ok);
+                    } else {
+                        prefill_read(member, ok);
                     }
                 }
+                runs[index].clear();
             }
         }
+        if (outstanding == 0) { runs.clear(); } // no run is in flight: their indices start over
         if (!done.empty()) { last_work = Clock::now(); }
         if (open && done.empty()) {
             if (Clock::now() - last_work > kIdleSpin) {

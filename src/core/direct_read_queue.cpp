@@ -11,6 +11,7 @@
 #    include <fcntl.h>
 #    include <mutex>
 #    include <sys/stat.h>
+#    include <sys/uio.h>
 #    include <unistd.h>
 #endif
 
@@ -98,6 +99,10 @@ struct DirectReadQueue::Impl {
         std::uint64_t offset = 0;
         std::size_t bytes    = 0;
         std::byte* destination = nullptr;
+        std::vector<Target> targets; // a scatter read's destinations (empty: `destination`)
+#ifdef _WIN32
+        std::vector<FILE_SEGMENT_ELEMENT> pages; // ReadFileScatter's page list, null-terminated
+#endif
         Priority priority      = Priority::Demand;
         std::uint32_t issues = 0, hard_failures = 0, timeouts = 0, transient_retries = 0;
         Clock::time_point issued{}, first_transient{}, not_before{};
@@ -138,6 +143,7 @@ struct DirectReadQueue::Impl {
         std::uint64_t offset = 0;
         std::size_t bytes    = 0;
         std::byte* destination = nullptr;
+        std::vector<Target> targets;
     };
     std::mutex mutex;
     std::condition_variable work_ready, done_ready;
@@ -226,14 +232,33 @@ struct DirectReadQueue::Impl {
         io.overlapped            = OVERLAPPED{};
         io.overlapped.Offset     = static_cast<DWORD>(io.offset & 0xffffffffULL);
         io.overlapped.OffsetHigh = static_cast<DWORD>(io.offset >> 32U);
-        if (!::ReadFile(files[io.file].handle, io.destination, static_cast<DWORD>(io.bytes), nullptr, &io.overlapped)) {
+        BOOL started = FALSE;
+        if (io.targets.empty()) {
+            started = ::ReadFile(files[io.file].handle, io.destination, static_cast<DWORD>(io.bytes), nullptr,
+                                 &io.overlapped);
+        } else {
+            // One element per 4 KiB page (the system page size on x64), then a null terminator.
+            io.pages.clear();
+            for (const Target& target : io.targets) {
+                auto* page = static_cast<std::byte*>(target.destination);
+                for (std::size_t at = 0; at < target.bytes; at += kAlignment) {
+                    FILE_SEGMENT_ELEMENT element{};
+                    element.Buffer = static_cast<void*>(page + at); // PVOID64 is void* on x64
+                    io.pages.push_back(element);
+                }
+            }
+            io.pages.push_back(FILE_SEGMENT_ELEMENT{});
+            started = ::ReadFileScatter(files[io.file].handle, io.pages.data(), static_cast<DWORD>(io.bytes), nullptr,
+                                        &io.overlapped);
+        }
+        if (!started) {
             const DWORD error = ::GetLastError();
             if (error != ERROR_IO_PENDING) { held.push_back({io.self, win32_error(error), 0, Clock::now()}); }
         }
 #else
         {
             std::lock_guard<std::mutex> lock(mutex);
-            jobs.push_back({io.self, files[io.file].fd, io.offset, io.bytes, io.destination});
+            jobs.push_back({io.self, files[io.file].fd, io.offset, io.bytes, io.destination, io.targets});
         }
         work_ready.notify_one();
 #endif
@@ -294,11 +319,23 @@ struct DirectReadQueue::Impl {
                 job = jobs.front();
                 jobs.pop_front();
             }
+            if (job.targets.empty()) { job.targets.push_back({job.destination, job.bytes}); }
             std::size_t total = 0;
             std::error_code error;
             while (total < job.bytes) {
-                const ssize_t got = ::pread(job.fd, job.destination + total, job.bytes - total,
-                                            static_cast<off_t>(job.offset + total));
+                // The destinations not yet filled, the first one from where the last read stopped.
+                std::vector<iovec> parts;
+                std::size_t skip = total;
+                for (const Target& target : job.targets) {
+                    if (skip >= target.bytes) {
+                        skip -= target.bytes;
+                        continue;
+                    }
+                    parts.push_back({static_cast<std::byte*>(target.destination) + skip, target.bytes - skip});
+                    skip = 0;
+                }
+                const ssize_t got = ::preadv(job.fd, parts.data(), static_cast<int>(parts.size()),
+                                             static_cast<off_t>(job.offset + total));
                 if (got < 0) {
                     if (errno == EINTR) { continue; }
                     error = errno_error(errno);
@@ -322,6 +359,20 @@ struct DirectReadQueue::Impl {
         if (read.bytes == 0 || read.bytes > kMaxReadBytes || read.bytes % kAlignment != 0 || read.offset % kAlignment != 0 ||
             reinterpret_cast<std::uintptr_t>(read.destination) % kAlignment != 0) {
             throw std::invalid_argument("DirectReadQueue: reads need 4 KiB-aligned offsets, sizes and destinations");
+        }
+        if (!read.scatter.empty()) {
+            std::size_t sum = 0;
+            for (const Target& target : read.scatter) {
+                if (target.destination == nullptr || target.bytes == 0 || target.bytes % kAlignment != 0 ||
+                    reinterpret_cast<std::uintptr_t>(target.destination) % kAlignment != 0) {
+                    throw std::invalid_argument("DirectReadQueue: scatter destinations need 4 KiB-aligned addresses and sizes");
+                }
+                sum += target.bytes;
+            }
+            if (sum != read.bytes || read.scatter.size() > kMaxTargets || read.priority != Priority::Demand) {
+                throw std::invalid_argument(
+                    "DirectReadQueue: a scatter read is a demand read whose destinations (at most 16) cover its bytes");
+            }
         }
         std::size_t r;
         if (!free_requests.empty()) {
@@ -352,6 +403,7 @@ struct DirectReadQueue::Impl {
             io.offset      = read.offset + static_cast<std::uint64_t>(k) * piece;
             io.bytes       = std::min(piece, read.bytes - static_cast<std::size_t>(k) * piece);
             io.destination = static_cast<std::byte*>(read.destination) + static_cast<std::size_t>(k) * piece;
+            io.targets     = read.scatter; // a scatter read is one piece (demand reads are not split)
             io.priority    = read.priority;
             waiting[static_cast<int>(read.priority)].push_back(i);
         }

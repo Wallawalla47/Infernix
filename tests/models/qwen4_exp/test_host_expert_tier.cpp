@@ -187,6 +187,7 @@ void test_fetch(const ExpertStore& store) {
     std::vector<std::uint32_t> ranked(kKeys);
     for (std::uint32_t k = 0; k < kKeys; ++k) { ranked[k] = k; }
     check(tier.prefill(ranked) == 50, "fetch: pre-fill fills the resident slots");
+    const std::uint64_t runs_before = tier.stats().run_reads, run_records_before = tier.stats().run_records;
     DeviceSide device{channel.channel(0)};
     tier.begin_round(32);
 
@@ -205,6 +206,11 @@ void test_fetch(const ExpertStore& store) {
         device.consume(i + 1);
     }
     check(all, "fetch: 20 records (10 from RAM, 10 through an 8-slot ring) land in job order with their bytes");
+    tier.end_round();
+    tier.begin_round(32); // publishes the agent's counters
+    check(tier.stats().run_reads > runs_before &&
+              tier.stats().run_records - run_records_before > tier.stats().run_reads - runs_before,
+          "fetch: neighbouring records of one request are read together");
     check(from_ram, "fetch: a key in RAM lands at its RAM slot without a read");
     check(device.beat() != beat_before, "fetch: the heartbeat advances while a round is open");
 
@@ -256,6 +262,9 @@ int main(int argc, char** argv) {
             bool all = true;
             for (std::uint32_t k = 0; k < 50; ++k) { all = all && matches(tier.record(k), k); }
             check(all, "pre-filled records equal the file bytes");
+            // Keys 0..49 follow each other in file A: scatter reads of at most 16 records each.
+            check(tier.stats().run_reads == 4 && tier.stats().run_records == 50,
+                  "the pre-fill reads neighbouring records as scatter reads of up to 16");
             check(tier.record(50) == nullptr, "a key beyond the pre-fill is SSD-only");
             std::vector<std::uint32_t> dirty;
             tier.take_dirty(dirty);

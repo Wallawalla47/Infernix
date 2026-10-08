@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <new>
 #include <random>
 #include <stdexcept>
@@ -214,6 +215,78 @@ void test_faults(const std::filesystem::path& path) {
     } catch (const std::invalid_argument&) {}
 }
 
+// Scatter reads: one file range lands in several separate destinations, in order, as one device
+// read; with a retried hard error; past the end of the file it fails; malformed ones are rejected.
+void test_scatter(const std::filesystem::path& path) {
+    // Three records of unequal sizes, each in its own buffer, with untouched guard pages between.
+    const std::size_t sizes[] = {2 * kBlock, 675 * kBlock, 16 * kBlock}; // 675 pages: one expert record
+    std::vector<std::unique_ptr<Aligned>> buffers;
+    std::vector<DirectReadQueue::Target> targets;
+    std::size_t total = 0;
+    for (const std::size_t bytes : sizes) {
+        buffers.push_back(std::make_unique<Aligned>(bytes + 2 * kBlock));
+        std::fill(buffers.back()->p, buffers.back()->p + bytes + 2 * kBlock, std::byte{0xee});
+        targets.push_back({buffers.back()->p + kBlock, bytes});
+        total += bytes;
+    }
+    const auto landed = [&](std::uint64_t offset) {
+        bool ok = true;
+        std::uint64_t at = offset;
+        for (std::size_t k = 0; k < targets.size(); ++k) {
+            const std::byte* p = buffers[k]->p;
+            ok = ok && matches(p + kBlock, at, sizes[k]);
+            for (std::size_t g = 0; g < kBlock; ++g) {
+                ok = ok && p[g] == std::byte{0xee} && p[kBlock + sizes[k] + g] == std::byte{0xee};
+            }
+            at += sizes[k];
+        }
+        return ok;
+    };
+    {
+        DirectReadQueue queue;
+        const auto file = queue.open(path);
+        const std::uint64_t offset = 777 * kBlock;
+        queue.submit({file, offset, total, nullptr, DirectReadQueue::Priority::Demand, 5, targets});
+        const auto done = drain(queue, 1);
+        check(done.size() == 1 && done[0].tag == 5 && done[0].status == DirectReadQueue::Status::Ok &&
+                  queue.stats().issued == 1,
+              "a scatter read completes once, as one device read");
+        check(landed(offset), "a scatter read lands each piece of the range in its destination, in order");
+    }
+    {
+        DirectReadQueue queue;
+        const auto file = queue.open(path);
+        queue.set_faults({.fail_read = 1, .fail_count = 1});
+        queue.submit({file, 0, total, nullptr, DirectReadQueue::Priority::Demand, 6, targets});
+        const auto done = drain(queue, 1);
+        check(done.size() == 1 && done[0].status == DirectReadQueue::Status::Ok && done[0].attempts == 2 && landed(0),
+              "a scatter read's hard error is retried once");
+        const std::uint64_t last = (kFileBytes / kBlock) * kBlock - total + kBlock; // ends past the end
+        queue.submit({file, last, total, nullptr, DirectReadQueue::Priority::Demand, 7, targets});
+        const auto past = drain(queue, 1);
+        check(past.size() == 1 && past[0].status == DirectReadQueue::Status::Failed,
+              "a scatter read past the end of the file fails");
+    }
+    DirectReadQueue queue;
+    const auto file  = queue.open(path);
+    const auto bad   = [&](DirectReadQueue::Read read, const char* what) {
+        try {
+            queue.submit(read);
+            check(false, what);
+        } catch (const std::invalid_argument&) {}
+    };
+    bad({file, 0, total - kBlock, nullptr, DirectReadQueue::Priority::Demand, 0, targets},
+        "a scatter read whose destinations do not cover its bytes is rejected");
+    bad({file, 0, total, nullptr, DirectReadQueue::Priority::Prefetch, 0, targets}, "a prefetch scatter read is rejected");
+    auto misaligned = targets;
+    misaligned[1].destination = static_cast<std::byte*>(misaligned[1].destination) + 64;
+    bad({file, 0, total, nullptr, DirectReadQueue::Priority::Demand, 0, misaligned},
+        "a misaligned scatter destination is rejected");
+    bad({file, 0, 17 * kBlock, nullptr, DirectReadQueue::Priority::Demand, 0,
+         std::vector<DirectReadQueue::Target>(17, {buffers[2]->p + kBlock, kBlock})},
+        "a scatter read of more than 16 destinations is rejected");
+}
+
 // cancel_all with reads queued and in flight: every request completes once, Cancelled or Ok, and
 // Ok ones hold their bytes; a queue destroyed with reads in flight waits for them.
 void test_cancel(const std::filesystem::path& path) {
@@ -270,6 +343,7 @@ int main() {
         test_reads(path);
         test_priority_and_split(path);
         test_faults(path);
+        test_scatter(path);
         test_cancel(path);
         std::error_code ec;
         std::filesystem::remove(path, ec);
