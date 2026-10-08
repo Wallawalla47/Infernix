@@ -41,7 +41,7 @@ and the chunk size only picks the scatter. So:
 | `infernix-perplexity --prefill-chunk N` | perplexity at a chosen prefill pass size ([guide](../perplexity.md)) |
 | `infernix-perplexity --a16-activations --save-top-tokens FILE` | the 16-bit-activation reference distribution |
 | `infernix-perplexity --kl-reference FILE` | KL divergence and top-1 agreement against a saved reference |
-| `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference ([benchmarks](../../bench/README.md#decode-quality)) |
+| `infernix_decode_quality_gen` / `infernix_decode_quality_judge` | end-to-end greedy decode through the production speculative path, judged token by token against the 16-bit reference (Qwen3.8-Flash-Next, which has no 16-bit route: its stored activations, `--stored-activations`) ([benchmarks](../../bench/README.md#decode-quality)) |
 
 Perplexity scoring runs prefill only; decode kernels, speculative verification and n-gram drafting
 need the decode-quality pair. The generator uses only Engine API that NInfer also has, so the

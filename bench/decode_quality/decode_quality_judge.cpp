@@ -7,7 +7,12 @@
 // generated tokens, and the mean regret (top log-probability minus the generated token's); per
 // pair of builds, the generated prefix they share exactly.
 //
-// Usage: infernix_decode_quality_judge <artifact> <corpus.txt> <gen_file>...
+// --stored-activations scores with the activations the artifact records instead (every other
+// condition the same). It is the reference for models without a 16-bit-activation route
+// (Qwen3.8-Flash-Next): it isolates what decoding changes (KV format, chunking, speculation,
+// batching) but not the cost of the stored activation precision itself.
+//
+// Usage: infernix_decode_quality_judge [--stored-activations] <artifact> <corpus.txt> <gen_file>...
 
 #include "infernix/engine.h"
 
@@ -48,8 +53,13 @@ std::vector<Segment> read_generation(const std::string& path) {
 } // namespace
 
 int main(int argc, char** argv) {
+    const bool stored = argc > 1 && std::string(argv[1]) == "--stored-activations";
+    if (stored) {
+        ++argv;
+        --argc;
+    }
     if (argc < 4) {
-        std::cerr << "usage: infernix_decode_quality_judge <artifact> <corpus.txt> <gen_file>...\n";
+        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] <artifact> <corpus.txt> <gen_file>...\n";
         return 2;
     }
     try {
@@ -71,7 +81,7 @@ int main(int argc, char** argv) {
         options.max_context     = context;
         options.prefill_chunk   = context;
         options.kv_cache        = infernix::KvCacheStorage::BFloat16;
-        options.a16_activations = true;
+        options.a16_activations = !stored;
         infernix::Engine engine(options);
 
         std::ifstream corpus(argv[2], std::ios::binary);

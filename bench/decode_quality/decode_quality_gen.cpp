@@ -1,14 +1,15 @@
 // End-to-end decode quality, generator half. Greedy continuations of fixed segments of a UTF-8
 // corpus, written as token ids, through the production decode path: DFlash2 with 7 drafts and the
-// optimized proposal head, INT8 KV, CUDA Graph decode. infernix_decode_quality_judge scores the
-// output of any number of builds against one 16-bit-activation reference.
+// optimized proposal head, INT8 KV, CUDA Graph decode; with `mtp`, Qwen3.8-Flash-Next's: its MTP
+// drafter with 4 drafts and the optimized proposal head. infernix_decode_quality_judge scores the
+// output of any number of builds against one reference.
 //
 // This file uses only Engine API that NInfer also has, so the same source builds in an
-// NInfer checkout (define INFERNIX_DECODE_QUALITY_NINFER there: it drops n-gram drafting, which
-// NInfer lacks). That is how bench/README.md compares Infernix's decode with NInfer's.
+// NInfer checkout (define INFERNIX_DECODE_QUALITY_NINFER there: it drops n-gram and MTP drafting,
+// which NInfer lacks). That is how bench/README.md compares Infernix's decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
-//                                  <new_tokens> [ngram]
+//                                  <new_tokens> [ngram] [mtp]
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
 
 #include "infernix/engine.h"
@@ -25,14 +26,25 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram]\n";
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp]\n";
         return 2;
     }
     try {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        const bool ngram         = argc > 7 && std::string(argv[7]) == "ngram";
+        bool ngram = false, mtp = false;
+        for (int i = 7; i < argc; ++i) {
+            const std::string flag = argv[i];
+            if (flag == "ngram") {
+                ngram = true;
+            } else if (flag == "mtp") {
+                mtp = true;
+            } else {
+                std::cerr << "unknown option " << flag << " (ngram, mtp)\n";
+                return 2;
+            }
+        }
         if (segments == 0 || prompt_tokens == 0 || new_tokens == 0) {
             std::cerr << "segments, prompt_tokens and new_tokens must be positive\n";
             return 2;
@@ -47,12 +59,22 @@ int main(int argc, char** argv) {
         options.speculative.backend               = infernix::SpeculativeBackend::DFlash2;
         options.speculative.draft_tokens          = 7;
         options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
+        if (mtp) {
+#if defined(INFERNIX_DECODE_QUALITY_NINFER)
+            std::cerr << "MTP drafting is not available in NInfer\n";
+            return 2;
+#else
+            // infernix-serve's production Qwen3.8-Flash-Next drafting (--spec mtp --draft-tokens 4).
+            options.speculative.backend      = infernix::SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = 4;
+#endif
+        }
         options.context_cache.enabled             = false;
         options.context_cache.device_state_slots  = 0;
         options.context_cache.host_capacity_bytes = 0;
         if (ngram) {
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)
-            std::cerr << "n-gram drafting is not available NInfer\n";
+            std::cerr << "n-gram drafting is not available in NInfer\n";
             return 2;
 #else
             // infernix-serve's production n-gram settings.
