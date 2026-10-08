@@ -54,7 +54,9 @@ Setup, conversion and tuning: [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next
   ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
 - **Tool calling for agent clients**: the XML call forms Claude Code and other agents emit,
   tolerant recovery of broken calls (`--tolerant-tool-calls`, which also returns complete calls a
-  model strands in thinking it never closed; from Woesch-Nich's fix with Hundsbuah's review),
+  model strands in thinking it never closed; from Woesch-Nich's fix with Hundsbuah's review), a
+  call the answer only quotes inside a Markdown code fence or inline code kept as text (as Strata
+  0.1.40, #1058),
   Anthropic and OpenAI options used by
   Claude Code, Qwen Code, Codex, Zed and GitHub Copilot, and correct handling of reasoning output.
 - **Faster prefill**: FlashAttention-2 style INT8 prompt attention, FP4/FP8 Tensor Core paths for

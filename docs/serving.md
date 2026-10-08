@@ -316,7 +316,10 @@ command that echoes the markup. An unmatched nested parameter opener, or a quote
 followed by the next token, cannot be represented unambiguously and makes that tool-call region
 ordinary content. Later content is still examined:
 the first tool-call region (any accepted marker form) that parses becomes the structured turn, and any
-quoted markup before it stays ordinary content. Generated reasoning closes only at a `</think>`
+quoted markup before it stays ordinary content. A marker inside a Markdown code fence (```` ``` ```` or
+`~~~`) or inline code of the answer is a quoted example and stays content even when it is a complete
+call; only the text before the marker decides, so streamed and complete responses agree. A marker
+after a closed fence, or after a sentence on the same line, still opens a call. Generated reasoning closes only at a `</think>`
 followed by a line break or the end of the turn, so a marker the model quotes while reasoning (followed
 by a space, punctuation or an escaped `
 `) stays in the reasoning channel.
