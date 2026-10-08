@@ -192,13 +192,22 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
         throw std::overflow_error("direct file read exceeds platform I/O limits");
     }
 
-    ssize_t bytes = -1;
-    do {
-        bytes =
-            ::pread(impl_->fd, destination.data(), destination.size(), static_cast<off_t>(offset));
-    } while (bytes < 0 && errno == EINTR);
-    if (bytes < 0) { throw std::system_error(errno, std::generic_category(), "direct file read"); }
-    return static_cast<std::size_t>(bytes);
+    // One pread may return less than requested before the end of the file (FUSE and network
+    // filesystems cap a read), so read until the range is full or the file ends, as the Windows
+    // path does (upstream Neroued/ninfer#381).
+    std::size_t total = 0;
+    while (total < destination.size()) {
+        const ssize_t bytes = ::pread(impl_->fd, destination.data() + total,
+                                      destination.size() - total,
+                                      static_cast<off_t>(offset + total));
+        if (bytes < 0) {
+            if (errno == EINTR) { continue; }
+            throw std::system_error(errno, std::generic_category(), "direct file read");
+        }
+        if (bytes == 0) { break; }
+        total += static_cast<std::size_t>(bytes);
+    }
+    return total;
 }
 
 } // namespace infernix

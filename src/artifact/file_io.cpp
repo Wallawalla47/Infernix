@@ -151,12 +151,23 @@ std::size_t InputFile::read_direct(std::uint64_t offset, std::span<std::byte> de
         direct_fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (direct_fd_ < 0) { fail(path_, "open direct"); }
     }
-    ssize_t read;
-    do {
-        read = ::pread(direct_fd_, destination.data(), destination.size(), file_offset(offset));
-    } while (read < 0 && errno == EINTR);
-    if (read < 0) { fail(path_, "direct pread"); }
-    return static_cast<std::size_t>(read);
+    // One pread may return less than requested before the end of the file (FUSE and network
+    // filesystems cap a read at their own maximum), so read until the range is full or the file
+    // ends, as the Windows path does (upstream Neroued/ninfer#381). O_DIRECT cannot continue from
+    // an unaligned position, so after such a short read the buffered descriptor finishes the range.
+    std::size_t total = 0;
+    while (total < destination.size()) {
+        const int fd    = total % kPayloadAlignment ? fd_ : direct_fd_;
+        const auto rest = destination.subspan(total);
+        const auto read = ::pread(fd, rest.data(), rest.size(), file_offset(offset + total));
+        if (read < 0) {
+            if (errno == EINTR) { continue; }
+            fail(path_, "direct pread");
+        }
+        if (!read) { break; }
+        total += static_cast<std::size_t>(read);
+    }
+    return total;
 #endif
 }
 
