@@ -5,3 +5,15 @@
 
 # Chat template fixtures are acceptance-digested byte-exact content.
 /tests/fixtures/frontend/reasoning_effort_froggeric_v225_chat_template.jinja eol=lf
+
+# Inputs whose exact bytes are the content: digest-checked fixtures and corpora, tokenized texts and
+# chat templates. A CRLF checkout (Git for Windows' default core.autocrlf=true) would fail their
+# digests and feed "\r\n" to the tokenizer, so every checkout keeps the committed LF bytes.
+/bench/fixtures/** eol=lf
+/examples/cli/messages/** eol=lf
+/eval/corpora/** eol=lf
+/tools/freq_corpus/fixtures/** eol=lf
+/tools/chat_templates/** eol=lf
+# Binary fixtures under those paths stay untouched.
+/bench/fixtures/**/*.png binary
+/tools/freq_corpus/fixtures/**/*.i64 binary

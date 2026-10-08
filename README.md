@@ -349,8 +349,11 @@ gives both engines the same 52,000 MiB host cache.
 
 **Quality.** Perplexity on the repository's fixed corpus (all 16 streams, 1,044,876 scored tokens,
 16K context, 8K stride, INT8 KV) with each engine's own `perplexity` tool: NInfer 4.8264, Infernix
-4.8398 (+0.28 %). The [perplexity guide](docs/perplexity.md) measured run-to-run shifts of up to
-~1 % on this NVFP4 artifact from the prefill chunking alone, so the two engines are level. The
+4.8398 (+0.28 %). Both scored a Windows checkout of the corpus in which Git had converted its line
+endings to CRLF; the corpus is now kept as LF on every checkout, which tokenizes slightly
+differently, so a new checkout's absolute values will differ a little while the comparison stands.
+The [perplexity guide](docs/perplexity.md) measured run-to-run shifts of up to ~1 % on this NVFP4
+artifact from the prefill chunking alone, so the two engines are level. The
 offline scorer ran at 5,434 tok/s on NInfer and 5,303 tok/s on Infernix (−2.4 %, one run).
 
 ## Quick start (Windows)
