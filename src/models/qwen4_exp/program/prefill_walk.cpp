@@ -38,10 +38,13 @@ std::size_t ProgramImpl::walk_bytes(std::uint32_t tokens, std::size_t chunks) co
 }
 
 // The exclusive end of the span that starts at lane.next_call; lane.next_call when the call runs
-// chunk-major. Lends the stream lease (with the walk's area) when none is held.
+// chunk-major. Lends the stream lease (with the walk's area) when none is held, or lends it again
+// with the area when the held one has none for the span (another lane's chunk-major calls lent
+// it). Another prefilling lane waits while the span runs (context_blocks), so two long prompts
+// walk span by span instead of both re-streaming every expert per call.
 std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     const std::size_t first = lane.next_call;
-    if (!expert_stream_ || residency_->frames() == 0 || walk_.active || prefilling_besides(index)) { return first; }
+    if (!expert_stream_ || residency_->frames() == 0 || walk_.active) { return first; }
     std::size_t end     = first;
     std::uint32_t from  = lane.state_tokens;
     std::uint32_t total = 0;
@@ -56,6 +59,10 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         if (prefix_tap_due(lane, end)) { break; }
     }
     if (end - first < 2) { return first; }
+    if (stream_lease_.valid() && walk_bytes(tokens[2], 2) > stream_walk_bytes_) {
+        // Between calls nothing reads the lease; its frames go back and come out again with the area.
+        return_stream_lease();
+    }
     if (!stream_lease_.valid()) {
         // Sized for the prompt's largest span: as many tokens as remain (at most the cap) in calls
         // of the configured chunk, plus a remainder call.
