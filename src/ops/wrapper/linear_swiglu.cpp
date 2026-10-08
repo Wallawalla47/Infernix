@@ -3,6 +3,7 @@
 
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
+#include "ops/linear_swiglu/bf16/bf16_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
@@ -43,6 +44,13 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, min_tokens});
         (void)detail::q8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
+        return 0;
+    }
+    if (qtype == QType::BF16) {
+        // The register-streamed route of Qwen3.8-Flash-Next's shared expert, decode widths only.
+        if (gate_up_rows != 1280 || input_rows != 2560 || max_tokens > detail::kBf16LinearSwiGluStreamMaxColumns) {
+            throw std::invalid_argument("linear_swiglu workspace: BF16 serves gate/up [1280, 2560] at 1..16 columns");
+        }
         return 0;
     }
     if (qtype == QType::Q4_G64_FP16) {
@@ -90,6 +98,13 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     }
     if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
         throw std::invalid_argument("linear_swiglu: x/out must be non-null and 16-byte aligned");
+    }
+    if (gate_up_weight.qtype == QType::BF16) {
+        if (!detail::bf16_linear_swiglu_stream_pair_supported(x, gate_up_weight, out)) {
+            throw std::invalid_argument("linear_swiglu: BF16 serves gate/up [1280, 2560] at 1..16 columns");
+        }
+        detail::bf16_linear_swiglu_stream_pair_launch(x, gate_up_weight, out, stream);
+        return;
     }
 
     const bool common_row_split =

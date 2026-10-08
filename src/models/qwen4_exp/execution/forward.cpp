@@ -43,7 +43,10 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
 // weights (recipe A) project, split and multiply.
 void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
                    cudaStream_t s) {
-    if (gate_up.weight.qtype == QType::Q8_G32_FP16) {
+    // Q8 (Dense8) at every width; BF16 (the bit-exact artifact) on its register-streamed route at decode
+    // and verification widths, the tuned GEMM then SwiGLU beyond.
+    if (gate_up.weight.qtype == QType::Q8_G32_FP16 ||
+        (gate_up.weight.qtype == QType::BF16 && x.ne[1] <= 16)) {
         ops::linear_swiglu(x, gate_up.weight, out, gate_up.policy, work, s);
         return;
     }
