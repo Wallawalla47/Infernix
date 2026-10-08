@@ -156,6 +156,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   about as fast as a cold start when it does not; the other half stays free to fill quickly. `--expert-state FILE` moves the file; `--expert-state off` starts with an empty cache,
   as cold benchmarks need. Output is the same either way: where an expert is computed never
   changes a bit.
+- The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
+  the session and the last ten requests.
 - After each request the engine logs two Info lines: the expert cache's hit rate, and the
   request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
   of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
@@ -192,7 +194,12 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
 
 When the routed experts do not all fit in RAM, or `--expert-ram-mib N` caps them below the ~64.5 GiB
 they need, the experts stay in the artifact: startup pins N MiB (or what the ledger leaves) of
-expert slots and fills them with the saved ranking of `--expert-state`, then the rest in file order.
+expert slots and fills all but ~430 of them (kept free for reads and demotions) before the first
+request. RAM and VRAM hold different experts: the VRAM warm start takes the top of the saved
+ranking of `--expert-state`, and RAM the next ones, then the experts the last session used most,
+then the rest spread evenly across the layers (the same spread with no saved state). The tier's
+usage ranking starts from the saved counts, so the best-ranked RAM experts are not the first to
+be replaced. A VRAM eviction of an expert worth keeping copies it back into RAM.
 A round that routes an expert in neither VRAM nor RAM reads it from the artifact while the layer's
 other experts compute: decode and verification hand it to the CPU expert engine, prefill copies it
 from the read as soon as it lands. Read experts that rank above the coldest RAM expert replace it.
