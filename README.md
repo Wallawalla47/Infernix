@@ -380,7 +380,8 @@ For Qwen3.8-Flash-Next, see the [Flash-Next guide](docs/qwen3_8-flash-next.md#ru
 infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 65536 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft
 ```
 
-Add `--prefix-cache-file PATH` to keep the prefix cache across restarts, and
+Add `--prefix-cache-file PATH` to keep the prefix cache across restarts (with
+`--prefix-cache-save-mins N` it is also saved every N minutes, so a crash loses less), and
 `--reasoning-loop conclude` to end a thinking phase that keeps repeating itself. Stop the server
 with Ctrl+C twice (the first press asks for confirmation); it then saves the cache and exits.
 `infernix-serve.exe --help` lists every option by category.

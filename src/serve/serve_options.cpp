@@ -246,6 +246,15 @@ std::string serve_usage_text(const char* argv0) {
            "                             shutdown (Ctrl+C twice); relative paths resolve\n"
            "                             against the launch directory (default off:\n"
            "                             nothing is saved)\n"
+           "  --prefix-cache-save-mins N also save the host tier to --prefix-cache-file\n"
+           "                             every N minutes while serving, when it changed;\n"
+           "                             requests wait while it is written (default off:\n"
+           "                             only at shutdown). The file is replaced only once\n"
+           "                             the new one is complete. WARNING: each save\n"
+           "                             rewrites the whole file (up to --host-context-mib,\n"
+           "                             several GB), so a short interval writes a lot to\n"
+           "                             the drive and wears an SSD faster; prefer 15-60\n"
+           "                             minutes\n"
            "  --device-snapshot-slots N  device state snapshot slots (default concurrency\n"
            "                             + 1; + 2 without a host tier). Qwen3.8-Flash-\n"
            "                             Next has none\n"
@@ -555,6 +564,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
             hybrid_option_flag = "--prefix-cache-file";
+        } else if (arg == "--prefix-cache-save-mins") {
+            const int minutes = parse_nonnegative_int(require_value("--prefix-cache-save-mins"), "prefix-cache-save-mins");
+            if (minutes == 0) { throw std::invalid_argument("--prefix-cache-save-mins must be positive"); }
+            options.context_cache.hybrid.persistent_save_interval = std::chrono::minutes(minutes);
+            hybrid_option_flag = "--prefix-cache-save-mins";
         } else if (arg == "--no-queue-holds") {
             options.context_cache.hybrid.queue_holds = false;
             hybrid_option_flag                       = "--no-queue-holds";
@@ -774,6 +788,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                         "--use-original-prefix-caching");
         }
         std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        if (file.empty() && options.context_cache.hybrid.persistent_save_interval.count() != 0) {
+            throw std::invalid_argument("--prefix-cache-save-mins saves to --prefix-cache-file, which is not set");
+        }
         if (!file.empty()) {
             if (host_context_explicit && options.context_cache.host_capacity_bytes == 0) {
                 throw std::invalid_argument(

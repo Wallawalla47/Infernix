@@ -3832,11 +3832,13 @@ public:
                                                     const StartupObserver& observer);
     void save_prefix_cache_for_shutdown() noexcept;
     [[nodiscard]] std::optional<PrefixCachePersistence> prefix_shutdown_save() const { return prefix_shutdown_save_; }
+    [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
 
 private:
     std::filesystem::path prefix_file_;
     std::string prefix_fingerprint_;
     std::optional<PrefixCachePersistence> prefix_shutdown_save_;
+    std::uint64_t prefix_saved_writes_ = 0; // host_write_bytes at the last save or load
 
 public:
     [[nodiscard]] HybridPrefixCacheStats prefix_stats() const noexcept;

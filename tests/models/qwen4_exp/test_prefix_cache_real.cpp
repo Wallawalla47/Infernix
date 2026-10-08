@@ -24,6 +24,7 @@
 #include "kv_cache_storage.h"
 #include "infernix/engine.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -282,6 +284,37 @@ int run_persistence(const char* artifact, const char* ngram) {
         failures += check(after.generated_token_ids == before.generated_token_ids,
                           "the restored resume equals Engine 1's turn 2 (" +
                               first_difference(after.generated_token_ids, before.generated_token_ids) + ")");
+    }
+    std::filesystem::remove(file, ignored);
+
+    // The periodic save (persistent_save_interval): the file appears while the Engine runs, through
+    // its .tmp, once the interval has passed after a change. A save during the request may find the
+    // Host tier still filling and the next one rewrite it; once the Host tier stops changing, the
+    // file holds the endpoint and is not rewritten.
+    {
+        infernix::EngineOptions o                       = options();
+        o.context_cache.hybrid.persistent_save_interval = std::chrono::seconds(1);
+        infernix::Engine engine(o);
+        failures += check(!std::filesystem::exists(file), "the periodic test starts without a file");
+        (void)chat_on(engine, turn1, 16);
+        std::filesystem::path tmp = file;
+        tmp += ".tmp";
+        bool saved = false;
+        for (int i = 0; i < 100 && !saved; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            saved = std::filesystem::exists(file) && !std::filesystem::exists(tmp);
+        }
+        failures += check(saved, "the periodic save wrote the file while the Engine was idle");
+        bool settled = false;
+        for (int i = 0; i < 4 && saved && !settled; ++i) {
+            const auto written = std::filesystem::last_write_time(file, ignored);
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            settled = std::filesystem::last_write_time(file, ignored) == written;
+        }
+        failures += check(settled, "an unchanged Host tier is not saved again");
+        const std::uintmax_t size = saved ? std::filesystem::file_size(file, ignored) : 0;
+        failures += check(size > (std::uintmax_t{64} << 20),
+                          "the settled periodic file holds turn 1's snapshot (" + std::to_string(size) + " bytes)");
     }
     std::filesystem::remove(file, ignored);
     return failures;

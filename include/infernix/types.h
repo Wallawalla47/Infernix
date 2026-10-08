@@ -276,6 +276,12 @@ struct HybridPrefixCacheOptions {
     std::string persistent_identity;
     // Lets the product abandon the save at shutdown (infernix-serve: Ctrl+C during the stop).
     PrefixCacheSaveControl persistent_save;
+    // With `persistent_file`: also save the Host tier this often while the Engine runs (zero: only
+    // at shutdown). A save runs at the first worker boundary once the interval has passed, also
+    // while requests run (it pauses generation for its duration), and only when the Host tier has
+    // been written since the last save. Like the shutdown save it writes `<file>.tmp` and replaces
+    // the file only once complete; stopping the Engine abandons a periodic save in progress.
+    std::chrono::seconds persistent_save_interval{0};
     // Queue holds: the snapshot each queued request would resume from, and its path, are evicted
     // after every other cache entry, the request furthest back in the queue first; new snapshots
     // and Host block writes that would need a held snapshot's slabs are skipped instead. False

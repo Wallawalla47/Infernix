@@ -162,7 +162,23 @@ HybridCachePersistence ProgramImpl::attach_hybrid_cache_file(const std::filesyst
     HybridCachePersistence loaded = public_result(hybrid_->load(path, fingerprint, observer));
     hybrid_file_                  = path;
     hybrid_fingerprint_           = std::move(fingerprint);
+    hybrid_saved_writes_          = hybrid_->counters().host_write_bytes;
     return loaded;
+}
+
+std::optional<HybridCachePersistence> ProgramImpl::save_hybrid_cache_now(const CancellationView& abandoned) {
+    if (!hybrid_ || hybrid_file_.empty() || hybrid_->counters().host_write_bytes == hybrid_saved_writes_) {
+        return std::nullopt;
+    }
+    // As at shutdown: every Host write lands before the slabs are read; lanes pinning a path do not
+    // matter, the save only reads.
+    device.synchronize();
+    if (device.transfer_stream != nullptr) { CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream)); }
+    hybrid_->drain();
+    const std::uint64_t written = hybrid_->counters().host_write_bytes;
+    HybridCachePersistence saved = public_result(hybrid_->save(hybrid_file_, hybrid_fingerprint_, abandoned));
+    if (saved.ok) { hybrid_saved_writes_ = written; }
+    return saved;
 }
 
 void ProgramImpl::save_hybrid_cache_for_shutdown() noexcept {

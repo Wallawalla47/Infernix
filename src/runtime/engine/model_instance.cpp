@@ -59,6 +59,12 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
     }
+    if (const auto interval = options.context_cache.hybrid.persistent_save_interval; interval.count() != 0) {
+        if (interval.count() < 0) { throw std::invalid_argument("prefix cache save interval must not be negative"); }
+        if (options.context_cache.hybrid.persistent_file.empty()) {
+            throw std::invalid_argument("a periodic prefix cache save needs a prefix cache file");
+        }
+    }
     if (options.enable_vision && options.media_live_bytes == 0) {
         throw std::invalid_argument(
             "Engine media_live_bytes must be nonzero when Vision is enabled");
