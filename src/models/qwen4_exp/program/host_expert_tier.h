@@ -77,10 +77,11 @@ public:
     [[nodiscard]] std::size_t record_bytes() const noexcept { return store_.record_bytes(); }
 
     // ---- engine thread, no round in flight
-    // Reads the first keys of `ranked` (best first) into free resident slots; returns how many.
+    // Reads the keys of `ranked` (best first) that have no host copy into free resident slots until
+    // none is left; returns how many.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked);
-    // A round boundary: admits the last round's landings (T10), then hands the agent a fresh ring and
-    // opens the round. `allowance` is the boundary's demotion allowance (HostTier::begin_round).
+    // A round boundary: admits the last round's landings (T10), refills the demotion list, then hands
+    // the agent a fresh ring and opens the round. `allowance` is the boundary's demotion allowance (HostTier::begin_round).
     void begin_round(std::uint32_t allowance);
     // The round's kernels have completed (or it was abandoned): the agent stops spinning.
     void end_round() noexcept;

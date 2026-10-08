@@ -380,12 +380,88 @@ void test_stream_pins() {
     tier.check();
 }
 
+// ---- the warm start's fill (seeded ranking, released shadows)
+void test_warm_fill() {
+    // Without seeds every pre-filled key scores 0 and the lowest slot, which the pre-fill gave the
+    // best-ranked key, is the first victim.
+    {
+        HostTier tier(small_config());
+        for (std::uint32_t k = 0; k < 8; ++k) {
+            std::int32_t slot = -1;
+            check(tier.prefill(k, slot), "prefill");
+        }
+        tier.begin_round(32);
+        const std::uint32_t used[] = {40};
+        tier.record_uses(1, used, 5.0);
+        const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), 40};
+        check(tier.admit({&landing, 1}, false) == 1 && !tier.host_copy(0), "unseeded: the best-ranked key goes first");
+    }
+    // Seeded with the last session's counts (key k used 8 - k times), the least used one goes.
+    HostTier tier(small_config());
+    std::vector<std::uint32_t> counts(100, 0);
+    for (std::uint32_t k = 0; k < 8; ++k) { counts[k] = 8 - k; }
+    counts[50] = 100; // capped
+    tier.seed_uses(counts, 16);
+    check(tier.lfu().score(50) == 16.0 && tier.lfu().score(0) == 8.0 && tier.lfu().score(60) == 0.0,
+          "seeds are capped counts at the current time");
+    for (std::uint32_t k = 0; k < 8; ++k) {
+        std::int32_t slot = -1;
+        check(tier.prefill(k, slot), "prefill");
+    }
+    check(!tier.has_free_resident(), "the resident slots are full");
+    tier.begin_round(32);
+    {
+        const std::uint32_t used[] = {40};
+        tier.record_uses(1, used, 5.0);
+    }
+    const Landing landing{tier.ring()[0], tier.serial(tier.ring()[0]), 40};
+    check(tier.admit({&landing, 1}, false) == 1 && !tier.host_copy(7) && tier.host_copy(0) && tier.host_copy(40),
+          "seeded: the least-used key goes first");
+    tier.check();
+    (void)dirty(tier);
+
+    // The frames' warm start loads keys 1 and 2 (published: shadows); key 3's load is still in flight.
+    for (const std::uint32_t k : {1U, 2U, 3U}) {
+        tier.queued(k);
+        tier.promotion_issued(k);
+    }
+    tier.promotion_completed(1, true);
+    tier.promotion_completed(2, true);
+    check(tier.shadow_count() == 2, "two shadows");
+    check(tier.release_shadows() == 2 && tier.shadow_count() == 0, "release_shadows frees the published copies");
+    check(!tier.host_copy(1) && !tier.host_copy(2) && tier.host_copy(3), "a pinned slot keeps its key");
+    check(dirty(tier) == std::vector<std::uint32_t>{1, 2}, "released keys are dirty");
+    tier.check();
+    std::int32_t slot = -1;
+    check(tier.prefill(90, slot) && tier.prefill(91, slot) && !tier.has_free_resident(),
+          "the released slots take the next keys");
+    check(tier.release_shadows() == 0, "nothing more to release");
+    // A released key VRAM evicts later is demoted like any key without a host copy (T4).
+    {
+        const std::uint32_t used[] = {1};
+        tier.record_uses(0, used, 1000.0);
+    }
+    std::uint32_t target = 0;
+    check(tier.vram_evicted(1, true, target) == VramEviction::kDemote, "a released seed is demoted when evicted");
+    tier.demotion_completed(1, target, false);
+    check(tier.host_copy(1), "the demoted seed is back in RAM");
+    tier.check();
+    bool threw = false;
+    try {
+        tier.seed_uses(std::vector<std::uint32_t>(99, 1), 16);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    check(threw, "seed counts of another key count are refused");
+}
+
 } // namespace
 
 int main() {
     try {
         test_lfu();
         test_transitions();
+        test_warm_fill();
         test_stream_pins();
         test_random();
     } catch (const std::exception& e) {

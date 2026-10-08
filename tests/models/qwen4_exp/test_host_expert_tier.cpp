@@ -33,6 +33,7 @@ namespace {
 
 using infernix::models::qwen4_exp::ExpertStore;
 using infernix::models::qwen4_exp::HostExpertTier;
+namespace expert_cache = infernix::models::qwen4_exp::expert_cache;
 
 constexpr std::uint32_t kLayers = 3, kExperts = 40, kKeys = kLayers * kExperts;
 constexpr std::uint64_t kRecord = 8192; // two 4 KiB blocks
@@ -306,6 +307,41 @@ int main(int argc, char** argv) {
             std::cout << "host expert tier: " << tier.stats().demand_reads << " demand reads, "
                       << tier.stats().demand_failures << " failed, " << tier.stats().admitted << " admitted\n";
             tier.begin_round(32);
+        }
+        {
+            // The warm start's second pass: the frames took keys 0 and 1 (their RAM copies become
+            // shadows and are released), and the refill skips keys that still have a copy.
+            HostExpertTier tier(store, options());
+            std::vector<std::uint32_t> ranked(50);
+            for (std::uint32_t k = 0; k < 50; ++k) { ranked[k] = k; }
+            check(tier.prefill(ranked) == 50, "warm fill: the first pass fills the resident slots");
+            auto& host = tier.controller();
+            for (const std::uint32_t k : {0U, 1U}) {
+                host.queued(k);
+                host.promotion_issued(k);
+                host.promotion_completed(k, true);
+            }
+            check(host.release_shadows() == 2 && tier.record(0) == nullptr && tier.record(1) == nullptr,
+                  "warm fill: the seeds' RAM copies are released");
+            const std::vector<std::uint32_t> next{5, 6, 50, 51, 52};
+            check(tier.prefill(next) == 2, "warm fill: the refill skips keys with a copy and stops when full");
+            check(matches(tier.record(50), 50) && matches(tier.record(51), 51) && tier.record(52) == nullptr,
+                  "warm fill: the refilled records equal the file bytes");
+            host.check();
+
+            // A demotion takes a slot of the demotion list; the next boundary refills the list.
+            const std::vector<std::uint32_t> hot{60};
+            tier.record_uses(1, hot, 1000.0);
+            std::uint32_t target = 0;
+            check(host.vram_evicted(60, true, target) == expert_cache::VramEviction::kDemote &&
+                      host.demotion_slots() == 3,
+                  "a demotion takes a slot of the demotion list");
+            tier.begin_round(32);
+            check(host.demotion_slots() == 4, "the boundary refills the demotion list");
+            tier.end_round();
+            host.demotion_completed(60, target, false);
+            check(tier.record(60) != nullptr, "the demoted record is in RAM");
+            host.check();
         }
         if (argc > 1 && std::string_view(argv[1]) == "--fetch") { test_fetch(store); }
         {
