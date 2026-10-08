@@ -1139,6 +1139,7 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   runs alone; the rest run in waves of `--max-concurrency` and resume from the cached evidence, so
   N questions over one state (an image included) prefill and encode it once.
   `usage.cached_input_tokens` and `usage.computed_prefill_tokens` show the split.
+  `usage.output_tokens` counts the generated primitives' output steps; readout questions add none.
 - **Failures after validation are per question**: a question that fails during execution answers
   `{"type": "error", "code", "message"}` beside its siblings' answers. A request whose every
   question failed returns the first question's error status instead.

@@ -193,6 +193,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
         QuestionRun& run      = runs[q];
         const std::string& id = request.questions[q].id;
         input_tokens += static_cast<std::uint64_t>(std::max(0, run.prompt_tokens));
+        output_tokens += static_cast<std::uint64_t>(std::max(0, run.output_tokens));
         computed += run.computed_tokens;
         cached += run.cached_tokens;
         if (run.answer) {
@@ -215,7 +216,7 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
     body["model"]                            = public_model_id_;
     body["answers"]                          = std::move(answers);
     body["usage"]["input_tokens"]            = input_tokens;
-    body["usage"]["output_tokens"]           = 0;
+    body["usage"]["output_tokens"]           = output_tokens;
     body["usage"]["cached_input_tokens"]     = cached;
     body["usage"]["computed_prefill_tokens"] = computed;
     res.set_content(body.dump(-1, ' ', false, RequestJson::error_handler_t::replace),
