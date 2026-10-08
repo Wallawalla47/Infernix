@@ -30,7 +30,7 @@ tags:
 
 NVIDIA's [Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4) — 48
 layers, 512 routed experts per layer (top-10), an MTP drafter and vision — packed for
-[Infernix](https://github.com/Wallawalla47/ninfer-custom/tree/Infernix), a C++/CUDA engine that runs
+[Infernix](https://github.com/Wallawalla47/Infernix), a C++/CUDA engine that runs
 it on **one RTX 5090** (32 GB). The 24,576 routed experts (63 GiB) live in pinned host RAM, a VRAM
 cache holds the hot ones, the CPU computes part of each layer's misses, and the 52 GB PLE n-gram
 table is read from an NVMe drive.
@@ -47,9 +47,6 @@ for the full model to verify, is quantized further.
 > at 8K, and measured the same quality (perplexity 4.654 against this artifact's 4.666). Choose this
 > artifact when the weights must be NVIDIA's unchanged; otherwise Dense8 is the faster choice. See
 > [Performance](#performance).
-
-Until 2026-10-08 this repository held the 8-bit dense conversion under this name; it is now the
-Dense8 repository above.
 
 ## Files
 
@@ -119,7 +116,7 @@ The n-gram volume's 8.19 includes its 4 KiB block padding; the table itself is 8
   from the artifact (slower).
 - **Disk:** ~80 GB for the artifact, plus the 52 GB n-gram volume on an NVMe drive. A fast
   consumer drive is enough; a SATA SSD or a hard disk is far slower.
-- **Engine:** Infernix (Windows or Linux), branch `Infernix`.
+- **Engine:** [Infernix](https://github.com/Wallawalla47/Infernix) (Windows or Linux).
 
 ## Run
 
@@ -131,7 +128,7 @@ infernix-serve Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix-00001-of-00003.infernix 
 ```
 
 It serves the OpenAI Chat Completions and Responses APIs and the Anthropic Messages API. The
-[Flash-Next guide](https://github.com/Wallawalla47/ninfer-custom/blob/Infernix/docs/qwen3_8-flash-next.md)
+[Flash-Next guide](https://github.com/Wallawalla47/Infernix/blob/main/docs/qwen3_8-flash-next.md)
 covers the KV formats, YaRN beyond 262K, images and video, the prefix cache, the SSD expert tier
 and tuning.
 
@@ -155,7 +152,7 @@ probability) with its standard error. The two conversions are level within that 
 
 RTX 5090 in a PCIe Gen5 **x8** link (x16 is likely faster, most of all for this model, whose
 expert-cache misses cross PCIe on every token), Core i9-13900K, 96 GB DDR5, Windows 11; Infernix
-`Infernix` branch with the 2026-10-08 BF16 kernels, INT8 KV, MTP with 4 drafts and the proposal
+with the 2026-10-08 BF16 kernels, INT8 KV, MTP with 4 drafts and the proposal
 head; one request at a time, greedy, 1,024 output tokens, means over two or three prompts of each
 request's median of three sessions. Beside it, the Dense8 conversion on the same build:
 
@@ -172,7 +169,7 @@ text is, so single prompts vary by up to ±20 %. Against Strata 0.1.40 on the sa
 UD-Q4_K_XL with its MTP drafter; 12.3 s, 103 s and 158 s to the first token and 86, 77 and 96
 tok/s at the same contexts, measured on 7 October), this artifact reaches the first token 4.6-5.9×
 sooner and decodes 1.3-1.4× faster. Methods are in the
-[Infernix README](https://github.com/Wallawalla47/ninfer-custom/blob/Infernix/README.md#benchmarks).
+[Infernix README](https://github.com/Wallawalla47/Infernix/blob/main/README.md#benchmarks).
 
 ## Provenance
 
