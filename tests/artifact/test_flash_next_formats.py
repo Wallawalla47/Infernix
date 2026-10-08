@@ -1,4 +1,4 @@
-"""nvfp4_mul expert banks (nvfp4_expert_rg16_v1) and block-scaled FP8 (block128_scale_v1)."""
+"""nvfp4_mul expert banks (nvfp4_expert_rg16_v1)."""
 
 from __future__ import annotations
 
@@ -7,11 +7,6 @@ import struct
 import pytest
 import torch
 
-from tools.artifact.codecs.fp8_block import (
-    decode_fp8_block128_words,
-    dequantize_fp8_block128,
-    encode_fp8_block128,
-)
 from tools.artifact.codecs.nvfp4_expert import (
     decode_nvfp4_expert_bank_words,
     dequantize_nvfp4_mul,
@@ -19,7 +14,7 @@ from tools.artifact.codecs.nvfp4_expert import (
     expert_bank_record_offset,
 )
 from tools.artifact.formats import decode_e2m1_word, decode_e4m3fn_word
-from tools.artifact.layouts import block128_geometry, encoded_size, expert_bank_geometry
+from tools.artifact.layouts import encoded_size, expert_bank_geometry
 
 
 def _random_bank(e: int, h: int, i: int, seed: int = 0):
@@ -135,25 +130,3 @@ def test_bank_rejects_invalid_words():
         encode_nvfp4_expert_bank(**bad, shape=(1, 32, 16))
     with pytest.raises(ValueError):
         decode_nvfp4_expert_bank_words(b"\0" * 7, (1, 32, 16))
-
-
-def test_fp8_block128_round_trip_and_exact_values():
-    shape = (2, 300, 260)  # edge tiles in both axes
-    geo = block128_geometry("fp8_e4m3fn_block128_f32", shape)
-    assert (geo.scale_rows, geo.scale_cols) == (3, 3)
-    g = torch.Generator().manual_seed(1)
-    codes = torch.randint(0, 256, shape, generator=g, dtype=torch.uint8)
-    codes[(codes & 0x7F) == 0x7F] = 0
-    scales = torch.rand((2, 3, 3), generator=g, dtype=torch.float32) + 0.01
-    payload = encode_fp8_block128(codes, scales, shape)
-    assert len(payload) == encoded_size("block128_scale_v1", "fp8_e4m3fn_block128_f32", shape)
-    c2, s2 = decode_fp8_block128_words(payload, shape)
-    assert torch.equal(c2, codes) and torch.equal(s2.view(torch.int32), scales.view(torch.int32))
-    w = dequantize_fp8_block128(c2, s2)
-    for b, n, k in ((0, 0, 0), (1, 299, 259), (0, 128, 255), (1, 257, 128)):
-        expect = decode_e4m3fn_word(int(codes[b, n, k])) * float(scales[b, n // 128, k // 128])
-        assert float(w[b, n, k]) == expect
-    bad = codes.clone()
-    bad[0, 0, 0] = 0x7F
-    with pytest.raises(ValueError):
-        encode_fp8_block128(bad, scales, shape)

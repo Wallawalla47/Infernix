@@ -31,7 +31,7 @@ Branch: `claude/wonderful-ritchie-65xtnh` (17 commits on top of `master`, from `
 | What | Path |
 |---|---|
 | **Design (the authority)** | [`docs/maintainer/qwen3_8-flash-next-design.md`](qwen3_8-flash-next-design.md): performance model §4, artifact §6, decode pipeline and kernels §8, expert cache §9, CPU engine §10, speculation §11, NVMe PLE §12, calibration §14, numerics §16, milestones §19, **status §19.1** |
-| Format and layout definitions | [`tensor-formats.md`](tensor-formats.md) §3.5 `nvfp4_mul`, §3.6 `fp8_e4m3fn_block128_f32`; [`storage-layouts.md`](storage-layouts.md) §6 `nvfp4_expert_rg16_v1`, §7 `block128_scale_v1` |
+| Format and layout definitions | [`tensor-formats.md`](tensor-formats.md) §3.5 `nvfp4_mul`; [`storage-layouts.md`](storage-layouts.md) §6 `nvfp4_expert_rg16_v1` |
 | Canonical W4A4 arithmetic, shared by CPU and GPU | `src/ops/common/canonical_math.h` |
 | CPU expert kernels (scalar, AVX2, AVX-VNNI, AVX-512 VNNI) | `src/ops/offloaded_sparse_moe/cpu/w4a4_expert.{h,cpp}` |
 | CPU worker team (§10.3) | `src/ops/offloaded_sparse_moe/cpu/expert_team.{h,cpp}` |
@@ -40,8 +40,8 @@ Branch: `claude/wonderful-ritchie-65xtnh` (17 commits on top of `master`, from `
 | Host expert cache: LFRU, residency words, frame epochs, controller | `src/models/qwen4_exp/program/expert_cache/expert_cache.{h,cpp}` |
 | PLE n-gram row ids | `src/models/qwen4_exp/frontend/ngram_hash.{h,cpp}` |
 | Model build wiring | `src/models/qwen4_exp/program_sources.cmake` |
-| C++ format registration | `src/core/weight.h` (`QType::NVFP4_MUL`, `FP8_E4M3FN_BLOCK128_F32`; `QuantLayout::ExpertRg16`, `Block128Scale`), `src/artifact/formats.cpp`, `src/core/weight_view.{h,cpp}` (`expert_bank_planes`, `block128_planes`) |
-| Python formats, layouts and codecs | `tools/artifact/formats.py`, `tools/artifact/layouts.py`, `tools/artifact/codecs/nvfp4_expert.py`, `tools/artifact/codecs/fp8_block.py` |
+| C++ format registration | `src/core/weight.h` (`QType::NVFP4_MUL`; `QuantLayout::ExpertRg16`), `src/artifact/formats.cpp`, `src/core/weight_view.{h,cpp}` (`expert_bank_planes`) |
+| Python formats, layouts and codecs | `tools/artifact/formats.py`, `tools/artifact/layouts.py`, `tools/artifact/codecs/nvfp4_expert.py` |
 | ModelOpt source readers | `tools/convert/sources/modelopt.py` |
 | M0 checkpoint inspector | `tools/flash_next/inspect_checkpoint.py` |
 | A4 quantizer reference vs ModelOpt | `tools/flash_next/a4_reference.py` |

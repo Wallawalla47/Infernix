@@ -18,7 +18,6 @@ from typing import Mapping
 
 import torch
 
-from tools.artifact.codecs.fp8_block import dequantize_fp8_block128
 from tools.artifact.codecs.nvfp4_expert import encode_nvfp4_expert_bank
 from tools.artifact.layouts import expert_bank_geometry
 from tools.flash_next.ngram import NgramConfig, head_tables, layer_multipliers
@@ -28,7 +27,7 @@ from .model import Model, Parameter
 from .qwen3_5 import _Builder, _f32, _fixed, _positive, _rope_source, vision_config
 from .resources import load_resources
 from .sources.logical import LogicalSource
-from .sources.modelopt import fp8_block_matrix_words, nvfp4_matrix_words
+from .sources.modelopt import dequantize_fp8_block128, fp8_block_matrix_words, nvfp4_matrix_words
 from .sources.safetensors import SafetensorsSource, tensor_source
 
 ARCHITECTURES = ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")

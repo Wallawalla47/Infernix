@@ -118,3 +118,12 @@ def nvfp4_expert_bank(
     )
     shared = bool(torch.equal(input_scales[:, 0].view(torch.int32), input_scales[:, 1].view(torch.int32)))
     return ExpertBank(payload=payload, input_scales=input_scales, shared_gate_up_input=shared)
+
+
+def dequantize_fp8_block128(codes: torch.Tensor, scales: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """Exact represented weights in binary64 (4 + 24 significant bits)."""
+
+    n, k = codes.shape[-2:]
+    expanded = scales.to(torch.float64).repeat_interleave(block, dim=-2)[..., :n, :]
+    expanded = expanded.repeat_interleave(block, dim=-1)[..., :k]
+    return codes.view(torch.float8_e4m3fn).to(torch.float64) * expanded
