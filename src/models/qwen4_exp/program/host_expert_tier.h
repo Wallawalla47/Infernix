@@ -62,6 +62,8 @@ public:
         std::uint64_t demand_reads = 0, demand_failures = 0, prefill_reads = 0, admitted = 0, discarded = 0;
         std::uint64_t fetch_requests = 0, fetch_records = 0, fetch_from_ram = 0; // the fetch channel's
         std::uint64_t read_ns = 0; // demand reads, submit to landing, summed
+        // Scatter reads of records that follow each other in a file, and the records they read.
+        std::uint64_t run_reads = 0, run_records = 0;
     };
 
     HostExpertTier(const ExpertStore& store, Options options);
@@ -134,6 +136,10 @@ private:
     void agent_main();
     // Agent: submits the reads of `key` into `slot` with tags (kind, index, segment).
     void submit(std::uint32_t key, std::uint32_t slot, std::uint64_t tag_base);
+    // Whether `key`'s record starts where `before`'s ends, each in one segment of the same file.
+    [[nodiscard]] bool follows(std::uint32_t before, std::uint32_t key) const;
+    // Agent: one scatter read of a run of (key, slot) whose records follow each other in a file.
+    void submit_run(std::span<const std::pair<std::uint32_t, std::uint32_t>> run, std::uint64_t tag);
     // A new ticket of this round for `key` (kNoTicket when the round has run out); resident when the
     // key is in RAM, else pending a read.
     std::uint32_t new_ticket(std::uint32_t key, std::int32_t fetch);
@@ -174,6 +180,7 @@ private:
     // Written by the agent; read at boundaries.
     std::atomic<std::uint64_t> agent_reads_{0}, agent_failures_{0}, agent_read_ns_{0};
     std::atomic<std::uint64_t> agent_fetch_requests_{0}, agent_fetch_records_{0}, agent_fetch_from_ram_{0};
+    std::atomic<std::uint64_t> agent_run_reads_{0}, agent_run_records_{0};
     std::uint32_t prefill_failures_ = 0; // published to prefill() by prefill_done_
     std::thread agent_;
 };

@@ -43,6 +43,14 @@ public:
         std::uint32_t posix_workers = 4;
     };
 
+    // One destination of a scatter read; 4 KiB-aligned, a positive multiple of 4 KiB.
+    struct Target {
+        void* destination = nullptr;
+        std::size_t bytes = 0;
+    };
+    // A scatter read lands in at most this many destinations.
+    static constexpr std::size_t kMaxTargets = 16;
+
     struct Read {
         std::uint32_t file   = 0; // from open()
         std::uint64_t offset = 0;
@@ -50,6 +58,10 @@ public:
         void* destination    = nullptr;
         Priority priority    = Priority::Demand;
         std::uint64_t tag    = 0; // returned with the completion
+        // When not empty, a scatter read: the file range lands in these destinations in order
+        // (their bytes sum to `bytes`) as one device read, and `destination` is unused. Neighbouring
+        // records read this way reach a higher device rate than as separate reads. Demand only.
+        std::vector<Target> scatter;
     };
 
     struct Completion {

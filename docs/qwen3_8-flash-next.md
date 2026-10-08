@@ -208,7 +208,9 @@ be replaced. A VRAM eviction of an expert worth keeping copies it back into RAM.
 A round that routes an expert in neither VRAM nor RAM reads it from the artifact while the layer's
 other experts compute: decode and verification hand it to the CPU expert engine, prefill copies it
 from the read as soon as it lands. Read experts that rank above the coldest RAM expert replace it.
-Outputs are the same bits as with every expert in RAM; only speed changes, with the share of routed
+Records that follow each other in the artifact are read as one request (the startup fill up to
+32 MiB, a prefill's fetched experts up to 12 MiB), which the drive serves faster than one request
+per expert. Outputs are the same bits as with every expert in RAM; only speed changes, with the share of routed
 experts read from disk. The tier needs at least 2.6 GiB (1,024 slots). A read that fails fails the
 requests of that round with an error and the server keeps serving.
 
