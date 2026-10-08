@@ -26,9 +26,13 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+  # Sources are UTF-8. Without /utf-8 MSVC reads them in the system code page, and the bundled fmt
+  # rejects any code page but UTF-8 (a stock English or German Windows uses 1252).
   add_compile_options(
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
   # the project-wide /MD runtime. Keep one CRT in the final process.
   add_link_options($<HOST_LINK:/NODEFAULTLIB:LIBCMT>)
