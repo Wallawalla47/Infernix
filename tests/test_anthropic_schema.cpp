@@ -399,6 +399,11 @@ int test_tools() {
 
     body["tools"] = Json::array({ordinary_tool(true)});
     failures += check(parse(body).generation.tools[0].strict, "strict reaches generation");
+    body["tools"][0]["strict"] = "true";
+    failures += check(api_param([&] { (void)parse(body); }) == "tools", "a non-boolean strict is refused");
+    body["tools"][0]["strict"] = nullptr;
+    failures += check(!parse(body).generation.tools[0].strict, "a null strict means not strict");
+    body["tools"][0]["strict"] = true;
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
