@@ -60,6 +60,10 @@ void DecodeGraphDefinition::capture(cudaStream_t stream, const std::function<voi
     nvtx::ScopedRange capture_range(nvtx::Name::CudaGraphCapture, nvtx::Category::Graph);
     reset();
 
+    // Thread-local mode: only this thread's capture-unsafe calls (synchronous copies, allocation,
+    // event queries on the captured stream) invalidate the capture. Other threads of the process
+    // (a Program's SSD read agent, VRAM monitor and n-gram volume reader) are not checked, so they
+    // must never use the captured stream or its events; none does.
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
 
     try {

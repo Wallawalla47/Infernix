@@ -2977,9 +2977,14 @@ private:
         }
         wide_arena_ = std::make_unique<WorkspaceArena>(span);
         std::swap(*work_, *wide_arena_);
+        wide_active_ = true;
     }
 
-    void leave_wide() noexcept { std::swap(*work_, *wide_arena_); }
+    void leave_wide() noexcept {
+        std::swap(*work_, *wide_arena_);
+        wide_active_ = false;
+    }
+    bool wide_active_ = false; // *work_ is the wide arena (enter_wide .. leave_wide)
 
     // After a prompt's last wide call is enqueued: the wide arena's own lease or allocation goes back
     // (the stream lease's part goes back with it).
@@ -3057,6 +3062,11 @@ private:
             body();
             graph.warmed = true;
         } else {
+            // A captured body bakes in whatever it reads by address: the arena *work_ points at and
+            // the per-layer waits forward_call consumes. Neither may be a call's temporary.
+            if (wide_active_ || !next_waits_[0].empty() || !next_waits_[1].empty()) {
+                throw std::logic_error("Qwen4Exp: a graph capture inside a wide call or with pending layer waits");
+            }
             const std::size_t free_before = trace_ ? trace_free() : 0;
             graph.definition.capture(s, body);
             graph.executable.instantiate(graph.definition);
@@ -3591,6 +3601,10 @@ private:
                                .kv_only          = true});
         }
         if (steps == 0) {
+            // No synchronize here: the uploads above may still be queued when the caller stages the
+            // verification round into the same pinned slots and rows, which is safe only because it
+            // stages the same lanes in the same order (and mtp_host_ is next written after that
+            // round's synchronize). A caller that stages other lanes there must synchronize first.
             for (std::int32_t b = 0; b < batch; ++b) {
                 Lane& lane = lanes_[lanes[b]];
                 if (lane.mtp_live) { lane.mtp_cells = lane.state_tokens; }
