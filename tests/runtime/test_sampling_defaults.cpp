@@ -65,15 +65,29 @@ int main() {
                       "MoE mode defaults mismatch");
 
     const infernix::ResolvedSamplingParameters thinking = infernix::runtime::resolve_sampling(
-        dense, infernix::SamplingMode::Thinking, infernix::SamplingOverrides{});
+        dense, infernix::SamplingMode::Thinking, infernix::SamplingOverrides{}, false);
     const infernix::ResolvedSamplingParameters non_thinking = infernix::runtime::resolve_sampling(
-        dense, infernix::SamplingMode::NonThinking, infernix::SamplingOverrides{});
+        dense, infernix::SamplingMode::NonThinking, infernix::SamplingOverrides{}, false);
     failures += check(thinking.temperature == 1.0F && thinking.top_p == 0.95F &&
                           thinking.presence_penalty == 0.0F && thinking.seed == 0,
                       "omitted overrides did not select Dense thinking defaults");
     failures += check(non_thinking.temperature == 0.7F && non_thinking.top_p == 0.8F &&
                           non_thinking.presence_penalty == 1.5F,
                       "omitted overrides did not select Dense non-thinking defaults");
+
+    // A content constraint drops the preset penalties (they would steer sampling to legal tokens
+    // that alter the content); every other preset field and an explicit penalty still apply.
+    const infernix::ResolvedSamplingParameters constrained = infernix::runtime::resolve_sampling(
+        moe, infernix::SamplingMode::Thinking, infernix::SamplingOverrides{}, true);
+    failures += check(constrained.temperature == 1.0F && constrained.top_p == 0.95F &&
+                          constrained.presence_penalty == 0.0F && constrained.frequency_penalty == 0.0F,
+                      "a content constraint kept the preset penalties");
+    infernix::SamplingOverrides penalized;
+    penalized.presence_penalty = 1.25F;
+    failures += check(infernix::runtime::resolve_sampling(dense, infernix::SamplingMode::NonThinking, penalized,
+                                                          true)
+                              .presence_penalty == 1.25F,
+                      "a content constraint dropped an explicit presence penalty");
 
     infernix::SamplingOverrides overrides;
     overrides.temperature       = 0.0F;
@@ -84,7 +98,7 @@ int main() {
     overrides.frequency_penalty = -1.0F;
     overrides.seed              = 123;
     const infernix::ResolvedSamplingParameters overridden =
-        infernix::runtime::resolve_sampling(dense, infernix::SamplingMode::NonThinking, overrides);
+        infernix::runtime::resolve_sampling(dense, infernix::SamplingMode::NonThinking, overrides, false);
     failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
@@ -93,7 +107,7 @@ int main() {
     overrides.top_k = 21;
     failures += check(throws_invalid([&] {
                           (void)infernix::runtime::resolve_sampling(
-                              dense, infernix::SamplingMode::Thinking, overrides);
+                              dense, infernix::SamplingMode::Thinking, overrides, false);
                       }),
                       "top_k beyond the executable candidate domain was accepted");
     overrides.top_k = 0;
@@ -101,7 +115,7 @@ int main() {
     overrides.temperature = std::numeric_limits<float>::quiet_NaN();
     failures += check(throws_invalid([&] {
                           (void)infernix::runtime::resolve_sampling(
-                              dense, infernix::SamplingMode::Thinking, overrides);
+                              dense, infernix::SamplingMode::Thinking, overrides, false);
                       }),
                       "non-finite sampling override was accepted");
 
