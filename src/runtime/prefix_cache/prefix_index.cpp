@@ -547,16 +547,23 @@ InsertResult PrefixCacheIndex::insert_block(NodeRef parent, std::uint64_t lookup
     if (device_id == kNoId) { throw std::invalid_argument("prefix cache block has no device id"); }
     if (const auto existing = find_child(parent, lookup_hash, block_tokens, extra)) {
         Node& node = nodes_[existing->index];
-        ++node.pins;
-        bool attached = false;
+        InsertResult result{*existing, false, false};
         if (attach && node.device == CopyState::Absent) {
             // A host-only block recomputed by this sequence regains its Device copy.
             node.device_id = device_id;
             set_device(node, CopyState::Resident);
-            attached = true;
+            result.device_attached = true;
+        } else if (attach && node.device == CopyState::Resident && node.pins == 0) {
+            // A block recomputed by this sequence whose Device copy nobody maps: the sequence's page
+            // replaces it, so the two never hold two pages for one block (the sequence pins its
+            // own, and an evictable copy would otherwise become pinned beside it).
+            result.replaced_device_id = node.device_id;
+            node.device_id            = device_id;
+            result.device_attached    = true;
         }
+        ++node.pins;
         refresh_node(existing->index);
-        return InsertResult{*existing, false, attached};
+        return result;
     }
     if (free_nodes_.empty()) { invariant("prefix cache node capacity exhausted"); }
     const std::uint32_t index = free_nodes_.back();

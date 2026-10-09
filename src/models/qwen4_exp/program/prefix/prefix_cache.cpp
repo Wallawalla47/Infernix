@@ -181,6 +181,9 @@ pc::InsertResult PrefixCache::insert_block(pc::NodeRef parent, std::uint64_t loo
         free_blocks_.push_back(id);
         ++counters_.blocks_duplicate;
     } else {
+        // The replaced Device copy is unmapped and unread (the index replaces only unpinned ones),
+        // so its page returns to the pool as an eviction's would.
+        if (result.replaced_device_id != pc::kNoId) { release_device_block(result.replaced_device_id); }
         node_mtp_next_[result.node.index] = mtp_next;
         ++(result.inserted ? counters_.blocks_inserted : counters_.blocks_reattached);
     }

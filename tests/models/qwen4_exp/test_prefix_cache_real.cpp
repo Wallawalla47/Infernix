@@ -18,6 +18,9 @@
 //                generates what the capturing run generated.
 //   X12          (plain mode) Engine 1 serves two chat turns and stops, saving its Host tier to a file;
 //                Engine 2 loads the file and resumes turn 2 from it, generating what Engine 1 did.
+//   one context  (MTP mode, own Engine with kv_capacity = max_context) A recomputed cached prefix
+//                replaces the cached copies instead of pinning them beside its pages: the request
+//                completes, equals its cold run, and the Engine keeps serving.
 //
 //   infernix_qwen4_exp_prefix_cache_real_test [--mtp] [--plain]   (default: both modes)
 
@@ -237,6 +240,45 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
     return failures;
 }
 
+// One context of KV (issue #1: --kv-capacity == --max-context): B shares A's first 2,000 tokens but
+// no snapshot on that path, so it recomputes them from the root while the admission eviction leaves
+// A's shallowest blocks cached. Each recomputed block must replace its unpinned cached copy: pinning
+// the copy beside B's page fills the pool, and B's first decode page past its admission then has
+// no source (the capacity contract error, formerly fatal for the Engine).
+int run_one_context(const char* artifact, const char* ngram) {
+    std::printf("== one context of KV (MTP drafter, kv_capacity = max_context)\n");
+    infernix::EngineOptions options = base_options(artifact, ngram);
+    options.kv_capacity               = infernix::KvCapacityPolicy::explicit_capacity(4096);
+    options.speculative.backend       = infernix::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    infernix::Engine engine(std::move(options));
+    int failures = 0;
+    const std::vector<infernix::TokenId> a = synthetic_tokens(3000, 21);
+    std::vector<infernix::TokenId> b(a.begin(), a.begin() + 2000);
+    const auto suffix = synthetic_tokens(1300, 22);
+    b.insert(b.end(), suffix.begin(), suffix.end());
+    const Run cold_b = generate(engine, b, 700, false);
+    (void)generate(engine, a, 16, true);
+    const infernix::RuntimeStats before = engine.runtime_stats();
+    Run warm_b;
+    try {
+        warm_b = generate(engine, b, 700, true);
+    } catch (const std::exception& error) {
+        return check(false, std::string("B completes in one context of KV (") + error.what() + ")");
+    }
+    const infernix::RuntimeStats after = engine.runtime_stats();
+    std::printf("        B reused %u tokens; blocks reattached %llu, duplicate %llu\n", warm_b.reused,
+                static_cast<unsigned long long>(after.hybrid_blocks_reattached - before.hybrid_blocks_reattached),
+                static_cast<unsigned long long>(after.hybrid_blocks_duplicate - before.hybrid_blocks_duplicate));
+    failures += check(warm_b.reused < 2000 && after.hybrid_blocks_reattached > before.hybrid_blocks_reattached,
+                      "B recomputes cached blocks and replaces their copies");
+    failures += check(warm_b.tokens == cold_b.tokens,
+                      "B equals the cold run (" + first_difference(warm_b.tokens, cold_b.tokens) + ")");
+    const Run later = generate(engine, synthetic_tokens(200, 23), 8, true);
+    failures += check(later.tokens.size() == 8, "the Engine keeps serving");
+    return failures;
+}
+
 // X12: the Host tier saved at an Engine's stop and loaded by the next Engine.
 int run_persistence(const char* artifact, const char* ngram) {
     std::printf("== persistence (X12)\n");
@@ -340,6 +382,7 @@ int main(int argc, char** argv) {
         int failures = 0;
         if (plain) { failures += run_mode(artifact, ngram, false); }
         if (mtp) { failures += run_mode(artifact, ngram, true); }
+        if (mtp) { failures += run_one_context(artifact, ngram); }
         if (plain) { failures += run_persistence(artifact, ngram); }
         std::printf(failures == 0 ? "qwen4_exp prefix cache checks passed\n" : "FAIL: %d checks failed\n", failures);
         return failures == 0 ? 0 : 1;

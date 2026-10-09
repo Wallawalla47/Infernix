@@ -3,6 +3,7 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -84,6 +85,9 @@ std::vector<NodeRef> insert_sequence(PrefixCacheIndex& index, RecordingBackend& 
         require(result.inserted == result.device_attached || !result.inserted,
                 "a new node must own its device id");
         if (!result.device_attached) { backend.release_device_block(id); }
+        if (result.replaced_device_id != kNoId) {
+            backend.release_device_block(result.replaced_device_id);
+        }
         path.push_back(result.node);
         parent = result.node;
     }
@@ -434,13 +438,59 @@ void test_host_only_reattach() {
         require(view.device == CopyState::Resident && view.host == CopyState::Resident,
                 "a reattached block is resident on both tiers");
     }
-    // Device-resident duplicates stay private to the inserting sequence.
+    // Duplicates of Device copies another sequence pins stay private to the inserting sequence.
     const auto twice = insert_sequence(index, backend, tokens);
-    require(backend.live.size() == live_before + 3, "a resident duplicate must not be retained");
+    require(backend.live.size() == live_before + 3, "a pinned resident duplicate must not be retained");
     index.release_path(twice);
     index.release_path(again);
     index.check_invariants();
     require(index.evict_device_blocks(3) == 3, "reattached backed blocks are evictable again");
+    index.check_invariants();
+}
+
+// A sequence recomputing cached blocks (a resume from a shallower snapshot) must not hold two pages
+// per block: its page replaces an unpinned Device copy, which returns to the pool, while a copy
+// another sequence pins stays and the sequence keeps its page private. Before this, every
+// recomputed block pinned its evictable copy beside the sequence's page, and a pool sized to one
+// context ran out of pages for the next unit.
+void test_resident_duplicate_replacement() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(64, 1), backend);
+    const auto tokens = make_tokens(64 * 3, 62);
+    const auto path   = insert_sequence(index, backend, tokens);
+    backup_node(index, path[1]);
+    index.release_path(path);
+    require(index.device_evictable_blocks() == 3 && backend.live.size() == 3,
+            "the cached blocks are evictable Device copies");
+    std::vector<std::uint32_t> old_ids;
+    for (const NodeRef node : path) { old_ids.push_back(index.node(node).device_id); }
+    const std::array<NodeRef, 1> reader{path[0]};
+    index.acquire_path(reader); // another sequence maps block 0
+
+    const std::uint32_t first_new = backend.next;
+    const auto again              = insert_sequence(index, backend, tokens);
+    require(again == path, "recomputed blocks resolve to the existing nodes");
+    require(index.node(path[0]).device_id == old_ids[0] && backend.live.contains(old_ids[0]) &&
+                !backend.live.contains(first_new),
+            "a pinned Device copy stays and the sequence's page stays private");
+    for (std::uint32_t b = 1; b < 3; ++b) {
+        const NodeView view = index.node(path[b]);
+        require(view.device == CopyState::Resident && view.device_id == first_new + b &&
+                    view.pins == 1,
+                "an unpinned Device copy is replaced by the sequence's page");
+        require(!backend.live.contains(old_ids[b]), "the replaced copy returns to the pool");
+    }
+    require(index.node(path[1]).host == CopyState::Resident,
+            "a replaced block keeps its Host copy");
+    require(backend.live.size() == 3, "one page per block while the sequence holds the path");
+    require(index.device_evictable_blocks() == 0, "the sequence pins its path");
+    index.check_invariants();
+
+    index.release_path(again);
+    index.release_path(reader);
+    require(index.device_evictable_blocks() == 3, "the replaced blocks are evictable again");
+    require(index.evict_device_blocks(3) == 3 && backend.live.empty(),
+            "evicting the blocks releases the adopted pages");
     index.check_invariants();
 }
 
@@ -1219,6 +1269,9 @@ void test_random_stress() {
                     const InsertResult result =
                         index.insert_block(parent, hashes[b], block, 0, id, true);
                     if (!result.device_attached) { backend.release_device_block(id); }
+                    if (result.replaced_device_id != kNoId) {
+                        backend.release_device_block(result.replaced_device_id);
+                    }
                     path.push_back(result.node);
                     parent = result.node;
                     if (index.node(result.node).host == CopyState::Absent &&
@@ -1474,6 +1527,7 @@ int main() {
         test_host_write_admission();
         test_unshared_boundary();
         test_host_only_reattach();
+        test_resident_duplicate_replacement();
         test_tail_device_fill();
         test_persistence_roundtrip();
         test_restore_plan();
