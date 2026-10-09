@@ -2,7 +2,8 @@
 // source reports the real card less a "taken" amount, which the test raises by 2 GiB (another
 // program) and lowers again:
 //   1. during a greedy generation: the expert cache shrinks at the next round boundary and grows
-//      back after the (shortened) grow delay, and the token ids equal an undisturbed run;
+//      back after the (shortened) grow delay before the generation ends, and the token ids equal an
+//      undisturbed run;
 //   2. while the engine is idle: the monitor wakes the engine, which shrinks and grows the cache
 //      outside any round (maintain()).
 // Skips (77) unless INFERNIX_QWEN4_ARTIFACT names a Qwen4Exp artifact.
@@ -103,12 +104,12 @@ int main() {
             if (s.has_budget) { s.local_budget = s.local_budget > t ? s.local_budget - t : 0; }
             return s;
         });
-        infernix::models::qwen4_exp::testing::set_vram_grow_delay(1.0);
+        infernix::models::qwen4_exp::testing::set_vram_grow_delay(0.5);
 
         Diagnostics diagnostics;
         infernix::EngineOptions options;
         options.artifact_path = artifact;
-        options.context_cache.enabled = false; // no prefix cache (Qwen4Exp has no Legacy cache)
+        options.context_cache.enabled = false;
         if (ngram != nullptr) { options.ngram_volume_path = ngram; }
         options.max_context = 4096;
         options.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
@@ -120,15 +121,19 @@ int main() {
         const auto baseline = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
         check(baseline.size() == kTokens, "baseline generated " + std::to_string(baseline.size()) + " tokens");
 
-        // 1. Pressure during a generation: another program takes 2 GiB at 1.5 s and frees it at 4 s.
+        // 1. Pressure during a generation: another program takes 2 GiB at 1 s and frees it at 2.5 s.
+        // The monitor samples once a second, so the cache grows back by about 4 s (sample, grow delay,
+        // round boundary); the generation must still be running then, and is checked to be.
         const std::size_t mark = diagnostics.size();
         std::thread squeeze([&] {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
             taken = 2 * kGiB;
-            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1500));
             taken = 0;
         });
+        const auto started   = std::chrono::steady_clock::now();
         const auto pressured = engine.generate(engine.prepare(story()), greedy(kTokens)).generated_token_ids;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         squeeze.join();
         check(pressured == baseline, "ids under pressure equal the undisturbed run");
         const auto during = diagnostics.resizes(mark);
@@ -137,6 +142,9 @@ int main() {
             shrank |= to < from;
             regrew |= shrank && to > from;
         }
+        char took[64];
+        std::snprintf(took, sizeof(took), "generation took %.1f s", seconds);
+        check(seconds >= 4.5, std::string(took) + ", long enough to observe the regrowth");
         check(shrank, "the cache shrank during the generation (" + std::to_string(during.size()) + " resizes)");
         check(regrew, "the cache grew back after the memory was freed");
 
