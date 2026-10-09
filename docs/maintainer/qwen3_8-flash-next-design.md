@@ -656,6 +656,48 @@ exact decode oracle:
 `q8_g32_fp16`, and the import would need a second ~180 GB source checkpoint. If a class fails the
 gate as Q8, it would fail as block FP8.
 
+### 6.1.1 Recipe `qwen3_8_flash_next_nvfp4_orcarouter` (C)
+
+The source is [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4)
+(revision `cddc6ec5`): an abliterated (refusal-removed) Qwen3.8-Flash-Next exported **weight-only** by
+llm-compressor (`compressed-tensors`, no activation scales), for runtimes that keep activations in
+BF16. Recipe C imports every quantized tensor bit-exactly and runs it as the checkpoint is served:
+experts W4A16 (§16.2.1), dense projections W8A16. Its BF16 classes follow recipe B.
+
+| Tensor class | Source form | Recipe C | Reason |
+|---|---|---|---|
+| Routed experts (48 × 512) | `nvfp4-pack-quantized`: `weight_packed` (E2M1, two per byte, low nibble first), E4M3 `weight_scale` per 16, FP32 `weight_global_scale` (a **divisor**) per matrix | **Exact import** of the codes and block scales as `nvfp4_mul` in `nvfp4_expert_rg16_v1`; the multiplier is `fl32(1 / weight_global_scale)`, the import's one rounding. No `expert_input_scales`: the bank's use is A16-only, which selects the W4A16 arithmetic | The checkpoint's weights; its activations are BF16, so no scale is borrowed or calibrated |
+| GDN q/k/v (`in_proj_qkv`) and z, `out_proj`; QSA q/gate (`q_proj`), k, v, `o_proj`; shared experts | `naive-quantized` FP8 E4M3 per output row, BF16 row scales | **Exact import** as `fp8_e4m3fn_row_bf16`, A16-only (W8A16). The QSA query/gate/key/value form one parent and the BF16 indexer another (explicit recipe groups); the model runs them as two projections | The checkpoint's weights and its serving arithmetic; FP8-row A16 routes for the five Flash-Next shapes (`src/ops/linear/fp8/shapes`, selected by `bench/ops/fp8_flash_next_sweep.cu`) |
+| HC mixers, PLE key/value projections, `lm_head` | BF16 | `q8_g32_fp16`, as recipe B | Recipe B's dense-byte saving where the checkpoint is BF16 |
+| Router, shared-expert gate, GDN `a`/`b`, QSA indexer, token embedding, vision, norms | BF16 | BF16 (`A_log`, `dt_bias` widened exactly to FP32) | As recipes A and B |
+| MTP (dense and 512 routed experts, fused `gate_up_proj` [E, 2I, H] with the gate rows first, `down_proj` [E, H, I]) | BF16 | Recipe A's drafter: `q8_g32_fp16` dense, `q4_g64_fp16` (MSE) experts | Affects only acceptance |
+| N-gram table (128 shards) | **BF16** (the source keeps it unquantized) | FP8 per tensor in BF16 arithmetic: `s = bf16(amax / 448)`, `code = e4m3_rn_satfinite(bf16(v / s))` (`qwen4_exp.NgramTable`) | This is the rule NVIDIA's FP8 table follows: the abliteration leaves the table untouched, and on all 327,680 sampled values (and its scale word) the result equals NVIDIA's codes, so recipe C reuses recipes A and B's 52 GB volume (the converter checks 512 rows; `verify_artifact` checks every row) |
+
+The configs differ only in the attention layer name (`qwen_sparse_attention` for `full_attention`).
+Recipes A and B refuse a weight-only bank, and recipe C refuses a ModelOpt one.
+
+**Verification (2026-10-09).** `verify_artifact` finds every expert (24,576), every imported tensor
+(1,323) and every n-gram row (320,001,536) equal to the checkpoint and the reused volume.
+
+**Column invariance of the FP8 routes.** The first sweep paired a T = 1 GEMV with 8 values per lane
+in 4 accumulator chains with a SIMT tile of 16 values in one chain. Their sums round differently, and
+greedy MTP left plain decode at the 67th generated token. The test and the sweep had not shown it:
+patterned E4M3 codes with uniform activations sum exactly in FP32 in any order. Both now use every
+finite E4M3 code and activations over 25 binades. A column's order is fixed by the values per lane
+and the chain count alone, so each shape takes its GEMV and its SIMT tile from one family; 16 values
+in one chain is the fastest family on all four CUDA-core shapes:
+
+| Shape | T = 1 GEMV, before → after | SIMT T = 2..8 |
+|---|---:|---:|
+| 16384 × 2560 | 27.3 → 27.2 µs | 29.3-31.4 µs |
+| 13312 × 2560 | 23.1 → 22.9 µs | 25.2-29.2 µs |
+| 2560 × 6144 | 12.9 → 12.9 µs | 14.8-17.0 µs |
+| 1280 × 2560 | 5.1 → 4.7 µs | 7.3-9.3 µs |
+
+The shared expert's down (2560 × 640) runs one tensor-core tile family at every width. On the real
+model, 128 teacher-forced positions as calls of 1 and of 5 columns give equal logits (they differed at
+every position before), and greedy MTP equals plain decode over 128 tokens.
+
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 
 The pinned host bank is read by the GPU (DMA into a frame, then the expert kernels) and by the CPU

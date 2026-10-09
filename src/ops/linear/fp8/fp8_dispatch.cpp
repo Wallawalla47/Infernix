@@ -6,8 +6,9 @@
 
 namespace infernix::ops::detail {
 namespace {
-const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
-                         &kFp8N5120K6144,  &kFp8N5120K17408, &kFp8N248320K5120};
+const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120, &kFp8N5120K6144,
+                         &kFp8N5120K17408,  &kFp8N248320K5120, &kFp8N16384K2560, &kFp8N13312K2560,
+                         &kFp8N2560K6144,   &kFp8N1280K2560,   &kFp8N2560K640};
 
 const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");

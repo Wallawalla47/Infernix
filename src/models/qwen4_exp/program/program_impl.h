@@ -861,6 +861,7 @@ public:
                     .wide_from   = assist ? decode_columns + 1 : 0,
                     .wide_jobs   = assist ? static_cast<int>(std::min<std::uint32_t>(assist_jobs, ops::offloaded_moe::kMaxCpuJobs)) : 0,
                     .cpus        = {},
+                    .activation  = parameters_.layers.front().moe.bank->activation,
                     .records     = tier_.get()}); // tier mode: SSD-only jobs read through the tier
             for (std::uint32_t l = 0; l < c_.num_hidden_layers; ++l) {
                 experts.cpu.push_back(cpu_service_->channel(static_cast<int>(l)));

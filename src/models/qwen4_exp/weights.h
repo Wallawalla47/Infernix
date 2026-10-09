@@ -50,7 +50,9 @@ struct MoeWeights {
     WeightId router, shared_score;
     WeightId shared_gate, shared_up, shared_down;
     WeightId experts;      // nvfp4_mul bank in nvfp4_expert_rg16_v1, pinned host memory
-    WeightId input_scales; // FP32 [experts, 3]: gate, up, down activation global scales
+    // FP32 [experts, 3]: gate, up, down activation global scales of a W4A4 bank (its use allows A4);
+    // not bound for a W4A16 bank (its use is A16-only: experts stored without activation scales).
+    WeightId input_scales;
 };
 
 struct PleWeights {

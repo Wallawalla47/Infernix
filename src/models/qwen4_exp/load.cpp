@@ -135,8 +135,11 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& prefix,
     out.shared_up    = b.parameter(p + "shared/up", {s, h}, input);
     out.shared_down  = b.parameter(p + "shared/down", {h, s}, p + "shared/product");
     out.experts      = b.parameter(p + "experts", {e, h, c.moe.intermediate}, input, QType::NVFP4_MUL, experts);
-    out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32,
-                                   Residency::Values);
+    // A bank whose use allows A4 is W4A4 and carries its activation scales; an A16-only bank is
+    // W4A16 (design §16.2.1) and has none.
+    if (b.weights.at(out.experts.index).policy != ops::LinearPolicy::A16Only) {
+        out.input_scales = b.parameter(p + "expert_input_scales", {e, 3}, {}, QType::FP32, Residency::Values);
+    }
     return out;
 }
 
@@ -316,6 +319,19 @@ std::vector<ops::offloaded_moe::ExpertScales> expert_scales(const ExpertBankPlan
     return out;
 }
 
+// A W4A16 bank's scalars (design §16.2.1): no input scales, alpha = the stored multipliers.
+std::vector<ops::offloaded_moe::ExpertScales> a16_expert_scales(const ExpertBankPlanes& planes, const std::string& name) {
+    std::vector<ops::offloaded_moe::ExpertScales> out(planes.experts);
+    for (std::uint32_t e = 0; e < planes.experts; ++e) {
+        const float* m = planes.multipliers + 3 * std::size_t(e);
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(m[i]) || m[i] <= 0) { throw ArtifactError(name + ": expert multipliers must be positive finite FP32"); }
+        }
+        out[e] = {0.0F, 0.0F, 0.0F, m[0], m[1], m[2]};
+    }
+    return out;
+}
+
 } // namespace
 
 struct LoadPlan::Impl {
@@ -323,7 +339,7 @@ struct LoadPlan::Impl {
     LoadOptions options;
     TextWeights weights;
     std::vector<PendingWeight> pending;
-    std::vector<artifact::HostValues> input_scales; // [layer]
+    std::vector<artifact::HostValues> input_scales; // [layer], W4A4 banks only (empty for W4A16)
     artifact::MaterializationPlan materialization;
     FrontendResources resources;
     InstanceInfo info;
@@ -421,10 +437,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             out->weights.proposal = proposal;
         }
     }
+    // Every layer's bank has the same arithmetic: the activation policy of the first.
+    const bool a16 = !out->weights.layers.front().moe.input_scales.valid();
     for (const auto& layer : out->weights.layers) {
-        out->input_scales.push_back(
-            binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding,
-                          QType::FP32));
+        if (layer.moe.input_scales.valid() == a16) {
+            throw ArtifactError("Qwen4Exp: every layer's expert bank needs the same activation policy");
+        }
+        if (!a16) {
+            out->input_scales.push_back(
+                binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding, QType::FP32));
+        }
     }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
@@ -500,8 +522,13 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.planes.intermediate != data->config.text.moe.intermediate) {
             throw ArtifactError("expert bank geometry differs from the text config");
         }
-        bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
-                                    bound.at(layers[i].moe.input_scales.index).name);
+        if (layers[i].moe.input_scales.valid()) {
+            bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
+                                        bound.at(layers[i].moe.input_scales.index).name);
+        } else {
+            bank.activation = ops::offloaded_moe::ExpertActivation::kA16;
+            bank.scales     = a16_expert_scales(bank.planes, bound.at(layers[i].moe.experts.index).name);
+        }
         banks.push_back(std::move(bank));
     }
     std::optional<ExpertStore> store;

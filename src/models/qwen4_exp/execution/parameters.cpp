@@ -41,10 +41,32 @@ public:
                             [&] { return ops::prepare_linear_weight(std::span<const ops::WeightInput>(rows)); });
     }
 
+    // The converter packs the six input projections into one parent, unless the index projections
+    // are stored in another format (recipe C: FP8 query/gate/key/value, BF16 indexer); then they form
+    // two parents and run as two projections.
     AttentionParameters attention(const AttentionWeights& a) const {
-        return AttentionParameters{linear({a.query, a.gate, a.key, a.value, a.index_query, a.index_key}),
-                                   tensor(a.query_norm), tensor(a.key_norm), tensor(a.index_query_norm),
-                                   tensor(a.index_key_norm), linear({a.output})};
+        const bool joined = one_parent({a.query, a.gate, a.key, a.value, a.index_query, a.index_key});
+        AttentionParameters out{joined ? linear({a.query, a.gate, a.key, a.value, a.index_query, a.index_key})
+                                       : linear({a.query, a.gate, a.key, a.value}),
+                                std::nullopt,
+                                tensor(a.query_norm),
+                                tensor(a.key_norm),
+                                tensor(a.index_query_norm),
+                                tensor(a.index_key_norm),
+                                linear({a.output})};
+        if (!joined) { out.index_projection = linear({a.index_query, a.index_key}); }
+        return out;
+    }
+
+    bool one_parent(std::initializer_list<WeightId> ids) const {
+        const void* parent = nullptr;
+        for (const auto id : ids) {
+            for (const auto& part : model_.weight(id).view.parts) {
+                if (parent == nullptr) { parent = part.parent; }
+                if (part.parent != parent) { return false; }
+            }
+        }
+        return true;
     }
 
     Tensor tensor(WeightId id) const {

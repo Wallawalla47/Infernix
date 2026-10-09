@@ -28,11 +28,13 @@ struct InstanceInfo {
     artifact::ArtifactId artifact_id{};
 };
 
-// The routed experts of one MoE layer: the pinned host bank and each expert's scalars. alpha is
-// derived once here from the stored words, alpha = fl32(weight_scale_2 * input_scale), so every
-// route (GPU frame, GPU staging, CPU) reads the same values (design §6.1, §16.2).
+// The routed experts of one MoE layer: the pinned host bank, its arithmetic and each expert's
+// scalars. W4A4 (design §16.2): alpha is derived once here from the stored words, alpha =
+// fl32(weight_scale_2 * input_scale), so every route (GPU frame, GPU staging, CPU) reads the same
+// values. W4A16 (§16.2.1): no input scales; alpha holds the stored multipliers themselves.
 struct ExpertBank {
     ExpertBankPlanes planes;
+    ops::offloaded_moe::ExpertActivation activation = ops::offloaded_moe::ExpertActivation::kA4;
     std::vector<ops::offloaded_moe::ExpertScales> scales; // [experts]
 };
 

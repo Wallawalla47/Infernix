@@ -28,7 +28,11 @@ struct HyperConnectionParameters {
 };
 
 struct AttentionParameters {
-    LinearParameters projection; // [q | gate | k | v | index q | index k, H]
+    // [q | gate | k | v | index q | index k, H] in one parent; or, when the converter stores the index
+    // projections in another format (the FP8 dense projections of recipe C beside its BF16 indexer),
+    // [q | gate | k | v, H] here and [index q | index k, H] in index_projection.
+    LinearParameters projection;
+    std::optional<LinearParameters> index_projection;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
     LinearParameters output;
 };
