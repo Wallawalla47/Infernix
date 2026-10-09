@@ -350,7 +350,7 @@ struct ProgramOptions {
     std::uint32_t mtp_draft_tokens = 0;
     // CPU-served misses (design section 10): host expert-engine workers (0 disables), the most
     // experts one layer call hands to them, and the share kept on the PCIe stage (misses / divisor;
-    // 0 derives it from the measured link: 3 at PCIe 5.0 x8, where it measured fastest, 2 at x16).
+    // 0 derives it from the measured link and CPU rates, design §19.3.12).
     // Defaults measured fastest on the i9-13900K (design sections 19.2 and 19.3.16): 16 jobs pay in
     // calls with many misses (C = 4 fill +7 %, cold MTP +3 %) and are neutral elsewhere; 32 is no faster.
     std::uint32_t cpu_expert_workers = 6;

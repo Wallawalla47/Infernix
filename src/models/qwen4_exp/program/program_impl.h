@@ -841,6 +841,8 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
+            // The team's rate sets the decode miss split (design §19.3.12).
+            measure_cpu_rate(record_stride);
             // Decode and verification calls are CPU-served up to decode_columns; prefill calls up to
             // kAssistMaxColumns take the assist cap (wider chunks stream or stage on the GPU).
             const int decode_columns = std::max(ops::offloaded_moe::kMaxCpuColumns, lanes * max_width_);
@@ -3852,7 +3854,7 @@ private:
     DeviceBuffer window_backing_;
     prefix::KvWindowGeometry window_geometry_;
 
-    // ---- the host-to-device link (design §19.4: bandwidth-dependent choices follow the machine) ----
+    // ---- the host-to-device link (design §19.3.12: bandwidth-dependent choices follow the machine) ----
     // The rate at which the prefill and prefix cost constants were fitted (RTX 5090 at PCIe 5.0 x8).
     static constexpr double kReferenceLinkBytesPerSecond = 27.5e9;
     double link_bytes_per_second_ = kReferenceLinkBytesPerSecond;
@@ -3875,9 +3877,9 @@ private:
         if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
         char text[256];
         std::snprintf(text, sizeof(text),
-                      "host-to-device link: %.1f GB/s%s; decode misses kept on the link: 1/%d; decode promotes every "
-                      "%llu tokens; prefill CPU split up to %d columns",
-                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured", pcie_divisor(),
+                      "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
+                      "%d columns",
+                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
                       static_cast<unsigned long long>(promotion_interval()),
                       options_.prefill_cpu_split ? split_columns() : 0);
         diagnostic(text, DiagnosticLevel::Debug);
@@ -3886,11 +3888,29 @@ private:
         diagnostic(text);
     }
 
-    // The share of a decode call's misses the PCIe stage keeps (misses / divisor): 3 measured
-    // fastest on the reference link; a faster link carries more of them (x16: 2), a slower one fewer.
+    // ---- the CPU expert team's decode rate (design §19.3.12) ----
+    // Experts per second on one-column jobs (memory-bound, as decode's misses are) for
+    // cpu_expert_workers workers, measured at startup while the link copies records (the staging's
+    // DRAM reads compete with the CPU's). Without records in host memory (the SSD tier) the
+    // i9-13900K's 6-worker rate stands. The prefill CPU split keeps its fitted rates
+    // (ProgramOptions::cpu_split_*_rate): on the measured ones it is not yet qualified.
+    static constexpr double kReferenceCpuExpertRate = 21000.0;
+    double cpu_expert_rate_ = kReferenceCpuExpertRate;
+    void measure_cpu_rate(std::uint64_t record_stride);
+
+    // The share of a decode call's misses the PCIe stage keeps, misses / d, from C t (C experts per
+    // second on the CPU, t seconds per record on the link): d = floor(1.65 + C t). The balance point
+    // of the two parts is d = 1 + C t; the measured fastest divisors (2026-10-09, x8) put the
+    // switches between them: C t = 1.5-1.7 at 6 workers (d = 3; d = 2 loses 9 % MTP), 1.0 at 3 and
+    // 0.7-0.8 at 2 (d = 2; d = 3 loses 4-12 %), so d steps from 2 to 3 at C t = 1.35, midway, and
+    // the startup measurement's noise (± 7 %) stays clear of it; x16 gives 2. A whole divisor, as a
+    // fractional share flips calls' splits at floor(M share) between startups (3 workers: 100.8
+    // against 107.5 tok/s). A positive cpu_pcie_divisor fixes d.
     [[nodiscard]] int pcie_divisor() const noexcept {
         if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
-        return std::max(2, static_cast<int>(std::lround(1.0 + 2.0 * kReferenceLinkBytesPerSecond / link_bytes_per_second_)));
+        const double record_seconds =
+            static_cast<double>(parameters_.layers.front().moe.bank->planes.record_stride) / link_bytes_per_second_;
+        return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate_ * record_seconds)));
     }
 
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
