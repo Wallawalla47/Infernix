@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -372,6 +373,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         Responder::Mode fetch = Responder::Mode::kAnswer;
         bool fetched  = false; // the fetch channel serves SSD-only experts no CPU job takes
         bool overlap  = false; // passes staged on the overlap stream
+        int idle      = 0;     // calls after the service idles 60 ms; 2: wake() before each
     };
     // Which misses the CPU takes (design §19.3.5 S3): the fewest-column ones first, in job order within a
     // width, want = min(cap, M - M / divisor) of those with at most max_job_columns columns.
@@ -409,6 +411,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     cudaEvent_t fork_events[2] = {};
     cuda_check(cudaStreamCreateWithFlags(&fork_stream, cudaStreamNonBlocking), "cudaStreamCreate");
     for (auto& event : fork_events) { cuda_check(cudaEventCreateWithFlags(&event, cudaEventDisableTiming), "event"); }
+    double gpu_idle_extra = 0.0; // what 60 ms of idle adds to a call without the CPU service (the GPU's own wake-up)
     for (const Config config : {Config{0, nullptr}, Config{1, nullptr}, Config{3, nullptr}, Config{64, nullptr},
                                 Config{3, &service_two}, Config{64, &service_eight}, Config{0, &service_eight},
                                 Config{64, nullptr, true}, Config{64, &service_two, true}, Config{3, nullptr, true},
@@ -447,7 +450,13 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
                                        .fetch = Responder::Mode::kFail, .fetched = true},
                                 Config{.slots = 3, .service = nullptr, .table = true, .ssd = 2,
-                                       .fetch = Responder::Mode::kSilent, .fetched = true}}) {
+                                       .fetch = Responder::Mode::kSilent, .fetched = true},
+                                // An idle service answers its first request promptly (Windows: no 15.6 ms
+                                // timer-tick sleep): through its short idle wait, and at once after wake().
+                                // The first call, without the service, measures the GPU's own idle cost.
+                                Config{.slots = 64, .service = nullptr, .idle = 1},
+                                Config{.slots = 64, .service = &service_eight, .idle = 1},
+                                Config{.slots = 64, .service = &service_eight, .idle = 2}}) {
         const int slots = config.slots;
         // A fresh dispatch: a fetch call reorders its jobs (fetch-served last).
         infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
@@ -504,6 +513,38 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         source.error = error_device;
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+        if (config.idle > 0) {
+            // The time 60 ms of idle adds to a call, against the same call made at once after another. The
+            // GPU's own wake-up adds ~0.1 ms without the service. With it, small calls measured +0.3 to +7.3 ms
+            // (2026-10-09, median of 5; not yet explained), large ones nothing (the CPU wakes while the GPU
+            // works); a timer-tick sleep in the service's idle wait (Windows: 15.6 ms) adds about 8 ms more on
+            // average, so the bound is 10 ms beyond the GPU's own, plus 5 % of the call as noise.
+            const auto timed = [&] {
+                const auto start = std::chrono::steady_clock::now();
+                infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+                cuda_check(cudaDeviceSynchronize(), "moe_experts");
+                return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            };
+            (void)timed();
+            const double busy = timed();
+            std::array<double, 5> extra{};
+            for (double& e : extra) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+                if (config.idle == 2) { config.service->wake(); }
+                e = timed() - busy;
+            }
+            std::sort(extra.begin(), extra.end());
+            std::printf("E=%d T=%d k=%d idle %s: call %.2f ms busy, +%.2f ms idle (median of 5, max +%.2f)\n", experts,
+                        columns, top_k,
+                        config.service == nullptr ? "GPU only" : config.idle == 2 ? "service after wake()" : "service",
+                        busy, extra[2], extra[4]);
+            if (config.service == nullptr) {
+                gpu_idle_extra = extra[2];
+            } else {
+                check(extra[2] - gpu_idle_extra < 10.0 + 0.05 * busy,
+                      "an idle CPU miss service adds under 10 ms to a call beyond the GPU's own (median of 5)");
+            }
+        }
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
         infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");

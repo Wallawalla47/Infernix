@@ -61,9 +61,15 @@ public:
     // answer then times out (kErrorHostSilent) on every later call, so the caller treats a failed
     // service as fatal and reports this cause.
     [[nodiscard]] std::string failure() const;
+    // A round that may hand the service requests is about to be enqueued: an idle service thread
+    // wakes now and spins again. Requests are served without it too, only later: after 20 ms
+    // without a request the thread idles in waits of about 0.5 ms (Windows: a high-resolution
+    // waitable timer; a plain sleep_for(50 us) there lasts one 15.6 ms timer tick).
+    void wake() const noexcept;
 
 private:
     void serve();
+    void idle_wait() noexcept;
     void record_failure(std::string what) noexcept;
 
     std::vector<Layer> layers_;
@@ -77,6 +83,9 @@ private:
     std::uint32_t* heartbeat_ = nullptr; // mapped, beside status_: advanced while the service thread lives
     std::uint32_t* sequence_ = nullptr; // device
     std::atomic<bool> stop_{false};
+    mutable std::atomic<std::uint32_t> wakes_{0};   // wake() calls the service thread has not seen yet
+    void* wake_event_ = nullptr;             // Windows: auto-reset event wake() signals
+    void* idle_timer_ = nullptr;             // Windows: the idle wait's high-resolution timer
     std::atomic<std::uint64_t> served_{0}, experts_{0};
     mutable std::mutex failure_mutex_;
     std::string failure_;
