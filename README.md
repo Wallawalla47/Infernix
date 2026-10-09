@@ -25,8 +25,8 @@ n-gram embedding table from an NVMe drive.
 
 - **Faster than Strata** on the same RTX 5090, both with the model's MTP drafter: 4.6-6.4× sooner
   to the first token and 1.6-1.8× the decode speed from 8K to 250K tokens of context, and in a
-  replayed agentic coding workload a sixth of Strata 0.1.41's average time to first token (5.7 s
-  against 33.9 s) and about a third of its wall time
+  replayed agentic coding workload under a fifth of Strata 0.1.41's average time to first token
+  (5.9 s against 32.9 s) and about a third of its wall time
   ([benchmarks](#qwen38-flash-next-nvfp4-infernix-vs-strata)).
 - **Quality at least Strata's**: teacher-forced perplexity 4.654 against Strata's 4.844 on the same
   texts (lower is better); every optimisation was held to that bar.
@@ -104,7 +104,7 @@ by the same client, so all engines are measured the same way.
   tool calls, compactions, retries and aborted requests, sampled at temperature 1.0, closed loop
   (each engine's own answers are fed back) with up to eight requests in flight. Qwen3.8-27B runs
   it in full on three workload seeds; Qwen3.8-Flash-Next at half length (`--scale 0.5`, 68 scored
-  requests) on two, which keeps Strata's runs to 20-25 minutes. Cells are the mean over seeds with
+  requests) on three, which keeps Strata's runs to 20-25 minutes. Cells are the mean over seeds with
   the range in brackets. Infernix and NInfer figures come from each server's own request log,
   joined to the client's record of every request.
 - **How Strata's figures are derived.** Strata writes no per-request log of this kind, so its
@@ -175,43 +175,46 @@ follow-up prompts differ in size because Infernix re-sends the previous answer's
 tokens in the prompt and Strata leaves them out.
 
 **Agentic replay** (both engines with MTP; the replay at half length, `--scale 0.5`: 68 scored
-requests per run with all three sessions and eleven subagents, prompts up to ~98K tokens; two
+requests per run with all three sessions and eleven subagents, prompts up to ~98K tokens; three
 seeds, both engines run back to back on each seed on 8-9 October):
 
 | Metric | Strata 0.1.41 | Infernix | Change |
 |---|---:|---:|---:|
-| Average time to first token (s) | 33.9 (30.9-36.8) | **5.7** (5.5-5.9) | −83.0 % |
-| Median time to first token (s) | 28.77 (19.04-38.51) | **2.69** (2.47-2.91) | −89.7 % |
-| 90th-percentile time to first token (s) | 70.7 (66.3-75.1) | **13.1** (12.9-13.4) | −81.3 % |
-| Average TTFT, turns that continue a conversation (s) | 32.34 (29.99-34.69) | **5.43** (5.29-5.57) | −83.1 % |
-| Average TTFT, new long prompts (s) | 39.4 (38.8-40.0) | **11.8** (9.5-14.0) | −70.0 % |
-| Prompt tokens served from cache | 54.8 % (49.3-60.4) | **84.8 %** (84.7-84.8) | +29.9 points |
-| Prompt tokens prefilled | 1,183K (1,021K-1,345K) | **403K** (398K-408K) | −65.3 % |
-| Main-session turns that re-prefilled the whole prompt (of 41) | 11.5 (10-13) | **0** | −11.5 |
-| Prefill tok/s, requests with no cache hit | 1,423 (1,359-1,487) | **5,911** (5,846-5,975) | 4.2× |
-| Output tok/s, one request decoding | 85 (83-86) | **123** (121-124) | +45.1 % |
-| Output tok/s, two requests decoding (combined) | (one at a time) | 161 (160-162) | |
-| Output tok/s, at the run's own batching | 85 (83-86) | **141** (140-143) | +67.0 % |
-| Decode rounds/s, one request (engine speed) | 41.0 (40.1-41.9) | **61.3** (58.6-64.1) | +49.7 % |
-| Tokens per round, one request (draft acceptance) | 2.07 (2.06-2.08) | 2.01 (1.94-2.07) | level (within the seeds' spread) |
-| Workload wall time (min) | 22.1 (19.6-24.5) | **7.7** (6.5-9.0) | −65.1 % |
+| Average time to first token (s) | 32.9 (30.9-36.8) | **5.9** (5.5-6.2) | −82.1 % |
+| Median time to first token (s) | 27.00 (19.04-38.51) | **2.84** (2.47-3.14) | −88.7 % |
+| 90th-percentile time to first token (s) | 67.8 (62.0-75.1) | **13.3** (12.9-13.7) | −80.2 % |
+| Average TTFT, turns that continue a conversation (s) | 32.62 (29.99-34.69) | **5.52** (5.29-5.68) | −83.0 % |
+| Average TTFT, new long prompts (s) | 38.9 (37.9-40.0) | **12.7** (9.5-14.5) | −67.3 % |
+| Prompt tokens served from cache | 53.8 % (49.3-60.4) | **84.6 %** (84.3-84.8) | +30.8 points |
+| Prompt tokens prefilled | 1,222K (1,021K-1,345K) | **411K** (398K-428K) | −65.9 % |
+| Main-session turns that re-prefilled the whole prompt (of 41) | 12.0 (10-13) | **0** | −12.0 |
+| Prefill tok/s, requests with no cache hit | 1,423 (1,359-1,487) | **5,879** (5,815-5,975) | 4.1× |
+| Output tok/s, one request decoding | 86 (83-88) | **125** (121-128) | +45.3 % |
+| Output tok/s, two requests decoding (combined) | (one at a time) | 164 (160-170) | |
+| Output tok/s, at the run's own batching | 86 (83-88) | **143** (140-147) | +67.2 % |
+| Decode rounds/s, one request (engine speed) | 41.2 (40.1-41.9) | **63.5** (58.6-68.0) | +54.2 % |
+| Tokens per round, one request (draft acceptance) | **2.08** (2.06-2.11) | 1.97 (1.89-2.07) | −5.6 % |
+| Workload wall time (min) | 22.3 (19.6-24.5) | **7.8** (6.5-9.0) | −65.0 % |
 
-Infernix wrote more in both runs (31.8K and 50.4K output tokens against Strata's 31.1K and 43.5K)
-and still finished in about a third of the time.
+Infernix wrote more in every run (31.8K, 50.4K and 42.9K output tokens against Strata's 31.1K,
+43.5K and 37.9K) and still finished in about a third of the time.
 
-Draft acceptance was level (Infernix's two seeds 1.94 and 2.07 tokens per round, Strata's 2.06 and
-2.08); Infernix decodes faster because each round takes about a third less time. Both verify every
-draft, so drafting changes speed, not output. Strata offers a draft only while its draft layer is
-at least 70 % sure of it; Infernix cuts a single request's drafts at the first below 50 %, and two
-requests decoding together draft for both with one shared length (output unchanged either way; see
-the Flash-Next guide's `--max-concurrency`).
+Strata's drafts are accepted a little more often (2.08 against 1.97 tokens per round; per seed
+level on seed 42 and 6 % and 11 % lower on seeds 43 and 44); Infernix decodes faster because each
+round takes about a third less time. Both verify every draft, so drafting changes speed, not
+output. Strata offers a draft only while its draft layer is at least 70 % sure of it; Infernix cuts
+a single request's drafts at the first below 50 %, and two requests decoding together draft for
+both with one shared length (output unchanged either way; see the Flash-Next guide's
+`--max-concurrency`). Seed 42's single-request rows rest on only 57 s of one request decoding alone,
+so they are the least certain (Infernix 58.6 rounds/s there, against 64.1 and 68.0 on the others).
 
-Against the previous version of this table (Strata 0.1.40 and Infernix `3b35ccf9`, 7 October, same
-workload and seeds), Strata 0.1.41 was slower on this workload (average TTFT 25.3 → 33.9 s, cache
-reuse 64.3 → 54.8 %, wall time 18.3 → 22.1 min) and Infernix's single-request decode 5 % slower
-(129 → 123 tok/s, 64.9 → 61.3 rounds/s, with seed 43 level and seed 42 lower), its other rows level
-or better. Neither change has been attributed: the builds, the generated texts and the warmed
-expert-cache state all differ between the two measurements.
+Against the previous version of this table (Strata 0.1.40 and Infernix `3b35ccf9`, 7 October,
+seeds 42 and 43), Strata 0.1.41 was slower on this workload (average TTFT on those two seeds
+25.3 → 33.9 s, cache reuse 64.3 → 54.8 %, wall time 18.3 → 22.1 min). Infernix's single-request
+decode on the same two seeds was 5 % lower (129 → 123 tok/s, 64.9 → 61.3 rounds/s), but its third
+seed measured 128 tok/s and 68.0 rounds/s, so across seeds the new build spans the earlier one;
+its other rows were level or better. Neither difference has been attributed: the builds, the
+generated texts and the warmed expert-cache state all differ between the measurements.
 
 Earlier versions of these tables were measured on an artifact converted by mistake from
 `RadixArk/Qwen3.8-Flash-Next-NVFP4`, another Model Optimizer quantization of the same model with
