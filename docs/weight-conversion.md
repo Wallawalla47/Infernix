@@ -13,7 +13,7 @@ Run the commands below from the repository root.
 
 The offline upgrade tool supports the official Qwen3.6/3.8-27B groupwise-int and NVFP4 artifacts,
 and Qwen3.6-35B-A3B groupwise-int. Update your checkout to the current `master` and
-[rebuild Infernix](../README.md#quick-start), then run with Python 3.11:
+[rebuild Infernix](../README.md#quick-start-windows), then run with Python 3.11:
 
 ```bash
 python3 tools/upgrade_ninfer_v2_to_v3.py \

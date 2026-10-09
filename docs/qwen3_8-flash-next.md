@@ -288,7 +288,8 @@ The speed figures in this guide were measured before 2026-10-07 on an artifact c
 README's context-length decode came out 1.6-4.1 % lower and the agentic replay level; the
 [README benchmarks](../README.md#qwen38-flash-next-nvfp4-infernix-vs-strata) are the current figures.
 Recipe A (bit-exact) decodes about 18 % slower than recipe B and reaches the first token 6-8 %
-later at 8K, level from 128K ([README](../README.md#bit-exact-against-dense8)).
+later at 8K, level from 128K (the bit-exact
+[model card's performance table](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix#performance)).
 
 | Workload | tok/s |
 |---|---:|

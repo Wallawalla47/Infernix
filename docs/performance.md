@@ -51,7 +51,7 @@ and [Qwen3.8 completion outcomes](performance/qwen3.8-27b.md#completion-outcomes
 - [Serving benchmark runners](../tools/bench/README.md#serving-corpus-benchmark): usage and local report files.
 - [Engine and Op benchmarks](../bench/README.md): their separate measurement scopes and commands.
 - [Capability evaluation](../eval/README.md): evaluation workflow; published scores live in the
-  [model cards](README.md#model-artifacts), with a [README summary](../README.md#evaluation).
+  [model cards](README.md#model-artifacts), with the README's [benchmark summary](../README.md#benchmarks).
 - [Perplexity](perplexity.md): offline causal-scoring measurement and comparison rules.
 
 Model pages are the detailed result authority. README and model-card performance tables are
