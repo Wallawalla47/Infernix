@@ -2361,6 +2361,65 @@ prompts:
 - Every residency route is tested by exact comparison: all-GPU vs all-CPU vs random mixes
   (§16.4).
 
+### 16.2.1 The canonical W4A16 arithmetic (experts without activation scales)
+
+Some NVFP4 exports are weight-only: their routed experts carry codes, block scales and a global
+weight scale but no activation scale, because the serving runtime keeps activations in BF16
+(orcarouter's Qwen3.8-Flash-Next-Uncensored-NVFP4, recipe C of §6.1). Such experts use this
+arithmetic instead of §16.2's A4. It keeps the same requirement: a narrow-route expert's BF16
+output is bit-identical on the GPU (frame or staging) and the CPU (every ISA).
+
+**Encoding.** A BF16 column v of K elements (x, K = 2,560, or h, K = 640) is encoded once:
+
+```text
+M_j  = 128 | mantissa_j (normal), mantissa_j (subnormal)      e_j = max(E_j, 1)
+emax = max_j e_j          (1 for an all-zero column; a column with Inf or NaN is "non-finite")
+X_j  = sign_j · rne( M_j · 2^15 / 2^(emax − e_j) )            |X_j| < 2^23
+```
+
+- v_j = X_j · 2^(emax − 149) exactly for every element within 2^15 of the column's largest
+  exponent; smaller ones are rounded to the nearest multiple of 2^(emax − 149), ties to even
+  (a relative 2^−23 of the column's largest magnitude). The tensor-core runtimes this format is
+  served with accumulate in FP32, which has the same resolution relative to the largest term.
+- X is stored as three bytes: lo and mid, the unsigned low bytes of its two's complement, and
+  hi = X >> 16 in [−128, 127], so X = lo + 256·mid + 65536·hi.
+
+**Row product.** With c2 and Ŝ as in §16.2:
+
+```text
+P_b = Σ_{j<16} c2(w[r,16b+j]) · X[16b+j]       |P_b| ≤ 12 · 16 · (2^23 − 1) < 2^31, exact int32
+S   = Σ_b P_b · Ŝ(ws[r,b])                     |S| < 2^57, exact int64, any order
+y   = bf16_rn( (fl32_rn(S) · 2^(emax − 159)) ⊗ m )
+```
+
+- m = fl32(1 / weight global scale), the multiplier stored in the record's tail (§6.2); the
+  checkpoint's global scale divides, so this reciprocal is the import's only rounding.
+- The scaling by 2^(emax − 159) (2^−1 for the doubled code, 2^−9 for Ŝ, 2^(emax − 149) for X) is
+  two exact power-of-two multiplies, so a subnormal product is rounded once; a non-finite column
+  gives the canonical NaN (0x7FC0) in every row.
+- The byte limbs make every product a byte product: the GPU uses dp4a (signed codes times unsigned
+  lo and mid bytes, and times signed hi bytes); the CPU uses vpdpbusd / vpmaddubsw with unsigned
+  activation bytes times signed codes for lo and mid, and biased codes (c2 + 12) times signed hi
+  bytes minus 12 · Σ hi. P_b is assembled in wrapping int32, which is exact because the true value
+  fits.
+
+**SwiGLU and h.** y_gate and y_up are the BF16 outputs above; h_i = swiglu_bf16(y_gate,i, y_up,i)
+as in §16.2; h is then encoded as a column of 640 with its own exponent, and the down product gives
+the expert output in BF16. Semantic boundaries:
+
+```text
+x (BF16) → A16 → gate/up → BF16 → SwiGLU → BF16 h → A16 → down → BF16 y_e → combine
+```
+
+**Wide route.** Experts with more than eight columns use a BF16 tensor-core grouped GEMM: each
+weight is c2/2 · Ŝ/2⁹, exactly representable in BF16 (at most six significant bits), the
+activations are the unencoded BF16 x and h, and the FP32 accumulator is scaled by m and rounded to
+BF16 at the same boundaries. It is qualified against FP64 like §16.2's wide route.
+
+**Cost.** Three byte products per weight instead of one: the GPU narrow kernels stay bound by the
+record reads they share with A4, while the CPU's integer work per miss triples (§10.2); recipe C
+measures its effect on decode.
+
 ### 16.3 Recipe qualification
 
 **Recipe A** is qualified by exactness, not by a quality threshold:

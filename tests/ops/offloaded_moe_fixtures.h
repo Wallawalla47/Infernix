@@ -64,6 +64,31 @@ inline std::vector<std::uint16_t> random_activations(std::mt19937& rng, int ncol
     return x;
 }
 
+// An expert stored without activation scales (design §16.2.1): random codes and block scales as
+// random_expert, no input scales, and multipliers m = fl32(1 / weight global scale).
+inline Expert random_a16_expert(std::mt19937& rng) {
+    Expert e = random_expert(rng, false);
+    std::uniform_real_distribution<float> lg(-14.0F, -6.0F);
+    e.scales = {0.0F, 0.0F, 0.0F, std::exp2(lg(rng)), std::exp2(lg(rng)), std::exp2(lg(rng))};
+    return e;
+}
+
+// Activations with a wide dynamic range per column: most elements near 0.05, a few outliers up to
+// 2^12 and some tiny ones, so the A16 encoding rounds elements more than 2^15 below the column's
+// largest (design §16.2.1).
+inline std::vector<std::uint16_t> wide_range_activations(std::mt19937& rng, int ncols) {
+    std::vector<std::uint16_t> x = random_activations(rng, ncols);
+    std::uniform_int_distribution<int> pos(0, moe::kHidden - 1);
+    std::uniform_real_distribution<float> lg(-30.0F, 12.0F);
+    for (int c = 0; c < ncols; ++c) {
+        for (int i = 0; i < 64; ++i) {
+            const float v = std::exp2(lg(rng)) * (i % 2 ? -1.0F : 1.0F);
+            x[static_cast<std::size_t>(c) * moe::kHidden + static_cast<std::size_t>(pos(rng))] = to_bf16(v);
+        }
+    }
+    return x;
+}
+
 // ---------------------------------------------------------------------------- golden case
 
 // A fixed expert and input built from an integer generator (portable across standard libraries).
@@ -106,6 +131,17 @@ inline GoldenCase golden_case(int ncols) {
         const std::uint64_t r = splitmix(s);
         v = static_cast<std::uint16_t>(((r & 1) << 15) | ((118 + (r >> 1) % 8) << 7) | ((r >> 8) & 0x7F));
     }
+    return g;
+}
+
+// The golden case as an expert without activation scales (design §16.2.1), and its output hashes:
+// every CPU ISA, compiler and the GPU narrow route must reproduce them.
+inline constexpr std::uint64_t kGoldenA16_1 = 0xb85b350a35f47a1dULL; // ncols = 1
+inline constexpr std::uint64_t kGoldenA16_4 = 0xad57d940d8832ffeULL; // ncols = 4
+
+inline GoldenCase golden_a16_case(int ncols) {
+    GoldenCase g    = golden_case(ncols);
+    g.expert.scales = {0.0F, 0.0F, 0.0F, 3.0e-4F, 2.5e-4F, 5.0e-4F};
     return g;
 }
 
