@@ -24,7 +24,7 @@ class Nvfp4MatrixWords:
     codes: torch.Tensor          # uint8 [N, K/2]
     scales: torch.Tensor         # uint8 [N, K/16], E4M3FN words
     weight_scale_2: torch.Tensor  # float32 scalar, the multiplier
-    input_scale: torch.Tensor    # float32 scalar, the activation global scale
+    input_scale: torch.Tensor | None  # float32 scalar, the activation global scale (None: weight-only)
 
 
 def _signature(store: SafetensorsSource, name: str, shape: tuple[int, ...], dtype: str) -> None:
@@ -62,6 +62,31 @@ def nvfp4_matrix_words(store: SafetensorsSource, leaf: str, shape: tuple[int, in
         weight_scale_2=_fp32_scalar(store, leaf + ".weight_scale_2"),
         input_scale=_fp32_scalar(store, leaf + ".input_scale"),
     )
+
+
+def nvfp4_packed_matrix_words(store: SafetensorsSource, leaf: str, shape: tuple[int, int]) -> Nvfp4MatrixWords:
+    """Read one weight-only compressed-tensors NVFP4 matrix ``leaf`` exactly: ``weight_packed`` codes
+    (two per byte, the first element in the low nibble, as ModelOpt packs them) and ``weight_scale``
+    E4M3FN block scales, unchanged. The format's ``weight_global_scale`` divides (value = code x
+    block scale / global scale); the expert bank stores a multiplier, so weight_scale_2 is its
+    reciprocal rounded once to FP32. There is no activation scale (design §16.2.1)."""
+
+    n, k = shape
+    if k % 16:
+        raise ValueError(f"{leaf}: NVFP4 K must be divisible by 16")
+    _signature(store, leaf + ".weight_packed", (n, k // 2), "U8")
+    _signature(store, leaf + ".weight_scale", (n, k // 16), "F8_E4M3")
+    if store.has(leaf + ".input_global_scale"):
+        raise ValueError(f"{leaf}: an activation scale belongs to a W4A4 export, not a weight-only one")
+    codes = store.read_flat(leaf + ".weight_packed").reshape(n, k // 2).clone()
+    scales = store.read_flat(leaf + ".weight_scale").view(torch.uint8).reshape(n, k // 16).clone()
+    if bool((((scales & 0x80) != 0) | (scales == 0x7F)).any()):
+        raise ValueError(f"{leaf}.weight_scale: expected nonnegative finite E4M3FN words")
+    divisor = _fp32_scalar(store, leaf + ".weight_global_scale")
+    multiplier = torch.ones((), dtype=torch.float32) / divisor  # one IEEE FP32 division
+    if not bool(torch.isfinite(multiplier)) or float(multiplier) <= 0:
+        raise ValueError(f"{leaf}.weight_global_scale: its reciprocal is not a positive finite FP32")
+    return Nvfp4MatrixWords(codes=codes, scales=scales, weight_scale_2=multiplier, input_scale=None)
 
 
 def fp8_block_matrix_words(

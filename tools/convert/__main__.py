@@ -179,9 +179,7 @@ def main(argv=None):
             if args.ngram_reuse is not None:
                 if args.ngram_out is not None:
                     raise ValueError("--ngram-reuse and --ngram-out are exclusive")
-                volume_id = qwen4_exp.read_ngram_volume_id(
-                    base, qwen4_exp.ngram_volume_shards(base, model.config), args.ngram_reuse
-                )
+                volume_id = qwen4_exp.read_ngram_volume_id(qwen4_exp.ngram_table(base, model.config), args.ngram_reuse)
                 model.config["ngram_table"]["volume_id"] = volume_id.hex()
                 ngram_out = None
             else:
@@ -248,8 +246,7 @@ def main(argv=None):
                 print(f"[ngram {index+1}/{total}]", flush=True)
 
             qwen4_exp.write_ngram_volume(
-                base,
-                qwen4_exp.ngram_volume_shards(base, model.config),
+                qwen4_exp.ngram_table(base, model.config),
                 ngram_out,
                 bytes.fromhex(table["volume_id"]),
                 progress=ngram_progress,

@@ -298,12 +298,14 @@ def qwen3_8_flash_next_nvfp4(model, recipe, sources):
     experts become exact ``nvfp4_mul`` banks in ``nvfp4_expert_rg16_v1`` with each matrix's own
     ModelOpt input scale; the FP8 n-gram table is written to its own volume) and every BF16 or FP32
     tensor keeps its dtype. Only the MTP drafter is re-quantized (``_flash_next_drafter``)."""
-    from .qwen4_exp import import_expert_bank
+    from .qwen4_exp import import_expert_bank, weight_only_bank
 
     if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
     for name, parameter in model.parameters.items():
         if name.startswith("text/layers/") and name.endswith("/moe/experts"):
+            if weight_only_bank(parameter.source):
+                raise ValueError(f"{name}: weight-only experts take recipe C (qwen3_8_flash_next_nvfp4_orcarouter)")
             recipe.assign(
                 name,
                 format="nvfp4_mul",
@@ -340,6 +342,71 @@ def qwen3_8_flash_next_nvfp4_dense8(model, recipe, sources):
         _assign(recipe, name, Q8)
 
 
+def qwen3_8_flash_next_nvfp4_orcarouter(model, recipe, sources):
+    """Recipe C of Qwen3.8-Flash-Next (design §6.1): orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4,
+    a weight-only compressed-tensors export of the abliterated model, served with BF16 activations.
+
+    Bit-exact where the checkpoint is quantized: the routed experts' NVFP4 codes and block scales (a
+    W4A16 bank, design §16.2.1: the global scale stored as its FP32 reciprocal, no activation scales)
+    and the row-scaled FP8 GDN, QSA and shared-expert projections (W8A16). Its BF16 classes follow
+    recipe B: the hyper-connection mixers, the PLE projections and ``lm_head`` in ``q8_g32_fp16``;
+    the router, shared-expert gate, GDN a/b, QSA indexer, embedding and vision tower stay BF16. The
+    n-gram table is quantized per tensor (qwen4_exp.NgramTable), which reproduces NVIDIA's FP8 table
+    of the same base model word for word. The drafter is recipe A's, from the checkpoint's BF16 MTP.
+
+    The QSA query/gate/key/value projections (FP8) and the indexer (BF16) form two parents, which the
+    model runs as two projections."""
+
+    from .qwen4_exp import import_expert_bank, weight_only_bank
+
+    if model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    banks = [name for name in model.parameters if name.startswith("text/layers/") and name.endswith("/moe/experts")]
+    if not banks or not all(weight_only_bank(model.parameters[name].source) for name in banks):
+        raise ValueError("recipe C imports weight-only compressed-tensors experts (W4A16 banks)")
+    base = sources["base"]
+    fp8 = (
+        "/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output",
+        "/attention/query", "/attention/gate", "/attention/key", "/attention/value", "/attention/output",
+        "/moe/shared/gate", "/moe/shared/up", "/moe/shared/down",
+    )
+    dense8 = (
+        "/attn_hc/down", "/attn_hc/inject", "/attn_hc/up",
+        "/mlp_hc/down", "/mlp_hc/inject", "/mlp_hc/up",
+        "/ple/key_projection", "/ple/value_projection",
+    )
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/"):
+            continue
+        if name.endswith("/moe/experts"):
+            recipe.assign(
+                name,
+                format="nvfp4_mul",
+                layout="nvfp4_expert_rg16_v1",
+                method=import_expert_bank,
+                activation_policy="A16Only",
+            )
+            recipe.group(name, shape=parameter.shape)
+        elif name.endswith(fp8):
+            recipe.assign(
+                name,
+                format=FP8,
+                method=import_encoded,
+                source=model.source(name, base, FP8),
+                activation_policy="A16Only",
+            )
+        elif name.endswith(dense8):
+            _assign(recipe, name, Q8)
+    for name in ("text/final_mixer/down", "text/final_mixer/up", "text/output_head"):
+        _assign(recipe, name, Q8)
+    for layer, kind in enumerate(model.config["layer_types"]):
+        if kind == "full_attention":
+            p = f"text/layers/{layer}/attention/"
+            recipe.group([p + "query", p + "gate", p + "key", p + "value"])
+            recipe.group([p + "index_query", p + "index_key"])
+    _flash_next_drafter(model, recipe)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -351,4 +418,5 @@ RECIPES = {
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
     "qwen3_8_flash_next_nvfp4_dense8": qwen3_8_flash_next_nvfp4_dense8,
+    "qwen3_8_flash_next_nvfp4_orcarouter": qwen3_8_flash_next_nvfp4_orcarouter,
 }
