@@ -4,7 +4,8 @@
 // service thread watches the mapped request that moe_experts publishes for a layer call, computes
 // the requested experts with the worker team (the service thread is worker 0) from the pinned
 // expert banks, writes the BF16 outputs to mapped memory and answers with the request's sequence.
-// The arithmetic is expert_forward's, so a CPU-served output equals the GPU's bit for bit.
+// The arithmetic is expert_forward's (A16: expert_forward_a16's), so a CPU-served output equals the
+// GPU's bit for bit.
 //
 // The service owns the mapped channel buffers and the device sequence counter. It must outlive
 // every call that uses its channels, and its destructor must run only when no call is pending.
@@ -39,6 +40,8 @@ public:
         int wide_from   = 0;     // calls of at least this many columns (0: none) take wide_jobs as their cap
         int wide_jobs   = 0;     // prefill assist cap, at most kMaxCpuJobs
         std::vector<int> cpus;   // optional CPU of worker i (worker 0 is the service thread)
+        // The arithmetic of every layer's experts; it must equal the calls' MoeExpertSource::activation.
+        ExpertActivation activation = ExpertActivation::kA4;
         // Tiered requests (design §19.3.7): a job without a record pointer is read through `records`
         // (demanded before the other jobs run, computed after them); without a provider, or when a
         // read fails, the request is answered with an errno in the status word. The service keeps its

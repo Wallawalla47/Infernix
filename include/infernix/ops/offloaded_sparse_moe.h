@@ -155,6 +155,10 @@ struct MoeExpertSource {
     std::uint32_t* error = nullptr;
     std::uint64_t record_stride      = 0;
     const offloaded_moe::ExpertScales* scales = nullptr;
+    // The layer's expert arithmetic: W4A4 with stored input scales (§16.2), or W4A16 for experts
+    // stored without activation scales (§16.2.1; scales then hold the multipliers in alpha_*). The
+    // CPU channel's service must compute with the same arithmetic.
+    offloaded_moe::ExpertActivation activation = offloaded_moe::ExpertActivation::kA4;
     std::uint8_t* staging_base  = nullptr;
     std::int32_t staging_slots  = 0;
     MoeCpuChannel cpu;
