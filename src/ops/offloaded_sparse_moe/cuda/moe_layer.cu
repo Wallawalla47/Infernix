@@ -851,9 +851,6 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
 // per entry); down CTAs encode it under its own column exponent.
 
 constexpr int kA16PassColumns = 4; // columns per pass of the multi-column A16 kernels
-// Whether A16 experts with more than eight columns leave these kernels for a wide route. None
-// exists yet, so the exact narrow kernels compute every A16 expert, in passes of kA16PassColumns.
-constexpr bool kA16WideRoute = false;
 
 // An encoded A16 block in the layout the dp4a loop reads: four elements' bytes per word.
 struct A16Act {
@@ -991,7 +988,7 @@ __global__ void __launch_bounds__(kThreads)
     if (record == nullptr) { return; }
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (kA16WideRoute && moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
                 sm.stage, kGateUpSliceBytes);
@@ -1058,7 +1055,7 @@ __global__ void __launch_bounds__(kThreads)
     const std::uint8_t* down = record + moe::kGateUpBytes;
     const moe::ExpertScales scales = source.scales[expert];
     const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (kA16WideRoute && moe::wide_route(count, scales)) { return; }
+    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
                 kDownSliceBytes);
@@ -1613,8 +1610,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]) &&
-                          (source.activation == moe::ExpertActivation::kA4 || kA16WideRoute);
+    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
