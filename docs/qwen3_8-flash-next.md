@@ -66,6 +66,14 @@ The second command names the three files as numbered parts
 opens part 1.
 
 - **Recipe A.** Use `--recipe qwen3_8_flash_next_nvfp4` and the name without `-Dense8`.
+- **Recipe C, weight-only exports.** `--recipe qwen3_8_flash_next_nvfp4_orcarouter` converts
+  [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4)
+  (published as `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix`): its NVFP4 experts and FP8 dense
+  projections, stored without activation scales, are imported bit-exactly and run with BF16
+  activations in an exact integer arithmetic (W4A16 experts, W8A16 dense); its BF16 classes follow
+  recipe B. Its n-gram table (BF16 in the checkpoint) quantizes to NVIDIA's FP8 table byte for
+  byte, so pass `--ngram-reuse` with the NVIDIA volume. The arithmetic and its trade-offs are in
+  the [design notes](maintainer/qwen3_8-flash-next-design.md) (§6.1.1, §16.2.1).
 - **Verification.** `python -m tools.flash_next.verify_artifact --model <checkpoint> --artifact
   <part 1> --ngram <volume>` compares every stored tensor, expert and n-gram row with the
   checkpoint and lists the re-quantized parameters per component.

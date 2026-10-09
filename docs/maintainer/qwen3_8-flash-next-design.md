@@ -678,6 +678,10 @@ Recipes A and B refuse a weight-only bank, and recipe C refuses a ModelOpt one.
 
 **Verification (2026-10-09).** `verify_artifact` finds every expert (24,576), every imported tensor
 (1,323) and every n-gram row (320,001,536) equal to the checkpoint and the reused volume.
+Teacher-forced on the frozen texts (2,557 positions, INT8 KV, `tools.flash_next.strata_compare`):
+perplexity 4.772 against Strata 0.1.40 UD-Q4_K_XL's 4.844 (ΔNLL −0.015 ± 0.010 nats; code +0.010,
+document +0.010, chat −0.052) and recipe B's 4.653 on the same build; the gap to recipe B is the
+abliterated weights. The qwen4_exp prefix-cache, preemption and decide real tests pass on it.
 
 **Column invariance of the FP8 routes.** The first sweep paired a T = 1 GEMV with 8 values per lane
 in 4 accumulator chains with a SIMT tile of 16 values in one chain. Their sums round differently, and
