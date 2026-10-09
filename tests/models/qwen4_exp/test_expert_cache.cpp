@@ -377,21 +377,28 @@ void test_load_serials() {
 
 // Frame lending (design §19.3.2, VT4): choose_run picks the run of held experts with the minimum
 // summed LFRU score, never a lent frame, and avoids busy frames while a run without them exists;
-// lend evicts every expert in the run (ABSENT, no frame maps to it) and shrinks the capacity by
-// the run; give_back restores the capacity and loads queued experts into it. With lending, the ABA
-// case: K in frame f (serial s1), f lent and given back, K re-admitted into f (s2): s1 does not
-// publish, s2 does. Every frame is back after the last give_back.
+// lend shrinks the capacity by the run, which evicts the lowest-score experts wherever they are
+// (ABSENT), relocates the run's other experts into frames outside it (no frame maps into the run)
+// and lends it; give_back restores the capacity and loads queued experts into it. With lending,
+// the ABA case: K's copy from before the loan (serial s1) does not publish once K is re-admitted
+// (s2), s2 does. Every frame is back after the last give_back.
 void test_lending() {
     constexpr std::uint32_t kKeys = 64, kFrames = 8;
     CacheController cache(kKeys, kFrames, 0, 1);
     std::vector<CacheController::Command> cmds;
     std::vector<std::uint32_t> frame_of(kKeys, ~0U);
     std::vector<std::uint64_t> serial_of(kKeys, 0);
+    std::uint32_t relocations = 0;
     const auto apply = [&] {
         for (const auto& c : cmds) {
             if (c.kind == CacheController::Command::Kind::kCopy) {
                 frame_of[c.key]  = c.frame;
                 serial_of[c.key] = c.serial;
+            }
+            if (c.kind == CacheController::Command::Kind::kRelocate) {
+                check(frame_of[c.key] == c.source, "a relocation moves the key from its frame");
+                frame_of[c.key] = c.frame;
+                ++relocations;
             }
             if (c.kind == CacheController::Command::Kind::kWriteEntry &&
                 ResidencyEntry::decode(c.word).state == ResidencyState::kAbsent) {
@@ -442,20 +449,29 @@ void test_lending() {
     check(cache.choose_run(kFrames, std::vector<std::uint8_t>(kFrames, 1)) == std::optional<std::uint32_t>(0),
           "choose_run takes busy frames when no run avoids them");
 
-    // K = the key in the first frame of the run; lend the run.
-    const std::uint32_t first = *cache.choose_run(3, none);
-    const std::uint32_t K     = *cache.frame_key(first);
-    const std::uint64_t s1    = serial_of[K];
+    // Lend the run of the three highest-score experts (keys 5..7 in frames 5..7): the three
+    // lowest-score experts (keys 0..2) leave and keys 5..7 move into their frames. K = key 0.
+    const std::uint32_t first = 5;
+    check(cache.frame_key(first) == std::optional<std::uint32_t>(5), "key k fills frame k");
+    const std::uint32_t K        = 0;
+    const std::uint32_t K_frame  = frame_of[K];
+    const std::uint64_t s1       = serial_of[K];
     const std::uint32_t capacity = cache.policy().capacity();
     const std::uint32_t evicted  = cache.lend(first, 3, cmds);
     apply();
-    check(evicted == 3, "lend evicts the three experts in the run");
+    check(evicted == 3, "lend evicts three experts");
+    check(relocations == 3, "lend relocates the run's three experts");
     check(cache.loaned_frames() == 3 && cache.policy().capacity() == capacity - 3, "lend shrinks the capacity by the run");
+    bool lowest = true;
+    for (std::uint32_t k = 0; k < kFrames; ++k) {
+        lowest &= (k < 3) == (cache.entry(k).state == ResidencyState::kAbsent);
+        if (k >= 3) { lowest &= cache.entry(k).frame == frame_of[k] && cache.frame_key(frame_of[k]) == std::optional(k); }
+    }
+    check(lowest, "the lowest-score experts are ABSENT, the others READY where the commands put them");
     bool clear = true;
     for (std::uint32_t f = first; f < first + 3; ++f) { clear &= !cache.frame_key(f).has_value(); }
     for (std::uint32_t k = 0; k < kKeys; ++k) { clear &= frame_of[k] == ~0U || frame_of[k] < first || frame_of[k] >= first + 3; }
     check(clear, "no expert maps to a lent frame");
-    check(cache.entry(K).state == ResidencyState::kAbsent, "the run's experts are ABSENT");
     check(!cache.choose_run(kFrames, none).has_value(), "lent frames are never chosen");
 
     // Routes K until it is resident again (queued while the frames are lent, then loaded).
@@ -472,7 +488,7 @@ void test_lending() {
     check(cache.loaned_frames() == 0 && cache.policy().capacity() == capacity, "give_back restores the capacity");
     route_k();
     check(frame_of[K] != ~0U, "K is resident again after the give-back");
-    check(!cache.complete_load(K, first, s1), "K's copy from before the loan (ABA) does not publish");
+    check(!cache.complete_load(K, K_frame, s1), "K's copy from before the loan (ABA) does not publish");
     check(cache.complete_load(K, frame_of[K], serial_of[K]) && serial_of[K] != s1, "K's newest copy publishes");
     bool threw = false;
     try {
