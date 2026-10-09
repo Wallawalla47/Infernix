@@ -1,53 +1,49 @@
 # Hybrid prefix cache: design and decisions
 
-The hybrid prefix cache (HPC) is `infernix-serve`'s default prefix-cache mode
-(`ContextCacheOptions::mode = ContextCacheMode::Hybrid`). It reuses prompt prefixes through
-content-addressed 64-token KV blocks and sparse recurrent-state snapshots, kept on the Device and in
-one pinned Host tier. The original system
-([Resource scheduling and context cache](resource-scheduling-and-context-cache.md)) stays available
-with `--use-original-prefix-caching` (`ContextCacheMode::Original`, still the Engine option
-default); the two modes coexist by explicit owner request. Throughout this document "Legacy" names
-that original mode.
+The hybrid prefix cache (HPC) is Infernix's prefix cache for every supported artifact. It reuses
+prompt prefixes through content-addressed 64-token KV blocks and sparse recurrent-state snapshots,
+kept on the Device and in one pinned Host tier. It replaced the original continuation/checkpoint
+cache, which was removed on 2026-10-09; throughout this document "Legacy" names that removed
+design, kept only where it explains a decision or a measurement. Scheduling, permits, preemption
+and Replay recovery are in [Resource scheduling](resource-scheduling-and-context-cache.md).
 
-This document is the authority for the Hybrid mode. §0–§11 describe the design as implemented,
+This document is the authority for the prefix cache. §0–§11 describe the design as implemented,
 marking the parts of the original design that were not built; §12–§15 cover optional features,
 tests, configuration and risks; the [decision record](#16-decision-record) (§16) lists the decisions
 taken while building and operating it, with the measurements behind them and the alternatives that
 were tried and reverted.
 
-Scope: an alternative to Infernix's prefix-reuse, checkpoint-retention and cache-pressure
-system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
+Scope: prefix reuse, snapshot retention and cache pressure for
+`Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
 `max_concurrency` 1..8, every KV profile (BF16, INT8-G64, FP8-E4M3FN-row256, NVFP4-G16, K8V4, K4V2,
 VQ2),
 and every speculative backend (none, MTP, DFlash, DFlash2). `Qwen4ExpForCausalLM`
 (Qwen3.8-Flash-Next) has its own binding of the same index and frontend keys (§17).
 
-Coexistence rules:
+Configuration rules:
 
-- The mode is fixed at Engine construction. The original-only option `--device-state-slots`
-  requires `--use-original-prefix-caching`; Hybrid-only options are rejected with it.
-  `--host-context-mib` applies to both modes (in Hybrid mode it sizes the Host slab pool);
-  `--no-prefix-reuse` disables the cache, runs the original manager disabled, and is rejected
-  with `--use-original-prefix-caching` and with every Hybrid option.
-- Hybrid mode reuses the active-execution machinery unchanged: the Engine core and scheduler,
-  incremental unit reservation, preemption and Replay recovery, the binding transaction,
+- `--host-context-mib` sizes the Host slab pool. `--no-prefix-reuse` disables the cache: every
+  request starts from the root on the same Engine core, with no Device snapshot slots and no Host
+  tier; it is rejected with `--host-context-mib` and with every cache option.
+- The cache plugs into the active-execution machinery: the Engine core and scheduler, incremental
+  unit reservation, preemption and Replay recovery, the binding transaction,
   `LogicalKVPageStore`, `KVAddressSpaceStore`, execution rows, the `StateImageStore` images and the
-  prefill/decode/speculative paths. It replaces only admission-source selection, retention, capture
-  and cache eviction. Tree nodes hold non-writer references to logical pages; active address spaces
-  map those pages exactly as a checkpoint prefix fork does.
+  prefill/decode/speculative paths. It owns admission-source selection, retention, taps and cache
+  eviction. Tree nodes hold non-writer references to logical pages; an admitted request maps those
+  pages through the page-prefix fork (§6.4).
 
 ---
 
 ## Status
 
-Hybrid mode configures itself: the only capacity a deployment chooses is `--host-context-mib`
+The cache configures itself: the only capacity a deployment chooses is `--host-context-mib`
 (default 8192, 0 = Device only; Qwen3.8-Flash-Next: default 4096, must be positive, §17); every
 other value is derived from the rest of the configuration (§14.2).
 
 | area | state |
 |---|---|
 | §5 index, §9 eviction (device LRU, host superseded-first then GDSF, dead KV), §7.1 tap planner | implemented; host-only unit tests (`infernix_prefix_cache_index_test`) |
-| §5.4 automatic Device sizing | implemented: in Hybrid mode the Main pool is not clamped to `C·L`, and `infernix-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
+| §5.4 automatic Device sizing | implemented: with the cache enabled the Main pool is not clamped to `C·L`, and `infernix-serve` defaults `--kv-capacity` to `auto`, so free VRAM becomes Device block cache |
 | §5.4 unified Host slab pool | implemented: KV blocks, snapshot images (split over slabs) and snapshot tails share one pinned pool; GDSF and the dead-KV sweep decide the split at run time |
 | §6 admission as the Engine's binding transaction | implemented: staging reserves the first unit's Device pages and the state slot, Host restores run on a dedicated restore stream, and completion forks the lane at once; its Device work queues behind the copies it reads, layer by layer (§6.4, §6.5, §12.1). Later units reserve incrementally; preemption recovers by Replay (§9.5) |
 | §6.6 prefetching the blocked head | implemented: Host-only path blocks are copied into spare Device cache while the FIFO head waits |
@@ -63,11 +59,11 @@ other value is derived from the rest of the configuration (§14.2).
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
-| §13.3 real-artifact scenarios | `infernix_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `INFERNIX_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `infernix_ngram_concurrent_real` runs on Hybrid with `INFERNIX_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
+| §13.3 real-artifact scenarios | `infernix_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `INFERNIX_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `infernix_qwen3_5_prefix_real_test`, `infernix_ngram_concurrent_real` and the other real tests run on the cache as well |
 
 ## 0. Summary
 
-| | Legacy mode | Hybrid mode |
+| | Legacy (removed) | Hybrid |
 |---|---|---|
 | Unit of reuse | owner/checkpoint (private continuation, shared prefix, 5 checkpoint kinds) | content-addressed 64-token KV block + sparse state snapshot |
 | Identity | per-owner token ledgers, session index, shortlist keys, markers | exact token path in one radix tree (hash only for lookup) |
@@ -97,7 +93,7 @@ What the design changes for users:
 
 ---
 
-## 1. Why a second design
+## 1. Why it replaced the original design
 
 Evidence is taken from the Legacy sources and documents.
 
@@ -253,11 +249,10 @@ Ownership against AGENTS.md boundaries:
   are not implemented. Taps are Device copies of the committed StateImage.
 - **Program** owns the whole cache: exact identity, physical residency, refs, eviction, taps.
   There is no cross-layer logical/physical split, because the cache's policy decisions are
-  local physical facts. In Hybrid mode `ResourceManager`, `MaterializationPlanner`,
-  `SharedCapturePlanner`, portfolio value and the target/pressure machinery are not constructed
-  or called; they remain the Legacy-mode implementation.
+  local physical facts. Legacy's `ResourceManager`, `MaterializationPlanner`,
+  `SharedCapturePlanner`, portfolio value and target/pressure machinery were removed.
 - **Runtime** keeps the scheduler and the common request contracts. `HybridResourceManager`
-  presents the ResourceManager surface to the Engine core (§8.2), and `runtime/prefix_cache/`
+  connects the Engine core to the Program's index (§8.2), and `runtime/prefix_cache/`
   holds the model-agnostic index, tap planner and cost model.
 - **Frontend** supplies tokens, media digests, boundary hints and block hashes. It no longer
   produces cache "candidates", evidence flags or session keys for the cache.
@@ -363,10 +358,10 @@ struct Snapshot {
   (paged-kv §3–§4, §6.4, §10–§11). A page group is in exactly one state: `Free`, `Active`
   (owned by one sequence, private), `Cached` (owned by a node or snapshot tail), or `Filling`
   (transfer destination). `available = free + evictable_cached`.
-- **Main pool size**: automatic sizing keeps the capacity curve. In Hybrid mode the upper clamp
-  `M_max = C·L` is removed (only the int32 token representation bounds it): pages beyond the active
-  leases are cache-only device capacity. `infernix-serve` defaults `--kv-capacity` to `auto` in
-  Hybrid mode. Active admission still requires `M ≥ max(L, C)`.
+- **Main pool size**: automatic sizing keeps the capacity curve. With the cache enabled the upper
+  clamp `M_max = C·L` is removed (only the int32 token representation bounds it): pages beyond the
+  active leases are cache-only device capacity. `infernix-serve` defaults `--kv-capacity` to `auto`
+  with the cache enabled. Active admission still requires `M ≥ max(L, C)`.
 - **Device state pool**: `C` active slots plus `D = device_snapshot_slots` snapshot slots in the
   existing slot-indexed layout (`ssm_states [128,128,Hv,C+D]` per layer, and so on). Snapshot slots
   are also the staging destination for taps (§7.4). Default `D = C + 1` with a Host tier (one
@@ -487,7 +482,7 @@ the request queued, exactly as for a checkpoint source.
 
 **Backfill proof** (engine-architecture §5.2) uses the same arithmetic:
 `need(borrower) + need(head root) ≤ free + all_evictable + Σ donor entitlements released`.
-Hybrid mode does not issue it: a blocked FIFO head is never overtaken.
+The Engine does not issue it: a blocked FIFO head is never overtaken.
 
 *Tried and not adopted (2026-09-27).* A proof with this arithmetic plus a growth reserve was
 implemented and measured (the change record near the top of this document). Without the reserve,
@@ -678,13 +673,14 @@ Candidates, in priority order:
 Tap placement is a function of the prompt, so it is deterministic. Endpoint snapshots are exact
 (§7.7).
 
-Exact taps are the only prefill splits in Hybrid mode. The chat template's rewrite execution
+Exact taps are the only prefill splits of a cached lane. The chat template's rewrite execution
 frontiers (after each assistant header, after `<think>`, after the reasoning close) split Legacy
-prefill for its rewrite checkpoints and execution provenance. Hybrid captures nothing there, so a
-Hybrid lane ignores them. Each split is a whole extra pass over the model. A short chat turn used
-to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it takes two (to
-the opener, then the rest), or one when the opener is dropped, unless a client breakpoint or
-structural boundary falls inside the new tokens.
+prefill for its rewrite checkpoints and execution provenance. The cache captures nothing there, so
+a cached lane ignores them; with the cache disabled, prefill still splits there, and Replay
+repeats every split the ledger recorded. Each split is a whole extra pass over the model. A short
+chat turn used to prefill as four passes (reuse point, opener, `<think>`, reasoning close). Now it
+takes two (to the opener, then the rest), or one when the opener is dropped, unless a client
+breakpoint or structural boundary falls inside the new tokens.
 
 ### 7.2 Phase-aligned chunked GDN
 
@@ -704,8 +700,8 @@ boundary an absolute multiple of 64, the Op gains a `phase = base % 64` paramete
 
 Prefill chunks remain `--prefill-chunk` tokens long. The **first** chunk after a non-aligned base
 is `chunk − phase` tokens long, so every later chunk starts page-aligned. This is one boundary
-change in `TextContext::prefill`. In Hybrid mode no `prefill_split_frontier_` or
-`rewrite_execution_frontiers` split is requested (both remain for Legacy).
+change in `TextContext::prefill`. A cached lane requests no `prefill_split_frontier_` or
+`rewrite_execution_frontiers` split.
 
 ### 7.3 Tap Op contracts
 
@@ -847,41 +843,40 @@ internal to prefill. `finish` publishes the endpoint into the tree and returns n
 
 ### 8.2 Engine
 
-The Engine core is a template over its resource manager, chosen at construction from
-`ContextCacheMode`: the original `ResourceManager`, or `HybridResourceManager`, which presents the
-same surface, so scheduling, binding, incremental unit reservation, preemption and commit
-orchestration are shared by both modes. Retention policy lives in the Program's index:
+The Engine core owns scheduling, binding, incremental unit reservation, preemption and commit
+orchestration; its `HybridResourceManager` connects them to the Program's index, where retention
+policy lives:
 
 - `candidates` returns the Program's hybrid sources; empty while a prefilling sibling is about to
   publish the snapshot the request should resume from (§12.2), which leaves the request queued.
 - `reclaim` evicts cached Device blocks (`hybrid_reclaim`); when nothing is evictable it reports
-  `Blocked`, and the Engine pauses a younger request as in checkpoint mode.
-- No checkpoint is published, captured, adopted or kept: `host_victims` offers nothing and the
-  Program keeps no Host context arena, so a paused request recovers by Replay, from the deepest
-  source the tree then holds.
+  `Blocked`, and the Engine pauses a younger request.
+- A paused request recovers by Replay, from the deepest source the tree then holds; a pause
+  publishes nothing beyond the blocks and snapshots the lane already committed.
 - While the FIFO head waits, the Engine asks for a prefetch of its Host-only path (§6.6).
 - After each admission pass the Engine passes the queue to `hold_queue`, which recomputes the
   Program's queue holds when the queue or the snapshot epoch changed (§9.6).
-- A waiting request retains no source: `retain_source`, `binding_started` and `release_source`
-  hold nothing (queue holds only order eviction), and a lane that frees quotes the tree again. A stale quote binds as an invalid
-  source (`BindingReservation::source_valid` false), so the Engine moves to its next candidate;
-  a shortage the pools could hold at all lets the request wait for resident progress.
+- A waiting request retains no source (queue holds only order eviction), and a lane that frees
+  quotes the tree again. A stale quote binds as an invalid source
+  (`BindingReservation::source_valid` false), so the Engine moves to its next candidate; a shortage
+  the pools could hold at all lets the request wait for resident progress.
 - `HybridPrefixCacheStats` feed the `throughput` record's `context_cache.hybrid` object.
 
 ### 8.3 Frontend and protocol mapping
 
-- `PreparedPrompt` gains `block_hashes` and `tap_hints` (sorted `{position, priority}`), filled in
-  both modes (cheap). Hybrid mode ignores `PreparedContextCache` session key, retention and
-  opportunities, and `PromptIdentity` rewrite fields; Legacy ignores the new fields.
-- `ContextCacheHints` is unchanged. In Hybrid mode:
+- `PreparedPrompt` carries `block_hashes` and `tap_hints` (sorted `{position, priority}`).
+  `PromptIdentity` keeps the rewrite frontiers, which only split prefill so Replay repeats the
+  decomposition.
+- `ContextCacheHints` carries the markers and `allow_engine_automatic_shared_prefixes`:
   - explicit-evidence markers map to priority-1 tap hints, automatic protocol markers to
     `Automatic` hints (planned as structural, published as ordinary taps);
-  - `session_key`, `retention`, `allow_engine_automatic_shared_prefixes` and
-    `update_session_index` are ignored. Content addressing finds session chains without them.
-- External protocol behaviour is identical in both modes:
+  - `allow_engine_automatic_shared_prefixes` false (a protocol write-policy mode) withholds only
+    the Engine's tool-boundary marker. There is no session key: content addressing finds session
+    chains.
+- External protocol behaviour:
   - OpenAI `prompt_cache_*` and breakpoints, and Anthropic `cache_control` validation, limits
     (four distinct breakpoints) and error cases are unchanged.
-  - In Hybrid mode, breakpoints mean "tap here" (priority 1). Protocol write-policy modes
+  - Breakpoints mean "tap here" (priority 1). Protocol write-policy modes
     (`mode:"explicit"`, Anthropic `cache_control`-only requests) do not suppress automatic taps:
     taps are cheap and content-deduplicated, so markers can only add reuse.
   - `cached_tokens` and `cache_read_input_tokens` report `reuse_tokens`. The streaming
@@ -1252,7 +1247,7 @@ Fault injection covers:
 
 ### 13.4 Performance acceptance plan
 
-The baseline is Legacy mode, run on identical traces and flags, with `--host-cache-mib` equal in
+The baseline was Legacy, run on identical traces and flags, with `--host-cache-mib` equal in
 both runs.
 
 | metric | requirement |
@@ -1269,22 +1264,19 @@ both runs.
 
 ---
 
-## 14. Original cache and configuration
+## 14. Configuration
 
 ### 14.1 Shared code
 
-Both modes share the Engine core, the scheduler, the binding/pause/replay transactions and the
-logical KV page and StateImage stores. The hybrid cache adds its own index and Host slab pool, the
-page-prefix fork on `KVAddressSpaceStore` and copied-destination activation on `StateImageStore`.
-The original cache's checkpoints, prefix index, capture transactions and Host context arena are not
-used in Hybrid mode.
+The cache shares the Engine core, the scheduler, the binding/pause/replay transactions and the
+logical KV page and StateImage stores with every request. It adds its own index and Host slab pool,
+the page-prefix fork on `KVAddressSpaceStore` and copied-destination activation on
+`StateImageStore`.
 
 ### 14.2 Configuration surface
 
 ```cpp
-enum class ContextCacheMode : std::uint8_t { Original, Hybrid };
-
-struct HybridPrefixCacheOptions {                           // used only when mode == Hybrid
+struct HybridPrefixCacheOptions {
     std::optional<std::uint32_t> device_snapshot_slots;     // --device-snapshot-slots
     std::optional<std::uint32_t> max_new_taps;              // --cache-taps-per-request
     std::optional<std::uint32_t> tap_ladder_tokens;         // --cache-tap-ladder (G)
@@ -1296,15 +1288,13 @@ struct HybridPrefixCacheOptions {                           // used only when mo
 };
 
 struct ContextCacheOptions {
-    bool enabled;
-    ContextCacheMode mode = ContextCacheMode::Original;   // infernix-serve selects Hybrid by default
+    bool enabled;                                           // --no-prefix-reuse disables
     HybridPrefixCacheOptions hybrid;
-    std::optional<std::uint32_t> device_state_slots;      // Original only (--device-state-slots)
-    std::optional<std::size_t> host_capacity_bytes;       // --host-context-mib: Hybrid slab pool
+    std::optional<std::size_t> host_capacity_bytes;         // --host-context-mib: Host slab pool
 };
 ```
 
-Engine construction (`normalize_engine_options`) resolves every unset Hybrid value, and
+Engine construction (`normalize_engine_options`) resolves every unset value, and
 `Engine::options()` reports the effective ones. With `C = max_concurrency`, `chunk =
 prefill_chunk` and a Host tier present when the budget is nonzero:
 
@@ -1317,8 +1307,8 @@ prefill_chunk` and a Host tier present when the budget is nonzero:
 | `tap_min_gap_tokens` | `max(1024, chunk)` | the same |
 | KV capacity (`infernix-serve`) | `--kv-capacity auto` unless given | free VRAM becomes Device block cache |
 
-`device_state_slots` is rejected in Hybrid mode: the extra Device StateImages are the snapshot
-slots.
+With the cache disabled, `host_capacity_bytes` and `device_snapshot_slots` resolve to 0 and a
+nonzero value is rejected.
 
 ---
 
@@ -1331,7 +1321,7 @@ slots.
 | Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active (§16.3). Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |
-| Hybrid mode ignores session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged in both modes. |
+| No session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged. |
 
 ---
 
@@ -1362,10 +1352,12 @@ served 90.8% and 90.9% of prompt tokens from cache with no errors.
 
 ### 16.2 Decisions while building
 
-1. **A second mode, not a replacement.** The owner asked for both systems to stay available, so
-   Hybrid reuses the active-execution machinery and replaces only admission-source selection,
-   retention, capture and pressure (coexistence rules above). `infernix-serve` defaults to Hybrid;
-   the Engine option default stays Legacy.
+1. **First a second mode, then the only cache.** The owner first asked for both systems to stay
+   available, so Hybrid reused the active-execution machinery and replaced only admission-source
+   selection, retention, capture and pressure, with `infernix-serve` defaulting to it. On
+   2026-10-09 the owner had Legacy removed: every artifact runs on this cache, a disabled cache
+   binds every request from the root on the same core, and a paused request recovers by Replay.
+   Legacy's pause snapshots (a Snapshot route for Qwen3.5) went with it.
 2. **Snapshots copy the committed state at chunk boundaries; the zero-split GDN tap was not
    built.** A tap copies the lane's StateImage into a snapshot slot (about 0.25 ms D2D), so only
    exact taps split a prefill chunk, at about 15 ms per split on 27B. §7.2–§7.3 remain the design
@@ -1558,7 +1550,7 @@ superseded storage:
   record-addressed KV Host copies) maps onto the new stores directly.
 - In Hybrid mode the Host budget is the slab pool and the Program keeps no Host context arena, so a
   paused request recovers by Replay; the tree usually still holds its prefix.
-- `--use-original-prefix-caching` now selects NInfer's new continuation/checkpoint cache; the
+- `--use-original-prefix-caching` then selected NInfer's new continuation/checkpoint cache; the
   old catalog cache and its flags (`--host-cache-mib`, `--host-state-slots`, `--host-kv-mib`,
   catalogs, long anchors) were removed with it. `--host-context-mib` replaces `--host-cache-mib`.
 - The per-request `materialization` admission diagnostics were dropped with the old transaction;
@@ -1578,13 +1570,14 @@ rules, measurements and the build record are in the
 
 | area | Qwen4Exp |
 |---|---|
-| Configuration | Hybrid only: `normalize_engine_options` resolves the Host tier per architecture (default 4 GiB, `kDefaultQwen4ExpHybridHostCacheBytes`; 0 is refused), no Device snapshot slots (`--device-snapshot-slots` is refused), the common tap budget (8, ladder max(4096, 2 x chunk), gap max(1024, chunk)). The original prefix cache (`ContextCacheMode::Original` enabled) is refused: a Qwen4Exp Engine runs with the hybrid cache or with the context cache disabled |
+| Configuration | `normalize_engine_options` resolves the Host tier per architecture (default 4 GiB, `kDefaultQwen4ExpHybridHostCacheBytes`; 0 is refused), no Device snapshot slots (`--device-snapshot-slots` is refused), the common tap budget (8, ladder max(4096, 2 x chunk), gap max(1024, chunk)). A Qwen4Exp Engine runs with the cache or with the context cache disabled |
 | Snapshots | Host-born only: a capture reserves Host slabs and copies the lane's state image (GDN recurrent and conv state, PLE state, QSA tails, the MTP drafter's saved residual) and its partial page, one decoder layer at a time on the transfer stream; the next call of the lane waits per layer. Restores are one batch per admission on the restore stream, waited on per layer by the first call |
 | MTP drafter | Cells and anchors follow rules MR1-MR6 (design §19.3.1): blocks record `mtp_next`, snapshots `mtp_written`/`mtp_next`; a resume whose continuation differs rewrites the anchor's last cell in a private copy |
-| Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the request's whole KV extent, so every execution unit fits and a Qwen4Exp request is never paused. A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
+| Admission | Two sources per request: the affordable snapshot chosen without a lane, then the root. `start_binding` re-selects for the actual lane (crediting a lane-resident snapshot) and returns no reservation when the choice changed, so the Engine falls back to the root; otherwise it reserves the prompt's pages plus one round, and later rounds grow the lane (design §19.3.13). A prefetch landing over the prompt's path is waited for before matching, and pending Host writes are drained before a cached source is given up (as §6.6). A blocked FIFO head's Host-only blocks are prefetched into free and Host-backed Device pages, never growing the pool into the expert frames (`RuntimeStats::hybrid_prefetched_blocks`). A fresh request whose prompt shares a prefix (media agreeing, as §12.2) with a lane still prefilling waits for that lane's snapshot at the divergence when the predicted wait is within half the queue timeout: an exact tap is planned there (splitting the lane's pending call) and published as a Boundary. Shortages are reclaimed by evicting unpinned cached Device blocks |
 | Taps | `plan_taps` with Vision exclusions, then the call planner (`prefix/call_plan.h`): boundary exact taps (Explicit, Structural) always split; the generation opener and Automatic taps split only when the split adds at most 0.1 s of call cost (a CPU-served opener tail costs ~35 ms), else become flexible. Taps planned as boundaries (Explicit, Structural, coalescing) are published as `SnapshotKind::Boundary`. The opener is kept after endpoint resumes; a resume from an opener snapshot whose capturing request had resumed from an endpoint counts `endpoint_mismatch_fallbacks` |
 | Prefill calls | The plan's calls from the resume frontier: without exact taps `F, F + chunk, ...` (for F = 0 the cold grid). Calls of at most 8 columns are CPU-served and promote experts at the decode rate |
 | Vision | A resume frontier strictly inside an item is never chosen; items ending at or before the frontier are not encoded again (the encode window is planned from the frontier); suffix M-RoPE positions come from the prompt |
 | Statistics | `RuntimeStats::hybrid_*` and the request log's `cached_prefix_tokens` / `restored_host_bytes` as in Qwen3.5 |
 | Persistence | As §5.5, own format (`prefix/persist.cpp`, `NINFQ4PC` version 1): the block table also stores each block's `mtp_next`; snapshot meta travels inside each image's header slab and is validated by the state-image layout fingerprint, which the file's geometry also records. Saved at the Engine's stop after every lane is released; loaded into the empty cache at startup |
-| Not built | Device snapshot slots, preemption (pause and Snapshot/Replay recovery: the whole extent is reserved at admission instead), prefill CPU assist and C > 1 extras (design P7, P8) |
+| Preemption | A pause publishes the lane's blocks and its state at the frontier to the cache, as a consistent abort does, and releases the lane (design §19.3.13); the resume binds from the deepest snapshot, without replay when it sits at the paused frontier |
+| Not built | Device snapshot slots, prefill CPU assist and C > 1 extras (design P7, P8) |

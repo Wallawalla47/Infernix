@@ -230,9 +230,10 @@ int run(const Options& options) {
     for (std::uint32_t lane = 0; lane < options.batch_size; ++lane) {
         auto prompt       = frontend.prepare_tokens(prompt_tokens(options.context_tokens), false);
         auto request_base = program->plan_request(std::move(prompt), execution);
-        auto source       = program->inspect_source(request_base, std::nullopt);
-        if (!source ||
-            !program->start_binding(request_base, infernix::runtime::LaneId{lane}, *source)) {
+        // Prefix reuse is off, so the only source is a root start.
+        const auto sources = program->hybrid_sources(request_base, UINT32_MAX);
+        if (sources.empty() ||
+            !program->start_binding(request_base, infernix::runtime::LaneId{lane}, sources.front())) {
             throw std::runtime_error("benchmark root binding could not reserve its first unit");
         }
         std::optional<qwen::SequenceHandle> started;

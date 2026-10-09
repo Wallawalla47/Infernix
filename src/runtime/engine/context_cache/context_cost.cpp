@@ -1,5 +1,4 @@
 #include "runtime/engine/context_cache/context_cost.h"
-#include "runtime/contract/int128.h"
 
 #include <nlohmann/json.hpp>
 
@@ -28,32 +27,6 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = uint128;
-
-constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
-    return static_cast<std::size_t>(direction);
-}
-
-std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
-    return right > std::numeric_limits<std::uint64_t>::max() - left
-               ? std::numeric_limits<std::uint64_t>::max()
-               : left + right;
-}
-
-std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
-}
-
-std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
-    if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
-}
 
 void require_object(const Json& value, std::string_view context) {
     if (!value.is_object()) {
@@ -328,58 +301,6 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
 }
 
 } // namespace
-
-std::uint64_t ContextMachineCostModel::transfer_ns(ContextTransferDirection direction,
-                                                   TransferWork work) const noexcept {
-    if (work.payload_bytes == 0 && work.copy_operations == 0) { return 0; }
-    const std::size_t index = direction_index(direction);
-    if (index >= transfer.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-    const ContextTransferCost& cost = transfer[index];
-    const std::uint64_t operation_limited =
-        saturating_add(cost.batch_ns, saturating_product(cost.operation_ns, work.copy_operations));
-    const std::uint64_t bandwidth_limited =
-        q32_product_ns(cost.ns_per_byte_q32, work.payload_bytes);
-    return std::max(operation_limited, bandwidth_limited);
-}
-
-std::uint64_t ContextMachineCostModel::prefill_ns(PrefillWork work) const noexcept {
-    std::uint64_t result = saturating_product(prefill.chunk_ns, work.chunks);
-    result = saturating_add(result, q32_product_ns(prefill.token_ns_q32, work.tokens));
-    result =
-        saturating_add(result, q32_product_ns(prefill.attention_pair_ns_q32, work.attention_pairs));
-    result = saturating_add(result, saturating_product(prefill.vision_item_ns, work.vision_items));
-    result =
-        saturating_add(result, q32_product_ns(prefill.vision_patch_ns_q32, work.vision_patches));
-    return result;
-}
-
-std::uint64_t price_context_transfer_requirements(
-    const ContextMachineCostModel& model,
-    std::span<const ContextTransferRequirement> requirements) noexcept {
-    std::array<TransferWork, 3> coalesced{};
-    for (const ContextTransferRequirement& requirement : requirements) {
-        const std::size_t index = direction_index(requirement.direction);
-        if (index >= coalesced.size()) { return std::numeric_limits<std::uint64_t>::max(); }
-        coalesced[index].payload_bytes =
-            saturating_add(coalesced[index].payload_bytes, requirement.work.payload_bytes);
-        const std::uint64_t operations =
-            static_cast<std::uint64_t>(coalesced[index].copy_operations) +
-            requirement.work.copy_operations;
-        coalesced[index].copy_operations = operations > std::numeric_limits<std::uint32_t>::max()
-                                               ? std::numeric_limits<std::uint32_t>::max()
-                                               : static_cast<std::uint32_t>(operations);
-    }
-    constexpr std::array directions{
-        ContextTransferDirection::DeviceToHost,
-        ContextTransferDirection::HostToDevice,
-        ContextTransferDirection::DeviceToDevice,
-    };
-    std::uint64_t total = 0;
-    for (std::size_t index = 0; index < coalesced.size(); ++index) {
-        total = saturating_add(total, model.transfer_ns(directions[index], coalesced[index]));
-    }
-    return total;
-}
 
 std::string context_cost_hardware_class(std::string_view gpu_name, int major, int minor) {
     std::string slug;

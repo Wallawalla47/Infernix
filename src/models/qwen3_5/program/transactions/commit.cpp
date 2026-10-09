@@ -67,8 +67,6 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));
-    } else if (requests[lane].prefill && requests[lane].capture_pending) {
-        out.capture_ready = true;
     }
     return out;
 }
@@ -111,10 +109,10 @@ PendingBatch ProgramImpl::decode(std::span<const SequenceHandle> members,
     }
 }
 
-// Begin and ordinary rounds may already have provisional identity through the accepted extent;
-// speculative and forced spans arrive with identity at their base. Both are Program-owned pending
-// states, and this is their single accepted-prefix identity commit.
-void ProgramImpl::commit_generated_prefix_identity(
+// Begin and ordinary rounds may already have provisional splits through the accepted extent;
+// speculative and forced spans arrive with splits at their base. Both are Program-owned pending
+// states, and this is their single accepted-prefix split commit.
+void ProgramImpl::commit_generated_splits(
     SequenceState& sequence, std::uint32_t base_ledger_frontier,
     std::span<const TokenId> accepted_tokens,
     std::optional<std::uint32_t> prefix_execution_split_after) {
@@ -126,25 +124,18 @@ void ProgramImpl::commit_generated_prefix_identity(
         (prefix_execution_split_after &&
          (*prefix_execution_split_after == 0 ||
           *prefix_execution_split_after > accepted_tokens.size()))) {
-        throw std::logic_error("committed generated-prefix identity has an invalid span");
+        throw std::logic_error("committed generated ledger splits have an invalid span");
     }
-    const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
-                                  sequence.prefix_digests.size() == sequence.ledger.size();
-    const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
-                               sequence.prefix_digests.size() == base_ledger_frontier;
+    const bool already_appended = sequence.ledger_splits.size() == sequence.ledger.size();
+    const bool awaits_append    = sequence.ledger_splits.size() == base_ledger_frontier;
     if (!already_appended && !awaits_append) {
-        throw std::logic_error("generated-prefix identity is not at its base or committed extent");
+        throw std::logic_error("generated ledger splits are not at their base or committed extent");
     }
     if (already_appended && !prefix_execution_split_after) { return; }
-    sequence.prefix_identity.truncate(base_ledger_frontier);
-    sequence.prefix_digests.truncate(base_ledger_frontier);
-    sequence.prefix_identity.append_generated(accepted_tokens.size(), sequence.rope_delta,
-                                              prefix_execution_split_after);
-    sequence.prefix_digests.append_generated(accepted_tokens, sequence.rope_delta,
-                                             prefix_execution_split_after);
-    if (sequence.prefix_identity.size() != sequence.ledger.size() ||
-        sequence.prefix_digests.size() != sequence.ledger.size()) {
-        throw std::logic_error("committed generated-prefix identity changed the ledger shape");
+    sequence.ledger_splits.truncate(base_ledger_frontier);
+    sequence.ledger_splits.append_generated(accepted_tokens.size(), prefix_execution_split_after);
+    if (sequence.ledger_splits.size() != sequence.ledger.size()) {
+        throw std::logic_error("committed generated ledger splits changed the ledger shape");
     }
 }
 
@@ -174,8 +165,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
         if (sequence.execution_frontier == std::numeric_limits<std::uint32_t>::max() ||
             sequence.ledger_frontier != sequence.execution_frontier + 1U ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier ||
+            sequence.ledger_splits.size() != sequence.ledger_frontier ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != sequence.execution_frontier) ||
@@ -317,7 +307,6 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     sequence.dflash_context_frontier = cursor;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
-                settle_state_fork(sequence);
                 copy_tail(sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
@@ -327,15 +316,14 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
             timing.end_wait();
             work.reset();
 
-            commit_generated_prefix_identity(sequence, base_ledger_frontier, forced,
-                                             prefix_execution_splits[row]);
+            commit_generated_splits(sequence, base_ledger_frontier, forced,
+                                    prefix_execution_splits[row]);
             sequence.execution_frontier = end;
             sequence.ledger_frontier    = end + 1U;
             sequence.mtp_draft_count    = 0;
             sequence.tail_hidden_valid  = true;
             if (sequence.ledger.size() != sequence.ledger_frontier ||
-                sequence.prefix_identity.size() != sequence.ledger_frontier ||
-                sequence.prefix_digests.size() != sequence.ledger_frontier ||
+                sequence.ledger_splits.size() != sequence.ledger_frontier ||
                 sequence.ledger.back() != forced.back()) {
                 throw std::logic_error("forced-token commit did not establish a valid frontier");
             }
@@ -476,23 +464,6 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                 discarded[row] ? out.rows[row].speculative : requests[lanes[row]].speculative_stats;
             out.rows[row].speculative_counters = {stats.rounds, stats.drafted_tokens,
                                                   stats.accepted_tokens, stats.fallback_steps};
-            if (pending_kinds[row] != PendingKind::Begin || discarded[row]) { continue; }
-            RequestControl& request = requests[lanes[row]];
-            if (decisions[row].terminal) {
-                request.prefill.reset();
-                continue;
-            }
-            if (!request.prefill) { continue; }
-            RequestControl::Prefill& prefill = *request.prefill;
-            if (prefill.cursor != prefill.prompt_tokens ||
-                request.next_capture >= request.capture_groups.size() ||
-                request.capture_groups[request.next_capture].frontier != prefill.prompt_tokens ||
-                request.capture_pending) {
-                throw std::logic_error("prompt-frontier capture carrier is inconsistent");
-            }
-
-            request.capture_pending = true;
-            out.capture_ready[row]  = true;
         }
         out.timing = timing.finish();
         return out;
@@ -534,12 +505,8 @@ FinishResult ProgramImpl::finish(SequenceHandle handle) noexcept {
     out.constrained_draws = std::move(request.constraint_trace);
     try {
         device.synchronize();
-        if (hybrid_) {
-            // Hybrid mode retains context in the prefix index, never as a checkpoint.
-            hybrid_finish_lane(sequences[lane], true);
-        } else if (request.publish_continuation) {
-            out.checkpoint = detach_checkpoint(sequences[lane]);
-        }
+        // The prefix cache retains the finished context: its blocks and an endpoint snapshot.
+        hybrid_finish_lane(sequences[lane], true);
         clear_lane(sequences[lane], request);
         out.status = runtime::ConsumeStatus::Consumed;
     } catch (...) { clear_lane(sequences[lane], request); }
@@ -555,19 +522,17 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
     try {
         device.synchronize();
     } catch (...) { return out; }
-    if (context_transaction_ && context_transaction_->kind != ContextOperationKind::Demote &&
-        context_transaction_->lane == lane) {
+    if (context_transaction_ && context_transaction_->lane == lane) {
         abort_context();
     }
-    if (hybrid_ && requests[lane].lifecycle != Lifecycle::Empty) {
+    if (requests[lane].lifecycle != Lifecycle::Empty) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         const auto& request  = requests[lane];
         const auto& sequence = sequences[lane];
         const bool consistent =
             (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
              (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
-              sequence.text_kv_valid == request.prefill->cursor)) &&
-            !sequence.state.fork_pending;
+              sequence.text_kv_valid == request.prefill->cursor));
         hybrid_finish_lane(sequences[lane], consistent);
     }
     clear_lane(sequences[lane], requests[lane]);
@@ -592,8 +557,6 @@ void ProgramImpl::fail_all_cleanup() noexcept {
         }
         hybrid_->clear();
     }
-    // Published checkpoints belong to Runtime or ResumeState. After readers settle, their
-    // owners release them; clearing this directory here would invalidate those live owners.
 }
 
 void ProgramImpl::shutdown_cleanup() noexcept {

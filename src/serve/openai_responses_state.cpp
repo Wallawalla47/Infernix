@@ -144,8 +144,7 @@ ChatTurn instruction_turn(const std::string& text) {
 
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
-                                OpenAIResponsesStore& store, std::optional<std::string> response_id,
-                                bool store_response) {
+                                OpenAIResponsesStore& store) {
     OpenAIResponsesResolvedPrompt resolved;
     resolved.generation = request.generation;
 
@@ -180,16 +179,6 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
     apply_openai_prompt_cache_policy(resolved.generation, request.cache_policy);
-
-    if (response_id) {
-        if (parent_record) {
-            resolved.session_key = parent_record->session_key;
-        } else if (store_response) {
-            resolved.session_key = *response_id;
-        }
-        resolved.cache_hints.session_key          = resolved.session_key;
-        resolved.cache_hints.update_session_index = store_response;
-    }
     return resolved;
 }
 

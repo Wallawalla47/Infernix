@@ -1,5 +1,5 @@
 #include "core/device.h"
-#include "core/host_kv_arena.h"
+#include "core/host_context_arena.h"
 #include "models/qwen3_5/state/state_image.h"
 
 #include <cuda_runtime.h>
@@ -174,86 +174,14 @@ void test_host_roundtrip(bool dflash, infernix::DeviceContext& device, bool dfla
 
     infernix::HostContextArena host_backing(planned.layout.host.image_bytes,
                                           planned.layout.host.image_bytes);
-    q36::HostStatePool host(host_backing, planned.layout.host);
-    const auto handle = host.allocate();
-    expect(handle.has_value(), "HostStatePool allocates its fixed slot");
-    expect(!host.allocate().has_value(), "HostStatePool reports capacity exhaustion");
-    expect(host.occupied() == 1, "HostStatePool occupied count after allocation");
-
-    pool.copy_to_host(0, host.writable_view(*handle), device.stream);
+    auto image = host_backing.allocate(planned.layout.host.image_bytes);
+    expect(image.has_value(), "pinned Host backing holds one StateImage");
+    pool.copy_to_host(0, {.data = image->data(), .layout = &planned.layout.host}, device.stream);
     device.synchronize();
-    expect(host.publish(*handle), "Host state publication accepts its reservation");
-    expect(host_backing.reserved_bytes() == 0 &&
-               host_backing.live_bytes() == planned.layout.host.image_bytes,
-           "Host state publication converts reservation to one live allocation");
-    pool.copy_from_host(host.view(*handle), 1, device.stream);
+    pool.copy_from_host({.data = image->data(), .layout = &planned.layout.host}, 1, device.stream);
     device.synchronize();
     expect_slot(pool, 1, dflash ? 0x19 : 0x25,
                 dflash ? "DFlash Host roundtrip" : "common Host roundtrip");
-
-    const q36::HostStateSlotHandle stale = *handle;
-    expect(host.release(stale), "HostStatePool releases a live handle");
-    expect(host.occupied() == 0, "HostStatePool occupied count after release");
-    bool stale_view_rejected = false;
-    try {
-        (void)host.view(stale);
-    } catch (const std::invalid_argument&) { stale_view_rejected = true; }
-    expect(stale_view_rejected, "HostStatePool rejects a stale view");
-    const auto reused = host.allocate();
-    expect(reused && reused->index == stale.index && reused->generation != stale.generation,
-           "HostStatePool reuse advances generation");
-    expect(!host.release(stale), "HostStatePool rejects stale release");
-    expect(host.release(*reused), "HostStatePool releases the reused slot");
-}
-
-void test_shared_host_capacity() {
-    const PlannedPool planned           = plan_pool(false, 2);
-    const infernix::HostKVPageLayout page = infernix::plan_host_kv_page_layout(
-        {.page_tokens = 1,
-         .planes      = {{.dtype = infernix::DType::BF16, .leading_extent = 8, .head_extent = 1}}});
-    const std::size_t image_bytes = planned.layout.host.image_bytes;
-    expect(image_bytes % page.page_stride == 0,
-           "shared Host fixture image consists of complete KV page extents");
-    const auto pages_per_image = static_cast<std::uint32_t>(image_bytes / page.page_stride);
-    infernix::HostContextArena backing(image_bytes * 2, std::min(image_bytes, page.page_stride));
-    const std::array layouts{page};
-    infernix::HostKVArena kv(backing, layouts);
-    q36::HostStatePool state(backing, planned.layout.host);
-    q36::HostStatePool other_state(backing, planned.layout.host);
-    auto source                     = state.allocate();
-    const std::byte* original_bytes = state.view(*source).data;
-    expect(state.publish(*source), "shared Host source publication");
-    auto destination = kv.allocate(page, pages_per_image);
-    expect(destination && backing.live_bytes() == image_bytes &&
-               backing.reserved_bytes() == image_bytes && !state.can_allocate() &&
-               !state.allocate() && !kv.allocate(page, 1),
-           "State and in-flight KV destination consume the same actual backing");
-    expect(!other_state.release(*source) && !other_state.publish(*source),
-           "State handles cannot release another typed owner's allocation");
-    destination.reset();
-    expect(backing.reserved_bytes() == 0 && backing.live_bytes() == image_bytes &&
-               state.view(*source).data == original_bytes,
-           "KV transfer cancellation retains the pinned State source");
-    expect(state.release(*source), "shared Host state release");
-    auto all_kv = kv.allocate(page, pages_per_image * 2);
-    expect(all_kv && kv.view(*all_kv).data() == original_bytes &&
-               backing.occupied_bytes() == backing.capacity_bytes(),
-           "KV reuses the exact physical extent previously occupied by State");
-    all_kv->publish();
-    const auto stale = kv.view(*all_kv);
-    auto parts       = kv.split(std::move(*all_kv), pages_per_image);
-    expect(!stale.valid() && backing.live_bytes() == image_bytes * 2,
-           "KV split invalidates old views while keeping unique byte accounting");
-    (void)parts.first.release();
-    auto recovered = state.allocate();
-    expect(recovered && state.view(*recovered).data == original_bytes &&
-               backing.occupied_bytes() == backing.capacity_bytes(),
-           "State reuses the exact physical extent released by split KV");
-    expect(state.release(*recovered), "shared Host recovered state release");
-    (void)parts.second.release();
-    expect(backing.occupied_bytes() == 0 && backing.allocation_count() == 0 &&
-               backing.capacity_bytes() == image_bytes * 2,
-           "shared Host typed owners return all live and reserved extents");
 }
 
 // The exact KV window is a per-slot component: a layer view spans every slot, a slot view one;
@@ -322,9 +250,9 @@ void test_segmented_roundtrip(bool dflash, infernix::DeviceContext& device, bool
 
     infernix::HostContextArena contiguous_backing(planned.layout.host.image_bytes,
                                                 planned.layout.host.image_bytes);
-    q36::HostStatePool contiguous(contiguous_backing, planned.layout.host);
-    const auto handle = contiguous.allocate();
-    pool.copy_to_host(0, contiguous.writable_view(*handle), device.stream);
+    auto contiguous = contiguous_backing.allocate(planned.layout.host.image_bytes);
+    pool.copy_to_host(0, {.data = contiguous->data(), .layout = &planned.layout.host},
+                      device.stream);
 
     const std::size_t image_bytes   = planned.layout.host.image_bytes;
     const std::size_t segment_bytes = 777;
@@ -338,7 +266,7 @@ void test_segmented_roundtrip(bool dflash, infernix::DeviceContext& device, bool
     pool.copy_to_host_segments(0, scattered, segment_bytes, device.stream);
     device.synchronize();
 
-    const std::byte* packed = contiguous.view(*handle).data;
+    const std::byte* packed = contiguous->data();
     bool equal              = true;
     for (std::size_t offset = 0; offset < image_bytes; ++offset) {
         equal =
@@ -381,7 +309,6 @@ void test_segmented_roundtrip(bool dflash, infernix::DeviceContext& device, bool
                                    segment_bytes, device.stream);
     } catch (const std::invalid_argument&) { short_rejected = true; }
     expect(short_rejected || segments == 1, "segments that do not cover the image were accepted");
-    (void)contiguous.release(*handle);
 }
 
 } // namespace
@@ -428,7 +355,6 @@ int main() {
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);
-    test_shared_host_capacity();
     test_host_roundtrip(false, device, false, true);
     test_kv_window(device);
     test_segmented_roundtrip(false, device);

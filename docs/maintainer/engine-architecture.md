@@ -2,9 +2,10 @@
 
 This document defines model instances, execution ownership, the request lifecycle and the commit
 relationships across modules.
-[Resource scheduling and context cache](resource-scheduling-and-context-cache.md) defines the cache and
-preemption policy; [Paged KV Context Store](paged-kv-cache.md) defines physical pages, replicas, the
-address space and the consumer contract.
+[Resource scheduling and context cache](resource-scheduling-and-context-cache.md) defines admission,
+permits and preemption; the [hybrid prefix cache](hybrid-prefix-cache-spec.md) defines prefix reuse;
+[Paged KV Context Store](paged-kv-cache.md) defines physical pages, the address space and the consumer
+contract.
 
 ## 1. Product execution model
 
@@ -64,7 +65,7 @@ flowchart TD
     G["Gateway: protocol, connections, input acquisition"] --> F["Frontend: PreparedPrompt / OutputSession"]
     F --> E["EngineCore: requests, lifecycle, commit and publication"]
     E --> S["Scheduler: execution membership, order, fairness"]
-    E --> R["ResourceManager: cache candidates and retention policy"]
+    E --> R["HybridResourceManager: cache candidates and reclaim"]
     E --> P["Program: physical resources, state, execution"]
     R --> P
     P --> O["Ops / Core: compute, storage and transfer primitives"]
@@ -106,17 +107,16 @@ A lane is a resident request position; the StateImage slot, KV execution row and
 are independent identities. After a pause releases its lane, the request is still owned by EngineCore;
 resuming can acquire a different lane.
 
-### 2.3 ResourceManager
+### 2.3 HybridResourceManager
 
-The ResourceManager owns private continuation owners and their restore points, the shared prefix
-index, session hints, retention priority and optional save admission. It queries the Program for actual
-checkpoint contents, transfer requirements and finite physical actions, selects a source, chooses
-reclaim actions by restore loss, the current shortfall and evidence of real demand, and then adopts
-the result returned by the Program.
+The `HybridResourceManager` connects the Engine to the Program's prefix index: it asks for an admitted
+request's candidate sources, reclaims by evicting cached Device blocks, prefetches the blocked FIFO
+head's Host-only path, passes the queue for queue holds and publishes the cache statistics. Retention
+policy (the block tree, snapshots, taps and eviction) lives in the Program's index
+([hybrid prefix cache](hybrid-prefix-cache-spec.md)).
 
-The actual occupancy of State slots, Device pages, Host bytes, shared references and pins exists only
-in the Program stores. The ResourceManager's index and retention records are not a second physical
-ledger.
+The actual occupancy of State slots, Device pages, Host slabs, shared references and pins exists only
+in the Program stores and its index.
 
 ### 2.4 Model and Program
 
@@ -126,7 +126,7 @@ const Parameters borrow these resources, and planning and execution consume the 
 Each Program exclusively owns:
 
 - the active sequences, committed prefix identity, execution ledger and backend state;
-- the StateImage, KV history, Device/Host replicas, leases and reservations;
+- the StateImage, KV history, prefix cache, source pins and reservations;
 - prefill, ordinary/speculative decode, forced control and Replay;
 - provisional model state and accepted-prefix commit/rollback;
 - workspace, CUDA Graphs and the fixed model calls.
@@ -170,7 +170,6 @@ stateDiagram-v2
     Waiting --> Materializing: initial bind
     Materializing --> Prefill
     Materializing --> Replay: re-execute accepted history
-    Materializing --> DecodeReady: Snapshot restore
     Materializing --> ControlReady
     Prefill --> DecodeReady
     DecodeReady --> ControlReady
@@ -190,31 +189,27 @@ stateDiagram-v2
     ModelFinished --> [*]: resource and output settlement
 ```
 
-`Materializing` covers the source lease, any required transfers and destination installation; the
+`Materializing` covers the source pins, any required transfers and destination installation; the
 SequenceHandle is exposed only after the complete binding is adopted.
-Capture is a temporary execution gate on a resident request; a request whose capture is incomplete
-does not enter a model unit.
 `ModelFinished` means the model has finished, but the Engine still holds the lane until finish/release
 and the cache index update complete.
 Cancellation and failure can enter a terminal state from the corresponding stable boundary.
 
 ### 3.1 Pause and resume
 
-A pause is completed by the Program at a committed GPU boundary and returns an owning `ResumeState`:
-
-- Snapshot keeps complete State/KV coverage that can be restored directly;
-- Replay keeps the input, accepted ledger, RNG and backend control state needed to continue the
-  request, and re-executes the missing history on resume.
+A pause is completed by the Program at a committed GPU boundary and returns an owning `ResumeState`
+that keeps the input, accepted ledger and its execution splits, RNG and backend control state needed
+to continue the request; the lane's device state is released. On resume the request binds from the
+deepest cached state on its history and re-executes the missing history (Replay).
 
 The Engine keeps the same request record, OutputSession, generation budget and published results.
 When Replay rebuilds physical state it does not republish historical output or consume the user's
-generation budget again. A Snapshot is a reclaimable acceleration resource; after it is revoked the
-request can still Replay.
+generation budget again.
 A resume bind acquires a complete permit for "rebuild to the old frontier + the first real new unit",
 and Native keeps the actual reservation across chunks.
 At most one request is in this protected resume at a time; real new progress or a terminal state ends
-the permit, after which other resumes are attempted.
-Optional capture is skipped during this period; other requests that hold permits can still execute.
+the permit, after which other resumes are attempted; other requests that hold permits can still
+execute.
 
 ### 3.2 Outstanding capacity
 
@@ -229,24 +224,21 @@ consumer_released   wait has finished, or the GenerationHandle was abandoned
 The two can happen in either order; capacity is released exactly once. Abandoning a handle only sets
 cancellation and `consumer_released`; the consumer thread does not call the Program.
 
-### 3.3 Continuation and session
+### 3.3 Cached prefixes
 
-An active continuation is writable model state; a checkpoint is an immutable restore point. A complete
-checkpoint aligns State, Main KV, the selected backend KV and the metadata needed to continue
-execution. One private owner can hold multiple restore points that share KV history.
-
-A session key provides a continuation lookup hint. Each request has a monotonic `publication_order`;
-when an earlier-submitted request finishes later, it does not overwrite the session binding of a newer
-result. The concrete restore point and shared publication rules are defined in the
-[context cache](resource-scheduling-and-context-cache.md) document.
+A lane's state is writable; a cached snapshot is an immutable restore point that aligns State, Main
+KV, the selected backend KV and the metadata needed to continue execution at its position. Cached
+prefixes are identified by content, so requests that share a prefix share its blocks and snapshots
+without session keys; the [hybrid prefix cache](hybrid-prefix-cache-spec.md) defines where snapshots
+are taken and what is kept.
 
 ## 4. Worker, resources and execution
 
-Only the Engine worker modifies request runtime state, the Scheduler, the ResourceManager and the
-Program. Ingress, consumers and transport interact through queues, atomic cancellation flags and
+Only the Engine worker modifies request runtime state, the Scheduler, the HybridResourceManager
+and the Program. Ingress, consumers and transport interact through queues, atomic cancellation flags and
 response events.
 
-A worker cycle first advances resource transactions, capture and terminal states and processes
+A worker cycle first advances context transactions and terminal states and processes
 cancellation, and on a capacity event tries a complete resume of the oldest paused request. It then
 acquires unit permits row by row for resident requests (resumes first, then original ticket order),
 uses the remaining headroom to try fresh admission, and then executes the runnable control and decode
@@ -257,8 +249,8 @@ The Program's `reserve_units` atomically acquires the typed incremental demand o
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other
 permitted rows from executing. Ordinary unit settlement releases unused reservations and provisional
 suffixes; a resume permit keeps the reservation still needed for the future rebuild and the first new
-unit. Pressure can reclaim optional cache, revoke paused Snapshots or pause young resident requests;
-admission and fairness details are in the core cache document.
+unit. Pressure can evict cached blocks or pause young resident requests; admission and fairness
+details are in the [resource scheduling](resource-scheduling-and-context-cache.md) document.
 
 A resource transaction can interleave with execution of unaffected resident requests, but the
 Program freezes dependencies on the same sequence, source/destination lease, block table and transfer
@@ -275,21 +267,20 @@ whole remaining generation length.
 
 ### 5.1 Context transactions
 
-Bind, Capture, Demote and Pause use the same transaction driver:
+Bind and Pause use the same transaction driver:
 
 ```text
 select the operation and source
-  -> Program acquires the destination reservation and source lease
+  -> Program pins the source and acquires the destination reservation
   -> stepwise transfers and completion checks
   -> publish the complete physical result
-  -> Engine / ResourceManager adopt the result
+  -> Engine adopts the result
 ```
 
-The Program holds physical ownership during the transaction and returns the new sequence, restore
-points, retired checkpoints, pause state and transfer observations. The source remains valid until the
-required data has been copied and verified; abort cleans up reservations and transfers and does not
-publish an incomplete destination. Reclaims or demotions that completed safely can be kept, and the
-result must match the final actual occupancy.
+The Program holds physical ownership during the transaction and returns the new sequence or the pause
+state. The source remains valid until the required data has been copied and verified; abort cleans
+up reservations and transfers and does not publish an incomplete destination. Evictions that
+completed safely are kept, and the result must match the final actual occupancy.
 
 ### 5.2 Model unit transactions
 
@@ -301,7 +292,7 @@ The Engine forms each row's decision using the Frontend preview, then calls `Pro
 state, RNG and speculative state.
 
 The recurrent fold of a speculative round is enqueued onto the Program stream inside commit and returns
-without waiting for the device to finish: the decode, capture, transfer and prefill work that later
+without waiting for the device to finish: the decode, snapshot, transfer and prefill work that later
 reads or writes that state is ordered after it on the same stream, and the host does not read the
 fold's result. Only a terminal DFlash row that appends context through the pinned ingress synchronizes
 inside commit, because the next round's submission overwrites that ingress.
@@ -337,17 +328,16 @@ Forced control uses the same commit mechanism; the tokens are provided by the Fr
 calls the sampler nor advances the sampling RNG.
 Once initial admission is established, `GenerationStart` is published once before any output delta; a
 preemption resume does not publish it again.
-The final response waits for terminal resources and cache owner settlement to complete.
+The final response waits for terminal resources and the cache's publication to complete.
 
 ## 6. Finish, cancellation and failure
 
-On successful finish, the Program hands a retainable continuation to the ResourceManager or releases
-the sequence; the ResourceManager updates the private owner, shared index and session, and then the
-Engine releases the lane and completes the response.
+On successful finish, the Program publishes the lane's blocks and endpoint snapshot into the prefix
+cache and releases the sequence; then the Engine releases the lane and completes the response.
 
 Cancellation takes effect at a worker boundary: a Waiting request ends directly; a request that is
 binding or transferring first settles/aborts its transaction; a resident request aborts after its GPU
-unit is stable; a paused request releases its ResumeState and the related owners. Cancellation does
+unit is stable; a paused request releases its ResumeState. Cancellation does
 not rewrite in-flight mappings, and committed output is not rolled back.
 
 Queue timeout, overload, input over limit and an unrepresentable request are request-level
@@ -364,8 +354,8 @@ its heartbeat). The Engine raises it itself for the capacity contract error
 ([resource scheduling](resource-scheduling-and-context-cache.md) §3), which fires before the unit
 runs. The Engine fails the requests holding lanes with it, the Program releases those
 lanes without publishing anything and empties a prefix cache the failed round may have published
-into, and queued requests keep waiting; if the Engine is binding, materializing, capturing or holding
-a paused request at that moment it fails everything instead. A service or read thread that has itself
+into, and queued requests keep waiting; if the Engine is binding, materializing or holding a
+paused request at that moment it fails everything instead. A service or read thread that has itself
 stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
 its cause. CUDA errors are never recoverable: the context state is unknown.
 
@@ -384,7 +374,7 @@ Text/the selected MTP finish consuming it, and speculative features and verify r
 the commit boundary.
 
 Growing KV uses shared typed paged pools, with physical pages separated from the logical token
-frontier. All reservations, mapping updates, COW and replica publication complete at a stable GPU
+frontier. All reservations, mapping updates, COW and cache publication complete at a stable GPU
 boundary. Consumers receive only non-owning typed views.
 
 CUDA Graphs are built per legal exact-`B` topology; page IDs, request identity and state selectors are
@@ -401,16 +391,16 @@ defaults are used for configurations without a matching measurement.
 The actual reservations and stores determine physical feasibility.
 
 Serve warmup uses the public Engine but disables the request-level context cache; afterwards it leaves
-no continuation or checkpoint that external requests could hit.
+no cached prefix that external requests could hit.
 
 ## 8. Core invariants and implementation locations
 
 1. The Engine worker is the only executor of request runtime state and physical mutation.
-2. The Scheduler decides order, the ResourceManager decides logical retention, and the Program
+2. The Scheduler decides order, the Program's prefix index decides retention, and the Program
    decides physical feasibility and state operations.
 3. A unit acquires a complete permit before executing; a resume permit is kept across chunks until
    real new progress, and resources and mappings are stable during execution.
-4. A checkpoint must correspond to complete State/KV coverage from one actual execution.
+4. A cached snapshot must correspond to complete State/KV coverage from one actual execution.
 5. Pausing preserves request semantics and published output; resuming does not repeat output or
    generation accounting.
 6. Output can be published only after its PendingBatch is fully consumed; a request keeps resource
@@ -422,7 +412,8 @@ no continuation or checkpoint that external requests could hit.
 | Public Engine facade | `include/infernix/engine.h`, `src/runtime/engine/engine.cpp` |
 | Request lifecycle, scheduling and observation | `src/runtime/engine/engine_core.h`, `request_record.h`, `scheduler.h`, `engine_metrics.inl` |
 | Instance construction | `src/runtime/engine/model_instance.*` |
-| Cache owners, index and costs | `src/runtime/engine/context_cache/` |
+| Engine connection to the prefix cache | `src/runtime/engine/context_cache/` |
+| Model-agnostic prefix index, tap planner and cost model | `src/runtime/prefix_cache/` |
 | Public request, execution and resource contracts | `src/runtime/contract/` |
 | Model config, binding and read-only data | `src/models/qwen3_5/config.*`, `load/`, `model.*` |
 | Native parameters and fixed model calls | `src/models/qwen3_5/execution/` |

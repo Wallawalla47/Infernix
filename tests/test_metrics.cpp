@@ -20,8 +20,7 @@ int main() {
     options.max_concurrency                  = 2;
     options.context_cache.hybrid.device_snapshot_slots = 1;
     MemorySummary memory;
-    memory.kv_capacity_page_groups     = 256;
-    memory.host_context_capacity_bytes = 1048576;
+    memory.kv_capacity_page_groups = 256;
     RuntimeStats baseline;
     baseline.generated_tokens         = 4;
     baseline.speculative_draft_tokens = 3;
@@ -32,8 +31,7 @@ int main() {
     running.speculative_draft_tokens += 6;
     running.speculative_accepted_tokens = 3;
     running.running_requests            = 1;
-    running.host_context_occupied_bytes = 4096;
-    running.host_context_reserved_bytes = 1024;
+    running.prefix_selections           = 2;
     metrics.first_token({.prepare_seconds = 0.05, .elapsed_since_submit_seconds = 0.2});
     const auto live = metrics.render(running, true);
     check(live.find("infernix_generation_tokens_total 5\n") != std::string::npos,
@@ -49,8 +47,9 @@ int main() {
     check(live.find("model_name=\"custom\\\"model\\\\name\\nline\"") != std::string::npos,
           "model label must escape quotes, backslashes and newlines");
     check(metrics.render(running, true) == live, "scrapes must not consume or reset counters");
-    check(live.find("infernix_host_context_used_bytes 4096\n") != std::string::npos,
-          "reserved bytes must not be added to occupancy twice");
+    check(live.find("infernix_prefix_selections_total 2\n") != std::string::npos &&
+              live.find("infernix_device_state_capacity_slots 3\n") != std::string::npos,
+          "prefix-cache selections and StateImage capacity must be observable");
 
     GenerationOutcome outcome;
     outcome.finish_reason                            = FinishReason::OutputLimit;

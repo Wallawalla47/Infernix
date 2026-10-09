@@ -19,7 +19,6 @@ namespace infernix {
 using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
-inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
@@ -795,15 +794,13 @@ struct PromptCacheMarker {
                                                    PromptCacheMarker) noexcept = default;
 };
 
+// Where the rendered prompt has reusable structure: the prefix cache places state snapshots
+// (taps) at these frontiers.
 struct ContextCacheHints {
-    std::optional<std::string> session_key;
     std::vector<PromptCacheMarker> markers;
     // Protocols with their own automatic/explicit write policy disable the Engine's structural
-    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    // candidates (the tool-definition boundary).
     bool allow_engine_automatic_shared_prefixes = true;
-    // Advance the named session lineage when session_key is present. This does not require an
-    // anonymous content-matched source to be retained.
-    bool update_session_index = true;
 };
 
 struct PromptInput {
@@ -964,11 +961,11 @@ enum class GenerationSchedulingTransition : std::uint8_t {
     Restored,
     ReplayComplete,
     RecoveryComplete,
-    SnapshotRevoked,
     Terminal,
 };
 
-enum class GenerationRecoveryRoute : std::uint8_t { None, Snapshot, Replay };
+// A paused request recovers by Replay from the deepest state the prefix cache holds.
+enum class GenerationRecoveryRoute : std::uint8_t { None, Replay };
 
 // Sparse lifecycle observations captured by the Engine worker and delivered by wait() on the
 // consumer thread. Counter deltas between boundaries, less the request's own deltas, measure
@@ -1079,20 +1076,18 @@ struct GenerationEngineTiming {
     std::uint64_t control_units                  = 0;
 };
 
-// Request-owned scheduling observations. Restore counters count completed restorations;
-// replayed_tokens counts tokens actually recomputed, including previously generated output;
-// these tokens are separate from initial prompt prefill and delivered output. paused_ns covers
-// pause preparation, waiting and binding restoration, excluding replay computation.
-// Transfer bytes count request-owned payload submitted for binding, capture,
-// pause and restore; background cache maintenance remains in the Engine-wide counters.
+// Request-owned scheduling observations. Restore counters count completed restorations: a
+// snapshot restore resumed from a prefix-cache snapshot at the paused frontier itself, a replay
+// restore recomputed past the deepest cached state. replayed_tokens counts tokens actually
+// recomputed, including previously generated output; these tokens are separate from initial
+// prompt prefill and delivered output. paused_ns covers pause preparation, waiting and binding
+// restoration, excluding replay computation.
 struct GenerationSchedulingStats {
-    std::uint64_t preemptions          = 0;
-    std::uint64_t snapshot_restores    = 0;
-    std::uint64_t replay_restores      = 0;
-    std::uint64_t replayed_tokens      = 0;
-    std::uint64_t paused_ns            = 0;
-    std::uint64_t device_to_host_bytes = 0;
-    std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t preemptions       = 0;
+    std::uint64_t snapshot_restores = 0;
+    std::uint64_t replay_restores   = 0;
+    std::uint64_t replayed_tokens   = 0;
+    std::uint64_t paused_ns         = 0;
 };
 
 // Request-owned execution work. GPU stream intervals overlap Host submission and completion
@@ -1102,11 +1097,6 @@ struct GenerationWorkTiming {
     double wait_seconds   = 0.0;
     double post_seconds   = 0.0;
     double gpu_seconds    = 0.0;
-};
-
-struct GenerationTransferTiming {
-    std::uint64_t bytes = 0;
-    double seconds      = 0.0;
 };
 
 // Frozen immediately before the first nonempty public output delta is published. This boundary
@@ -1121,9 +1111,6 @@ struct GenerationFirstOutputTiming {
     GenerationWorkTiming replay;
     GenerationSchedulingStats scheduling;
     std::uint32_t computed_prefill_tokens = 0;
-    // Resources: State, Main KV, Backend KV. Directions: D2H, H2D, D2D.
-    // Completed request-owned transfers only; background reclamation remains Engine-wide.
-    std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
 };
 
 struct SpeculativeStats {
@@ -1181,10 +1168,9 @@ struct ConstraintObservation {
     std::uint64_t mask_upload_bytes = 0;
 };
 
+// A root start, or a prefix-cache snapshot: a previous generation's endpoint, or a prefill tap.
 enum class PrefixReusePath : std::uint8_t {
     Root,
-    Checkpoint,
-    // Hybrid prefix cache: a previous generation's endpoint snapshot, or a prefill snapshot.
     HybridEndpoint,
     HybridSnapshot,
 };
@@ -1192,8 +1178,6 @@ enum class PrefixReusePath : std::uint8_t {
 enum class AdmissionFallbackReason : std::uint8_t {
     None,
     SourceInvalid,
-    SourceRevoked,
-    CostChanged,
     CapacityLimit,
     IsolatedCapacity,
 };
@@ -1203,7 +1187,6 @@ struct GenerationAdmissionStats {
     // Subset of initial queue wait, not additional TTFT. Includes waiting for a lane
     // after a useful source has been selected.
     double source_wait_seconds              = 0.0;
-    std::uint32_t revoked_checkpoints       = 0;
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
 
@@ -1337,13 +1320,6 @@ struct MemorySummary {
     // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
     std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
-    // One shared physical Host context backing. Reserved bytes are included in occupied bytes;
-    // State/KV occupancy below is a breakdown and must not be added to this ledger again.
-    std::size_t host_context_capacity_bytes = 0;
-    std::size_t host_context_occupied_bytes = 0;
-    std::size_t host_context_reserved_bytes = 0;
-    std::uint32_t host_state_occupied_slots = 0;
-    std::size_t host_kv_occupied_bytes      = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -1384,7 +1360,7 @@ struct RuntimeStats {
     std::uint64_t speculative_draft_tokens    = 0;
     std::uint64_t speculative_accepted_tokens = 0;
     std::uint64_t speculative_fallback_steps  = 0;
-    // Initial prompt tokens evaluated by prefill. Reused checkpoint-prefix tokens and replay
+    // Initial prompt tokens evaluated by prefill. Reused prefix-cache tokens and replay
     // recomputation are excluded; replayed_tokens separately counts that additional model work.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
@@ -1399,66 +1375,28 @@ struct RuntimeStats {
     std::uint32_t paused_requests           = 0;
     std::uint32_t replaying_requests        = 0;
     std::uint32_t materializing_requests    = 0;
-    std::uint32_t capture_pending_requests  = 0;
     std::uint32_t terminal_pending_requests = 0;
-    std::uint64_t active_captures_completed = 0;
-    std::uint64_t active_captures_aborted   = 0;
     std::uint64_t preemptions               = 0;
     std::uint64_t snapshot_restores         = 0;
     std::uint64_t replay_restores           = 0;
     std::uint64_t replayed_tokens           = 0;
 
+    // Initial bindings from the root and from a prefix-cache snapshot.
     std::uint64_t root_selections               = 0;
-    std::uint64_t checkpoint_selections         = 0;
+    std::uint64_t prefix_selections             = 0;
     std::uint64_t reused_prompt_tokens          = 0;
     std::uint32_t last_selected_frontier_tokens = 0;
 
-    std::uint64_t state_moves                 = 0;
+    // StateImage copies from a snapshot into a lane (state_forks; at initial binding too:
+    // materialization_state_forks), Host snapshot restores and private partial-tail page copies.
     std::uint64_t state_forks                 = 0;
     std::uint64_t materialization_state_forks = 0;
     std::uint64_t state_restores              = 0;
-    std::uint64_t state_d2h_count             = 0;
-    std::uint64_t state_h2d_count             = 0;
-    std::uint64_t state_d2d_count             = 0;
-    std::uint64_t state_d2h_bytes             = 0;
-    std::uint64_t state_h2d_bytes             = 0;
-    std::uint64_t state_d2d_bytes             = 0;
-    double state_d2h_seconds                  = 0.0;
-    double state_h2d_seconds                  = 0.0;
-    double state_d2d_seconds                  = 0.0;
+    std::uint64_t partial_tail_cow_pages      = 0;
 
-    std::uint64_t main_kv_d2h_pages    = 0;
-    std::uint64_t main_kv_h2d_pages    = 0;
-    std::uint64_t main_kv_d2d_pages    = 0;
-    std::uint64_t main_kv_d2h_bytes    = 0;
-    std::uint64_t main_kv_h2d_bytes    = 0;
-    std::uint64_t main_kv_d2d_bytes    = 0;
-    double main_kv_d2h_seconds         = 0.0;
-    double main_kv_h2d_seconds         = 0.0;
-    double main_kv_d2d_seconds         = 0.0;
-    std::uint64_t backend_kv_d2h_pages = 0;
-    std::uint64_t backend_kv_h2d_pages = 0;
-    std::uint64_t backend_kv_d2d_pages = 0;
-    std::uint64_t backend_kv_d2h_bytes = 0;
-    std::uint64_t backend_kv_h2d_bytes = 0;
-    std::uint64_t backend_kv_d2d_bytes = 0;
-    double backend_kv_d2h_seconds      = 0.0;
-    double backend_kv_h2d_seconds      = 0.0;
-    double backend_kv_d2d_seconds      = 0.0;
-
-    std::uint64_t pressure_spill_pages             = 0;
-    std::uint64_t partial_tail_cow_pages           = 0;
     std::uint32_t device_state_occupied_slots      = 0;
-    std::uint32_t host_state_occupied_slots        = 0;
     std::uint32_t device_main_kv_occupied_pages    = 0;
     std::uint32_t device_backend_kv_occupied_pages = 0;
-    std::size_t host_kv_occupied_bytes             = 0;
-    // Unified physical Host context occupancy. Reserved destinations are included in occupied.
-    std::size_t host_context_occupied_bytes = 0;
-    std::size_t host_context_reserved_bytes = 0;
-    // Allocator lifetime high-water mark, including reserved transfer destinations.
-    std::size_t host_context_peak_occupied_bytes = 0;
-    double actual_context_transfer_seconds       = 0.0;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
     // rest are cumulative event counters.

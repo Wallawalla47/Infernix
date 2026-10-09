@@ -13,8 +13,6 @@ struct RuntimeTypes {
     using SequencePlan      = qwen3_5::SequencePlan;
     using RequestBasePlan   = qwen3_5::RequestBasePlan;
     using SequenceHandle    = qwen3_5::SequenceHandle;
-    using CheckpointHandle  = qwen3_5::CheckpointHandle;
-    using CheckpointSummary = qwen3_5::CheckpointSummary;
     using SourceCandidate   = qwen3_5::SourceCandidate;
     using ResumeState       = qwen3_5::ResumeState;
     using ExecutionUnit     = qwen3_5::ExecutionUnit;
@@ -28,6 +26,5 @@ struct RuntimeTypes {
     using FinishResult      = qwen3_5::FinishResult;
     using AbortResult       = qwen3_5::AbortResult;
     using Program           = qwen3_5::Program;
-    using CacheSessionKey   = qwen3_5::PreparedSessionKey;
 };
 } // namespace infernix::models::qwen3_5

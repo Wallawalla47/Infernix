@@ -243,9 +243,10 @@ int main(int argc, char** argv) {
             const auto control_fresh =
                 control.generate(control.prepare_tokens(control_prompt), request(8, false));
             const auto stats = control.runtime_stats();
-            require(control_restore.reused_prompt_tokens > 0 && stats.state_h2d_count == 0 &&
-                        stats.main_kv_h2d_pages == 0,
-                    "device control did not retain its checkpoint");
+            require(control_restore.reused_prompt_tokens > 0 &&
+                        stats.hybrid_host_image_restores == 0 &&
+                        stats.hybrid_host_block_restores == 0,
+                    "device control did not retain its snapshot on the device");
             std::cout << "device control: reused=" << control_restore.reused_prompt_tokens
                       << " equals_fresh=" << (device_restored == control_fresh.generated_token_ids)
                       << std::endl;
@@ -276,15 +277,21 @@ int main(int argc, char** argv) {
         const auto spilled  = engine.runtime_stats();
         const auto restored = engine.generate(engine.prepare_tokens(follow), request(8, true));
         const auto after    = engine.runtime_stats();
-        std::cout << "host spill: state=" << spilled.state_d2h_count - before.state_d2h_count
-                  << " kv_pages=" << spilled.main_kv_d2h_pages - before.main_kv_d2h_pages
-                  << " restore_state=" << after.state_h2d_count - spilled.state_h2d_count
-                  << " restore_pages=" << after.main_kv_h2d_pages - spilled.main_kv_h2d_pages
+        // The prefix cache writes snapshots and blocks to the Host tier as it publishes them; the
+        // pressure request evicts the Device copies of the blocks, so the follow-up must restore
+        // them from the Host. A snapshot image still held in a Device slot needs no restore.
+        std::cout << "host tier: image_writes=" << spilled.hybrid_host_image_writes
+                  << " block_writes=" << spilled.hybrid_host_block_writes
+                  << " evicted_blocks=" << spilled.hybrid_evicted_blocks - before.hybrid_evicted_blocks
+                  << " image_restores="
+                  << after.hybrid_host_image_restores - spilled.hybrid_host_image_restores
+                  << " block_restores="
+                  << after.hybrid_host_block_restores - spilled.hybrid_host_block_restores
                   << " reused=" << restored.reused_prompt_tokens << std::endl;
-        require(spilled.state_d2h_count > 0 && spilled.main_kv_d2h_pages > before.main_kv_d2h_pages,
+        require(spilled.hybrid_host_image_writes > 0 && spilled.hybrid_host_block_writes > 0 &&
+                    spilled.hybrid_evicted_blocks > before.hybrid_evicted_blocks,
                 "host spill not exercised");
-        require(after.state_h2d_count > spilled.state_h2d_count &&
-                    after.main_kv_h2d_pages > spilled.main_kv_h2d_pages &&
+        require(after.hybrid_host_block_restores > spilled.hybrid_host_block_restores &&
                     restored.reused_prompt_tokens > 0,
                 "host restore not exercised");
         require(restored.generated_token_ids == device_restored,
@@ -402,9 +409,10 @@ int main(int argc, char** argv) {
             require(stats.running_requests == 0 && stats.waiting_requests == 0 &&
                         stats.terminal_pending_requests == 0,
                     "soak did not drain its request queue");
-            require(stats.device_state_occupied_slots <= options.max_concurrency &&
-                        stats.host_state_occupied_slots <= 4 &&
-                        stats.host_kv_occupied_bytes <= (256ULL << 20) &&
+            require(stats.device_state_occupied_slots <=
+                            options.max_concurrency +
+                                options.context_cache.hybrid.device_snapshot_slots.value_or(0) &&
+                        stats.hybrid_host_used_bytes <= stats.hybrid_host_capacity_bytes &&
                         stats.device_main_kv_occupied_pages <= 64,
                     "soak exceeded its bounded context pools");
             require(ngram_k == 0 || soak_accepted > 0,

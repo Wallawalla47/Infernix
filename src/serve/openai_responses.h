@@ -66,8 +66,6 @@ struct OpenAIResponsesCreateRequest {
 struct OpenAIResponsesResolvedPrompt {
     GenerationRequest generation;
     OpenAIResponseContext parent;
-    std::optional<std::string> session_key;
-    ContextCacheHints cache_hints;
     bool preserve_thinking_semantic_change = false;
 };
 
@@ -91,8 +89,7 @@ parse_openai_responses_input_tokens_request(const RequestJson& body, const Reque
 
 OpenAIResponsesResolvedPrompt
 resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
-                                OpenAIResponsesStore& store, std::optional<std::string> response_id,
-                                bool store_response);
+                                OpenAIResponsesStore& store);
 
 BuiltOpenAIResponse make_openai_response_object(const std::string& id, std::int64_t created_at,
                                                 const OpenAIResponsesCreateRequest& request,

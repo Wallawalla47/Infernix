@@ -51,7 +51,6 @@ struct Request {
     std::uint64_t id                 = 0;
     std::uint32_t admission_bypasses = 0;
     Phase phase                      = Phase::Waiting;
-    bool capture_pending             = false;
     bool recovery_pending            = false;
     std::optional<Budget> budget     = Budget{};
     std::optional<SequenceHandle> sequence;
@@ -294,16 +293,12 @@ void test_prefill_replay_round_robin() {
         require(lane == expected, "prefill and replay did not receive rotating execution units");
         scheduler.prefill_executed(*lane, 4);
     }
-    slots[2]->capture_pending = true;
-    require(scheduler.next_prefill(slots, 4) == 3,
-            "capture dependency blocked unrelated ready prefill work");
-    scheduler.prefill_executed(3, 4);
     slots[1]->phase = Request::Phase::Decode;
     slots[3]->phase = Request::Phase::Finished;
+    require(scheduler.next_prefill(slots, 4) == 2, "replay lost its turn to unready members");
+    scheduler.prefill_executed(2, 4);
+    slots[2]->phase = Request::Phase::Decode;
     require(!scheduler.next_prefill(slots, 4), "unready prefill member was scheduled");
-    slots[2]->capture_pending = false;
-    require(scheduler.next_prefill(slots, 4) == 2,
-            "completed capture did not restore replay eligibility");
 }
 
 void test_decode_and_control_membership() {
@@ -314,14 +309,13 @@ void test_decode_and_control_membership() {
     slots[0]->output.model_tokens = 3;
     slots[2]                      = request(2, Request::Phase::Decode);
     slots[2]->recovery_pending    = true;
-    slots[3]                      = request(3, Request::Phase::Decode);
-    slots[3]->capture_pending     = true;
+    slots[3]                      = request(3, Request::Phase::Prefill);
     const auto round              = scheduler.build_round_membership(slots, 4);
     require(round.size == 2 && round.lanes[0] == 0 && round.lanes[1] == 2 &&
                 round.sequences[0] == 1 && round.sequences[1] == 2 &&
                 round.budgets[0].generated_tokens_remaining == 3 &&
                 round.budgets[1].generated_tokens_remaining == 1,
-            "compact decode lost output limits, first-unit limits or capture dependencies");
+            "compact decode lost output limits or first-unit limits, or took a prefill lane");
 
     slots[0]->phase          = Request::Phase::Control;
     slots[0]->output.control = {7, 8, 9};

@@ -49,8 +49,9 @@ std::string prefill_signature(const Model& model) {
             v.patch_size, v.temporal_patch_size, v.spatial_merge_size, v.num_position_embeddings};
     }
     std::vector<const BoundWeight*> weights;
-    // PrefillWork prices primary Text/Vision reconstruction. The coefficients were measured
-    // for that work; optional draft/proposal calls do not change the baseline's applicability.
+    // The context-cost model prices primary Text/Vision reconstruction. The coefficients were
+    // measured for that work; optional draft/proposal calls do not change the baseline's
+    // applicability.
     for (const auto& weight : model.weight_data()) {
         if (weight.name.starts_with("text/") || weight.name.starts_with("vision/")) {
             weights.push_back(&weight);

@@ -592,9 +592,6 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     if (!candidate.hybrid || !base.impl_ || !base.impl_->prompt) {
         throw std::logic_error("binding requires a prefix cache source");
     }
-    if (resume && resume->has_snapshot()) {
-        throw std::logic_error("a paused request resumes without a snapshot");
-    }
     if (!hybrid_ && candidate.hybrid->reuse_frontier != 0) {
         throw std::logic_error("a reusing source requires the prefix cache");
     }
@@ -640,7 +637,6 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     transaction.resume           = resume;
     transaction.reuse_frontier   = reuse;
     transaction.backend_frontier = backend_kv_cache() ? hybrid_backend_frontier(reuse) : 0U;
-    transaction.binding_prepared = true;
     auto& binding                = transaction.hybrid.emplace();
     binding.quote                = candidate.hybrid;
     plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
@@ -876,7 +872,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     history->backend = tx.reserved_kv->backend;
     history->owner   = this;
     tx.reserved_kv.reset();
-    // From here an abort releases the lane's state and KV like an adopted checkpoint binding.
+    // From here an abort releases the lane's state and KV.
     tx.adopted                   = true;
     SequenceState& state         = sequences[lane];
     state.kv                     = history;
@@ -896,7 +892,6 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     install_binding(tx);
     // The snapshot image's continuation hidden belongs to the snapshot, not to a committed tail.
     state.tail_hidden_valid = false;
-    refresh_history_requirements(history);
     if (!hybrid_) {
         // Without a prefix cache the lane publishes nothing.
         out.sequence  = sequence_handle(lane);
@@ -1109,7 +1104,7 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
     HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
     pc::PrefixCacheIndex& index   = hybrid_->index();
     HybridCacheCounters& counters = hybrid_->counters();
-    if (sequence.state.fork_pending || frontier == 0 || frontier > sequence.text_kv_valid) {
+    if (frontier == 0 || frontier > sequence.text_kv_valid) {
         ++counters.taps_skipped;
         return;
     }
@@ -1130,7 +1125,7 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
     try {
         state_images->copy_slot(state_store->physical_slot(sequence.state.write),
                                 state_store->physical_slot(*image), device.stream);
-        state_store->publish_copied_checkpoint(*image);
+        state_store->publish_copied_snapshot(*image);
         lane.pending.push_back(HybridPendingTap{
             .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary});
     } catch (...) {
@@ -1247,7 +1242,7 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
             if (endpoint && backend_caught_up && frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
-                !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&
+                sequence.state.read == sequence.state.write &&
                 state_store->role(sequence.state.write) == StateImageRole::ActiveMutable) {
                 pc::PrefixCacheIndex& index = hybrid_->index();
                 // The lineage moves past its source here, so a slot it needs comes from its own

@@ -153,8 +153,10 @@ int run(const Options& options) {
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
     auto request_base                 = program->plan_request(std::move(prompt), execution);
-    auto source                       = program->inspect_source(request_base, std::nullopt);
-    if (!source || !program->start_binding(request_base, infernix::runtime::LaneId{0}, *source)) {
+    // Prefix reuse is off, so the only source is a root start.
+    const auto sources = program->hybrid_sources(request_base, UINT32_MAX);
+    if (sources.empty() ||
+        !program->start_binding(request_base, infernix::runtime::LaneId{0}, sources.front())) {
         throw std::runtime_error("benchmark root binding could not reserve its first unit");
     }
     std::optional<qwen::SequenceHandle> started;

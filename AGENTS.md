@@ -46,8 +46,8 @@ the SSD behind a VRAM expert cache. The implementation targets `sm_120a` and is 
 GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
-bounded FIFO ingress with finite bypass, resource-pressure preemption with Snapshot/Replay recovery,
-and one compact decode batch per round.
+bounded FIFO ingress with finite bypass, resource-pressure preemption with Replay recovery,
+one content-addressed prefix cache, and one compact decode batch per round.
 Generation and offline CausalScoring use the same public `.infernix` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale continuous
@@ -176,7 +176,7 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 |---|---|
 | Product capabilities and exact commands | `README.md`, executable `--help`; `docs/cli.md`, `docs/serving.md`, `docs/perplexity.md` |
 | Execution, model/runtime ownership, scheduling, transactions, graphs | `docs/maintainer/engine-architecture.md` |
-| Context resources, checkpoints, replicas; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/paged-kv-cache.md` |
+| Scheduling, permits, preemption; prefix cache; physical KV | `docs/maintainer/resource-scheduling-and-context-cache.md`; `docs/maintainer/hybrid-prefix-cache-spec.md`; `docs/maintainer/paged-kv-cache.md` |
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |

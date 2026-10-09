@@ -20,9 +20,8 @@ import sys
 # Every arm is compared with the control; `alt` is AB_ALT_EXE (default the treatment build) with
 # AB_ALT_EXTRA_FLAGS; AB_CONTROL_LABEL, AB_TREATMENT_LABEL and AB_ALT_LABEL rename the arms.
 ARMS = ("control", "treatment", "alt")
-LABEL = {"control": "NInfer + Windows port", "treatment": "Infernix",
-         "alt": "Infernix, original prefix cache"}
-SHORT = {"control": "NInfer", "treatment": "Infernix", "alt": "Infernix original-cache"}
+LABEL = {"control": "NInfer + Windows port", "treatment": "Infernix", "alt": "Infernix, alternative"}
+SHORT = {"control": "NInfer", "treatment": "Infernix", "alt": "Infernix alt"}
 
 
 def use_labels(cfg):
@@ -510,7 +509,7 @@ def headline(arms, ms):
 
 
 def each(arms, value, fmt=lambda v: v):
-    """`ninfer 1.2, infernix 3.4, infernix original-cache 5.6`, for the notes."""
+    """`ninfer 1.2, infernix 3.4, infernix alt 5.6`, for the notes."""
     return ", ".join("%s %s" % (SHORT[a].lower(), fmt(value(a))) for a in arms)
 
 

@@ -97,35 +97,6 @@ struct PromptIdentity {
     std::vector<std::uint32_t> rewrite_execution_frontiers;
 };
 
-inline constexpr std::size_t kPreparedSessionKeyCapacity = kMaximumContextCacheSessionKeyBytes;
-
-struct PreparedSessionKey {
-    std::uint16_t size = 0;
-    std::array<char, kPreparedSessionKeyCapacity> bytes{};
-
-    [[nodiscard]] std::string_view view() const noexcept { return {bytes.data(), size}; }
-
-    [[nodiscard]] friend bool operator==(const PreparedSessionKey&,
-                                         const PreparedSessionKey&) noexcept = default;
-};
-
-struct PreparedCacheOpportunity {
-    PromptCacheMarkerKind kind       = PromptCacheMarkerKind::SharedStablePrefix;
-    SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
-    std::uint32_t frontier           = 0;
-    std::uint32_t input_order        = 0;
-
-    [[nodiscard]] friend bool operator==(PreparedCacheOpportunity,
-                                         PreparedCacheOpportunity) noexcept = default;
-};
-
-struct PreparedContextCache {
-    std::optional<PreparedSessionKey> session_key;
-    std::vector<PreparedCacheOpportunity> opportunities;
-    // Controls replacement of a named SessionIndex entry, not anonymous source ownership.
-    bool update_session_index = true;
-};
-
 struct PrepareStats {
     double seconds                       = 0.0;
     double media_preprocess_seconds      = 0.0;
@@ -187,7 +158,6 @@ struct PreparedPromptData {
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
     PromptIdentity identity;
-    PreparedContextCache context_cache;
     PreparedTapHints tap_hints;
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;

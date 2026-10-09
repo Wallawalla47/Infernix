@@ -205,7 +205,7 @@ tokens; KV blocks are shared across requests. `infernix` (one request) runs with
   every N minutes while serving (only when it changed; requests wait while the file is written, a
   few seconds for several GB; the file is replaced only once the new one is complete). Each save
   rewrites the whole file, so a short interval adds a lot of SSD wear: prefer 15-60 minutes.
-- Not available for this model: `--use-original-prefix-caching`, `--device-snapshot-slots`.
+- Not available for this model: `--device-snapshot-slots`.
 
 ## SSD expert tier
 

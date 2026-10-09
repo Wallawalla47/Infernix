@@ -185,11 +185,11 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
     COUNTER(decode_row_rounds, "decode_row_rounds_total", "Sum of decode batch sizes.");
     COUNTER(preemptions, "preemptions_total", "Resource-pressure pauses.");
     COUNTER(snapshot_restores, "snapshot_restores_total",
-            "Restores from complete paused snapshots.");
+            "Restores from a prefix-cache snapshot at the paused frontier.");
     COUNTER(replay_restores, "replay_restores_total", "Recovery operations that rebuild history.");
-    COUNTER(root_selections, "root_selections_total", "Initial bindings without checkpoint reuse.");
-    COUNTER(checkpoint_selections, "checkpoint_selections_total",
-            "Initial bindings with checkpoint reuse.");
+    COUNTER(root_selections, "root_selections_total", "Initial bindings without prefix reuse.");
+    COUNTER(prefix_selections, "prefix_selections_total",
+            "Initial bindings from a prefix-cache snapshot.");
     COUNTER(speculative_rounds, "spec_decode_rounds_total",
             "Native speculative verification rounds.");
     COUNTER(speculative_draft_tokens, "spec_decode_draft_tokens_total",
@@ -209,43 +209,9 @@ std::string Metrics::render(const RuntimeStats& stats, bool ready) const {
           "Main KV pool capacity in pages.");
     GAUGE(device_backend_kv_occupied_pages, "device_backend_kv_used_pages",
           "Occupied speculative backend KV pages.");
-    GAUGE(host_context_occupied_bytes, "host_context_used_bytes",
-          "Occupied Host backing, including reservations.");
-    GAUGE(host_context_reserved_bytes, "host_context_reserved_bytes",
-          "Reserved Host bytes, a subset of used bytes.");
-    gauge("host_context_capacity_bytes", memory_.host_context_capacity_bytes,
-          "Shared pinned Host backing capacity.");
-    GAUGE(host_context_peak_occupied_bytes, "host_context_peak_bytes",
-          "Host backing high-water mark, including reservations.");
-    GAUGE(host_state_occupied_slots, "host_state_images",
-          "StateImages in the shared Host backing.");
-    GAUGE(host_kv_occupied_bytes, "host_kv_used_bytes",
-          "KV bytes in the shared Host backing, a subset of used bytes.");
 #undef GAUGE
 #undef COUNTER
 
-    header("context_transfer_bytes_total", "counter", "Completed context payload transfers.");
-    const auto transfer_bytes = [&](const char* resource, const char* direction, auto current,
-                                    auto baseline) {
-        out << "infernix_context_transfer_bytes_total{resource=\"" << resource << "\",direction=\""
-            << direction << "\"} " << current - baseline << '\n';
-    };
-#define TRANSFER(resource, prefix, direction)                                                      \
-    transfer_bytes(resource, #direction, stats.prefix##_##direction##_bytes,                       \
-                   baseline_.prefix##_##direction##_bytes)
-    TRANSFER("state", state, d2h);
-    TRANSFER("state", state, h2d);
-    TRANSFER("state", state, d2d);
-    TRANSFER("main_kv", main_kv, d2h);
-    TRANSFER("main_kv", main_kv, h2d);
-    TRANSFER("main_kv", main_kv, d2d);
-    TRANSFER("backend_kv", backend_kv, d2h);
-    TRANSFER("backend_kv", backend_kv, h2d);
-    TRANSFER("backend_kv", backend_kv, d2d);
-#undef TRANSFER
-    counter("context_transfer_seconds_total", stats.actual_context_transfer_seconds,
-            baseline_.actual_context_transfer_seconds,
-            "Accumulated context transfer operation time.");
     header("host_work_seconds_total", "counter",
            "Exclusive Engine Host phases, excluding device waits.");
     const auto host = [&](std::string_view phase, std::uint64_t value, std::uint64_t baseline) {

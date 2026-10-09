@@ -285,8 +285,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             sequence.execution_frontier >= capacity ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.ledger_splits.size() != sequence.ledger_frontier) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -373,9 +372,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_ordinary_batch(
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
-            sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-            sequence.prefix_digests.append_generated(std::span<const TokenId>(&token, 1),
-                                                     sequence.rope_delta);
+            sequence.ledger_splits.append_generated(1);
             request.pending   = PendingCandidate{.kind          = PendingKind::Ordinary,
                                                  .base_E        = base_E,
                                                  .base_S        = base_S,
@@ -532,8 +529,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_mtp_batch(
             sequence.mtp_kv_valid != sequence.execution_frontier ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier ||
+            sequence.ledger_splits.size() != sequence.ledger_frontier ||
             sequence.mtp_draft_count > mtp_ar_depth) {
             throw std::logic_error("MTP batch row is not decode-ready");
         }
@@ -762,8 +758,7 @@ runtime::BatchedGeneratedRound ProgramImpl::decode_dflash_batch(
             sequence.execution_frontier - sequence.dflash_context_frontier > draft_window + 1U ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
-            sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.ledger_splits.size() != sequence.ledger_frontier) {
             throw std::logic_error("DFlash batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -1090,7 +1085,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     const std::uint32_t base_ledger_frontier = request.pending.kind == PendingKind::Begin
                                                    ? request.pending.prompt_tokens
                                                    : request.pending.base_S;
-    commit_generated_prefix_identity(
+    commit_generated_splits(
         sequence, base_ledger_frontier,
         std::span<const TokenId>(sequence.ledger).subspan(base_ledger_frontier, accepted_tokens),
         prefix_execution_split_after);
@@ -1110,24 +1105,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_non_speculative_pending(
     }
     if (sequence.ledger_frontier != sequence.execution_frontier + 1 ||
         sequence.ledger.size() != sequence.ledger_frontier ||
-        sequence.prefix_identity.size() != sequence.ledger_frontier ||
-        sequence.prefix_digests.size() != sequence.ledger_frontier) {
+        sequence.ledger_splits.size() != sequence.ledger_frontier) {
         throw std::logic_error("resolved round did not establish a valid frontier");
-    }
-    // Begin publishes a sampled token but does not execute it through the target. An exact-hit
-    // Fork therefore still names an immutable read source and an unwritten destination here; the
-    // first state-mutating decode commit closes it. A suffix prefill already closed its Fork at
-    // the committed prefill frontier.
-    if (request.pending.kind == PendingKind::Begin && terminal && sequence.state.fork_pending) {
-        const StateImageSelectors selectors = state_selectors(sequence);
-        timing.resume_submit();
-        state_images->copy_slot(selectors.source, selectors.destination, device.stream);
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
-        settle_state_fork(sequence);
-    } else if (request.pending.kind == PendingKind::Ordinary) {
-        settle_state_fork(sequence);
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
     if (terminal) { sequence.mtp_draft_count = 0; }

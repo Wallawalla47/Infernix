@@ -387,8 +387,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             metadata.weights_id = name;
         }
     }
-    return {std::move(instance), std::move(summary), std::move(metadata),
-            std::move(context_cost.model)};
+    return {std::move(instance), std::move(summary), std::move(metadata)};
 }
 
 } // namespace infernix::runtime

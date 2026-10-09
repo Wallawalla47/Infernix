@@ -211,7 +211,6 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
     const auto lane = ContractAccess::lane(handle).value;
     require_unit(lane, ExecutionUnitKind::Prefill);
     auto& state = sequences[lane];
-    prepare_capture_boundary(lane);
     const auto permit = *requests[lane].permit;
     ensure_sequence_kv_mapped(state, permit.main_frontier, permit.backend_frontier);
     set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(state.kv->text));
@@ -343,8 +342,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         if (sequence.execution_frontier != pending.base_E ||
             sequence.ledger_frontier != pending.base_S ||
             sequence.ledger.size() != pending.base_S ||
-            sequence.prefix_identity.size() != pending.base_S ||
-            sequence.prefix_digests.size() != pending.base_S ||
+            sequence.ledger_splits.size() != pending.base_S ||
             sequence.text_kv_valid != pending.base_E ||
             (speculative_backend == SpeculativeBackend::Mtp &&
              sequence.mtp_kv_valid != pending.base_E) ||
@@ -486,15 +484,14 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
 
             const PendingCandidate pending = request.pending;
             const std::uint32_t committed  = accepted_tokens[row];
-            settle_state_fork(sequence);
             const TokenId* token_base =
                 speculative_backend == SpeculativeBackend::Mtp
                     ? mtp_host_egress->licensed_tokens.data() + row * width
                     : dflash_host_egress->licensed_tokens.data() + row * width;
             sequence.ledger.insert(sequence.ledger.end(), token_base, token_base + committed);
-            commit_generated_prefix_identity(sequence, pending.base_S,
-                                             std::span<const TokenId>(token_base, committed),
-                                             prefix_execution_splits[row]);
+            commit_generated_splits(sequence, pending.base_S,
+                                    std::span<const TokenId>(token_base, committed),
+                                    prefix_execution_splits[row]);
             sequence.execution_frontier = pending.base_E + committed;
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
@@ -576,9 +573,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     }
 
     RequestControl::Prefill& staged = *request.prefill;
-    if (request.capture_pending) {
-        throw std::logic_error("prefill cannot advance while a capture is pending");
-    }
     const runtime::BeginSummary summary{.prompt_tokens        = staged.prompt_tokens,
                                         .reused_prompt_tokens = staged.base,
                                         .prefix_reuse_path    = staged.reuse};
@@ -611,7 +605,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         };
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;
-        if (request.next_capture < request.capture_groups.size() || hybrid_taps_left()) {
+        if (hybrid_taps_left()) {
             rewrite_capture_hidden = state_images->continuation_hidden_slot(selectors.destination);
             rewrite_capture_hidden_ptr = &rewrite_capture_hidden;
         }
@@ -691,7 +685,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0;
                 const std::optional<std::uint32_t> hybrid_split = next_hybrid_split();
-                if (request.next_capture < request.capture_groups.size() || hybrid_taps_left()) {
+                if (hybrid_taps_left()) {
                     rewrite_capture_hidden =
                         state_images->continuation_hidden_slot(selectors.destination);
                     schedule_state.rewrite_checkpoint_hidden = &rewrite_capture_hidden;
@@ -700,16 +694,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
 
                 const bool final_candidate = staged.cursor + remaining == staged.prompt_tokens;
-                const std::optional<std::uint32_t> capture_frontier =
-                    request.next_capture < request.capture_groups.size()
-                        ? std::optional<std::uint32_t>(
-                              request.capture_groups[request.next_capture].frontier)
-                        : std::nullopt;
-                std::optional<std::uint32_t> split_frontier = capture_frontier;
-                // Rewrite execution frontiers split prefill for the original cache's rewrite
-                // checkpoints and execution provenance. The hybrid cache captures nothing there:
-                // it keys resume points by content and splits only at its own exact taps, so
-                // each split would be a whole extra pass over the model for nothing.
+                std::optional<std::uint32_t> split_frontier;
+                // Without a prefix cache, rewrite execution frontiers split prefill as replay
+                // does. The prefix cache keys resume points by content and splits only at its own
+                // exact taps: each rewrite split would be a whole extra pass for nothing.
                 const auto& rewrite_frontiers = staged.prompt.identity.rewrite_execution_frontiers;
                 const auto rewrite_split =
                     hybrid_lane != nullptr && hybrid_lane->active
@@ -754,32 +742,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 
-                // Prompt transitions are canonical immediately. If this was the first write after
-                // an immutable source, close the Fork before potentially freezing a new rewrite.
-                settle_state_fork(sequence);
                 copy_tail(sequence,
                           prefill_hidden.slice(
                               1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
                 sequence.tail_hidden_valid = true;
                 if (hybrid_lane != nullptr && !result.finalized) {
                     hybrid_after_prefill_chunk(sequence, staged.cursor, staged.prompt_tokens);
-                }
-                const bool reached_capture = capture_frontier && staged.cursor == *capture_frontier;
-                if (reached_capture) {
-                    if (result.finalized) {
-                        // The prompt-frontier state becomes publishable only after the generated
-                        // Begin token is committed. commit() marks this capture group ready.
-                    } else {
-                        staged.elapsed_seconds +=
-                            std::chrono::duration<double>(Clock::now() - started).count();
-
-                        request.capture_pending = true;
-                        return runtime::PrefillStepResult{
-                            .summary                 = summary,
-                            .processed_prompt_tokens = processed_prompt_tokens,
-                            .timing                  = timing.finish(),
-                        };
-                    }
                 }
 
                 finalized = result.finalized;
@@ -860,9 +828,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
         sequence.ledger.push_back(host_tokens[0]);
-        sequence.prefix_identity.append_generated(1, sequence.rope_delta);
-        sequence.prefix_digests.append_generated(std::span<const TokenId>(host_tokens, 1),
-                                                 sequence.rope_delta);
+        sequence.ledger_splits.append_generated(1);
         sequence.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
             if (sequence.mtp_kv_valid != prompt_tokens) {
@@ -890,10 +856,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
         if (staged.vision) { staged.vision->retire_handoff(); }
 
-        const bool prompt_frontier_capture =
-            request.next_capture < request.capture_groups.size() &&
-            request.capture_groups[request.next_capture].frontier == prompt_tokens;
-        if (!prompt_frontier_capture) { request.prefill.reset(); }
+        request.prefill.reset();
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,

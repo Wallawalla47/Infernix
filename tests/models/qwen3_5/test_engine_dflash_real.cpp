@@ -69,7 +69,7 @@ std::vector<std::uint8_t> gradient_ppm() {
     return ppm;
 }
 
-infernix::PromptInput media_conversation(infernix::MediaKind kind, std::string session = {}) {
+infernix::PromptInput media_conversation(infernix::MediaKind kind) {
     infernix::MessagePart media;
     media.kind              = infernix::MessagePartKind::Media;
     media.media.kind        = kind;
@@ -87,13 +87,12 @@ infernix::PromptInput media_conversation(infernix::MediaKind kind, std::string s
     infernix::PromptInput input;
     input.messages.push_back(std::move(user));
     input.options.enable_thinking = false;
-    if (!session.empty()) { input.context_cache.session_key = std::move(session); }
     return input;
 }
 
 infernix::PromptInput media_followup(const infernix::GenerationResult& first) {
     infernix::PromptInput input =
-        media_conversation(infernix::MediaKind::Image, "dflash-vision-prefix-real");
+        media_conversation(infernix::MediaKind::Image);
     infernix::ChatMessage assistant;
     assistant.role              = infernix::ChatRole::Assistant;
     assistant.reasoning_content = first.reasoning;
@@ -112,7 +111,6 @@ infernix::PromptInput media_followup(const infernix::GenerationResult& first) {
 infernix::PromptInput initial_conversation() {
     infernix::PromptInput input;
     input.options.enable_thinking   = false;
-    input.context_cache.session_key = "dflash-boundary-real";
 
     infernix::ChatMessage user;
     user.role = infernix::ChatRole::User;
@@ -336,7 +334,7 @@ int exercise_vision_dflash(const char* artifact, const std::vector<infernix::Tok
     }
 
     const infernix::GenerationResult first = engine.generate(
-        engine.prepare(media_conversation(infernix::MediaKind::Image, "dflash-vision-prefix-real")),
+        engine.prepare(media_conversation(infernix::MediaKind::Image)),
         greedy_options(4, true));
     if (!first.prompt.has_media || first.generated_token_ids.size() != 4 ||
         first.speculative.backend != infernix::SpeculativeBackend::DFlash ||

@@ -30,42 +30,4 @@ std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept {
     return frontier == 0 ? 0U : 1U + (frontier - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-std::size_t context_resource_index(runtime::ContextResourceClass resource) {
-    switch (resource) {
-    case runtime::ContextResourceClass::State:
-        return 0;
-    case runtime::ContextResourceClass::MainKV:
-        return 1;
-    case runtime::ContextResourceClass::BackendKV:
-        return 2;
-    }
-    throw std::logic_error("unknown context resource class");
-}
-
-runtime::ContextTransferRequirement
-state_transfer_requirement(const StateImageHostLayout& layout,
-                           runtime::ContextTransferDirection direction, bool fork_local_only) {
-    return runtime::ContextTransferRequirement{
-        .resource   = runtime::ContextResourceClass::State,
-        .direction  = direction,
-        .units      = 1,
-        .page_count = 0,
-        .work       = fork_local_only ? fork_local_transfer_work(layout)
-                                      : state_image_transfer_work(layout),
-    };
-}
-
-runtime::ContextTransferRequirement
-kv_transfer_requirement(runtime::ContextResourceClass resource,
-                        runtime::ContextTransferDirection direction, std::uint32_t pages,
-                        TransferWork work) {
-    return runtime::ContextTransferRequirement{
-        .resource   = resource,
-        .direction  = direction,
-        .units      = work.payload_bytes,
-        .page_count = pages,
-        .work       = work,
-    };
-}
-
 } // namespace infernix::models::qwen3_5::detail

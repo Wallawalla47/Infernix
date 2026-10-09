@@ -23,8 +23,8 @@ std::size_t estimate_turn_bytes(const ChatTurn& turn) {
 }
 
 std::size_t record_envelope_bytes(const StoredOpenAIResponse& record) {
-    std::size_t bytes = sizeof(StoredOpenAIResponse) + record.id.size() +
-                        record.session_key.size() + record.response.dump().size();
+    std::size_t bytes =
+        sizeof(StoredOpenAIResponse) + record.id.size() + record.response.dump().size();
     for (const nlohmann::json& item : record.input_items) {
         bytes += sizeof(nlohmann::json) + item.dump().size();
     }
@@ -94,11 +94,8 @@ std::shared_ptr<const StoredOpenAIResponse> OpenAIResponsesStore::get(const std:
 }
 
 void OpenAIResponsesStore::put(StoredOpenAIResponse response) {
-    if (response.id.empty() || response.session_key.empty() ||
-        response.session_key.size() > kMaximumContextCacheSessionKeyBytes ||
-        !response.response.is_object()) {
-        throw std::invalid_argument(
-            "stored response must have an id, bounded session key and object body");
+    if (response.id.empty() || !response.response.is_object()) {
+        throw std::invalid_argument("stored response must have an id and object body");
     }
     const std::size_t envelope_bytes = record_envelope_bytes(response);
     const std::size_t context_bytes  = response.context ? response.context->cumulative_bytes : 0;

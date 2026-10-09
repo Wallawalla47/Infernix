@@ -40,7 +40,6 @@ struct ConstructedModel {
     std::unique_ptr<ModelInstance> instance;
     LoadSummary load;
     ModelMetadata model_metadata;
-    ContextMachineCostModel context_cost;
 };
 
 // The option checks that need no artifact (shared by every architecture, and the Qwen3.5-only

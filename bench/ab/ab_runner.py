@@ -72,11 +72,10 @@ BAT_MAX_CONTEXT = "220000"
 # configuration. The treatment uses all of them; the control uses the subset its
 # --help supports (Infernix-only flags are dropped automatically). --request-log-jsonl
 # is appended by build_args(). The published run used Infernix's original prefix cache with
-# explicit Host state/KV and catalog capacities; that cache is now NInfer's context cache, which
-# --use-original-prefix-caching selects and --host-context-mib sizes.
+# explicit Host state/KV and catalog capacities; that cache has since been removed, and the
+# treatment runs on the prefix cache that --host-context-mib sizes.
 BAT_FLAGS = [
     ("--host", HOST), ("--port", str(PORT)),
-    ("--use-original-prefix-caching", None),
     ("--max-context", "220000"), ("--max-concurrency", "2"),
     ("--spec", "dflash2"), ("--draft-tokens", "7"),
     ("--lm-head-draft", None),

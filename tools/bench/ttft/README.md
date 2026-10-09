@@ -128,16 +128,16 @@ binary to use its own CLI without compatibility flags in the candidate:
   "common_args": ["--kv-dtype", "fp8", "--no-thinking", "--greedy"],
   "profiles": {
     "cache-hot": ["--max-context", "8192", "--kv-capacity", "8192",
-                  "--max-concurrency", "1", "--device-state-slots", "2",
+                  "--max-concurrency", "1", "--device-snapshot-slots", "2",
                   "--host-context-mib", "0"]
   }
 }
 ```
 
 The controller applies a common one-second statistics interval, enables request logging, and
-records these effective arguments in its manifest. Host capacity is a unified byte budget for KV
-and state; when comparing a baseline with separate pools, match its actual aggregate backing.
-`--device-state-slots` remains extra state capacity beyond active lanes.
+records these effective arguments in its manifest. Host capacity is the prefix cache's slab pool,
+one byte budget for KV blocks and snapshots; when comparing a baseline with separate pools, match its
+actual aggregate backing. `--device-snapshot-slots` is extra state capacity beyond active lanes.
 
 Before loading servers, the controller stages the selected immutable artifact once under
 `/dev/shm/infernix-artifacts/`. It reuses that copy while the source identity is unchanged; insufficient

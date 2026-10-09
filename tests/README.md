@@ -254,19 +254,19 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 ```
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
-Snapshot/Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
-selects `all`, `snapshot`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover
-physical state/KV ownership, binding, capture, reclamation and abort; their positional backend is
-`none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
+Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
+selects `all`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover pause and
+Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
+positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the
 [TTFT campaign](../tools/bench/ttft/README.md).
 
-`infernix_qwen3_5_tools_real_test [none|mtp|dflash|dflash2] [graph|eager|basic|snapshot|replay|cancel] [concurrency]`
+`infernix_qwen3_5_tools_real_test [none|mtp|dflash|dflash2] [graph|eager|basic|replay|cancel] [concurrency]`
 uses `INFERNIX_TEST_ARTIFACT` for strict tools, thinking, raw continuation, mixed batches, and
 call/result prefix reuse, and required-tool → JSON continuation with committed constraint observations.
 `basic` checks default constraints with open/complex schemas, continuation,
-streaming and mixed strict/basic/free rows. Snapshot/Replay modes force resource pressure and
-validate the completed argument value after recovery; `cancel` interrupts the paused request.
+streaming and mixed strict/basic/free rows. The `replay` mode forces resource pressure and
+validates the completed argument value after recovery; `cancel` interrupts the paused request.
 `INFERNIX_TEST_TOOL_REPORT` appends schema/output/timing JSONL.
 `python3 tests/models/qwen3_5/test_tool_schema.py` checks the native Qwen grammar and decoder against
 `jsonschema` (dependencies in `tests/text/requirements.txt`), including string pattern/Unicode-length
@@ -283,7 +283,7 @@ DFlash2 a tree width for every batch size (constrained rounds still verify chain
 and mixed batches. `infernix_regex_choice_test` checks literal-set prefix masks and regex edge cases;
 `python3 tests/text/test_regex_choice.py` compares regex membership with independent fullmatch semantics.
 Set `INFERNIX_TEST_CONSTRAINT=grammar` or `json_schema` on the preemption test to
-check matcher continuity through Snapshot/Replay and cancellation. `infernix_grammar_test` and
+check matcher continuity through Replay and cancellation. `infernix_grammar_test` and
 `infernix_json_schema_test` cover CPU language semantics. `infernix_json_schema_oracle_test` compares
 supported schemas with the independent Python `jsonschema` validator; install its dependency with
 `python3 -m pip install -r tests/text/requirements.txt` in the selected test environment.

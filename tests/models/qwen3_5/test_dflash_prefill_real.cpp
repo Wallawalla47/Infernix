@@ -205,19 +205,20 @@ void run(const char* artifact, SpeculativeBackend backend) {
     const auto untouched_full  = full_bytes(program, 0, pages);
     require_full_positions(program, 1, 0, 16);
 
-    // A checkpoint freezes the source and forks subsequent execution into another physical slot.
+    // Execution reading one StateImage slot and writing another leaves the source untouched.
     // Leave decode ingress pointing to the old slot, exactly as it did at request admission.
     states.freeze(*source);
     const auto destination = states.reserve_destination();
-    require(destination.has_value(), "fixture fork destination allocation failed");
-    const auto binding = states.begin_fork(*source, *destination);
+    require(destination.has_value(), "fixture destination allocation failed");
+    const qwen::detail::StateImageSelectors binding{
+        .source = states.physical_slot(*source), .destination = states.physical_slot(*destination)};
     program.state_images->copy_dflash_local(binding.source, binding.destination, device.stream);
+    states.activate_copied(*destination);
     context.state_source_slot      = binding.source;
     context.state_destination_slot = binding.destination;
-    prefill(23, 23); // Actual chunk is seven tokens, shortened at the capture frontier.
-    states.commit_fork(*source, *destination);
+    prefill(23, 23); // Actual chunk is seven tokens, shortened at the split frontier.
     require(local_bytes(program, source_slot) == frozen,
-            "prefill mutated the frozen checkpoint after a StateImage fork");
+            "prefill mutated the frozen source after a slot-to-slot pass");
     const auto active = local_bytes(program, binding.destination);
     require(active != frozen, "prefill did not append to the fork destination");
     require_full_positions(program, 1, 16, 23);

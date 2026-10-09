@@ -34,7 +34,6 @@ std::vector<ChatTurn> flatten_openai_response_context(const OpenAIResponseContex
 
 struct StoredOpenAIResponse {
     std::string id;
-    std::string session_key;
     nlohmann::json response;
     std::vector<nlohmann::json> input_items;
     OpenAIResponseContext context;
