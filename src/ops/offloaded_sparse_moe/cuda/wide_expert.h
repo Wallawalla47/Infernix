@@ -56,6 +56,7 @@ inline constexpr int kHScaleMapBytes = (kHScaleBytes + 15) / 16 * 16;
 inline constexpr int kHRowStride = kHBlocks * static_cast<int>(sizeof(canon::A4Block));
 
 static_assert(kXRowBytes % 16 == 0 && kXCodeBytes % 16 == 0, "TMA needs 16-byte rows and bases");
+static_assert(kXRowBytes >= kIntermediate * 2, "a W4A16 call keeps BF16 h rows in the x plane");
 static_assert(kHRowStride % 16 == 0 && kHRowStride >= kHCodeBytes + kHScaleMapBytes && kHCodeBytes % 16 == 0);
 
 // The 16-element A4 block b of a plane row is stored at block position plane_block(b): within each
@@ -84,7 +85,8 @@ inline constexpr std::size_t kCpuCallBytes = 2304; // 2 words + 512 indices, rou
 [[nodiscard]] ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries);
 
 // Device and host state of one moe_experts call's wide route; a plain value, valid until the call's
-// workspace is released. `descriptors` points to the call's staged TMA descriptors.
+// workspace is released. `descriptors` points to the call's staged TMA descriptors (W4A4 only).
+// W4A16 calls (wide_expert_a16.cuh) read x by token and keep h in BF16 in the workspace's x plane.
 struct Call {
     MoeDispatch dispatch;
     const ExpertScales* scales                = nullptr;
@@ -95,6 +97,10 @@ struct Call {
     std::uint16_t* outputs                    = nullptr; // BF16 [H, entries]
     const void* descriptors                   = nullptr;
     std::int32_t passes                       = 0;
+    bool a16                                  = false;
+    const std::uint16_t* x                    = nullptr; // W4A16: BF16 [H, T]
+    std::uint16_t* h16                        = nullptr; // W4A16: BF16 [entries][kIntermediate]
+    std::int32_t top_k                        = 0;
 };
 
 // Plans the call's wide work tiles in passes of `pass_jobs` jobs (the passes moe_experts stages),

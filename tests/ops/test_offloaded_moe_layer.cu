@@ -11,8 +11,8 @@
 // FP64 qualification is test_offloaded_moe_wide), equals the first configuration's: neither the record's
 // location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
 // moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
-// same configurations against expert_forward_a16; they have no wide route yet, so every one of
-// their outputs is compared bit for bit.
+// same configurations against expert_forward_a16 (their wide route's BF16 GEMM, too, is qualified
+// in test_offloaded_moe_wide).
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -397,10 +397,10 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         return chosen;
     };
     // Outputs of the narrow route (design §8.5): an expert with at most eight columns, or one whose
-    // gate and up projections keep separate input scales (the fixture's every third expert).
+    // gate and up projections keep separate input scales (the W4A4 fixture's every third expert).
     std::vector<std::uint8_t> narrow(static_cast<std::size_t>(top_k) * columns);
     for (std::size_t i = 0; i < narrow.size(); ++i) {
-        narrow[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
+        narrow[i] = expert_columns[ids[i]] <= moe::kMaxCpuColumns || (!a16 && ids[i] % 3 == 0);
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.

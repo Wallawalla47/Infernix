@@ -1,7 +1,8 @@
 // The wide route of offloaded_sparse_moe: work planning, A4 quantization of x for the wide
-// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh).
+// entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), and the
+// W4A16 route's BF16 GEMMs (wide_expert_a16.cuh).
 
-#include "ops/offloaded_sparse_moe/cuda/wide_expert.cuh"
+#include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
 
 #include "core/device.h"
 
@@ -205,6 +206,15 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source.scales, max_jobs, pass_jobs, call.passes,
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
+    if (source.activation == ExpertActivation::kA16) {
+        // BF16 activations: x is read by token, h kept in BF16 in the x plane (1,440 >= 1,280 bytes per
+        // entry); no quantization and no tensor maps.
+        call.a16   = true;
+        call.x     = static_cast<const std::uint16_t*>(x.data);
+        call.h16   = reinterpret_cast<std::uint16_t*>(workspace.x_plane);
+        call.top_k = top_k;
+        return call;
+    }
     quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
         static_cast<const std::uint16_t*>(x.data), top_k, dispatch, source.scales, workspace.tiles,
         workspace.pass_tiles, call.passes, workspace.x_plane);
@@ -221,6 +231,11 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
 
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
+    if (call.a16) {
+        launch_a16<Matrix::GateUp>(call, pass, GateUpEpilogueA16{call.scales, call.h16}, stream);
+        launch_a16<Matrix::Down>(call, pass, DownEpilogue{call.scales, call.dispatch.entries, call.outputs}, stream);
+        return;
+    }
     launch<Matrix::GateUp>(call, pass, GateUpEpilogue{call.scales, call.h_plane}, stream);
     launch<Matrix::Down>(call, pass, DownEpilogue{call.scales, call.dispatch.entries, call.outputs}, stream);
 }
