@@ -28,6 +28,11 @@ table from an NVMe drive.
   about 34 s.
 - **Less RAM than the model needs?** An SSD expert tier keeps what fits in RAM and reads the rest
   from the artifact.
+- **Uncensored too**: the
+  [Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix)
+  conversion of orcarouter's abliterated build keeps its weights bit-exact (perplexity 4.772 against
+  Strata's 4.844 for the base model) and decodes about as fast as the NVIDIA Dense8 conversion
+  ([models](#models)).
 
 Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 
@@ -156,6 +161,12 @@ next to it. Qwen3.8-Flash-Next (see the [guide](docs/qwen3_8-flash-next.md#run))
 infernix-serve.exe Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
 ```
 
+The uncensored Flash-Next takes the same options and the same n-gram volume:
+
+```bat
+infernix-serve.exe Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00001-of-00003.infernix --ngram-volume Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --kv-dtype int8 --max-context 262144 --prefill-chunk 4096 --spec mtp --draft-tokens 4 --lm-head-draft --max-concurrency 2
+```
+
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
@@ -202,7 +213,9 @@ first; reads through `/mnt/` are slow.
   [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4),
   an abliterated build of Qwen3.8-Flash-Next whose refusal behaviour has been removed (see its model
   card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16
-  activations; the other dense classes are stored in 8 bits as in Dense8.
+  activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's
+  base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). It needs Infernix
+  `windows-2026.10.09.2` or later; earlier releases refuse it.
 - **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)**
   (**recommended** for the 27B): [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
   with a DFlash2 draft model and a proposal head for `--lm-head-draft`.
@@ -214,7 +227,9 @@ first; reads through `/mnt/` are slow.
   an abliterated build of Qwen3.8-27B whose safety alignment has been substantially removed (see its
   model card), with the same draft model and proposal head.
 
-All three Flash-Next conversions use the same 52 GB n-gram volume. `python -m tools.convert` converts
+All three Flash-Next conversions use the same 52 GB n-gram volume,
+[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram)
+(the uncensored repo does not carry its own copy). `python -m tools.convert` converts
 your own checkpoints ([weight conversion](docs/weight-conversion.md)).
 
 ## Documentation
