@@ -439,7 +439,8 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size);
     const std::int32_t QW = dim(a.query_width()), KW = dim(a.key_width()), D = dim(a.head_dim);
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
-    Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + IH * ID + ID, T});
+    const std::int32_t index_rows = IH * ID + ID;
+    Tensor projected = work_.alloc(DType::BF16, {2 * QW + 2 * KW + (p.index_projection ? 0 : index_rows), T});
     project(x, p.projection, projected, work_, s);
     Tensor q = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor gate = work_.alloc(DType::BF16, {QW, T});
@@ -449,8 +450,17 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
     Tensor ik = call.key_records.data != nullptr ? call.key_records.view({ID, T}) : work_.alloc(DType::BF16, {ID, T});
     {
         Tensor qf = q.view({QW, T}), kf = k.view({KW, T}), vf = v.view({KW, T}), iqf = iq.view({IH * ID, T});
-        Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
-        ops::split_rows(projected, parts, s);
+        if (p.index_projection) {
+            Tensor indexed = work_.alloc(DType::BF16, {index_rows, T});
+            project(x, *p.index_projection, indexed, work_, s);
+            Tensor* parts[]       = {&qf, &gate, &kf, &vf};
+            Tensor* index_parts[] = {&iqf, &ik};
+            ops::split_rows(projected, parts, s);
+            ops::split_rows(indexed, index_parts, s);
+        } else {
+            Tensor* parts[] = {&qf, &gate, &kf, &vf, &iqf, &ik};
+            ops::split_rows(projected, parts, s);
+        }
     }
     Tensor qn = work_.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor kn = work_.alloc(DType::BF16, {D, dim(a.kv_heads), T});
@@ -544,6 +554,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.records),
                                 .record_stride = p.bank->planes.record_stride,
                                 .scales        = p.device_scales,
+                                .activation    = p.bank->activation,
                                 .staging_base  = experts_.staging_base,
                                 .staging_slots = experts_.staging_slots,
                                 .cpu           = experts_.cpu.empty() ? ops::MoeCpuChannel{} : experts_.cpu.at(layer)};

@@ -1,5 +1,6 @@
 #pragma once
 #include "ops/linear/fp8/fp8_launch.h"
+#include "ops/linear/fp8/fp8_a16_tma_mma.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include <algorithm>
@@ -29,6 +30,15 @@ void fp8_linear_a16_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStrea
 template <class Geometry, class Schedule>
 void fp8_linear_a16_sliced_k(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_fp8_a16_sliced_k_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
+        fp8_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
+        LinearIdentityEpilogue{}, stream);
+}
+
+// The warp-specialized TMA A16 GEMM (both operands streamed through TMA, codes widened to BF16 in
+// registers) as a plain linear.
+template <class Geometry, class Schedule>
+void fp8_linear_a16_tma(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_fp8_a16_tma_mma<Fp8ScheduleInstance<Schedule, Geometry::kInputRows>>(
         fp8_a16_operands(x, w), LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), w.n},
         LinearIdentityEpilogue{}, stream);
 }

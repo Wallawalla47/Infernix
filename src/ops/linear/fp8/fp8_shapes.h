@@ -17,4 +17,10 @@ extern const Fp8LinearShape kFp8N34816K5120;
 extern const Fp8LinearShape kFp8N5120K6144;
 extern const Fp8LinearShape kFp8N5120K17408;
 extern const Fp8LinearShape kFp8N248320K5120;
+// Qwen3.8-Flash-Next (recipe C, W8A16: A16 routes only).
+extern const Fp8LinearShape kFp8N16384K2560;
+extern const Fp8LinearShape kFp8N13312K2560;
+extern const Fp8LinearShape kFp8N2560K6144;
+extern const Fp8LinearShape kFp8N1280K2560;
+extern const Fp8LinearShape kFp8N2560K640;
 } // namespace infernix::ops::detail
