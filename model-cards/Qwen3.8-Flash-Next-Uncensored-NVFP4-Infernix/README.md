@@ -33,6 +33,21 @@ tags:
 > will answer requests that Qwen's and NVIDIA's releases decline, and its output is not filtered.
 > You are responsible for how you use it and for what it produces.
 
+> [!IMPORTANT]
+> **You also need the 52 GB PLE n-gram volume, which is not in this repository.** It is the same file
+> as for the NVIDIA conversions; download
+> **[`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram)**
+> from [Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)
+> (the Dense8 repository has an identical copy), put it on an NVMe drive and pass it with
+> `--ngram-volume`:
+>
+> ```text
+> hf download Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram --local-dir <nvme dir>
+> ```
+>
+> If you already run either NVIDIA conversion, use the volume you have. [`NGRAM-VOLUME.md`](NGRAM-VOLUME.md)
+> in this repository repeats these links.
+
 orcarouter's [Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4)
 (revision `cddc6ec5`) — 48 layers, 512 routed experts per layer (top-10), an MTP drafter and vision
 — packed for [Infernix](https://github.com/Wallawalla47/Infernix), a C++/CUDA engine that runs it on
@@ -60,6 +75,8 @@ conversion stores in 8 bits are stored in 8 bits here as well.
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00002-of-00003.infernix` | 32,000,000,000 | model, part 2 of 3 |
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix-00003-of-00003.infernix` | 12,302,074,624 | model, part 3 of 3 |
 | `Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix.conversion.json` | 967,282 | conversion report: sources, methods and formats per object |
+| `NGRAM-VOLUME.md` | | where to download the n-gram volume (not in this repository) |
+| `LICENSE` | | the Qwen Community License 1.0 of the base model (see [License](#license)) |
 
 Keep the three model parts in one directory and give Infernix part 1, as with a split GGUF.
 
@@ -188,5 +205,5 @@ provenance record the paths of the machine that converted it.
 orcarouter publishes the source checkpoint under the
 [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0). It derives from
 [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next), released under the Qwen Community
-License 1.0, whose conditions (among them a separate license from Qwen for some commercial uses) may
+License 1.0 (copy in `LICENSE`), whose conditions (among them a separate license from Qwen for some commercial uses) may
 apply to derivatives as well; check both before use.
