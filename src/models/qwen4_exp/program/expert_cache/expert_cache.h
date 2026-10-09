@@ -141,6 +141,8 @@ public:
     void on_quiescent();                                            // no round in flight
     // A free frame below `limit` (a relocation target when the pool shrinks to `limit`).
     [[nodiscard]] std::optional<std::uint32_t> acquire_below(std::uint32_t limit);
+    // A free frame outside [first, first + count) (a relocation target when that run is lent).
+    [[nodiscard]] std::optional<std::uint32_t> acquire_outside(std::uint32_t first, std::uint32_t count);
     // Backs frames [0, frames). Growing frees the new frames; shrinking needs every frame at or
     // above `frames` free (the controller relocates their experts first).
     void resize(std::uint32_t frames);
@@ -220,9 +222,10 @@ public:
     // ineligible, and runs over `busy` frames (targets of loads still in flight) are avoided while a
     // run without them exists. Nothing when no run fits.
     [[nodiscard]] std::optional<std::uint32_t> choose_run(std::uint32_t count, std::span<const std::uint8_t> busy) const;
-    // At a quiescent boundary (no retiring frame): evicts every expert held in the run (ABSENT
-    // writes), lends the run and shrinks the policy's capacity by `count` (further victims are
-    // evicted elsewhere). Returns the number of evicted experts.
+    // At a quiescent boundary (no retiring frame, every issued load landed): shrinks the policy's
+    // capacity by `count`, which evicts its lowest-score residents (ABSENT writes), relocates the
+    // run's remaining experts into free frames outside it, and lends the run. Returns the number
+    // of evicted experts.
     std::uint32_t lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);
     // Returns the run: capacity grows back and queued experts load into it.
     void give_back(std::uint32_t first, std::uint32_t count, std::vector<Command>& out);

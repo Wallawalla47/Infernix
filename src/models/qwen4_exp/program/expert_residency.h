@@ -56,7 +56,8 @@ public:
         std::uint64_t hits       = 0; // of those, resident in a frame at the round's start
         std::uint64_t promotions = 0; // expert copies issued
         std::uint64_t lent_frames    = 0; // frames lent now
-        std::uint64_t lend_evictions = 0; // experts evicted to lend their frames, since start
+        std::uint64_t lend_evictions   = 0; // lowest-score experts evicted to lend frames, since start
+        std::uint64_t lend_relocations = 0; // experts moved out of lent runs by device copies, since start
         std::uint64_t seeded         = 0; // experts loaded by the warm start
         std::uint64_t landed         = 0; // staged misses landed in reserved frames and adopted (S4)
         std::uint64_t demotions      = 0; // SSD tier: VRAM victims copied to RAM (T4)

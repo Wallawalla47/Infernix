@@ -214,6 +214,18 @@ FramePool::FramePool(std::uint32_t frames, std::uint32_t rounds_in_flight, std::
     }
 }
 
+std::optional<std::uint32_t> FramePool::acquire_outside(std::uint32_t first, std::uint32_t count) {
+    for (std::size_t i = free_.size(); i-- > 0;) {
+        const std::uint32_t f = free_[i];
+        if (f >= first && f < first + count) { continue; }
+        free_[i] = free_.back();
+        free_.pop_back();
+        state_[f] = kHeld;
+        return f;
+    }
+    return std::nullopt;
+}
+
 std::optional<std::uint32_t> FramePool::acquire_below(std::uint32_t limit) {
     for (std::size_t i = free_.size(); i-- > 0;) {
         const std::uint32_t f = free_[i];
@@ -520,25 +532,32 @@ std::optional<std::uint32_t> CacheController::choose_run(std::uint32_t count, st
 
 std::uint32_t CacheController::lend(std::uint32_t first, std::uint32_t count, std::vector<Command>& out) {
     if (frames_.pending_count() != 0) { throw std::logic_error("frames lent while some still retire"); }
-    std::uint32_t evicted = 0;
-    for (std::uint32_t f = first; f < first + count; ++f) {
-        if (frame_key_[f] == kNoKey) { continue; }
-        const std::uint32_t key = frame_key_[f];
-        policy_.evict(key);
-        make_absent(key, out);
-        frames_.release_now(f);
-        ++evicted;
-    }
-    frames_.lend(first, count);
-    // The policy keeps no more residents than the frames it may still use.
+    // The policy keeps no more residents than the frames it may still use: its lowest-score
+    // residents leave, wherever their frames are.
     const std::uint32_t capacity = policy_.capacity() > count ? policy_.capacity() - count : 0;
     std::vector<std::uint32_t> victims;
     policy_.set_capacity(capacity, victims);
+    std::uint32_t evicted = 0;
     for (std::uint32_t v : victims) {
         if (table_[v].state == ResidencyState::kAbsent) { continue; } // still queued: drain drops it
         frames_.release_now(make_absent(v, out));
         ++evicted;
     }
+    // The run's other experts move into free frames outside it, so the loan costs the cache its
+    // lowest-score experts rather than the ones its frames happened to hold. At most `capacity`
+    // experts are resident, so the frames outside the run suffice.
+    for (std::uint32_t f = first; f < first + count; ++f) {
+        if (frame_key_[f] == kNoKey) { continue; }
+        const std::uint32_t key = frame_key_[f];
+        const auto target       = frames_.acquire_outside(first, count);
+        if (!target) { throw std::logic_error("frame lending found no relocation target"); }
+        table_[key] = table_[key].next(ResidencyState::kReady, *target);
+        out.push_back({Command::Kind::kRelocate, key, *target, table_[key].encode(), f});
+        frame_key_[*target] = key;
+        frame_key_[f]       = kNoKey;
+        frames_.release_now(f);
+    }
+    frames_.lend(first, count);
     return evicted;
 }
 
