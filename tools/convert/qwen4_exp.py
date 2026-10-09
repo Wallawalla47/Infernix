@@ -27,7 +27,12 @@ from .model import Model, Parameter
 from .qwen3_5 import _Builder, _f32, _fixed, _positive, _rope_source, vision_config
 from .resources import load_resources
 from .sources.logical import LogicalSource
-from .sources.modelopt import dequantize_fp8_block128, fp8_block_matrix_words, nvfp4_matrix_words
+from .sources.modelopt import (
+    dequantize_fp8_block128,
+    fp8_block_matrix_words,
+    nvfp4_matrix_words,
+    nvfp4_packed_matrix_words,
+)
 from .sources.safetensors import SafetensorsSource, tensor_source
 
 ARCHITECTURES = ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration")
@@ -192,18 +197,27 @@ def ngram_config(config: dict) -> NgramConfig:
 
 @dataclass(frozen=True, slots=True)
 class ExpertBankSource:
-    """One layer's ModelOpt NVFP4 experts; only ``import_expert_bank`` can read it."""
+    """One layer's NVFP4 experts; only ``import_expert_bank`` can read it. ``packed`` selects the
+    weight-only compressed-tensors export (``weight_packed`` / ``weight_global_scale``, no activation
+    scales: a W4A16 bank, design §16.2.1) instead of ModelOpt's W4A4 one."""
 
     shape: tuple[int, int, int]
     label: str
     store: SafetensorsSource
     prefix: str  # "...mlp.experts." so expert e's gate is f"{prefix}{e}.gate_proj"
+    packed: bool = False
     read_encoded: object = None
     weight_divisor: object = None
     input_divisor: object = None
 
     def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
         raise ValueError(f"{self.label}: an expert bank is imported exactly, never as values")
+
+
+def weight_only_bank(source) -> bool:
+    """Whether a routed-expert parameter's source is a weight-only (W4A16) bank."""
+
+    return isinstance(source, ExpertBankSource) and source.packed
 
 
 _BANK_CHUNK = 32  # experts encoded per step; bounds conversion memory at ~0.4 GB
@@ -223,6 +237,7 @@ def import_expert_bank(request: PrepareRequest) -> PreparedMethod:
         raise ValueError("expert bank target shape differs from its source")
     experts, hidden, intermediate = source.shape
     geometry = expert_bank_geometry("nvfp4_mul", source.shape)
+    words = nvfp4_packed_matrix_words if source.packed else nvfp4_matrix_words
 
     def produce(output):
         multipliers = []
@@ -230,9 +245,9 @@ def import_expert_bank(request: PrepareRequest) -> PreparedMethod:
             count = min(_BANK_CHUNK, experts - first)
             gc, gs, uc, us, dc, ds, mult = [], [], [], [], [], [], []
             for e in range(first, first + count):
-                gate = nvfp4_matrix_words(source.store, f"{source.prefix}{e}.gate_proj", (intermediate, hidden))
-                up = nvfp4_matrix_words(source.store, f"{source.prefix}{e}.up_proj", (intermediate, hidden))
-                down = nvfp4_matrix_words(source.store, f"{source.prefix}{e}.down_proj", (hidden, intermediate))
+                gate = words(source.store, f"{source.prefix}{e}.gate_proj", (intermediate, hidden))
+                up = words(source.store, f"{source.prefix}{e}.up_proj", (intermediate, hidden))
+                down = words(source.store, f"{source.prefix}{e}.down_proj", (hidden, intermediate))
                 gc.append(gate.codes)
                 gs.append(gate.scales)
                 uc.append(up.codes)
@@ -378,25 +393,40 @@ class _Qwen4ExpBuilder(_Builder):
                  inputs=(p + "shared/product",))
         self.group(p + "shared/gate", p + "shared/up")
         if mtp:
+            # Each expert's matrices become row ranges of two parents (gate and up interleaved per
+            # expert, then every down), so the drafter's resident-expert kernel selects them by id.
             # NVIDIA stores the MTP experts per expert in Qwen's block-scaled FP8 (E4M3FN codes, one
-            # FP32 multiplier per 128 x 128 tile). Each expert's matrices become row ranges of two
-            # parents (gate and up interleaved per expert, then every down), so the drafter's
-            # resident-expert kernel selects them by id; their values are the exact products.
+            # FP32 multiplier per 128 x 128 tile; their values are the exact products); a BF16
+            # export keeps them fused, gate_up_proj [E, 2I, H] (the gate rows first) and down_proj
+            # [E, H, I].
+            fused = store.has(sp + "experts.gate_up_proj")
             gate_up, downs = [], []
             for expert in range(e):
                 ep, leaf = p + f"experts/{expert}/", sp + f"experts.{expert}."
-                for role in ("gate", "up"):
-                    self.add_fp8_block(ep + role, store, leaf + role + "_proj", (ir, h), inputs=(ffn_input,))
+                for half, role in enumerate(("gate", "up")):
+                    if fused:
+                        self.add(ep + role, store, sp + "experts.gate_up_proj", (ir, h), source_shape=(e, 2 * ir, h),
+                                 offset=(2 * expert + half) * ir * h, inputs=(ffn_input,))
+                    else:
+                        self.add_fp8_block(ep + role, store, leaf + role + "_proj", (ir, h), inputs=(ffn_input,))
                     gate_up.append(ep + role)
-                self.add_fp8_block(ep + "down", store, leaf + "down_proj", (h, ir), inputs=(ep + "product",))
+                if fused:
+                    self.add(ep + "down", store, sp + "experts.down_proj", (h, ir), source_shape=(e, h, ir),
+                             offset=expert * h * ir, inputs=(ep + "product",))
+                else:
+                    self.add_fp8_block(ep + "down", store, leaf + "down_proj", (h, ir), inputs=(ep + "product",))
                 downs.append(ep + "down")
             self.group(*gate_up)
             self.group(*downs)
             return
-        bank = ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.")
+        # ModelOpt W4A4 banks carry each matrix's activation scale; a weight-only compressed-tensors
+        # bank (weight_packed) has none and is W4A16 (design §16.2.1).
+        packed = store.has(sp + "experts.0.gate_proj.weight_packed")
+        bank = ExpertBankSource((e, h, ir), f"{store.path}:{sp}experts", store, sp + "experts.", packed=packed)
         self.model.add(Parameter(p + "experts", (e, h, ir), bank, None, (ffn_input,), "nvfp4_mul", residency="text"))
-        self.model.add(Parameter(p + "expert_input_scales", (e, 3), _expert_input_scales(store, sp + "experts.", e),
-                                 None, (), "fp32", residency="text"))
+        if not packed:
+            self.model.add(Parameter(p + "expert_input_scales", (e, 3), _expert_input_scales(store, sp + "experts.", e),
+                                     None, (), "fp32", residency="text"))
 
     def ple(self, prefix, source_prefix, store, config):
         h, width, dim = config["hidden_size"], config["hc_count"] * config["hidden_size"], config["ple_embed_dim"]
@@ -410,7 +440,10 @@ class _Qwen4ExpBuilder(_Builder):
             self.add(prefix + "ple/" + role, store, sp + field + ".weight", (width,))
         self.add(prefix + "ple/convolution", store, sp + "conv1d.weight", (taps, width),
                  source_shape=(width, 1, taps), transpose=(2, 0, 1))
-        self.add(prefix + "ple/ngram_scale", store, sp + "ple_embedding.ngram_embedding.weight_scale", (1,))
+        # The n-gram volume's per-tensor scale: the checkpoint's own, or a BF16 table's derived one.
+        table = self.ngram
+        scale = LogicalSource((1,), f"{store.path}:{table.prefix}scale", lambda begin, end: table.scale()[begin:end])
+        self.model.add(Parameter(prefix + "ple/ngram_scale", (1,), scale, None, (), "bf16", residency="text"))
 
     def block(self, prefix, source_prefix, store, config, mixer, *, mtp=False):
         self.hyper_connection(prefix + "attn_hc/", source_prefix + "attn_hyper_connection.", store, config)
@@ -441,22 +474,73 @@ def _check_ngram_buffers(store: SafetensorsSource, prefix: str, config: dict, pl
     return padded
 
 
-def ngram_shards(store: SafetensorsSource, prefix: str, config: dict, rows: int) -> list[tuple[str, int]]:
-    """``(tensor, rows)`` for every table shard in row order; shards concatenate along rows."""
+class NgramTable:
+    """The PLE n-gram table as the volume stores it: E4M3FN rows with one per-tensor scale.
 
-    parts = config["split_ngram_parts"]
-    width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
-    out, total = [], 0
-    for index in range(parts):
-        name = f"{prefix}ple.ple_embedding.ngram_embedding.shard_{index}.weight"
-        info = store.describe(name)
-        if info.dtype != "F8_E4M3" or len(info.shape) != 2 or info.shape[1] != width:
-            raise ValueError(f"{name}: expected F8_E4M3 [rows, {width}]")
-        out.append((name, info.shape[0]))
-        total += info.shape[0]
-    if total != rows:
-        raise ValueError(f"n-gram shards hold {total} rows, the hash domain needs {rows}")
-    return out
+    FP8 shards (NVIDIA) are the checkpoint's words and its ``weight_scale``. BF16 shards (a BF16
+    export) are quantized by the per-tensor rule ModelOpt applies in the table's own dtype:
+    s = bf16(amax / 448) and code = e4m3_rn_satfinite(bf16(v / s)). From the same BF16 table this
+    reproduces NVIDIA's FP8 table word for word, so such a conversion can reuse its n-gram volume.
+    """
+
+    def __init__(self, store: SafetensorsSource, prefix: str, config: dict, rows: int):
+        self.store = store
+        self.prefix = prefix + "ple.ple_embedding.ngram_embedding."
+        width = config["ple_embed_dim"] // ((config["ngram_size"] - 1) * config["heads_per_ngram"])
+        self.shards: list[tuple[str, int]] = []
+        dtypes = set()
+        for index in range(config["split_ngram_parts"]):
+            name = f"{self.prefix}shard_{index}.weight"
+            info = store.describe(name)
+            if info.dtype not in ("F8_E4M3", "BF16") or len(info.shape) != 2 or info.shape[1] != width:
+                raise ValueError(f"{name}: expected F8_E4M3 or BF16 [rows, {width}]")
+            dtypes.add(info.dtype)
+            self.shards.append((name, info.shape[0]))
+        if len(dtypes) != 1:
+            raise ValueError("n-gram shards mix dtypes")
+        self.bf16 = dtypes == {"BF16"}
+        self.rows = sum(count for _, count in self.shards)
+        self.row_bytes = width  # one E4M3FN byte per element
+        if self.rows != rows:
+            raise ValueError(f"n-gram shards hold {self.rows} rows, the hash domain needs {rows}")
+        self._scale: torch.Tensor | None = None
+
+    def scale(self) -> torch.Tensor:
+        """The per-tensor scale, BF16 ``[1]`` (exact: NVIDIA's FP32 word is a BF16 value)."""
+
+        if self._scale is None:
+            if self.bf16:
+                amax = torch.zeros((), dtype=torch.bfloat16)
+                for name, count in self.shards:
+                    step = 1 << 20
+                    for begin in range(0, count, step):
+                        end = min(count, begin + step)
+                        chunk = self.store.read_flat(name, begin * self.row_bytes, end * self.row_bytes)
+                        amax = torch.maximum(amax, chunk.abs().max())
+                if not bool(torch.isfinite(amax)) or float(amax) <= 0:
+                    raise ValueError("the BF16 n-gram table must have a positive finite absolute maximum")
+                self._scale = (amax / torch.tensor(448.0, dtype=torch.bfloat16)).reshape(1)
+            else:
+                name = self.prefix + "weight_scale"
+                info = self.store.describe(name)
+                if info.dtype not in ("F32", "BF16") or prod(info.shape) != 1:
+                    raise ValueError(f"{name}: expected one scalar scale")
+                value = self.store.read_flat(name).reshape(1)
+                scale = value.to(torch.bfloat16)
+                if not torch.equal(scale.to(value.dtype), value):
+                    raise ValueError(f"{name}: the volume's scale must be exact in BF16")
+                self._scale = scale
+        return self._scale
+
+    def codes(self, name: str, begin: int, end: int) -> torch.Tensor:
+        """E4M3FN words ``uint8 [end - begin, row_bytes]`` of rows [begin, end) of shard ``name``."""
+
+        values = self.store.read_flat(name, begin * self.row_bytes, end * self.row_bytes)
+        if not self.bf16:
+            return values.view(torch.uint8).reshape(end - begin, self.row_bytes)
+        quotient = values / self.scale()  # BF16 division: one rounding to BF16, as ModelOpt
+        codes = quotient.float().clamp(-448.0, 448.0).to(torch.float8_e4m3fn)  # BF16 -> FP32 is exact
+        return codes.view(torch.uint8).reshape(end - begin, self.row_bytes)
 
 
 def build_model(
@@ -473,10 +557,10 @@ def build_model(
     (ple_layer,) = config["ple_layer_ids"]
     ple_prefix = f"{text_prefix}layers.{ple_layer - 1}."
     rows = _check_ngram_buffers(base, ple_prefix, config, 0)
-    shards = ngram_shards(base, ple_prefix, config, rows)
+    table = NgramTable(base, ple_prefix, config, rows)
     config["ngram_table"] = {
         "format": "fp8_e4m3fn",
-        **ngram_geometry(rows, base.describe(shards[0][0]).shape[1]),
+        **ngram_geometry(rows, table.row_bytes),
     }
     records = {"text": {"config": config}}
     if "vision" in selected:
@@ -495,6 +579,7 @@ def build_model(
         records[component]["resources"] = resource_refs
     model = Model(records, resources=resources, token_count=count, special_token_ids=special)
     builder = _Qwen4ExpBuilder(model)
+    builder.ngram = table
     h, r = config["hidden_size"], config["vocab_size"]
     builder.add("text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h))
     heads = ("text/final_hidden",) + (("mtp/final_hidden",) if "mtp" in selected else ())
@@ -520,12 +605,12 @@ def build_model(
     return model
 
 
-def ngram_volume_shards(base: SafetensorsSource, config: dict) -> list[tuple[str, int]]:
-    """The table shards of a model built by :func:`build_model`, in row order."""
+def ngram_table(base: SafetensorsSource, config: dict) -> NgramTable:
+    """The n-gram table of a model built by :func:`build_model`."""
 
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
     (ple_layer,) = config["ple_layer_ids"]
-    return ngram_shards(base, f"{text_prefix}layers.{ple_layer - 1}.", config, config["ngram_table"]["rows"])
+    return NgramTable(base, f"{text_prefix}layers.{ple_layer - 1}.", config, config["ngram_table"]["rows"])
 
 
 # ---------------------------------------------------------------------------- n-gram volume
@@ -556,18 +641,18 @@ def ngram_geometry(rows: int, row_bytes: int) -> dict:
 NGRAM_REUSE_SAMPLES = 512
 
 
-def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
-    """The volume id of an existing n-gram volume written from this checkpoint's table.
+def read_ngram_volume_id(table: NgramTable, path: Path) -> bytes:
+    """The volume id of an existing n-gram volume written from this table's words.
 
-    Another recipe of the same checkpoint (recipe B) shares recipe A's volume: the rows are the
-    checkpoint's words in both. The header geometry and the file size must match this table, and
-    NGRAM_REUSE_SAMPLES rows spread over the table (the first and last included) must equal this
-    checkpoint's rows byte for byte, so a volume written from another checkpoint with the same
-    geometry is refused instead of adopted (the runtime only compares the id the artifact stores).
+    Another recipe of the same checkpoint (recipe B) shares recipe A's volume, and so does a BF16
+    export of the same table (recipe C; NgramTable quantizes it to the same words). The header
+    geometry and the file size must match this table, and NGRAM_REUSE_SAMPLES rows spread over the
+    table (the first and last included) must equal this table's rows byte for byte, so a volume
+    written from another table with the same geometry is refused instead of adopted (the runtime
+    only compares the id the artifact stores).
     """
 
-    row_bytes = store.describe(shards[0][0]).shape[1]
-    rows = sum(count for _, count in shards)
+    row_bytes, rows, shards = table.row_bytes, table.rows, table.shards
     geometry = ngram_geometry(rows, row_bytes)
     path = Path(path)
     with path.open("rb") as stream:
@@ -597,7 +682,7 @@ def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
         for row in samples:
             shard_first, name, _ = next(s for s in reversed(starts) if s[0] <= row)
             local = row - shard_first
-            expected = store.read_flat(name, local * row_bytes, (local + 1) * row_bytes).view(torch.uint8)
+            expected = table.codes(name, local, local + 1)
             per_block = geometry["rows_per_block"]
             stream.seek(NGRAM_BLOCK_BYTES + (row // per_block) * NGRAM_BLOCK_BYTES + (row % per_block) * row_bytes)
             if stream.read(row_bytes) != expected.numpy().tobytes():
@@ -606,17 +691,17 @@ def read_ngram_volume_id(store: SafetensorsSource, shards, path: Path) -> bytes:
     return volume_id
 
 
-def write_ngram_volume(store: SafetensorsSource, shards, path: Path, volume_id: bytes, *, progress=None) -> dict:
+def write_ngram_volume(table: NgramTable, path: Path, volume_id: bytes, *, progress=None) -> dict:
     """Write the FP8 n-gram rows, 25 per 4 KiB block and never straddling one (design §12.2).
 
     Row ``r`` lives at ``header_bytes + (r // rows_per_block) * 4096 + (r % rows_per_block) * row_bytes``;
-    each block's tail is zero. The codes are the checkpoint's words unchanged.
+    each block's tail is zero. The codes are the table's words (NgramTable: the checkpoint's FP8 words
+    unchanged, or a BF16 table's per-tensor quantization).
     """
 
     if len(volume_id) != 16:
         raise ValueError("the n-gram volume id is 16 bytes")
-    row_bytes = store.describe(shards[0][0]).shape[1]
-    rows = sum(count for _, count in shards)
+    row_bytes, rows, shards = table.row_bytes, table.rows, table.shards
     geometry = ngram_geometry(rows, row_bytes)
     per_block = geometry["rows_per_block"]
     path = Path(path)
@@ -654,8 +739,7 @@ def write_ngram_volume(store: SafetensorsSource, shards, path: Path, volume_id: 
                 step = batch_blocks * per_block
                 for begin in range(0, count, step):
                     end = min(count, begin + step)
-                    chunk = store.read_flat(name, begin * row_bytes, end * row_bytes).view(torch.uint8)
-                    pending = flush(torch.cat((pending, chunk.reshape(end - begin, row_bytes))), False)
+                    pending = flush(torch.cat((pending, table.codes(name, begin, end))), False)
                 if progress is not None:
                     progress(index, len(shards))
             flush(pending, True)

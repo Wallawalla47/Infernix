@@ -1,14 +1,20 @@
-"""The format maps of the two Qwen3.8-Flash-Next recipes (design §6.1): recipe A keeps every main-model
+"""The format maps of the Qwen3.8-Flash-Next recipes (design §6.1): recipe A keeps every main-model
 tensor as NVIDIA stores it and re-quantizes only the MTP drafter; recipe B (Dense8) adds q8_g32_fp16 for
-the dense projection classes that dominate per-token weight reads and leaves the rest as recipe A."""
+the dense projection classes that dominate per-token weight reads and leaves the rest as recipe A; recipe
+C (weight-only exports) is selected by its W4A16 banks."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from tools.convert.methods import cast_direct, grouped_absmax, grouped_mse
 from tools.convert.model import Model, Parameter
-from tools.convert.official_recipes import qwen3_8_flash_next_nvfp4, qwen3_8_flash_next_nvfp4_dense8
-from tools.convert.qwen4_exp import import_expert_bank
+from tools.convert.official_recipes import (
+    qwen3_8_flash_next_nvfp4,
+    qwen3_8_flash_next_nvfp4_dense8,
+    qwen3_8_flash_next_nvfp4_orcarouter,
+)
+from tools.convert.qwen4_exp import ExpertBankSource, import_expert_bank
 from tools.convert.recipe import Recipe
 from tools.convert.sources.logical import array_source
 
@@ -92,3 +98,23 @@ def test_recipe_b_adds_q8_for_the_dense_classes_only() -> None:
     for name in DENSE8:
         chosen = _only(selections, name)
         assert (chosen.format, chosen.method) == (Q8, grouped_absmax), name
+
+
+def _weight_only_model() -> Model:
+    model = _model()
+    del model.parameters[BANK]
+    bank = ExpertBankSource((2, 4, 64), BANK, None, "experts.", packed=True)
+    model.add(Parameter(BANK, (2, 4, 64), bank, inputs=("input",)))
+    return model
+
+
+def test_weight_only_experts_take_recipe_c_and_modelopt_ones_recipes_a_and_b() -> None:
+    # A weight-only bank has no activation scales: recipes A and B (W4A4) refuse it, recipe C (W4A16)
+    # refuses a ModelOpt bank.
+    for recipe_function in (qwen3_8_flash_next_nvfp4, qwen3_8_flash_next_nvfp4_dense8):
+        model = _weight_only_model()
+        with pytest.raises(ValueError, match="recipe C"):
+            recipe_function(model, Recipe(model), {})
+    model = _model()
+    with pytest.raises(ValueError, match="weight-only"):
+        qwen3_8_flash_next_nvfp4_orcarouter(model, Recipe(model), {"base": None})
