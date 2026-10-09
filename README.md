@@ -198,6 +198,11 @@ first; reads through `/mnt/` are slow.
 - **[Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix)**:
   every weight the model computes with exactly as NVIDIA stores it, for when the weights must be
   unchanged.
+- **[Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix)**:
+  [orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4),
+  an abliterated build of Qwen3.8-Flash-Next whose refusal behaviour has been removed (see its model
+  card). Its weight-only NVFP4 experts and FP8 dense projections are kept bit-exact and run with BF16
+  activations; the other dense classes are stored in 8 bits as in Dense8.
 - **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)**
   (**recommended** for the 27B): [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
   with a DFlash2 draft model and a proposal head for `--lm-head-draft`.
@@ -209,7 +214,7 @@ first; reads through `/mnt/` are slow.
   an abliterated build of Qwen3.8-27B whose safety alignment has been substantially removed (see its
   model card), with the same draft model and proposal head.
 
-Both Flash-Next conversions use the same 52 GB n-gram volume. `python -m tools.convert` converts
+All three Flash-Next conversions use the same 52 GB n-gram volume. `python -m tools.convert` converts
 your own checkpoints ([weight conversion](docs/weight-conversion.md)).
 
 ## Documentation
