@@ -282,6 +282,7 @@ Thank you as well to everyone whose issues, pull requests, forks and research In
 [lonelystarCX](https://github.com/lonelystarCX),
 [gpillon](https://github.com/gpillon) (ignis),
 [CaptainArni](https://github.com/CaptainArni),
-David Oelfke, Fedor Suchkov, Yunado,
+[David Oelfke](https://github.com/Doelfke),
+Fedor Suchkov, Yunado,
 [IST-DASLab](https://github.com/IST-DASLab) (llmq), the authors of HyperQuant and Four Over Six,
 the Qwen team for the models, and NVIDIA for the NVFP4 checkpoints.
