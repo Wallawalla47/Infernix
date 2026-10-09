@@ -115,7 +115,6 @@ ChatTurn call_turn(std::initializer_list<std::pair<const char*, const char*>> ca
 StoredOpenAIResponse stored_parent(OpenAIResponseContext context) {
     StoredOpenAIResponse record;
     record.id                = "resp_parent";
-    record.session_key       = "responses-session";
     record.response          = Json{{"id", record.id}, {"object", "response"}};
     record.context           = std::move(context);
     record.preserve_thinking = true;
@@ -171,21 +170,12 @@ int test_basic_request_and_resolution() {
 
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_current", true);
+        resolve_openai_responses_prompt(request.prompt, store);
     failures += check(resolved.generation.messages.size() == 2 &&
                           resolved.generation.messages[0].role == infernix::ChatRole::Developer &&
                           resolved.generation.messages[0].content[0].text == "be concise" &&
                           resolved.generation.messages[1].content[0].text == "hello",
                       "instructions and current input composed in model order");
-    failures += check(resolved.session_key == "resp_current" &&
-                          resolved.cache_hints.session_key == "resp_current" &&
-                          resolved.cache_hints.update_session_index,
-                      "stored root response receives one live Engine session");
-    const OpenAIResponsesResolvedPrompt unstored =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_unstored", false);
-    failures += check(!unstored.session_key && !unstored.cache_hints.session_key &&
-                          !unstored.cache_hints.update_session_index,
-                      "store=false root must not create or advance a named Engine session");
     return failures;
 }
 
@@ -356,7 +346,7 @@ int test_typed_items_and_cache_markers() {
 
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_typed", true);
+        resolve_openai_responses_prompt(request.prompt, store);
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[1].tool_call_id == "call_1",
                       "typed Items survive call-graph normalization");
@@ -394,7 +384,7 @@ int test_prompt_cache_policy_after_history_resolution() {
                                       {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}},
                                  Json{{"type", "input_text"}, {"text", "first question"}}})}}})}};
     const auto initial = parse_openai_responses_create_request(initial_body, limits());
-    const auto first   = resolve_openai_responses_prompt(initial.prompt, store, "resp_first", true);
+    const auto first   = resolve_openai_responses_prompt(initial.prompt, store);
     const auto first_prompt = to_prompt_input(first.generation, ResolvedPromptSemantics{}, {});
     int failures            = 0;
     failures +=
@@ -422,7 +412,7 @@ int test_prompt_cache_policy_after_history_resolution() {
                        {"input", "next question"}};
     const auto followup = parse_openai_responses_create_request(followup_body, limits());
     const auto second =
-        resolve_openai_responses_prompt(followup.prompt, store, "resp_second", true);
+        resolve_openai_responses_prompt(followup.prompt, store);
     const auto second_prompt = to_prompt_input(second.generation, ResolvedPromptSemantics{}, {});
     failures += check(
         second_prompt.context_cache.markers.size() == 2 &&
@@ -451,7 +441,7 @@ int test_prompt_cache_policy_after_history_resolution() {
     followup_body["prompt_cache_options"] = Json{{"mode", "explicit"}};
     const auto explicit_request = parse_openai_responses_create_request(followup_body, limits());
     const auto explicit_result =
-        resolve_openai_responses_prompt(explicit_request.prompt, store, "resp_explicit", true);
+        resolve_openai_responses_prompt(explicit_request.prompt, store);
     const auto explicit_prompt =
         to_prompt_input(explicit_result.generation, ResolvedPromptSemantics{}, {});
     failures += check(
@@ -518,7 +508,7 @@ int test_contiguous_assistant_items() {
 
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_grouped", true);
+        resolve_openai_responses_prompt(request.prompt, store);
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[1].content.size() == 1 &&
                           resolved.generation.messages[1].tool_calls.size() == 1,
@@ -836,7 +826,7 @@ int test_namespace_tools() {
         parse_openai_responses_create_request(history, limits());
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(replay.prompt, store, "resp_replay", true);
+        resolve_openai_responses_prompt(replay.prompt, store);
     failures += check(resolved.generation.messages[1].tool_calls[0].name == "mcp__clock__now" &&
                           resolved.generation.messages[2].tool_result_name == "mcp__clock__now" &&
                           replay.prompt.input_items[1].at("namespace") == "mcp__clock" &&
@@ -848,8 +838,7 @@ int test_namespace_tools() {
     const OpenAIResponsesCreateRequest mismatched =
         parse_openai_responses_create_request(mismatch, limits());
     failures += check(api_code([&] {
-                          (void)resolve_openai_responses_prompt(mismatched.prompt, store,
-                                                                "resp_mismatch", true);
+                          (void)resolve_openai_responses_prompt(mismatched.prompt, store);
                       }) == "invalid_tool_history",
                       "tool output identity must agree with its call_id");
 
@@ -866,7 +855,7 @@ int test_namespace_tools() {
                                          {"output", "12:00"}}})}},
         limits());
     const OpenAIResponsesResolvedPrompt stored_resolved =
-        resolve_openai_responses_prompt(stored_replay.prompt, store, "resp_stored_replay", true);
+        resolve_openai_responses_prompt(stored_replay.prompt, store);
     failures +=
         check(stored_resolved.generation.messages.back().tool_call_id == "call_stored_clock" &&
                   stored_resolved.generation.messages.back().tool_result_name == "mcp__clock__now",
@@ -988,7 +977,7 @@ int test_custom_tools() {
     const OpenAIResponsesCreateRequest replay = parse_openai_responses_create_request(history, limits());
     OpenAIResponsesStore store(8, 1ULL << 20);
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(replay.prompt, store, "resp_custom_replay", true);
+        resolve_openai_responses_prompt(replay.prompt, store);
     failures += check(resolved.generation.messages[1].tool_calls[0].name == "apply_patch" &&
                           resolved.generation.messages[1].tool_calls[0].arguments_json ==
                               Json{{"input", patch}}.dump() &&
@@ -1091,23 +1080,15 @@ int test_previous_response_call_graph() {
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(reordered_body, limits());
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_child", true);
+        resolve_openai_responses_prompt(request.prompt, store);
     int failures = 0;
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[2].tool_call_id == "call_a" &&
                           resolved.generation.messages[3].tool_call_id == "call_b",
                       "complete tool results are normalized to declaration order");
-    failures += check(resolved.session_key == "responses-session" &&
-                          resolved.generation.preserve_thinking == true &&
+    failures += check(resolved.generation.preserve_thinking == true &&
                           !resolved.preserve_thinking_semantic_change,
-                      "parent continuation inherits session and prompt semantics");
-
-    const OpenAIResponsesResolvedPrompt disposable =
-        resolve_openai_responses_prompt(request.prompt, store, "resp_disposable", false);
-    failures += check(disposable.session_key == "responses-session" &&
-                          disposable.cache_hints.session_key == "responses-session" &&
-                          !disposable.cache_hints.update_session_index,
-                      "store=false consumes parent session without advancing it");
+                      "parent continuation inherits prompt semantics");
 
     Json partial     = reordered_body;
     partial["input"] = Json::array(
@@ -1115,8 +1096,7 @@ int test_previous_response_call_graph() {
     const OpenAIResponsesCreateRequest invalid =
         parse_openai_responses_create_request(partial, limits());
     failures += check(api_code([&] {
-                          (void)resolve_openai_responses_prompt(invalid.prompt, store,
-                                                                "resp_invalid", true);
+                          (void)resolve_openai_responses_prompt(invalid.prompt, store);
                       }) == "invalid_tool_history",
                       "non-prefix partial tool results are rejected");
 
@@ -1126,16 +1106,14 @@ int test_previous_response_call_graph() {
     const OpenAIResponsesCreateRequest unknown_request =
         parse_openai_responses_create_request(unknown, limits());
     failures += check(api_code([&] {
-                          (void)resolve_openai_responses_prompt(unknown_request.prompt, store,
-                                                                "resp_unknown", true);
+                          (void)resolve_openai_responses_prompt(unknown_request.prompt, store);
                       }) == "invalid_tool_history",
                       "unknown tool result call_id is rejected");
 
     OpenAIResponsesCreateRequest missing_parent = request;
     missing_parent.prompt.previous_response_id  = "resp_missing";
     failures += check(api_code([&] {
-                          (void)resolve_openai_responses_prompt(missing_parent.prompt, store,
-                                                                "resp_new", true);
+                          (void)resolve_openai_responses_prompt(missing_parent.prompt, store);
                       }) == "response_not_found",
                       "missing parent response is reported precisely");
     return failures;
@@ -1426,7 +1404,7 @@ int test_input_tokens_uses_shared_state_path() {
                         {"tools", Json::array({Json{{"type", "function"}, {"name", "now"}}})}}})}},
         limits());
     const OpenAIResponsesResolvedPrompt resolved =
-        resolve_openai_responses_prompt(request, store, std::nullopt, false);
+        resolve_openai_responses_prompt(request, store);
     int failures = 0;
     failures += check(resolved.generation.messages.size() == 4 &&
                           resolved.generation.messages[0].role == infernix::ChatRole::Developer &&
@@ -1457,7 +1435,7 @@ int test_constrained_decoding() {
         changed["structured_outputs"] = value;
         const auto parsed             = parse_openai_responses_create_request(changed, limits());
         const auto selected =
-            resolve_openai_responses_prompt(parsed.prompt, store, std::nullopt, false);
+            resolve_openai_responses_prompt(parsed.prompt, store);
         failures +=
             check(to_request_options(selected.generation, {}, {}, true).constraint ==
                       (value.contains("choice") ? infernix::OutputConstraint::choice({"yes", "no"})
@@ -1465,7 +1443,7 @@ int test_constrained_decoding() {
                   "Responses choice/regex lost through prompt resolution");
     }
     const auto resolved =
-        resolve_openai_responses_prompt(request.prompt, store, std::nullopt, false);
+        resolve_openai_responses_prompt(request.prompt, store);
     failures += check(to_request_options(resolved.generation, {}, {}, true).constraint->source ==
                           "root ::= \"yes\"",
                       "Responses GBNF extension was lost in resolution or Engine translation");

@@ -23,7 +23,6 @@ infernix::PromptInput prompt(bool thinking = false) {
     input.messages.push_back({.role  = infernix::ChatRole::User,
                               .parts = {{.kind = infernix::MessagePartKind::Text,
                                          .text = g_preamble + "Return the requested answer."}}});
-    input.context_cache.session_key = "grammar-test";
     return input;
 }
 
@@ -92,7 +91,6 @@ void choice_and_regex(infernix::Engine& engine, unsigned concurrency, bool specu
                                    infernix::OutputConstraint::regex("(BUG|TASK)-[0-9]{4}")}) {
         auto input                 = prompt();
         input.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
-        input.context_cache.session_key.reset();
         input.messages.push_back(
             {.role  = infernix::ChatRole::Assistant,
              .parts = {{.kind = infernix::MessagePartKind::Text, .text = "TASK-"}}});
@@ -160,18 +158,19 @@ int main(int argc, char** argv) {
         options.kv_cache        = infernix::KvCacheStorage::Fp8E4M3Row256;
         options.context_cache.hybrid.device_snapshot_slots = 8;
         options.context_cache.host_capacity_bytes          = 512ULL << 20;
-        // INFERNIX_TEST_NGRAM_VOLUME names a Qwen4Exp artifact's n-gram volume. That model's prefix
-        // cache keeps its snapshots in its default Host tier, covering whole 64-token blocks, and
-        // drafts adaptively: a one-row round verifies only confident drafts, so a short sampled
-        // answer may take no round.
+        // The prefix cache keeps whole 64-token blocks and snapshots inside the prompt, so the
+        // prompts carry a fixed preamble long enough for it to keep.
+        for (int line = 1; line <= 12; ++line) {
+            g_preamble += "Note " + std::to_string(line) +
+                          ": this line belongs to a fixed preamble that only makes the prompt long "
+                          "enough for the prefix cache to keep.\n";
+        }
+        // INFERNIX_TEST_NGRAM_VOLUME names a Qwen4Exp artifact's n-gram volume. That model keeps
+        // its snapshots in its default Host tier and drafts adaptively: a one-row round verifies
+        // only confident drafts, so a short sampled answer may take no round.
         const char* volume = std::getenv("INFERNIX_TEST_NGRAM_VOLUME");
         const bool qwen4   = volume != nullptr && *volume != '\0';
         if (qwen4) {
-            for (int line = 1; line <= 12; ++line) {
-                g_preamble += "Note " + std::to_string(line) +
-                              ": this line belongs to a fixed preamble that only makes the prompt long "
-                              "enough for the prefix cache to keep.\n";
-            }
             options.ngram_volume_path                 = volume;
             options.context_cache.hybrid.device_snapshot_slots = {};
             options.context_cache.host_capacity_bytes          = {};
@@ -229,7 +228,6 @@ int main(int argc, char** argv) {
                 "thinking control broke constrained content");
 
         auto continued = prompt();
-        continued.context_cache.session_key.reset();
         continued.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
         const std::string prefix       = "{\"value\":";
         const std::string whole        = prefix + "\"你好\"}";
@@ -287,10 +285,10 @@ int main(int argc, char** argv) {
         const auto hit = engine.generate(engine.prepare_tokens(raw_prompt), literal("no"));
         std::cout << "exact hit: content=\"" << hit.content << "\" reused=" << hit.reused_prompt_tokens << " of "
                   << raw_prompt.size() << '\n';
-        // The hybrid cache resumes from its last snapshot before the prompt's end and prefills the rest;
-        // the first token must still follow this request's grammar.
-        require(hit.content == "no" && (qwen4 ? hit.reused_prompt_tokens > 0
-                                              : hit.reused_prompt_tokens == raw_prompt.size()),
+        // The prefix cache resumes from its last snapshot before the prompt's end and prefills the
+        // rest; the first token must still follow this request's grammar.
+        require(hit.content == "no" && hit.reused_prompt_tokens > 0 &&
+                    hit.reused_prompt_tokens < raw_prompt.size(),
                 "exact prefix hit reused grammar state or bypassed first-token mask");
         auto raw = engine.generate(engine.prepare_tokens(engine.tokenize_text("Answer: ")),
                                    literal(answer));
@@ -354,7 +352,6 @@ int main(int argc, char** argv) {
         json_thinking.execution.thinking.budget = 2;
         record(schema, engine.generate(engine.prepare(prompt(true)), json_thinking));
         auto numeric_prefix = prompt();
-        numeric_prefix.context_cache.session_key.reset();
         numeric_prefix.options.continuation =
             infernix::PromptContinuationMode::ContinueFinalAssistant;
         const std::string partial_number = "{\"description\":\"你好\",\"values\":[1.5e-";
@@ -374,7 +371,6 @@ int main(int argc, char** argv) {
         const auto fixed  = nlohmann::ordered_json{{"const", {{"text", "你好\n"}, {"n", 2}}}};
         auto continuation = prompt();
         continuation.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
-        continuation.context_cache.session_key.reset();
         const std::string json_prefix = "{\"text\":";
         continuation.messages.push_back(
             {.role  = infernix::ChatRole::Assistant,

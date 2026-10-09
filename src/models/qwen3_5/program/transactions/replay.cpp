@@ -44,7 +44,7 @@ PreparedPromptData replay_prompt(const RequestBasePlanImpl& base, const Sequence
             out.positions[axis * ledger_tokens + token] = static_cast<std::int32_t>(position);
         }
     }
-    const auto splits = sequence.prefix_identity.execution_frontiers();
+    const auto splits = sequence.ledger_splits.frontiers();
     out.identity.rewrite_execution_frontiers.assign(splits.begin(), splits.end());
     return out;
 }
@@ -124,9 +124,6 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
          sequence.ledger.size() != static_cast<std::size_t>(request.replay_target) + 1U)) {
         throw std::logic_error("replay does not describe a committed recovery frontier");
     }
-    if (request.capture_pending) {
-        throw std::logic_error("replay cannot advance while a capture is pending");
-    }
     require_unit(lane, ExecutionUnitKind::Replay);
     const double prior_vision_seconds =
         request.replay && request.replay->vision ? request.replay->vision->elapsed_seconds() : 0.0;
@@ -140,10 +137,6 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         sequence.mtp_draft_count = 0;
         request.lifecycle        = request.resume_lifecycle;
         request.replay.reset();
-        initialize_captures(lane, request.replay_target,
-                            request.lifecycle == Lifecycle::Prefilling
-                                ? request.base->summary.prompt_tokens
-                                : request.replay_target);
     };
 
     try {
@@ -162,11 +155,6 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             permit.main_frontier > request.replay_target) {
             throw std::logic_error("replay permit does not cover its next chunk");
         }
-        prepare_capture_boundary(lane);
-        const std::optional<std::uint32_t> capture_frontier =
-            request.capture_reservation
-                ? std::optional<std::uint32_t>(request.capture_reservation->frontier)
-                : std::nullopt;
         ensure_sequence_kv_mapped(sequence, permit.main_frontier, permit.backend_frontier);
         set_device_i32(io.text_kv_table_row, text_kv_addresses->bound_row(sequence.kv->text));
         set_device_i32(io.backend_kv_table_row,
@@ -190,13 +178,10 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             count = std::min(count, prompt_tokens - cursor - 1U);
         }
         const bool skip_mtp_alignment = awaits_first_mtp_token && cursor + 1U == prompt_tokens;
-        const auto splits             = sequence.prefix_identity.execution_frontiers();
+        const auto splits             = sequence.ledger_splits.frontiers();
         const auto next_split         = std::upper_bound(splits.begin(), splits.end(), cursor);
-        std::optional<std::uint32_t> split =
+        const std::optional<std::uint32_t> split =
             next_split != splits.end() ? std::optional<std::uint32_t>(*next_split) : std::nullopt;
-        if (capture_frontier && (!split || *capture_frontier < *split)) {
-            split = capture_frontier;
-        }
 
         const StateImageSelectors selectors = state_selectors(sequence);
         execution::PrefillContext context{
@@ -331,7 +316,6 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
             sequence.dflash_context_frontier = end;
         }
         commit_sequence_kv(sequence, end, backend_kv_valid(sequence));
-        settle_state_fork(sequence);
         timing.resume_submit();
         copy_tail(sequence, prefill_hidden.slice(
                                 1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
@@ -344,15 +328,10 @@ ReplayProgress ProgramImpl::advance_replay(SequenceHandle handle,
         sequence.mtp_draft_count   = 0;
         request.replay_cursor      = end;
 
-        const bool capture_ready = capture_frontier && end == *capture_frontier;
-        if (capture_ready) { request.capture_pending = true; }
-        // A recovered semantic point is published through the same capture transaction as
-        // prefill. Even at the replay target, retain this lifecycle until that capture settles.
-        const bool complete = end == request.replay_target && !capture_ready;
+        const bool complete = end == request.replay_target;
         if (complete) { complete_replay(); }
         settle_unit(lane);
-        return ReplayProgress{.capture_ready    = capture_ready,
-                              .processed_tokens = result.processed_tokens,
+        return ReplayProgress{.processed_tokens = result.processed_tokens,
                               .complete         = complete,
                               .timing           = timing.finish()};
     } catch (...) {

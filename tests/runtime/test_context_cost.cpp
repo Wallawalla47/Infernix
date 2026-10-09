@@ -106,52 +106,13 @@ std::string read_file(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-void test_exact_evaluation() {
+void test_hardware_class() {
     expect(infernix::runtime::context_cost_hardware_class("NVIDIA GeForce RTX 5090", 12, 0) ==
                "nvidia-geforce-rtx-5090-sm120",
            "hardware class duplicated or lost the NVIDIA vendor");
     expect(infernix::runtime::context_cost_hardware_class("Example Accelerator", 9, 0) ==
                "nvidia-example-accelerator-sm90",
            "hardware class did not canonicalize a vendorless CUDA device name");
-
-    infernix::runtime::ContextMachineCostModel model{.transfer = transfer(), .prefill = prefill()};
-    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
-                             {.payload_bytes = 4, .copy_operations = 2}) == 16,
-           "transfer operation roofline changed");
-    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
-                             {.payload_bytes = 100, .copy_operations = 1}) == 50,
-           "transfer bandwidth roofline changed");
-    expect(model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost, {}) == 0,
-           "empty transfer has a nonzero cost");
-    const infernix::runtime::PrefillWork work = infernix::runtime::make_prefill_work(100, 10, 2, 7, 8);
-    expect(work.chunks == 2 && work.tokens == 10 && work.attention_pairs == 1055 &&
-               work.vision_items == 2 && work.vision_patches == 7,
-           "prefill feature construction changed");
-    expect(infernix::runtime::make_prefill_work(std::numeric_limits<std::uint64_t>::max(),
-                                              std::numeric_limits<std::uint64_t>::max(), 0, 0, 1)
-                   .attention_pairs == std::numeric_limits<std::uint64_t>::max(),
-           "prefill attention work did not saturate");
-    expect(model.prefill_ns(work) == 299, "prefill formula or Q32 rounding changed");
-
-    std::array requirements{
-        infernix::runtime::ContextTransferRequirement{
-            .direction = infernix::runtime::ContextTransferDirection::DeviceToHost,
-            .work      = {.payload_bytes = 4, .copy_operations = 1},
-        },
-        infernix::runtime::ContextTransferRequirement{
-            .direction = infernix::runtime::ContextTransferDirection::DeviceToHost,
-            .work      = {.payload_bytes = 4, .copy_operations = 1},
-        },
-    };
-    expect(infernix::runtime::price_context_transfer_requirements(model, requirements) == 16,
-           "capture transfer requirements were not coalesced before pricing");
-    requirements[1].direction = infernix::runtime::ContextTransferDirection::HostToDevice;
-    expect(infernix::runtime::price_context_transfer_requirements(model, requirements) == 26,
-           "independent transfer directions were incorrectly coalesced");
-
-    model.prefill.chunk_ns = std::numeric_limits<std::uint64_t>::max();
-    expect(model.prefill_ns({.chunks = 2}) == std::numeric_limits<std::uint64_t>::max(),
-           "prefill cost did not saturate");
 }
 
 void test_schema_validation() {
@@ -235,9 +196,8 @@ void test_resolution_and_atomic_upserts() {
         expect(
             generic.summary.transfer_source == infernix::ContextCostPresetSource::GenericDefault &&
                 generic.summary.prefill_source == infernix::ContextCostPresetSource::GenericDefault &&
-                generic.model.transfer_ns(infernix::runtime::ContextTransferDirection::DeviceToHost,
-                                          {.payload_bytes = 1024, .copy_operations = 1}) > 0 &&
-                generic.model.prefill_ns({.tokens = 1}) > 0,
+                generic.model.transfer[0].ns_per_byte_q32 > 0 &&
+                generic.model.prefill.token_ns_q32 > 0,
             "unknown identity did not retain a numerical cost model");
 
         infernix::runtime::upsert_context_transfer_cost_atomic(path, unknown.hardware_class,
@@ -292,7 +252,7 @@ void test_resolution_and_atomic_upserts() {
 } // namespace
 
 int main() {
-    test_exact_evaluation();
+    test_hardware_class();
     test_schema_validation();
     test_resolution_and_atomic_upserts();
     if (failures == 0) { std::cout << "ok\n"; }

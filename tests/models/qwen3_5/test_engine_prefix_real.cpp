@@ -29,22 +29,6 @@ infernix::EngineOptions engine_options(const char* artifact) {
     return options;
 }
 
-infernix::EngineOptions host_restore_engine_options(const char* artifact) {
-    infernix::EngineOptions options;
-    options.artifact_path                     = artifact;
-    options.max_context                       = 512;
-    options.kv_capacity                       = infernix::KvCapacityPolicy::explicit_capacity(512);
-    options.prefill_chunk                     = 256;
-    options.speculative.backend               = infernix::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens          = 3;
-    options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
-    options.max_concurrency                   = 1;
-    options.max_pending_requests              = 1;
-    options.context_cache.hybrid.device_snapshot_slots  = 1;
-    options.context_cache.host_capacity_bytes = 256ULL << 20;
-    return options;
-}
-
 infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* artifact) {
     infernix::EngineOptions options;
     options.artifact_path                    = artifact;
@@ -445,133 +429,6 @@ int exercise_prefix(infernix::Engine& engine) {
     return 0;
 }
 
-int exercise_semantic_captures(const char* artifact) {
-    auto configured          = host_restore_engine_options(artifact);
-    configured.max_context   = 1024;
-    configured.kv_capacity   = infernix::KvCapacityPolicy::explicit_capacity(1024);
-    configured.prefill_chunk = 128;
-    configured.speculative   = {};
-    infernix::RequestOptions request;
-    request.execution.requested_output_tokens = 2;
-    request.execution.sampling.temperature    = 0.0F;
-    request.stop.include_model_defaults       = false;
-    // Cache scenarios exercise free model output; constrained tools need model stops.
-    request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
-
-    // Both inputs span several chunks. Raw input retains P; Chat retains its typed R.
-    // Each fresh Engine has room for that one recovery state and its active writer.
-    for (const bool chat : {false, true}) {
-        infernix::Engine engine(configured);
-        infernix::PreparedPrompt prepared;
-        if (chat) {
-            infernix::PromptInput input;
-            input.options.enable_thinking                              = true;
-            input.options.preserve_thinking                            = true;
-            input.context_cache.allow_engine_automatic_shared_prefixes = false;
-            std::string text                                           = "A";
-            for (std::uint32_t index = 1; index < 512; ++index) { text += " A"; }
-            infernix::ChatMessage user;
-            user.role = infernix::ChatRole::User;
-            user.parts.push_back(infernix::MessagePart{
-                .kind = infernix::MessagePartKind::Text, .text = std::move(text), .media = {}});
-            input.messages.push_back(std::move(user));
-            prepared = engine.prepare(std::move(input));
-        } else {
-            prepared = engine.prepare_tokens(std::vector<infernix::TokenId>(512, 5834));
-        }
-        const auto result = engine.generate(std::move(prepared), request);
-        const auto stats  = engine.runtime_stats();
-        if (result.generated_token_ids.size() != 2 ||
-            result.prompt.prompt_tokens <= configured.prefill_chunk ||
-            result.computed_prefill_tokens != result.prompt.prompt_tokens ||
-            stats.active_captures_completed != 1 || stats.active_captures_aborted != 0 ||
-            stats.state_d2h_count != 0) {
-            std::cerr << (chat ? "Chat R" : "raw P")
-                      << " did not remain the only prefill capture: prompt="
-                      << result.prompt.prompt_tokens
-                      << " computed=" << result.computed_prefill_tokens
-                      << " captures=" << stats.active_captures_completed
-                      << " aborted=" << stats.active_captures_aborted
-                      << " state_d2h=" << stats.state_d2h_count << '\n';
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int exercise_host_restore(const char* artifact) {
-    infernix::Engine engine(host_restore_engine_options(artifact));
-    auto options = [](std::uint32_t outputs, bool reuse) {
-        infernix::RequestOptions request;
-        request.execution.requested_output_tokens = outputs;
-        request.execution.sampling.temperature    = 0.0F;
-        request.execution.allow_prefix_reuse      = reuse;
-        request.stop.include_model_defaults       = false;
-        // Cache scenarios exercise free model output; constrained tools need model stops.
-        request.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
-        return request;
-    };
-
-    // One full prefill chunk leaves a prompt and a later generation checkpoint on Device.
-    // A token branch isolates typed Host restore from template rewriting and
-    // the retention of a shorter, optional chat rewrite anchor.
-    const std::vector<infernix::TokenId> retained_input(256, 5834);
-    const infernix::GenerationResult retained =
-        engine.generate(engine.prepare_tokens(retained_input), options(5, true));
-    if (retained.prompt.prompt_tokens != 256 || retained.generated_token_ids.size() != 5) {
-        std::cerr << "Host-restore source request did not complete\n";
-        return 1;
-    }
-
-    auto continuation = retained_input;
-    // Match only the prompt checkpoint: a deeper generation point may retain Device state.
-    continuation.push_back(retained.generated_token_ids.front() == 198 ? 5834 : 198);
-    continuation.insert(continuation.end(), 5, 198);
-
-    const infernix::RuntimeStats before_pressure = engine.runtime_stats();
-    const infernix::GenerationResult pressure_result =
-        engine.generate(engine.prepare_tokens(continuation), options(2, false));
-    const infernix::RuntimeStats after_pressure = engine.runtime_stats();
-    if (pressure_result.generated_token_ids.size() != 2 ||
-        after_pressure.state_d2h_count <= before_pressure.state_d2h_count ||
-        after_pressure.main_kv_d2h_pages <= before_pressure.main_kv_d2h_pages ||
-        after_pressure.backend_kv_d2h_pages <= before_pressure.backend_kv_d2h_pages) {
-        std::cerr << "Host pressure did not demote the complete MTP checkpoint: state="
-                  << after_pressure.state_d2h_count << " main=" << after_pressure.main_kv_d2h_pages
-                  << " backend=" << after_pressure.backend_kv_d2h_pages << '\n';
-        return 1;
-    }
-
-    const infernix::GenerationResult restored =
-        engine.generate(engine.prepare_tokens(continuation), options(2, true));
-    const infernix::RuntimeStats after_restore = engine.runtime_stats();
-    if (restored.generated_token_ids.size() != 2 ||
-        restored.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
-        restored.reused_prompt_tokens == 0 ||
-        after_restore.state_h2d_count <= after_pressure.state_h2d_count ||
-        restored.reused_prompt_tokens != retained_input.size() ||
-        after_restore.main_kv_h2d_pages <= after_pressure.main_kv_h2d_pages ||
-        after_restore.main_kv_h2d_pages - after_pressure.main_kv_h2d_pages >
-            after_pressure.main_kv_d2h_pages - before_pressure.main_kv_d2h_pages ||
-        after_restore.backend_kv_h2d_pages - after_pressure.backend_kv_h2d_pages >
-            after_pressure.backend_kv_d2h_pages - before_pressure.backend_kv_d2h_pages) {
-        // Deficit-sized eviction can move only E's backend suffix; P does not need to read
-        // that suffix back. Native transaction tests separately force a full backend restore.
-        std::cerr << "MTP checkpoint did not restore its missing prefix replicas: path="
-                  << static_cast<int>(restored.prefix_reuse_path)
-                  << " reused=" << restored.reused_prompt_tokens
-                  << " outputs=" << restored.generated_token_ids.size()
-                  << " state=" << after_restore.state_h2d_count
-                  << " main=" << after_restore.main_kv_h2d_pages
-                  << " backend=" << after_restore.backend_kv_h2d_pages << '\n';
-        return 1;
-    }
-
-    // The uncached pressure request and checkpoint resume use different valid prefill splits, so
-    // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
-    return 0;
-}
-
 int exercise_explicit_prefix(const char* artifact) {
     auto options                              = engine_options(artifact);
     options.enable_vision                     = false;
@@ -620,7 +477,7 @@ int exercise_explicit_prefix(const char* artifact) {
         engine.generate(engine.prepare(input("Use lookup for bravo.", false)), request);
     if (source.generated_token_ids.size() != 3 || branch.generated_token_ids.size() != 3 ||
         cold.generated_token_ids.size() != 3 ||
-        branch.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        branch.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         branch.reused_prompt_tokens == 0 ||
         branch.reused_prompt_tokens >= branch.prompt.prompt_tokens ||
         cold.prefix_reuse_path != infernix::PrefixReusePath::Root || cold.reused_prompt_tokens != 0) {
@@ -703,8 +560,8 @@ int exercise_nested_tool_markers(const char* artifact) {
     };
     if (!accounted(seed) || !accounted(deep) || !accounted(shallow) ||
         seed.prefix_reuse_path != infernix::PrefixReusePath::Root || seed.reused_prompt_tokens != 0 ||
-        deep.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
-        shallow.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        deep.prefix_reuse_path == infernix::PrefixReusePath::Root ||
+        shallow.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         shallow.reused_prompt_tokens == 0 ||
         deep.reused_prompt_tokens <= shallow.reused_prompt_tokens ||
         deep.reused_prompt_tokens >= deep.prompt.prompt_tokens ||
@@ -730,7 +587,6 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         infernix::PromptInput input;
         input.options.enable_thinking   = true;
         input.options.preserve_thinking = true;
-        input.context_cache.session_key = "anthropic-prefix-regression";
 
         infernix::ChatMessage user;
         user.role = infernix::ChatRole::User;
@@ -782,7 +638,7 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     const std::uint64_t followup_prefill =
         after_followup.computed_prefill_tokens - before_followup.computed_prefill_tokens;
     if (followup.generated_token_ids.size() != 1 ||
-        followup.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        followup.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         followup.reused_prompt_tokens == 0 ||
         followup_prefill != followup.prompt.prompt_tokens - followup.reused_prompt_tokens) {
         std::cerr << "model-output reasoning frontier did not resume from its checkpoint: path="
@@ -834,7 +690,6 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
     const std::uint64_t branch_prefill =
         after_branch.computed_prefill_tokens - before_branch.computed_prefill_tokens;
 
-    const auto memory = engine.memory_summary();
     // This sequence also retains the earlier reasoning dialogue and unrelated private fillers.
     // Report optional-prefix eviction under that fixed pressure rather than assuming all of
     // those histories fit. The independent nested-tool-markers scenario verifies both captures.
@@ -845,8 +700,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
               << " branch_prompt=" << branch.prompt.prompt_tokens
               << " branch_computed=" << branch_prefill
               << " branch_ttft_ms=" << branch.timings.first_token_seconds * 1000
-              << " host_peak_bytes=" << after_branch.host_context_peak_occupied_bytes
-              << " host_capacity_bytes=" << memory.host_context_capacity_bytes << '\n';
+              << " host_used_bytes=" << after_branch.hybrid_host_used_bytes
+              << " host_capacity_bytes=" << after_branch.hybrid_host_capacity_bytes << '\n';
     const auto accounted = [](const infernix::GenerationResult& result) {
         return result.generated_token_ids.size() == 1 &&
                result.finish_reason == infernix::FinishReason::OutputLimit &&
@@ -858,9 +713,7 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         !accounted(second_filler) || !accounted(branch) ||
         late_prefill != late.computed_prefill_tokens ||
         branch_prefill != branch.computed_prefill_tokens ||
-        after_branch.host_context_occupied_bytes > memory.host_context_capacity_bytes ||
-        after_branch.host_context_peak_occupied_bytes > memory.host_context_capacity_bytes ||
-        after_branch.host_context_reserved_bytes > after_branch.host_context_occupied_bytes) {
+        after_branch.hybrid_host_used_bytes > after_branch.hybrid_host_capacity_bytes) {
         std::cerr << "mixed-prefix pressure violated request or physical Host accounting\n";
         return 1;
     }
@@ -1000,7 +853,7 @@ int exercise_shared_rewrite_materialization(const char* artifact) {
 
     if (first.prefix_reuse_path != infernix::PrefixReusePath::Root ||
         second.reused_prompt_tokens == 0 ||
-        third.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        third.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         third.reused_prompt_tokens != expected_reuse ||
         third.reused_prompt_tokens <= second.reused_prompt_tokens ||
         third.computed_prefill_tokens != third.prompt.prompt_tokens - expected_reuse ||
@@ -1071,11 +924,10 @@ int exercise_explicit_anchor_branch(const char* artifact) {
               2);
     // Keep the session hint while changing the final suffix; matching still uses the input
     // identity.
-    replacement_input.context_cache.session_key = "private-long-anchor-replacement";
     const infernix::GenerationResult replacement =
         engine.generate(engine.prepare(std::move(replacement_input)), request);
     if (replacement.generated_token_ids.size() != 1 ||
-        replacement.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        replacement.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         replacement.reused_prompt_tokens == 0 ||
         replacement.reused_prompt_tokens >= replacement.prompt.prompt_tokens) {
         std::cerr << "explicit intermediate checkpoint was not selected for a changed branch: path="
@@ -1089,11 +941,10 @@ int exercise_explicit_anchor_branch(const char* artifact) {
         input({std::string(stable), "Follow the replacement branch.",
                "Continue through a different branch suffix."},
               std::nullopt);
-    replaced_input.context_cache.session_key = "private-long-anchor-replacement";
     const infernix::GenerationResult replaced =
         engine.generate(engine.prepare(std::move(replaced_input)), request);
     if (replaced.generated_token_ids.size() != 1 ||
-        replaced.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        replaced.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         replaced.reused_prompt_tokens <= replacement.reused_prompt_tokens ||
         replaced.reused_prompt_tokens >= replaced.prompt.prompt_tokens) {
         const infernix::RuntimeStats stats = engine.runtime_stats();
@@ -1102,8 +953,8 @@ int exercise_explicit_anchor_branch(const char* artifact) {
                   << " first_reused=" << replacement.reused_prompt_tokens
                   << " replaced_reused=" << replaced.reused_prompt_tokens
                   << " prompt=" << replaced.prompt.prompt_tokens
-                  << " captures=" << stats.active_captures_completed
-                  << " capture_aborts=" << stats.active_captures_aborted << '\n';
+                  << " taps=" << stats.hybrid_taps_created
+                  << " snapshot_hits=" << stats.hybrid_snapshot_hits << '\n';
         return 1;
     }
     return 0;
@@ -1172,14 +1023,14 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
     const infernix::GenerationResult exact_replay =
         engine.generate(engine.prepare(input_with_history(0, false)), options(true));
     if (exact_replay.generated_token_ids.size() != 4 ||
-        exact_replay.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        exact_replay.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         exact_replay.reused_prompt_tokens == 0) {
         const infernix::RuntimeStats stats = engine.runtime_stats();
         std::cerr << "pre-generation response checkpoint was not restored on an exact replay: "
                   << "path=" << static_cast<int>(exact_replay.prefix_reuse_path)
                   << " reused=" << exact_replay.reused_prompt_tokens
-                  << " captures=" << stats.active_captures_completed
-                  << " capture_aborts=" << stats.active_captures_aborted << '\n';
+                  << " taps=" << stats.hybrid_taps_created
+                  << " snapshot_hits=" << stats.hybrid_snapshot_hits << '\n';
         return 1;
     }
     const infernix::GenerationResult exact_baseline =
@@ -1199,7 +1050,7 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
     const infernix::GenerationResult first_replay =
         engine.generate(engine.prepare(input_with_history(1, true)), options(true));
     if (first_replay.generated_token_ids.size() != 4 ||
-        first_replay.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        first_replay.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         first_replay.reused_prompt_tokens == 0) {
         std::cerr << "normalized tool response did not reuse a compatible checkpoint\n";
         return 1;
@@ -1207,22 +1058,27 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
 
     const infernix::GenerationResult second_replay =
         engine.generate(engine.prepare(input_with_history(2, true)), options(true));
+    // The prefix cache places a turn's generation-opener snapshot only a block (64 tokens) or more
+    // past the snapshot the turn resumed from, so across short tool rounds the reuse frontier stays
+    // within that distance of the previous turn's opener (16 tokens cover the opener itself).
     if (second_replay.generated_token_ids.size() != 4 ||
-        second_replay.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
-        second_replay.reused_prompt_tokens <= first_replay.reused_prompt_tokens) {
+        second_replay.prefix_reuse_path == infernix::PrefixReusePath::Root ||
+        second_replay.reused_prompt_tokens < first_replay.reused_prompt_tokens ||
+        second_replay.reused_prompt_tokens + 64 + 16 < first_replay.prompt.prompt_tokens) {
         const infernix::RuntimeStats stats = engine.runtime_stats();
-        std::cerr << "rolling response checkpoint did not advance across the tool loop: first="
+        std::cerr << "rolling response checkpoint fell behind the tool loop: first_prompt="
+                  << first_replay.prompt.prompt_tokens << " first="
                   << first_replay.reused_prompt_tokens
                   << " second=" << second_replay.reused_prompt_tokens
-                  << " captures=" << stats.active_captures_completed
-                  << " capture_aborts=" << stats.active_captures_aborted << '\n';
+                  << " taps=" << stats.hybrid_taps_created
+                  << " snapshot_hits=" << stats.hybrid_snapshot_hits << '\n';
         return 1;
     }
 
     const infernix::GenerationResult mode_change =
         engine.generate(engine.prepare(input_with_history(2, false)), options(true));
     if (mode_change.generated_token_ids.size() != 4 ||
-        mode_change.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        mode_change.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         mode_change.reused_prompt_tokens == 0) {
         std::cerr << "preserve-thinking policy change discarded a compatible response checkpoint: "
                   << "path=" << static_cast<int>(mode_change.prefix_reuse_path)
@@ -1254,7 +1110,6 @@ int exercise_agent_continuation(const char* artifact) {
     infernix::PromptInput input;
     input.options.enable_thinking                              = true;
     input.options.preserve_thinking                            = true;
-    input.context_cache.session_key                            = "agent-continuation-main";
     input.context_cache.allow_engine_automatic_shared_prefixes = false;
     input.options.tool_jsons.push_back(
         R"({"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{"step":{"type":"integer"}},"required":["step"]}}})");
@@ -1282,8 +1137,8 @@ int exercise_agent_continuation(const char* artifact) {
         const auto after  = engine.runtime_stats();
         if (result.generated_token_ids.size() != 4 ||
             result.finish_reason != infernix::FinishReason::OutputLimit ||
-            result.prefix_reuse_path != (expected_frontier ? infernix::PrefixReusePath::Checkpoint
-                                                                    : infernix::PrefixReusePath::Root) ||
+            (result.prefix_reuse_path == infernix::PrefixReusePath::Root) !=
+                (expected_frontier == 0) ||
             result.reused_prompt_tokens != expected_frontier ||
             result.reused_prompt_tokens >= result.prompt.prompt_tokens ||
             result.computed_prefill_tokens !=
@@ -1348,7 +1203,6 @@ int exercise_agent_continuation(const char* artifact) {
 
         if (round == 8) {
             auto branch                               = input;
-            branch.context_cache.session_key          = "agent-continuation-branch";
             branch.messages.back().parts.front().text = "{\"value\":999,\"branch\":\"alternate\"}";
             const auto before_branch                  = engine.runtime_stats();
             if (!generate(std::move(branch), expected_frontier, round, "branch")) { return 1; }
@@ -1363,23 +1217,18 @@ int exercise_agent_continuation(const char* artifact) {
     }
 
     const auto settled = engine.runtime_stats();
-    const auto memory  = engine.memory_summary();
     if (settled.running_requests || settled.waiting_requests || settled.paused_requests ||
         settled.replaying_requests || settled.materializing_requests ||
         settled.prefilling_requests || settled.decode_ready_requests ||
-        settled.capture_pending_requests || settled.terminal_pending_requests ||
-        settled.host_context_reserved_bytes ||
-        settled.host_context_peak_occupied_bytes > memory.host_context_capacity_bytes) {
-        std::cerr << "agent continuation left active membership or transfer reservations: running="
+        settled.terminal_pending_requests) {
+        std::cerr << "agent continuation left active membership: running="
                   << settled.running_requests << " waiting=" << settled.waiting_requests
                   << " paused=" << settled.paused_requests
                   << " replaying=" << settled.replaying_requests
                   << " materializing=" << settled.materializing_requests
                   << " prefilling=" << settled.prefilling_requests
                   << " decode=" << settled.decode_ready_requests
-                  << " capture=" << settled.capture_pending_requests
-                  << " terminal=" << settled.terminal_pending_requests
-                  << " reserved=" << settled.host_context_reserved_bytes << '\n';
+                  << " terminal=" << settled.terminal_pending_requests << '\n';
         return 1;
     }
     std::cout << "agent continuation: main_rounds=" << rounds << " branches=1"
@@ -1439,7 +1288,7 @@ int exercise_rewrite_branch(const char* artifact) {
         engine.generate(engine.prepare(input(true)), options(false));
     if (branch.generated_token_ids.size() != 4 || branch.reused_prompt_tokens == 0 ||
         branch.reused_prompt_tokens >= branch.prompt.prompt_tokens ||
-        branch.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+        branch.prefix_reuse_path == infernix::PrefixReusePath::Root ||
         branch_baseline.generated_token_ids.size() != 4 ||
         branch_baseline.reused_prompt_tokens != 0) {
         std::cerr << "replacement user suffix did not reuse the stable conversation prefix: path="
@@ -1510,7 +1359,7 @@ int exercise_late_instructions(const char* artifact) {
         const auto after             = engine.runtime_stats();
         if (next.generated_token_ids.size() != 16 || next.content.empty() ||
             next.finish_reason != infernix::FinishReason::OutputLimit ||
-            next.prefix_reuse_path != infernix::PrefixReusePath::Checkpoint ||
+            next.prefix_reuse_path == infernix::PrefixReusePath::Root ||
             next.reused_prompt_tokens < required_frontier ||
             next.reused_prompt_tokens <= previous.reused_prompt_tokens ||
             next.computed_prefill_tokens != next.prompt.prompt_tokens - next.reused_prompt_tokens ||
@@ -1557,7 +1406,6 @@ int exercise_vision(infernix::Engine& engine) {
         infernix::PromptInput input;
         input.messages.push_back(std::move(message));
         input.options.enable_thinking   = false;
-        input.context_cache.session_key = "vision-prefix-real";
         return input;
     };
     auto followup_input = [&](const std::vector<std::uint8_t>& bytes,
@@ -1732,7 +1580,7 @@ int exercise_vision(infernix::Engine& engine) {
     return 0;
 }
 
-infernix::PromptInput session_turn(std::string session, std::string question) {
+infernix::PromptInput session_turn(std::string question) {
     infernix::PromptInput input;
     infernix::ChatMessage user;
     user.role = infernix::ChatRole::User;
@@ -1740,7 +1588,6 @@ infernix::PromptInput session_turn(std::string session, std::string question) {
         .kind = infernix::MessagePartKind::Text, .text = std::move(question), .media = {}});
     input.messages.push_back(std::move(user));
     input.options.enable_thinking   = false;
-    input.context_cache.session_key = std::move(session);
     return input;
 }
 
@@ -1758,16 +1605,15 @@ infernix::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
 int exercise_concurrent_resource_settlement(const char* artifact) {
     infernix::Engine engine(concurrent_engine_options(artifact));
 
-    constexpr std::string_view kSession = "publication-order-real";
     constexpr std::string_view kOlderQuestion =
         "Describe deterministic scheduling using exactly one concise paragraph.";
     constexpr std::string_view kNewerQuestion =
         "Describe prefix caching using exactly one concise paragraph.";
     auto older = engine.submit(
-        engine.prepare(session_turn(std::string(kSession), std::string(kOlderQuestion))),
+        engine.prepare(session_turn(std::string(kOlderQuestion))),
         fixed_output(24));
     auto newer = engine.submit(
-        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        engine.prepare(session_turn(std::string(kNewerQuestion))),
         fixed_output(2));
     const infernix::GenerationResult newer_result = newer.wait();
     const infernix::GenerationResult older_result = older.wait();
@@ -1780,8 +1626,7 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     for (std::uint32_t index = 0; index < 6; ++index) {
         const std::string suffix              = std::to_string(index);
         const infernix::GenerationResult filler = engine.generate(
-            engine.prepare(session_turn("publication-filler-" + suffix,
-                                        "Give one deterministic token for filler " + suffix + '.')),
+            engine.prepare(session_turn("Give one deterministic token for filler " + suffix + '.')),
             fixed_output(1));
         if (filler.generated_token_ids.size() != 1) {
             std::cerr << "session-order catalog filler did not complete\n";
@@ -1789,7 +1634,7 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
         }
     }
     const infernix::GenerationResult replay = engine.generate(
-        engine.prepare(session_turn(std::string(kSession), std::string(kNewerQuestion))),
+        engine.prepare(session_turn(std::string(kNewerQuestion))),
         fixed_output(2));
     if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
         replay.prefix_reuse_path == infernix::PrefixReusePath::Root) {
@@ -1835,12 +1680,11 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     if (settled.running_requests != 0 || settled.materializing_requests != 0 ||
         settled.paused_requests != 0 || settled.replaying_requests != 0 ||
         settled.prefilling_requests != 0 || settled.decode_ready_requests != 0 ||
-        settled.capture_pending_requests != 0 || settled.terminal_pending_requests != 0) {
+        settled.terminal_pending_requests != 0) {
         std::cerr << "C=8 terminal settlement left live logical membership: running="
                   << settled.running_requests << " materializing=" << settled.materializing_requests
                   << " prefill=" << settled.prefilling_requests
                   << " decode=" << settled.decode_ready_requests
-                  << " capture=" << settled.capture_pending_requests
                   << " terminal=" << settled.terminal_pending_requests << '\n';
         return 1;
     }
@@ -1906,8 +1750,6 @@ int exercise_artifact(const char* artifact) {
         infernix::Engine engine(engine_options(artifact));
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
-    if (const int result = exercise_semantic_captures(artifact); result != 0) { return result; }
-    if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
     if (const int result = exercise_explicit_prefix(artifact); result != 0) { return result; }
     if (const int result = exercise_nested_tool_markers(artifact); result != 0) { return result; }
     if (const int result = exercise_explicit_anchor_branch(artifact); result != 0) {

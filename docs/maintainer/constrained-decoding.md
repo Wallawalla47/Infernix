@@ -1046,7 +1046,7 @@ Verification follows these contracts rather than the number of internal files:
 | Sampling | a small-vocabulary FP64 oracle for penalties, masks, top-k and normalization; legal candidates beyond the original top 20, insufficient support and empty sets |
 | Speculative probabilities | independent p/q and residuals; one-hot and real sparse q; illegal proposals, bonus, rejection at every position and the counter-example of section 8 |
 | State transactions | lookahead without persistent side effects; preview/discard; EOS prefixes; forced control; cancellation and single-row failure in mixed batches |
-| Request lifecycle | first token, exact hit, ContinueFinalAssistant, Snapshot/Replay; matcher consistent with the real committed prefix |
+| Request lifecycle | first token, exact hit, ContinueFinalAssistant, Replay; matcher consistent with the real committed prefix |
 | Final protocol results | JSON, exact GBNF bytes, thinking boundaries, tool arguments, stream endings and truncation |
 | Performance | cold/warm compiles, ordinary/MTP/DFlash/DFlash2 and Flash-Next MTP/n-gram, mixed batches; CPU work, added waits, accepted length, TTFT and throughput |
 
@@ -1059,7 +1059,7 @@ configuration and comparable workloads, and report each route's gains and costs.
 
 This design reuses the worker, request ownership, PendingBatch and publication order of the
 [Engine architecture](engine-architecture.md) and the preemption/recovery contract of
-[resource scheduling and the context cache](resource-scheduling-and-context-cache.md).
+[resource scheduling](resource-scheduling-and-context-cache.md).
 [DFlash](dflash.md) and the existing Sampling/Speculative Ops keep owning proposals and the mathematical
 execution.
 

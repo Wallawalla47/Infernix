@@ -178,9 +178,14 @@ int main(int argc, char** argv) {
         require(tree_auto || sample1.generated_token_ids == sample2.generated_token_ids,
                 "same DFlash2 seed and inputs did not reproduce the conditional path");
 
-        // Terminal flush and fork must retain the consumed frontier for a later request.
-        const auto retained = engine.generate(engine.prepare_tokens(prompt), request(12, true));
-        auto continuation   = prompt;
+        // Terminal flush and fork must retain the consumed frontier for a later request. The prefix
+        // cache keeps an endpoint at least one block past its deepest snapshot, so the retained
+        // prompt is longer than one block.
+        auto retained_prompt = std::vector<infernix::TokenId>(64, 198);
+        retained_prompt.insert(retained_prompt.end(), prompt.begin(), prompt.end());
+        const auto retained =
+            engine.generate(engine.prepare_tokens(retained_prompt), request(12, true));
+        auto continuation = retained_prompt;
         continuation.insert(continuation.end(), retained.generated_token_ids.begin(),
                             retained.generated_token_ids.end());
         continuation.push_back(198);
@@ -237,9 +242,8 @@ int main(int argc, char** argv) {
             }
         }
         const auto stats = engine.runtime_stats();
-        require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
-                    stats.backend_kv_h2d_bytes == 0,
-                "DFlash2 allocated or transferred a full backend KV pool");
+        require(stats.device_backend_kv_occupied_pages == 0,
+                "DFlash2 allocated a full backend KV pool");
         if (k == 15) {
             // One oversized prefill replaces the ring, then decode appends across its wrap point.
             auto long_prompt = std::vector<infernix::TokenId>(2100, 198);
@@ -270,9 +274,7 @@ int main(int argc, char** argv) {
                   << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
                   << "/" << first.speculative.drafted_tokens
                   << " tree_rounds=" << first.speculative.tree_rounds
-                  << " side_rounds=" << first.speculative.tree_side_rounds
-                  << " state_d2h=" << stats.state_d2h_count
-                  << " state_h2d=" << stats.state_h2d_count << '\n';
+                  << " side_rounds=" << first.speculative.tree_side_rounds << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

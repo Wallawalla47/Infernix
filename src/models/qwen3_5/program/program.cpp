@@ -78,44 +78,12 @@ const runtime::RequestPlanSummary& RequestBasePlan::summary() const noexcept {
     return impl_ != nullptr ? impl_->summary : empty;
 }
 
-const PreparedContextCache& RequestBasePlan::context_cache() const noexcept {
-    static const PreparedContextCache empty;
-    return impl_ != nullptr ? impl_->context_cache : empty;
-}
-
-std::vector<std::uint32_t> RequestBasePlan::capture_frontiers() const {
-    std::vector<std::uint32_t> frontiers;
-    if (impl_) {
-        frontiers.reserve(impl_->capture_groups.size());
-        for (const auto& group : impl_->capture_groups) { frontiers.push_back(group.frontier); }
-    }
-    return frontiers;
-}
-
-std::optional<PrefixShortlistKey>
-RequestBasePlan::prefix_shortlist_key(std::uint32_t frontier) const noexcept {
-    if (impl_ == nullptr || frontier == 0 || frontier > impl_->prefix_digests.size()) {
-        return std::nullopt;
-    }
-    return PrefixShortlistKey{
-        .digests      = impl_->prefix_digests.at(frontier),
-        .frontier     = frontier,
-        .identity_tag = impl_->prefix_identity_tag,
-    };
-}
-
 ResumeState::ResumeState(std::unique_ptr<detail::ResumeStateImpl> impl) noexcept
     : impl_(std::move(impl)) {}
 
 ResumeState::ResumeState(ResumeState&&) noexcept            = default;
 ResumeState& ResumeState::operator=(ResumeState&&) noexcept = default;
 ResumeState::~ResumeState()                                 = default;
-
-bool ResumeState::has_snapshot() const noexcept { return impl_ && impl_->snapshot.has_value(); }
-
-std::optional<CheckpointHandle> ResumeState::snapshot_handle() const noexcept {
-    return impl_ ? impl_->snapshot : std::nullopt;
-}
 
 std::uint32_t ResumeState::frontier() const noexcept { return impl_ ? impl_->frontier : 0; }
 
@@ -134,80 +102,8 @@ ScoreResult Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_t
                                options);
 }
 
-std::optional<SourceCandidate>
-Program::inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                        bool consume_source, std::span<const CheckpointHandle> private_points,
-                        std::span<const CheckpointHandle> retired_points) const {
-    return impl_->inspect_source(base, checkpoint, consume_source, private_points, retired_points);
-}
-
-PrefixShortlistKey Program::checkpoint_key(CheckpointHandle h, std::uint32_t f) const {
-    return impl_->checkpoint_key(h, f);
-}
-
-runtime::ContextResourceUsage
-Program::checkpoint_footprint(std::span<const CheckpointHandle> handles) const {
-    return impl_->checkpoint_footprint(handles);
-}
-
-CheckpointSummary Program::checkpoint_summary(CheckpointHandle h) const {
-    return impl_->checkpoint_summary(h);
-}
-
-CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle h) const {
-    return impl_->checkpoint_metadata(h);
-}
-
-bool Program::checkpoint_matches(CheckpointHandle h, const RequestBasePlan& b) const {
-    return impl_->checkpoint_matches(h, b);
-}
-
-std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle retained,
-                                                    const RequestBasePlan& base,
-                                                    std::uint32_t target) const {
-    return impl_->checkpoint_recovery_frontier(retained, base, target);
-}
-
-std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
-                                                std::span<const CheckpointHandle> surviving) const {
-    return impl_->checkpoint_recovery_loss(removed, surviving);
-}
-
-bool Program::valid_checkpoint(CheckpointHandle h) const noexcept {
-    return impl_->valid_checkpoint(h);
-}
-
-bool Program::release_checkpoint(CheckpointHandle h) noexcept {
-    return impl_->release_checkpoint(h);
-}
-
-bool Program::revoke_snapshot(ResumeState& paused) noexcept {
-    return impl_->revoke_snapshot(paused);
-}
-
-runtime::ContextResourceUsage Program::snapshot_resources(const ResumeState& paused) const {
-    return impl_->snapshot_resources(paused);
-}
-
-std::size_t Program::host_bytes_released(std::span<const CheckpointHandle> checkpoints) const {
-    return impl_->host_bytes_released(checkpoints);
-}
-
-std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle sequence) const {
-    return impl_->pause_host_bytes(sequence);
-}
-
-std::size_t Program::release_redundant_host(std::span<const CheckpointHandle> excluded,
-                                            std::optional<SequenceHandle> pending_backup) {
-    return impl_->release_redundant_host(excluded, pending_backup);
-}
-
 runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUnit> units) {
     return impl_->reserve_units(units);
-}
-
-bool Program::reclaim_capture_reservation(runtime::ContextResourceUsage shortage) {
-    return impl_->reclaim_capture_reservation(shortage);
 }
 
 void Program::release_units(std::span<const SequenceHandle> units) noexcept {
@@ -220,32 +116,8 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     return impl_->start_binding(base, lane, source, resume, kind, tokens);
 }
 
-bool Program::start_capture(SequenceHandle h) { return impl_->start_capture(h); }
-
-bool Program::capture_is_input(SequenceHandle h) const { return impl_->capture_is_input(h); }
-
-std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle h) {
-    return impl_->prepare_capture(h);
-}
-
-void Program::skip_capture(SequenceHandle h) { impl_->skip_capture(h); }
-
-bool Program::start_demote(const ContextDemotion& plan) { return impl_->start_demote(plan); }
-
-ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle> allowed,
-                                         std::span<const CheckpointHandle> excluded,
-                                         runtime::ContextResourceUsage shortage) const {
-    return impl_->plan_reclaim(allowed, excluded, shortage);
-}
-
-std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHandle> allowed,
-                                                   std::span<const CheckpointHandle> excluded,
-                                                   runtime::ContextResourceUsage shortage) const {
-    return impl_->plan_releases(allowed, excluded, shortage);
-}
-
-bool Program::start_pause(SequenceHandle h, bool save, runtime::ExecutionTiming* timing) {
-    return impl_->start_pause(h, save, timing);
+bool Program::start_pause(SequenceHandle h, runtime::ExecutionTiming* timing) {
+    return impl_->start_pause(h, timing);
 }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView c) {

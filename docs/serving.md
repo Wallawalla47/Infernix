@@ -30,11 +30,6 @@ restore it later. `--host-context-mib 8192` is the one pinned Host pool that blo
 snapshots share; every other cache capacity is derived from `--max-concurrency` and
 `--prefill-chunk`.
 
-With `--use-original-prefix-caching`, the original continuation/checkpoint cache is used instead:
-`--kv-capacity` then follows `--max-context`, `--device-state-slots N` adds Device StateImages beyond
-the active lanes, and the default shared pinned Host budget is 8 GiB plus eight model StateImages,
-holding retained state, KV and pause snapshots, including in-flight destinations.
-
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
@@ -89,7 +84,7 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `DELETE /v1/responses/{id}` | delete a locally stored Response |
 | `GET /v1/responses/{id}/input_items` | list that Response's normalized input Items |
 | `POST /v1/messages` | Anthropic-style message generation |
-| `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
+| `POST /v1/messages/count_tokens` | Engine-native expanded input-token count |
 | `POST /v1/decide` (alias `/v1/systemone`) | typed decisions read from the next-token distribution, with nothing generated ([Decisions](#decisions)) |
 
 Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
@@ -409,7 +404,7 @@ rendering, including tool schemas and historical tool inputs. Canonical model-or
 retain that member order in aggregate and streaming responses, so an unmodified replay reconstructs
 the same ordered tool call. Infernix does not canonicalize semantically equivalent JSON: if a client
 reorders members, inserts defaults, or otherwise rewrites a tool object, the changed rendered input
-does not match the model-held endpoint and can reuse only an earlier exact checkpoint.
+does not match the model-held endpoint and can reuse only an earlier exact cached prefix.
 Generated token segmentation can also differ from re-encoding the same text, limiting prefix reuse.
 
 `--chat-template FILE` selects a local Jinja template; by default, the server uses the template
@@ -613,9 +608,9 @@ latest four remain write candidates. Exact reads of already-published prefixes d
 request to repeat a marker.
 
 These fields are optimization hints. A legal boundary that cannot be represented as an exact
-rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` is not an
-Engine session key or prefix identity. Valid TTL/retention values are accepted, but Infernix does not
-promise their wall-clock residency; physical retention follows the resource scheduler.
+rendered-token frontier is ignored without changing prompt content. `prompt_cache_key` does not
+affect prefix identity. Valid TTL/retention values are accepted, but Infernix does not promise their
+wall-clock residency; physical retention follows the prefix cache's eviction.
 
 ## OpenAI Responses Core
 
@@ -811,7 +806,7 @@ an SSE response has started produce `response.failed`; validation and preparatio
 normal HTTP error responses. `completed_at` is populated only for completed Responses. A
 reasoning-only incomplete result contains no invented empty assistant message.
 
-Usage is checkpoint-native:
+Usage reports the Engine's exact counts:
 
 ```json
 {
@@ -824,7 +819,7 @@ Usage is checkpoint-native:
 ```
 
 `input_tokens` includes the chat template and expanded media tokens. `cached_tokens` is the exact
-checkpoint-proven prompt prefix reused by Engine. `output_tokens` is the count of accepted generated token
+prompt prefix the Engine's prefix cache supplied. `output_tokens` is the count of accepted generated token
 IDs, including a withheld stop token when applicable. `reasoning_tokens` is counted in the Qwen
 output decoder while accepted tokens are still in the reasoning channel; it is not estimated by
 re-tokenizing decoded text.
@@ -876,20 +871,19 @@ LRU store. They are lost on restart and are not OpenAI's durable cloud retention
 input. The current `instructions` value is placed first but is not saved into the continuation
 context, matching the Responses rule that previous top-level instructions do not carry forward.
 Function definitions are request configuration rather than conversation Items and must be sent
-again on tool-result turns. The reconstructed prompt follows the ordinary Engine path, so compatible
-checkpoint reuse applies naturally.
+again on tool-result turns. The reconstructed prompt follows the ordinary Engine path, so prefix
+reuse applies naturally.
 
 A stored Response also retains its resolved `preserve_thinking` value. A child which omits the
 field inherits the parent value. An explicit different value creates a new semantic branch; prompt
-rendering and identity still determine reuse. Changing the boolean alone never invalidates an exact
-checkpoint already proved compatible by the model runtime.
+rendering and identity still determine reuse. Changing the boolean alone never invalidates a
+cached prefix the rendered prompt still matches.
 
-For Engine-local reuse, a stored root Response receives one bounded session key derived from its
-response ID, and every `previous_response_id` child inherits that key. `store:false` roots remain
-anonymous; a `store:false` child may read its inherited session checkpoint but does not replace the
-stored chain's latest endpoint. Response-store eviction or deletion removes the HTTP object, not an
-independently retained Engine checkpoint; the latter remains bounded by the Engine's own retention
-and pressure policy. No session key or cache marker is added to the HTTP schema.
+Engine-local reuse is content-addressed: a `previous_response_id` child reuses the prefix its
+reconstructed prompt shares with the cached history, whether or not either Response is stored.
+Response-store eviction or deletion removes the HTTP object, not the Engine's cached blocks and
+snapshots; those remain bounded by the cache's own eviction. No session key or cache marker is added
+to the HTTP schema.
 
 Resource behavior:
 
@@ -1171,7 +1165,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with `--use-original-prefix-caching` or `--no-prefix-reuse` | `auto` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the prefix cache and `--max-context` with `--no-prefix-reuse` | `auto` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free. Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`; `auto` = 1024). Qwen3.8-Flash-Next: after the expert cache takes the rest, for the display and other programs (`auto` = 1024 with a display on the GPU, 256 without; [details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Qwen3.8-Flash-Next on Windows: also size the expert cache into the VRAM the Windows per-process budget withholds (~0.6 GiB, ~240 more expert frames on an RTX 5090), measured at startup; that memory may be moved to system memory if another program needs VRAM ([details](qwen3_8-flash-next.md#vram)) | off |
 | `--expert-state FILE\|off` | Qwen3.8-Flash-Next: the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. `off` starts with an empty cache and saves nothing; cold benchmarks need it | `<artifact>.expert-state` |
@@ -1220,17 +1214,15 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vision-offload auto\|on\|off` | keep the vision tower in pinned system RAM and borrow Device memory only while encoding; `on` requires `--vision`. `auto` is on for Qwen3.8-Flash-Next (the expert cache lends the encode memory) and off for Qwen3.5 | `auto` |
 | `--vision-max-merged N` | merged vision tokens per image or video, `64..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-prefix-reuse` | disable compatible-prefix caching; pause/replay resources stay available; rejected with the hybrid options below | prefix reuse on |
-| `--host-context-mib N` | pinned Host budget in decimal MiB that resolve to whole bytes. Hybrid cache: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected; a paused request then recovers by replay. Original cache: the shared budget for StateImages, KV and pause snapshots, including in-flight destinations; `0` disables Host context backing Qwen3.8-Flash-Next: default 4096 MiB and must be positive (its state snapshots live in this pool). | hybrid `8192 MiB`; original `8192 MiB + 8 native StateImages` |
-| `--use-original-prefix-caching` | select the original continuation/checkpoint prefix cache ([resource scheduling](maintainer/resource-scheduling-and-context-cache.md)) instead of the hybrid prefix cache ([spec](maintainer/hybrid-prefix-cache-spec.md)), whose content-addressed 64-token KV blocks are shared across requests alongside sparse state snapshots. The hybrid cache configures itself: `--kv-capacity` defaults to `auto` (free VRAM becomes Device block cache) and `--host-context-mib` sizes its one pinned Host pool. The hybrid options below are rejected with this flag, and `--device-state-slots` requires it. | hybrid cache |
-| `--device-snapshot-slots N` | hybrid: Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `max-concurrency + 1`; `+ 2` without a Host tier |
-| `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
-| `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
-| `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
-| `--no-queue-holds` | hybrid: turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) | holds on |
-| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
-| `--prefix-cache-save-mins N` | hybrid, with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
-| `--device-state-slots N` | original: extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
+| `--no-prefix-reuse` | disable the prefix cache: every request prefills from the root, and a paused request recovers by replay; rejected with `--host-context-mib` and the cache options below | prefix reuse on |
+| `--host-context-mib N` | pinned Host budget in decimal MiB that resolve to whole bytes: the slab pool the prefix cache's KV blocks and state snapshots share ([spec](maintainer/hybrid-prefix-cache-spec.md)), split at run time by eviction value. `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Qwen3.8-Flash-Next: default 4096 MiB and must be positive (its state snapshots live in this pool). | `8192 MiB` |
+| `--device-snapshot-slots N` | Device state snapshot slots (`1..64`); not available for Qwen3.8-Flash-Next, whose snapshots live in the Host tier | `max-concurrency + 1`; `+ 2` without a Host tier |
+| `--cache-taps-per-request N` | new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
+| `--cache-tap-ladder N` | history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
+| `--cache-tap-min-gap N` | minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
+| `--no-queue-holds` | turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) | holds on |
+| `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `infernix-serve` binary is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. | off: nothing is saved or restored |
+| `--prefix-cache-save-mins N` | with `--prefix-cache-file`: also save the Host tier there every `N` minutes while serving, counted from the end of the previous save, and only when it changed since the last save or load. The save runs at the first point between execution units once due, also while requests run: they wait while it is written (the log reports the size, the save time and how long requests waited). It writes `PATH.tmp` and replaces `PATH` only once complete, so a crash or power loss leaves the previous file; stopping the server during a periodic save abandons it before the shutdown save. Each save rewrites the whole file (up to `--host-context-mib`, several GB), so a short interval writes a lot to the drive and wears an SSD faster: at 7.5 GB every 5 minutes that is up to ~2 TB a day, every 30 minutes ~360 GB. | off: saved only when the server stops |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and complete calls stranded in thinking the model never closed | off |
@@ -1265,12 +1257,9 @@ answers pick legal neighbouring tokens that change the content (a JSON string op
 the value starts with a comma). A penalty from a process flag or the request still applies.
 
 For `C=--max-concurrency`, total Device StateImage capacity is `C+H`, where `H` is
-`--device-snapshot-slots` with the hybrid cache and `--device-state-slots` with the original one.
-The Host budget is startup-fixed context storage, not a limit on total process RAM. With the
-original cache, Host state and Main/Backend KV share it and `--host-context-mib 0` disables Host
-context backing. `--no-prefix-reuse` disables cross-request history reads and writes and runs the
-original cache's manager disabled; pause/replay recovery remains available, and
-`--device-state-slots` and `--host-context-mib` may still be specified.
+`--device-snapshot-slots` (0 with `--no-prefix-reuse`). The Host budget is startup-fixed context
+storage, not a limit on total process RAM. `--no-prefix-reuse` disables cross-request history reads
+and writes; pause/replay recovery remains available.
 
 Run `./build/apps/infernix-serve --help` for the exact option contract.
 
@@ -1339,10 +1328,9 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_prefill_tokens_total`, `infernix_replayed_tokens_total` | Actual initial prefill and separate recovery recomputation |
 | `infernix_generation_tokens_total`, `infernix_decode_tokens_total` | All committed outputs, or decode/control outputs excluding the first token; include thinking and injected control tokens |
 | `infernix_spec_decode_{rounds,draft_tokens,accepted_tokens,fallback_steps}_total` | Live native speculative work, including MTP and DFlash/DFlash2 |
-| `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes |
-| `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; retained history also occupies these pools |
-| `infernix_host_context_{used,reserved,capacity,peak}_bytes` | Unified Host backing; reserved bytes are already included in used bytes |
-| `infernix_context_transfer_bytes_total{resource,direction}` | Actual State/Main KV/backend KV payload transfers |
+| `infernix_{preemptions,snapshot_restores,replay_restores}_total` | Pressure pauses and recovery routes; a snapshot restore resumed from a cache snapshot at the paused frontier |
+| `infernix_{root,prefix}_selections_total` | Initial bindings from the root and from a prefix-cache snapshot |
+| `infernix_device_kv_{used,capacity}_pages`, `infernix_device_state_{used,capacity}_slots` | Physical Main KV and StateImage occupancy; cached blocks and snapshots also occupy these pools |
 | `infernix_host_work_seconds_total{phase}`, `infernix_device_wait_seconds_total` | Instrumented worker wall time; device wait is not CUDA kernel time |
 | `infernix_constraint_requests_total{outcome}`, `infernix_constraint_cache_total{result}` | Settled constrained requests by completion state and compilation-cache access |
 | `infernix_constraint_{prepare,mask,matcher}_seconds_total`, `infernix_constraint_mask_{positions,upload_bytes}_total` | Constraint work aggregated at request settlement, including truncated/cancelled results |
@@ -1396,7 +1384,7 @@ they do not infer request behavior from process-global counter deltas.
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
-| `request_scheduling` | request identity, pause/restore/recovery transitions, Snapshot revocation, Engine observation time and cumulative global/request work counters |
+| `request_scheduling` | request identity, pause/restore/recovery transitions, Engine observation time and cumulative global/request work counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges including Device KV growth leases, decode-round batch statistics, and hybrid prefix-cache gauges and counters when that cache is in use |
 
@@ -1426,19 +1414,18 @@ rejection/error records rather than successful constraint outcomes.
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
-`generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens, paused time
-and request-owned transfer bytes. Replay rebuilds committed state without adding new output usage.
+`generation.scheduling` records preemptions, snapshot/replay restores, replayed tokens and paused
+time. Replay rebuilds committed state without adding new output usage.
 
-`generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`,
-`revoked_checkpoints`, and `fallback_reason`. Source waiting is a subset of initial queue time;
-selecting or retaining a checkpoint does not itself count as a cache hit. Revocations count retained
-checkpoint references removed under resource pressure. Fallback reasons are `none`, `source_invalid`,
-`source_revoked`, `cost_changed`, `capacity_limit`, and `isolated_capacity`.
+`generation.admission` records the initial `preferred_reused_tokens`, `source_wait_seconds`, and
+`fallback_reason`. Source waiting is a subset of initial queue time; selecting a source does not
+itself count as a cache hit. Fallback reasons are `none`, `source_invalid`, `capacity_limit`, and
+`isolated_capacity`.
 
 `request_scheduling` records `pause_started`, `paused`, `restore_started`, `restored`,
-`replay_complete`, `recovery_complete`, `snapshot_revoked`, and a `terminal` boundary for preempted
-requests. `preemption_index` identifies each pause cycle; `route` is `snapshot`, `replay`, or `null`
-while pause preparation has not yet selected the saved representation. `steady_ns` is captured on
+`replay_complete`, `recovery_complete`, and a `terminal` boundary for preempted requests.
+`preemption_index` identifies each pause cycle; `route` is `replay`, or `null` during pause
+preparation. `steady_ns` is captured on
 the Engine worker, and `elapsed_ns` starts at Engine submission; JSONL writes happen on the request
 consumer thread. Compare `steady_ns` rather than delivery order across requests. `restored` ends
 binding; `recovery_complete` marks the first fresh committed unit or normal terminal progress,
@@ -1508,10 +1495,8 @@ interval is resident time. Its `engine` observations describe resident Host/Devi
 the whole request.
 
 The work `gpu_seconds` measures Text prefill stream intervals, including their MTP/DFlash work;
-Vision encode, standalone bridges and exact-hit sampling fall outside that interval.
-`context_transfers` reports completed request-owned State/Main KV/backend KV copies by direction,
-using transfer-event time and bytes. GPU intervals overlap Host submission and waits, so they are
-separate evidence, not additional wall-time stages. Background reclamation remains Engine-wide.
+Vision encode, standalone bridges and exact-hit sampling fall outside that interval. GPU intervals
+overlap Host submission and waits, so they are separate evidence, not additional wall-time stages.
 
 `result.generated_token_ids` records committed output token IDs for exact prefix analysis.
 The JSONL file never records an API-key value; `argv` replaces it with `<redacted>`.
@@ -1531,14 +1516,15 @@ counts tokens finally committed by decode rounds, excluding the first token prod
 For MTP, DFlash and DFlash2 this is the accepted committed output, not draft or rejected tokens.
 Pretty `batch` and JSONL `average_size` are decode row-rounds divided by decode rounds during the
 same interval. The
-`running`, `prefilling`, `decode_ready`, `waiting`, `paused`, `replaying`, `materializing`,
-`capture_pending`, and `terminal_pending` fields are the Engine scheduler snapshot at the end of the
-interval. The JSONL `context_cache` object reports selections, captures, StateImage operations,
-transfers, tail-page COW and pressure spills as interval deltas; `occupancy` and `last_selection` are
+`running`, `prefilling`, `decode_ready`, `waiting`, `paused`, `replaying`, `materializing`, and
+`terminal_pending` fields are the Engine scheduler snapshot at the end of the interval. The JSONL
+`context_cache` object reports `selections` (`root`, `prefix`, reused prompt tokens), StateImage
+`state_operations` (forks, forks at initial binding, Host restores) and `partial_tail_cow_pages` as
+interval deltas; `occupancy` (Device StateImages, Main and backend KV pages) and `last_selection` are
 end-of-interval gauges. The separate `scheduling` object reports preemptions, restores and replayed
-tokens. Occupancy includes Host reservations while transfers are in flight.
+tokens.
 
-With the hybrid prefix cache (the default), `context_cache.hybrid` is present once
+`context_cache.hybrid` is present once
 the cache has inserted a block or holds a snapshot. `device_blocks` (Device-resident 64-token KV blocks),
 `evictable_blocks` (those Device eviction may drop now), `tree_blocks` (blocks on the Device or
 Host), `snapshots`, `host_capacity_bytes`, and `host_used_bytes` are end-of-interval gauges; the rest
@@ -1615,8 +1601,7 @@ answer quality; validate the workload before deployment.
 `--max-context` is each sequence's logical ceiling. `--kv-capacity` fixes the shared Main Text KV
 pool used by active requests and retained prefixes. `auto` accounts for the complete enabled runtime
 and leaves 1 GiB of sizing headroom (`--vram-headroom-mib`); omitting the option selects `auto`
-with the hybrid prefix cache and follows `--max-context` with `--use-original-prefix-caching` or
-`--no-prefix-reuse`. The
+with the prefix cache and follows `--max-context` with `--no-prefix-reuse`. The
 CUDA Graph driver-state allowance reserved against that budget is 64 MiB plus 4 MiB for every
 decode-graph executable the engine instantiates: one per topology class of each captured family,
 for every batch size up to `--max-concurrency` (DFlash and DFlash2 capture a second family when
@@ -1635,9 +1620,7 @@ progress for the oldest resident request. A paused request does not block fresh 
 the remaining capacity. Restoration follows original request order and reserves enough space to
 rebuild the saved frontier and complete one new execution unit.
 
-A paused request keeps its committed output and protocol state. With the original cache and
-sufficient Host backing, it can restore a snapshot; otherwise (always with the hybrid cache, whose
-Host pool holds cached blocks and snapshots, not pause snapshots) it rebuilds model state from the
+A paused request keeps its committed output and protocol state. It rebuilds model state from the
 deepest cached prefix plus retained input and committed tokens.
 Replay does not resample or republish those tokens, but it consumes compute and can increase gaps in
 the output stream. The policy and ownership rules are defined in
@@ -1648,26 +1631,20 @@ Compatible prefixes are reused for both text and multimodal histories unless the
 positions, encoded-media digest, grid, and consumer spans. Media wholly inside a matched prefix
 skips Vision execution, while new suffix media is encoded normally. The pretty completion record
 shows `cache N (P%, path)` using readable path labels; JSONL retains the exact
-`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root`, `checkpoint`, or with the hybrid
-cache `hybrid_endpoint` or `hybrid_snapshot`). Reuse requires
-matching KV, recurrent state, hidden state, selected-backend state and exact prefix identity.
+`prefix_cache_hit_tokens` and `prefix_reuse_path` fields (`root`, `hybrid_endpoint` or
+`hybrid_snapshot`). Reuse requires matching KV, recurrent state, hidden state, selected-backend
+state and exact prefix identity.
 
-The hybrid prefix cache retains content-addressed KV blocks and sparse state snapshots; its
-admission, tap placement, Host tier and eviction are defined in the
-[hybrid prefix cache spec](maintainer/hybrid-prefix-cache-spec.md). The rest of this section
-describes the original cache (`--use-original-prefix-caching`).
-
-Completed conversation endpoints serve direct continuations. A separate input checkpoint preserves
-the stable boundary before a response that a later prompt may normalize or replace. With
-`preserve_thinking=true`, that boundary precedes the response's generation prologue; with `false`,
-it precedes the assistant turn whose closed reasoning may be omitted. The next request can therefore
-recompute the changed suffix while retaining the preceding conversation. Capture follows these
-semantic boundaries and shared-prefix hints.
+The prefix cache retains content-addressed KV blocks and sparse state snapshots; its admission, tap
+placement, Host tier and eviction are defined in the
+[hybrid prefix cache spec](maintainer/hybrid-prefix-cache-spec.md). Completed conversation endpoints
+serve direct continuations, and snapshots at the generation opener and at structural boundaries
+let a later prompt that normalizes or replaces a response recompute only the changed suffix.
 
 Changing `preserve_thinking` or reasoning effort changes the rendered prompt where applicable;
-already retained exact prefixes remain usable. An appended mid-conversation system message is an
+already cached exact prefixes remain usable. An appended mid-conversation system message is an
 ordinary suffix. Modifying, removing or moving a historical message changes the prefix and may
-require an earlier checkpoint or a root prefill.
+require an earlier snapshot or a root prefill.
 
 Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
 truncates a multi-token MTP, DFlash or DFlash2 round, the Engine commits the exact accepted target prefix so

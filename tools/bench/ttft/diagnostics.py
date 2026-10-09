@@ -10,8 +10,7 @@ from typing import Any, Sequence
 
 
 SCHEDULING_FIELDS = (
-    "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens",
-    "paused_ns", "device_to_host_bytes", "host_to_device_bytes",
+    "preemptions", "snapshot_restores", "replay_restores", "replayed_tokens", "paused_ns",
 )
 MECHANISM_COUNTERS = {
     "preemption": "preemptions",
@@ -19,13 +18,8 @@ MECHANISM_COUNTERS = {
     "replay_restore": "replay_restores",
 }
 
-TRANSFER_RESOURCES = ("state", "main_kv", "backend_kv")
-TRANSFER_DIRECTIONS = ("d2h", "h2d", "d2d")
-OCCUPANCY_FIELDS = (
-    "device_state_slots", "device_main_kv_pages", "device_backend_kv_pages",
-    "host_state_slots", "host_kv_bytes", "host_context_occupied_bytes",
-    "host_context_reserved_bytes",
-)
+OCCUPANCY_FIELDS = ("device_state_slots", "device_main_kv_pages", "device_backend_kv_pages")
+REQUEST_LOG_SCHEMA_VERSION = 27
 
 TTFT_STAGES = ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")
 ENGINE_HOST_PHASES = (
@@ -51,7 +45,6 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         "first_computed_prefill_tokens": None,
         "preferred_reused_tokens": None,
         "source_wait_ms": None,
-        "revoked_checkpoints": None,
         "admission_fallback_reason": None,
         "engine_elapsed_ms": None,
         **{f"{stage}_{suffix}": None for stage in TTFT_STAGES for suffix in ("ms", "pct")},
@@ -59,8 +52,6 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         "device_wait_exposed_ms": None,
         **{f"{work}_{phase}_ms": None for work in ("prefill", "replay")
            for phase in (*WORK_PHASES, "program")},
-        **{f"{resource}_{direction}_{field}": None for resource in TRANSFER_RESOURCES
-           for direction in TRANSFER_DIRECTIONS for field in ("ms", "bytes")},
         **{f"prepare_{field}_ms": None for field in
            ("frontend", "acquisition", "media_preprocess", "media_preprocess_work", "tokenize")},
         **{f"{field}_before_first": None for field in
@@ -80,7 +71,6 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
     if isinstance(admission, dict):
         row["preferred_reused_tokens"] = admission.get("preferred_reused_tokens")
         row["source_wait_ms"] = milliseconds(read_seconds(admission, "source_wait_seconds"))
-        row["revoked_checkpoints"] = admission.get("revoked_checkpoints")
         row["admission_fallback_reason"] = admission.get("fallback_reason")
 
     if request.get("stream") is not True:
@@ -138,14 +128,6 @@ def request_timing_analysis(request: dict[str, Any]) -> dict[str, Any]:
         parts = [row[f"{work}_{phase}_ms"] for phase in ("submit", "wait", "post")]
         if all(part is not None for part in parts):
             row[f"{work}_program_ms"] = sum(parts)
-    transfers = first.get("context_transfers", {})
-    for resource in TRANSFER_RESOURCES:
-        directions = transfers.get(resource, {}) if isinstance(transfers, dict) else {}
-        for direction in TRANSFER_DIRECTIONS:
-            transfer = directions.get(direction, {}) if isinstance(directions, dict) else {}
-            row[f"{resource}_{direction}_ms"] = milliseconds(read_seconds(transfer, "seconds"))
-            size = transfer.get("bytes") if isinstance(transfer, dict) else None
-            row[f"{resource}_{direction}_bytes"] = size if type(size) is int and size >= 0 else None
     preparation = diagnostics.get("preparation_seconds")
     for field in ("frontend", "acquisition", "media_preprocess", "media_preprocess_work", "tokenize"):
         row[f"prepare_{field}_ms"] = milliseconds(read_seconds(
@@ -165,7 +147,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
     servers = {event.get("server_instance_id") for event in events}
     if len(servers) != 1 or not all(isinstance(server, str) and server for server in servers):
         return {"status": "unavailable", "reason": "ambiguous_server_instance"}
-    if any(event.get("schema_version") not in (23, 24, 25, 26) for event in intervals):
+    if any(event.get("schema_version") != REQUEST_LOG_SCHEMA_VERSION for event in intervals):
         return {"status": "unavailable", "reason": "unsupported_runtime_schema"}
 
     def values_at(path: Sequence[str]) -> list[int | float] | None:
@@ -183,16 +165,6 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         values = values_at(path)
         return sum(values) if values is not None else None
 
-    transfers = {
-        resource: {
-            direction: {
-                field: total("context_cache", f"{resource}_transfers", direction, field)
-                for field in ("bytes", "seconds", "count" if resource == "state" else "pages")
-            }
-            for direction in TRANSFER_DIRECTIONS
-        }
-        for resource in TRANSFER_RESOURCES
-    }
     host_work = {
         group: {field: total("host_work", group, field) for field in fields}
         for group, fields in (
@@ -212,7 +184,6 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
             "sampled_max": max(values) if values is not None else None,
             "last": values[-1] if values is not None else None,
         }
-    peak = values_at(("context_cache", "occupancy", "host_context_peak_occupied_bytes"))
     final_intervals = [index for index, event in enumerate(intervals)
                        if event.get("final_interval") is True]
     tail_status = (
@@ -226,8 +197,7 @@ def _global_runtime_observations(events: Sequence[dict[str, Any]]) -> dict[str, 
         "scope": "isolated_server_runtime_intervals", "intervals": len(intervals),
         "reported_interval_seconds": total("interval_seconds"),
         "shutdown_tail": tail_status,
-        "transfers": transfers, "host_work": host_work, "occupancy": occupancy,
-        "host_context_peak_occupied_bytes": max(peak) if peak is not None else None,
+        "host_work": host_work, "occupancy": occupancy,
         "scheduling": {field: total("scheduling", field) for field in
                        ("preemptions", "snapshot_restores", "replay_restores", "replayed_tokens")},
         "startup_memory": startup.get("memory"),
@@ -253,7 +223,7 @@ def _scheduling_observations(
     intervals = []
     incomplete_requests = []
     unavailable = False
-    supported = any(event.get("schema_version") in (24, 25, 26) for event in events)
+    supported = any(event.get("schema_version") == REQUEST_LOG_SCHEMA_VERSION for event in events)
     for request in requests:
         diagnostic = request.get("diagnostics", {})
         engine_id = diagnostic.get("engine_request_id")
@@ -402,7 +372,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
             "matched_by": [field for field, value in wire.items() if value in identities[field]],
         }
         starts = [item for item in events if item.get("event") == "request_start"
-                  and item.get("schema_version") in (23, 24, 25, 26)]
+                  and item.get("schema_version") == REQUEST_LOG_SCHEMA_VERSION]
         preparation = starts[0].get("preparation_seconds") if len(starts) == 1 else None
         identity.update(
             preparation_seconds=preparation,
@@ -418,7 +388,7 @@ def attach_generation_diagnostics(run: dict[str, Any], path: Path | None) -> str
         scheduling = generation.get("scheduling") if isinstance(generation, dict) else None
         engine_id = generation.get("engine_request_id") if isinstance(generation, dict) else None
         if (
-            event.get("schema_version") not in (23, 24, 25, 26)
+            event.get("schema_version") != REQUEST_LOG_SCHEMA_VERSION
             or type(engine_id) is not int or engine_id <= 0
             or not isinstance(scheduling, dict)
             or any(type(scheduling.get(field)) is not int or scheduling[field] < 0

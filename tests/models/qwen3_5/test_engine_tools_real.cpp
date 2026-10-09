@@ -42,7 +42,6 @@ infernix::PromptInput prompt(const Json& schema, bool strict = true) {
         {.role  = infernix::ChatRole::User,
          .parts = {{.kind = infernix::MessagePartKind::Text,
                     .text = "Call record once with the values in its schema. Set number to 3."}}});
-    input.context_cache.session_key = "tools-real";
     return input;
 }
 
@@ -135,7 +134,6 @@ void exercise_basic(infernix::Engine& engine, unsigned concurrency, bool specula
     const Json complex_schema{{"anyOf", {open_schema, Json{{"type", "object"}}}}};
     auto continued                 = prompt(complex_schema, false);
     continued.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
-    continued.context_cache.session_key.reset();
     continued.messages.push_back(
         {.role  = infernix::ChatRole::Assistant,
          .parts = {{.kind = infernix::MessagePartKind::Text,
@@ -267,7 +265,7 @@ void exercise(infernix::Engine& engine, unsigned concurrency, bool speculative) 
     require(reuse.tool_calls.empty(), "none emitted a tool call");
     record("tool_result_reuse", reuse, schema);
     // Consecutive newlines in this value can be generated as two tokens and re-encoded as one.
-    // Exercise full endpoint reuse separately with a canonical integer parameter.
+    // Exercise canonical tool-history reuse separately with a canonical integer parameter.
     const Json cache_schema{{"type", "object"},
                             {"properties", {{"number", {{"type", "integer"}, {"const", 3}}}}},
                             {"required", {"number"}},
@@ -284,12 +282,15 @@ void exercise(infernix::Engine& engine, unsigned concurrency, bool speculative) 
          .tool_call_id = "cache_call"});
     const auto cache_hit = engine.generate(engine.prepare(cache_input), next);
     record("canonical_tool_result_reuse", cache_hit, cache_schema);
-    require(cache_hit.reused_prompt_tokens >=
-                cache_call.prompt.prompt_tokens + cache_call.generated_token_ids.size() - 3,
-            "canonical tool history failed to reuse the generated call prefix");
+    // The prefix cache keeps an endpoint only a block or more past its deepest snapshot, so after
+    // this short call the follow-up resumes from the call prompt's generation-opener snapshot: the
+    // same distance before the prompt's end as the warm exact replay above.
+    const std::size_t opener_tokens = first.prompt.prompt_tokens - first.reused_prompt_tokens;
+    require(first.reused_prompt_tokens != 0 &&
+                cache_hit.reused_prompt_tokens + opener_tokens >= cache_call.prompt.prompt_tokens,
+            "canonical tool history failed to reuse the call prompt");
 
     auto continued = prompt(schema);
-    continued.context_cache.session_key.reset();
     continued.options.continuation = infernix::PromptContinuationMode::ContinueFinalAssistant;
     continued.messages.push_back(
         {.role  = infernix::ChatRole::Assistant,

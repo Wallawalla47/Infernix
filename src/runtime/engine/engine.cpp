@@ -227,7 +227,7 @@ public:
             load.cuda_sync_mode = device.sync_mode();
             sampling_defaults = qwen4->frontend.sampling_defaults();
             StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
-            core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options, runtime::ContextMachineCostModel{});
+            core = std::make_unique<Qwen4ExpCore>(*qwen4, device, options);
             finalize_phase.complete();
             return;
         }
@@ -248,8 +248,7 @@ public:
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);
         } else {
-            core = std::make_unique<GenerationCore>(*active, device, options,
-                                                    std::move(constructed.context_cost));
+            core = std::make_unique<GenerationCore>(*active, device, options);
         }
         finalize_phase.complete();
     }

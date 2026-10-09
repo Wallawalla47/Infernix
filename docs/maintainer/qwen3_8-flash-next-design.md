@@ -3930,7 +3930,7 @@ GPU's staging reads; worker scheduling on P- and E-cores.
 | `--cache-taps-per-request`, `--cache-tap-ladder`, `--cache-tap-min-gap` | Unchanged: 8 / max(4096, 2·chunk) / max(1024, chunk) |
 | `--prefix-cache-file PATH` | Unchanged; Qwen4Exp blocks persist `mtp_next`, snapshots their meta (after P6) |
 | `--kv-capacity N\|auto` | `auto` = `max_context × C`; both get the C spare pages (documented) |
-| `--use-original-prefix-caching` | Rejected for Qwen4Exp with a clear message |
+| `--use-original-prefix-caching` | Rejected for Qwen4Exp with a clear message (the flag and the original cache were removed on 2026-10-09) |
 
 **Engine.** `normalize_engine_options` fills `device_snapshot_slots = C + 1` and the 8 GiB Host
 default and rejects 0 (`model_instance.cpp:180, 188, 199`); these move to per-model resolution in

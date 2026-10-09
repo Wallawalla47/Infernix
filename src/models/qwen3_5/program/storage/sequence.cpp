@@ -8,6 +8,33 @@
 
 namespace infernix::models::qwen3_5::detail {
 
+KVHistory::~KVHistory() {
+    if (!owner) { return; }
+    if (backend && !owner->backend_kv_addresses->release_after_deactivate(*backend)) {
+        std::terminate();
+    }
+    if (!owner->text_kv_addresses->release_after_deactivate(text)) { std::terminate(); }
+}
+
+PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
+    PhysicalUsageSnapshot out;
+    if (state_store) {
+        out.occupied.state_slots = state_store->device_occupied();
+        out.capacity.state_slots = state_store->device_capacity();
+    }
+    if (text_kv_pages) {
+        const auto& pool           = text_kv_pages->physical_pool();
+        out.occupied.main_kv_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.capacity.main_kv_pages = pool.capacity_pages();
+    }
+    if (backend_kv_pages) {
+        const auto& pool              = backend_kv_pages->physical_pool();
+        out.occupied.backend_kv_pages = pool.allocated_pages() + pool.reserved_pages();
+        out.capacity.backend_kv_pages = pool.capacity_pages();
+    }
+    return out;
+}
+
 SequenceHandle ProgramImpl::sequence_handle(std::uint32_t lane) const noexcept {
     return ContractAccess::make_sequence(this, runtime::LaneId{lane}, lane_epochs[lane]);
 }
@@ -69,18 +96,8 @@ void ProgramImpl::refresh_state_views(SequenceState& sequence) {
         state_images->continuation_hidden_slot(state_store->physical_slot(sequence.state.read));
 }
 
-void ProgramImpl::settle_state_fork(SequenceState& sequence) {
-    if (!sequence.state.fork_pending) { return; }
-    state_store->commit_fork(sequence.state.read, sequence.state.write);
-    sequence.state = {.read = sequence.state.write, .write = sequence.state.write};
-    refresh_state_views(sequence);
-}
-
 void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
     try {
-        if (sequence.state.fork_pending) {
-            state_store->abort_fork(sequence.state.read, sequence.state.write);
-        }
         if (state_store->valid(sequence.state.write) &&
             !state_store->release(sequence.state.write)) {
             std::terminate();
@@ -98,7 +115,6 @@ void ProgramImpl::release_sequence_kv(SequenceState& sequence) noexcept {
     if (text_kv_addresses->active(sequence.kv->text)) {
         text_kv_addresses->deactivate(sequence.kv->text);
     }
-    refresh_history_requirements(sequence.kv, true);
     sequence.kv.reset();
 }
 

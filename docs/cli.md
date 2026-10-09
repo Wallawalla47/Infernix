@@ -143,8 +143,8 @@ GPU residency is frozen when the Engine starts:
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
   enables image/video input.
-- the one-request CLI disables cross-request history and Host context backing, so it does not
-  reserve an extra Device checkpoint StateImage or retain continuations.
+- the one-request CLI disables the prefix cache, so it reserves no Device snapshot StateImage
+  and no Host tier.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: an Engine
 started without Vision rejects media and cannot enable Vision later. DFlash/DFlash2 and Vision may
@@ -359,7 +359,7 @@ Per token and KV head, K+V take 1024 bytes as `bf16`, 528 as `int8`, 516 as `fp8
 288 as `nvfp4`, 196 as `k4v2` and 132 as `vq2`. `vq2` stores 2-bit vector-quantized K and V (one
 16-bit code per 8 rotated values) and `k4v2` 4-bit K with the same 2-bit V; both keep the attention
 sinks and the most recent 768 keys exact through a per-sequence INT8 window, about 40 MB per state
-slot for the 27B models, which every running request and every Device checkpoint slot holds.
+slot for the 27B models, which every running request and every Device snapshot slot holds.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime

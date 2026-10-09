@@ -39,23 +39,16 @@ struct ContextPrefillCost {
                                                    ContextPrefillCost) noexcept = default;
 };
 
+// Calibrated machine coefficients; the prefix cache prices admission sources and snapshot value
+// with them (model_instance.cpp).
 struct ContextMachineCostModel {
     // Direction order is DeviceToHost, HostToDevice, DeviceToDevice.
     std::array<ContextTransferCost, 3> transfer{};
     ContextPrefillCost prefill;
 
-    // max(batch + copy_operations * operation, payload_bytes * ns_per_byte)
-    [[nodiscard]] std::uint64_t transfer_ns(ContextTransferDirection direction,
-                                            TransferWork work) const noexcept;
-    [[nodiscard]] std::uint64_t prefill_ns(PrefillWork work) const noexcept;
-
     [[nodiscard]] friend constexpr bool
     operator==(const ContextMachineCostModel&, const ContextMachineCostModel&) noexcept = default;
 };
-
-[[nodiscard]] std::uint64_t price_context_transfer_requirements(
-    const ContextMachineCostModel& model,
-    std::span<const ContextTransferRequirement> requirements) noexcept;
 
 struct ContextCostIdentity {
     std::string hardware_class;

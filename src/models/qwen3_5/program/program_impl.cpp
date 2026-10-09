@@ -62,10 +62,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                                              sizeof(qwen3_5::DFlashDecodeEgress) +
                                                              sizeof(qwen3_5::DFlashPrefillIngress))
                       : std::nullopt),
-      context_source_ready_(device_in), context_completion_(device_in),
-      context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream),
-                               CudaEventTimer(device_in, device_in.transfer_stream)},
       prefill_gpu_timer_(device_in) {
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
@@ -121,63 +117,20 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         if (!local) { throw std::logic_error("DFlash StateImage has no local state"); }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
     }
-    // The prefix cache owns the whole Host budget as its slab pool (hybrid_program.cpp).
-    const std::size_t host_bytes = 0;
-    std::vector<HostKVPageLayout> layouts{
-        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry())};
-    text_host_kv_page_stride = layouts.front().page_stride;
-    if (const auto* backend = backend_kv_cache()) {
-        auto layout                 = plan_host_kv_page_layout(backend->page_pool().geometry());
-        backend_host_kv_page_stride = layout.page_stride;
-        if (layout != layouts.front()) { layouts.push_back(std::move(layout)); }
-    }
-    std::size_t minimum_stride    = state_images->host_layout().image_bytes;
-    std::size_t minimum_kv_stride = layouts.front().page_stride;
-    for (const auto& layout : layouts) {
-        minimum_stride    = std::min(minimum_stride, layout.page_stride);
-        minimum_kv_stride = std::min(minimum_kv_stride, layout.page_stride);
-    }
-    const auto checked_count = [](std::uint64_t value) {
-        if (value > std::numeric_limits<std::uint32_t>::max()) {
-            throw std::overflow_error("context resource descriptor capacity exceeds uint32");
-        }
-        return static_cast<std::uint32_t>(value);
-    };
-    const auto logical_states = checked_count(state_images->slot_count() +
-                                              host_bytes / state_images->host_layout().image_bytes);
-    // One immutable image can serve private replay, an explicit anchor, a public view and an
-    // exact-hit endpoint. Alias descriptors are bounded separately from physical state slots.
-    checkpoints.resize(checked_count(4ULL * logical_states + 2ULL * max_concurrency));
-    const auto address_capacity = checked_count(checkpoints.size() + max_concurrency + 2U);
-    if (host_bytes) {
-        StartupPhaseScope phase(startup_observer, StartupPhase::HostContextPin,
-                                StartupProgressUnit::Bytes, host_bytes);
-        host_context_arena = std::make_unique<HostContextArena>(host_bytes, minimum_stride);
-        host_state_images =
-            std::make_unique<HostStatePool>(*host_context_arena, state_images->host_layout());
-        host_kv_arena      = std::make_unique<HostKVArena>(*host_context_arena, layouts);
-        const auto extents = checked_count(host_bytes / minimum_kv_stride);
-        if (extents) {
-            host_kv_extents = std::make_unique<HostKVExtentStore>(*host_kv_arena, extents);
-        }
-        phase.complete(host_bytes, host_bytes);
-    }
-    state_store =
-        std::make_unique<StateImageStore>(*state_images, host_state_images.get(), logical_states);
-    const auto logical_pages = [&](const DeviceKVPagePool& pool) {
-        const auto stride = plan_host_kv_page_layout(pool.geometry()).page_stride;
-        return checked_count(pool.capacity_pages() + host_bytes / stride);
-    };
+    // Device state and KV only: the prefix cache owns the whole Host budget as its slab pool
+    // (hybrid_program.cpp). Every lane owns one KV address space per pool, and a binding stages
+    // the next one before its lane is published.
+    state_store   = std::make_unique<StateImageStore>(*state_images);
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
-        decoder->text_kv.page_pool(), logical_pages(decoder->text_kv.page_pool()));
+        decoder->text_kv.page_pool(), decoder->text_kv.page_pool().capacity_pages());
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
-        *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
+        *text_kv_pages, decoder->text_kv.execution_tables(), max_concurrency + 1U,
         decoder->text_kv.execution_tables().logical_page_capacity());
     if (auto* backend = backend_kv_cache()) {
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
-            backend->page_pool(), logical_pages(backend->page_pool()));
+            backend->page_pool(), backend->page_pool().capacity_pages());
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
-            *backend_kv_pages, backend->execution_tables(), address_capacity,
+            *backend_kv_pages, backend->execution_tables(), max_concurrency + 1U,
             backend->execution_tables().logical_page_capacity());
     }
 
@@ -505,36 +458,6 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
     }
 }
 
-void ProgramImpl::start_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].start();
-}
-
-void ProgramImpl::stop_context_transfer_timer(runtime::ContextResourceClass resource) {
-    context_transfer_timers_[context_resource_index(resource)].record_stop();
-}
-
-runtime::ContextTransferObservation ProgramImpl::context_transfer_observation(
-    runtime::ContextResourceClass resource, runtime::ContextTransferDirection direction,
-    TransferWork work, std::uint32_t page_count, std::uint64_t state_images) const {
-    const double elapsed_ns =
-        static_cast<double>(
-            context_transfer_timers_[context_resource_index(resource)].elapsed_ms()) *
-        1'000'000.0;
-    const std::uint64_t measured_ns =
-        elapsed_ns >= static_cast<double>(std::numeric_limits<std::uint64_t>::max())
-            ? std::numeric_limits<std::uint64_t>::max()
-            : std::max<std::uint64_t>(1, static_cast<std::uint64_t>(elapsed_ns + 0.5));
-    return runtime::ContextTransferObservation{
-        .resource  = resource,
-        .direction = direction,
-        .units =
-            resource == runtime::ContextResourceClass::State ? state_images : work.payload_bytes,
-        .page_count = page_count,
-        .work       = work,
-        .elapsed_ns = measured_ns,
-    };
-}
-
 MemorySummary ProgramImpl::memory_summary() const noexcept {
     MemorySummary out;
     out.device          = device.device;
@@ -582,13 +505,6 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_measured_bytes    = graph_measured_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
-    if (host_state_images) { out.host_state_occupied_slots = host_state_images->occupied(); }
-    if (host_kv_arena) { out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes(); }
-    if (host_context_arena) {
-        out.host_context_capacity_bytes = host_context_arena->capacity_bytes();
-        out.host_context_occupied_bytes = host_context_arena->occupied_bytes();
-        out.host_context_reserved_bytes = host_context_arena->reserved_bytes();
-    }
     return out;
 }
 

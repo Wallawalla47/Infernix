@@ -31,7 +31,6 @@ struct PendingResponseStorage {
     std::vector<ChatTurn> input_turns;
     std::vector<Json> input_items;
     OpenAIResponseContext previous_context;
-    std::string session_key;
     bool enabled = false;
 };
 
@@ -80,12 +79,8 @@ void commit_stored_response(OpenAIResponsesStore& store, PendingResponseStorage 
                             std::vector<ChatTurn> output_history,
                             std::optional<bool> preserve_thinking) {
     if (!pending.enabled) { return; }
-    if (pending.session_key.empty()) {
-        throw std::logic_error("stored Response has no Engine session key");
-    }
     StoredOpenAIResponse stored;
     stored.id                = std::move(id);
-    stored.session_key       = std::move(pending.session_key);
     stored.response          = response;
     stored.input_items       = std::move(pending.input_items);
     stored.context           = terminal_context(std::move(pending.previous_context),
@@ -250,8 +245,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         const auto body           = parse_json_body(req);
         request                   = parse_openai_responses_create_request(body, limits);
         validate_openai_model(request.prompt.model, public_model_id_);
-        resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
-                                                   request.store);
+        resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_);
         resolved.generation.ngram_session = resolve_ngram_session(req, body, options_);
     } catch (const ApiException& exception) {
         write_openai_error(res, responses_error(exception.error()));
@@ -281,7 +275,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
             {.phase_timings = true,
              .scheduling    = scheduling_observer(req_id, metadata.http_request_id),
              .first_token   = first_token_observer()},
-            [&req] { return client_disconnected(req); }, std::move(resolved.cache_hints));
+            [&req] { return client_disconnected(req); });
     } catch (const ApiException& exception) {
         const ApiError error = responses_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -339,8 +333,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         storage.input_turns      = std::move(request.prompt.input_turns);
         storage.input_items      = std::move(request.prompt.input_items);
         storage.previous_context = std::move(resolved.parent);
-        if (resolved.session_key) { storage.session_key = std::move(*resolved.session_key); }
-        storage.enabled = request.store;
+        storage.enabled          = request.store;
         try {
             commit_stored_response(openai_responses_store_, std::move(storage), id, response->body,
                                    std::move(response->output_history), prepared.preserve_thinking);
@@ -374,10 +367,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
         stream->storage.input_turns      = std::move(request.prompt.input_turns);
         stream->storage.input_items      = std::move(request.prompt.input_items);
         stream->storage.previous_context = std::move(resolved.parent);
-        if (resolved.session_key) {
-            stream->storage.session_key = std::move(*resolved.session_key);
-        }
-        stream->storage.enabled = request.store;
+        stream->storage.enabled          = request.store;
         stream->encoder         = std::make_unique<OpenAIResponsesEventStream>(
             id, created, std::move(request), runtime_values(stream->prepared));
 
@@ -537,7 +527,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
         validate_openai_model(request.model, public_model_id_);
         OpenAIResponsesResolvedPrompt resolved =
-            resolve_openai_responses_prompt(request, openai_responses_store_, std::nullopt, false);
+            resolve_openai_responses_prompt(request, openai_responses_store_);
         const int tokens = service_->count_prompt_tokens(
             resolved.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_openai_response_input_tokens_body(tokens), "application/json");

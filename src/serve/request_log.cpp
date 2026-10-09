@@ -161,8 +161,6 @@ const char* prefix_reuse_path_name(infernix::PrefixReusePath path) {
     switch (path) {
     case infernix::PrefixReusePath::Root:
         return "root";
-    case infernix::PrefixReusePath::Checkpoint:
-        return "checkpoint";
     case infernix::PrefixReusePath::HybridEndpoint:
         return "hybrid_endpoint";
     case infernix::PrefixReusePath::HybridSnapshot:
@@ -194,8 +192,6 @@ const char* scheduling_transition_name(infernix::GenerationSchedulingTransition 
         return "replay_complete";
     case Transition::RecoveryComplete:
         return "recovery_complete";
-    case Transition::SnapshotRevoked:
-        return "snapshot_revoked";
     case Transition::Terminal:
         return "terminal";
     }
@@ -206,8 +202,6 @@ Json recovery_route_json(infernix::GenerationRecoveryRoute route) {
     switch (route) {
     case infernix::GenerationRecoveryRoute::None:
         return nullptr;
-    case infernix::GenerationRecoveryRoute::Snapshot:
-        return "snapshot";
     case infernix::GenerationRecoveryRoute::Replay:
         return "replay";
     }
@@ -379,9 +373,7 @@ Json scheduling_json(const infernix::GenerationSchedulingStats& stats) {
                 {"snapshot_restores", stats.snapshot_restores},
                 {"replay_restores", stats.replay_restores},
                 {"replayed_tokens", stats.replayed_tokens},
-                {"paused_ns", stats.paused_ns},
-                {"device_to_host_bytes", stats.device_to_host_bytes},
-                {"host_to_device_bytes", stats.host_to_device_bytes}};
+                {"paused_ns", stats.paused_ns}};
 }
 
 Json admission_json(const infernix::GenerationAdmissionStats& stats) {
@@ -393,12 +385,6 @@ Json admission_json(const infernix::GenerationAdmissionStats& stats) {
     case infernix::AdmissionFallbackReason::SourceInvalid:
         reason = "source_invalid";
         break;
-    case infernix::AdmissionFallbackReason::SourceRevoked:
-        reason = "source_revoked";
-        break;
-    case infernix::AdmissionFallbackReason::CostChanged:
-        reason = "cost_changed";
-        break;
     case infernix::AdmissionFallbackReason::CapacityLimit:
         reason = "capacity_limit";
         break;
@@ -409,7 +395,6 @@ Json admission_json(const infernix::GenerationAdmissionStats& stats) {
     if (!reason) { throw std::logic_error("invalid admission fallback reason"); }
     return Json{{"preferred_reused_tokens", stats.preferred_reused_tokens},
                 {"source_wait_seconds", stats.source_wait_seconds},
-                {"revoked_checkpoints", stats.revoked_checkpoints},
                 {"fallback_reason", reason}};
 }
 
@@ -454,24 +439,13 @@ Json work_timing_json(const infernix::GenerationWorkTiming& timing) {
 }
 
 Json first_output_timing_json(const infernix::GenerationFirstOutputTiming& timing) {
-    Json transfers = Json::object();
-    constexpr std::array resources{"state", "main_kv", "backend_kv"};
-    constexpr std::array directions{"d2h", "h2d", "d2d"};
-    for (std::size_t resource = 0; resource < resources.size(); ++resource) {
-        for (std::size_t direction = 0; direction < directions.size(); ++direction) {
-            const auto& transfer = timing.context_transfers[resource][direction];
-            transfers[resources[resource]][directions[direction]] =
-                Json{{"bytes", transfer.bytes}, {"seconds", transfer.seconds}};
-        }
-    }
     return Json{{"elapsed_seconds", timing.elapsed_seconds},
                 {"initial_binding_seconds", timing.initial_binding_seconds},
                 {"engine", request_engine_timing_json(timing.engine)},
                 {"prefill", work_timing_json(timing.prefill)},
                 {"replay", work_timing_json(timing.replay)},
                 {"scheduling", scheduling_json(timing.scheduling)},
-                {"computed_prefill_tokens", timing.computed_prefill_tokens},
-                {"context_transfers", std::move(transfers)}};
+                {"computed_prefill_tokens", timing.computed_prefill_tokens}};
 }
 
 infernix::RuntimeHostWorkStats host_work_delta(const infernix::RuntimeHostWorkStats& previous,
@@ -633,12 +607,7 @@ std::string format_server_start_json(
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
              {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},
-             {"kv_payload_bytes", memory.kv_payload_bytes},
-             {"host_context_capacity_bytes", memory.host_context_capacity_bytes},
-             {"host_context_occupied_bytes", memory.host_context_occupied_bytes},
-             {"host_context_reserved_bytes", memory.host_context_reserved_bytes},
-             {"host_state_occupied_slots", memory.host_state_occupied_slots},
-             {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
+             {"kv_payload_bytes", memory.kv_payload_bytes}};
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -779,7 +748,6 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                 {"paused", current.paused_requests},
                                 {"replaying", current.replaying_requests},
                                 {"materializing", current.materializing_requests},
-                                {"capture_pending", current.capture_pending_requests},
                                 {"terminal_pending", current.terminal_pending_requests}};
     record["scheduling"] = Json{
         {"preemptions", monotonic_delta(previous.preemptions, current.preemptions)},
@@ -822,94 +790,22 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                   microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };
     record["context_cache"] = Json{
-        {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
-                                                        current.active_captures_completed)},
-                          {"aborted", monotonic_delta(previous.active_captures_aborted,
-                                                      current.active_captures_aborted)}}},
         {"selections",
          Json{{"root", monotonic_delta(previous.root_selections, current.root_selections)},
-              {"checkpoint",
-               monotonic_delta(previous.checkpoint_selections, current.checkpoint_selections)},
+              {"prefix", monotonic_delta(previous.prefix_selections, current.prefix_selections)},
               {"reused_prompt_tokens",
                monotonic_delta(previous.reused_prompt_tokens, current.reused_prompt_tokens)}}},
         {"last_selection", Json{{"frontier_tokens", current.last_selected_frontier_tokens}}},
         {"state_operations",
-         Json{{"moves", monotonic_delta(previous.state_moves, current.state_moves)},
-              {"forks", monotonic_delta(previous.state_forks, current.state_forks)},
+         Json{{"forks", monotonic_delta(previous.state_forks, current.state_forks)},
               {"materialization_forks", monotonic_delta(previous.materialization_state_forks,
                                                         current.materialization_state_forks)},
               {"restores", monotonic_delta(previous.state_restores, current.state_restores)}}},
-        {"state_transfers",
-         Json{{"d2h",
-               Json{{"count", monotonic_delta(previous.state_d2h_count, current.state_d2h_count)},
-                    {"bytes", monotonic_delta(previous.state_d2h_bytes, current.state_d2h_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_d2h_seconds, current.state_d2h_seconds)}}},
-              {"h2d",
-               Json{{"count", monotonic_delta(previous.state_h2d_count, current.state_h2d_count)},
-                    {"bytes", monotonic_delta(previous.state_h2d_bytes, current.state_h2d_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_h2d_seconds, current.state_h2d_seconds)}}},
-              {"d2d",
-               Json{{"count", monotonic_delta(previous.state_d2d_count, current.state_d2d_count)},
-                    {"bytes", monotonic_delta(previous.state_d2d_bytes, current.state_d2d_bytes)},
-                    {"seconds",
-                     monotonic_delta(previous.state_d2d_seconds, current.state_d2d_seconds)}}}}},
-        {"main_kv_transfers",
-         Json{
-             {"d2h",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_d2h_pages, current.main_kv_d2h_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_d2h_bytes, current.main_kv_d2h_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_d2h_seconds, current.main_kv_d2h_seconds)}}},
-             {"h2d",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_h2d_pages, current.main_kv_h2d_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_h2d_bytes, current.main_kv_h2d_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_h2d_seconds, current.main_kv_h2d_seconds)}}},
-             {"d2d",
-              Json{
-                  {"pages", monotonic_delta(previous.main_kv_d2d_pages, current.main_kv_d2d_pages)},
-                  {"bytes", monotonic_delta(previous.main_kv_d2d_bytes, current.main_kv_d2d_bytes)},
-                  {"seconds",
-                   monotonic_delta(previous.main_kv_d2d_seconds, current.main_kv_d2d_seconds)}}}}},
-        {"backend_kv_transfers",
-         Json{{"d2h", Json{{"pages", monotonic_delta(previous.backend_kv_d2h_pages,
-                                                     current.backend_kv_d2h_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_d2h_bytes,
-                                                     current.backend_kv_d2h_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_d2h_seconds,
-                                                       current.backend_kv_d2h_seconds)}}},
-              {"h2d", Json{{"pages", monotonic_delta(previous.backend_kv_h2d_pages,
-                                                     current.backend_kv_h2d_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_h2d_bytes,
-                                                     current.backend_kv_h2d_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_h2d_seconds,
-                                                       current.backend_kv_h2d_seconds)}}},
-              {"d2d", Json{{"pages", monotonic_delta(previous.backend_kv_d2d_pages,
-                                                     current.backend_kv_d2d_pages)},
-                           {"bytes", monotonic_delta(previous.backend_kv_d2d_bytes,
-                                                     current.backend_kv_d2d_bytes)},
-                           {"seconds", monotonic_delta(previous.backend_kv_d2d_seconds,
-                                                       current.backend_kv_d2d_seconds)}}}}},
-        {"pressure",
-         Json{{"spill_pages",
-               monotonic_delta(previous.pressure_spill_pages, current.pressure_spill_pages)},
-              {"partial_tail_cow_pages",
-               monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)}}},
-        {"occupancy",
-         Json{{"device_state_slots", current.device_state_occupied_slots},
-              {"host_state_slots", current.host_state_occupied_slots},
-              {"device_main_kv_pages", current.device_main_kv_occupied_pages},
-              {"device_backend_kv_pages", current.device_backend_kv_occupied_pages},
-              {"host_kv_bytes", current.host_kv_occupied_bytes},
-              {"host_context_occupied_bytes", current.host_context_occupied_bytes},
-              {"host_context_peak_occupied_bytes", current.host_context_peak_occupied_bytes},
-              {"host_context_reserved_bytes", current.host_context_reserved_bytes}}},
-        {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
-                                                    current.actual_context_transfer_seconds)}};
+        {"partial_tail_cow_pages",
+         monotonic_delta(previous.partial_tail_cow_pages, current.partial_tail_cow_pages)},
+        {"occupancy", Json{{"device_state_slots", current.device_state_occupied_slots},
+                           {"device_main_kv_pages", current.device_main_kv_occupied_pages},
+                           {"device_backend_kv_pages", current.device_backend_kv_occupied_pages}}}};
     // Hybrid prefix cache (the serving default): absolute occupancy, per-interval events.
     if (current.hybrid_snapshots != 0 || current.hybrid_tree_blocks != 0 ||
         current.hybrid_blocks_inserted != 0) {

@@ -4,7 +4,6 @@
 #include "infernix/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/engine/generation_budget.h"
-#include "runtime/engine/context_cache/types.h"
 
 #include <atomic>
 #include <chrono>
@@ -187,20 +186,15 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
-    EngineRequestState model_state        = EngineRequestState::Waiting;
-    bool capture_pending                  = false;
-    EngineRequestState post_capture_state = EngineRequestState::Prefill;
+    EngineRequestState model_state = EngineRequestState::Waiting;
     std::optional<FinishReason> terminal_reason;
 
     std::optional<BasePlan> base_plan;
     std::optional<ResumeState> suspended;
-    ContinuationOwnerToken continuation_owner = 0;
-    std::uint64_t device_to_host_bytes        = 0;
-    std::uint64_t host_to_device_bytes        = 0;
-    EngineRequestState resume_phase           = EngineRequestState::Prefill;
-    std::uint32_t admission_bypasses          = 0;
-    std::uint64_t admission_generation        = 0;
-    bool admission_observed                   = false;
+    EngineRequestState resume_phase    = EngineRequestState::Prefill;
+    std::uint32_t admission_bypasses   = 0;
+    std::uint64_t admission_generation = 0;
+    bool admission_observed            = false;
     GenerationAdmissionStats admission;
     std::optional<Clock::time_point> source_wait_started;
     bool recovery_pending                  = false;
@@ -218,7 +212,6 @@ struct RequestRecord {
     std::uint64_t initial_binding_ns = 0;
     GenerationWorkTiming prefill_work;
     GenerationWorkTiming replay_work;
-    std::array<std::array<GenerationTransferTiming, 3>, 3> context_transfers{};
     std::optional<GenerationFirstOutputTiming> first_output_timing;
     SpeculativeStats speculative_stats;
     std::optional<ExpertCacheStats> expert_cache;

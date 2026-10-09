@@ -149,11 +149,6 @@ int main() {
     memory.cuda_graph_allowance_bytes        = 600;
     memory.cuda_graph_measured_bytes         = 450;
     memory.kv_payload_bytes                  = 400;
-    memory.host_context_capacity_bytes       = 64ULL << 20;
-    memory.host_context_occupied_bytes       = 12ULL << 20;
-    memory.host_context_reserved_bytes       = 4ULL << 20;
-    memory.host_state_occupied_slots         = 1;
-    memory.host_kv_occupied_bytes            = 8ULL << 20;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -275,12 +270,8 @@ int main() {
                           server.at("memory").at("vram_headroom_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100,
                       "adaptive KV memory ledger missing");
-    failures += check(server.at("memory").at("host_context_capacity_bytes") == (64ULL << 20) &&
-                          server.at("memory").at("host_context_occupied_bytes") == (12ULL << 20) &&
-                          server.at("memory").at("host_context_reserved_bytes") == (4ULL << 20) &&
-                          server.at("memory").at("host_state_occupied_slots") == 1 &&
-                          server.at("memory").at("host_kv_occupied_bytes") == (8ULL << 20),
-                      "Host context-cache memory ledger missing");
+    failures += check(!server.at("memory").contains("host_context_capacity_bytes"),
+                      "the removed Host context ledger is still reported");
     failures += check(server.dump().find("must-not-appear") == std::string::npos,
                       "server JSON leaked the API key");
     failures += check(server.at("argv").at(3) == "<redacted>",
@@ -422,7 +413,7 @@ int main() {
     outcome.metrics.total_seconds           = 5.7037035803702;
     outcome.metrics.prefix_cache_hit_tokens = 101;
     outcome.metrics.computed_prefill_tokens = 300;
-    outcome.metrics.prefix_reuse_path       = infernix::PrefixReusePath::Checkpoint;
+    outcome.metrics.prefix_reuse_path       = infernix::PrefixReusePath::HybridSnapshot;
     outcome.metrics.engine_timing           = {
                   .queue_wait_seconds                   = 0.001,
                   .engine_boundary_exposed_seconds      = 0.001,
@@ -463,8 +454,6 @@ int main() {
                                .replay_restores      = 2,
                                .replayed_tokens      = 640,
                                .paused_ns            = 123456789012345ULL,
-                               .device_to_host_bytes = 3145728,
-                               .host_to_device_bytes = 2097152,
     };
     outcome.thinking = infernix::ThinkingBudgetStats{.configured_budget     = 256,
                                                    .model_thinking_tokens = 256,
@@ -482,9 +471,7 @@ int main() {
                                                                  {"snapshot_restores", 1},
                                                                  {"replay_restores", 2},
                                                                  {"replayed_tokens", 640},
-                                                                 {"paused_ns", 123456789012345ULL},
-                                                                 {"device_to_host_bytes", 3145728},
-                                                                 {"host_to_device_bytes", 2097152}},
+                                                                 {"paused_ns", 123456789012345ULL}},
               "per-request scheduling observations or Engine request ID missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
@@ -506,7 +493,7 @@ int main() {
     failures += check(render_request_done(context, cancelled).message.find("prefill 512.0 tok/s") !=
                           std::string::npos,
                       "cancelled prefill rate must use completed work, not the remaining prompt");
-    failures += check(done.at("result").at("prefix_reuse_path") == "checkpoint",
+    failures += check(done.at("result").at("prefix_reuse_path") == "hybrid_snapshot",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
@@ -576,10 +563,7 @@ int main() {
                                     .paused_ns       = 123456789},
         .computed_prefill_tokens = 192,
     };
-    auto& first                   = *observed.metrics.first_output_timing;
-    first.context_transfers[0][0] = {.bytes = 9007199254740993ULL, .seconds = 0.010};
-    first.context_transfers[1][1] = {.bytes = 2113536, .seconds = 0.011};
-    first.context_transfers[2][2] = {.bytes = 16384, .seconds = 0.012};
+    const auto& first = *observed.metrics.first_output_timing;
     const Json observed_done =
         Json::parse(format_request_done_json("serve-test", 3001, context, observed));
     const auto& first_json = observed_done.at("first_output_timing");
@@ -590,18 +574,16 @@ int main() {
                       "request diagnostics lost exact generated token IDs or schema version");
     observed.metrics.admission = {.preferred_reused_tokens = 19057,
                                   .source_wait_seconds     = 0.25,
-                                  .revoked_checkpoints     = 1,
                                   .fallback_reason =
-                                      infernix::AdmissionFallbackReason::SourceRevoked};
+                                      infernix::AdmissionFallbackReason::SourceInvalid};
     const auto admission_done =
         Json::parse(format_request_done_json("serve-test", 3002, context, observed));
     failures +=
         check(admission_done.at("generation").at("admission") ==
                   Json{{"preferred_reused_tokens", 19057},
                        {"source_wait_seconds", 0.25},
-                       {"revoked_checkpoints", 1},
-                       {"fallback_reason", "source_revoked"}},
-              "admission observation lost selected source, queue subset or revocation reason");
+                       {"fallback_reason", "source_invalid"}},
+              "admission observation lost selected source, queue subset or fallback reason");
 
     const infernix::GenerationSchedulingObservation scheduling{
         .transition              = infernix::GenerationSchedulingTransition::ReplayComplete,
@@ -643,7 +625,7 @@ int main() {
         Json::parse(format_request_scheduling_json("serve-test", 3003, 8, "http-eight", pausing));
     failures += check(pausing_json.at("transition") == "pause_started" &&
                           pausing_json.at("route").is_null(),
-                      "pause preparation claimed a completed Snapshot or Replay route");
+                      "pause preparation claimed a completed recovery route");
     failures += check(
         first_json.at("elapsed_seconds") == first.elapsed_seconds &&
             first_json.at("initial_binding_seconds") == first.initial_binding_seconds &&
@@ -666,21 +648,12 @@ int main() {
                                                           {"post_seconds", 0.008},
                                                           {"gpu_seconds", 0.009}},
                       "request work timing merged replay, prefill or overlapping GPU intervals");
-    failures += check(first_json.at("context_transfers").at("state").at("d2h") ==
-                              Json{{"bytes", 9007199254740993ULL}, {"seconds", 0.010}} &&
-                          first_json.at("context_transfers").at("main_kv").at("h2d") ==
-                              Json{{"bytes", 2113536}, {"seconds", 0.011}} &&
-                          first_json.at("context_transfers").at("backend_kv").at("d2d") ==
-                              Json{{"bytes", 16384}, {"seconds", 0.012}} &&
-                          first_json.at("context_transfers").at("main_kv").at("d2h") ==
-                              Json{{"bytes", 0}, {"seconds", 0.0}},
-                      "first-output transfer resource, direction or integer precision changed");
 
     const OperationalRecord pretty_done = render_request_done(context, outcome);
     failures += check(
         pretty_done.message ==
             "req#7 done | openai-chat | output limit | prompt 401 | output 1,024 | cache 101 "
-            "(25.2%, checkpoint) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
+            "(25.2%, hybrid_snapshot) | TTFT 358 ms | total 5.7s | prefill 1.28k tok/s | "
             "decode 191.4 tok/s | mtp accepted 720/900 (80.0%) | archive bound 400/441 accepted, "
             "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
@@ -797,12 +770,12 @@ int main() {
     throughput.decode_rounds                            = 10;
     throughput.decode_row_rounds                        = 18;
     throughput.previous.root_selections                 = 2;
-    throughput.previous.checkpoint_selections           = 3;
+    throughput.previous.prefix_selections               = 3;
     throughput.previous.preemptions                     = 8;
     throughput.previous.snapshot_restores               = 4;
     throughput.previous.replay_restores                 = 2;
     throughput.previous.replayed_tokens                 = 128;
-    throughput.previous.state_h2d_bytes                 = 100;
+    throughput.previous.state_forks                     = 100;
     throughput.current.running_requests                 = 2;
     throughput.current.prefilling_requests              = 1;
     throughput.current.decode_ready_requests            = 1;
@@ -814,20 +787,13 @@ int main() {
     throughput.current.replay_restores                  = 4;
     throughput.current.replayed_tokens                  = 896;
     throughput.current.materializing_requests           = 1;
-    throughput.current.capture_pending_requests         = 1;
     throughput.current.terminal_pending_requests        = 1;
     throughput.current.root_selections                  = 3;
-    throughput.current.checkpoint_selections            = 5;
-    throughput.current.state_h2d_count                  = 1;
-    throughput.current.state_h2d_bytes                  = 132;
-    throughput.current.state_h2d_seconds                = 0.25;
+    throughput.current.prefix_selections                = 5;
+    throughput.current.state_forks                      = 132;
     throughput.current.device_state_occupied_slots      = 3;
-    throughput.current.host_state_occupied_slots        = 1;
-    throughput.current.host_context_occupied_bytes      = 16ULL << 20;
-    throughput.current.host_context_reserved_bytes      = 4ULL << 20;
-    throughput.current.host_context_peak_occupied_bytes = 20ULL << 20;
     throughput.current.last_selected_frontier_tokens    = 64;
-    throughput.current.pressure_spill_pages             = 4;
+    throughput.current.partial_tail_cow_pages           = 4;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -851,8 +817,7 @@ int main() {
         check(pretty_throughput ==
                   "throughput | 2.0s | prefill 50.0 tok/s (100 tok) | decode 20.0 tok/s (40 tok) | "
                   "running 2 (prefill 1, decode-ready 1) | waiting 3 | paused 2 | replaying 1 | "
-                  "materializing 1 | "
-                  "capture-pending 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
+                  "materializing 1 | terminal-pending 1 | batch 1.80 | host 0.8% (15.0 ms)",
               "pretty throughput record mismatch");
     ThroughputReport single_decode;
     single_decode.interval_seconds                     = 5.000168;
@@ -881,9 +846,8 @@ int main() {
     const Json tail_json  = Json::parse(format_throughput_json("serve-test", 5125, tail));
     failures += check(
         tail_json.at("final_interval").get<bool>() && tail_json.at("interval_seconds") == 0.125 &&
-            tail_json.at("context_cache").at("occupancy").at("host_context_peak_occupied_bytes") ==
-                (20ULL << 20),
-        "shutdown interval or allocator high-water mark was lost");
+            tail_json.at("context_cache").at("occupancy").at("device_state_slots") == 3,
+        "shutdown interval or its occupancy gauges were lost");
     failures += check(throughput_json.at("tokens").at("computed_prefill") == 100 &&
                           throughput_json.at("tokens").at("committed_decode") == 40,
                       "throughput token deltas mismatch");
@@ -892,7 +856,6 @@ int main() {
     failures += check(throughput_json.at("scheduler").at("materializing") == 1 &&
                           throughput_json.at("scheduler").at("paused") == 2 &&
                           throughput_json.at("scheduler").at("replaying") == 1 &&
-                          throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
     failures += check(throughput_json.at("scheduling") == Json{{"preemptions", 3},
@@ -900,12 +863,6 @@ int main() {
                                                                {"replay_restores", 2},
                                                                {"replayed_tokens", 768}},
                       "scheduling counters were not reported as interval deltas");
-    failures += check(
-        throughput_json.at("context_cache").at("occupancy").at("host_context_occupied_bytes") ==
-                (16ULL << 20) &&
-            throughput_json.at("context_cache").at("occupancy").at("host_context_reserved_bytes") ==
-                (4ULL << 20),
-        "unified Host occupied and reserved gauges missing");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
                  0.015) < 1.0e-15 &&
@@ -939,10 +896,10 @@ int main() {
         "zero Host-work denominators must serialize as null");
     failures += check(
         throughput_json.at("context_cache").at("selections").at("root") == 1 &&
-            throughput_json.at("context_cache").at("state_transfers").at("h2d").at("bytes") == 32 &&
+            throughput_json.at("context_cache").at("state_operations").at("forks") == 32 &&
             throughput_json.at("context_cache").at("occupancy").at("device_state_slots") == 3 &&
-            throughput_json.at("context_cache").at("pressure").at("spill_pages") == 4 &&
-            throughput_json.at("context_cache").at("selections").at("checkpoint") == 2,
+            throughput_json.at("context_cache").at("partial_tail_cow_pages") == 4 &&
+            throughput_json.at("context_cache").at("selections").at("prefix") == 2,
         "context-cache throughput statistics missing or not interval-scoped");
 
     const std::filesystem::path log_path =

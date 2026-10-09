@@ -2,8 +2,8 @@
 
 A black-box A/B benchmark of two `infernix-serve` builds serving the same model on the same GPU,
 driven by a closed-loop replay of real agentic coding traffic over the OpenAI chat-completions
-API. Infernix runs its default hybrid prefix cache; an optional third arm runs Infernix build with
-the original prefix cache (`--use-original-prefix-caching`). It produces a
+API. An optional third arm runs another Infernix build or configuration (`AB_ALT_EXE`,
+`AB_ALT_EXTRA_FLAGS`). It produces a
 README-style comparison table covering:
 
 - **prefix-cache hits** (tokens served from cache, continuing turns that had to re-prefill);
@@ -121,7 +121,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
    python runner.py
    ```
 
-   `--arms treatment,alt,control` adds the original-prefix-cache arm (about 50 minutes; the arms
+   `--arms treatment,alt,control` adds the alternative arm (about 50 minutes; the arms
    always run in that order). `--seeds 42,43,44` runs every arm once per workload seed, seed by seed, into
    `<out>/seed-<n>`, and writes a combined report to `<out>/report.md`; each seed replays
    different observations. `--ctx N` skips calibration, `--scale F` stretches or shrinks the
@@ -138,9 +138,9 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_TREATMENT_EXE` | `build-windows\apps\Release\infernix-serve.exe` in this checkout |
 | `AB_CONTROL_EXE` | `bench\agentic_ab\control\build\apps\Release\ninfer-serve.exe` |
 | `AB_TREATMENT_EXTRA_FLAGS` | none |
-| `AB_ALT_EXTRA_FLAGS` | `--use-original-prefix-caching` (added to the treatment's flags) |
+| `AB_ALT_EXTRA_FLAGS` | none (added to the treatment's flags) |
 | `AB_ALT_EXE` | the treatment executable; another build puts a second Infernix build in the alt arm |
-| `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, original prefix cache") |
+| `AB_CONTROL_LABEL` / `AB_TREATMENT_LABEL` / `AB_ALT_LABEL` | none (the report calls the arms "NInfer + Windows port", "Infernix" and "Infernix, alternative") |
 | `AB_CONTROL_KIND` | `serve`; `strata` runs the control arm as a Strata server (below) |
 | `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | none, required for a Strata control / its `strata-unsloth-ud-q4_k_xl.json` |
 | `AB_STRATA_EXTRA_ARGS` | none (engine arguments added to the Strata config's) |

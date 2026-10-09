@@ -64,6 +64,20 @@ Frontend make_frontend(const FrontendResources& source, bool vision = true) {
 
 using PublishedOutput = infernix::models::qwen3_5::PublishedOutput;
 namespace fi          = infernix::models::qwen3_5::frontend;
+using TapHint         = infernix::runtime::prefix_cache::TapHint;
+using TapHintKind     = infernix::runtime::prefix_cache::TapHintKind;
+
+// The prefix-cache tap hints a request's own cache markers produced (explicit and automatic), in
+// marker order; the Engine's structural, opener and message-boundary hints are left out.
+std::vector<TapHint> marker_hints(const infernix::models::qwen3_5::PreparedPromptData& data) {
+    std::vector<TapHint> out;
+    for (const TapHint& hint : data.tap_hints.hints) {
+        if (hint.kind == TapHintKind::Explicit || hint.kind == TapHintKind::Automatic) {
+            out.push_back(hint);
+        }
+    }
+    return out;
+}
 
 constexpr std::string_view kThinkingControlGuidance =
     "\n\n Considering the limited time by the user, I have to give the solution based on the "
@@ -1419,18 +1433,16 @@ int test_text_and_image_prepare(const Frontend& frontend) {
     if (!prepared_data.vision_items.empty() &&
         !prepared_data.vision_items.front().token_spans.empty()) {
         const auto span            = prepared_data.vision_items.front().token_spans.front();
-        const auto explicit_marker = std::find_if(
-            prepared_data.context_cache.opportunities.begin(),
-            prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
-                return infernix::has_shared_candidate_evidence(
-                    opportunity.evidence, infernix::SharedCandidateEvidence::ExplicitBoundary);
-            });
-        failures += check(explicit_marker != prepared_data.context_cache.opportunities.end() &&
-                              explicit_marker->frontier >= span.begin + span.count &&
+        const auto& hints          = prepared_data.tap_hints.hints;
+        const auto explicit_marker = std::find_if(hints.begin(), hints.end(), [](const auto& hint) {
+            return hint.kind == TapHintKind::Explicit;
+        });
+        failures += check(explicit_marker != hints.end() &&
+                              explicit_marker->position >= span.begin + span.count &&
                               prepared_data.identity.rewrite_checkpoint &&
                               prepared_data.identity.rewrite_checkpoint->recovery_frontier ==
-                                  explicit_marker->frontier &&
-                              explicit_marker->frontier < prepared_data.token_ids.size(),
+                                  explicit_marker->position &&
+                              explicit_marker->position < prepared_data.token_ids.size(),
                           "media expansion did not remap the following message cache boundary");
     }
     if (image_patches.size() == 16 * 1536) {
@@ -1531,16 +1543,12 @@ int test_explicit_leading_instruction_cache_boundary() {
 
     const auto prepared        = frontend.prepare(std::move(input));
     const auto& data           = FrontendFactory::inspect(prepared);
-    const auto explicit_marker = std::find_if(
-        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
-        [](const auto& opportunity) {
-            return infernix::has_shared_candidate_evidence(
-                opportunity.evidence, infernix::SharedCandidateEvidence::ExplicitBoundary);
-        });
-    return check(explicit_marker != data.context_cache.opportunities.end() &&
-                     explicit_marker->kind == infernix::PromptCacheMarkerKind::SharedStablePrefix &&
-                     explicit_marker->frontier != 0 &&
-                     explicit_marker->frontier < data.token_ids.size(),
+    const auto& hints          = data.tap_hints.hints;
+    const auto explicit_marker = std::find_if(hints.begin(), hints.end(), [](const auto& hint) {
+        return hint.kind == TapHintKind::Explicit;
+    });
+    return check(explicit_marker != hints.end() && explicit_marker->position != 0 &&
+                     explicit_marker->position < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
                  "full-system marker");
 }
@@ -1619,7 +1627,7 @@ int test_trimmed_source_cache_boundaries() {
             input.context_cache.markers.push_back(marker);
             const auto prepared       = frontend.prepare(input);
             const auto& data          = FrontendFactory::inspect(prepared);
-            const auto& opportunities = data.context_cache.opportunities;
+            const auto opportunities  = marker_hints(data);
             if (item.prefix) {
                 const std::string expected =
                     "<|im_start|>" +
@@ -1627,8 +1635,8 @@ int test_trimmed_source_cache_boundaries() {
                     *item.prefix;
                 const bool matches =
                     opportunities.size() == 1 &&
-                    opportunities[0].frontier < data.token_ids.size() &&
-                    tokenizer.decode(std::span(data.token_ids).first(opportunities[0].frontier)) ==
+                    opportunities[0].position < data.token_ids.size() &&
+                    tokenizer.decode(std::span(data.token_ids).first(opportunities[0].position)) ==
                         expected;
                 if (!matches) {
                     std::cerr << "expression=" << item.expression
@@ -1689,13 +1697,11 @@ int test_source_part_recovery_boundary() {
                            : "<|im_start|>user\nseed<|im_end|>\n<|im_start|>" +
                                  std::string(role == infernix::ChatRole::User ? "user" : "system") +
                                  "\nalpha beta";
-                const auto frontier = data.context_cache.opportunities.empty()
-                                          ? 0U
-                                          : data.context_cache.opportunities.front().frontier;
+                const auto hints    = marker_hints(data);
+                const auto frontier = hints.empty() ? 0U : hints.front().position;
                 const auto& rewrite = data.identity.rewrite_checkpoint;
                 failures += check(
-                    frontier > 0 && frontier < data.token_ids.size() &&
-                        data.context_cache.opportunities.size() == 1 &&
+                    frontier > 0 && frontier < data.token_ids.size() && hints.size() == 1 &&
                         fixture_tokenizer().decode(std::span(data.token_ids).first(frontier)) ==
                             expected &&
                         rewrite && rewrite->frontier > frontier &&
@@ -1764,20 +1770,12 @@ int test_automatic_message_boundary_fallback() {
         });
         const auto prepared = frontend.prepare(std::move(input));
         const auto& data    = FrontendFactory::inspect(prepared);
-        const bool explicit_boundary =
-            infernix::has_shared_candidate_evidence(evidence, Evidence::ExplicitBoundary);
-        if (explicit_boundary) {
-            failures += check(data.context_cache.opportunities.empty(),
-                              "unproved explicit message boundary fell back to a content part");
-        } else {
-            failures +=
-                check(data.token_ids.size() > expected.size() &&
-                          std::equal(expected.begin(), expected.end(), data.token_ids.begin()) &&
-                          data.context_cache.opportunities.size() == 1 &&
-                          data.context_cache.opportunities.front().frontier == expected.size() &&
-                          data.context_cache.opportunities.front().evidence == evidence,
-                      "automatic message boundary lost the exact last source-part fallback");
-        }
+        // A message-boundary marker becomes a tap only at a proven message boundary: an
+        // unproved boundary yields no tap, whatever the marker's evidence.
+        failures += check(data.token_ids.size() > expected.size() &&
+                              std::equal(expected.begin(), expected.end(), data.token_ids.begin()) &&
+                              marker_hints(data).empty(),
+                          "unproved message boundary produced a cache tap");
     }
     return failures;
 }

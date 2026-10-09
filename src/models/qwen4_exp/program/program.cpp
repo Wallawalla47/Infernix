@@ -78,7 +78,7 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
     return impl_->reserve_units(units);
 }
 
-bool Program::start_pause(SequenceHandle sequence, bool, runtime::ExecutionTiming*) {
+bool Program::start_pause(SequenceHandle sequence, runtime::ExecutionTiming*) {
     return impl_->start_pause(sequence);
 }
 

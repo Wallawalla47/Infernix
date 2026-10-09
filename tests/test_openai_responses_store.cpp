@@ -30,8 +30,7 @@ ChatTurn text_turn(infernix::ChatRole role, std::string text) {
 
 StoredOpenAIResponse record(std::string id, OpenAIResponseContext context) {
     StoredOpenAIResponse value;
-    value.id          = std::move(id);
-    value.session_key = "session-" + value.id;
+    value.id = std::move(id);
     value.response =
         nlohmann::json{{"id", value.id}, {"object", "response"}, {"status", "completed"}};
     value.input_items.push_back(nlohmann::json{{"id", "msg_" + value.id}, {"type", "message"}});

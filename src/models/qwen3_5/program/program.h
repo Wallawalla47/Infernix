@@ -29,10 +29,6 @@ struct SequencePlanImpl;
 struct SequencePlannerImpl;
 struct RequestBasePlanImpl;
 struct ResumeStateImpl;
-struct DemotionPlan;
-struct ReleasePlan;
-struct ReclaimPlan;
-struct DemotionBatch;
 class ProgramImpl;
 struct ContractAccess;
 struct HybridQuoteImpl;
@@ -46,13 +42,6 @@ struct GraphExecutionProfile {
     std::uint32_t topology_class = 0;
 };
 enum class TextPhase { Prefill, Verify };
-
-struct PrefixShortlistKey {
-    std::array<std::uint64_t, 2> digests{};
-    std::uint32_t frontier                                                  = 0;
-    std::uint32_t identity_tag                                              = 0;
-    friend bool operator==(PrefixShortlistKey, PrefixShortlistKey) noexcept = default;
-};
 
 class SequencePlan {
 public:
@@ -112,10 +101,6 @@ public:
     RequestBasePlan& operator=(const RequestBasePlan&) = delete;
 
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
-    [[nodiscard]] const PreparedContextCache& context_cache() const noexcept;
-    [[nodiscard]] std::vector<std::uint32_t> capture_frontiers() const;
-    [[nodiscard]] std::optional<PrefixShortlistKey>
-    prefix_shortlist_key(std::uint32_t frontier) const noexcept;
 
 private:
     explicit RequestBasePlan(std::shared_ptr<detail::RequestBasePlanImpl> impl) noexcept;
@@ -139,50 +124,12 @@ private:
     friend struct detail::ContractAccess;
 };
 
-// One complete immutable state/KV coverage record. Generation protects reused descriptors.
-struct CheckpointHandle {
-    const void* owner                                                   = nullptr;
-    std::uint32_t index                                                 = 0;
-    std::uint64_t generation                                            = 0;
-    friend bool operator==(CheckpointHandle, CheckpointHandle) noexcept = default;
-};
-
-struct CheckpointMetadata {
-    std::uint32_t frontier       = 0;
-    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    bool leased                  = false;
-};
-
-struct CheckpointSummary {
-    PrefixShortlistKey key;
-    std::uint32_t frontier       = 0;
-    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    bool leased                  = false;
-    // Resources relevant to eviction; shared optional aliases are counted per record.
-    runtime::ContextResourceUsage evictable_resources;
-};
-
+// One admission source (docs/maintainer/hybrid-prefix-cache-spec.md §6): a quote of the
+// block-tree path and snapshot to resume from, or of a root start.
 struct SourceCandidate {
-    std::optional<CheckpointHandle> checkpoint;
     std::uint32_t reused_tokens = 0;
-    runtime::PrefillWork remaining_work;
-    std::vector<runtime::ContextTransferRequirement> transfers;
-    bool consume_source = false;
-    bool take_private   = false;
-    bool move_state     = false;
-    bool move_history   = false;
-    bool split_state    = false;
-    bool backup_state   = false;
-    // Compatible carry intent. Binding may consume the selected point if its State slot
-    // is necessary for execution and no preservation destination can be obtained.
-    std::vector<CheckpointHandle> private_points;
-    // Authorized retirement, applied only after binding capacity has been checked.
-    std::vector<CheckpointHandle> retired_points;
-    // Hybrid prefix cache source (docs/maintainer/hybrid-prefix-cache-spec.md §6): a quote of
-    // the block-tree path and snapshot to resume from, or of a root start. A binding started from
-    // it activates the lane from cached blocks instead of a checkpoint.
     std::shared_ptr<const detail::HybridQuoteImpl> hybrid;
-    PrefixReusePath reuse_path = PrefixReusePath::Checkpoint;
+    PrefixReusePath reuse_path = PrefixReusePath::Root;
 };
 
 struct BindingReservation {
@@ -190,8 +137,6 @@ struct BindingReservation {
     bool source_valid      = true;
     bool capacity_possible = true;
     runtime::ContextResourceUsage shortage;
-    std::vector<CheckpointHandle> retired_points;
-    std::optional<CheckpointHandle> consumed_source;
 
     explicit operator bool() const noexcept { return reserved; }
 };
@@ -247,53 +192,6 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_host_refusals         = 0;
 };
 
-struct ContextDemotion {
-    std::vector<CheckpointHandle> sources;
-    std::size_t host_bytes = 0;
-    runtime::ContextResourceUsage released;
-    std::shared_ptr<const detail::DemotionPlan> impl;
-};
-
-struct ContextRelease {
-    std::vector<CheckpointHandle> sources;
-    // Guaranteed release in the queried shortage pool; other quantities are not inventoried.
-    runtime::ContextResourceUsage released;
-    std::shared_ptr<const detail::ReleasePlan> impl;
-};
-
-class ContextDemotionBatch {
-public:
-    ContextDemotionBatch(ContextDemotionBatch&&) noexcept;
-    ContextDemotionBatch& operator=(ContextDemotionBatch&&) noexcept;
-    ~ContextDemotionBatch();
-    ContextDemotionBatch(const ContextDemotionBatch&)            = delete;
-    ContextDemotionBatch& operator=(const ContextDemotionBatch&) = delete;
-
-    [[nodiscard]] bool append(const ContextDemotion&);
-    [[nodiscard]] bool covers(const ContextRelease&) const;
-    [[nodiscard]] std::optional<ContextDemotion> finish() const;
-
-private:
-    explicit ContextDemotionBatch(std::unique_ptr<detail::DemotionBatch>);
-    std::unique_ptr<detail::DemotionBatch> impl_;
-    friend struct ContextReclaimPlan;
-};
-
-// Read-only facts for one synchronous evaluation. Discard before any Native mutation or yield.
-// start_demote independently revalidates the selected quote before reserving destinations.
-struct ContextReclaimPlan {
-    std::vector<ContextDemotion> demotions;
-    std::vector<ContextRelease> releases;
-
-    [[nodiscard]] ContextDemotionBatch begin_kv_batch(runtime::ContextResourceUsage shortage) const;
-    [[nodiscard]] std::uint64_t recovery_loss(std::span<const CheckpointHandle> removed,
-                                              std::span<const CheckpointHandle> surviving) const;
-
-private:
-    std::shared_ptr<detail::ReclaimPlan> impl_;
-    friend class detail::ProgramImpl;
-};
-
 class ResumeState {
 public:
     ResumeState(ResumeState&&) noexcept;
@@ -301,8 +199,6 @@ public:
     ~ResumeState();
     ResumeState(const ResumeState&)            = delete;
     ResumeState& operator=(const ResumeState&) = delete;
-    [[nodiscard]] bool has_snapshot() const noexcept;
-    [[nodiscard]] std::optional<CheckpointHandle> snapshot_handle() const noexcept;
     [[nodiscard]] std::uint32_t frontier() const noexcept;
 
 private:
@@ -375,7 +271,6 @@ struct PrefillProgress {
     bool complete                         = false;
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
-    bool capture_ready = false;
     std::optional<PromptReadout> readout;
 };
 
@@ -395,7 +290,6 @@ struct CommitRowResult {
 
 struct CommitResult {
     std::array<CommitRowResult, kMaximumConcurrency> rows{};
-    std::array<bool, kMaximumConcurrency> capture_ready{};
     std::size_t row_count = 0;
     runtime::ExecutionTiming timing;
 };
@@ -410,7 +304,6 @@ struct FinishResult {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::vector<ConstrainedDraw> constrained_draws;
-    std::optional<CheckpointHandle> checkpoint;
 };
 
 struct AbortResult {
@@ -420,19 +313,12 @@ struct AbortResult {
 };
 
 struct ReplayProgress {
-    bool capture_ready             = false;
     std::uint32_t processed_tokens = 0;
     bool complete                  = false;
     runtime::ExecutionTiming timing;
 };
 
-struct CapturePreparation {
-    std::uint32_t frontier = 0;
-    bool reserved          = false;
-    runtime::ContextResourceUsage shortage;
-    std::size_t host_bytes = 0;
-};
-enum class ContextOperationKind : std::uint8_t { Bind, Capture, Demote, Pause };
+enum class ContextOperationKind : std::uint8_t { Bind, Pause };
 
 struct ContextProgress {
     ContextOperationKind kind = ContextOperationKind::Bind;
@@ -442,10 +328,6 @@ struct ContextProgress {
     std::optional<SequenceHandle> sequence;
     std::optional<ResumeState> paused;
     bool replaying = false;
-    std::vector<CheckpointHandle> private_points;
-    std::vector<CheckpointHandle> retired_checkpoints;
-    std::vector<CheckpointHandle> captured_checkpoints;
-    std::vector<runtime::ContextTransferObservation> transfers;
     runtime::ContextOperationCounts operations;
     std::optional<GenerationTimings> request_timings;
     SpeculativeStats request_speculative;
@@ -454,10 +336,6 @@ struct ContextProgress {
 struct PhysicalUsageSnapshot {
     runtime::ContextResourceUsage occupied;
     runtime::ContextResourceUsage capacity;
-    std::size_t host_reserved_bytes      = 0;
-    std::size_t host_peak_occupied_bytes = 0;
-    std::uint32_t host_state_slots       = 0;
-    std::size_t host_kv_bytes            = 0;
 };
 
 class Program {
@@ -471,58 +349,18 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
                                            const ScoreOptions& options);
-    [[nodiscard]] std::optional<SourceCandidate>
-    inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
-                   bool consume_source                              = false,
-                   std::span<const CheckpointHandle> private_points = {},
-                   std::span<const CheckpointHandle> retired_points = {}) const;
-    [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
-    [[nodiscard]] runtime::ContextResourceUsage
-        checkpoint_footprint(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle checkpoint) const;
-    [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle checkpoint) const;
-    [[nodiscard]] bool checkpoint_matches(CheckpointHandle checkpoint,
-                                          const RequestBasePlan& base) const;
-    [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle retained,
-                                                             const RequestBasePlan& base,
-                                                             std::uint32_t target) const;
-    [[nodiscard]] std::uint64_t
-    checkpoint_recovery_loss(std::span<const CheckpointHandle> removed,
-                             std::span<const CheckpointHandle> surviving) const;
-    [[nodiscard]] bool valid_checkpoint(CheckpointHandle checkpoint) const noexcept;
-    [[nodiscard]] bool release_checkpoint(CheckpointHandle checkpoint) noexcept;
-    [[nodiscard]] bool revoke_snapshot(ResumeState& paused) noexcept;
-    [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
-    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
-    [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
-    [[nodiscard]] std::size_t
-    release_redundant_host(std::span<const CheckpointHandle> excluded,
-                           std::optional<SequenceHandle> pending_backup = std::nullopt);
     // Reservations stay owned by their lane through commit. Failure leaves prior permits intact.
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit> units);
-    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle> sequences) noexcept;
     [[nodiscard]] BindingReservation
     start_binding(const RequestBasePlan& base, runtime::LaneId lane, const SourceCandidate& source,
                   ResumeState* resume           = nullptr,
                   ExecutionUnitKind resume_kind = ExecutionUnitKind::Decode,
                   std::uint32_t resume_tokens   = 1);
-    [[nodiscard]] bool start_capture(SequenceHandle sequence);
-    [[nodiscard]] bool capture_is_input(SequenceHandle sequence) const;
-    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle sequence);
-    void skip_capture(SequenceHandle sequence);
-    // Finite physical actions, each including every optional holder needed for its release.
-    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle> allowed,
-                                                  std::span<const CheckpointHandle> excluded,
-                                                  runtime::ContextResourceUsage shortage) const;
-    [[nodiscard]] std::vector<ContextRelease>
-    plan_releases(std::span<const CheckpointHandle> allowed,
-                  std::span<const CheckpointHandle> excluded,
-                  runtime::ContextResourceUsage shortage) const;
-    [[nodiscard]] bool start_demote(const ContextDemotion& plan);
-    [[nodiscard]] bool start_pause(SequenceHandle sequence, bool save_snapshot,
+    // Releases the lane and opens a Pause transaction that returns the request's ResumeState: its
+    // ledger, frontier and request-level state. The resume binding restores the deepest cached
+    // state up to the frontier and replays the rest.
+    [[nodiscard]] bool start_pause(SequenceHandle sequence,
                                    runtime::ExecutionTiming* timing = nullptr);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView cancellation);
     [[nodiscard]] bool has_context_transaction() const noexcept;

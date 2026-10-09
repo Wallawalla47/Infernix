@@ -223,7 +223,7 @@ def logged_campaign(tmp_path, records, events, *, required=()):
 
 def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
     return {
-        "artifact_type": "infernix_serve_request_log", "schema_version": 23,
+        "artifact_type": "infernix_serve_request_log", "schema_version": 27,
         "event": "request_done", "server_instance_id": "serve-test",
         "request": {"request_id": service_id, "http_request_id": wire_id,
                     "response_id": response_id},
@@ -234,7 +234,6 @@ def done_event(service_id, wire_id, response_id, *, preemptions=0, replay=0):
                 "preemptions": preemptions, "snapshot_restores": 0,
                 "replay_restores": replay, "replayed_tokens": 192 if replay else 0,
                 "paused_ns": 100_000_000 if preemptions else 0,
-                "device_to_host_bytes": 0, "host_to_device_bytes": 0,
             },
         },
     }
@@ -297,14 +296,9 @@ def test_mechanism_not_observed_keeps_valid_performance(tmp_path):
     assert summary["ttft_groups"][0]["median_ttft_ns"] == 4_000_000
 
 
-def runtime_interval(*, schema=23, final=None, state_bytes=0, main_bytes=0,
-                     host_seconds=0.0, occupied=0, peak=None):
-    occupancy = {"device_state_slots": 1, "device_main_kv_pages": 8,
-                 "device_backend_kv_pages": 0, "host_state_slots": 1,
-                 "host_kv_bytes": occupied, "host_context_occupied_bytes": occupied,
-                 "host_context_reserved_bytes": 0}
-    if peak is not None:
-        occupancy["host_context_peak_occupied_bytes"] = peak
+def runtime_interval(*, schema=27, final=None, host_seconds=0.0, main_pages=8):
+    occupancy = {"device_state_slots": 1, "device_main_kv_pages": main_pages,
+                 "device_backend_kv_pages": 0}
     event = {
         "artifact_type": "infernix_serve_request_log", "schema_version": schema,
         "event": "throughput", "server_instance_id": "serve-test",
@@ -315,51 +309,41 @@ def runtime_interval(*, schema=23, final=None, state_bytes=0, main_bytes=0,
     }
     if final is not None:
         event["final_interval"] = final
-    for resource, amount in (("state", state_bytes), ("main_kv", main_bytes), ("backend_kv", 0)):
-        unit = "count" if resource == "state" else "pages"
-        event["context_cache"][f"{resource}_transfers"] = {
-            direction: {"bytes": amount if direction == "d2h" else 0,
-                        "seconds": 0.001 if direction == "d2h" else 0.0, unit: 1}
-            for direction in ("d2h", "h2d", "d2d")
-        }
     return event
 
 
-def test_global_intervals_include_unowned_demotion_and_shutdown_tail(tmp_path):
+def test_global_intervals_include_shutdown_tail(tmp_path):
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     summary = summarize_campaign(logged_campaign(tmp_path, [measured], [
         done_event(1, "req_wire", "response-a"),
-        runtime_interval(final=False, main_bytes=100, host_seconds=0.1, occupied=800, peak=900),
-        runtime_interval(final=True, state_bytes=25, main_bytes=50,
-                         host_seconds=0.02, occupied=200, peak=1000),
+        runtime_interval(final=False, host_seconds=0.1, main_pages=800),
+        runtime_interval(final=True, host_seconds=0.02, main_pages=200),
     ]))
     global_work = summary["global_runtime_observations"][0]
     assert global_work["status"] == "available"
     assert global_work["shutdown_tail"] == "observed"
     assert global_work["intervals"] == 2
     assert global_work["reported_interval_seconds"] == 1.125
-    assert global_work["transfers"]["main_kv"]["d2h"]["bytes"] == 150
-    assert global_work["transfers"]["state"]["d2h"]["bytes"] == 25
     assert global_work["host_work"]["elapsed_seconds"]["total"] == pytest.approx(0.12)
     assert global_work["host_work"]["device_wait_seconds"] == 0.5
-    assert global_work["occupancy"]["host_context_occupied_bytes"] == {"sampled_max": 800, "last": 200}
-    assert global_work["host_context_peak_occupied_bytes"] == 1000
-    assert summary["stream_observations"][0]["device_to_host_bytes"] == 0
+    assert global_work["occupancy"]["device_main_kv_pages"] == {"sampled_max": 800, "last": 200}
+    assert summary["stream_observations"][0]["paused_ns"] == 0
     markdown = render_markdown(summary)
     assert "Global runtime costs" in markdown and "Sampled max" in markdown
 
 
 def test_missing_runtime_fields_remain_explicit(tmp_path):
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
-    event = runtime_interval(main_bytes=100)
-    del event["context_cache"]["backend_kv_transfers"]["h2d"]["seconds"]
+    event = runtime_interval()
+    del event["host_work"]["device_wait_seconds"]
+    del event["context_cache"]["occupancy"]["device_backend_kv_pages"]
     summary = summarize_campaign(logged_campaign(tmp_path, [measured], [event]))
     global_work = summary["global_runtime_observations"][0]
     assert global_work["status"] == "available"
     assert global_work["shutdown_tail"] == "unconfirmed"
-    assert global_work["host_context_peak_occupied_bytes"] is None
-    assert global_work["transfers"]["main_kv"]["d2h"]["bytes"] == 100
-    assert global_work["transfers"]["backend_kv"]["h2d"]["seconds"] is None
+    assert global_work["host_work"]["device_wait_seconds"] is None
+    assert global_work["occupancy"]["device_backend_kv_pages"]["sampled_max"] is None
+    assert global_work["occupancy"]["device_main_kv_pages"]["last"] == 8
     assert summary["stream_observations"][0]["preemptions"] is None
 
 
@@ -443,7 +427,6 @@ def first_output_event():
                     "post_seconds": 0.001, "gpu_seconds": 0.007},
         "replay": {"submit_seconds": 0, "wait_seconds": 0,
                    "post_seconds": 0, "gpu_seconds": 0},
-        "context_transfers": {"main_kv": {"h2d": {"bytes": 1024, "seconds": 0.008}}},
     }
     return event
 
@@ -451,10 +434,10 @@ def first_output_event():
 def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path):
     measured = record([output(101_000_000), ProtocolEvent("terminal", "done", 102_000_000)])
     done = first_output_event()
-    done["schema_version"] = 25
+    done["schema_version"] = 27
     done["generation"]["admission"] = {
         "preferred_reused_tokens": 19057, "source_wait_seconds": 0.003,
-        "revoked_checkpoints": 1, "fallback_reason": "source_revoked",
+        "fallback_reason": "source_invalid",
     }
     start = {**done, "event": "request_start",
              "preparation_seconds": {"total": 0.015, "acquisition": 0.003, "tokenize": 0.010}}
@@ -467,8 +450,7 @@ def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path
     row = summary["request_timing_analysis"][0]
     assert row["preferred_reused_tokens"] == 19057
     assert row["source_wait_ms"] == 3.0
-    assert row["revoked_checkpoints"] == 1
-    assert row["admission_fallback_reason"] == "source_revoked"
+    assert row["admission_fallback_reason"] == "source_invalid"
 
     assert row["analysis_status"] == "available"
     assert row["ttft_ms"] == 100
@@ -482,8 +464,6 @@ def test_first_output_partition_preserves_terminal_and_overlapping_work(tmp_path
                ("prepare", "queue", "initial_binding", "paused", "resident", "http_residual")) == pytest.approx(100)
     assert row["prefill_program_ms"] == 9
     assert row["prefill_gpu_ms"] == 7
-    assert row["main_kv_h2d_ms"] == 8
-    assert row["state_d2h_ms"] is None
     assert row["preemptions_before_first"] == 1
     assert summary["stream_observations"][0]["preemptions"] == 9
     csv_rows = list(csv.DictReader(io.StringIO(render_request_analysis_csv(summary))))
@@ -626,10 +606,10 @@ def test_replay_progress_uses_engine_interval_and_subtracts_self(tmp_path, other
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 24
+    done["schema_version"] = 27
     def transition(name, at, replayed, decoded):
         return {
-            "artifact_type": "infernix_serve_request_log", "schema_version": 24,
+            "artifact_type": "infernix_serve_request_log", "schema_version": 27,
             "event": "request_scheduling", "server_instance_id": "serve-test",
             "request": {"request_id": 1, "http_request_id": "req_wire"},
             "engine_request_id": 11, "preemption_index": 1, "route": "replay",
@@ -673,9 +653,9 @@ def test_replay_evidence_missing_events_cannot_prove_no_other_progress(tmp_path,
     measured = record([output(5_000_000), ProtocolEvent("terminal", "done", 15_000_000)])
     measured["response_id"] = "response-a"
     done = done_event(1, "req_wire", "response-a", preemptions=1, replay=1)
-    done["schema_version"] = 24
+    done["schema_version"] = 27
     event = {
-        "artifact_type": "infernix_serve_request_log", "schema_version": 24,
+        "artifact_type": "infernix_serve_request_log", "schema_version": 27,
         "event": "request_scheduling", "server_instance_id": "serve-test",
         "request": {"request_id": 1, "http_request_id": "req_wire"},
         "engine_request_id": 11, "preemption_index": 1, "route": "replay",

@@ -3,7 +3,6 @@
 
 #include "core/arena.h"
 #include "core/gdn_replay_records.h"
-#include "core/host_kv_arena.h"
 #include "infernix/ops/gdn_replay.h"
 #include "infernix/ops/sampling.h"
 #include "infernix/ops/speculative_tree.h"
@@ -13,11 +12,9 @@
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/speculative/tree_width_controller.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
-#include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_address_space.h"
 #include "models/qwen3_5/program/storage/state_store.h"
-#include "models/qwen3_5/program/prefix_identity.h"
-#include "core/host_context_arena.h"
+#include "models/qwen3_5/program/ledger_splits.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_prefill.h"
@@ -45,19 +42,6 @@ namespace infernix::models::qwen3_5::detail {
 using execution::dimension;
 using PreparedPromptData = qwen3_5::PreparedPromptData;
 
-struct PreparedCaptureBacking {
-    PrefixShortlistDigests digests;
-    std::vector<TokenId> ledger;
-    qwen3_5::detail::ResidentPrefixIdentity prefix_identity;
-};
-
-struct CaptureGroup {
-    std::shared_ptr<const PreparedCaptureBacking> identity;
-    PrefixShortlistKey key;
-    std::uint32_t frontier = 0;
-    std::vector<runtime::CheckpointRole> roles;
-};
-
 enum class MtpBridgeMode : std::uint8_t {
     None,
     BeforeSuffix,
@@ -84,23 +68,15 @@ struct RequestConstraintPlan {
 struct RequestBasePlanImpl {
     std::shared_ptr<const PreparedPromptData> prompt;
     runtime::RequestPlanSummary summary;
-    qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     // Tokens whose prompt-frontier log-probabilities complete the request's prefill.
     std::vector<TokenId> readout_tokens;
     RequestConstraintPlan constraint;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
-    std::vector<CaptureGroup> capture_groups;
-    std::shared_ptr<const PreparedCaptureBacking> capture_backing;
-    PrefixShortlistDigests prefix_digests;
-    std::uint32_t prefix_identity_tag = 0;
-    bool allow_prefix_reuse           = false;
+    bool allow_prefix_reuse = false;
     // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
     // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
     std::shared_ptr<PreparedNgramIndex> ngram_index;
-
-    [[nodiscard]] bool accepts_capture(std::uint32_t frontier) const noexcept;
-    [[nodiscard]] CaptureGroup capture_group(std::uint32_t frontier) const;
 };
 enum class PendingKind : std::uint8_t { None, Begin, Ordinary, Speculative };
 
@@ -145,8 +121,7 @@ struct SequenceKVBundle {
     std::optional<KVAddressSpaceHandle> backend;
 };
 
-// One mutable KV directory shared by the internal recovery points of a private history.
-// Independent public/branch views own a different history and share only physical prefix pages.
+// The KV address spaces of one active sequence; cached prefix blocks share only physical pages.
 struct KVHistory {
     ProgramImpl* owner = nullptr;
     KVAddressSpaceHandle text;
@@ -211,8 +186,8 @@ struct SequenceState {
     std::uint32_t execution_frontier = 0;
     std::uint32_t ledger_frontier    = 0;
     std::vector<TokenId> ledger;
-    qwen3_5::detail::ResidentPrefixIdentity prefix_identity;
-    qwen3_5::detail::PrefixShortlistDigests prefix_digests;
+    // Execution frontiers (rewrite splits) of the ledger, which replay reproduces.
+    LedgerSplits ledger_splits;
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
@@ -221,17 +196,6 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
-};
-
-struct CaptureReservation {
-    ProgramImpl* owner = nullptr;
-    std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> points;
-    StateImageHandle state;
-    std::optional<HostContextAllocation> host;
-    std::optional<DeviceKVPageReservation> main_tail;
-    std::optional<DeviceKVPageReservation> backend_tail;
-    std::uint32_t frontier = 0;
-    ~CaptureReservation();
 };
 
 struct RequestControl {
@@ -249,14 +213,9 @@ struct RequestControl {
     std::shared_ptr<const RequestBasePlanImpl> base;
     std::optional<UnitDemand> permit;
     std::optional<RecoveryPermit> recovery;
-    std::unique_ptr<CaptureReservation> capture_reservation;
     std::uint32_t replay_target = 0;
     std::uint32_t replay_cursor = 0;
     Lifecycle resume_lifecycle  = Lifecycle::Empty;
-    bool publish_continuation   = true;
-    std::vector<CaptureGroup> capture_groups;
-    std::size_t next_capture = 0;
-    bool capture_pending     = false;
     // Constrained requests: the draws of the pending candidate (one per produced token, in
     // order) and the committed trace they move into.
     std::vector<ConstrainedDraw> constraint_round;
@@ -281,32 +240,12 @@ struct RequestControl {
     std::optional<Prefill> replay;
 };
 
-struct CheckpointState {
-    std::shared_ptr<KVHistory> kv;
-    runtime::CheckpointRole role = runtime::CheckpointRole::Continuation;
-    StateImageHandle state;
-    std::shared_ptr<const PreparedCaptureBacking> identity;
-    PrefixShortlistKey key;
-    std::uint32_t frontier         = 0;
-    std::uint32_t backend_frontier = 0;
-    std::int32_t rope_delta        = 0;
-    bool tail_hidden_valid         = false;
-};
-
-struct CheckpointSlot {
-    std::optional<CheckpointState> value;
-    std::uint64_t generation = 1;
-    std::uint32_t pins       = 0;
-    bool reserved            = false;
-};
-
+// A paused request: its ledger, frontier and request-level state. Its lane's state and KV were
+// released at the pause.
 struct ResumeStateImpl {
-    ProgramImpl* owner = nullptr;
-    std::optional<CheckpointHandle> snapshot;
     SequenceState sequence;
     RequestControl control;
     std::uint32_t frontier = 0;
-    ~ResumeStateImpl();
 };
 
 // Hybrid prefix cache admission decision (docs/maintainer/hybrid-prefix-cache-spec.md §6): the
@@ -374,54 +313,12 @@ public:
                                                const runtime::ResolvedExecutionOptions&);
     [[nodiscard]] ScoreResult causal_score(PreparedPromptData&&, std::uint32_t first_target,
                                            const ScoreOptions& options);
-    [[nodiscard]] std::optional<SourceCandidate>
-    inspect_source(const RequestBasePlan&, std::optional<CheckpointHandle>, bool = false,
-                   std::span<const CheckpointHandle> = {},
-                   std::span<const CheckpointHandle> = {}) const;
-    [[nodiscard]] PrefixShortlistKey checkpoint_key(CheckpointHandle, std::uint32_t frontier) const;
-    [[nodiscard]] runtime::ContextResourceUsage
-        checkpoint_footprint(std::span<const CheckpointHandle>) const;
-    [[nodiscard]] CheckpointSummary checkpoint_summary(CheckpointHandle) const;
-    [[nodiscard]] CheckpointMetadata checkpoint_metadata(CheckpointHandle) const;
-    [[nodiscard]] bool checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const;
-    [[nodiscard]] std::uint32_t checkpoint_recovery_frontier(CheckpointHandle,
-                                                             const RequestBasePlan&,
-                                                             std::uint32_t target) const;
-    [[nodiscard]] std::uint64_t checkpoint_recovery_loss(std::span<const CheckpointHandle>,
-                                                         std::span<const CheckpointHandle>) const;
-    [[nodiscard]] bool can_release_checkpoint(CheckpointHandle) const noexcept;
-    [[nodiscard]] std::optional<runtime::ContextResourceUsage>
-        checkpoint_release_resources(std::span<const CheckpointHandle>,
-                                     runtime::ContextResourceUsage) const;
-    [[nodiscard]] bool release_checkpoint(CheckpointHandle) noexcept;
-    void refresh_history_requirements(const std::shared_ptr<KVHistory>&, bool trim_unused = false);
-    [[nodiscard]] bool revoke_snapshot(ResumeState&) noexcept;
-    [[nodiscard]] runtime::ContextResourceUsage snapshot_resources(const ResumeState& paused) const;
-    // Exact Host bytes freed by deleting this fixed set, with physical sharing counted once.
-    [[nodiscard]] std::size_t
-    host_bytes_released(std::span<const CheckpointHandle> checkpoints) const;
-    [[nodiscard]] std::optional<std::size_t> pause_host_bytes(SequenceHandle sequence) const;
-    [[nodiscard]] std::size_t
-    release_redundant_host(std::span<const CheckpointHandle> excluded,
-                           std::optional<SequenceHandle> pending_backup = std::nullopt);
     [[nodiscard]] runtime::ResourceReservation reserve_units(std::span<const ExecutionUnit>);
-    [[nodiscard]] bool reclaim_capture_reservation(runtime::ContextResourceUsage shortage);
     void release_units(std::span<const SequenceHandle>) noexcept;
     [[nodiscard]] BindingReservation start_binding(const RequestBasePlan&, runtime::LaneId,
                                                    const SourceCandidate&, ResumeState*,
                                                    ExecutionUnitKind, std::uint32_t);
-    [[nodiscard]] bool start_capture(SequenceHandle);
-    [[nodiscard]] bool capture_is_input(SequenceHandle) const;
-    [[nodiscard]] std::optional<CapturePreparation> prepare_capture(SequenceHandle);
-    void skip_capture(SequenceHandle);
-    [[nodiscard]] ContextReclaimPlan plan_reclaim(std::span<const CheckpointHandle>,
-                                                  std::span<const CheckpointHandle>,
-                                                  runtime::ContextResourceUsage) const;
-    [[nodiscard]] std::vector<ContextRelease> plan_releases(std::span<const CheckpointHandle>,
-                                                            std::span<const CheckpointHandle>,
-                                                            runtime::ContextResourceUsage) const;
-    [[nodiscard]] bool start_demote(const ContextDemotion&);
-    [[nodiscard]] bool start_pause(SequenceHandle, bool save_snapshot, runtime::ExecutionTiming*);
+    [[nodiscard]] bool start_pause(SequenceHandle, runtime::ExecutionTiming*);
     [[nodiscard]] ContextProgress poll_context(runtime::CancellationFlagView);
 
     [[nodiscard]] bool has_context_transaction() const noexcept {
@@ -509,17 +406,11 @@ public:
     DeviceArena workspace_storage;
     WorkspaceArena work;
     std::unique_ptr<qwen3_5::DecoderState> decoder;
-    std::unique_ptr<HostContextArena> host_context_arena;
-    std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> text_kv_addresses;
     std::unique_ptr<LogicalKVPageStore> backend_kv_pages;
     std::unique_ptr<KVAddressSpaceStore> backend_kv_addresses;
-    std::unique_ptr<HostKVExtentStore> host_kv_extents;
-    std::size_t text_host_kv_page_stride    = 0;
-    std::size_t backend_host_kv_page_stride = 0;
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
-    std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
@@ -550,7 +441,6 @@ public:
     std::uint64_t next_constraint_serial_ = 1;
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
-    std::vector<CheckpointSlot> checkpoints;
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
@@ -579,68 +469,28 @@ public:
     std::optional<PendingTransaction> pending_transaction_;
     std::uint64_t next_transaction_id_ = 1;
 
-    struct KVTransfer {
-        LogicalKVPageStore* pages              = nullptr;
-        runtime::ContextResourceClass resource = runtime::ContextResourceClass::MainKV;
-        std::vector<LogicalKVPageHandle> logical;
-        std::vector<DeviceKVPageHandle> physical;
-        std::optional<HostKVExtentReservation> host_destination;
-        std::optional<DeviceKVPageReservation> device_reservation;
-        bool restore     = false;
-        bool drop_device = false;
-    };
-
+    // A binding from a prefix cache source, or a pause.
     struct ContextTransaction {
         ContextOperationKind kind = ContextOperationKind::Bind;
         std::uint32_t lane        = 0;
         std::uint64_t epoch       = 0;
-        std::optional<CheckpointHandle> source;
-        std::vector<std::pair<CheckpointHandle, runtime::CheckpointRole>> capture_points;
-        std::vector<CheckpointHandle> carried_points;
-        std::vector<CheckpointHandle> carried_pins;
-        std::vector<std::pair<CheckpointHandle, CheckpointHandle>> carried_clones;
-        std::vector<CheckpointHandle> retired_points;
         std::shared_ptr<const RequestBasePlanImpl> base;
-        ResumeState* resume  = nullptr;
-        bool resume_snapshot = false;
+        ResumeState* resume = nullptr;
         std::optional<ResumeState> paused;
-        std::optional<StateImageTransfer> state_transfer;
-        std::vector<KVTransfer> kv_transfers;
-        std::optional<KVPrefixForkReservation> text_fork;
-        std::optional<KVPrefixForkReservation> backend_fork;
         std::optional<KVActivationReservation> text_activation;
         std::optional<KVActivationReservation> backend_activation;
-        std::optional<KVActivePrefixViewReservation> text_view;
-        std::optional<KVActivePrefixViewReservation> backend_view;
         std::optional<StateImageHandle> reserved_state;
-        std::optional<DeviceKVPageReservation> main_growth;
-        std::optional<DeviceKVPageReservation> backend_growth;
-        bool binding_prepared          = false;
         std::uint32_t reuse_frontier   = 0;
         std::uint32_t backend_frontier = 0;
         UnitDemand first_unit;
         UnitDemand reservation_demand;
         std::optional<RecoveryPermit> recovery;
         std::optional<SequenceKVBundle> reserved_kv;
-        std::shared_ptr<KVHistory> binding_history;
-        std::shared_ptr<KVHistory> source_history;
-        std::vector<runtime::ContextTransferRequirement> transfers;
-        std::vector<runtime::ContextTransferObservation> observations;
         runtime::ContextOperationCounts operations;
-        bool submitted             = false;
-        bool preserve_state_device = true;
-        bool consume_source        = false;
-        bool take_private          = false;
-        bool split_state           = false;
-        bool backup_state          = false;
-        bool adopted               = false;
-        bool borrow_text           = false;
-        bool borrow_backend        = false;
-        bool borrow_state          = false;
-        bool source_tail_hidden    = false;
+        bool adopted = false;
 
-        // A binding from a hybrid prefix cache source: the pinned tree path and snapshot, the
-        // forks that share its pages, and the Host restore the source needs.
+        // The binding's source: the pinned tree path and snapshot, the forks that share its
+        // pages, and the Host restore the source needs.
         struct HybridBinding {
             std::shared_ptr<const HybridQuoteImpl> quote;
             std::vector<runtime::prefix_cache::NodeRef> path;
@@ -658,9 +508,6 @@ public:
     };
 
     std::optional<ContextTransaction> context_transaction_;
-    CudaCompletionEvent context_source_ready_;
-    CudaCompletionEvent context_completion_;
-    std::array<CudaEventTimer, 3> context_transfer_timers_;
     CudaEventTimer prefill_gpu_timer_;
 
     // Captured transfers and external events reference the buffers and events declared above.
@@ -679,31 +526,13 @@ public:
     void settle_unit(std::uint32_t lane) noexcept;
     [[nodiscard]] bool valid_sequence(SequenceHandle) const noexcept;
     [[nodiscard]] bool valid_pending(const PendingBatch&) const noexcept;
-    [[nodiscard]] bool valid_checkpoint(CheckpointHandle) const noexcept;
-    [[nodiscard]] CheckpointState& checkpoint(CheckpointHandle);
-    [[nodiscard]] const CheckpointState& checkpoint(CheckpointHandle) const;
-    [[nodiscard]] std::optional<CheckpointHandle> reserve_checkpoint();
-    [[nodiscard]] std::optional<CheckpointHandle> detach_checkpoint(SequenceState&);
     void abort_context() noexcept;
-    void enqueue_context_transfers(ContextTransaction&);
-    void enqueue_state_backup(ContextTransaction&);
-    void copy_local_for_context(ContextTransaction&, std::int32_t source, std::int32_t destination);
-    void copy_context_tail(ContextTransaction&, LogicalKVPageStore&, DeviceKVPageHandle source,
-                           DeviceKVPageHandle destination, runtime::ContextResourceClass);
-    void publish_context_transfers(ContextTransaction&);
-    [[nodiscard]] bool prepare_backup(ContextTransaction&, CheckpointState&, bool shared_device);
     void plan_binding_units(ContextTransaction&, const RequestBasePlan&, ResumeState*,
                             ExecutionUnitKind, std::uint32_t);
     void install_binding(ContextTransaction&);
-    void prepare_binding(ContextTransaction&);
-    void complete_binding(ContextTransaction&, ContextProgress&);
-    void publish_capture(ContextTransaction&);
-    [[nodiscard]] bool reserve_capture_destination(std::uint32_t lane, std::uint32_t frontier);
-    void prepare_capture_boundary(std::uint32_t lane);
     [[nodiscard]] ResumeState complete_pause(ContextTransaction&);
     void install_resume_sampling(SequenceState&, RequestControl&);
     void initialize_prefill(std::uint32_t lane, std::uint32_t base);
-    void initialize_captures(std::uint32_t lane, std::uint32_t from, std::uint32_t through);
     void preencode_overlay_vision(execution::VisionPrefillSession&, const PreparedPromptData&,
                                   const VisionPrefillPlan&, std::uint32_t base);
     [[nodiscard]] SequenceHandle sequence_handle(std::uint32_t lane) const noexcept;
@@ -715,7 +544,6 @@ public:
     void ordered_reset(SequenceState&);
     void refresh_state_views(SequenceState&);
     [[nodiscard]] StateImageSelectors state_selectors(const SequenceState&) const;
-    void settle_state_fork(SequenceState&);
     void release_sequence_state(SequenceState&) noexcept;
     void release_sequence_kv(SequenceState&) noexcept;
     void ensure_sequence_kv_mapped(SequenceState&, std::uint32_t main, std::uint32_t backend = 0);
@@ -737,12 +565,6 @@ public:
     resolve_pending_raw(std::span<const std::uint32_t>, std::span<const std::uint32_t>,
                         std::span<const std::uint8_t>, std::span<const std::uint8_t>,
                         std::span<const std::optional<std::uint32_t>>, runtime::ExecutionTiming*);
-    void start_context_transfer_timer(runtime::ContextResourceClass);
-    void stop_context_transfer_timer(runtime::ContextResourceClass);
-    [[nodiscard]] runtime::ContextTransferObservation
-        context_transfer_observation(runtime::ContextResourceClass,
-                                     runtime::ContextTransferDirection, TransferWork, std::uint32_t,
-                                     std::uint64_t) const;
     [[nodiscard]] runtime::BatchedGeneratedRound decode_raw(std::span<const std::uint32_t>,
                                                             std::span<const runtime::RoundBudget>,
                                                             runtime::ExecutionTiming*,
@@ -753,10 +575,9 @@ public:
     void set_device_i32(Tensor& tensor, std::int32_t value);
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
-    void
-    commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
-                                     std::span<const TokenId> accepted_tokens,
-                                     std::optional<std::uint32_t> prefix_execution_split_after);
+    void commit_generated_splits(SequenceState& sequence, std::uint32_t base_ledger_frontier,
+                                 std::span<const TokenId> accepted_tokens,
+                                 std::optional<std::uint32_t> prefix_execution_split_after);
     [[nodiscard]] runtime::ExecutionTiming
     resolve_non_speculative_pending(SequenceState& sequence, RequestControl& request,
                                     std::uint32_t accepted_tokens, bool terminal,
@@ -837,9 +658,10 @@ public:
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
 
     void create_hybrid_prefix_cache(const StartupObserver& observer);
-    // Stages a binding from a hybrid source: pins the quoted path and snapshot, makes room by
-    // evicting unpinned cached blocks, submits the Host restores the source needs and reserves
-    // the forks. Returns the remaining shortage when room cannot be made from the cache.
+    // Stages a binding: pins the quoted path and snapshot, makes room by evicting unpinned
+    // cached blocks, submits the Host restores the source needs and reserves the forks. Returns
+    // the remaining shortage when room cannot be made from the cache. Without a prefix cache
+    // every source is a root start.
     [[nodiscard]] BindingReservation
     start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
                          const SourceCandidate& candidate, ResumeState* resume,

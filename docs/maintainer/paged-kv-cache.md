@@ -1,12 +1,13 @@
 # Infernix Paged KV Context Store
 
 This document defines the physical storage and consumer contract of Infernix's growing KV. It is the
-maintainer authority for typed KV pools, logical pages, Device/Host replicas, address spaces,
-reservations, block tables and GPU consumer views.
+maintainer authority for typed KV pools, logical pages, address spaces, reservations, block tables and
+GPU consumer views.
 
-Request order and lifecycle are in [Engine architecture](engine-architecture.md); the checkpoint, cache
-retention, preemption and resource reclaim policy is in
-[Resource scheduling and context cache](resource-scheduling-and-context-cache.md). The KV Store fulfills
+Request order and lifecycle are in [Engine architecture](engine-architecture.md); preemption and
+resource policy are in [Resource scheduling](resource-scheduling-and-context-cache.md); prefix reuse,
+the cache's Host tier and eviction are in the [hybrid prefix cache](hybrid-prefix-cache-spec.md). The KV
+Store fulfills
 the physical requirements of the selected operations and provides model execution units with stable
 direct-access views.
 
@@ -41,7 +42,7 @@ The KV architecture distinguishes:
 |---|---|---|
 | allocation granularity | How much token payload a pool acquires or releases at once | `P=64` for every growing pool |
 | valid-frontier granularity | Which logical position a consumer can read up to | 1 token |
-| reusable-state granularity | Which frontier has a complete model continuation | target-defined checkpoint |
+| reusable-state granularity | Which frontier has a complete model continuation | target-defined snapshot |
 
 A page boundary is not an Attention mask boundary and not a prefix hit boundary. A valid frontier can
 lie at any offset inside a page.
@@ -49,8 +50,7 @@ lie at any offset inside a page.
 The KV Store can represent, truncate or protect a prefix at any token frontier; this does not prove the
 model can resume from that position.
 A reusable frontier requires both a complete StateImage and the target-defined backend state; the
-specific rules are in
-[Continuation and checkpoint](resource-scheduling-and-context-cache.md#checkpoints).
+specific rules are in the [hybrid prefix cache](hybrid-prefix-cache-spec.md).
 
 ---
 
@@ -151,7 +151,7 @@ B(M)=B_{min}+(M-M_{min})B_{step}
 where \(B(M)\) is the complete runtime Device reservation for that Main capacity, including:
 
 - the Main and selected backend typed pools;
-- active/checkpoint State storage;
+- active and snapshot State storage;
 - block tables and fixed persistent state;
 - the unified workspace;
 - the CUDA Graph allowance.
@@ -205,12 +205,11 @@ redistribute the pool geometry at runtime.
 
 ### 3.5 Host capacity
 
-StateImage, Main KV and the selected backend KV share a startup-fixed pinned `HostContextArena`.
-`HostKVArena` provides typed KV allocations on the same backing; each allocation carries its own page
-layout.
-Host capacity is charged by actual packed bytes and extent geometry, and does not raise the Device
-capacity or the single-sequence context ceiling. Input, the request ledger and other CPU data have their
-own lifecycles and are not counted against this physical context backing.
+The prefix cache's Host tier is one startup-fixed pinned slab pool that cached KV blocks and snapshot
+images share ([spec §5.4](hybrid-prefix-cache-spec.md)); Core's record-addressed Host copies move whole
+pages between it and the Device pools. It does not raise the Device capacity or the single-sequence
+context ceiling. Input, the request ledger and other CPU data have their own lifecycles and are not
+counted against it.
 
 ---
 
@@ -310,9 +309,9 @@ The physical payload per token/head of the D256 Main/MTP profiles is:
 | VQ2 | 64 B + 2 B | 64 B + 2 B | 132 B |
 
 The K/V code and scale planes have their own dtype, leading extent and group size; they still share
-page-group identity, frontier and lifetime. The capacity curve, Device/Host replicas, continuation
-transfers and memory summary are all computed from this typed plane inventory; `2 * vector_bytes` must
-not be used in place of K8V4's asymmetric byte count.
+page-group identity, frontier and lifetime. The capacity curve, the prefix cache's Host copies and
+the memory summary are all computed from this typed plane inventory; `2 * vector_bytes` must not be
+used in place of K8V4's asymmetric byte count.
 
 ### 4.4 Logical position domain
 
@@ -342,47 +341,34 @@ page size. Changing the page size, grouping or closed plane order is an architec
 
 ---
 
-## 5. Logical pages and replicas
+## 5. Logical pages
 
 ### 5.1 Logical page identity
 
-A Device page ID is only the physical location of the current Device replica, not prefix identity. The
-Program maintains generation-checked logical pages for each pool:
+A Device page ID is only the physical location of a page's payload, not prefix identity. The Program
+maintains generation-checked logical pages for each pool:
 
 ```text
 LogicalKVPage
 ├── object generation
-├── content epoch
 ├── committed columns [0, P]
 ├── protected columns
-├── address-space references
+├── address-space and prefix-cache references
 ├── active references and writer state
-├── optional Device page-group lease
-├── optional Host extent membership
-└── transaction pins
+├── Device page-group lease
+└── source pins and transfer-destination state
 ```
 
-A logical page's canonical content is identified by `content epoch + committed columns`. Speculative or
-not-yet-committed bytes do not extend committed coverage.
+Speculative or not-yet-committed bytes do not extend committed coverage.
 
-The same logical page keeps the same page index in every address space that references it. Fork and
-view share the prefix at its original position, COW and growth create new logical pages, and truncation
-only deletes the suffix; an address space also never references the same page twice.
-So when checking the complete holders of a selected page, the actual handle can be looked up by that
-page index within each checkpoint's coverage.
+The same logical page keeps the same page index in every address space that references it. A
+cached-prefix fork shares pages at their original position, COW and growth create new logical pages,
+and truncation only deletes the suffix; an address space also never references the same page twice.
 
-A replica is valid for the first \(n\) columns a checkpoint needs if and only if:
+### 5.2 Device page leases
 
-\[
-replica.epoch=page.epoch
-\quad\land\quad
-replica.coverage\ge n
-\]
-
-### 5.2 Device replica
-
-A Device replica uses the consumer-native plane layout of section 4. A `DeviceKVPageLease` exclusively
-owns one pool-local physical page group; the generation prevents stale handles after release/reuse.
+A page uses the consumer-native plane layout of section 4. A `DeviceKVPageLease` exclusively owns one
+pool-local physical page group; the generation prevents stale handles after release/reuse.
 
 A pool distinguishes, for the same capacity unit:
 
@@ -398,79 +384,37 @@ allocated+reserved+available=capacity
 
 Materialize turns a reservation into a lease; dematerialize returns a lease to the same reservation.
 Ordinary unit settlement releases the remainder; a protected resume keeps the remainder needed for
-future coverage and returns it after real new progress. Checkpoint aliases and shared history
-references do not occupy physical pages twice.
+future coverage and returns it after real new progress. Shared prefix references do not occupy
+physical pages twice.
 
-### 5.3 Host replica
+### 5.3 Transfer destinations and source pins
 
-A Host replica uses the logical-order packed `HostKVPageLayout`:
+A copy into a new page (a cached partial tail copied into a lane's private page, or a Host restore)
+materializes a transfer destination that no address space references yet; it is published to its
+owner only after the copy completes, and aborting it returns the page to its reservation. A source pin
+keeps a page's payload and coverage unchanged while a copy or fork reads it.
 
-- it stores no Device page IDs or block-table holes;
-- each page contains the full grouped plane payload of that typed pool;
-- a variable-size extent pays only for the actual page count;
-- Main/backend layouts can allocate extents of different strides in the same arena.
+Host transfers copy complete page payloads and can merge adjacent physical IDs into fewer transfer
+runs. Core chooses a 2D copy from the bound plane geometry: a short PageMajor run can merge planes of
+equal width and spacing, and HeadMajor can choose page or head as the outer submission dimension. The
+merged path is used only when it reduces the call count and the pitch is legal; the Host layout and
+payload do not change.
 
-The Host arena is a bounded variable-size allocator. State and the different KV layouts compete for the
-same backing with no fixed quotas between them. A request must satisfy alignment and contiguous extent
-geometry; `free_bytes` is only an occupancy summary, not sufficient proof of allocatability. A shared
-Host extent is counted once by its actual allocation, and a pending destination already occupies
-capacity before publication.
+### 5.4 Descriptor lifetime
 
-### 5.4 Replica transfer
-
-D2H/H2D transfers copy complete page payloads and can merge adjacent physical IDs into fewer transfer
-runs.
-Core chooses a 2D copy from the bound plane geometry: a short PageMajor run can merge planes of equal
-width and spacing, and HeadMajor can choose page or head as the outer submission dimension. The merged
-path is used only when it reduces the call count and the pitch is legal; the Host layout and payload do
-not change. Native records the actual bytes moved and call count from Core's return value.
-The publication order of a replacement replica is:
-
-```text
-reserve destination
-  -> copy page payload
-  -> verify epoch and committed coverage
-  -> publish replica
-  -> release source when no longer required
-```
-
-Both source and destination are pinned while the copy runs. Before the copy completes, the destination
-does not enter an address space or execution table, and the only valid source cannot be released first.
-
-### 5.5 Descriptor lifetime
-
-A logical descriptor is not a third copy of the payload. It can continue to exist in Device-only,
-Host-only or Both placements.
-Only when references, replicas and transaction pins are all zero can the descriptor be reclaimed and its
-generation advanced.
+A logical descriptor is reclaimed, and its generation advanced, when its last reference is released
+and no pin or transfer holds it; its Device lease returns to the pool.
 
 ---
 
 ## 6. KV history and address space
 
-### 6.1 Shared history and independent views
+### 6.1 KV history
 
-A `KVHistory` holds the Main and optional backend address spaces. A private continuation's current
-execution state and its internal restore points share the same history, and each restore point records
-its own required frontier and StateImage.
-
-```text
-private continuation
-├── current sequence ───────────┐
-├── input recovery checkpoint ──┼── KVHistory
-└── recent boundary checkpoint ─┘   ├── Main address space
-                                   └── selected backend address space
-```
-
-The history's directory can keep appending; an old restore point reads only the prefix it already
-protects. Keeping multiple restore points does not copy the complete KV directory or charge prefix pages
-twice. The Program maintains the protected range from the maximum Main/backend frontier of the surviving
-restore points.
-
-Independent branches and public shared prefixes hold their own history. They can share complete
-physical prefix pages but do not share the suffix of a mutable directory. Two independent computation
-results with the same token identity are still different content objects; State and KV must come from
-the same actual history.
+A `KVHistory` holds a sequence's Main and optional backend address spaces. The prefix cache's block tree
+holds its own references to the full pages a lane commits; a later request shares those pages through
+a cached-prefix fork, so two histories can share complete physical prefix pages but never the suffix of
+a mutable directory. State and KV of one binding always come from the same actual history.
 
 ### 6.2 Address space
 
@@ -478,7 +422,6 @@ the same actual history.
 KVAddressSpace
 ├── logical-block -> LogicalKVPage directory
 ├── committed frontier
-├── checkpoint-protected frontier
 ├── active/inactive state
 ├── unit / recovery growth reservation
 └── optional execution-row lease
@@ -494,7 +437,6 @@ Each address space records separately:
 |---|---|
 | membership | Logical pages that already belong to this address space |
 | committed frontier | The token prefix that has formed canonical content |
-| protected frontier | The maximum coverage some checkpoint still needs |
 | growth reservation | Incremental pages acquired for a unit or complete resume coverage but not yet materialized |
 
 Membership can cover a provisional suffix such as the speculative window, whose bytes cannot serve as a
@@ -518,25 +460,24 @@ An execution row does not own logical pages, a frontier or a reservation.
 
 ### 7.1 Binding
 
-On an initial bind from the root or a checkpoint, the Program prepares State, all enabled KV pools and
+On an initial bind from the root or a cached prefix, the Program prepares State, all enabled KV pools and
 the first legal unit together.
 A pause resume instead prepares the complete resume coverage: the peak needed for the old frontier,
 backend normalization/bridge and the first real new unit.
 
 ```text
-lease source and acquire destination
-  -> reserve missing replicas, private tails and unit/recovery growth
-  -> restore missing Host-only pages
-  -> Move or Fork memberships
+pin the cached source and acquire destinations
+  -> reserve the private tail, the State slot and unit/recovery growth
+  -> restore Host-only blocks
+  -> fork the shared pages and copy the tail
   -> lease execution rows and publish mappings
   -> publish complete sequence
 ```
 
-A shortfall in any pool blocks the complete bind. The source lease covers the required transfers and
-installation; a failure before the irreversible takeover cleans up the destination and keeps the
-source. After the takeover commits, the old checkpoint may already have been consumed, and later
-exceptions go to Engine failure cleanup. One bind's State and KV are never spliced from different
-computation histories.
+A shortfall in any pool blocks the complete bind. The source pins cover the required transfers and
+installation; a failure before publication cleans up the destination and keeps the cached source,
+and later exceptions go to Engine failure cleanup. One bind's State and KV are never spliced from
+different computation histories.
 
 ### 7.2 Unit reservation and materialization
 
@@ -572,19 +513,15 @@ At settlement, uncommitted tail pages are explicitly truncated and dematerialize
 ordinary unit releases the remainder; during a resume, the pages still needed for the complete resume
 coverage are kept. Reaching the old frontier does not release them by itself; a real new prefill/token
 commit or a terminal state ends the protection.
-`truncate` cannot delete the protected range of a surviving checkpoint, nor overwrite a partial tail
-another reader needs. Merely requesting shorter coverage does not trigger trimming.
+`truncate` cannot overwrite the protected coverage of a shared page, nor a partial tail another
+reader needs. Merely requesting shorter coverage does not trigger trimming.
 
 ### 7.4 Pause, finish and release
 
-On pause or finish, the execution row, active references and unused growth reservation are released.
-Restore points that must be kept continue to hold complete State/KV coverage; a Snapshot can migrate to
-the Host, or resume through Replay after its physical acceleration replica is abandoned.
-
-Removing one checkpoint only revokes its State and history references. Directories and replicas still
-needed by other checkpoints, active sequences or transactions stay valid. When the last history owner
-is destroyed, the Main/backend address spaces are released; when the last physical reference
-disappears, the corresponding replica is returned.
+On pause or finish, the execution row, active references and unused growth reservation are released,
+and the lane's committed full pages stay referenced by the prefix cache. A paused request keeps no KV;
+it resumes through Replay. When the last reference to a page disappears, its Device lease is
+returned.
 
 ### 7.5 Stable boundary
 
@@ -592,52 +529,24 @@ From block-table publication until the GPU unit completes, the selected rows, me
 frontier and accessed payload all stay stable. Mapping updates, frontier commits, truncation and row
 recycling complete at GPU boundaries; allocator and transfer ownership never enter a kernel.
 
-## 8. Move, Fork and active prefix view
+## 8. Cached-prefix fork and write protection
 
-### 8.1 Taking over a private history
+### 8.1 Forking a cached prefix
 
-A private continuation can take over an existing history and keep appending on the same directory.
-Internal restore points keep their own State and frontier; they do not force the current sequence to
-copy all KV on every continuation. When rewinding from a shallower restore point, the stale deeper
-protection is lifted first, then the stores validate and trim the suffix.
-
-Move/Fork of State and Move/Fork of KV history are decided separately; complete source coverage and the
-actual reader leases determine whether the existing writer can be reused, not just the number of logical
-checkpoints.
-
-### 8.2 Independent branch
-
-A branch acquires an independent history and execution row and shares the complete logical pages before
-the frontier. If the boundary falls in a partial page, the required tail is first copied to a private
-destination, and then appending begins.
+A request admitted from a cached snapshot acquires an empty address space and an execution row and
+shares the complete cached pages before the snapshot's frontier. If the frontier falls in a partial
+page, the cached tail is first copied to a private destination, and then appending begins.
 
 For example, with \(P=64\) and frontier \(F=1000\): the first 15 complete pages are shared, and one
-private tail page is copied for the last 40 valid tokens.
-The checkpoint still lies exactly at token 1000; allocation does not round the hit frontier down to
-960.
+private tail page is copied for the last 40 valid tokens. The snapshot lies exactly at token 1000;
+allocation does not round the hit frontier down to 960.
 
-### 8.3 Exporting an immutable prefix from an active history
+### 8.2 Write protection
 
-`KVActivePrefixViewReservation` exports an independent view from an active history stopped at a stable
-boundary:
-
-- the source keeps its execution row, growth reservation, suffix and writer;
-- the destination shares the complete prefix pages;
-- the tail at a non-aligned frontier is copied to an independent page;
-- the destination receives immutable membership in one step after the copy completes.
-
-During the export the source stops executing, and the reservation and source pins keep the content
-valid. Completing the export does not replace the source row, truncate its suffix or republish its block
-table. It is used for shared publication and for branching a history that is still executing.
-
-### 8.4 Write protection
-
-The stores check protected coverage, active references, the writer, the epoch and transaction pins
-together.
-Multiple read-only references can share one page; append does not overwrite the valid prefix of any
-surviving checkpoint.
-A branch that needs to write a shared partial tail first acquires a private COW page. A refcount by
-itself does not grant write permission.
+The stores check protected coverage, active references, the writer and source pins together. Shared
+full pages carry protected coverage and are never truncated; multiple read-only references can share
+one page. A branch that needs to write a shared partial tail first acquires a private COW page. A
+refcount by itself does not grant write permission.
 
 ---
 
@@ -656,7 +565,7 @@ In one speculative unit, Main and the backend:
 - trim rejected trailing mappings separately.
 
 During an MTP draft, the backend mapped extent can temporarily lead Main; DFlash Full usually lags
-behind Main. A provisional lead does not form committed checkpoint coverage. Rejected bytes can remain
+behind Main. A provisional lead does not form committed snapshot coverage. Rejected bytes can remain
 in a partial page, but must be overwritten by a new canonical write before any later read.
 
 ### 9.2 Fixed and transient K/V
@@ -666,7 +575,7 @@ The following storage does not enter the growing pools:
 | Resource | Owner |
 |---|---|
 | DFlash/DFlash2 local sliding-window K/V | fixed per-sequence StateImage |
-| DFlash/DFlash2 boundary-local snapshot | fixed checkpoint StateImage |
+| DFlash/DFlash2 boundary-local snapshot | fixed snapshot StateImage |
 | Vision/query temporary K/V | Program workspace |
 
 DFlash/DFlash2 cyclic K/V uses its own `CyclicKVCacheLayerView` and modulo/window semantics; it holds no
@@ -721,7 +630,7 @@ destination state slot:
 So the window restored by a prefix-cache hit is byte-identical to the window at the same frontier on a
 miss. The window per slot per layer is \(1088\times H_{kv}\times 536\) B (Qwen3.6/3.8-27B: 17 layers,
 \(H_{kv}=4\), about 39.7 MB); it occupies the Device StateImage slot and is also counted in the Host
-checkpoint image and in fork transfer work.
+snapshot image and in fork transfer work.
 
 ---
 
@@ -826,28 +735,27 @@ a replay is in flight.
 
 ## 12. Core invariants
 
-1. Each Device page-group lease carries at most one logical page replica in its pool.
+1. Each Device page-group lease carries at most one logical page in its pool.
 2. A pool only groups planes that share frontier, lifetime, page size and allocation semantics.
 3. A pool's K/V/code/scale planes use the same page-group ID for the same logical block.
 4. Device occupancy counts allocated leases and reservations; logical aliases are not charged twice.
-5. Logical page identity, content epoch and physical page ID are independent of one another.
-6. The valid frontier is exact to the token; page boundaries do not change Attention or checkpoint
+5. Logical page identity and physical page ID are independent of one another.
+6. The valid frontier is exact to the token; page boundaries do not change Attention or snapshot
    semantics.
-7. Coverage a published checkpoint needs cannot be overwritten by a writer; any logical page has at most
+7. Coverage a cached page protects cannot be overwritten by a writer; any logical page has at most
    one writer.
 8. Shared full pages are immutable; a non-aligned writable tail first gets a private COW page.
-9. A Host/Device replacement is published only after the copy and epoch/coverage verification
-   complete.
+9. A transfer destination is published only after its copy completes.
 10. Ordinary unit settlement returns unused capacity; a resume reservation is kept across chunks until
     real new progress or a terminal state.
-11. Within one GPU execution unit, membership, block tables, replicas and the read frontier are stable.
+11. Within one GPU execution unit, membership, block tables, pages and the read frontier are stable.
 12. An inactive address space occupies no execution row; an execution row owns no logical pages.
 13. Main and backend pools reserve, materialize, commit and truncate separately.
 14. Growing-cache consumers access KV only through paged views and block tables, and acquire no allocator
     or ownership authority.
 15. Kernel correctness does not depend on physical page ID contiguity and does not build
     request-contiguous KV by gathering.
-16. Checkpoint reusability is proven by a complete target continuation; the existence of KV pages by
+16. Snapshot reusability is proven by a complete target continuation; the existence of KV pages by
     itself does not constitute a hit.
 17. A block-table publication's H2D reads the execution row's pinned shadow only when the stream reaches
     it. A later publication of the same row (including the next owner's publication after release) waits
@@ -862,11 +770,10 @@ a replay is in flight.
 |---|---|
 | Device page pools, reservations and execution tables | `src/core/paged_kv_cache.*` |
 | Closed K/V data/scale plane schema | `src/core/paged_kv_storage.h` |
-| Unified Host backing, typed KV layout and allocation | `src/core/host_context_arena.*`, `src/core/host_kv_arena.*` |
-| Logical pages, replicas and references | `src/models/qwen3_5/program/storage/logical_kv_store.h` |
-| Address spaces, directories and views | `src/models/qwen3_5/program/storage/kv_address_space.h` |
-| History and checkpoint lifecycle | `src/models/qwen3_5/program/storage/checkpoints.cpp`, `sequence.cpp` |
-| Host extent membership | `src/models/qwen3_5/program/storage/host_kv_store.h` |
+| Logical pages and references | `src/models/qwen3_5/program/storage/logical_kv_store.h` |
+| Address spaces, directories and the cached-prefix fork | `src/models/qwen3_5/program/storage/kv_address_space.h` |
+| History lifecycle | `src/models/qwen3_5/program/storage/sequence.cpp` |
+| Prefix cache pages, Host slabs and transfers | `src/models/qwen3_5/program/prefix/` |
 | Unit permits and context transactions | `src/models/qwen3_5/program/planning/request_plan.cpp`, `transactions/` |
 | Model pool layout and capacity curve | `src/models/qwen3_5/program/planning/startup.cpp` |
 | Public paged consumer views | `src/core/paged_kv_cache.h` |

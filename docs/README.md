@@ -55,8 +55,8 @@ other references own narrower contracts:
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |
 | [Constrained decoding](maintainer/constrained-decoding.md) | GBNF/JSON/choice/regex, tool policies, masks, speculative transactions and observations |
 | [DFlash2 tree verification](maintainer/tree-verification.md) | per-round lattice draft trees, tree acceptance and its exactness, automatic and per-batch-size tree widths, accepted-path compaction |
-| [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for continuation, retention, incremental resources, preemption and recovery |
-| [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | `infernix-serve`'s default prefix-cache mode: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
+| [Resource scheduling and context cache](maintainer/resource-scheduling-and-context-cache.md) | core design for incremental resources, admission, preemption and Replay recovery |
+| [Hybrid prefix cache](maintainer/hybrid-prefix-cache-spec.md) | the prefix cache: block tree, sparse state snapshots, tap placement, Host slab tier, eviction and automatic configuration |
 | [Paged KV context store](maintainer/paged-kv-cache.md) | typed pools, pages, replicas, address spaces, reservations and consumer views |
 | [ReplaySSM GDN](maintainer/replayssm-gdn.md) | raw transition records and faithful commitment of the verified state prefix |
 | [Op development](maintainer/op-development.md) | semantic boundaries, source ownership, numerical qualification and performance evidence |

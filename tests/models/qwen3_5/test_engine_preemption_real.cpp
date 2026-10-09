@@ -251,14 +251,6 @@ public:
                     first.scheduling.snapshot_restores == 0 &&
                     first.scheduling.replayed_tokens == 0,
                 "post-output pressure recovery leaked into the first-output snapshot");
-        std::uint64_t first_d2h = 0, first_h2d = 0;
-        for (const auto& resource : first.context_transfers) {
-            first_d2h += resource[0].bytes;
-            first_h2d += resource[1].bytes;
-        }
-        require(first_d2h <= result.scheduling.device_to_host_bytes &&
-                    first_h2d <= result.scheduling.host_to_device_bytes,
-                "first-output transfers exceed the request's completed transfer accounting");
     }
 
 private:
@@ -274,17 +266,14 @@ private:
     std::string reasoning_;
 };
 
-void settled(const infernix::RuntimeStats& stats, const infernix::MemorySummary& memory) {
+void settled(const infernix::RuntimeStats& stats) {
     require(stats.running_requests == 0 && stats.waiting_requests == 0 &&
                 stats.paused_requests == 0 && stats.replaying_requests == 0 &&
                 stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
-                stats.materializing_requests == 0 && stats.capture_pending_requests == 0 &&
-                stats.terminal_pending_requests == 0,
+                stats.materializing_requests == 0 && stats.terminal_pending_requests == 0,
             "completed recovery left live scheduling membership");
     require(stats.device_state_occupied_slots == 0 && stats.device_main_kv_occupied_pages == 0 &&
-                stats.device_backend_kv_occupied_pages == 0 &&
-                stats.host_context_occupied_bytes == 0 && stats.host_context_reserved_bytes == 0 &&
-                memory.host_context_occupied_bytes == 0 && memory.host_context_reserved_bytes == 0,
+                stats.device_backend_kv_occupied_pages == 0,
             "completed recovery retained physical resources with history disabled");
 }
 
@@ -294,7 +283,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     const auto memory = engine.memory_summary();
     require(memory.max_context == kCapacity && memory.kv_capacity == kCapacity,
             "Engine changed the fixed pressure workload's context capacity");
-    require(memory.host_context_capacity_bytes == 0,
+    require(engine.runtime_stats().hybrid_host_capacity_bytes == 0,
             "Engine reserved Host context memory without a prefix cache");
     const auto before = engine.runtime_stats();
     std::array<unsigned, 2> first_token_counts{};
@@ -398,9 +387,8 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
 
     // The memory summary also waits for the completed worker boundary before we inspect its
     // published counters; wait() may return as soon as the terminal response is available.
-    const auto completed_memory = engine.memory_summary();
     const auto after            = engine.runtime_stats();
-    settled(after, completed_memory);
+    settled(after);
     require(first_token_counts[0] == 1 && first_token_counts[1] == 1,
             "recovery or cancellation duplicated/lost first-token observations");
     require(after.prompt_tokens - before.prompt_tokens == 2 * kPromptTokens &&
@@ -434,8 +422,6 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
         totals.snapshot_restores += result->scheduling.snapshot_restores;
         totals.replayed_tokens += result->scheduling.replayed_tokens;
         totals.paused_ns += result->scheduling.paused_ns;
-        totals.device_to_host_bytes += result->scheduling.device_to_host_bytes;
-        totals.host_to_device_bytes += result->scheduling.host_to_device_bytes;
     }
     const char* label = cancel_stage == CancelStage::Paused   ? "cancel-paused"
                         : cancel_stage == CancelStage::Replay ? "cancel-replay"
@@ -443,9 +429,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     std::cout << label << " backend=" << backend_name << " preemptions=" << totals.preemptions
               << " snapshot_restores=" << totals.snapshot_restores
               << " replay_restores=" << totals.replay_restores
-              << " replayed_tokens=" << totals.replayed_tokens << " paused_ns=" << totals.paused_ns
-              << " d2h_bytes=" << totals.device_to_host_bytes
-              << " h2d_bytes=" << totals.host_to_device_bytes;
+              << " replayed_tokens=" << totals.replayed_tokens << " paused_ns=" << totals.paused_ns;
     if (cancel_stage != CancelStage::None) {
         std::cout << " observed_paused=" << cancellation_observed.paused_requests
                   << " observed_replaying=" << cancellation_observed.replaying_requests
@@ -469,8 +453,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
         // validate() checks the complete drained stream against the terminal result as well.
         require(second_result.generated_token_ids.size() >= committed_at_cancellation,
                 "cancellation discarded tokens already committed to the stream");
-        require(second_result.scheduling.snapshot_restores == 0 &&
-                    totals.device_to_host_bytes == 0 && totals.host_to_device_bytes == 0,
+        require(second_result.scheduling.snapshot_restores == 0,
                 "cancellation unexpectedly used a physical snapshot");
         if (cancel_stage == CancelStage::Paused) {
             require(second_result.scheduling.replay_restores == 0 &&
@@ -484,8 +467,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
         }
     } else {
         require(totals.snapshot_restores == 0 && totals.replay_restores != 0 &&
-                    totals.replayed_tokens > kPromptTokens && totals.device_to_host_bytes == 0 &&
-                    totals.host_to_device_bytes == 0,
+                    totals.replayed_tokens > kPromptTokens,
                 "replay did not rebuild prompt and already published output without a snapshot");
         require(totals.replay_restores == totals.preemptions,
                 "growth pressure did not restore every affected request");
@@ -495,8 +477,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     require(probe.generated_token_ids.size() == 4 &&
                 probe.finish_reason == infernix::FinishReason::OutputLimit,
             "request after recovery could not reuse the released execution resources");
-    const auto settled_memory = engine.memory_summary();
-    settled(engine.runtime_stats(), settled_memory);
+    settled(engine.runtime_stats());
     require(engine.is_available(), "Engine became unavailable after recovery");
 }
 

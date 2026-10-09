@@ -382,10 +382,8 @@ GenerationService::acquire_lifetime(const std::shared_ptr<RequestCapacity>& capa
 PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            GenerationConsumerMode consumer_mode,
                                            infernix::GenerationObservationOptions observation,
-                                           std::function<bool()> is_cancelled,
-                                           ContextCacheHints context_cache) const {
+                                           std::function<bool()> is_cancelled) const {
     return prepare_impl(request, consumer_mode, std::move(observation), std::move(is_cancelled),
-                        std::move(context_cache),
                         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite
                                                     : CacheParticipation::Disabled,
                         DeadlinePolicy::ClientPendingTimeout);
@@ -395,7 +393,6 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                                 GenerationConsumerMode consumer_mode,
                                                 infernix::GenerationObservationOptions observation,
                                                 std::function<bool()> is_cancelled,
-                                                ContextCacheHints context_cache,
                                                 CacheParticipation cache_participation,
                                                 DeadlinePolicy deadline_policy) const {
     PreparedRequest prepared;
@@ -424,16 +421,6 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                 return acquire_media(part, prepared.lifetime->deadline, is_cancelled,
                                      remaining_media_bytes);
             });
-        std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
-        const bool protocol_allows_engine_automatic =
-            input.context_cache.allow_engine_automatic_shared_prefixes;
-        input.context_cache = std::move(context_cache);
-        input.context_cache.markers.insert(input.context_cache.markers.end(),
-                                           std::make_move_iterator(protocol_markers.begin()),
-                                           std::make_move_iterator(protocol_markers.end()));
-        input.context_cache.allow_engine_automatic_shared_prefixes =
-            input.context_cache.allow_engine_automatic_shared_prefixes &&
-            protocol_allows_engine_automatic;
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);
@@ -607,7 +594,7 @@ void GenerationService::warmup() {
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
     PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
+        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {},
                      CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
     run(prepared, nullptr);
 }

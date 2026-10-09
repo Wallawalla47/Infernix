@@ -1006,7 +1006,6 @@ public:
         impl->pages    = binding_pages(base, base.summary.prompt_tokens);
         impl->vision   = base.vision;
         SourceCandidate out;
-        std::size_t calls = plan_prefill(data, 0, {}, base.reuse).ends.size();
         if (selection) {
             if (selection->snapshot) {
                 // Items inside the reused prefix are not encoded again (design §19.3.2).
@@ -1014,12 +1013,9 @@ public:
                 out.reused_tokens = selection->frontier;
                 out.reuse_path    = reuse_path_for(prefix_->index().snapshot(*selection->snapshot).kind);
             }
-            calls        = selection->plan.ends.size();
             impl->prefix = std::move(selection);
         }
-        out.remaining_work.chunks = calls;
-        out.remaining_work.tokens = base.summary.prompt_tokens - out.reused_tokens;
-        out.hybrid                = std::move(impl);
+        out.hybrid = std::move(impl);
         return out;
     }
 
@@ -1045,7 +1041,7 @@ public:
     }
 
     // Stages the binding of `source` on `lane`: re-selects against the cache as it is now (crediting
-    // a lane-resident snapshot), reserves the whole KV extent and maps the cached blocks. The Begin
+    // a lane-resident snapshot), reserves the prompt plus one round and maps the cached blocks. The Begin
     // the Engine published names the source's frontier, so a changed choice is refused and the Engine
     // falls back to the next source (the root).
     runtime::ResourceReservation start_binding(const RequestBasePlan& base, runtime::LaneId destination,

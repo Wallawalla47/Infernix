@@ -492,20 +492,19 @@ def _stream_markdown(summary: dict[str, Any]) -> list[str]:
         "", "## Scheduling evidence and costs", "",
         "Only exact wire request/response IDs join client observations to one server instance",
         "and service request. Missing or incomplete diagnostics are unavailable, not zero.",
-        "A zero counter is not_observed; a positive counter is observed. Transfer bytes are",
-        "per-generation totals and do not by themselves attribute a transfer to preemption.", "",
+        "A zero counter is not_observed; a positive counter is observed.", "",
     ])
     lines.extend(_table(
         ("Case", "Sample", "Role", "Join", "Service/engine ID", "Preemption", "Snapshot", "Replay",
-         "Replay tokens", "Paused ms", "D2H bytes", "H2D bytes", "Usage check", "Reason"),
+         "Replay tokens", "Paused ms", "Usage check", "Reason"),
         (
             (row["case"], row["sample"], row["request_role"], row["diagnostic_status"],
              f"{row['service_request_id']}/{row['engine_request_id']}",
              f"{row['mechanisms']['preemption']} ({row['preemptions']})",
              f"{row['mechanisms']['snapshot_restore']} ({row['snapshot_restores']})",
              f"{row['mechanisms']['replay_restore']} ({row['replay_restores']})",
-             row["replayed_tokens"], ms(row, "paused_ns"), row["device_to_host_bytes"],
-             row["host_to_device_bytes"], row["usage_check"], row["diagnostic_reason"] or "—")
+             row["replayed_tokens"], ms(row, "paused_ns"), row["usage_check"],
+             row["diagnostic_reason"] or "—")
             for row in summary["stream_observations"]
         ),
     ))
@@ -542,7 +541,7 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
     rows = summary["global_runtime_observations"]
     lines = [
         "## Global runtime costs", "",
-        "These are isolated-server interval deltas, including cache demotion without a request owner.",
+        "These are isolated-server interval deltas, including cache work without a request owner.",
         "The shutdown tail completes the interval stream when explicitly observed. Logs without",
         "a tail marker are unconfirmed; absent fields are unavailable, not zero.",
         "Host work is the mutually exclusive Engine clock, not a sum of request exposed times.",
@@ -562,28 +561,16 @@ def _runtime_markdown(summary: dict[str, Any]) -> list[str]:
     ))
     available = [row for row in rows if row["status"] == "available"]
     if available:
-        lines.extend(["", "### Physical transfers", ""])
-        lines.extend(_table(
-            ("Case", "Sample", "Resource", "Direction", "Bytes", "Seconds"),
-            ((row["case"], row["sample"], resource, direction, values["bytes"], seconds(values["seconds"]))
-             for row in available for resource, directions in row["transfers"].items()
-             for direction, values in directions.items()),
-        ))
         lines.extend([
             "", "### Resource occupancy", "",
-            "Sampled maxima can miss short-lived allocations. Only the Host allocator's recorded",
-            "lifetime high-water mark is labelled peak. Startup backing/capacity and the full Host",
-            "work breakdown remain in the JSON report; sampled occupancy is not reserved backing.", "",
+            "Sampled maxima can miss short-lived allocations. Startup capacity and the full Host",
+            "work breakdown remain in the JSON report.", "",
         ])
         lines.extend(_table(
             ("Case", "Sample", "Resource", "Sampled max", "Last sample"),
             ((row["case"], row["sample"], resource, value["sampled_max"], value["last"])
              for row in available for resource, value in row["occupancy"].items()),
         ))
-        lines.extend(["", *_table(
-            ("Case", "Sample", "Host allocator peak occupied bytes"),
-            ((row["case"], row["sample"], row["host_context_peak_occupied_bytes"]) for row in available),
-        )])
     return [*lines, ""]
 
 
@@ -598,9 +585,8 @@ def _request_timing_markdown(summary: dict[str, Any]) -> list[str]:
         "Negative residuals are retained and marked inconsistent. Missing logs or output, and",
         "aggregate responses, have no streaming first-output partition. Per-request milliseconds,",
         "TTFT percentages and execution details are in `request-analysis.csv` and the JSON report.",
-        "Host exposure, prefill/replay work and CUDA transfer intervals overlap this partition;",
-        "they are independent evidence and must not be added to it. Transfer intervals cover only",
-        "completed request-owned work, excluding background cache reclamation.", "",
+        "Host exposure and prefill/replay work overlap this partition; they are independent",
+        "evidence and must not be added to it.", "",
     ]
 
     def mean(rows: list[dict[str, Any]], field: str) -> str:
@@ -762,8 +748,6 @@ CSV_FIELDS = (
     "replay_restores",
     "replayed_tokens",
     "paused_ns",
-    "device_to_host_bytes",
-    "host_to_device_bytes",
     "raw",
 )
 

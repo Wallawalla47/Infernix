@@ -40,25 +40,6 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
 
 } // namespace
 
-bool RequestBasePlanImpl::accepts_capture(std::uint32_t frontier) const noexcept {
-    if (frontier == 0 || frontier > summary.prompt_tokens) { return false; }
-    if (vision_control_plan) {
-        for (const auto& item : vision_control_plan->items) {
-            if (item.token_begin < frontier && frontier < item.token_end) { return false; }
-        }
-    }
-    return true;
-}
-
-CaptureGroup RequestBasePlanImpl::capture_group(std::uint32_t frontier) const {
-    if (!capture_backing || !accepts_capture(frontier)) {
-        throw std::logic_error("capture identity requires a legal prompt frontier");
-    }
-    return {.identity = capture_backing,
-            .key      = {prefix_digests.at(frontier), frontier, prefix_identity_tag},
-            .frontier = frontier};
-}
-
 RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
                                           const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
@@ -130,7 +111,6 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     }
 
     auto base                             = std::make_shared<RequestBasePlanImpl>();
-    base->context_cache                   = prompt.context_cache;
     base->summary.prompt_tokens           = static_cast<std::uint32_t>(prompt.token_ids.size());
     base->summary.requested_output_tokens = options.requested_output_tokens;
     const std::uint32_t capacity_output =
@@ -195,11 +175,6 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         base->vision_control_plan = std::move(vision);
     }
 
-
-    base->prefix_digests.assign(prompt);
-    base->prefix_identity_tag = static_cast<std::uint32_t>(speculative_backend) |
-                                (static_cast<std::uint32_t>(proposal_head) << 8U) |
-                                (static_cast<std::uint32_t>(kv_storage) << 16U);
     std::uint32_t previous = 0;
     for (const auto frontier : prompt.identity.rewrite_execution_frontiers) {
         if (frontier <= previous || frontier > base->summary.prompt_tokens) {
@@ -213,39 +188,6 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
             PreparedNgramIndex{.index = std::move(prompt.ngram_index.index)});
     }
     base->prompt = std::make_shared<const PreparedPromptData>(std::move(prompt));
-    // The hybrid prefix cache publishes its own blocks and snapshots as the lane commits them;
-    // it never captures checkpoints.
-    if (base->summary.publish_continuation && !hybrid_) {
-        const auto& prepared = *base->prompt;
-        auto backing         = std::make_shared<PreparedCaptureBacking>();
-        backing->digests     = base->prefix_digests;
-        backing->ledger      = prepared.token_ids;
-        backing->prefix_identity.assign(prepared);
-        base->capture_backing = std::move(backing);
-        const auto add        = [&](std::uint32_t frontier, runtime::CheckpointRole role) {
-            if (!base->accepts_capture(frontier)) { return; }
-            auto it =
-                std::find_if(base->capture_groups.begin(), base->capture_groups.end(),
-                                    [frontier](const auto& group) { return group.frontier == frontier; });
-            if (it == base->capture_groups.end()) {
-                base->capture_groups.push_back(base->capture_group(frontier));
-                it = std::prev(base->capture_groups.end());
-            }
-            if (std::find(it->roles.begin(), it->roles.end(), role) == it->roles.end()) {
-                it->roles.push_back(role);
-            }
-        };
-        const auto& rewrite = prepared.identity.rewrite_checkpoint;
-        add(rewrite ? rewrite->recovery_frontier : base->summary.prompt_tokens,
-            runtime::CheckpointRole::InputReplay);
-        for (const auto& opportunity : prepared.context_cache.opportunities) {
-            add(opportunity.frontier, opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor
-                                          ? runtime::CheckpointRole::LongAnchor
-                                          : runtime::CheckpointRole::SharedPrefix);
-        }
-        std::sort(base->capture_groups.begin(), base->capture_groups.end(),
-                  [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
-    }
     return RequestBasePlan(std::move(base));
 }
 

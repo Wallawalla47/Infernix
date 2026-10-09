@@ -97,8 +97,6 @@ const char* prefix_reuse_path_name(infernix::PrefixReusePath path) noexcept {
     switch (path) {
     case infernix::PrefixReusePath::Root:
         return "root";
-    case infernix::PrefixReusePath::Checkpoint:
-        return "checkpoint";
     case infernix::PrefixReusePath::HybridEndpoint:
         return "hybrid_endpoint";
     case infernix::PrefixReusePath::HybridSnapshot:
@@ -456,9 +454,6 @@ OperationalRecord render_throughput(const ThroughputReport& report) {
     }
     if (report.current.materializing_requests != 0) {
         out << " | materializing " << report.current.materializing_requests;
-    }
-    if (report.current.capture_pending_requests != 0) {
-        out << " | capture-pending " << report.current.capture_pending_requests;
     }
     if (report.current.terminal_pending_requests != 0) {
         out << " | terminal-pending " << report.current.terminal_pending_requests;
