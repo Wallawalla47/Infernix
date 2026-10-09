@@ -1710,7 +1710,7 @@ void shared_capture_alignment(DeviceContext& device, const qwen::execution::Para
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(256);
     options.max_concurrency                   = 2;
     options.context_cache.enabled             = true;
-    options.context_cache.device_state_slots  = 2;
+    options.context_cache.hybrid.device_snapshot_slots  = 2;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
     auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 4);
@@ -1852,7 +1852,7 @@ void replay_sampling_counts(DeviceContext& device, const qwen::execution::Parame
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(128);
     options.max_concurrency                   = 2;
     options.context_cache.enabled             = false;
-    options.context_cache.device_state_slots  = 0;
+    options.context_cache.hybrid.device_snapshot_slots  = 0;
     options.context_cache.host_capacity_bytes = 0;
     auto planner = qwen::detail::make_sequence_planner_impl(parameters, device, options);
     auto plan    = qwen::detail::finalize_sequence_plan_impl(std::move(planner), 2);
@@ -2013,7 +2013,7 @@ int main(int argc, char** argv) {
         options.use_cuda_graph           = false;
         options.speculative.backend      = backend;
         options.speculative.draft_tokens = backend == SpeculativeBackend::None ? 0U : 3U;
-        options.context_cache.device_state_slots  = 2;
+        options.context_cache.hybrid.device_snapshot_slots  = 2;
         options.context_cache.host_capacity_bytes = 512ULL * 1024 * 1024;
         auto planner = qwen::make_sequence_planner(parameters, device, options);
         auto plan    = std::move(planner).finalize(16);
@@ -2052,7 +2052,7 @@ int main(int argc, char** argv) {
         full_pool.reset();
         options.max_context                       = kCapacity;
         options.max_concurrency                   = 1;
-        options.context_cache.device_state_slots  = 0;
+        options.context_cache.hybrid.device_snapshot_slots  = 0;
         options.context_cache.host_capacity_bytes = 0;
         auto capture_planner = qwen::make_sequence_planner(parameters, device, options);
         auto capture_plan    = std::move(capture_planner).finalize(8);
@@ -2064,7 +2064,7 @@ int main(int argc, char** argv) {
             no_capture_fixture.private_move();
         }
         no_capture_destination.reset();
-        options.context_cache.device_state_slots = 1;
+        options.context_cache.hybrid.device_snapshot_slots = 1;
         auto capture_retry_planner = qwen::make_sequence_planner(parameters, device, options);
         auto capture_retry_plan    = std::move(capture_retry_planner).finalize(8);
         auto capture_retry =

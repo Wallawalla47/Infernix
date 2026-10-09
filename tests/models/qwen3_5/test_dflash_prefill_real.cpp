@@ -125,7 +125,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.prefill_chunk                     = capacity;
     options.kv_capacity                       = KvCapacityPolicy::explicit_capacity(2 * capacity);
     options.max_concurrency                   = 2;
-    options.context_cache.device_state_slots  = 1;
+    options.context_cache.hybrid.device_snapshot_slots  = 1;
     options.context_cache.host_capacity_bytes = 0;
     options.use_cuda_graph                    = false;
     options.speculative.backend               = backend;

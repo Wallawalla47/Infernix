@@ -212,7 +212,7 @@ def test_selected_kv_reaches_server_and_is_verified(
         "speculative_backend": "none",
         "speculative_draft_window": 0,
         "proposal_head": "full",
-        "context_cache": {"device_state_slots": 0, "host_capacity_bytes": 0},
+        "context_cache": {"device_snapshot_slots": 0, "host_capacity_bytes": 0},
     }
     event = {
         "artifact_type": corpus.SERVER_LOG_ARTIFACT_TYPE,
@@ -259,10 +259,9 @@ def test_selected_kv_reaches_server_and_is_verified(
         )
         validate = lambda: corpus.validate_server_start(event, spec, args.device)
     assert command[command.index("--kv-dtype") + 1] == kv_dtype
-    assert command[command.index("--device-state-slots") + 1] == "0"
-    assert command[command.index("--host-context-mib") + 1] == "0"
+    assert "--no-prefix-reuse" in command
     assert validate() == ("instance", "bindings")
-    for field in ("device_state_slots", "host_capacity_bytes"):
+    for field in ("device_snapshot_slots", "host_capacity_bytes"):
         engine["context_cache"][field] = 1
         with pytest.raises(corpus.CampaignError, match="context cache capacity differs"):
             validate()

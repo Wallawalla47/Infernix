@@ -300,8 +300,6 @@ void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 void Program::shutdown_cleanup() noexcept { impl_->shutdown_cleanup(); }
 
-bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_ != nullptr; }
-
 std::vector<SourceCandidate> Program::hybrid_sources(const RequestBasePlan& base,
                                                      std::uint32_t maximum_frontier) {
     return impl_->hybrid_sources(base, maximum_frontier);

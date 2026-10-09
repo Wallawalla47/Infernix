@@ -68,7 +68,6 @@ int main() {
         options.max_concurrency = 2;
         options.kv_cache        = infernix::KvCacheStorage::Int8Group64;
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(8192);
-        options.context_cache.mode                = infernix::ContextCacheMode::Hybrid;
         options.context_cache.host_capacity_bytes = 2ULL << 30;
         options.diagnostic_observer.callback = [&](const infernix::Diagnostic& d) {
             const std::lock_guard<std::mutex> lock(diagnostics_mutex);

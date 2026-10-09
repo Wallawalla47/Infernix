@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
                   << " graph=" << options.use_cuda_graph << " full_head="
                   << (options.speculative.proposal_head == infernix::ProposalHead::Full)
                   << " codec=" << codec << std::endl;
-        options.context_cache.device_state_slots                = 0;
+        options.context_cache.hybrid.device_snapshot_slots = 1;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
         std::string text;
         for (int i = 0; i < 240; ++i) {
@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
         std::vector<infernix::TokenId> device_retained, device_restored;
         {
             auto control_options                                 = options;
-            control_options.context_cache.device_state_slots     = 2;
+            control_options.context_cache.hybrid.device_snapshot_slots     = 2;
             control_options.context_cache.host_capacity_bytes = 0;
             infernix::Engine control(control_options);
             auto control_prompt = control.tokenize_text(text);

@@ -68,35 +68,29 @@ int main() {
     std::vector<infernix::TokenId> prompt;
     std::vector<infernix::TokenId> candidates;
     std::vector<std::pair<std::string, infernix::PromptReadout>> readouts;
-    // Hybrid keeps at least one prompt token to prefill: with 256-token chunks and ladder the
-    // repeat restores a ladder snapshot at a chunk boundary and prefills the rest. The original cache claims the whole
-    // prompt and samples from the cached tail hidden (the zero-suffix route).
+    // The prefix cache keeps at least one prompt token to prefill: with 256-token chunks and
+    // ladder the repeat restores a ladder snapshot at a chunk boundary and prefills the rest.
     // Only a prompt prefilled in one pass, as the oracle scores it, is compared with the oracle:
     // chunked prefill sums in another order and on this repetitive prompt moved the candidates'
     // log-probabilities by up to 1.6 (0.07-0.22 on the top token) at every chunk size tried
-    // (128-640, with and without the grouped small-pass route), identically in both cache modes.
-    // The readout itself is exact against a one-pass prefill, so the chunked configuration checks
-    // that a restored repeat reads what its own cold run read.
+    // (128-640, with and without the grouped small-pass route). The one-pass configuration takes
+    // no ladder snapshot (a tap would split its prefill), so its repeat starts from the root; the
+    // chunked configuration checks that a restored repeat reads what its own cold run read.
     struct Configuration {
-        infernix::ContextCacheMode mode;
         std::uint32_t prefill_chunk;
+        bool ladder;
     };
     for (const Configuration configuration :
-         {Configuration{infernix::ContextCacheMode::Original, 1024},
-          Configuration{infernix::ContextCacheMode::Hybrid, 256}}) {
-        const bool hybrid      = configuration.mode == infernix::ContextCacheMode::Hybrid;
-        const std::string name = std::string(hybrid ? "hybrid" : "original") + " chunk " +
-                                 std::to_string(configuration.prefill_chunk);
+         {Configuration{1024, false}, Configuration{256, true}}) {
+        const std::string name = "chunk " + std::to_string(configuration.prefill_chunk);
         infernix::EngineOptions options;
-        options.artifact_path      = artifact;
-        options.max_context        = kMaxContext;
-        options.kv_capacity        = infernix::KvCapacityPolicy::explicit_capacity(
-            (hybrid ? 4U : 2U) * kMaxContext);
-        options.kv_cache           = kKvStorage;
-        options.max_concurrency    = 2;
-        options.prefill_chunk      = configuration.prefill_chunk;
-        options.context_cache.mode = configuration.mode;
-        if (hybrid) {
+        options.artifact_path   = artifact;
+        options.max_context     = kMaxContext;
+        options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(4U * kMaxContext);
+        options.kv_cache        = kKvStorage;
+        options.max_concurrency = 2;
+        options.prefill_chunk   = configuration.prefill_chunk;
+        if (configuration.ladder) {
             options.context_cache.hybrid.tap_ladder_tokens  = 256;
             options.context_cache.hybrid.tap_min_gap_tokens = 256;
         }
@@ -140,8 +134,7 @@ int main() {
         infernix::GenerationResult warm = run(readout_request(candidates));
         std::cout << name << ": repeat reused " << warm.reused_prompt_tokens << " of "
                   << prompt.size() << " prompt tokens\n";
-        if (!warm.readout || warm.reused_prompt_tokens == 0 ||
-            (!hybrid && warm.reused_prompt_tokens != prompt.size())) {
+        if (!warm.readout || (configuration.ladder && warm.reused_prompt_tokens == 0)) {
             return fail(name + ": the repeated readout did not reuse the cached prompt");
         }
         for (std::size_t i = 0; i < candidates.size(); ++i) {

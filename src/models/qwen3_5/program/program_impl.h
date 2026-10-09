@@ -826,7 +826,7 @@ public:
                         std::span<const runtime::RoundBudget> budgets,
                         runtime::ExecutionTiming* failed_timing, runtime::TokenMaskProvider* masks);
 
-    // ---- hybrid prefix cache (null unless ContextCacheMode::Hybrid) ----------------------------
+    // ---- prefix cache (null when the context cache is disabled) --------------------------------
     std::unique_ptr<HybridPrefixCache> hybrid_;
     std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;

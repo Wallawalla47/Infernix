@@ -3,12 +3,13 @@
 #include "infernix/types.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
-#include "runtime/engine/context_cache/resource_manager.h"
+#include "runtime/engine/context_cache/types.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -27,15 +28,35 @@ public:
     using Base       = typename Model::RequestBasePlan;
     using Handle     = typename Model::CheckpointHandle;
     using OwnerToken = ContinuationOwnerToken;
-    using Original   = ResourceManager<Model>;
+    using Source     = typename Model::SourceCandidate;
 
-    using Admission     = typename Original::Admission;
-    using ReclaimCursor = typename Original::ReclaimCursor;
-    using SourceChoice  = typename Original::SourceChoice;
+    struct Admission {
+        CacheRetentionPriority priority;
+        CacheRetentionPriority demand;
+        const Base* base       = nullptr;
+        std::uint32_t frontier = 0;
+        std::optional<Handle> checkpoint;
+        std::vector<Handle> sources;
+    };
 
-    // The manager serves every admission of its core, whether or not a prefix cache exists: Qwen3.5
-    // builds its hybrid core only with the hybrid cache on, while Qwen3.8-Flash-Next always runs on
-    // it and its Program offers the root alone when the cache is off.
+    struct ReclaimCursor {
+        std::optional<Admission> admission;
+        ReclaimRights rights;
+    };
+
+    struct SourceChoice {
+        Source source;
+        OwnerToken owner           = 0;
+        std::uint64_t shared_entry = 0;
+        bool take_over             = false;
+        std::optional<OwnerToken> resume_owner;
+        bool session_hint               = false;
+        std::uint64_t publication_order = 0;
+        std::uint64_t ordinal           = 0;
+    };
+
+    // The manager serves every admission of its core, whether or not a prefix cache exists: with
+    // the cache off the Program offers the root alone.
     HybridResourceManager(bool /*enabled*/, ContextMachineCostModel /*costs*/) {}
 
     // The tree's quotes in preference order (its chosen path, then a root start). Empty while a

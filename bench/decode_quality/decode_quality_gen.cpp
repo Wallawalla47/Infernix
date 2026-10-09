@@ -70,7 +70,6 @@ int main(int argc, char** argv) {
 #endif
         }
         options.context_cache.enabled             = false;
-        options.context_cache.device_state_slots  = 0;
         options.context_cache.host_capacity_bytes = 0;
         if (ngram) {
 #if defined(INFERNIX_DECODE_QUALITY_NINFER)

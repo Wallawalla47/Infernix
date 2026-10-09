@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
         options.kv_capacity     = infernix::KvCapacityPolicy::explicit_capacity(2304 * batch);
         options.prefill_chunk   = 2304;
         options.max_concurrency = batch;
-        options.context_cache.device_state_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
+        options.context_cache.hybrid.device_snapshot_slots = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                   = graph;
         options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
         options.kv_cache = infernix::test::parse_kv_cache_storage(argc > 5 ? argv[5] : "bf16");

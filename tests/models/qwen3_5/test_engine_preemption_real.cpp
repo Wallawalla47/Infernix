@@ -24,7 +24,6 @@ namespace {
 constexpr std::uint32_t kPromptTokens    = 192;
 constexpr std::uint32_t kOutputTokens    = 256;
 constexpr std::uint32_t kCapacity        = 512;
-constexpr std::size_t kSnapshotHostBytes = 512ULL << 20;
 const infernix::GenerationObservationOptions kObservations{
     .phase_timings = true, .live_timings = true, .prompt_progress = true};
 
@@ -88,7 +87,7 @@ infernix::RequestOptions request(std::uint32_t outputs) {
 }
 
 infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
-                                     infernix::SpeculativeBackend selected, bool snapshot) {
+                                     infernix::SpeculativeBackend selected) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
     options.max_context          = kCapacity;
@@ -101,10 +100,8 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
         options.speculative.draft_tokens  = 3;
         options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     }
-    // History is deliberately disabled: the two cases exercise only the requests' own recovery.
-    options.context_cache.enabled             = false;
-    options.context_cache.device_state_slots  = 0;
-    options.context_cache.host_capacity_bytes = snapshot ? kSnapshotHostBytes : 0;
+    // History is deliberately disabled: the cases exercise only the requests' own recovery.
+    options.context_cache.enabled = false;
     return options;
 }
 
@@ -292,14 +289,13 @@ void settled(const infernix::RuntimeStats& stats, const infernix::MemorySummary&
 }
 
 void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
-              std::string_view backend_name, bool snapshot,
-              CancelStage cancel_stage = CancelStage::None) {
-    infernix::Engine engine(engine_options(artifact, selected, snapshot));
+              std::string_view backend_name, CancelStage cancel_stage = CancelStage::None) {
+    infernix::Engine engine(engine_options(artifact, selected));
     const auto memory = engine.memory_summary();
     require(memory.max_context == kCapacity && memory.kv_capacity == kCapacity,
             "Engine changed the fixed pressure workload's context capacity");
-    require(memory.host_context_capacity_bytes <= (snapshot ? kSnapshotHostBytes : 0),
-            "Engine exceeded the fixture's fixed Host quota");
+    require(memory.host_context_capacity_bytes == 0,
+            "Engine reserved Host context memory without a prefix cache");
     const auto before = engine.runtime_stats();
     std::array<unsigned, 2> first_token_counts{};
     std::array<infernix::GenerationObservationOptions, 2> observations{kObservations, kObservations};
@@ -400,7 +396,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     require(first_result->engine_request_id != second_result.engine_request_id,
             "concurrent requests lost their independent identity");
 
-    // The physical snapshot also waits for the completed worker boundary before we inspect its
+    // The memory summary also waits for the completed worker boundary before we inspect its
     // published counters; wait() may return as soon as the terminal response is available.
     const auto completed_memory = engine.memory_summary();
     const auto after            = engine.runtime_stats();
@@ -443,7 +439,6 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     }
     const char* label = cancel_stage == CancelStage::Paused   ? "cancel-paused"
                         : cancel_stage == CancelStage::Replay ? "cancel-replay"
-                        : snapshot                            ? "snapshot"
                                                               : "replay";
     std::cout << label << " backend=" << backend_name << " preemptions=" << totals.preemptions
               << " snapshot_restores=" << totals.snapshot_restores
@@ -476,7 +471,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                 "cancellation discarded tokens already committed to the stream");
         require(second_result.scheduling.snapshot_restores == 0 &&
                     totals.device_to_host_bytes == 0 && totals.host_to_device_bytes == 0,
-                "Host=0 cancellation unexpectedly used a physical snapshot");
+                "cancellation unexpectedly used a physical snapshot");
         if (cancel_stage == CancelStage::Paused) {
             require(second_result.scheduling.replay_restores == 0 &&
                         second_result.scheduling.replayed_tokens == 0,
@@ -487,18 +482,12 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                         second_result.scheduling.replayed_tokens != 0,
                     "replay cancellation lost work performed before cancellation");
         }
-    } else if (snapshot) {
-        require(totals.snapshot_restores != 0 && totals.device_to_host_bytes != 0 &&
-                    totals.host_to_device_bytes != 0,
-                "fixed 512 MiB Host case did not save and restore a real request snapshot");
     } else {
         require(totals.snapshot_restores == 0 && totals.replay_restores != 0 &&
                     totals.replayed_tokens > kPromptTokens && totals.device_to_host_bytes == 0 &&
                     totals.host_to_device_bytes == 0,
-                "Host=0 did not rebuild prompt and already published output without a snapshot");
-    }
-    if (cancel_stage == CancelStage::None) {
-        require(totals.snapshot_restores + totals.replay_restores == totals.preemptions,
+                "replay did not rebuild prompt and already published output without a snapshot");
+        require(totals.replay_restores == totals.preemptions,
                 "growth pressure did not restore every affected request");
     }
 
@@ -526,21 +515,16 @@ int main() {
         const auto backend_name = setting("INFERNIX_TEST_BACKEND", "none");
         const auto selected     = backend(backend_name);
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
-        require(scenario == "all" || scenario == "replay" || scenario == "snapshot" ||
-                    scenario == "cancel-paused" || scenario == "cancel-replay",
-                "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, snapshot, cancel-paused "
-                "or cancel-replay");
-        if (scenario == "all" || scenario == "replay") {
-            exercise(artifact, selected, backend_name, false);
-        }
-        if (scenario == "all" || scenario == "snapshot") {
-            exercise(artifact, selected, backend_name, true);
-        }
+        require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
+                    scenario == "cancel-replay",
+                "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused or "
+                "cancel-replay");
+        if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
-            exercise(artifact, selected, backend_name, false, CancelStage::Paused);
+            exercise(artifact, selected, backend_name, CancelStage::Paused);
         }
         if (scenario == "all" || scenario == "cancel-replay") {
-            exercise(artifact, selected, backend_name, false, CancelStage::Replay);
+            exercise(artifact, selected, backend_name, CancelStage::Replay);
         }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';

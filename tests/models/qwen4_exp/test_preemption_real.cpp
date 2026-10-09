@@ -78,7 +78,6 @@ int run_mode(const char* artifact, const char* ngram, bool mtp) {
                                                  : infernix::KvCacheStorage::Int8Group64;
     options.max_concurrency      = 2;
     options.max_pending_requests = 4;
-    options.context_cache.mode                = infernix::ContextCacheMode::Hybrid;
     options.context_cache.host_capacity_bytes = 2ULL << 30;
     if (mtp) {
         options.speculative.backend      = infernix::SpeculativeBackend::Mtp;

@@ -1672,62 +1672,6 @@ def _agent_preempted_continuation(route: str) -> CaseFunction:
     return run
 
 
-def _host_history_pressure_cancel(context: CaseContext, corpus: Corpus) -> None:
-    histories = [_preemption_messages(corpus, marker) for marker in ("OMEGA", "SIGMA")]
-    for index, history in enumerate(histories):
-        for step in ("seed", "warm"):
-            context.require_success(context.start(
-                f"history-{index}-{step}", chat_request(context.model, history, 16)))
-    context.notes.update({
-        "throughput_comparable": False,
-        "throughput_limitation": "A request-specific paused event triggers cancellation; completed work is conditional.",
-        "mechanism_requirements": ["preemption", "snapshot_restore", "pressure_cancellation"],
-        "mechanism_observations": {"pressure_cancellation": "unavailable"},
-        "workload_shape": {"histories": 2, "pressure_requests": 3, "pressure_input_tokens": 192,
-                           "pressure_output_limit": 256, "eos_policy": "normal"},
-    })
-
-    def cancel_paused(sample: dict[str, Any], handles: list[RequestHandle]) -> None:
-        event = sample["event"]
-        if event.get("event") != "request_scheduling" or "pressure_cancel" in context.notes:
-            return
-        context.notes["mechanism_observations"]["pressure_cancellation"] = "not_observed"
-        if event.get("transition") != "paused":
-            return
-        wire = event.get("request", {}).get("http_request_id")
-        if not isinstance(wire, str) or not wire:
-            return
-        target = next((handle for handle in handles
-                       if handle.as_record().get("wire_request_id") == wire), None)
-        if target is None or target.is_done:
-            return
-        context.notes["pressure_cancel"] = {
-            "target_role": target.role, "observed_transition": "paused", "event": event,
-            "cancel_ns": target.cancel(),
-        }
-
-    handles = _fixed_request_graph(
-        context,
-        [(role, chat_request(context.model, _preemption_messages(corpus, marker), 256))
-         for role, marker in (("a", "ALPHA"), ("b", "BRAVO"), ("c", "DELTA"))],
-        (0, 10_000_000, 20_000_000), {role: (192, 256) for role in ("a", "b", "c")}, cancel_paused,
-    )
-    cancellation = context.notes.get("pressure_cancel")
-    for handle in handles:
-        if cancellation is not None and cancellation["target_role"] == handle.role:
-            cancellation["outcome"] = handle.outcome()
-            context.notes["mechanism_observations"]["pressure_cancellation"] = (
-                "observed" if handle.outcome() == "cancelled" else "not_observed")
-            if handle.outcome() not in {"cancelled", "success"}:
-                context.require(False, "pressure cancellation terminated normally", handle.outcome(),
-                                dimension="request_outcome")
-        else:
-            context.require_success(handle)
-    for index, history in enumerate(histories):
-        context.require_success(context.start(
-            f"history-{index}-probe", chat_request(context.model, history, 16)))
-
-
 def _definition(
     name: str,
     protocol: str,
@@ -1759,12 +1703,6 @@ _DEFINITIONS = (
         _shared_growth_recovery,
     ),
     _definition(
-        "host-history-pressure-cancel", "openai_chat", "host-history-pressure", "scheduling",
-        ("interferer-256",),
-        "Two retained histories compete with three growing requests in limited Host storage; cancel a specifically observed paused request.",
-        _host_history_pressure_cancel,
-    ),
-    _definition(
         "vision-growth-replay", "openai_chat", "vision-growth-replay", "scheduling",
         ("interferer-256", "image-chart"),
         "Fixed Text/Vision growth with Host disabled; require the Vision request's own replay.",
@@ -1773,16 +1711,9 @@ _DEFINITIONS = (
     _definition(
         "preemption-replay", "openai_chat", "preemption-replay", "scheduling",
         ("interferer-256",),
-        "Two fixed arrivals compete for 512 KV tokens with no Host snapshot capacity; "
-        "observe preemption and replay separately from request completion.",
+        "Two fixed arrivals compete for 512 KV tokens; observe preemption and replay "
+        "separately from request completion.",
         _preemption_load("replay_restore"),
-    ),
-    _definition(
-        "preemption-snapshot", "openai_chat", "preemption-snapshot", "scheduling",
-        ("interferer-256",),
-        "The same two fixed arrivals with Host snapshot capacity; observe preemption and "
-        "snapshot restoration separately from request completion.",
-        _preemption_load("snapshot_restore"),
     ),
     _definition(
         "shared-state-working-set-shift", "openai_chat", "cache-state-working-set", "resource",
@@ -1908,13 +1839,7 @@ _DEFINITIONS += tuple(
         ("interferer-256",),
         f"A multi-turn agent experiences {route} recovery, then retries and continues its history.",
         _agent_preempted_continuation(route),
-    ) for route in ("replay", "snapshot")
-) + tuple(
-    _definition(
-        f"preemption-snapshot-{backend}", "openai_chat", f"preemption-snapshot-{backend}", "scheduling",
-        ("interferer-256",), f"The minimal snapshot graph with {backend} speculative execution.",
-        _preemption_load("snapshot_restore"),
-    ) for backend in ("mtp", "dflash2")
+    ) for route in ("replay",)
 )
 
 

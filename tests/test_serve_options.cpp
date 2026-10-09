@@ -231,9 +231,7 @@ int main() {
                           defaults.media_live_bytes == infernix::kDefaultMediaLiveBytes &&
                           defaults.media_preprocess_threads == 0,
                       "media preparation resource defaults mismatch");
-    failures += check(defaults.context_cache.enabled &&
-                          defaults.context_cache.mode == infernix::ContextCacheMode::Hybrid,
-                      "the hybrid prefix cache is not the default");
+    failures += check(defaults.context_cache.enabled, "the prefix cache is not the default");
     failures += check(defaults.kv_capacity.mode == infernix::KvCapacityMode::Automatic &&
                           !defaults.vram_headroom_bytes,
                       "default KV capacity is not sized to free VRAM for the hybrid cache");
@@ -417,8 +415,8 @@ int main() {
     failures += check(!configured.context_cache.enabled &&
                           configured.context_cache.host_capacity_bytes ==
                               defaults.context_cache.host_capacity_bytes &&
-                          configured.context_cache.device_state_slots ==
-                              defaults.context_cache.device_state_slots,
+                          configured.context_cache.hybrid.device_snapshot_slots ==
+                              defaults.context_cache.hybrid.device_snapshot_slots,
                       "--no-prefix-reuse changed context capacities or retained cache enablement");
     failures += check(configured.enable_vision, "--vision did not enable Vision");
     failures += check(configured.usage_chunk_choice,
@@ -454,23 +452,6 @@ int main() {
     const ServeOptions logging = parse({"infernix-serve", "model.ninfer", "--log-level", "debug"});
     failures += check(logging.log_level == infernix::product::LogLevel::Debug,
                       "log level did not reach serving options");
-
-    // The original prefix cache and its capacities.
-    const ServeOptions original = parse({"infernix-serve", "model.ninfer", "--max-context", "16384",
-                                         "--use-original-prefix-caching"});
-    failures += check(original.context_cache.enabled &&
-                          original.context_cache.mode == infernix::ContextCacheMode::Original &&
-                          original.kv_capacity.mode == infernix::KvCapacityMode::Explicit &&
-                          original.kv_capacity.explicit_tokens == 16384,
-                      "the original prefix cache must keep the explicit max-context KV capacity");
-    const ServeOptions context_cache =
-        parse({"infernix-serve", "model.ninfer", "--use-original-prefix-caching",
-               "--device-state-slots", "3", "--host-context-mib", "64"});
-    failures += check(context_cache.context_cache.enabled &&
-                          context_cache.context_cache.mode == infernix::ContextCacheMode::Original &&
-                          context_cache.context_cache.device_state_slots == 3 &&
-                          context_cache.context_cache.host_capacity_bytes == (64ULL << 20),
-                      "context-cache capacities did not reach serving options");
 
     const ServeOptions zero_host_context =
         parse({"infernix-serve", "model.ninfer", "--host-context-mib", "0"});
@@ -545,33 +526,18 @@ int main() {
                           ("integer-only MiB option accepted a fraction: " + option).c_str());
     }
 
-    for (const bool disable_first : {false, true}) {
-        std::vector<std::string> arguments = {"infernix-serve", "model.ninfer"};
-        if (disable_first) { arguments.push_back("--no-prefix-reuse"); }
-        arguments.insert(arguments.end(),
-                         {"--device-state-slots", "3", "--host-context-mib", "64"});
-        if (!disable_first) { arguments.push_back("--no-prefix-reuse"); }
-        const ServeOptions disabled_cache = parse(std::move(arguments));
-        failures +=
-            check(!disabled_cache.allow_prefix_reuse && !disabled_cache.context_cache.enabled &&
-                      disabled_cache.context_cache.device_state_slots == 3 &&
-                      disabled_cache.context_cache.host_capacity_bytes == (64ULL << 20),
-                  "--no-prefix-reuse did not preserve independently configured capacities");
-    }
-
-    // Hybrid prefix cache capacities.
+    // Prefix cache capacities.
     const ServeOptions hybrid =
         parse({"infernix-serve", "model.ninfer", "--host-context-mib", "4096",
                "--device-snapshot-slots", "3", "--cache-taps-per-request", "5",
                "--cache-tap-ladder", "8192", "--cache-tap-min-gap", "512"});
     failures += check(hybrid.context_cache.enabled &&
-                          hybrid.context_cache.mode == infernix::ContextCacheMode::Hybrid &&
                           hybrid.context_cache.host_capacity_bytes == (4096ULL << 20) &&
                           hybrid.context_cache.hybrid.device_snapshot_slots == 3 &&
                           hybrid.context_cache.hybrid.max_new_taps == 5 &&
                           hybrid.context_cache.hybrid.tap_ladder_tokens == 8192 &&
                           hybrid.context_cache.hybrid.tap_min_gap_tokens == 512,
-                      "hybrid prefix-cache options did not reach serving options");
+                      "prefix-cache options did not reach serving options");
     // The default is a complete configuration: the KV pool defaults to free VRAM (the Device
     // block cache) and every hybrid tuning value is left for the Engine to derive.
     const ServeOptions hybrid_minimal = parse({"infernix-serve", "model.ninfer"});
@@ -621,17 +587,7 @@ int main() {
     failures += check(hybrid_explicit_kv.kv_capacity.mode == infernix::KvCapacityMode::Explicit &&
                           hybrid_explicit_kv.kv_capacity.explicit_tokens == 16384 &&
                           hybrid_explicit_kv.context_cache.host_capacity_bytes == 0U,
-                      "hybrid mode must keep an explicit KV capacity and a zero Host budget");
-    for (const std::vector<std::string>& legacy_flag :
-         std::vector<std::vector<std::string>>{{"--device-state-slots", "2"}}) {
-        std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
-        arguments.insert(arguments.end(), legacy_flag.begin(), legacy_flag.end());
-        bool rejected = false;
-        try {
-            (void)parse(std::move(arguments));
-        } catch (const std::invalid_argument&) { rejected = true; }
-        failures += check(rejected, "an original prefix-cache flag was accepted without the mode");
-    }
+                      "the prefix cache must keep an explicit KV capacity and a zero Host budget");
     // The cache file resolves to an absolute path at launch, so the shutdown save writes where
     // startup read. A path with backslashes and a drive, as a Windows shell passes a quoted
     // argument, names the same file.
@@ -680,38 +636,33 @@ int main() {
                       "--prefix-cache-save-mins was accepted without --prefix-cache-file");
     failures += check(rejected_cache_file({"--prefix-cache-file", "file.cache", "--prefix-cache-save-mins", "0"}),
                       "--prefix-cache-save-mins accepted zero");
-    for (const std::vector<std::string>& hybrid_flag :
+    for (const std::vector<std::string>& cache_flag :
          std::vector<std::vector<std::string>>{{"--prefix-cache-file", "file.cache"},
                                                {"--device-snapshot-slots", "2"},
                                                {"--cache-taps-per-request", "2"},
                                                {"--cache-tap-ladder", "2048"},
                                                {"--cache-tap-min-gap", "64"},
-                                               {"--no-queue-holds"}}) {
-        for (const char* disabling : {"--use-original-prefix-caching", "--no-prefix-reuse"}) {
-            std::vector<std::string> arguments{"infernix-serve", "model.ninfer", disabling};
-            arguments.insert(arguments.end(), hybrid_flag.begin(), hybrid_flag.end());
+                                               {"--no-queue-holds"},
+                                               {"--host-context-mib", "64"}}) {
+        for (const bool disable_first : {false, true}) {
+            std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
+            if (disable_first) { arguments.push_back("--no-prefix-reuse"); }
+            arguments.insert(arguments.end(), cache_flag.begin(), cache_flag.end());
+            if (!disable_first) { arguments.push_back("--no-prefix-reuse"); }
             bool rejected = false;
             try {
                 (void)parse(std::move(arguments));
             } catch (const std::invalid_argument&) { rejected = true; }
-            failures += check(rejected, "a hybrid prefix-cache flag was accepted without the mode");
+            failures += check(rejected, "a prefix-cache flag was accepted with --no-prefix-reuse");
         }
     }
-    // --no-prefix-reuse disables whichever cache is selected by default and keeps the KV pool at
-    // --max-context; naming the original cache alongside it is contradictory.
+    // --no-prefix-reuse disables the prefix cache and keeps the KV pool at --max-context.
     const ServeOptions without_reuse =
         parse({"infernix-serve", "model.ninfer", "--max-context", "16384", "--no-prefix-reuse"});
     failures += check(!without_reuse.context_cache.enabled &&
                           without_reuse.kv_capacity.mode == infernix::KvCapacityMode::Explicit &&
                           without_reuse.kv_capacity.explicit_tokens == 16384,
                       "--no-prefix-reuse did not disable the default prefix cache");
-    bool original_without_reuse_rejected = false;
-    try {
-        (void)parse(
-            {"infernix-serve", "model.ninfer", "--use-original-prefix-caching", "--no-prefix-reuse"});
-    } catch (const std::invalid_argument&) { original_without_reuse_rejected = true; }
-    failures += check(original_without_reuse_rejected,
-                      "original prefix cache was accepted together with --no-prefix-reuse");
 
     const ServeOptions response_store =
         parse({"infernix-serve", "model.ninfer", "--response-store-max-records", "42",
@@ -791,9 +742,6 @@ int main() {
     failures +=
         check(serve_usage_text("infernix-serve").find("--host-context-mib") != std::string::npos,
               "serve help omits context-cache capacities");
-    failures += check(serve_usage_text("infernix-serve").find("--use-original-prefix-caching") !=
-                          std::string::npos,
-                      "serve help does not name the original prefix-cache selection");
     failures +=
         check(serve_usage_text("infernix-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");
@@ -830,7 +778,7 @@ int main() {
                       "serve help omits the artifact-derived model id default");
 
     const ServeOptions inherited = parse({"infernix-serve", "model.ninfer", "--max-context", "16384",
-                                          "--use-original-prefix-caching"});
+                                          "--no-prefix-reuse"});
     failures += check(inherited.kv_capacity.mode == infernix::KvCapacityMode::Explicit &&
                           inherited.kv_capacity.explicit_tokens == 16384,
                       "omitted --kv-capacity did not follow --max-context");

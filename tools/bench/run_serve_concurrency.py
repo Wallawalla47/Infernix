@@ -332,10 +332,6 @@ def server_command(
         "--kv-dtype",
         point.kv_dtype,
         "--no-prefix-reuse",
-        "--device-state-slots",
-        "0",
-        "--host-context-mib",
-        "0",
     ]
     if point.speculative_backend != "none":
         command.extend(
@@ -397,7 +393,7 @@ def validate_server_start(
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
     if (
-        context_cache.get("device_state_slots") != 0
+        context_cache.get("device_snapshot_slots") != 0
         or context_cache.get("host_capacity_bytes") != 0
     ):
         raise corpus.CampaignError("server_start context cache capacity differs from the point")

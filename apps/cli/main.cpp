@@ -359,10 +359,8 @@ int main(int argc, char** argv) {
         engine_options.vision_offload           = cli.vision_offload;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
-        // One CLI invocation owns exactly one request and needs neither history nor pause
-        // storage, so select those resource capacities explicitly.
+        // One CLI invocation owns exactly one request and needs no prefix cache.
         engine_options.context_cache.enabled             = false;
-        engine_options.context_cache.device_state_slots  = 0;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.startup_observer                  = startup_log.observer();
         engine_options.diagnostic_observer = infernix::product::engine_diagnostic_observer(logger);

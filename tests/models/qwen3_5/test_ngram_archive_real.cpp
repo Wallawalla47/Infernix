@@ -107,7 +107,7 @@ int main(int argc, char** argv) {
         options.kv_cache        = infernix::KvCacheStorage::Nvfp4Group16;
         options.use_cuda_graph  = argc < 3 || std::stoi(argv[2]) != 0;
         if (concurrency > 1) {
-            options.context_cache.device_state_slots        = 2;
+            options.context_cache.hybrid.device_snapshot_slots        = 2;
             options.context_cache.host_capacity_bytes = 1ULL << 30;
         }
         if (backend == "mtp") {
