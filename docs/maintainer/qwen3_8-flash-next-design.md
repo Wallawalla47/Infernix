@@ -2901,7 +2901,7 @@ roughly halve the miss stall.
 **CPU-served misses (adopted, §10.3).** For each decode or verify layer call:
 
 1. One GPU kernel picks up to `cpu_expert_jobs` non-resident experts. It takes all but
-   misses / `cpu_pcie_divisor` of them, the fewest-column ones first, each with at most 8 columns.
+   misses / `cpu_pcie_divisor` of them (§19.3.12), the fewest-column ones first, each with at most 8 columns.
 2. It writes x and a request into mapped host memory (`offloaded_moe::MissRequest`), fences at
    system scope, and publishes a device-counted sequence number. Graph replays stay valid.
 3. A host service thread (`CpuMissService`, worker 0 of the existing `CpuExpertTeam`) computes
@@ -8096,9 +8096,28 @@ elastic pool does the same job with no kernel change:
   in tests). The diagnostic line `host-to-device link: ...` reports it and the choices below.
 - It rescales the link-bound costs from the reference rate at which they were fitted (27.5 GB/s): the
   prefix cost's restore rate and the walk-span cost.
-- The decode miss split keeps 1 / d of a call's misses on the link, with
-  d = max(2, round(1 + 2 × 27.5 GB/s / link)): 3 at x8, where 3 measured fastest, and 2 at x16
-  (`cpu_pcie_divisor = 0`, the default, derives it; a positive value fixes it).
+- The decode miss split keeps misses / d of a call's misses on the link, d = max(1, floor(1.65 + C t))
+  for C experts per second on the CPU team (one-column jobs) and t seconds per record on the link.
+  1 + C t balances the two parts; the switches sit between the measured fastest divisors (below):
+  d steps from 2 to 3 at C t = 1.35, midway between 3 workers (1.0, d = 2) and 6 workers (1.5-1.7,
+  d = 3), so the startup measurement's noise (6 workers measured 15,000-17,200 experts/s) stays
+  clear of it; round(1 + C t) put that switch at 1.5, inside the noise. A fractional share
+  1 / (1 + C t) was tried and dropped: at a share near 1/2 the noise flips floor(M share) for M = 2
+  between startups (3 workers: 100.8 against 107.5 tok/s plain).
+  `cpu_pcie_divisor = 0`, the default, derives d; a positive value fixes it.
+- The CPU team's decode rate C is measured at startup for the configured workers
+  (`program/cpu_rates.cpp`, ~30 ms): the best of 3 batches of 8 rounds of 16 one-column jobs on
+  real records from the pinned banks (across layers, past the last-level cache) while the link
+  copies records into the staging slots (the staging's DRAM reads compete with the CPU's). Without host records (the SSD tier) the
+  i9-13900K's 6-worker rate stands (21,000 experts/s). The prefill CPU split below keeps its fitted
+  rates; on measured ones (lower under the link's load: 6 workers 17,000 experts/s and 46,000
+  expert columns/s against 21,000 / 66,000) it is not yet qualified.
+  Measured (2026-10-09, tg512 cold, Dense8, two passes in opposite orders). With fixed divisors the
+  best divisor follows the CPU: 6 workers d = 3 (plain 116.4 tok/s, MTP 167.1; d = 2 152.4 MTP), 3
+  workers d = 2 (107.3 / 150.3; d = 3 144.6 MTP), 2 workers d = 2 (100.3 / 138.0; d = 3 120.8 MTP);
+  the old rule (d = 3 at x8 whatever the CPU) costs 3 and 2 workers up to 12 %. The measured rates
+  were 15,000-17,200 experts/s at 6 workers (C t = 1.5-1.7: d = 3), 9,700-10,000 at 3 (1.0: d = 2)
+  and 7,000-7,700 at 2 (0.7-0.8: d = 2), so the derived divisor is the fastest one at each.
 - Decode promotes into the expert cache every `4 × 27.5 GB/s / link` tokens once the frames are full
   (4 at x8, where it measured fastest; 2 at x16). A promotion moves the bytes of serving its expert
   once, and on a faster link the rounds leave the link idler, so promotions cost less wall time. The
