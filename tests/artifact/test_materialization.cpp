@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/views.h"
+#include "core/copy_batch.h"
 #include "core/device.h"
 
 #include <cuda_runtime.h>
@@ -156,10 +157,10 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
     std::cout << path.filename().string() << ": all bound parent bytes and logical views passed\n";
 }
 
-void staging_reuse(DeviceContext& device) {
-    // More than one full staging ring, with distinct pages and a partial final block.
-    constexpr std::size_t bytes = 5ULL * 64 * 1024 * 1024 + 1024;
-    Fixture fixture;
+std::byte pattern_byte(std::size_t position) { return std::byte((position * 17 + (position / 4096) * 13) % 251); }
+
+// An artifact of one BF16 object "large" of `bytes` patterned bytes (pattern_byte).
+void write_pattern_artifact(Fixture& fixture, std::size_t bytes) {
     fixture.payload.clear();
     fixture.root    = {{"components", {{"text", {{"config", Json::object()}}}}},
                        {"objects", Json::array({{{"id", "large"},
@@ -183,28 +184,72 @@ void staging_reuse(DeviceContext& device) {
     file.write(reinterpret_cast<const char*>(header.data()), header.size());
     std::array<std::byte, 4096> page{};
     for (std::size_t offset = 0; offset < bytes; offset += page.size()) {
-        for (std::size_t i = 0; i < page.size(); ++i) {
-            page[i] = std::byte(((offset + i) * 17 + (offset / 4096) * 13) % 251);
-        }
+        for (std::size_t i = 0; i < page.size(); ++i) { page[i] = pattern_byte(offset + i); }
         file.write(reinterpret_cast<const char*>(page.data()),
                    std::min(page.size(), bytes - offset));
     }
     file.close();
-    Reader reader(fixture.entry);
-    Binder binder(reader);
-    (void)binder.parameter("large", {bytes / 2});
-    auto backing     = materialize(reader, std::move(binder).finish(), device);
-    const auto* base = backing.device_parent(reader.find("large")).data;
+}
+
+// Whether `bytes` bytes the device reads at `device` are the pattern.
+bool device_holds_pattern(const std::byte* device, std::size_t bytes) {
     std::vector<std::byte> chunk(1024 * 1024);
     for (std::size_t offset = 0; offset < bytes; offset += chunk.size()) {
         const auto count = std::min(chunk.size(), bytes - offset);
-        CUDA_CHECK(cudaMemcpy(chunk.data(), base + offset, count, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(chunk.data(), device + offset, count, cudaMemcpyDeviceToHost));
         for (std::size_t i = 0; i < count; ++i) {
-            const auto position = offset + i;
-            require(chunk[i] == std::byte((position * 17 + (position / 4096) * 13) % 251),
-                    "staging slot reuse overwrote an in-flight or later block");
+            if (chunk[i] != pattern_byte(offset + i)) { return false; }
         }
     }
+    return true;
+}
+
+void staging_reuse(DeviceContext& device) {
+    // More than one full staging ring, with distinct pages and a partial final block.
+    constexpr std::size_t bytes = 5ULL * 64 * 1024 * 1024 + 1024;
+    Fixture fixture;
+    write_pattern_artifact(fixture, bytes);
+    Reader reader(fixture.entry);
+    Binder binder(reader);
+    (void)binder.parameter("large", {bytes / 2});
+    auto backing = materialize(reader, std::move(binder).finish(), device);
+    require(device_holds_pattern(backing.device_parent(reader.find("large")).data, bytes),
+            "staging slot reuse overwrote an in-flight or later block");
+}
+
+// A pinned object (the expert banks' residency): read into pageable memory whose pages workers
+// zero ahead of the reads, then registered once. Several 64 MiB prefault chunks and a partial last
+// page; the host and the device (through its own mapping) see the file's bytes.
+void pinned_block(DeviceContext& device) {
+    constexpr std::size_t bytes = 5ULL * 64 * 1024 * 1024 + 1024;
+    Fixture fixture;
+    write_pattern_artifact(fixture, bytes);
+    Reader reader(fixture.entry);
+    Binder binder(reader);
+    (void)binder.parameter("large", {bytes / 2}, Residency::HostPinned);
+    auto backing         = materialize(reader, std::move(binder).finish(), device);
+    const auto& parent   = backing.pinned_parent(reader.find("large"));
+    bool host = true;
+    for (std::size_t i = 0; i < bytes; ++i) { host = host && parent.data[i] == pattern_byte(i); }
+    require(host, "a pinned object's host bytes differ from the file");
+    require(parent.device != nullptr, "a pinned object has no device address");
+    require(device_holds_pattern(parent.device, bytes), "the device reads other bytes than the pinned object's");
+    // Batched copies take the device address (core/copy_batch.h).
+    void* landed        = nullptr;
+    cudaStream_t stream = nullptr; // cudaMemcpyBatchAsync rejects the legacy default stream
+    CUDA_CHECK(cudaMalloc(&landed, bytes));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    {
+        CopyBatch copies(stream);
+        copies.add(landed, parent.device, bytes);
+        copies.flush();
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    const bool copied = device_holds_pattern(static_cast<const std::byte*>(landed), bytes);
+    CUDA_CHECK(cudaFree(landed));
+    require(copied, "a batched copy from the pinned object's device address moved other bytes");
+    require(backing.pinned_bytes_range().data() == parent.data, "the pinned range is not the block's host bytes");
 }
 
 } // namespace
@@ -231,6 +276,7 @@ int main(int argc, char** argv) {
         failure_and_host_only(device);
         infernix::test::materialization_cuda_errors(device);
         staging_reuse(device);
+        pinned_block(device);
         std::cout << "artifact materialization checks passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -744,10 +744,12 @@ public:
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
 
+        // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
+        // faults on a registered block's host address where the device maps it elsewhere: WDDM).
         std::vector<const std::uint8_t*> banks;
         std::uint64_t record_stride = 0;
         for (const auto& layer : parameters_.layers) {
-            banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+            banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
             record_stride = layer.moe.bank->planes.record_stride;
         }
         if (record_stride != plan_.record_stride) {
@@ -815,9 +817,9 @@ public:
                     return tier->record(tier->key(layer, expert));
                 };
             } else {
-                std::vector<const std::uint8_t*> banks;
+                std::vector<const std::uint8_t*> banks; // device addresses: the stream batches its copies
                 for (const auto& layer : parameters_.layers) {
-                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.records));
+                    banks.push_back(reinterpret_cast<const std::uint8_t*>(layer.moe.bank->planes.device_records));
                 }
                 record_of = [banks = std::move(banks), record_stride](std::uint32_t layer, std::uint32_t expert) {
                     return banks[layer] + static_cast<std::size_t>(expert) * record_stride;

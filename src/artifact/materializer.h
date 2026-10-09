@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "core/host_memory.h"
 #include "core/weight_view.h"
 #include "infernix/types.h"
 
@@ -123,9 +124,9 @@ public:
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle) const noexcept;
 
-    // Pinned host block backing HostPinned objects (e.g. the vision tower in overlay
-    // mode), exposed so the runtime can stream the weights to device staging.
-    [[nodiscard]] const PinnedHostBuffer& pinned_block() const;
+    // Pinned host block backing HostPinned objects (e.g. the vision tower in overlay mode), at its
+    // host address, so the runtime can copy the weights to device staging. Device code reads a
+    // pinned object at its parent's WeightParent::device instead.
     [[nodiscard]] std::span<const std::byte> pinned_bytes_range() const;
 
     // VMM arena pool present only when the plan reserved an evictable tail.
@@ -151,7 +152,7 @@ private:
     };
 
     std::unique_ptr<DeviceArena> arena_;
-    std::unique_ptr<PinnedHostBuffer> pinned_;
+    std::unique_ptr<RegisteredHostBuffer> pinned_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
     std::vector<ObjectStorage> objects_;
     StreamSource stream_source_;

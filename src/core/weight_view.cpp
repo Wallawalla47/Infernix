@@ -318,13 +318,28 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     return out;
 }
 
+Weight device_native_weight(const WeightView& view, float input_divisor) {
+    Weight out           = native_weight(view, input_divisor);
+    const auto* parent   = contiguous_weight_region(view).parent;
+    if (!parent->device) { throw std::invalid_argument("device native Weight requires a device-visible parent"); }
+    const auto rebase = [&](const void* p) -> const void* {
+        return p ? parent->device + (static_cast<const std::byte*>(p) - parent->data) : nullptr;
+    };
+    out.payload = rebase(out.payload);
+    out.qdata   = rebase(out.qdata);
+    out.qhigh   = rebase(out.qhigh);
+    out.scales  = rebase(out.scales);
+    return out;
+}
+
 ExpertBankPlanes expert_bank_planes(const WeightParent& parent) {
     if (!parent.data) {
         throw std::invalid_argument("expert bank planes require a resident nvfp4_expert_rg16_v1 parent");
     }
     ExpertBankPlanes out = expert_bank_layout(parent.geometry, reinterpret_cast<const float*>(parent.data +
                                                                                             parent.geometry.scale_offset));
-    out.records = parent.data;
+    out.records        = parent.data;
+    out.device_records = parent.device;
     return out;
 }
 

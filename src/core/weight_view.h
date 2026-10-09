@@ -60,6 +60,9 @@ struct WeightParent {
     WeightGeometry geometry;
     const std::byte* data      = nullptr;
     float weight_scale_divisor = 0.0F;
+    // Where device code reads `data`: data itself for device memory, the mapped address for pinned
+    // host memory (registered host memory may map elsewhere: WDDM), null for host-only memory.
+    const std::byte* device = nullptr;
 };
 
 struct WeightRegion {
@@ -99,11 +102,15 @@ struct WeightRowPlanes {
 // Existing Weight ABI: complete quantized parents, direct regions, and RowSplit row views.
 // Arbitrary FP8/NVFP4 regions use their explicit planes until a native consumer supports them.
 [[nodiscard]] Weight native_weight(const WeightView& view, float input_divisor = 0.0F);
+// native_weight read by device code from a pinned host parent: its pointers at the parent's device
+// address (WeightParent::device).
+[[nodiscard]] Weight device_native_weight(const WeightView& view, float input_divisor = 0.0F);
 
 // A routed-expert bank in nvfp4_expert_rg16_v1 (Qwen3.8-Flash-Next design §6.2). Pointers are in
 // the parent's memory space; nothing is dereferenced.
 struct ExpertBankPlanes {
     const std::byte* records     = nullptr; // expert e at records + e * record_stride
+    const std::byte* device_records = nullptr; // records where device code reads them (WeightParent::device)
     const float* multipliers     = nullptr; // [experts][3]: gate, up, down weight_scale_2
     std::uint64_t record_bytes   = 0;
     std::uint64_t record_stride  = 0;

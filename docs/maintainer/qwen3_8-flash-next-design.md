@@ -752,7 +752,7 @@ mathematics:
 | Class | Backing | Users |
 |---|---|---|
 | `device` (existing) | Uploaded at load | Dense weights |
-| `host_pinned` | Read with `O_DIRECT` into a huge-page, `cudaHostRegister`ed host arena. Never staged through the page cache. | Routed expert banks (NVFP4), embedding, and the vision tower under `--vision-offload` (856 MiB, §19.3.2) |
+| `host_pinned` | Read unbuffered (16 overlapped 8 MiB reads) into one committed pageable block whose pages workers zero ahead of the reads, then `cudaHostRegister`ed once, whole (`RegisteredHostBuffer`; `cudaMallocHost` zeroed and locked 63 GiB serially first, 7 s of a 20.9 s load). Never staged through the page cache. Device code reads it at `WeightParent::device`, which differs from the host address under WDDM. | Routed expert banks (NVFP4), embedding, and the vision tower under `--vision-offload` (856 MiB, §19.3.2) |
 | `stream` | Never materialized. The Model holds an open file region plus its layout. | N-gram table |
 
 Residency is a property of a Use and the startup options, not of the stored bytes. The same artifact
