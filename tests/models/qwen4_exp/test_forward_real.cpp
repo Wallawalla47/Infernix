@@ -554,6 +554,24 @@ int main(int argc, char** argv) {
                 const std::int32_t from      = std::min(job.dump_from, n);
                 const std::int32_t header[2] = {static_cast<std::int32_t>(vocab), n - from};
                 out.write(reinterpret_cast<const char*>(header), sizeof(header));
+                // --blocks: every block's mixer and MoE inputs and outputs at every position, so calls
+                // of different widths can be compared block by block.
+                const auto blocks             = static_cast<std::size_t>(c.num_hidden_layers);
+                const auto H                  = static_cast<std::int32_t>(c.hidden_size);
+                const std::size_t block_values = job.blocks_path.empty() ? 1 : 4 * blocks * H * chunk;
+                DeviceBuffer block_taps(block_values * 2);
+                std::vector<Tensor> block_tensors[4];
+                for (std::size_t b = 0; b < blocks; ++b) {
+                    for (std::size_t kind = 0; kind < 4; ++kind) {
+                        block_tensors[kind].emplace_back(static_cast<std::byte*>(block_taps.p) +
+                                                             (b * 4 + kind) * static_cast<std::size_t>(H) * chunk * 2,
+                                                         DType::BF16, std::initializer_list<std::int32_t>{H, chunk});
+                    }
+                }
+                q4::execution::ForwardTap block_tap{nullptr, nullptr, &block_tensors[0], &block_tensors[1],
+                                                    &block_tensors[2], &block_tensors[3]};
+                std::ofstream block_out;
+                if (!job.blocks_path.empty()) { block_out.open(job.blocks_path, std::ios::binary); }
                 double nll = 0.0;
                 std::int32_t scored = 0, same_top1 = 0;
                 t0 = std::chrono::steady_clock::now();
@@ -561,8 +579,21 @@ int main(int argc, char** argv) {
                     const std::int32_t width = std::min(chunk, n - first);
                     auto call = make_call(c, volume, {tokens}, first, width, {0}, {0}, true);
                     Tensor chunk_logits(logits.p, DType::FP32, {static_cast<std::int32_t>(vocab), width});
-                    harness.forward->run(call.batch, chunk_logits);
+                    harness.forward->run(call.batch, chunk_logits, job.blocks_path.empty() ? nullptr : &block_tap);
                     device.synchronize();
+                    if (!job.blocks_path.empty()) {
+                        // [position][block][mixer in, mixer out, moe in, moe out][H]
+                        std::vector<std::uint16_t> host(block_values);
+                        block_taps.copy_to_host(host.data(), block_values * 2, 0);
+                        for (std::int32_t t = 0; t < width; ++t) {
+                            for (std::size_t tap = 0; tap < 4 * blocks; ++tap) {
+                                const std::size_t at = tap * static_cast<std::size_t>(H) * chunk +
+                                                       static_cast<std::size_t>(t) * H;
+                                block_out.write(reinterpret_cast<const char*>(host.data() + at),
+                                                static_cast<std::streamsize>(H) * 2);
+                            }
+                        }
+                    }
                     if (first + width <= from) { continue; }
                     const auto rows       = to_float(logits, vocab * width);
                     const std::int32_t lo = std::max(0, from - first);
