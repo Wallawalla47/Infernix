@@ -31,7 +31,9 @@ namespace infernix::ops {
  * the same bits. An expert with more columns (and one shared gate/up input scale) takes the wide
  * route: the same A4 activations and BF16 boundaries, with the block products summed by FP32
  * tensor cores (qualified against FP64; design §8.5, §13). Both routes depend only on the column
- * count and the stored scales, never on placement. Router logits stay FP32, as in
+ * count and the stored scales, never on placement. W4A16 experts (§16.2.1) are exact on every
+ * route, the wide one included (integer tensor cores), so their bits depend on neither placement
+ * nor column count. Router logits stay FP32, as in
  * the Qwen3.5 sparse MoE: rounding them to BF16 would turn experts within one BF16 step of the
  * top-k boundary into ties. Each logit is one FP32 dot product whose order depends only on H, so
  * a column's routing is identical in every batch shape. Routing weights, the shared gate and the
@@ -197,7 +199,10 @@ struct MoeExpertSource {
     const std::uint8_t* prefetch_base  = nullptr;
 };
 
-[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries);
+/// Workspace of one moe_experts call of `columns` (T) columns and `entries` (k*T) routed entries
+/// with the layer's expert arithmetic.
+[[nodiscard]] std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+                                                      offloaded_moe::ExpertActivation activation);
 
 /// x: BF16 [H, T]. outputs: BF16 [H, k*T], column t*k + slot receives expert ids[slot, t]'s
 /// output for column t. max_jobs bounds the job count the grid covers (min(E, k*T)).

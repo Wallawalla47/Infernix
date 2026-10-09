@@ -11,8 +11,8 @@
 // FP64 qualification is test_offloaded_moe_wide), equals the first configuration's: neither the record's
 // location, nor the staging pass a job falls in, nor a CPU-served share may change an output bit.
 // moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
-// same configurations against expert_forward_a16 (their wide route's BF16 GEMM, too, is qualified
-// in test_offloaded_moe_wide).
+// same configurations against expert_forward_a16, which every W4A16 output equals bit for bit (its
+// wide route is exact as well).
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -271,7 +271,7 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns)),
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, top_k * columns, columns, activation)),
                "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     cuda_check(cudaMalloc(&d_out, expected.size() * sizeof(std::uint16_t)), "cudaMalloc");
@@ -396,11 +396,12 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
         }
         return chosen;
     };
-    // Outputs of the narrow route (design §8.5): an expert with at most eight columns, or one whose
-    // gate and up projections keep separate input scales (the W4A4 fixture's every third expert).
+    // Outputs with the CPU engine's bits: every W4A16 output (its wide route is exact too), and the
+    // W4A4 narrow route's (design §8.5): an expert with at most eight columns, or one whose gate and
+    // up projections keep separate input scales (the fixture's every third expert).
     std::vector<std::uint8_t> narrow(static_cast<std::size_t>(top_k) * columns);
     for (std::size_t i = 0; i < narrow.size(); ++i) {
-        narrow[i] = expert_columns[ids[i]] <= moe::kMaxCpuColumns || (!a16 && ids[i] % 3 == 0);
+        narrow[i] = a16 || expert_columns[ids[i]] <= moe::kMaxCpuColumns || ids[i] % 3 == 0;
     }
     std::vector<std::uint16_t> placed;
     // The fork stream and its events, for the one-pass decode/verification route.

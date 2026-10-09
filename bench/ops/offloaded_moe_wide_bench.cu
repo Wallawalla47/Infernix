@@ -9,10 +9,11 @@
 //   frames : every record in device memory (isolates the expert kernels);
 //   staged : every record in the pinned host bank, staged through the slots each call
 //            (the cold-layer case, bound by the staging copy).
-// The FLOP figure counts the wide entries' gate/up and down products only.
+// The FLOP figure counts the wide entries' gate/up and down products only. --activation a16 gives
+// the experts W4A16 arithmetic (no input scales, design §16.2.1).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
-//                                   [--warmup 3] [--repeat 10] [--seed N]
+//                                   [--activation a4|a16] [--warmup 3] [--repeat 10] [--seed N]
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -51,6 +52,7 @@ struct Options {
     int warmup            = 3;
     int repeat            = 10;
     std::uint32_t seed    = 20261004U;
+    bool a16              = false;
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -81,6 +83,10 @@ Options parse_options(int argc, char** argv) {
             options.warmup = std::stoi(value());
         } else if (arg == "--repeat") {
             options.repeat = std::stoi(value());
+        } else if (arg == "--activation") {
+            const std::string v = value();
+            if (v != "a4" && v != "a16") { throw std::invalid_argument("--activation takes a4 or a16"); }
+            options.a16 = v == "a16";
         } else if (arg == "--seed") {
             options.seed = static_cast<std::uint32_t>(std::stoul(value()));
         } else {
@@ -144,8 +150,9 @@ struct Fixture {
     std::uint8_t* host_device = nullptr;
     cudaStream_t overlap = nullptr;
     cudaEvent_t events[5] = {};
+    bool a16 = false;
 
-    explicit Fixture(std::uint32_t seed) {
+    Fixture(std::uint32_t seed, bool a16) : a16(a16) {
         std::mt19937 rng(seed);
         const auto records = random_records(rng);
         const std::size_t bank = static_cast<std::size_t>(kExperts) * moe::kRecordBytes;
@@ -170,6 +177,11 @@ struct Fixture {
             e.input_down              = std::exp2(lg(rng));
             e.alpha_gate = e.alpha_up = std::exp2(lg(rng)) * e.input_gate;
             e.alpha_down              = std::exp2(lg(rng)) * e.input_down;
+            if (a16) { // W4A16: no input scales, the multipliers alone
+                e.input_gate = e.input_up = e.input_down = 0.0F;
+                e.alpha_gate = e.alpha_up = std::exp2(lg(rng));
+                e.alpha_down              = std::exp2(lg(rng));
+            }
         }
         scales = DeviceBuffer(sizeof(moe::ExpertScales) * kExperts);
         CUDA_CHECK(cudaMemcpy(scales.p, s.data(), scales.bytes, cudaMemcpyHostToDevice));
@@ -193,6 +205,7 @@ struct Fixture {
                                .host_records  = host_device,
                                .record_stride = moe::kRecordBytes,
                                .scales        = static_cast<const moe::ExpertScales*>(scales.p),
+                               .activation    = a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4,
                                .staging_base  = static_cast<std::uint8_t*>(staging.p),
                                .staging_slots = kStagingSlots};
         s.overlap_stream = overlap;
@@ -233,7 +246,8 @@ void run_point(Fixture& fixture, int tokens, const Options& options, cudaStream_
     const DeviceBuffer x = bench::make_bf16(static_cast<std::size_t>(moe::kHidden) * tokens, options.seed + 7, -0.15F, 0.15F);
     DeviceBuffer outputs(sizeof(std::uint16_t) * moe::kHidden * entries);
     const int max_jobs = std::min(kExperts, entries);
-    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(max_jobs, entries));
+    DeviceBuffer workspace(ops::moe_experts_workspace_bytes(
+        max_jobs, entries, tokens, options.a16 ? moe::ExpertActivation::kA16 : moe::ExpertActivation::kA4));
     for (const bool staged : {false, true}) {
         if ((staged && options.placement == "frames") || (!staged && options.placement == "staged")) { continue; }
         const ops::MoeExpertSource source = fixture.source(staged);
@@ -256,9 +270,9 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        std::printf("# gpu=%s timed=moe_experts (routing and dispatch untimed) staging_slots=%d overlap=on\n",
-                    context.props.name, kStagingSlots);
-        Fixture fixture(options.seed);
+        std::printf("# gpu=%s timed=moe_experts (routing and dispatch untimed) activation=%s staging_slots=%d\n",
+                    context.props.name, options.a16 ? "a16" : "a4", kStagingSlots);
+        Fixture fixture(options.seed, options.a16);
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, context.stream); }
         return 0;
     } catch (const std::exception& error) {

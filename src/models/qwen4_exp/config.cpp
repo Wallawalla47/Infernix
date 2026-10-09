@@ -242,6 +242,8 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         Config out;
         out.text = text(directory.component("text").config);
         out.text.rope.yarn_factor = options.rope_yarn_factor;
+        // A weight-only export stores its banks without activation scales (the loader checks every layer).
+        out.text.moe.a16_experts = !directory.bindings.contains("text/layers/0/moe/expert_input_scales");
         if (options.rope_yarn_factor > 1.0F && out.text.rope.theta <= 1.0F) {
             throw ArtifactError("YaRN needs a RoPE theta above 1");
         }

@@ -2416,27 +2416,29 @@ output is bit-identical on the GPU (frame or staging) and the CPU (every ISA).
 ```text
 M_j  = 128 | mantissa_j (normal), mantissa_j (subnormal)      e_j = max(E_j, 1)
 emax = max_j e_j          (1 for an all-zero column; a column with Inf or NaN is "non-finite")
-X_j  = sign_j · rne( M_j · 2^15 / 2^(emax − e_j) )            |X_j| < 2^23
+X_j  = sign_j · rne( M_j · 2^13 / 2^(emax − e_j) )            |X_j| < 2^21
 ```
 
-- v_j = X_j · 2^(emax − 149) exactly for every element within 2^15 of the column's largest
-  exponent; smaller ones are rounded to the nearest multiple of 2^(emax − 149), ties to even
-  (a relative 2^−23 of the column's largest magnitude). The tensor-core runtimes this format is
-  served with accumulate in FP32, which has the same resolution relative to the largest term.
-- X is stored as three bytes: lo and mid, the unsigned low bytes of its two's complement, and
-  hi = X >> 16 in [−128, 127], so X = lo + 256·mid + 65536·hi.
+- v_j = X_j · 2^(emax − 147) exactly for every element within 2^13 of the column's largest
+  exponent; smaller ones are rounded to the nearest multiple of 2^(emax − 147), ties to even
+  (a relative 2^−21 of the column's largest magnitude, far below the outputs' BF16 rounding).
+  21 bits, rather than the 23 of the first version, let the wide route form a block's products
+  with two 32-deep integer MMAs (below); the golden expert outputs did not change, since their
+  columns span fewer than 13 binades.
+- The narrow routes store X as three bytes: lo and mid, the unsigned low bytes of its two's
+  complement, and hi = X >> 16 in [−32, 31], so X = lo + 256·mid + 65536·hi.
 
 **Row product.** With c2 and Ŝ as in §16.2:
 
 ```text
-P_b = Σ_{j<16} c2(w[r,16b+j]) · X[16b+j]       |P_b| ≤ 12 · 16 · (2^23 − 1) < 2^31, exact int32
-S   = Σ_b P_b · Ŝ(ws[r,b])                     |S| < 2^57, exact int64, any order
-y   = bf16_rn( (fl32_rn(S) · 2^(emax − 159)) ⊗ m )
+P_b = Σ_{j<16} c2(w[r,16b+j]) · X[16b+j]       |P_b| ≤ 12 · 16 · (2^21 − 1) < 2^29, exact int32
+S   = Σ_b P_b · Ŝ(ws[r,b])                     |S| < 2^55, exact int64, any order
+y   = bf16_rn( (fl32_rn(S) · 2^(emax − 157)) ⊗ m )
 ```
 
 - m = fl32(1 / weight global scale), the multiplier stored in the record's tail (§6.2); the
   checkpoint's global scale divides, so this reciprocal is the import's only rounding.
-- The scaling by 2^(emax − 159) (2^−1 for the doubled code, 2^−9 for Ŝ, 2^(emax − 149) for X) is
+- The scaling by 2^(emax − 157) (2^−1 for the doubled code, 2^−9 for Ŝ, 2^(emax − 147) for X) is
   two exact power-of-two multiplies, so a subnormal product is rounded once; a non-finite column
   gives the canonical NaN (0x7FC0) in every row.
 - The byte limbs make every product a byte product: the GPU uses dp4a (signed codes times unsigned
@@ -2453,10 +2455,33 @@ the expert output in BF16. Semantic boundaries:
 x (BF16) → A16 → gate/up → BF16 → SwiGLU → BF16 h → A16 → down → BF16 y_e → combine
 ```
 
-**Wide route.** Experts with more than eight columns use a BF16 tensor-core grouped GEMM: each
-weight is c2/2 · Ŝ/2⁹, exactly representable in BF16 (at most six significant bits), the
-activations are the unencoded BF16 x and h, and the FP32 accumulator is scaled by m and rounded to
-BF16 at the same boundaries. It is qualified against FP64 like §16.2's wide route.
+**Wide route.** Experts with more than eight columns use an integer tensor-core grouped GEMM with
+the same exact sums (`wide_expert_a16.cuh`). X is split as 2^14·H1 + 2^11·H0 + 8·L1 + L0 (H1
+signed, L1 a byte, H0 and L0 three bits); per 16-element block, two `mma.m16n8k32` with
+B = [8·c2 | c2] (|8·c2| ≤ 96 stays a signed byte) give c2·(X >> 11) from A = [H1 | H0] and
+c2·(X & 2047) from A = [L1 | L0], so P_b = 2048·first + second exactly, and S += P_b·Ŝ in int64.
+The route therefore returns the narrow route's and the CPU engine's bits: a W4A16 expert's output
+depends neither on placement nor on how many columns share its call.
+
+- *Why exact (finding, 2026-10-09).* The first wide route was a BF16 tensor-core GEMM qualified
+  against FP64 (mean relative L2 7.1e-5, as accurate as the exact arithmetic). It made an expert's
+  bits depend on its column count in the call (eight columns: exact; nine: FP32 tensor-core
+  order), so KV blocks that one request computed in a 476-column call and another reused differed
+  from that request's cold 512-column computation: the prefix-cache real test failed its
+  Host-block-restore (token 13) and restart-resume (token 27) checks, which pass with the exact
+  route. (W4A4 is canonical on every route, so recipes A and B never had this.)
+- *Speed (RTX 5090, `infernix_offloaded_moe_wide_bench --activation a16`, T = 4,096, records in
+  frames, 8 staging passes).* One call: three k16 MMAs per block 7.24 ms; two k32 per block
+  6.24 ms (a k32 MMA costs a k16 one's 13 cycles per SMSP; a BF16 m16n8k16 costs 26); 128-element
+  stages with 16 consumer warps 5.45 ms. W4A4 takes 1.65 ms. Rejected: four stages at one CTA
+  per SM alone (6.67 ms), 16 warps at 64-element stages (6.47), entry-major x planes read through
+  tensor maps (GEMMs ~1.4 % faster, +0.25 ms per call to encode x per entry, 8x the x workspace).
+  The profile shows the integer pipe ~50 % active and ~50 % issue utilization.
+- *End to end (same day, orca artifact, INT8 KV, `infernix_bench -r 3`, ABBA, exact route vs the
+  BF16 route's binary).* pp1024 (chunk 1024) 380.7 vs 373.2 tok/s (+2.0 %), pp4096 (chunk 4096)
+  1,659.7 vs 1,658.8 (0.0 %), pp16384 (chunk 4096) 6,176 vs 6,378 (−3.2 %): cold chunks wait on the
+  expert link, the warm chunks of a long prompt on these GEMMs. The first exact version (three k16
+  MMAs) measured −13.0 % on pp16384.
 
 **Cost.** Three byte products per weight instead of one: the GPU narrow kernels stay bound by the
 record reads they share with A4, while the CPU's integer work per miss triples (§10.2); recipe C

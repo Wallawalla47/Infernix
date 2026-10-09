@@ -74,7 +74,7 @@ inline Expert random_a16_expert(std::mt19937& rng) {
 }
 
 // Activations with a wide dynamic range per column: most elements near 0.05, a few outliers up to
-// 2^12 and some tiny ones, so the A16 encoding rounds elements more than 2^15 below the column's
+// 2^12 and some tiny ones, so the A16 encoding rounds elements more than 2^13 below the column's
 // largest (design §16.2.1).
 inline std::vector<std::uint16_t> wide_range_activations(std::mt19937& rng, int ncols) {
     std::vector<std::uint16_t> x = random_activations(rng, ncols);

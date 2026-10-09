@@ -439,6 +439,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     }
     // Every layer's bank has the same arithmetic: the activation policy of the first.
     const bool a16 = !out->weights.layers.front().moe.input_scales.valid();
+    if (a16 != out->config.text.moe.a16_experts) {
+        throw ArtifactError("Qwen4Exp: the expert banks' activation policy disagrees with their activation scales");
+    }
     for (const auto& layer : out->weights.layers) {
         if (layer.moe.input_scales.valid() == a16) {
             throw ArtifactError("Qwen4Exp: every layer's expert bank needs the same activation policy");

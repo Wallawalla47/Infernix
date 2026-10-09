@@ -334,7 +334,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns, moe::ExpertActivation::kA4)), "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
     cuda_check(cudaMalloc(&d_out, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
@@ -485,7 +485,7 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
                                             .scales        = d_scales,
                                             .staging_base  = d_staging,
                                             .staging_slots = 64};
-        const auto layout = wide::carve_experts_workspace(d_workspace, max_jobs, entries);
+        const auto layout = wide::carve_experts_workspace(d_workspace, max_jobs, entries, columns, moe::ExpertActivation::kA4);
         Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
         Tensor out(d_out, DType::BF16, {moe::kHidden, entries});
         const wide::Call call = wide::prepare(tx, dispatch, source, top_k, max_jobs, max_jobs, layout, out, nullptr);
@@ -622,16 +622,15 @@ void test_layer(const char* name, int experts, int columns, int top_k, const std
 
 // ------------------------------------------------------------------------------ W4A16 layer
 //
-// The W4A16 wide route (§16.2.1, wide_expert_a16.cuh), criteria fixed before the first run:
-//   A1  End to end against the FP64 chain: weights exactly decoded (c2 / 2 x E4M3 scale x m), the BF16
-//       x unencoded, BF16 at the semantic boundaries (y_gate, y_up, h, y), FP64 SiLU. Every wide entry's
-//       relative L2 error <= 2^-6, and the mean <= 1.25 x the exact narrow arithmetic's (the CPU engine
-//       on the same entry, the rounding-order control) + 1e-4.
-//   A2  Narrow experts (at most eight columns): equal to the CPU engine bit for bit.
-//   A3  Placement invariance: outputs bit-identical for every staging layout, the fork stream,
+// The W4A16 routes (§16.2.1; wide_expert_a16.cuh for experts of more than eight columns), criteria
+// fixed before the first run:
+//   A1  Every entry, wide and narrow: equal to the CPU engine (expert_forward_a16, the exact canonical
+//       arithmetic, qualified against FP64 in test_offloaded_moe_a16_cpu) bit for bit. A column with
+//       `nonfinite` set holds an Inf, so its outputs are the canonical NaN on every route.
+//   A2  Placement invariance: outputs bit-identical for every staging layout, the fork stream,
 //       zero-copy records and a rerun.
 void test_layer_a16(const char* name, int experts, int columns, int top_k, const std::vector<double>& weight,
-                    std::uint32_t seed) {
+                    std::uint32_t seed, bool nonfinite = false) {
     std::printf("== W4A16 %s: E=%d T=%d k=%d\n", name, experts, columns, top_k);
     std::mt19937 rng(seed);
     const std::size_t stride = moe::kRecordBytes;
@@ -675,7 +674,8 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, entries);
     infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
     cuda_check(cudaDeviceSynchronize(), "dispatch");
-    const auto x   = fixtures::wide_range_activations(rng, columns);
+    auto x = fixtures::wide_range_activations(rng, columns);
+    if (nonfinite) { x[5] = 0x7F80U; } // +Inf in column 0
     auto* d_x      = device_copy(x);
     const auto ids = host_copy(d_ids, static_cast<std::size_t>(entries));
     const auto offsets = host_copy(dispatch.offsets, static_cast<std::size_t>(experts) + 1);
@@ -693,7 +693,7 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
     std::uint8_t* d_staging = nullptr;
     cuda_check(cudaMalloc(&d_staging, stride * 64), "cudaMalloc");
     void* d_workspace = nullptr;
-    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries)), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(max_jobs, entries, columns, moe::ExpertActivation::kA16)), "cudaMalloc");
     std::uint16_t* d_out = nullptr;
     const std::size_t out_elements = static_cast<std::size_t>(moe::kHidden) * entries;
     cuda_check(cudaMalloc(&d_out, out_elements * sizeof(std::uint16_t)), "cudaMalloc");
@@ -741,23 +741,14 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
         } else {
             long differing = 0;
             for (std::size_t i = 0; i < got.size(); ++i) { differing += got[i] != first_outputs[i]; }
-            std::printf("   A3 %-24s: %ld outputs differ from the first run\n", config.name, differing);
-            check(differing == 0, "A3: outputs are bit-identical for every placement and pass layout");
+            std::printf("   A2 %-24s: %ld outputs differ from the first run\n", config.name, differing);
+            check(differing == 0, "A2: outputs are bit-identical for every placement and pass layout");
         }
     }
 
-    // A1 / A2: per entry, the FP64 chain and the CPU engine (the exact narrow arithmetic).
-    const auto weight_of = [](const std::uint8_t* matrix, int blocks, int row, int k) {
-        const int rg = row / 16, r = row % 16, b = k / 16, kk = k % 16;
-        const std::uint8_t* unit = matrix + (static_cast<std::size_t>(rg) * blocks + b) * moe::kUnitBytes;
-        const std::uint8_t byte  = unit[32 * (kk / 4) + 4 * (r % 8) + kk % 4];
-        return canon::e2m1_x2(r < 8 ? (byte & 15U) : (byte >> 4)) * 0.5 * static_cast<double>(canon::e4m3_value(unit[128 + r]));
-    };
-    const auto bf16 = [](double v) { return static_cast<double>(canon::bf16_to_f32(canon::f32_to_bf16_rn(static_cast<float>(v)))); };
-    double wide_error_sum = 0, narrow_error_sum = 0, worst = 0;
-    int wide_checked = 0, wide_bad = 0;
-    long narrow_mismatch = 0;
-    std::vector<std::vector<double>> w_gate_up, w_down; // decoded once per expert, lazily
+    // A1: per entry, the CPU engine.
+    std::vector<long> mismatch(2, 0), checked(2, 0); // [narrow, wide]
+    long nan_columns = 0;
     for (int entry = 0; entry < entries; ++entry) {
         const int e = ids[static_cast<std::size_t>(entry)];
         const fixtures::Expert& expert = bank[static_cast<std::size_t>(e)];
@@ -769,49 +760,15 @@ void test_layer_a16(const char* name, int experts, int columns, int top_k, const
             moe::expert_forward_a16(moe::best_cpu_isa(), expert.record.data(), expert.scales, 1, xp, yp);
         }
         const std::uint16_t* got = &first_outputs[static_cast<std::size_t>(entry) * moe::kHidden];
-        if (!moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)])) {
-            narrow_mismatch += std::memcmp(got, cpu.data(), moe::kHidden * 2) != 0;
-            continue;
-        }
-        if (wide_checked >= 160) { continue; } // FP64 chains are costly; a sample of wide entries
-        const std::uint8_t* gu = expert.record.data();
-        const std::uint8_t* dn = expert.record.data() + moe::kGateUpBytes;
-        std::vector<double> h(moe::kIntermediate);
-        for (int i = 0; i < moe::kIntermediate; ++i) {
-            double g = 0, u = 0;
-            for (int k = 0; k < moe::kHidden; ++k) {
-                const double xv = canon::bf16_to_f32(xc[k]);
-                g += weight_of(gu, moe::kGateUpBlocks, 2 * i, k) * xv;
-                u += weight_of(gu, moe::kGateUpBlocks, 2 * i + 1, k) * xv;
-            }
-            const double yg = bf16(g * expert.scales.alpha_gate), yu = bf16(u * expert.scales.alpha_up);
-            h[i] = bf16(yg / (1.0 + std::exp(-yg)) * yu);
-        }
-        double err_wide = 0, err_cpu = 0, norm = 0;
-        for (int row = 0; row < moe::kHidden; ++row) {
-            double acc = 0;
-            for (int k = 0; k < moe::kIntermediate; ++k) { acc += weight_of(dn, moe::kDownBlocks, row, k) * h[static_cast<std::size_t>(k)]; }
-            const double ref = bf16(acc * expert.scales.alpha_down);
-            const double a = canon::bf16_to_f32(got[row]), c = canon::bf16_to_f32(cpu[static_cast<std::size_t>(row)]);
-            err_wide += (a - ref) * (a - ref);
-            err_cpu += (c - ref) * (c - ref);
-            norm += ref * ref;
-        }
-        const double rw = std::sqrt(err_wide / std::max(norm, 1e-300)), rc = std::sqrt(err_cpu / std::max(norm, 1e-300));
-        wide_error_sum += rw;
-        narrow_error_sum += rc;
-        worst = std::max(worst, rw);
-        wide_bad += rw > std::ldexp(1.0, -6);
-        ++wide_checked;
+        const int route = moe::wide_route(counts[static_cast<std::size_t>(e)], scales[static_cast<std::size_t>(e)]) ? 1 : 0;
+        mismatch[static_cast<std::size_t>(route)] += std::memcmp(got, cpu.data(), moe::kHidden * 2) != 0;
+        ++checked[static_cast<std::size_t>(route)];
+        nan_columns += entry / top_k == 0 && cpu[0] == 0x7FC0U;
     }
-    const double mean_wide = wide_checked ? wide_error_sum / wide_checked : 0;
-    const double mean_cpu  = wide_checked ? narrow_error_sum / wide_checked : 0;
-    std::printf("   A1 %d wide entries: relative L2 vs FP64 mean %.3g (narrow arithmetic %.3g), worst %.3g, %d over 2^-6\n",
-                wide_checked, mean_wide, mean_cpu, worst, wide_bad);
-    std::printf("   A2 narrow entries differing from the CPU engine: %ld\n", narrow_mismatch);
-    check(wide_bad == 0, "A1: every wide entry within relative L2 2^-6 of the FP64 chain");
-    check(mean_wide <= 1.25 * mean_cpu + 1e-4, "A1: the wide route's mean error matches the exact arithmetic's");
-    check(narrow_mismatch == 0, "A2: narrow W4A16 experts equal the CPU engine bit for bit");
+    std::printf("   A1 entries differing from the CPU engine: narrow %ld of %ld, wide %ld of %ld\n", mismatch[0],
+                checked[0], mismatch[1], checked[1]);
+    check(mismatch[0] == 0 && mismatch[1] == 0, "A1: every W4A16 entry equals the CPU engine bit for bit");
+    if (nonfinite) { check(nan_columns == top_k, "A1: the non-finite column's outputs are the canonical NaN"); }
     for (auto event : events) { cudaEventDestroy(event); }
     cudaStreamDestroy(side);
     cudaFree(d_out);
@@ -852,10 +809,12 @@ int main() {
         test_layer("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), {}, 31);
         // A verification-width call: 10 columns at top-10 over 12 experts.
         test_layer("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), {}, 37);
-        // W4A16 (§16.2.1): the same prefill mix, the 9- and 65-column boundaries.
+        // W4A16 (§16.2.1): the same prefill mix, the 9- and 65-column boundaries (one with an Inf in
+        // a column), and a verification width.
         test_layer_a16("prefill mix", 20, 300, 4, popularity, 41);
         test_layer_a16("n = 9", 4, 9, 4, std::vector<double>(4, 1.0), 43);
-        test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47);
+        test_layer_a16("n = 65", 2, 65, 2, std::vector<double>(2, 1.0), 47, true);
+        test_layer_a16("T = 10", 12, 10, 10, std::vector<double>(12, 1.0), 53);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL: %s\n", e.what());
         return 1;

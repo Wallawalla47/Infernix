@@ -847,8 +847,8 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
 // Experts stored without activation scales: x and h are encoded per column (canon::a16_value) and
 // every product is three dp4a (signed codes times the unsigned lo and mid bytes and the signed hi
 // bytes of X), so P_b and the int64 row sums are the CPU engine's bit for bit. Gate/up CTAs write
-// h in BF16 to the call's h plane (the A4 wide route's x plane, unused here: 1,440 >= 1,280 bytes
-// per entry); down CTAs encode it under its own column exponent.
+// h in BF16 to the entry's row of the workspace's h rows (wide_expert.h); down CTAs encode it under
+// its own column exponent.
 
 constexpr int kA16PassColumns = 4; // columns per pass of the multi-column A16 kernels
 
@@ -1023,7 +1023,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         for (int i = threadIdx.x; i < 16 * n; i += blockDim.x) {
             const int k = i % 16, c = i / 16;
-            h_plane[static_cast<std::size_t>(first + pass + c) * moe::kIntermediate + 16 * slice + k] =
+            h_plane[static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements + 16 * slice + k] =
                 canon::swiglu_bf16(sm.y[c][2 * k], sm.y[c][2 * k + 1]);
         }
     }
@@ -1063,7 +1063,7 @@ __global__ void __launch_bounds__(kThreads)
         const int n = min(Columns, count - pass);
         __syncthreads();
         const auto column = [&](int c) {
-            return h_plane + static_cast<std::size_t>(first + pass + c) * moe::kIntermediate;
+            return h_plane + static_cast<std::size_t>(first + pass + c) * moe::wide::kA16HRowElements;
         };
         encode_a16_columns<Columns>(column, n, moe::kIntermediate, sm.acts, sm.emax, sm.key);
         stage_wait();
@@ -1121,7 +1121,7 @@ void launch_pass(bool few, const bf16* x, const MoeDispatch& dispatch, const Moe
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
                  PassPhase phase = PassPhase::All) {
     if (source.activation == moe::ExpertActivation::kA16) {
-        auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.x_plane);
+        auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.h_rows);
         if (few) {
             launch_expert_pass_a16<1>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
                                       stream, phase);
@@ -1510,8 +1510,9 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     check_launch("scatter");
 }
 
-std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
-    return moe::wide::experts_workspace_bytes(max_jobs, entries);
+std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+                                        moe::ExpertActivation activation) {
+    return moe::wide::experts_workspace_bytes(max_jobs, entries, columns, activation);
 }
 
 namespace {
@@ -1521,15 +1522,17 @@ static_assert(kFetchCallOffset + sizeof(FetchCall) <= moe::wide::kCpuCallBytes,
               "the workspace reserves kCpuCallBytes for a call's CPU and fetch bookkeeping");
 
 // The CPU bookkeeping of a call in its workspace.
-CpuCall* cpu_call_of(void* workspace, std::int32_t max_jobs, std::int32_t entries, std::int32_t** flags) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries);
+CpuCall* cpu_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
+                     std::int32_t entries, std::int32_t** flags) {
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
     if (flags != nullptr) { *flags = layout.cpu_flags; }
     return static_cast<CpuCall*>(layout.cpu_call);
 }
 
 // The fetch bookkeeping of a call in its workspace, after the CPU's.
-FetchCall* fetch_call_of(void* workspace, std::int32_t max_jobs, std::int32_t entries) {
-    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries);
+FetchCall* fetch_call_of(void* workspace, const Tensor& x, const MoeExpertSource& source, std::int32_t max_jobs,
+                         std::int32_t entries) {
+    const auto layout = moe::wide::carve_experts_workspace(workspace, max_jobs, entries, x.ne[1], source.activation);
     return reinterpret_cast<FetchCall*>(static_cast<std::byte*>(layout.cpu_call) + kFetchCallOffset);
 }
 
@@ -1545,7 +1548,7 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
     if (!cpu_served(x, source)) { return; }
-    CpuCall* call    = cpu_call_of(workspace, max_jobs, outputs.ne[1], nullptr);
+    CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], nullptr);
     bool warm        = false;
     for (int i = 0; i < MoeL2Warm::kSpans; ++i) {
         require(source.l2_warm.bytes[i] == 0 || reinterpret_cast<std::uintptr_t>(source.l2_warm.ptr[i]) % 16 == 0,
@@ -1574,10 +1577,10 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                 (source.landing_slots == 0 || (source.landing != nullptr && source.landed != nullptr)),
             "experts landing is incomplete");
     require(source.prefetched == nullptr || source.prefetch_base != nullptr, "experts prefetch table without its base");
-    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1]);
+    const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1], x.ne[1], source.activation);
     auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
-    CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
+    CpuCall* cpu_call       = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
     const bool cpu          = cpu_served(x, source);
     if (cpu) {
         require(source.cpu.request != nullptr && source.cpu.x != nullptr && source.cpu.y != nullptr &&
@@ -1599,7 +1602,7 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                     source.fetch.sequence != nullptr && source.fetch.heartbeat != nullptr &&
                     source.staging_slots > 0 && max_jobs <= offloaded_moe::kMaxFetch,
                 "experts fetch channel is incomplete (it needs a host table, staging and at most kMaxFetch jobs)");
-        fetch = fetch_call_of(workspace, max_jobs, outputs.ne[1]);
+        fetch = fetch_call_of(workspace, x, source, max_jobs, outputs.ne[1]);
         fetch_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, max_jobs, cpu ? cpu_flags : nullptr,
                                                       cpu ? cpu_call : nullptr, fetch);
         check_launch("fetch plan");
