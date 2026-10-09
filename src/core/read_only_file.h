@@ -32,6 +32,9 @@ public:
     // Size of the file on disk now; external truncation or extension after open is observed,
     // matching the short-read behavior of positional pread on POSIX.
     [[nodiscard]] std::uint64_t current_bytes() const noexcept;
+    // Unbuffered read of `destination` (4 KiB-aligned offset, size and address) from `offset`;
+    // returns the bytes read contiguously from `offset` (fewer only at the end of the file). On
+    // Windows a read of more than 8 MiB keeps up to 16 such blocks in flight.
     std::size_t read_direct(std::uint64_t offset, std::span<std::byte> destination) const;
 
     // Unbuffered reads of `block_bytes` at each offset (read_direct's alignment rules), at most

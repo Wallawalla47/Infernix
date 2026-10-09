@@ -60,6 +60,46 @@ void run(const infernix::ReadOnlyFile& file, std::size_t count, std::size_t ring
     check(bytes_ok, "every block carries its own bytes (" + where + ")");
 }
 
+// read_direct of many 8 MiB blocks (several in flight on Windows): a file of 5 blocks and 3 pages,
+// read whole, from an offset inside it, and past its end (the bytes up to the end, contiguous).
+void check_large_reads() {
+    constexpr std::size_t kLarge = 8ULL << 20;
+    constexpr std::size_t kPages = (5 * kLarge) / kBlock + 3;
+    const auto path = std::filesystem::temp_directory_path() / "infernix_read_only_file_large_test.bin";
+    {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        std::vector<std::byte> block(kBlock);
+        for (std::uint64_t b = 0; b < kPages; ++b) {
+            for (std::size_t k = 0; k < kBlock; ++k) { block[k] = pattern(b, k); }
+            out.write(reinterpret_cast<const char*>(block.data()), static_cast<std::streamsize>(kBlock));
+        }
+    }
+    {
+        const infernix::ReadOnlyFile file(path, infernix::FileMapping::None);
+        std::vector<std::byte> storage;
+        const auto all = aligned_ring(storage, kPages + 256); // room past the end
+        const auto pages_ok = [&](std::span<const std::byte> data, std::uint64_t first, std::size_t pages) {
+            bool ok = true;
+            for (std::size_t p = 0; p < pages; ++p) {
+                for (std::size_t k = 0; k < kBlock; k += 509) { ok &= data[p * kBlock + k] == pattern(first + p, k); }
+            }
+            return ok;
+        };
+        check(file.read_direct(0, all.first(kPages * kBlock)) == kPages * kBlock &&
+                  pages_ok(all, 0, kPages),
+              "read_direct reads a multi-block file whole");
+        const std::size_t from = 1000, count = 2 * kLarge / kBlock + 17;
+        check(file.read_direct(from * kBlock, all.first(count * kBlock)) == count * kBlock && pages_ok(all, from, count),
+              "read_direct reads multi-block ranges from an offset");
+        const std::size_t tail = 3000; // 12 MiB to the end, read as 22 MiB: a full, a short and an empty block
+        check(file.read_direct((kPages - tail) * kBlock, all.first((tail + 2600) * kBlock)) == tail * kBlock &&
+                  pages_ok(all, kPages - tail, tail),
+              "read_direct past the end returns the bytes up to the end");
+    }
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
+}
+
 } // namespace
 
 int main() {
@@ -102,6 +142,7 @@ int main() {
         const auto one = aligned_ring(one_storage, 1);
         check(direct.read_direct(5 * kBlock, one) == kBlock && one[0] == pattern(5, 0) && one[4095] == pattern(5, 4095),
               "FileMapping::None read_direct returns the block's bytes");
+        check_large_reads();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         ++failures;

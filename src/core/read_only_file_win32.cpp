@@ -202,30 +202,77 @@ std::size_t ReadOnlyFile::read_direct(std::uint64_t offset,
         throw std::overflow_error("direct file read exceeds platform I/O limits");
     }
 
-    std::size_t total = 0;
-    while (total < destination.size()) {
-        constexpr std::size_t max_read = 1ULL << 30;
-        const auto amount = static_cast<DWORD>(std::min(max_read, destination.size() - total));
-        const std::uint64_t absolute = offset + total;
-        OVERLAPPED operation{};
-        operation.Offset     = static_cast<DWORD>(absolute & 0xffffffffULL);
-        operation.OffsetHigh = static_cast<DWORD>(absolute >> 32U);
-
-        DWORD bytes = 0;
-        const BOOL started =
-            ::ReadFile(impl_->direct_file, destination.data() + total, amount, &bytes, &operation);
-        if (!started) {
-            const auto error = ::GetLastError();
-            if (error == ERROR_HANDLE_EOF) { break; }
-            if (error != ERROR_IO_PENDING ||
-                !::GetOverlappedResult(impl_->direct_file, &operation, &bytes, TRUE)) {
-                const auto final_error = error == ERROR_IO_PENDING ? ::GetLastError() : error;
-                throw std::system_error(static_cast<int>(final_error), std::system_category(),
-                                        "direct file read");
+    // Blocks of kBlock bytes with up to kDepth in flight: an NVMe needs the queue depth (one
+    // synchronous read at a time reached 5.4-5.9 GB/s on a 990 PRO, 8 MiB x 16 in flight 7.0;
+    // the expert banks load through here). A read of at most one block is a single request.
+    constexpr std::size_t kBlock = 8ULL << 20;
+    constexpr std::size_t kDepth = 16;
+    const std::size_t blocks     = (destination.size() + kBlock - 1) / kBlock;
+    const std::size_t slots      = std::min(kDepth, blocks);
+    // One OVERLAPPED per slot and no event objects: completion is polled (HasOverlappedIoCompleted),
+    // since a wait on the handle would return for any of the slots' reads.
+    std::vector<OVERLAPPED> operations(slots);
+    std::vector<std::size_t> reading(slots, blocks);
+    std::vector<DWORD> landed(blocks, 0);
+    std::size_t next = 0, in_flight = 0, end_block = blocks; // blocks at or past end_block are not read
+    DWORD failure = ERROR_SUCCESS;
+    while (in_flight > 0 || (next < end_block && failure == ERROR_SUCCESS)) {
+        bool progressed = false;
+        for (std::size_t s = 0; s < slots; ++s) {
+            if (reading[s] != blocks) {
+                if (!HasOverlappedIoCompleted(&operations[s])) { continue; }
+                DWORD bytes = 0;
+                if (!::GetOverlappedResult(impl_->direct_file, &operations[s], &bytes, FALSE)) {
+                    const DWORD error = ::GetLastError();
+                    if (error == ERROR_HANDLE_EOF) {
+                        end_block = std::min(end_block, reading[s]);
+                    } else if (failure == ERROR_SUCCESS) {
+                        failure = error;
+                    }
+                } else {
+                    landed[reading[s]] = bytes;
+                    if (bytes != std::min(kBlock, destination.size() - reading[s] * kBlock)) {
+                        end_block = std::min(end_block, reading[s] + 1); // the file ends in this block
+                    }
+                }
+                reading[s] = blocks;
+                --in_flight;
+                progressed = true;
+            }
+            if (next < end_block && failure == ERROR_SUCCESS) {
+                const std::size_t at         = next * kBlock;
+                const auto amount            = static_cast<DWORD>(std::min(kBlock, destination.size() - at));
+                const std::uint64_t absolute = offset + at;
+                OVERLAPPED& operation        = operations[s];
+                operation                    = OVERLAPPED{};
+                operation.Offset             = static_cast<DWORD>(absolute & 0xffffffffULL);
+                operation.OffsetHigh         = static_cast<DWORD>(absolute >> 32U);
+                if (!::ReadFile(impl_->direct_file, destination.data() + at, amount, nullptr, &operation)) {
+                    const DWORD error = ::GetLastError();
+                    if (error == ERROR_HANDLE_EOF) {
+                        end_block = std::min(end_block, next);
+                        continue;
+                    }
+                    if (error != ERROR_IO_PENDING) {
+                        failure = error;
+                        continue;
+                    }
+                }
+                reading[s] = next++;
+                ++in_flight;
+                progressed = true;
             }
         }
-        total += bytes;
-        if (bytes != amount) { break; }
+        if (!progressed && in_flight > 0) { YieldProcessor(); }
+    }
+    if (failure != ERROR_SUCCESS) {
+        throw std::system_error(static_cast<int>(failure), std::system_category(), "direct file read");
+    }
+    // The bytes read contiguously from `offset`: whole blocks up to the first short one.
+    std::size_t total = 0;
+    for (std::size_t b = 0; b < end_block; ++b) {
+        total += landed[b];
+        if (landed[b] != std::min(kBlock, destination.size() - b * kBlock)) { break; }
     }
     return total;
 }
