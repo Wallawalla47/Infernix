@@ -2851,6 +2851,7 @@ private:
              bool streamed = false) {
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
+        if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
         // share (design §19.3.12) gates the stream on each layer's routing.
@@ -3036,6 +3037,7 @@ private:
     void run_decode(std::int32_t batch) {
         const cudaStream_t s = device_.stream;
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
+        if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true);
         const execution::NgramRowGate gate = row_gate();
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
@@ -3227,6 +3229,7 @@ private:
         }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
+        if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true);
         const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {

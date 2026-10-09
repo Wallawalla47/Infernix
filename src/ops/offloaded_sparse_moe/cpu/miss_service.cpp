@@ -16,6 +16,9 @@
 #        define NOMINMAX
 #    endif
 #    include <windows.h>
+#    ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#        define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#    endif
 #endif
 #if defined(__x86_64__) || defined(_M_X64)
 #    include <immintrin.h>
@@ -80,17 +83,50 @@ CpuMissService::CpuMissService(std::vector<Layer> layers, Options options)
     heartbeat_ = done_ + 2;
     cuda_require(cudaMalloc(&sequence_, sizeof(std::uint32_t)), "cudaMalloc");
     cuda_require(cudaMemset(sequence_, 0, sizeof(std::uint32_t)), "cudaMemset");
+#if defined(_WIN32)
+    wake_event_ = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    idle_timer_ = ::CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
     thread_ = std::thread([this] { serve(); });
 }
 
 CpuMissService::~CpuMissService() {
     stop_.store(true, std::memory_order_release);
+    wake();
     if (thread_.joinable()) { thread_.join(); }
+#if defined(_WIN32)
+    if (wake_event_ != nullptr) { ::CloseHandle(wake_event_); }
+    if (idle_timer_ != nullptr) { ::CloseHandle(idle_timer_); }
+#endif
     cudaFree(sequence_);
     cudaFreeHost(done_);
     cudaFreeHost(y_);
     cudaFreeHost(x_);
     cudaFreeHost(request_);
+}
+
+void CpuMissService::wake() const noexcept {
+    wakes_.fetch_add(1, std::memory_order_acq_rel);
+#if defined(_WIN32)
+    if (wake_event_ != nullptr) { ::SetEvent(wake_event_); }
+#endif
+}
+
+void CpuMissService::idle_wait() noexcept {
+#if defined(_WIN32)
+    // A wait's timeout and sleep_for both round up to the 15.6 ms timer tick; the high-resolution
+    // timer measured 0.51 ms for a 50 us request (2026-10-09, Windows 11, i9-13900K).
+    if (wake_event_ != nullptr && idle_timer_ != nullptr) {
+        LARGE_INTEGER due{};
+        due.QuadPart = -500; // 50 us, relative, in 100 ns units
+        if (::SetWaitableTimerEx(idle_timer_, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            const HANDLE handles[2] = {wake_event_, idle_timer_};
+            ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+            return;
+        }
+    }
+#endif
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
 }
 
 MoeCpuChannel CpuMissService::channel(int layer) const {
@@ -136,10 +172,15 @@ void CpuMissService::serve() {
             *volatile_beat = ++beat;
             if (sequence == seen) {
                 relax();
-                // Spin while decoding; after 20 ms without a request, poll every 50 us.
-                if (++polls % 4096 == 0 &&
-                    std::chrono::steady_clock::now() - last > std::chrono::milliseconds(20)) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                // Spin while decoding; after 20 ms without a request or a wake(), idle in short
+                // waits that wake() ends at once.
+                if (++polls % 4096 == 0) {
+                    if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) {
+                        last = std::chrono::steady_clock::now();
+                    } else if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(20)) {
+                        idle_wait();
+                        if (wakes_.exchange(0, std::memory_order_acq_rel) != 0) { last = std::chrono::steady_clock::now(); }
+                    }
                 }
                 continue;
             }
