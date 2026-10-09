@@ -63,7 +63,6 @@ infernix::EngineOptions hybrid_options(const char* artifact, infernix::Speculati
     } else if (backend == infernix::SpeculativeBackend::DFlash2) {
         options.speculative.draft_tokens = 7;
     }
-    options.context_cache.mode                         = infernix::ContextCacheMode::Hybrid;
     options.context_cache.host_capacity_bytes          = host_bytes;
     options.context_cache.hybrid.device_snapshot_slots = device_slots;
     return options;

@@ -560,8 +560,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     } else {
         logger_->info("prefix cache | off");
     }
-    logger_->debug("context | history {} | {} active + {} extra device states | host {}",
-                   cache.enabled ? "on" : "off", engine.max_concurrency, *cache.device_state_slots,
+    logger_->debug("context | history {} | {} active + {} snapshot device states | host {}",
+                   cache.enabled ? "on" : "off", engine.max_concurrency,
+                   *cache.hybrid.device_snapshot_slots,
                    product::format_pretty_bytes(*cache.host_capacity_bytes));
 
     if (product::draft_tree_enabled(engine.speculative)) {

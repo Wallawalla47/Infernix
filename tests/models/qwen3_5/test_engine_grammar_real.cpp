@@ -158,12 +158,12 @@ int main(int argc, char** argv) {
         options.enable_vision   = argc > 4 && std::string_view(argv[4]) == "vision";
         options.prefill_chunk   = 128;
         options.kv_cache        = infernix::KvCacheStorage::Fp8E4M3Row256;
-        options.context_cache.device_state_slots  = 8;
-        options.context_cache.host_capacity_bytes = 128ULL << 20;
-        // INFERNIX_TEST_NGRAM_VOLUME names a Qwen4Exp artifact's n-gram volume. That model has only the
-        // hybrid prefix cache, whose snapshots live in its default Host tier and cover whole 64-token
-        // blocks, and drafts adaptively: a one-row round verifies only confident drafts, so a short
-        // sampled answer may take no round.
+        options.context_cache.hybrid.device_snapshot_slots = 8;
+        options.context_cache.host_capacity_bytes          = 512ULL << 20;
+        // INFERNIX_TEST_NGRAM_VOLUME names a Qwen4Exp artifact's n-gram volume. That model's prefix
+        // cache keeps its snapshots in its default Host tier, covering whole 64-token blocks, and
+        // drafts adaptively: a one-row round verifies only confident drafts, so a short sampled
+        // answer may take no round.
         const char* volume = std::getenv("INFERNIX_TEST_NGRAM_VOLUME");
         const bool qwen4   = volume != nullptr && *volume != '\0';
         if (qwen4) {
@@ -173,9 +173,8 @@ int main(int argc, char** argv) {
                               "enough for the prefix cache to keep.\n";
             }
             options.ngram_volume_path                 = volume;
-            options.context_cache.mode                = infernix::ContextCacheMode::Hybrid;
-            options.context_cache.device_state_slots  = {};
-            options.context_cache.host_capacity_bytes = {};
+            options.context_cache.hybrid.device_snapshot_slots = {};
+            options.context_cache.host_capacity_bytes          = {};
         }
         options.use_cuda_graph = argc < 3 || std::string_view(argv[2]) != "eager";
         if (backend == "mtp")

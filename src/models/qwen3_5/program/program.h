@@ -558,10 +558,9 @@ public:
     void shutdown_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
 
-    // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission binds a lane through the
-    // same context transaction as a checkpoint source: hybrid_sources() quotes, start_binding()
-    // stages and poll_context() activates.
-    [[nodiscard]] bool hybrid_prefix_cache() const noexcept;
+    // The prefix cache, when the context cache is enabled. Admission binds a lane through a
+    // context transaction: hybrid_sources() quotes, start_binding() stages and poll_context()
+    // activates.
     // The quoted sources for a request in preference order: the chosen cached path, if any, then
     // a root start. A resumed request's source never passes `maximum_frontier`. Empty while a
     // prefilling sibling is about to publish the snapshot this request should resume from.

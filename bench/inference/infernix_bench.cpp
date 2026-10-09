@@ -207,7 +207,6 @@ int main(int argc, char** argv) {
         engine_options.vram_headroom_bytes = options.vram_headroom_bytes;
         engine_options.vram_past_budget    = options.vram_past_budget;
         engine_options.context_cache.enabled             = false;
-        engine_options.context_cache.device_state_slots  = 0;
         engine_options.context_cache.host_capacity_bytes = 0;
         engine_options.speculative                       = options.speculative;
         engine_options.use_cuda_graph                    = options.use_cuda_graph;

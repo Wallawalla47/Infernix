@@ -123,7 +123,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     demand.other_pinned = plan.pinned_other_bytes();
     demand.later_pinned = kProgramPinnedAllowance;
     // The prefix cache pins its whole Host tier at startup, beside the experts.
-    if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid) {
+    if (options.context_cache.enabled) {
         demand.prefix_cache = options.context_cache.host_capacity_bytes.value();
     }
     demand.pageable     = models::qwen4_exp::NgramVolume::cache_bytes(plan.config().text.ple.table);
@@ -185,7 +185,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     // The hybrid prefix cache (design §19.3.1). Host-born snapshots live in the pinned slab pool;
     // the cost model ranks resume sources by the measured prefill coefficients.
     const ContextCacheOptions& cache = options.context_cache;
-    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
+    if (cache.enabled) {
         const std::uint32_t chunk         = options.prefill_chunk;
         program_options.prefix_cache      = true;
         // normalize_engine_options resolved every value for this architecture.
@@ -319,7 +319,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         after_weights > resolution.runtime_reservation_bytes ? after_weights - resolution.runtime_reservation_bytes : 0;
     LoadSummary::PrefixCacheRestore restore;
     if (const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
-        options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid && !file.empty()) {
+        options.context_cache.enabled && !file.empty()) {
         const models::qwen4_exp::PrefixCachePersistence loaded = instance->program->attach_prefix_cache_file(
             file, hybrid_cache_fingerprint(options, "qwen4_exp"), options.startup_observer);
         restore = LoadSummary::PrefixCacheRestore{

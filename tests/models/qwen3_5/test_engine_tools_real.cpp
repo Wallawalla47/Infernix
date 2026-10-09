@@ -332,7 +332,7 @@ void exercise(infernix::Engine& engine, unsigned concurrency, bool speculative) 
     }
 }
 
-void pressure(infernix::Engine& engine, bool snapshot, bool cancel) {
+void pressure(infernix::Engine& engine, bool cancel) {
     const Json schema{{"type", "object"},
                       {"properties",
                        {{"message", {{"type", "string"}, {"pattern", "^(ab cd ){180}$"}}},
@@ -379,9 +379,8 @@ void pressure(infernix::Engine& engine, bool snapshot, bool cancel) {
                     result.tool_calls.size() == 1 &&
                     Json::parse(result.tool_calls[0].arguments_json)["message"] == expected,
                 "recovery changed tool parser/matcher progress");
-        restores +=
-            snapshot ? result.scheduling.snapshot_restores : result.scheduling.replay_restores;
-        record(snapshot ? "snapshot" : "replay", result, schema);
+        restores += result.scheduling.replay_restores;
+        record("replay", result, schema);
     }
     require(restores > 0, "pressure fixture did not restore a preempted request");
 }
@@ -396,7 +395,7 @@ int main(int argc, char** argv) {
     try {
         const std::string backend = argc > 1 ? argv[1] : "none";
         const std::string mode    = argc > 2 ? argv[2] : "graph";
-        const bool pressure_mode  = mode == "snapshot" || mode == "replay" || mode == "cancel";
+        const bool pressure_mode  = mode == "replay" || mode == "cancel";
         require(pressure_mode || mode == "graph" || mode == "eager" || mode == "basic",
                 "unknown test mode");
         infernix::EngineOptions options;
@@ -409,8 +408,10 @@ int main(int argc, char** argv) {
         options.kv_cache                          = infernix::KvCacheStorage::Fp8E4M3Row256;
         options.use_cuda_graph                    = mode != "eager";
         options.context_cache.enabled             = !pressure_mode;
-        options.context_cache.device_state_slots  = pressure_mode ? 0 : 8;
-        options.context_cache.host_capacity_bytes = mode == "replay" ? 0 : 512ULL << 20;
+        if (!pressure_mode) {
+            options.context_cache.hybrid.device_snapshot_slots = 8;
+            options.context_cache.host_capacity_bytes          = 512ULL << 20;
+        }
         if (backend == "mtp")
             options.speculative.backend = infernix::SpeculativeBackend::Mtp;
         else if (backend == "dflash")
@@ -425,7 +426,7 @@ int main(int argc, char** argv) {
         }
         infernix::Engine engine(options);
         if (pressure_mode)
-            pressure(engine, mode != "replay", mode == "cancel");
+            pressure(engine, mode == "cancel");
         else if (mode == "basic")
             exercise_basic(engine, options.max_concurrency, backend != "none");
         else

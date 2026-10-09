@@ -34,7 +34,7 @@ infernix::EngineOptions dflash_engine_options(const char* artifact, infernix::Pr
     options.speculative.draft_tokens  = 3;
     options.speculative.proposal_head = proposal;
     options.use_cuda_graph            = true;
-    options.context_cache.device_state_slots = 2;
+    options.context_cache.hybrid.device_snapshot_slots = 2;
     return options;
 }
 

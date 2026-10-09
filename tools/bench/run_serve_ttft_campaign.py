@@ -71,14 +71,9 @@ CAMPAIGNS = {
     "resource": RESOURCE_CASES,
     "preemption": (
         "preemption-replay",
-        "preemption-snapshot",
-        "preemption-snapshot-mtp",
-        "preemption-snapshot-dflash2",
         "shared-growth-recovery",
-        "host-history-pressure-cancel",
         "vision-growth-replay",
         "agent-continuation-replay",
-        "agent-continuation-snapshot",
     ),
     "load": tuple(name for name in CASES
                   if name.startswith(("resident-", "mixed-arrivals-"))),

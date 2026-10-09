@@ -160,8 +160,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         options.speculative          = {};
         options.enable_vision        = false;
         options.use_cuda_graph       = false;
-        options.context_cache        = ContextCacheOptions{
-                   .enabled = false, .device_state_slots = 0, .host_capacity_bytes = 0};
+        options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
     default:
         throw std::invalid_argument("Engine purpose is invalid");
@@ -184,16 +183,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     }
     const std::uint32_t concurrency = options.max_concurrency;
     const bool qwen4_exp            = architecture == models::Architecture::Qwen4Exp;
-    if (qwen4_exp && cache.enabled && cache.mode == ContextCacheMode::Original) {
-        throw std::invalid_argument(
-            "Qwen3.8-Flash-Next has no original prefix cache: use the hybrid prefix cache or "
-            "disable the context cache");
-    }
-    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
-        if (cache.device_state_slots) {
-            throw std::invalid_argument(
-                "the hybrid prefix cache sizes its Device state slots with device_snapshot_slots");
-        }
+    if (cache.enabled) {
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
         cache.host_capacity_bytes = cache.host_capacity_bytes.value_or(
@@ -241,17 +231,16 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "hybrid tap ladder and minimum gap must be at least 64 tokens");
         }
-        // Every lane holds one active sequence; retained context lives in the Program's prefix
-        // index, whose snapshots take the extra Device StateImage slots.
-        cache.device_state_slots = hybrid.device_snapshot_slots;
     } else {
-        if (cache.mode == ContextCacheMode::Hybrid) { cache.mode = ContextCacheMode::Original; }
-        cache.device_state_slots = cache.device_state_slots.value_or(concurrency);
-    }
-    const std::uint64_t total_device_state_slots =
-        static_cast<std::uint64_t>(concurrency) + *cache.device_state_slots;
-    if (total_device_state_slots > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::overflow_error("context cache Device state capacity exceeds uint32");
+        // Without a prefix cache every request starts from the root and nothing is retained:
+        // the lanes' StateImages are the only Device state and there is no Host tier.
+        if (cache.host_capacity_bytes.value_or(0U) != 0 ||
+            cache.hybrid.device_snapshot_slots.value_or(0U) != 0) {
+            throw std::invalid_argument(
+                "prefix cache capacities require the context cache to be enabled");
+        }
+        cache.host_capacity_bytes          = 0U;
+        cache.hybrid.device_snapshot_slots = 0U;
     }
     return options;
 }
@@ -317,7 +306,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
                                                         device, options.startup_observer);
     LoadSummary::PrefixCacheRestore restore;
-    if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid) {
+    if (options.context_cache.enabled) {
         instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
         // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
         // is kept well inside its queue timeout.

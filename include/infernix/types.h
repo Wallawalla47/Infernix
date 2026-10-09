@@ -209,17 +209,6 @@ struct DiagnosticObserver {
     std::function<void(const Diagnostic& diagnostic)> callback;
 };
 
-// Prefix-cache implementation selected at Engine construction. Original is the
-// continuation/checkpoint ResourceManager
-// (docs/maintainer/resource-scheduling-and-context-cache.md). Hybrid is the content-addressed block
-// tree with sparse state snapshots (docs/maintainer/hybrid-prefix-cache-spec.md). infernix-serve
-// selects Hybrid unless
-// --use-original-prefix-caching selects Original; the Engine option itself defaults to Original.
-enum class ContextCacheMode : std::uint8_t {
-    Original,
-    Hybrid,
-};
-
 // Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
 // from any thread, also while the Engine is being destroyed. Copies share one state: the product
 // keeps a copy from the options it passes, beyond the Engine's lifetime.
@@ -251,7 +240,7 @@ private:
     std::shared_ptr<State> state_;
 };
 
-// Hybrid-mode tuning. Every field is optional: Engine construction derives the unset ones from
+// Prefix-cache tuning. Every field is optional: Engine construction derives the unset ones from
 // max_concurrency, prefill_chunk and whether a Host tier exists (host_capacity_bytes, default
 // kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
 // values.
@@ -289,20 +278,16 @@ struct HybridPrefixCacheOptions {
     bool queue_holds = true;
 };
 
+// The prefix cache: a content-addressed block tree with sparse state snapshots
+// (docs/maintainer/hybrid-prefix-cache-spec.md).
 struct ContextCacheOptions {
-    // Controls cross-request history reads and writes. Request pause/replay resources remain
-    // available when history is disabled.
+    // Controls cross-request history reads and writes. Disabled, every request starts from the
+    // root and a preempted request recovers by Replay, as it does with the cache on.
     bool enabled = true;
-    ContextCacheMode mode = ContextCacheMode::Original;
     HybridPrefixCacheOptions hybrid;
-    // Extra Device StateImage slots beyond max_concurrency. Defaults to max_concurrency.
-    std::optional<std::uint32_t> device_state_slots;
-    // Original mode: shared Host quota for StateImages, KV, pause snapshots and in-flight
-    // destinations; native startup defaults to 8 GiB plus eight Host StateImages using the
-    // model's actual layout. Hybrid mode: the pinned Host slab pool that cached KV blocks and
-    // state snapshots share (default kDefaultHybridHostCacheBytes, 0 disables the Host tier).
-    // This does not bound total process RAM.
-    // Engine::options() returns both resolved capacities after construction.
+    // The pinned Host slab pool that cached KV blocks and state snapshots share (default
+    // kDefaultHybridHostCacheBytes, 0 disables the Host tier; 0 when the cache is disabled). This
+    // does not bound total process RAM. Engine::options() returns the resolved capacity.
     std::optional<std::size_t> host_capacity_bytes;
 };
 
@@ -1475,8 +1460,8 @@ struct RuntimeStats {
     std::size_t host_context_peak_occupied_bytes = 0;
     double actual_context_transfer_seconds       = 0.0;
 
-    // Hybrid prefix cache (ContextCacheMode::Hybrid); zero in Original mode. Block and snapshot
-    // gauges are absolute; the rest are cumulative event counters.
+    // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
+    // rest are cumulative event counters.
     std::uint32_t hybrid_cached_blocks           = 0; // Device-resident tree blocks
     std::uint32_t hybrid_evictable_blocks        = 0;
     std::uint32_t hybrid_tree_blocks             = 0; // Device or Host

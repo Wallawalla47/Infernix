@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens                        = 5;
         options.speculative.ngram_draft_tokens                  = ngram;
         options.speculative.proposal_head                       = infernix::ProposalHead::Optimized;
-        options.context_cache.device_state_slots                = 1;
+        options.context_cache.hybrid.device_snapshot_slots                = 1;
         options.context_cache.host_capacity_bytes = 1ULL << 30;
         infernix::Engine engine(options);
         std::string source;

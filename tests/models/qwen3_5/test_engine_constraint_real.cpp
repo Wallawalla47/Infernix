@@ -57,7 +57,6 @@ infernix::EngineOptions engine_options(const char* artifact, infernix::Speculati
     options.kv_cache        = infernix::KvCacheStorage::BFloat16;
     options.max_concurrency = 2;
     // /v1/decide runs on infernix-serve's default cache, whose capacity may exceed the lanes' sum.
-    options.context_cache.mode  = infernix::ContextCacheMode::Hybrid;
     options.speculative.backend = backend;
     if (backend == infernix::SpeculativeBackend::DFlash2) { options.speculative.draft_tokens = 7; }
     return options;

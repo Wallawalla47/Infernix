@@ -25,7 +25,7 @@ infernix::EngineOptions engine_options(const char* artifact) {
     options.enable_vision                    = true;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
-    options.context_cache.device_state_slots = 4;
+    options.context_cache.hybrid.device_snapshot_slots = 4;
     return options;
 }
 
@@ -40,7 +40,7 @@ infernix::EngineOptions host_restore_engine_options(const char* artifact) {
     options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
-    options.context_cache.device_state_slots  = 1;
+    options.context_cache.hybrid.device_snapshot_slots  = 1;
     options.context_cache.host_capacity_bytes = 256ULL << 20;
     return options;
 }
@@ -56,7 +56,7 @@ infernix::EngineOptions anthropic_prefix_regression_engine_options(const char* a
     options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
     options.max_concurrency                  = 1;
     options.max_pending_requests             = 1;
-    options.context_cache.device_state_slots = 1;
+    options.context_cache.hybrid.device_snapshot_slots = 1;
     // This 27B workload has a fixed Host budget for four StateImages and 512 MiB of KV;
     // all contents compete within the same backing allocation.
     options.context_cache.host_capacity_bytes = 4ULL * 153954304 + (512ULL << 20);
@@ -75,7 +75,7 @@ infernix::EngineOptions shared_rewrite_materialization_engine_options(const char
     options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
-    options.context_cache.device_state_slots  = 2;
+    options.context_cache.hybrid.device_snapshot_slots  = 2;
     options.context_cache.host_capacity_bytes = 0;
     return options;
 }
@@ -89,7 +89,7 @@ infernix::EngineOptions explicit_anchor_engine_options(const char* artifact) {
     options.speculative.backend               = infernix::SpeculativeBackend::None;
     options.max_concurrency                   = 1;
     options.max_pending_requests              = 1;
-    options.context_cache.device_state_slots  = 4;
+    options.context_cache.hybrid.device_snapshot_slots  = 4;
     options.context_cache.host_capacity_bytes = 0;
     return options;
 }
@@ -105,7 +105,7 @@ infernix::EngineOptions concurrent_engine_options(const char* artifact) {
     options.speculative.proposal_head         = infernix::ProposalHead::Optimized;
     options.max_concurrency                   = 8;
     options.max_pending_requests              = 8;
-    options.context_cache.device_state_slots  = 16;
+    options.context_cache.hybrid.device_snapshot_slots  = 16;
     options.context_cache.host_capacity_bytes = 0;
     return options;
 }
@@ -667,7 +667,7 @@ int exercise_nested_tool_markers(const char* artifact) {
     auto configured = anthropic_prefix_regression_engine_options(artifact);
     // Five Device images cover the active writer, two shared points and private R/E;
     // the fixed Host pool also retains the completed probe histories for this 27B fixture.
-    configured.context_cache.device_state_slots  = 4;
+    configured.context_cache.hybrid.device_snapshot_slots  = 4;
     configured.context_cache.host_capacity_bytes = 512ULL << 20;
     infernix::Engine engine(std::move(configured));
     const std::string alpha   = nested_tool_definition("alpha", "stable-alpha");
@@ -1238,7 +1238,7 @@ int exercise_agent_continuation(const char* artifact) {
     // Retain main and branch R/E plus one writer. Both histories fit within the fixed
     // 4096-token KV pool; this trajectory exercises ownership rather than eviction.
     configured.max_context                       = 4096;
-    configured.context_cache.device_state_slots  = 4;
+    configured.context_cache.hybrid.device_snapshot_slots  = 4;
     configured.context_cache.host_capacity_bytes = 0;
     configured.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
     infernix::Engine engine(std::move(configured));
@@ -1424,7 +1424,7 @@ int exercise_rewrite_branch(const char* artifact) {
     };
 
     infernix::EngineOptions configured            = engine_options(artifact);
-    configured.context_cache.device_state_slots = 2;
+    configured.context_cache.hybrid.device_snapshot_slots = 2;
     infernix::Engine engine(std::move(configured));
     const infernix::GenerationResult source =
         engine.generate(engine.prepare(input(false)), options(true));
@@ -1453,7 +1453,7 @@ int exercise_rewrite_branch(const char* artifact) {
 
 int exercise_late_instructions(const char* artifact) {
     auto configured                             = explicit_anchor_engine_options(artifact);
-    configured.context_cache.device_state_slots = 1;
+    configured.context_cache.hybrid.device_snapshot_slots = 1;
     infernix::Engine engine(std::move(configured));
     const auto text_message = [](infernix::ChatRole role, std::string text) {
         infernix::ChatMessage message;
@@ -1888,7 +1888,7 @@ int verify_loaded_product(const infernix::Engine& engine) {
 int exercise_artifact(const char* artifact) {
     {
         infernix::EngineOptions options            = engine_options(artifact);
-        options.context_cache.device_state_slots = 2;
+        options.context_cache.hybrid.device_snapshot_slots = 2;
         infernix::Engine engine(std::move(options));
         if (const int result = verify_loaded_product(engine); result != 0) { return result; }
         if (const int result = exercise_artifact_frontend(engine); result != 0) { return result; }
@@ -1950,7 +1950,7 @@ int exercise_attention_integration(const char* artifact) {
     options.prefill_chunk                    = 1024;
     options.max_concurrency                  = batch;
     options.max_pending_requests             = batch;
-    options.context_cache.device_state_slots = batch + 2;
+    options.context_cache.hybrid.device_snapshot_slots = batch + 2;
     options.speculative.backend              = backend;
     options.speculative.draft_tokens  = backend == infernix::SpeculativeBackend::None ? 0 : drafts;
     options.speculative.proposal_head = infernix::ProposalHead::Full;
@@ -2066,7 +2066,7 @@ int run_scenarios() {
         result = exercise_explicit_anchor_branch(artifact);
     } else if (scenario == "rewrite-checkpoint") {
         auto options                             = engine_options(artifact);
-        options.context_cache.device_state_slots = 2;
+        options.context_cache.hybrid.device_snapshot_slots = 2;
         infernix::Engine engine(std::move(options));
         result = exercise_rewrite_checkpoints(engine);
     } else if (scenario == "stream-observations") {

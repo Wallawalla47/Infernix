@@ -137,7 +137,7 @@ void verify_real_plan(const char* artifact) {
                     options.speculative.draft_tokens         = neural;
                     options.speculative.ngram_draft_tokens   = ngram;
                     options.speculative.proposal_head        = infernix::ProposalHead::Optimized;
-                    options.context_cache.device_state_slots = 1;
+                    options.context_cache.hybrid.device_snapshot_slots = 1;
                     options.use_cuda_graph                   = graphs != 0;
                     auto planner     = qwen::make_sequence_planner(parameters, device, options);
                     const auto pages = planner.capacity_curve().minimum_main_page_groups;

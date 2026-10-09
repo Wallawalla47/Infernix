@@ -8,7 +8,7 @@
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/request_record.h"
-#include "runtime/engine/context_cache/resource_manager.h"
+#include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
@@ -39,10 +39,9 @@
 
 namespace infernix::runtime {
 
-// `Manager` selects the prefix-cache implementation: ResourceManager (the original
-// continuation/checkpoint cache) or HybridResourceManager
-// (docs/maintainer/hybrid-prefix-cache-spec.md). Both expose the same surface to the core.
-template <class Instance, class Manager = ResourceManager<typename Instance::ModelContract>>
+// Requests reuse context through the Program's prefix cache, driven by HybridResourceManager
+// (docs/maintainer/hybrid-prefix-cache-spec.md).
+template <class Instance>
 class EngineCore {
 
 public:
@@ -59,7 +58,7 @@ public:
     using Scheduling         = Scheduler<Request>;
     using RoundMembership    = typename Scheduling::RoundMembership;
     using ControlMembership  = typename Scheduling::ControlMembership;
-    using ResourceManagement = Manager;
+    using ResourceManagement = HybridResourceManager<ModelContract>;
     using Clock              = std::chrono::steady_clock;
 
     class RoundMasks final : public TokenMaskProvider {
@@ -100,7 +99,7 @@ public:
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
         diagnostics_ = options.diagnostic_observer;
-        if (options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid &&
+        if (options.context_cache.enabled &&
             !options.context_cache.hybrid.persistent_file.empty()) {
             prefix_save_interval_ = options.context_cache.hybrid.persistent_save_interval;
             next_prefix_save_     = Clock::now() + prefix_save_interval_;
@@ -1746,40 +1745,36 @@ private:
     // Hybrid prefix cache: copies the waiting FIFO head's Host-only blocks into spare Device cache
     // (hybrid-prefix-cache-spec §6.6).
     void prefetch_blocked_head() {
-        if constexpr (!std::is_same_v<Manager, ResourceManager<ModelContract>>) {
-            std::shared_ptr<Request> head;
-            {
-                std::lock_guard lock(queue_mutex_);
-                if (!pending_.empty()) { head = pending_.front(); }
-            }
-            if (!head || !head->base_plan) { return; }
-            resources_.prefetch_blocked_head(*instance_.program, *head->base_plan,
-                                             head->publication_order);
+        std::shared_ptr<Request> head;
+        {
+            std::lock_guard lock(queue_mutex_);
+            if (!pending_.empty()) { head = pending_.front(); }
         }
+        if (!head || !head->base_plan) { return; }
+        resources_.prefetch_blocked_head(*instance_.program, *head->base_plan,
+                                         head->publication_order);
     }
 
     // Hybrid prefix cache: the sources of the requests waiting for admission are evicted last, the
     // request furthest back first (hybrid-prefix-cache-spec §9.6). Paused requests restore before
     // fresh ones, so they come first. A request no admission pass has planned yet is skipped.
     void hold_queued_sources() {
-        if constexpr (!std::is_same_v<Manager, ResourceManager<ModelContract>>) {
-            if (!queue_holds_) { return; }
-            std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
-            {
-                std::lock_guard lock(queue_mutex_);
-                queue.insert(queue.end(), pending_.begin(), pending_.end());
-            }
-            std::vector<std::uint64_t> ids;
-            std::vector<const typename ModelContract::RequestBasePlan*> bases;
-            for (const auto& request : queue) {
-                if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
-                    continue;
-                }
-                ids.push_back(request->id);
-                bases.push_back(&*request->base_plan);
-            }
-            resources_.hold_queue(*instance_.program, ids, bases);
+        if (!queue_holds_) { return; }
+        std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
+        {
+            std::lock_guard lock(queue_mutex_);
+            queue.insert(queue.end(), pending_.begin(), pending_.end());
         }
+        std::vector<std::uint64_t> ids;
+        std::vector<const typename ModelContract::RequestBasePlan*> bases;
+        for (const auto& request : queue) {
+            if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
+                continue;
+            }
+            ids.push_back(request->id);
+            bases.push_back(&*request->base_plan);
+        }
+        resources_.hold_queue(*instance_.program, ids, bases);
     }
 
     bool try_admit_one(bool restoring) {

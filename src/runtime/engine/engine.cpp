@@ -208,16 +208,11 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
 class Engine::Impl {
 public:
     using GenerationCore = runtime::EngineCore<runtime::ModelInstance>;
-    using HybridGenerationCore =
-        runtime::EngineCore<runtime::ModelInstance,
-                            runtime::HybridResourceManager<runtime::ModelInstance::ModelContract>>;
-    using ScoringCore = runtime::CausalScoreCore<runtime::ModelInstance>;
-    // Qwen3.8-Flash-Next: the common core over the hybrid manager surface, without a prefix cache.
-    using Qwen4ExpCore = runtime::EngineCore<
-        runtime::Qwen4ExpInstance, runtime::HybridResourceManager<runtime::Qwen4ExpInstance::ModelContract>>;
+    using ScoringCore    = runtime::CausalScoreCore<runtime::ModelInstance>;
+    // Qwen3.8-Flash-Next: the common core over its own Program.
+    using Qwen4ExpCore = runtime::EngineCore<runtime::Qwen4ExpInstance>;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
-                              std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>>;
+                              std::unique_ptr<ScoringCore>, std::unique_ptr<Qwen4ExpCore>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(normalize(std::move(engine_options))),
@@ -252,10 +247,6 @@ public:
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);
-        } else if (options.context_cache.enabled &&
-                   options.context_cache.mode == ContextCacheMode::Hybrid) {
-            core = std::make_unique<HybridGenerationCore>(*active, device, options,
-                                                          std::move(constructed.context_cost));
         } else {
             core = std::make_unique<GenerationCore>(*active, device, options,
                                                     std::move(constructed.context_cost));
@@ -304,9 +295,9 @@ public:
     }
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
-        return (std::holds_alternative<std::unique_ptr<HybridGenerationCore>>(core) ||
+        return (std::holds_alternative<std::unique_ptr<GenerationCore>>(core) ||
                 std::holds_alternative<std::unique_ptr<Qwen4ExpCore>>(core)) &&
-               options.context_cache.enabled && options.context_cache.mode == ContextCacheMode::Hybrid &&
+               options.context_cache.enabled &&
                !options.context_cache.hybrid.persistent_file.empty();
     }
 

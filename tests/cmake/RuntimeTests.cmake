@@ -6,10 +6,6 @@ infernix_add_test(infernix_context_cost_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_context_cost.cpp"
   LIBRARIES infernix_runtime_support infernix::json)
 
-infernix_add_test(infernix_resource_manager_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_resource_manager.cpp"
-  LIBRARIES infernix_runtime_support)
-
 infernix_add_test(infernix_prefix_cache_index_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../runtime/test_prefix_cache_index.cpp"
   LIBRARIES infernix_runtime_support)

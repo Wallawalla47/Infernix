@@ -504,7 +504,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
     context_cache = engine.get("context_cache", {})
     if (
-        context_cache.get("device_state_slots") != 0
+        context_cache.get("device_snapshot_slots") != 0
         or context_cache.get("host_capacity_bytes") != 0
     ):
         raise CampaignError("server_start context cache capacity differs from the campaign")
@@ -774,10 +774,6 @@ def server_command(
         "--kv-dtype",
         spec.kv_dtype,
         "--no-prefix-reuse",
-        "--device-state-slots",
-        "0",
-        "--host-context-mib",
-        "0",
     ]
     if spec.speculative_backend != "none":
         command.extend(

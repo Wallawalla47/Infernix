@@ -74,10 +74,7 @@ PrefixReusePath reuse_path_for(pc::SnapshotKind kind) noexcept {
 // ---- construction ------------------------------------------------------------------------------
 
 void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
-    if (context_cache.mode != ContextCacheMode::Hybrid || !context_cache.enabled ||
-        causal_scoring) {
-        return;
-    }
+    if (!context_cache.enabled || causal_scoring) { return; }
     const DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
     const KVPageGeometry* backend_geometry =
         backend_kv_pages ? &backend_kv_pages->physical_pool().geometry() : nullptr;
@@ -85,8 +82,8 @@ void ProgramImpl::create_hybrid_prefix_cache(const StartupObserver& observer) {
                                                           state_images->host_layout().image_bytes);
     const std::uint32_t slabs =
         hybrid_host_slabs(host, context_cache.host_capacity_bytes.value_or(0U));
-    const std::uint32_t device_slots        = context_cache.device_state_slots.value_or(0U);
     const HybridPrefixCacheOptions& options = context_cache.hybrid;
+    const std::uint32_t device_slots        = options.device_snapshot_slots.value_or(0U);
     if (device_slots == 0 || !options.max_new_taps || !options.tap_ladder_tokens ||
         !options.tap_min_gap_tokens) {
         throw std::logic_error("hybrid prefix cache options are not normalized");
@@ -224,10 +221,10 @@ std::uint32_t ProgramImpl::hybrid_backend_frontier(std::uint32_t frontier) const
 
 std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& base,
                                                          std::uint32_t maximum_frontier) {
-    if (!hybrid_ || base.impl_ == nullptr || !base.impl_->prompt) {
-        throw std::logic_error("hybrid admission requires the hybrid prefix cache");
+    if (base.impl_ == nullptr || !base.impl_->prompt) {
+        throw std::logic_error("admission requires a prepared prompt");
     }
-    hybrid_->poll();
+    if (hybrid_) { hybrid_->poll(); }
     const RequestBasePlanImpl& plan  = *base.impl_;
     const PreparedPromptData& prompt = *plan.prompt;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -242,7 +239,8 @@ std::vector<SourceCandidate> ProgramImpl::hybrid_sources(const RequestBasePlan& 
         return candidate;
     };
     auto root = std::make_shared<HybridQuoteImpl>();
-    if (!plan.allow_prefix_reuse || !prompt.identity.reusable) {
+    // Without a prefix cache every request starts from the root.
+    if (!hybrid_ || !plan.allow_prefix_reuse || !prompt.identity.reusable) {
         return {source(std::move(root), PrefixReusePath::Root)};
     }
 
@@ -579,6 +577,7 @@ bool ProgramImpl::hybrid_make_room(std::uint32_t text_pages, std::uint32_t backe
         backend_kv_pages ? &backend_kv_pages->physical_pool() : nullptr;
     while (text_pool.available_pages() < text_pages ||
            (backend_pool != nullptr && backend_pool->available_pages() < backend_pages)) {
+        if (!hybrid_) { return false; }
         if (hybrid_->index().evict_device_blocks(1) != 0) { continue; }
         if (!hybrid_->transfers_pending()) { return false; }
         hybrid_->drain();
@@ -590,13 +589,16 @@ BindingReservation
 ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lane,
                                   const SourceCandidate& candidate, ResumeState* resume,
                                   ExecutionUnitKind resume_kind, std::uint32_t resume_tokens) {
-    if (!hybrid_ || !candidate.hybrid || !base.impl_ || !base.impl_->prompt) {
-        throw std::logic_error("hybrid binding requires a hybrid source");
+    if (!candidate.hybrid || !base.impl_ || !base.impl_->prompt) {
+        throw std::logic_error("binding requires a prefix cache source");
     }
     if (resume && resume->has_snapshot()) {
-        throw std::logic_error("hybrid mode pauses without snapshots");
+        throw std::logic_error("a paused request resumes without a snapshot");
     }
-    hybrid_->poll();
+    if (!hybrid_ && candidate.hybrid->reuse_frontier != 0) {
+        throw std::logic_error("a reusing source requires the prefix cache");
+    }
+    if (hybrid_) { hybrid_->poll(); }
     const PreparedPromptData& prompt = *base.impl_->prompt;
     const HybridQuoteImpl& quote     = *candidate.hybrid;
     const auto n                     = static_cast<std::uint32_t>(prompt.token_ids.size());
@@ -604,26 +606,26 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     const std::uint32_t full         = reuse / kBlock;
     const std::uint32_t tail         = reuse % kBlock;
     if (reuse >= n || (resume && reuse > resume->frontier())) { return {.source_valid = false}; }
-    pc::PrefixCacheIndex& index = hybrid_->index();
+    pc::PrefixCacheIndex* const cache = hybrid_ ? &hybrid_->index() : nullptr;
 
     // The quote may have gone stale since it was made; the Engine then tries its next source.
     std::vector<pc::NodeRef> path;
     pc::SnapshotView snapshot;
     if (reuse != 0) {
-        if (!index.valid(quote.snapshot)) { return {.source_valid = false}; }
-        snapshot = index.snapshot(quote.snapshot);
+        if (!cache->valid(quote.snapshot)) { return {.source_valid = false}; }
+        snapshot = cache->snapshot(quote.snapshot);
         if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
             throw std::logic_error("prepared prompt carries no hybrid block keys");
         }
         const pc::MatchResult match =
-            index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+            cache->match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         if (snapshot.frontier != reuse || match.path.size() < full ||
             (full != 0 ? !(snapshot.anchor == match.path[full - 1U]) : snapshot.anchor.valid())) {
             return {.source_valid = false};
         }
         path.assign(match.path.begin(), match.path.begin() + full);
         for (const pc::NodeRef node : path) {
-            const pc::CopyState device = index.node(node).device;
+            const pc::CopyState device = cache->node(node).device;
             if (device != pc::CopyState::Absent && device != pc::CopyState::Resident) {
                 return {.source_valid = false};
             }
@@ -649,7 +651,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
 
     std::vector<pc::NodeRef> host_only;
     for (const pc::NodeRef node : path) {
-        if (index.node(node).device == pc::CopyState::Absent) { host_only.push_back(node); }
+        if (cache->node(node).device == pc::CopyState::Absent) { host_only.push_back(node); }
     }
     const bool tail_restore  = tail != 0 && snapshot.tail_device_copy != pc::CopyState::Resident;
     const bool image_restore = reuse != 0 && snapshot.device_slot == pc::kNoId;
@@ -666,10 +668,10 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         backend_kv_pages ? restored + backend_growth + (backend_reuse % kBlock != 0 ? 1U : 0U) : 0U;
 
     // The source is pinned while room is made, so eviction never takes a block it stands on.
-    index.acquire_path(path);
+    if (cache != nullptr) { cache->acquire_path(path); }
     binding.path = std::move(path);
     if (reuse != 0) {
-        index.pin_snapshot(quote.snapshot);
+        cache->pin_snapshot(quote.snapshot);
         binding.snapshot_pinned = true;
     }
     const auto unwind = [&] {
@@ -767,7 +769,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             tx.reserved_kv->backend = *backend;
         }
         const pc::SnapshotView landed =
-            reuse != 0 ? index.snapshot(quote.snapshot) : pc::SnapshotView{};
+            reuse != 0 ? cache->snapshot(quote.snapshot) : pc::SnapshotView{};
         const auto prepare = [&](KVAddressSpaceStore& addresses, KVAddressSpaceHandle address,
                                  std::uint32_t frontier, std::uint32_t growth_pages, bool backend,
                                  std::optional<KVPagePrefixForkReservation>& fork,
@@ -782,13 +784,13 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             std::vector<LogicalKVPageHandle> shared;
             shared.reserve(full_pages);
             for (std::uint32_t page = 0; page < full_pages; ++page) {
-                const HybridBlockPages& block = hybrid_->block(index.node(hb.path[page]).device_id);
+                const HybridBlockPages& block = hybrid_->block(cache->node(hb.path[page]).device_id);
                 shared.push_back(backend ? *block.backend : block.text);
             }
             std::optional<LogicalKVPageHandle> tail_source;
             if (tail_columns != 0) {
                 const HybridBlockPages& block =
-                    full_pages < full ? hybrid_->block(index.node(hb.path[full_pages]).device_id)
+                    full_pages < full ? hybrid_->block(cache->node(hb.path[full_pages]).device_id)
                                       : hybrid_->block(landed.tail_device);
                 tail_source = backend ? *block.backend : block.text;
             }
@@ -836,7 +838,6 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     auto& hb                         = *tx.hybrid;
     const HybridQuoteImpl& quote     = *hb.quote;
     const std::uint32_t lane         = tx.lane;
-    pc::PrefixCacheIndex& index      = hybrid_->index();
     const std::uint32_t reuse        = quote.reuse_frontier;
     const RequestBasePlanImpl& base  = *tx.base;
     const PreparedPromptData& prompt = *base.prompt;
@@ -896,6 +897,13 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     // The snapshot image's continuation hidden belongs to the snapshot, not to a committed tail.
     state.tail_hidden_valid = false;
     refresh_history_requirements(history);
+    if (!hybrid_) {
+        // Without a prefix cache the lane publishes nothing.
+        out.sequence  = sequence_handle(lane);
+        out.replaying = requests[lane].lifecycle == Lifecycle::Replaying;
+        return;
+    }
+    pc::PrefixCacheIndex& index = hybrid_->index();
 
     // Taps are planned over the prompt the lane prefills, past its reuse frontier.
     const std::vector<VisionTokenRange> ranges = vision_ranges(prompt);

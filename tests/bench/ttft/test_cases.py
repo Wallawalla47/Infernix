@@ -86,8 +86,7 @@ class Corpus:
                 {"role": "user", "content": "Write a long story."}]
 
 
-@pytest.mark.parametrize("mode", ["replay", "snapshot"])
-def test_fixed_preemption_arrivals_do_not_wait_for_server_progress(monkeypatch, mode):
+def test_fixed_preemption_arrivals_do_not_wait_for_server_progress(monkeypatch):
     clock = Clock()
     trace = []
     monkeypatch.setattr(cases, "time", clock)
@@ -96,10 +95,10 @@ def test_fixed_preemption_arrivals_do_not_wait_for_server_progress(monkeypatch, 
         {"input_tokens": 192, "output_tokens": 256},
         {"input_tokens": 192, "output_tokens": 256},
     ])
-    definition = cases.get_case(f"preemption-{mode}")
+    definition = cases.get_case("preemption-replay")
     definition.run(context, Corpus())
 
-    assert definition.profile == f"preemption-{mode}"
+    assert definition.profile == "preemption-replay"
     assert [(event, role) for event, role, _ in trace[:4]] == [
         ("prepare", "a"), ("prepare", "b"), ("send", "a"), ("send", "b"),
     ]
@@ -109,7 +108,7 @@ def test_fixed_preemption_arrivals_do_not_wait_for_server_progress(monkeypatch, 
     assert arrivals[0]["sent_ns"] > arrivals[1]["sent_ns"]
     assert [entry["lateness_ns"] for entry in arrivals] == [20_000_000, 0]
     assert context.notes["arrival_mode"] == "fixed_schedule"
-    assert context.notes["mechanism_requirements"] == ["preemption", f"{mode}_restore"]
+    assert context.notes["mechanism_requirements"] == ["preemption", "replay_restore"]
     assert context.requests[0].payload["messages"] != context.requests[1].payload["messages"]
     for request in context.requests:
         assert request.payload["max_completion_tokens"] == 256
@@ -166,7 +165,7 @@ def test_generated_continuations_are_not_labelled_as_matching_fixed_work(run):
 def test_live_log_waits_for_complete_lines_and_ignores_warmup(tmp_path):
     path = tmp_path / "request.jsonl"
     paused = {"event": "request_scheduling", "transition": "paused", "request": {"http_request_id": "req-1"}}
-    resumed = {**paused, "transition": "snapshot_started"}
+    resumed = {**paused, "transition": "restored"}
     path.write_text(json.dumps(paused) + "\n")
     reader = cases._LiveRequestLog(SimpleNamespace(notes={"request_log_jsonl": str(path)}))
     assert reader.poll() == []
@@ -214,7 +213,7 @@ def mechanism_context():
 
 @pytest.mark.parametrize(("transitions", "expected_roles"), [
     ([], []),
-    ([("paused", "replay"), ("restored", "snapshot")], []),
+    ([("paused", "replay")], []),
     ([("restored", "replay"), ("restored", "replay")], ["recovery-short-1", "recovery-short-2"]),
 ])
 def test_recovery_arrivals_follow_the_first_replay_restore_only(
@@ -251,50 +250,6 @@ def test_recovery_arrivals_follow_the_first_replay_restore_only(
         assert context.notes["recovery_arrival_trigger"]["event"]["route"] == "replay"
     else:
         assert "recovery_arrival_trigger" not in context.notes
-
-
-def test_pressure_cancellation_selects_the_identified_request_and_continues_probes(monkeypatch):
-    context = mechanism_context()
-    handles = [MechanismHandle(role) for role in ("a", "b", "c")]
-
-    def fixed(ctx, requests, offsets, facts, on_sample):
-        for wire in ("req-b", "req-c"):
-            on_sample({"event": {
-                "event": "request_scheduling", "transition": "paused", "request": {"http_request_id": wire},
-            }, "observed_ns": 500}, handles)
-        return handles
-
-    monkeypatch.setattr(cases, "_fixed_request_graph", fixed)
-    cases.get_case("host-history-pressure-cancel").run(context, Corpus())
-    assert [handle.role for handle in handles if handle.cancelled] == ["b"]
-    cancellation = context.notes["pressure_cancel"]
-    assert cancellation["target_role"] == "b"
-    assert cancellation["event"]["request"]["http_request_id"] == "req-b"
-    assert context.notes["mechanism_observations"]["pressure_cancellation"] == "observed"
-    assert [role for role, _ in context.started[-2:]] == ["history-0-probe", "history-1-probe"]
-
-
-@pytest.mark.parametrize(("event", "already_done"), [
-    ({"event": "throughput", "scheduler": {"paused": 1}}, False),
-    ({"event": "request_scheduling", "transition": "paused", "request": {"http_request_id": "unrelated"}}, False),
-    ({"event": "request_scheduling", "transition": "paused"}, False),
-    ({"event": "request_scheduling", "transition": "snapshot_started", "request": {"http_request_id": "req-b"}}, False),
-    ({"event": "request_scheduling", "transition": "paused", "request": {"http_request_id": "req-b"}}, True),
-])
-def test_pressure_cancellation_requires_a_live_target_pause(monkeypatch, event, already_done):
-    context = mechanism_context()
-    handles = [MechanismHandle(role) for role in ("a", "b", "c")]
-    handles[0].as_record = lambda: {"wire_request_id": None}
-    handles[1].is_done = already_done
-
-    def fixed(ctx, requests, offsets, facts, on_sample):
-        on_sample({"event": event, "observed_ns": 500}, handles)
-        return handles
-
-    monkeypatch.setattr(cases, "_fixed_request_graph", fixed)
-    cases.get_case("host-history-pressure-cancel").run(context, Corpus())
-    assert not any(handle.cancelled for handle in handles)
-    assert "pressure_cancel" not in context.notes
 
 
 @pytest.mark.parametrize("case_name", ["mixed-arrivals-burst", "mixed-arrivals-sparse"])

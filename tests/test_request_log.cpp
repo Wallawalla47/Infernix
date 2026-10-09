@@ -93,7 +93,7 @@ int main() {
     engine_options.speculative                       = options.speculative;
     engine_options.enable_vision                     = options.enable_vision;
     engine_options.use_cuda_graph                    = options.use_cuda_graph;
-    engine_options.context_cache.device_state_slots  = 2;
+    engine_options.context_cache.hybrid.device_snapshot_slots  = 2;
     engine_options.context_cache.host_capacity_bytes = 64ULL << 20;
 
     const infernix::ModelSamplingDefaults sampling_defaults{
@@ -242,7 +242,7 @@ int main() {
         "resolved context-cost layers missing");
     failures += check(server.at("engine").at("prefix_reuse") == true, "prefix-reuse state missing");
     failures += check(
-        server.at("engine").at("context_cache").at("device_state_slots") == 2 &&
+        server.at("engine").at("context_cache").at("device_snapshot_slots") == 2 &&
             server.at("engine").at("context_cache").at("total_device_state_slots") == 4 &&
             server.at("engine").at("context_cache").at("host_capacity_bytes") == (64ULL << 20),
         "resolved context-cache configuration missing");
