@@ -129,10 +129,15 @@ DFlash2 drafting and the same flags (NInfer `master` at `68c54356` with the Wind
 | Prefill tok/s, requests with no cache hit | 6,127 | **8,254** | +35 % |
 | Output tok/s, one request decoding | 199 (193-202) | **235** (220-246) | +18 % |
 | Output tok/s, at the run's own batching | 249 (239-257) | **282** (276-290) | +13 % |
+| Workload wall time | 16.9 min (15.1-18.9) | **12.5 min** (9.9-15.7) | −25 % |
+
+Wall time also depends on how much each run wrote: on one seed Infernix wrote 31 % more output and
+finished 4 % later; on the other two it wrote 24-30 % less and finished 37-41 % sooner.
 
 Single requests with long prompts prefill 1.34-1.51× faster from 128K tokens, and decode without
-speculation is level. Quality is level: perplexity 4.840 against NInfer's 4.826 on the repository's
-corpus, within the ~1 % that prefill chunking alone moves it.
+speculation is level. Quality is level: on the repository's 1.04M-token perplexity corpus (16K
+context, INT8 KV cache) Infernix scores 4.468 against 4.479 for NInfer (`master` at `81c8ce09` with
+the Windows port).
 
 ## Quick start (Windows)
 
