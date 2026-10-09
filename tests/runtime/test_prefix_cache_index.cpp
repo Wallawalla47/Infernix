@@ -782,6 +782,74 @@ void test_unshared_boundary() {
     index.check_invariants();
 }
 
+// A lineage that resumes from a tap and goes past an endpoint below it (a client re-rendering the
+// reply, a retry, a branch) supersedes that endpoint before the tap, unless the endpoint has been
+// resumed from or the tap is a Boundary. Device-only, the endpoint then gives up its slot first.
+void test_passed_endpoints() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(0, 4), backend);
+    const auto main      = make_tokens(64 * 6, 70);
+    const auto main_path = insert_sequence(index, backend, main);
+    const SnapshotRef tap = publish_at(index, backend, main_path, main, 64 * 2, SnapshotKind::Tap);
+    const SnapshotRef dead =
+        publish_at(index, backend, main_path, main, 64 * 3 + 10, SnapshotKind::Endpoint);
+    // An endpoint below the same tap that a later request resumed from: an exact-replay client.
+    std::vector<TokenId> replayed(main.begin(), main.begin() + 64 * 2);
+    const auto replayed_suffix = make_tokens(64 * 2, 71);
+    replayed.insert(replayed.end(), replayed_suffix.begin(), replayed_suffix.end());
+    const auto replayed_path = insert_sequence(index, backend, replayed);
+    const SnapshotRef hit =
+        publish_at(index, backend, replayed_path, replayed, 64 * 3 + 5, SnapshotKind::Endpoint);
+    index.note_hit(hit);
+    const auto unrelated      = make_tokens(64 * 2, 73);
+    const auto unrelated_path = insert_sequence(index, backend, unrelated);
+    const SnapshotRef other =
+        publish_at(index, backend, unrelated_path, unrelated, 64 * 2, SnapshotKind::Tap);
+
+    // A continuation that ends before leaving the endpoint's path passes nothing.
+    index.supersede(tap, std::span<const TokenId>(main.data() + 64 * 2, 30));
+    require(index.snapshot(tap).superseded && !index.snapshot(dead).superseded,
+            "a continuation still on the endpoint's path must not supersede it");
+    index.note_hit(tap);
+
+    // The next request shares 150 tokens and goes on differently.
+    std::vector<TokenId> next(main.begin(), main.begin() + 150);
+    const auto next_suffix = make_tokens(64 * 5 - 150, 72);
+    next.insert(next.end(), next_suffix.begin(), next_suffix.end());
+    const auto next_path = insert_sequence(index, backend, next);
+    index.supersede(tap, std::span<const TokenId>(next.data() + 64 * 2, next.size() - 64 * 2));
+    require(index.snapshot(dead).superseded && index.snapshot(tap).superseded,
+            "the passed endpoint and the resumed tap must both be superseded");
+    require(!index.snapshot(hit).superseded, "an endpoint resumed from must stay retained");
+    const auto slot = index.acquire_device_slot();
+    require(slot.has_value() && !index.valid(dead) && index.valid(tap),
+            "the passed endpoint must give up its slot before the lineage's tap");
+    index.release_device_slot(*slot);
+    require(index.valid(hit) && index.valid(other), "retained snapshots must survive");
+
+    // Below a Boundary the endpoints may be other conversations': they are left alone.
+    RecordingBackend boundary_backend;
+    PrefixCacheIndex shared(small_config(0, 4), boundary_backend);
+    const auto shared_path = insert_sequence(shared, boundary_backend, main);
+    const SnapshotRef boundary =
+        publish_at(shared, boundary_backend, shared_path, main, 64 * 2, SnapshotKind::Boundary);
+    const SnapshotRef theirs =
+        publish_at(shared, boundary_backend, shared_path, main, 64 * 3 + 10, SnapshotKind::Endpoint);
+    const auto shared_next = insert_sequence(shared, boundary_backend, next);
+    shared.supersede(boundary, std::span<const TokenId>(next.data() + 64 * 2, next.size() - 64 * 2));
+    require(!shared.snapshot(theirs).superseded,
+            "an endpoint below a Boundary must not be superseded by another conversation");
+
+    index.release_path(main_path);
+    index.release_path(replayed_path);
+    index.release_path(unrelated_path);
+    index.release_path(next_path);
+    index.check_invariants();
+    shared.release_path(shared_path);
+    shared.release_path(shared_next);
+    shared.check_invariants();
+}
+
 // The production failure: a conversation resuming turn after turn under Host pressure, next to a
 // deep stale conversation. Each turn resumes from the previous turn's endpoint and publishes a
 // deeper one; the new endpoint must always survive to serve the next turn.
@@ -1526,6 +1594,7 @@ int main() {
         test_unbacked_slot_values();
         test_host_write_admission();
         test_unshared_boundary();
+        test_passed_endpoints();
         test_host_only_reattach();
         test_resident_duplicate_replacement();
         test_tail_device_fill();

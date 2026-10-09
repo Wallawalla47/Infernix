@@ -311,7 +311,7 @@ void PrefixCache::poll() {
         }
         if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
             (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
-            index_->supersede(*c.capture.supersedes);
+            index_->supersede(*c.capture.supersedes, c.capture.continuation);
         }
         if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
         published_[c.capture.id] = result;

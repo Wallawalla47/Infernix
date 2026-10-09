@@ -933,6 +933,16 @@ breakpoint or structural boundary, or at the divergence of coalesced requests, �
 by conversations, so it is superseded only while no other conversation has continued from it: while
 the tree below it is a single chain. Until then it is just its lineage's snapshot.
 
+**Passed endpoints.** When a lineage supersedes the snapshot it resumed from, every `Endpoint`
+whose nearest snapshot above it is that one, that has never been resumed from, and whose path the
+lineage's tokens leave before reaching it, is superseded too, first. Such an endpoint serves only an
+exact replay of its reply, and the conversation that went past its parent did not send one: a
+client re-rendering the reply (stripped or normalized thinking), a retry, or a branch. Endpoints
+resumed from (exact-replay clients) are left retained, and so is everything below a `Boundary`
+parent, whose endpoints may be other conversations'. Without this, a re-rendering conversation's
+endpoints were never superseded: Device-only they held their slots for good, and the lineage's own
+resume point became the only superseded owner, the first to go.
+
 Allocation of `k` slabs:
 
 1. **Dead KV sweep**: pop host-resident nodes with `live_snapshots_below == 0`,
@@ -1322,7 +1332,7 @@ nonzero value is rejected.
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |
 | No session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged. |
-| A branch supersedes its parent's snapshot | A lineage that continues past the snapshot it resumed from supersedes it, even when another conversation (the branch's parent) still resumes there. With a Host tier the snapshot keeps its Host copy and the parent resumes from it. Device-only (`--host-context-mib 0`) the branch's next snapshot can take its slot, and the parent's next turn recomputes from its deepest remaining snapshot, possibly the root (found 2026-10-09 by the agent-continuation real test). Not yet fixed: supersession could be withheld while another lineage has resumed from the snapshot, as for Boundary snapshots. |
+| A branch supersedes its parent's snapshot | A lineage that continues past the snapshot it resumed from supersedes it, even when another conversation (the branch's parent) still resumes there: at that moment the cache cannot tell a branch from the conversation's own next turn. With a Host tier the snapshot keeps its Host copy and the parent resumes from it. Device-only (`--host-context-mib 0`) it keeps its slot while an older superseded owner exists; endpoints that a re-rendering conversation went past are superseded first (§9.3, passed endpoints), so there normally is one. With every slot held by retained snapshots, the branch's next snapshot still takes the parent's slot. |
 
 ---
 
@@ -1558,6 +1568,15 @@ superseded storage:
   the `throughput` record keeps the hybrid gauges and counters.
 
 ---
+
+### 16.7 Fixes after the hybrid-only release (2026-10-09)
+
+Measured with the Qwen3.5 prefix real test on NInfer's official NVFP4 Qwen3.8-27B artifact, RTX
+5090.
+
+| change | section | result | status |
+|---|---|---|---|
+| A lineage resuming from a non-Boundary snapshot supersedes the never-resumed endpoints below it that it goes past (passed endpoints) | §9.3 | `agent-continuation-device` (4 Device slots, no Host tier; 16 main turns that re-render the reply, one branch at turn 8): before, the endpoints of turns 3 and 6 and the one below the system-block boundary held three slots for good, the branch's endpoint took the slot of the tap the main conversation resumes from, and the main turn after the branch recomputed all 784 prompt tokens (reused 0, expected 720). After, that turn computes 64, and the trajectory's totals (11,148 tokens reused, 1,784 computed) equal those with a 2 GiB Host tier (`agent-continuation`). Every other prefix scenario, the hybrid prefix test and the Qwen4Exp prefix test (Uncensored and Dense8) pass | kept |
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 

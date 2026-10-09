@@ -238,7 +238,15 @@ public:
     // one, oldest supersession first, and retained snapshots are valued against their nearest
     // retained ancestor. A Boundary snapshot is superseded only while no other conversation has
     // continued from it (the tree below it is a single chain).
-    void supersede(SnapshotRef snapshot);
+    // `continuation` is the lineage's tokens from `snapshot`'s frontier on, when it resumed from
+    // `snapshot`. Unless `snapshot` is a Boundary (whose endpoints below may be other
+    // conversations'), an Endpoint whose nearest snapshot above it is `snapshot`, never resumed
+    // from, that the continuation leaves before reaching it, is then superseded first: it serves
+    // only an exact replay of its reply, and the conversation that went past `snapshot` did not
+    // send one (a client re-rendering the reply, a retry, or a branch). Left retained, such
+    // endpoints held Device-only slots for good while the lineage's own resume point gave up its
+    // slot.
+    void supersede(SnapshotRef snapshot, std::span<const TokenId> continuation = {});
 
     // ---- queue holds (§9.6) --------------------------------------------------------------------
     // The snapshots queued requests will resume from, in admission order (rank 0 is admitted
@@ -510,6 +518,10 @@ private:
     // Whether the tree branches below the snapshot's frontier (another conversation continued
     // from its prefix).
     [[nodiscard]] bool shared_below(const Snapshot& snapshot) const noexcept;
+    // Whether `continuation` (path tokens from position `from` on) differs from the snapshot's
+    // path before the snapshot's frontier; false when it ends first without differing.
+    [[nodiscard]] bool leaves_path(const Snapshot& snapshot, std::uint32_t from,
+                                   std::span<const TokenId> continuation) const noexcept;
     [[nodiscard]] std::uint32_t find_ancestor(std::uint32_t snapshot) const noexcept;
     void link_snapshot(std::uint32_t snapshot);
     void unlink_snapshot(std::uint32_t snapshot);

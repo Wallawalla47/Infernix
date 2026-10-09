@@ -301,7 +301,42 @@ void PrefixCacheIndex::refresh_holds() {
     for (const std::uint32_t index : held_nodes_) { refresh_node(index); }
 }
 
-void PrefixCacheIndex::supersede(SnapshotRef snapshot) {
+bool PrefixCacheIndex::leaves_path(const Snapshot& snapshot, std::uint32_t from,
+                                   std::span<const TokenId> continuation) const noexcept {
+    const std::uint32_t end = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(snapshot.frontier, std::uint64_t{from} + continuation.size()));
+    const std::uint32_t anchored = snapshot.frontier - snapshot.tail_len;
+    for (std::uint32_t p = std::max(from, anchored); p < end; ++p) {
+        if (snapshot.tail[p - anchored] != continuation[p - from]) { return true; }
+    }
+    // The anchor chain, deepest block first, down to the block holding `from`.
+    std::uint32_t node = snapshot.anchor;
+    for (std::uint32_t begin = anchored; node != kNoId && begin > from;
+         node = nodes_[node].parent) {
+        begin -= kBlockTokens;
+        for (std::uint32_t p = std::max(from, begin); p < std::min(end, begin + kBlockTokens); ++p) {
+            if (nodes_[node].tokens[p - begin] != continuation[p - from]) { return true; }
+        }
+    }
+    return false;
+}
+
+void PrefixCacheIndex::supersede(SnapshotRef snapshot, std::span<const TokenId> continuation) {
+    // Below a Boundary the endpoints may be other conversations': one conversation passing them
+    // says nothing about theirs.
+    if (!continuation.empty() && require(snapshot).kind != SnapshotKind::Boundary) {
+        const Snapshot& source = require(snapshot);
+        std::vector<std::uint32_t> passed;
+        for (const std::uint32_t dependent : dependents_of(snapshot.index)) {
+            const Snapshot& endpoint = snapshots_[dependent];
+            if (endpoint.kind == SnapshotKind::Endpoint && endpoint.hits == 0 &&
+                !endpoint.superseded && leaves_path(endpoint, source.frontier, continuation)) {
+                passed.push_back(dependent);
+            }
+        }
+        // Before `snapshot`, so they are evicted first.
+        for (const std::uint32_t endpoint : passed) { supersede(ref_of_snapshot(endpoint)); }
+    }
     Snapshot& entry = require(snapshot);
     // A boundary serves the conversations that share it, so it is superseded only while the tree
     // shows no other conversation below it: until then it is just this lineage's snapshot.
