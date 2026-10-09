@@ -7,7 +7,9 @@
 // same link rate. Sources are read in stream order, as with cudaMemcpyAsync. Copies within one
 // driver batch run in no particular order, so a copy whose destination overlaps an earlier pending
 // one first enqueues the pending copies as a batch: the stream-order result (the later copy wins)
-// is kept.
+// is kept. A source in registered host memory is passed at its device address
+// (cudaHostGetDevicePointer): the batch faults on the host address where the device maps the
+// memory elsewhere (WDDM), and copies from the device address at the full link rate.
 
 #include <cuda_runtime.h>
 

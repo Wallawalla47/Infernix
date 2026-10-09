@@ -162,7 +162,7 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w = source.weights();
     const auto& c = source.config().text;
     const auto& embedding = source.weight(w.token_embedding);
-    token_embedding = with_context(embedding.name, [&] { return native_weight(embedding.view); });
+    token_embedding = with_context(embedding.name, [&] { return device_native_weight(embedding.view); });
     const auto& head = source.weight(w.output_head);
     if (!head.view.parts.empty() && head.view.parts.front().parent->geometry.format == QType::Q8_G32_FP16) {
         output_head_q8 = prepare.linear({w.output_head});

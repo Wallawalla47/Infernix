@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -18,7 +19,9 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 namespace infernix::artifact {
 namespace {
@@ -86,6 +89,52 @@ void read_pinned(const Reader& reader, std::uint64_t offset, std::span<std::byte
         if (!out.empty()) { read_bounced(reader, segment.file_index, file_offset, out, bounce); }
     }
 }
+
+// Zeroes the pinned block's pages ahead of its reads (RegisteredHostBuffer::prefault): workers take
+// 64 MiB chunks in address order and a read waits until every chunk under its range is done, so no
+// prefault write lands on bytes already read, and the OS's page zeroing runs beside the disk.
+class Prefault {
+public:
+    Prefault(const RegisteredHostBuffer& block, unsigned workers)
+        : block_(block), chunks_((block.size() + kChunk - 1) / kChunk), done_(chunks_) {
+        for (unsigned w = 0; w < workers; ++w) {
+            threads_.emplace_back([this] {
+                for (std::size_t c = next_.fetch_add(1); c < chunks_ && !stop_.load(); c = next_.fetch_add(1)) {
+                    block_.prefault(c * kChunk, (c + 1) * kChunk);
+                    done_[c].store(true, std::memory_order_release);
+                }
+            });
+        }
+    }
+    ~Prefault() {
+        stop_.store(true);
+        for (auto& t : threads_) { t.join(); }
+    }
+    Prefault(const Prefault&)            = delete;
+    Prefault& operator=(const Prefault&) = delete;
+
+    // Returns once the bytes [0, end) of the block are prefaulted.
+    void wait(std::uint64_t end) {
+        const std::size_t need = std::min<std::size_t>(chunks_, static_cast<std::size_t>((end + kChunk - 1) / kChunk));
+        while (ready_ < need) {
+            if (done_[ready_].load(std::memory_order_acquire)) {
+                ++ready_;
+            } else {
+                std::this_thread::yield();
+            }
+        }
+    }
+
+private:
+    static constexpr std::size_t kChunk = std::size_t{64} << 20;
+    const RegisteredHostBuffer& block_;
+    std::size_t chunks_;
+    std::vector<std::atomic<bool>> done_;
+    std::atomic<std::size_t> next_{0};
+    std::atomic<bool> stop_{false};
+    std::size_t ready_ = 0; // chunks [0, ready_) are done (the reader's view)
+    std::vector<std::thread> threads_;
+};
 
 void check_cuda(cudaError_t status, const char* operation) {
     if (status != cudaSuccess) {
@@ -224,15 +273,9 @@ std::vector<FileSegment> StreamSource::segments(ObjectHandle object, std::uint64
     return out;
 }
 
-const PinnedHostBuffer& MaterializedArtifact::pinned_block() const {
-    if (!pinned_) { throw ArtifactError("materialization has no pinned block"); }
-    return *pinned_;
-}
-
 std::span<const std::byte> MaterializedArtifact::pinned_bytes_range() const {
     if (!pinned_) { return {}; }
-    return std::span<const std::byte>(static_cast<const std::byte*>(pinned_->data()),
-                                      pinned_->size());
+    return std::span<const std::byte>(pinned_->data(), pinned_->size());
 }
 
 std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
@@ -337,8 +380,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             throw ArtifactError(message);
         }
         out.pinned_ =
-            std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
+            std::make_unique<RegisteredHostBuffer>(static_cast<std::size_t>(plan.pinned_capacity_bytes));
     }
+    // Its pages are zeroed by these workers while the reads fill it, and pinned once full.
+    std::optional<Prefault> prefault;
+    if (out.pinned_) { prefault.emplace(*out.pinned_, std::clamp(std::thread::hardware_concurrency() / 4, 1U, 8U)); }
     const auto bounce =
         plan.pinned_objects.empty() ? nullptr : std::make_unique<DirectBounce>();
     for (auto& placement : plan.host_objects) {
@@ -375,22 +421,26 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         // Read straight into the pinned block: large pinned objects (expert banks) must never be
         // staged through a second Host copy or the file cache.
-        const std::span<std::byte> data(
-            static_cast<std::byte*>(out.pinned_->data()) + placement.offset,
-            static_cast<std::size_t>(placement.bytes));
+        const std::span<std::byte> data(out.pinned_->data() + placement.offset,
+                                        static_cast<std::size_t>(placement.bytes));
+        prefault->wait(placement.offset + placement.bytes);
         read_pinned(reader, object_offset(object), data, *bounce);
         out.stats_.read_bytes =
             checked_add(out.stats_.read_bytes, data.size(), "pinned read bytes");
         const auto geometry = reader.geometry(placement.object);
         const auto divisor = read_divisor(reader, placement.object, geometry, data, out.stats_);
-        storage.pinned = WeightParent{
-            geometry,
-            static_cast<const std::byte*>(out.pinned_->data()) + placement.offset,
-            divisor};
+        storage.pinned = WeightParent{geometry, out.pinned_->data() + placement.offset, divisor};
         out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, placement.bytes,
                                               "pinned bytes");
         pinned_done = checked_add(pinned_done, placement.bytes, "pinned progress");
         phase.progress(pinned_done, load_total);
+    }
+    if (out.pinned_) {
+        prefault.reset(); // every worker done before the block is locked
+        out.pinned_->pin();
+        for (const auto& placement : plan.pinned_objects) {
+            out.objects_.at(placement.object.index).pinned->device = out.pinned_->device_data() + placement.offset;
+        }
     }
     std::vector<CopyRange> ranges;
     for (const auto& placement : plan.device_objects) {
@@ -416,7 +466,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         const auto divisor = object.host
                                  ? object.host->weight_scale_divisor
                                  : read_divisor(reader, placement.object, geometry, {}, out.stats_);
-        object.device = WeightParent{geometry, storage_data, divisor};
+        object.device = WeightParent{geometry, storage_data, divisor, storage_data};
         const auto& descriptor = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges.push_back({segment.file_index, segment.file_offset,

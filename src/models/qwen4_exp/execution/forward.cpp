@@ -556,7 +556,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::moe_dispatch(routing, E, dispatch, route_log, s);
     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
                                 .frames       = experts_.frames.at(layer),
-                                .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.records),
+                                .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.device_records),
                                 .record_stride = p.bank->planes.record_stride,
                                 .scales        = p.device_scales,
                                 .activation    = p.bank->activation,

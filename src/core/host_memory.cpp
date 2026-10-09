@@ -1,5 +1,7 @@
 #include "core/host_memory.h"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <stdexcept>
 
@@ -10,6 +12,7 @@
 #include <windows.h>
 #include <psapi.h>
 #else
+#include <sys/mman.h>
 #include <sys/resource.h>
 
 #include <fstream>
@@ -116,6 +119,52 @@ std::string reserve_process_working_set(std::uint64_t bytes) {
     (void)bytes;
     return {};
 #endif
+}
+
+RegisteredHostBuffer::RegisteredHostBuffer(std::size_t bytes) : size_(bytes) {
+    if (bytes == 0) { throw std::invalid_argument("RegisteredHostBuffer size must be nonzero"); }
+#ifdef _WIN32
+    void* p = ::VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p == nullptr) {
+        throw std::runtime_error("VirtualAlloc of " + std::to_string(bytes) + " bytes failed: Windows error " +
+                                 std::to_string(::GetLastError()));
+    }
+#else
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { throw std::runtime_error("mmap of " + std::to_string(bytes) + " bytes failed"); }
+#endif
+    data_ = static_cast<std::byte*>(p);
+}
+
+RegisteredHostBuffer::~RegisteredHostBuffer() {
+    if (device_ != nullptr) { (void)cudaHostUnregister(data_); }
+#ifdef _WIN32
+    (void)::VirtualFree(data_, 0, MEM_RELEASE);
+#else
+    (void)::munmap(data_, size_);
+#endif
+}
+
+void RegisteredHostBuffer::prefault(std::size_t begin, std::size_t end) const noexcept {
+    constexpr std::size_t kPage = 4096;
+    for (std::size_t at = begin / kPage * kPage; at < std::min(end, size_); at += kPage) {
+        *reinterpret_cast<volatile std::byte*>(data_ + std::max(at, begin)) = std::byte{0};
+    }
+}
+
+void RegisteredHostBuffer::pin() {
+    if (device_ != nullptr) { throw std::logic_error("RegisteredHostBuffer is already pinned"); }
+    if (const auto status = cudaHostRegister(data_, size_, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        status != cudaSuccess) {
+        throw std::runtime_error("cudaHostRegister of " + std::to_string(size_) +
+                                 " bytes failed: " + cudaGetErrorString(status));
+    }
+    void* device = nullptr;
+    if (const auto status = cudaHostGetDevicePointer(&device, data_, 0); status != cudaSuccess) {
+        (void)cudaHostUnregister(data_);
+        throw std::runtime_error(std::string("cudaHostGetDevicePointer failed: ") + cudaGetErrorString(status));
+    }
+    device_ = static_cast<std::byte*>(device);
 }
 
 } // namespace infernix
