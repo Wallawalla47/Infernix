@@ -2174,7 +2174,17 @@ private:
                     // failed rows wait or yield their own lane; they cannot block ready rows.
                     // The same shortage has already exhausted cache and paused snapshots.
                     if (pause_reclaim_victim(request->id)) { break; }
-                    throw std::logic_error("oldest resident cannot obtain its legal unit");
+                    // The capacity contract error (resource-scheduling ?3): nothing of the unit
+                    // ran, so only the residents fail and the Engine keeps serving.
+                    const char* kind = unit.kind == UnitKind::Control  ? "control"
+                                       : unit.kind == UnitKind::Decode ? "decode"
+                                       : unit.kind == UnitKind::Replay ? "replay"
+                                                                       : "prefill";
+                    throw RecoverableExecutionError(
+                        "oldest resident cannot obtain its legal unit (request " +
+                        std::to_string(request->id) + ", " + kind + " unit, " +
+                        std::to_string(result.shortage.main_kv_pages) +
+                        " KV page(s) short after reclaim)");
                 }
                 if (oldest != lane && (!blocked || request->id > slots_[*blocked]->id)) {
                     blocked = lane;

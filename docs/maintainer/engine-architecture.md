@@ -360,7 +360,9 @@ miss.
 One class of execution failure is recoverable: `runtime::RecoverableExecutionError`, which a Program
 raises after a stable boundary when a unit's inputs were unavailable rather than its state corrupted
 (Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that missed
-its heartbeat). The Engine fails the requests holding lanes with it, the Program releases those
+its heartbeat). The Engine raises it itself for the capacity contract error
+([resource scheduling](resource-scheduling-and-context-cache.md) §3), which fires before the unit
+runs. The Engine fails the requests holding lanes with it, the Program releases those
 lanes without publishing anything and empties a prefix cache the failed round may have published
 into, and queued requests keep waiting; if the Engine is binding, materializing, capturing or holding
 a paused request at that moment it fails everything instead. A service or read thread that has itself
