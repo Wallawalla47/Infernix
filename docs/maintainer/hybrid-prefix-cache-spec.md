@@ -762,18 +762,24 @@ lane publishes its remaining pending taps from its own last page, or drops them.
 
 When `F_s < 64k`, blocks `[F_s/64 .. k)` already exist in the tree but are recomputed, because the
 recurrent state must be rebuilt. The sequence writes them into its own private pages. At block
-commit (§7.6), each such block finds the existing node, so the private page stays private
-(`Duplicate`) and is freed at finish. The tree is not modified. KV-write elision, which maps the
-existing pages and discards those writes, is an optional optimisation (§12.4).
+commit (§7.6), each such block finds the existing node. When no other sequence maps its Device copy
+and no transfer reads it (the node is unpinned), the node adopts the sequence's page and its old copy
+returns to the pool, so a recomputed block never occupies two pages. Pinning the old copy beside the
+private page would turn evictable cache, which admission counted as room, into a second resident
+page per block: a long replay in a pool sized to one context would then exhaust it before its first
+decode unit. Only a copy that is already pinned leaves the page private (`Duplicate`, freed at
+finish). KV-write elision, which maps the existing pages and discards those writes, is an optional
+optimisation (§12.4).
 
 ### 7.6 Block commit (prefill and decode)
 
 After any commit that advances every enabled pool's committed frontier across a block end
 `64(b+1)`:
 
-- If `child(N_{b−1}, key(b))` exists with a Device copy: the sequence's page stays private
-  (`Duplicate`). If it exists host-only, it adopts the sequence's page as its Device copy. Otherwise
-  **insert** a node owning the sequence's page. The node stays pinned for this sequence.
+- If `child(N_{b−1}, key(b))` exists with a pinned Device copy: the sequence's page stays private
+  (`Duplicate`). If it exists host-only, or with an unpinned Device copy, it adopts the sequence's
+  page as its Device copy (the unpinned copy is released). Otherwise **insert** a node owning the
+  sequence's page. The node stays pinned for this sequence.
 - D2H write-through of the lane's Device-only nodes is enqueued in one batch when the lane releases
   its path (finish, abort or cancel), before the nodes become evictable. Batching coalesces runs of
   consecutive pages and slabs into one strided copy per plane, and pinned nodes need no backup yet.

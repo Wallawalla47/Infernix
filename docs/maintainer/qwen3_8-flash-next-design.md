@@ -3562,7 +3562,7 @@ lane-private.
 |---|---|
 | 1 | **Host-born snapshots.** `reserve_host_image(tail, claim)` takes free slabs (the image's, then one tail slab when `tail`), GDSF-evicting like `begin_snapshot_host_fill` but never past `claim` (`estimate_priority`); `release_host_image` returns them. `publish_host_snapshot(anchor, frontier, tail, optional tail_device_id, reservation, kind)` publishes a landed image and tail (`device_slot = kNoId`, Host Resident); a non-empty `tail` requires the reservation's tail slab and `host_blocks`; a duplicate frees its slabs and Device tail and returns the existing snapshot with `created = false`. The Host tail is mandatory: `snapshot_valid`, `refresh_tail`, tail eviction and `begin_snapshot_host_fill` assume a Host-resident snapshot has one (`prefix_index.cpp:124-129, 369-379, 629-637, 734-736`). `check_invariants` counts reserved slabs |
 | 2 | **Zero Device snapshot slots** are legal (`acquire_device_slot` returns `nullopt`) |
-| 3 | **`insert_block(…, bool attach)`**: `false` pins an existing Host-only child without adopting `device_id`; the caller keeps its page. Qwen3.5 passes `true` |
+| 3 | **`insert_block(…, bool attach)`**: `false` pins an existing child without adopting `device_id`; the caller keeps its page. With `true` a Host-only child adopts it, and so does a child whose Device copy is unpinned, which `replaced_device_id` hands back for release (hybrid-prefix-cache-spec §7.5: a recomputed block never holds two pages). Qwen3.5 passes `true` |
 | 4 | **Saturating call cost** (`cost.h`): ρ = `call_route_fraction` (default 0), `call_seconds(t) = chunk_seconds × (ρ > 0 ? 1 − (1 − ρ)^t : 1)`; `prefill_seconds` charges `⌊s/c⌋ × call_seconds(c) + call_seconds(s mod c)` plus token and attention terms. ρ = 0 is today's formula |
 
 #### Binding `Qwen4ExpPrefixCache` (`src/models/qwen4_exp/program/prefix/`)
@@ -3622,7 +3622,7 @@ Where snapshots are taken and what they cost (estimated):
 | Prompt tail | Start of the final call | Flexible | 0 | Image 4.5 ms | Absorbed by the opener in chat (proximity rule) |
 | Ladder `n − G·2^k`, G = max(4096, 2·chunk) | First call boundary ≥ p | Flexible | 0 | 4.5 ms + 116 MB Host each | ~log2(n/G) per cold long prompt |
 | Endpoint (end of turn, consistent abort) | Frontier after MR3 | — | ~0.2 ms flush if pending | Tail + image from the idle slot | F ≥ deepest + 64, all full blocks below F published |
-| Blocks | Every 64 final positions | — | O(1) host | 0.93 MB per new block at release (30K first turn: 437 MB ≈ 17 ms) | Mismatching or Device-resident duplicates stay private. A request writes 1-3 images (0.12-0.35 GB) plus its new blocks, all D2H |
+| Blocks | Every 64 final positions | — | O(1) host | 0.93 MB per new block at release (30K first turn: 437 MB ≈ 17 ms) | Mismatching duplicates and duplicates of a pinned Device copy stay private; an unpinned Device copy is replaced by the request's page. A request writes 1-3 images (0.12-0.35 GB) plus its new blocks, all D2H |
 
 #### Copy-engine discipline
 

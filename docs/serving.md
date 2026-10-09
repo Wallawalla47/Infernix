@@ -1544,8 +1544,10 @@ the cache has inserted a block or holds a snapshot. `device_blocks` (Device-resi
 Host), `snapshots`, `host_capacity_bytes`, and `host_used_bytes` are end-of-interval gauges; the rest
 are interval deltas. `snapshot_hits` counts admissions that resumed from a snapshot and
 `reused_tokens` the prompt tokens they reused. `blocks_inserted` counts new tree blocks,
-`blocks_reattached` blocks whose existing tree entry took a request's Device pages, and
-`blocks_duplicate` committed blocks the tree already held on the Device, whose pages were released.
+`blocks_reattached` blocks whose existing tree entry took a request's Device pages (a Host-only
+entry, or one whose unused Device copy the request's page replaced), and `blocks_duplicate`
+committed blocks whose Device copy another request was using, so the request's pages stayed private
+until it finished.
 `taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
 `endpoints_created` end-of-answer snapshots. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count

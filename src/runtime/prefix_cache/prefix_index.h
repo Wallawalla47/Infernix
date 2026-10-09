@@ -122,9 +122,13 @@ struct AdmissionChoice {
 struct InsertResult {
     NodeRef node;
     bool inserted = false;
-    // The supplied device id now belongs to the index: a new node, or an existing host-only node
-    // whose Device copy is re-established from the inserting sequence's page.
+    // The supplied device id now belongs to the index: a new node, an existing host-only node
+    // whose Device copy is re-established from the inserting sequence's page, or an existing node
+    // whose unpinned Device copy the sequence's page replaces.
     bool device_attached = false;
+    // The replaced Device copy (kNoId otherwise). No sequence maps it and no transfer reads it;
+    // the caller releases it.
+    std::uint32_t replaced_device_id = kNoId;
 };
 
 struct PublishResult {
@@ -268,8 +272,10 @@ public:
                                                     std::uint64_t extra) const;
     // Inserts a committed full block owning `device_id`, device Resident, pinned once for the
     // inserting sequence. When an identical child already exists `inserted` is false and the child
-    // is pinned; with `attach` a host-only existing child adopts `device_id` as its Device copy
-    // (device_attached), otherwise the caller keeps its page private.
+    // is pinned; with `attach` a host-only existing child adopts `device_id` as its Device copy, and
+    // an unpinned Device-resident one adopts it in place of its copy, returned in
+    // `replaced_device_id` (device_attached in both cases). Otherwise the caller keeps its page
+    // private: a pinned copy is mapped by another sequence or read by a transfer.
     [[nodiscard]] InsertResult insert_block(NodeRef parent, std::uint64_t lookup_hash,
                                             std::span<const TokenId> block_tokens,
                                             std::uint64_t extra, std::uint32_t device_id,

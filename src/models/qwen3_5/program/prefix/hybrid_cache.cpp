@@ -188,10 +188,11 @@ void HybridPrefixCache::adopt_destination(const HybridBlockPages& pages, std::ui
 InsertResult HybridPrefixCache::insert_block(NodeRef parent, std::uint64_t lookup_hash,
                                              std::span<const TokenId> tokens, std::uint64_t extra,
                                              HybridBlockPages pages) {
-    // Only a new node or a host-only node adopts the caller's page; a Device-resident duplicate
-    // leaves it private to the caller.
+    // A new node, a host-only node and a node whose unpinned Device copy the caller's page replaces
+    // adopt it; a Device copy another sequence maps (or a transfer reads) leaves it private.
     const std::optional<NodeRef> existing = index_->find_child(parent, lookup_hash, tokens, extra);
-    const bool adopts      = !existing || index_->node(*existing).device == CopyState::Absent;
+    const bool adopts = !existing || index_->node(*existing).device == CopyState::Absent ||
+                        (index_->node(*existing).device == CopyState::Resident && index_->node(*existing).pins == 0);
     const std::uint32_t id = allocate_block_id(pages);
     if (adopts) {
         try {
@@ -216,6 +217,11 @@ InsertResult HybridPrefixCache::insert_block(NodeRef parent, std::uint64_t looku
     } else if (result.inserted) {
         ++counters_.blocks_inserted;
     } else {
+        if (result.replaced_device_id != kNoId) {
+            // Not an eviction: the block keeps its Device copy, now on the caller's page.
+            release(*blocks_[result.replaced_device_id]);
+            free_block_id(result.replaced_device_id);
+        }
         ++counters_.blocks_reattached;
     }
     return result;
