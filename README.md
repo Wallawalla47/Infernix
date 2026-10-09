@@ -5,7 +5,7 @@
 > few other AI systems I’ve been testing). It is likely to be neither complete nor entirely
 > accurate. This is hobby development.
 
-Infernix is a from-scratch C++/CUDA inference engine that serves Qwen models on a single NVIDIA
+Infernix is a C++/CUDA inference engine that serves Qwen models on a single NVIDIA
 RTX 50-series GPU (tuned on the RTX 5090). It began as a fork of
 [NInfer](https://github.com/Neroued/ninfer) by [Neroued](https://github.com/Neroued) and has grown
 into its own engine; it reads NInfer's `.ninfer` artifacts as well as its own `.infernix` files.
