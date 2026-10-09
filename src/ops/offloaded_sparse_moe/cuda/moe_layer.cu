@@ -842,6 +842,307 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
     check_launch("down");
 }
 
+// ------------------------------------------------------------------------ A16 narrow route (§16.2.1)
+//
+// Experts stored without activation scales: x and h are encoded per column (canon::a16_value) and
+// every product is three dp4a (signed codes times the unsigned lo and mid bytes and the signed hi
+// bytes of X), so P_b and the int64 row sums are the CPU engine's bit for bit. Gate/up CTAs write
+// h in BF16 to the call's h plane (the A4 wide route's x plane, unused here: 1,440 >= 1,280 bytes
+// per entry); down CTAs encode it under its own column exponent.
+
+constexpr int kA16PassColumns = 4; // columns per pass of the multi-column A16 kernels
+// Whether A16 experts with more than eight columns leave these kernels for a wide route. None
+// exists yet, so the exact narrow kernels compute every A16 expert, in passes of kA16PassColumns.
+constexpr bool kA16WideRoute = false;
+
+// An encoded A16 block in the layout the dp4a loop reads: four elements' bytes per word.
+struct A16Act {
+    std::uint32_t lo[4];
+    std::uint32_t mid[4];
+    std::int32_t hi[4];
+};
+
+// Signed bytes of a times unsigned bytes of b, plus c (PTX dp4a.s32.u32).
+__device__ __forceinline__ int dp4a_su(int a, std::uint32_t b, int c) {
+    int d;
+    asm("dp4a.s32.u32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+// Encodes `n` <= Columns BF16 columns of `length` elements, column c at base(c), into acts
+// [c][length / 16] with their exponents in emax[c]. Every thread of the CTA calls it; it ends with
+// a barrier.
+template <int Columns, class Base>
+__device__ void encode_a16_columns(Base base, int n, int length, A16Act* acts, int* emax,
+                                   unsigned (&key)[kWarps][Columns]) {
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int vectors = length / 8; // uint4 loads of 8 elements
+    unsigned m[Columns];
+#pragma unroll
+    for (int c = 0; c < Columns; ++c) { m[c] = 0; }
+    for (int i = threadIdx.x; i < n * vectors; i += blockDim.x) {
+        const int c   = i / vectors;
+        const uint4 v = reinterpret_cast<const uint4*>(base(c))[i % vectors];
+        const unsigned words[4] = {v.x, v.y, v.z, v.w};
+        unsigned mm = 0;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) { mm = max(mm, max(words[w] & 0x7FFFU, (words[w] >> 16) & 0x7FFFU)); }
+#pragma unroll
+        for (int cc = 0; cc < Columns; ++cc) {
+            if (cc == c) { m[cc] = max(m[cc], mm); }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < Columns; ++c) {
+        m[c] = __reduce_max_sync(0xFFFFFFFFU, m[c]);
+        if (lane == 0) { key[warp][c] = m[c]; }
+    }
+    __syncthreads();
+    if (static_cast<int>(threadIdx.x) < n) {
+        unsigned k = 0;
+        for (int w = 0; w < kWarps; ++w) { k = max(k, key[w][threadIdx.x]); }
+        emax[threadIdx.x] = k >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(k >> 7), 1);
+    }
+    __syncthreads();
+    const int blocks = length / 16;
+    for (int i = threadIdx.x; i < n * blocks; i += blockDim.x) {
+        const int c = i / blocks, b = i % blocks;
+        const int e = emax[c];
+        const auto* src = reinterpret_cast<const uint4*>(base(c) + 16 * b);
+        const uint4 v0 = src[0], v1 = src[1];
+        const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        A16Act out{};
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const auto h  = static_cast<std::uint16_t>(j % 2 == 0 ? words[j / 2] & 0xFFFFU : words[j / 2] >> 16);
+            const auto xv = static_cast<std::uint32_t>(e == canon::kA16NonFinite ? 0 : canon::a16_value(h, e));
+            const int q = j / 4, s = 8 * (j % 4);
+            out.lo[q] |= (xv & 0xFFU) << s;
+            out.mid[q] |= ((xv >> 8) & 0xFFU) << s;
+            out.hi[q] = static_cast<std::int32_t>(static_cast<std::uint32_t>(out.hi[q]) | (((xv >> 16) & 0xFFU) << s));
+        }
+        acts[c * blocks + b] = out;
+    }
+    __syncthreads();
+}
+
+// Exact sums S[g][c] of row (lane & 15) of `Groups` row groups, A16 activations (§16.2.1). P is
+// assembled in wrapping arithmetic: its true value fits int32.
+template <int Groups, int Columns>
+__device__ void unit_sums_a16(const std::uint8_t* matrix, int blocks, const A16Act* acts, int n,
+                              std::int64_t (&s)[Groups][Columns]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int r = lane & 15, half = lane >> 4;
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+#pragma unroll
+        for (int c = 0; c < Columns; ++c) { s[g][c] = 0; }
+    }
+    for (int u = warp; u < Groups * blocks; u += kWarps) {
+        const int g = u / blocks, b = u % blocks;
+        const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+        const int w0 = row_quad(unit, r, 2 * half);
+        const int w1 = row_quad(unit, r, 2 * half + 1);
+        const int sw = canon::e4m3_scaled(unit[128 + r]);
+#pragma unroll
+        for (int c = 0; c < Columns; ++c) {
+            if (c < n) { // n is uniform across the warp
+                const A16Act& a = acts[c * blocks + b];
+                const int lo  = dp4a_su(w1, a.lo[2 * half + 1], dp4a_su(w0, a.lo[2 * half], 0));
+                const int mid = dp4a_su(w1, a.mid[2 * half + 1], dp4a_su(w0, a.mid[2 * half], 0));
+                const int hi  = __dp4a(w1, a.hi[2 * half + 1], __dp4a(w0, a.hi[2 * half], 0));
+                unsigned p = static_cast<unsigned>(lo) + (static_cast<unsigned>(mid) << 8) + (static_cast<unsigned>(hi) << 16);
+                p += static_cast<unsigned>(__shfl_xor_sync(0xFFFFFFFFU, static_cast<int>(p), 16));
+                const std::int64_t term = static_cast<std::int64_t>(static_cast<int>(p)) * sw;
+#pragma unroll
+                for (int gg = 0; gg < Groups; ++gg) {
+                    if (gg == g) { s[gg][c] += term; }
+                }
+            }
+        }
+    }
+}
+
+template <int Columns>
+struct GateUpShared16 {
+    alignas(16) std::uint8_t stage[kGateUpSliceBytes];
+    union { // acts are read only before the barrier that precedes the partial sums
+        A16Act acts[Columns * moe::kGateUpBlocks];
+        std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
+    };
+    std::uint16_t y[Columns][16 * kGateUpGroups];
+    int emax[Columns];
+    unsigned key[kWarps][Columns];
+};
+
+template <int Columns>
+__global__ void __launch_bounds__(kThreads)
+    gate_up_kernel_a16(const bf16* __restrict__ x, int hidden, MoeDispatch dispatch, MoeExpertSource source,
+                       int top_k, const std::uint8_t* const* __restrict__ job_records,
+                       const std::int32_t* __restrict__ cpu_flags, int job_base, std::uint16_t* __restrict__ h_plane,
+                       PassPhase phase) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm      = *reinterpret_cast<GateUpShared16<Columns>*>(smem_raw);
+    const int job = job_base + static_cast<int>(blockIdx.y);
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const int expert = dispatch.jobs[job];
+    const int slice  = blockIdx.x; // row groups 2*slice, 2*slice+1; h block `slice`
+    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    if (record == nullptr) { return; }
+    const moe::ExpertScales scales = source.scales[expert];
+    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (kA16WideRoute && moe::wide_route(count, scales)) { return; }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    stage_async(record + static_cast<std::size_t>(kGateUpGroups * slice) * moe::kGateUpBlocks * moe::kUnitBytes,
+                sm.stage, kGateUpSliceBytes);
+    for (int pass = 0; pass < count; pass += Columns) {
+        const int n = min(Columns, count - pass);
+        __syncthreads();
+        const auto column = [&](int c) {
+            return reinterpret_cast<const std::uint16_t*>(x) +
+                   static_cast<std::size_t>(dispatch.entries[first + pass + c] / top_k) * hidden;
+        };
+        encode_a16_columns<Columns>(column, n, moe::kHidden, sm.acts, sm.emax, sm.key);
+        stage_wait();
+        __syncthreads();
+        std::int64_t s[kGateUpGroups][Columns];
+        unit_sums_a16<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, sm.acts, n, s);
+        __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
+        if (lane < 16) {
+#pragma unroll
+            for (int g = 0; g < kGateUpGroups; ++g) {
+#pragma unroll
+                for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < 16 * kGateUpGroups * n; i += blockDim.x) {
+            const int row = i % (16 * kGateUpGroups), c = i / (16 * kGateUpGroups);
+            const bool gate = (row & 1) == 0;
+            std::int64_t total = 0;
+            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row][c]; }
+            sm.y[c][row] = canon::a16_row_output(total, sm.emax[c], gate ? scales.alpha_gate : scales.alpha_up);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < 16 * n; i += blockDim.x) {
+            const int k = i % 16, c = i / 16;
+            h_plane[static_cast<std::size_t>(first + pass + c) * moe::kIntermediate + 16 * slice + k] =
+                canon::swiglu_bf16(sm.y[c][2 * k], sm.y[c][2 * k + 1]);
+        }
+    }
+}
+
+template <int Columns>
+struct DownShared16 {
+    alignas(16) std::uint8_t stage[kDownSliceBytes];
+    A16Act acts[Columns * kHBlocks];
+    std::int64_t partial[kWarps][16 * kDownGroups][Columns];
+    int emax[Columns];
+    unsigned key[kWarps][Columns];
+};
+
+template <int Columns>
+__global__ void __launch_bounds__(kThreads)
+    down_kernel_a16(MoeDispatch dispatch, MoeExpertSource source, int hidden,
+                    const std::uint8_t* const* __restrict__ job_records, const std::int32_t* __restrict__ cpu_flags,
+                    int job_base, const std::uint16_t* __restrict__ h_plane, bf16* __restrict__ outputs,
+                    PassPhase phase) {
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    auto& sm      = *reinterpret_cast<DownShared16<Columns>*>(smem_raw);
+    const int job = job_base + static_cast<int>(blockIdx.y);
+    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
+    const int expert = dispatch.jobs[job];
+    const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
+    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    if (record == nullptr) { return; }
+    const std::uint8_t* down = record + moe::kGateUpBytes;
+    const moe::ExpertScales scales = source.scales[expert];
+    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
+    if (kA16WideRoute && moe::wide_route(count, scales)) { return; }
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
+                kDownSliceBytes);
+    for (int pass = 0; pass < count; pass += Columns) {
+        const int n = min(Columns, count - pass);
+        __syncthreads();
+        const auto column = [&](int c) {
+            return h_plane + static_cast<std::size_t>(first + pass + c) * moe::kIntermediate;
+        };
+        encode_a16_columns<Columns>(column, n, moe::kIntermediate, sm.acts, sm.emax, sm.key);
+        stage_wait();
+        __syncthreads();
+        std::int64_t s[kDownGroups][Columns];
+        unit_sums_a16<kDownGroups, Columns>(sm.stage, moe::kDownBlocks, sm.acts, n, s);
+        if (lane < 16) {
+#pragma unroll
+            for (int g = 0; g < kDownGroups; ++g) {
+#pragma unroll
+                for (int c = 0; c < Columns; ++c) { sm.partial[warp][g * 16 + lane][c] = s[g][c]; }
+            }
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < 16 * kDownGroups * n; i += blockDim.x) {
+            const int row = i % (16 * kDownGroups), c = i / (16 * kDownGroups);
+            std::int64_t total = 0;
+            for (int w = 0; w < kWarps; ++w) { total += sm.partial[w][row][c]; }
+            const int column = dispatch.entries[first + pass + c];
+            reinterpret_cast<std::uint16_t*>(outputs)[static_cast<std::size_t>(column) * hidden + 16 * kDownGroups * tile + row] =
+                canon::a16_row_output(total, sm.emax[c], scales.alpha_down);
+        }
+    }
+}
+
+template <int Columns>
+void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
+                            const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                            std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream,
+                            PassPhase phase = PassPhase::All) {
+    static const bool configured = [] {
+        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(GateUpShared16<Columns>)));
+        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(sizeof(DownShared16<Columns>)));
+        cudaFuncSetAttribute(gate_up_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        cudaFuncSetAttribute(down_kernel_a16<Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                             cudaSharedmemCarveoutMaxShared);
+        return true;
+    }();
+    (void)configured;
+    gate_up_kernel_a16<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared16<Columns>), stream>>>(
+        x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
+    check_launch("A16 gate/up");
+    down_kernel_a16<Columns><<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared16<Columns>), stream>>>(
+        dispatch, source, moe::kHidden, job_records, flags, base, h_plane, outputs, phase);
+    check_launch("A16 down");
+}
+
+// One pass of the narrow kernels in the source's arithmetic; `few` selects the one-column kernels
+// (calls of at most kNarrowPassColumns columns: decode and MTP verification).
+void launch_pass(bool few, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
+                 const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
+                 const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,
+                 PassPhase phase = PassPhase::All) {
+    if (source.activation == moe::ExpertActivation::kA16) {
+        auto* h_plane = reinterpret_cast<std::uint16_t*>(layout.x_plane);
+        if (few) {
+            launch_expert_pass_a16<1>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane, outputs,
+                                      stream, phase);
+        } else {
+            launch_expert_pass_a16<kA16PassColumns>(x, dispatch, source, top_k, job_records, flags, base, jobs, h_plane,
+                                                    outputs, stream, phase);
+        }
+        return;
+    }
+    if (few) {
+        launch_expert_pass<1>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks, columns_out,
+                              outputs, stream, phase);
+    } else {
+        launch_expert_pass<kPassColumns>(x, dispatch, source, top_k, job_records, flags, base, jobs, layout.h_blocks,
+                                         columns_out, outputs, stream, phase);
+    }
+}
+
 // ------------------------------------------------------------------------------ CPU-served misses
 
 // CTAs of cpu_wait_kernel: CTA c places the outputs of jobs c, c + kWaitCtas, ..., so the mapped
@@ -1277,7 +1578,6 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             "experts landing is incomplete");
     require(source.prefetched == nullptr || source.prefetch_base != nullptr, "experts prefetch table without its base");
     const auto layout  = moe::wide::carve_experts_workspace(workspace, max_jobs, outputs.ne[1]);
-    auto* h_blocks     = layout.h_blocks;
     auto** job_records = layout.job_records;
     std::int32_t* cpu_flags = nullptr;
     CpuCall* cpu_call       = cpu_call_of(workspace, max_jobs, outputs.ne[1], &cpu_flags);
@@ -1313,7 +1613,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     const int half      = source.staging_slots / 2;
     // In a call of more than eight columns, experts with more than eight take the wide route, pass
     // by pass once each pass's records are resolved; it is planned and x quantized before the passes.
-    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]);
+    const bool use_wide = x.ne[1] > moe::kMaxColumns && !forked(source, max_jobs, x.ne[1]) &&
+                          (source.activation == moe::ExpertActivation::kA4 || kA16WideRoute);
     // The staging overlap is not combined with the wide route: in the Program, overlapped calls with
     // wide experts gave run-to-run differences (prefix-cache exactness failures, varying greedy ids;
     // design §19.3.8, "F1 nondeterminism") that serial passes do not; the cause is not identified.
@@ -1341,9 +1642,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
             check_launch("stage");
             CUDA_CHECK(cudaEventRecord(events[1 + b], source.overlap_stream));
             CUDA_CHECK(cudaStreamWaitEvent(stream, events[1 + b], 0));
-            launch_expert_pass<kPassColumns>(static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records,
-                                             flags, base, jobs, h_blocks, outputs.ne[1],
-                                             static_cast<bf16*>(outputs.data), stream);
+            launch_pass(false, static_cast<const bf16*>(x.data), dispatch, buffer, top_k, job_records, flags, base, jobs,
+                        layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
             if (wide) { moe::wide::run_pass(*wide, pass, stream); }
             CUDA_CHECK(cudaEventRecord(events[3 + b], stream));
         }
@@ -1361,17 +1661,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         check_launch("stage");
         const auto* xs = static_cast<const bf16*>(x.data);
         auto* out      = static_cast<bf16*>(outputs.data);
-        if (x.ne[1] <= kNarrowPassColumns) {
-            launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
-                                  outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
-            launch_expert_pass<1>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
-                                  outputs.ne[1], out, stream, PassPhase::Resident);
-        } else {
-            launch_expert_pass<kPassColumns>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
-                                             outputs.ne[1], out, source.fork_stream, PassPhase::Staged);
-            launch_expert_pass<kPassColumns>(xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, h_blocks,
-                                             outputs.ne[1], out, stream, PassPhase::Resident);
-        }
+        const bool few = x.ne[1] <= kNarrowPassColumns;
+        launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out,
+                    source.fork_stream, PassPhase::Staged);
+        launch_pass(few, xs, dispatch, source, top_k, job_records, flags, 0, max_jobs, layout, outputs.ne[1], out, stream,
+                    PassPhase::Resident);
         CUDA_CHECK(cudaEventRecord(source.fork_events[1], source.fork_stream));
         // Joined here, or in moe_experts_cpu_wait so the caller's unrelated work (the shared
         // expert) also overlaps the staging.
@@ -1390,14 +1684,8 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         // Calls of a few columns (decode, MTP verification) use the one-column kernels, which fit
         // two gate/up CTAs per SM; a job with several columns takes one pass per column over its
         // staged weights.
-        if (x.ne[1] <= kNarrowPassColumns) {
-            launch_expert_pass<1>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records, flags, base,
-                                  jobs, h_blocks, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
-        } else {
-            launch_expert_pass<kPassColumns>(static_cast<const bf16*>(x.data), dispatch, source, top_k, job_records,
-                                             flags, base, jobs, h_blocks, outputs.ne[1],
-                                             static_cast<bf16*>(outputs.data), stream);
-        }
+        launch_pass(x.ne[1] <= kNarrowPassColumns, static_cast<const bf16*>(x.data), dispatch, source, top_k,
+                    job_records, flags, base, jobs, layout, outputs.ne[1], static_cast<bf16*>(outputs.data), stream);
         if (wide) { moe::wide::run_pass(*wide, base / pass_jobs, stream); }
     }
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }

@@ -115,7 +115,10 @@ MoeCpuChannel CpuMissService::channel(int layer) const {
 void CpuMissService::serve() {
     try {
         pin(options_.cpus.empty() ? -1 : options_.cpus[0]);
-        CpuExpertTeam team({.workers = options_.workers, .max_jobs = jobs_, .cpus = options_.cpus});
+        CpuExpertTeam team({.workers    = options_.workers,
+                            .max_jobs   = jobs_,
+                            .activation = options_.activation,
+                            .cpus       = options_.cpus});
         std::vector<CpuExpertJob> jobs(static_cast<std::size_t>(jobs_));
         std::vector<CpuExpertJob> ready, read;
         std::vector<std::uint32_t> tickets;
