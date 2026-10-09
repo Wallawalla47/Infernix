@@ -63,6 +63,9 @@ struct MoeConfig {
     std::uint32_t top_k               = 0;
     std::uint32_t intermediate        = 0;
     std::uint32_t shared_intermediate = 0;
+    // The routed experts' arithmetic, from the stored representation (parse_config): W4A16 when the
+    // banks carry no activation scales (design §16.2.1), else W4A4 (§16.2).
+    bool a16_experts = false;
 };
 
 struct HyperConnectionConfig {

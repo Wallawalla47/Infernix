@@ -2,7 +2,7 @@
 // (docs/maintainer/qwen3_8-flash-next-design.md §16.2.1). Host-only: needs no GPU.
 //
 // Oracles:
-//   - the A16 encoding against exact binary64 rounding of v / 2^(emax - 149), for every BF16 value
+//   - the A16 encoding against exact binary64 rounding of v / 2^(emax - 147), for every BF16 value
 //     and every column exponent at or above its own;
 //   - the int64 row sums against a direct int64 evaluation from decoded integers (no limbs);
 //   - every CPU ISA against the scalar reference, bit for bit;
@@ -36,9 +36,9 @@ void check(bool ok, const char* what) {
 
 // ---------------------------------------------------------------------------- encoding
 
-// rne(v / 2^(emax - 149)) in binary64: v and the quotient are exact, and so is the rounding.
+// rne(v / 2^(emax - 147)) in binary64: v and the quotient are exact, and so is the rounding.
 double expected_x(std::uint16_t v, int emax) {
-    const double q = std::ldexp(static_cast<double>(canon::bf16_to_f32(v)), 149 - emax);
+    const double q = std::ldexp(static_cast<double>(canon::bf16_to_f32(v)), 147 - emax);
     return std::nearbyint(q); // the default rounding mode is to nearest, ties to even
 }
 
@@ -50,13 +50,13 @@ void test_encoding() {
         const int field = (v >> 7) & 0xFF, own = field == 0 ? 1 : field;
         for (int emax = own; emax <= 254; ++emax) {
             const std::int32_t x = canon::a16_value(v, emax);
-            if (static_cast<double>(x) != expected_x(v, emax) || std::abs(x) >= (1 << 23)) { ++bad; }
-            // Exact while the element is within 2^15 of the column's largest exponent.
-            if (emax - own <= 15 && std::ldexp(static_cast<double>(x), emax - 149) != canon::bf16_to_f32(v)) { ++exact_bad; }
+            if (static_cast<double>(x) != expected_x(v, emax) || std::abs(x) >= (1 << 21)) { ++bad; }
+            // Exact while the element is within 2^13 of the column's largest exponent.
+            if (emax - own <= 13 && std::ldexp(static_cast<double>(x), emax - 147) != canon::bf16_to_f32(v)) { ++exact_bad; }
         }
     }
-    check(bad == 0, "a16_value is rne(v / 2^(emax - 149)) with |X| < 2^23");
-    check(exact_bad == 0, "a16_value is exact within 2^15 of the column exponent");
+    check(bad == 0, "a16_value is rne(v / 2^(emax - 147)) with |X| < 2^21");
+    check(exact_bad == 0, "a16_value is exact within 2^13 of the column exponent");
 
     std::mt19937 rng(1);
     std::uniform_int_distribution<int> any(0, 65535);
@@ -101,7 +101,7 @@ void test_row_output() {
         const std::uint16_t y = canon::a16_row_output(s, emax, m);
         // Reference: the same three roundings in binary64-then-binary32 form.
         const float t   = static_cast<float>(s);
-        const double ud = std::ldexp(static_cast<double>(t), emax - 159);
+        const double ud = std::ldexp(static_cast<double>(t), emax - 157);
         // Binary32 overflows from 2^128 - 2^103 (half an ulp above the largest finite value) up.
         const double overflow = std::ldexp(1.0, 128) - std::ldexp(1.0, 103);
         const float u = std::fabs(ud) >= overflow ? std::copysign(INFINITY, static_cast<float>(t))
@@ -109,7 +109,7 @@ void test_row_output() {
         const float w   = u * m;
         if (y != canon::f32_to_bf16_rn(w)) { ++bad; }
     }
-    check(bad == 0, "a16_row_output = bf16(fl32(fl32(S) * 2^(emax - 159)) * m)");
+    check(bad == 0, "a16_row_output = bf16(fl32(fl32(S) * 2^(emax - 157)) * m)");
 }
 
 // ---------------------------------------------------------------------------- experts

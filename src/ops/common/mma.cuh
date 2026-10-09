@@ -66,6 +66,25 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
+// m16n8k32 integer products, exact in int32 (wrapping): D = A B (no accumulator input, so no register
+// needs zeroing), s8 x s8; and C += A B with unsigned A bytes. A row-major: a0/a1 rows group/group + 8
+// at K 0-15, a2/a3 at K 16-31, four K bytes each; B: b0 K 0-15, b1 K 16-31 of column group, signed.
+__device__ __forceinline__ void mma_s8s8_k32_zero(int& d0, int& d1, int& d2, int& d3, unsigned a0, unsigned a1,
+                                                  unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
+}
+
+__device__ __forceinline__ void mma_u8s8_k32(int& c0, int& c1, int& c2, int& c3, unsigned a0, unsigned a1,
+                                             unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
 // Block-scaled E4M3 with FP32 accumulation, the full FP8 rate on RTX 5090. sfa and sfb are
 // UE8M0 scales (byte 0, 0x7f is exactly 1) applied to every row of A and column of B.
 __device__ __forceinline__ void mma_fp8_e4m3_scaled(float& c0, float& c1, float& c2, float& c3,

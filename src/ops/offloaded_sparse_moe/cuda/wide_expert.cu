@@ -1,6 +1,6 @@
 // The wide route of offloaded_sparse_moe: work planning, A4 quantization of x for the wide
 // entries, TMA descriptors and the per-pass GEMM launches (wide_expert.h, wide_expert.cuh), and the
-// W4A16 route's BF16 GEMMs (wide_expert_a16.cuh).
+// W4A16 route's limb encodings and exact integer GEMMs (wide_expert_a16.cuh).
 
 #include "ops/offloaded_sparse_moe/cuda/wide_expert_a16.cuh"
 
@@ -151,31 +151,177 @@ std::int32_t max_tiles(std::int32_t max_jobs, std::int32_t entries) {
     return max_jobs + (entries + kTileColumns - 1) / kTileColumns;
 }
 
-std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries) {
+namespace {
+
+// Byte offsets of the workspace's regions; `end` is its size.
+struct Offsets {
+    std::size_t job_records, cpu_flags, cpu_call, tiles, pass_tiles;
+    std::size_t h_blocks, x_plane;                      // W4A4
+    std::size_t x_limbs, h_rows, x_emax, h_emax;        // W4A16
+    std::size_t end;
+};
+
+Offsets offsets(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns, ExpertActivation activation) {
+    if (max_jobs <= 0 || entries <= 0 || columns <= 0) {
+        throw std::invalid_argument("offloaded_sparse_moe experts workspace: empty call");
+    }
     const auto e = static_cast<std::size_t>(entries), j = static_cast<std::size_t>(max_jobs);
-    return round256(e * kHBlocks * sizeof(canon::A4Block)) + round256(j * sizeof(void*)) +
-           round256(j * sizeof(std::int32_t)) + kCpuCallBytes + round256(e * kXRowBytes) +
-           round256(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t)) +
-           round256((j + 2) * sizeof(std::int32_t));
+    const auto t = static_cast<std::size_t>(columns);
+    Offsets o{};
+    std::size_t p = 0;
+    const auto take = [&p](std::size_t bytes) {
+        const std::size_t at = p;
+        p += round256(bytes);
+        return at;
+    };
+    o.job_records = take(j * sizeof(void*));
+    o.cpu_flags   = take(j * sizeof(std::int32_t));
+    o.cpu_call    = take(kCpuCallBytes);
+    o.tiles       = take(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t));
+    o.pass_tiles  = take((j + 2) * sizeof(std::int32_t));
+    if (activation == ExpertActivation::kA16) {
+        o.x_limbs = take(t * kA16XRowBytes);
+        o.h_rows  = take(e * kA16HRowBytes);
+        o.x_emax  = take(t * sizeof(std::int32_t));
+        o.h_emax  = take(e * sizeof(std::int32_t));
+    } else {
+        o.h_blocks = take(e * kHBlocks * sizeof(canon::A4Block));
+        o.x_plane  = take(e * kXRowBytes);
+    }
+    o.end = p;
+    return o;
 }
 
-ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries) {
-    const auto e = static_cast<std::size_t>(entries), j = static_cast<std::size_t>(max_jobs);
-    auto* p = static_cast<std::byte*>(base);
+// One 16-element block b of a row into its limb-plane row (wide_expert_a16.cuh): the canonical X
+// (canon::a16_value; zero in a non-finite column) as H1 = X >> 14, L1 = (X >> 3) & 255 and
+// H0 | L0 << 4 with H0 = (X >> 11) & 7, L0 = X & 7, in K tile b / 4 at block offset 16 (b % 4).
+template <class Byte>
+__device__ __forceinline__ uint4 pack16(const Byte (&b)[16]) {
+    unsigned w[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w[i] = static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i])) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 1])) << 8) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 2])) << 16) |
+               (static_cast<unsigned>(static_cast<std::uint8_t>(b[4 * i + 3])) << 24);
+    }
+    return make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+__device__ __forceinline__ void store_a16_block(std::uint8_t* row, int b, const std::uint16_t (&v)[16], int emax) {
+    std::uint8_t high[16], low[16], small[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const std::int32_t x = emax == canon::kA16NonFinite ? 0 : canon::a16_value(v[j], emax);
+        high[j]  = static_cast<std::uint8_t>(x >> 14);
+        low[j]   = static_cast<std::uint8_t>((x >> 3) & 255);
+        small[j] = static_cast<std::uint8_t>(((x >> 11) & 7) | ((x & 7) << 4));
+    }
+    std::uint8_t* at                              = row + (b / 4) * kA16LimbTileBytes + 16 * (b % 4);
+    *reinterpret_cast<uint4*>(at)                 = pack16(high);
+    *reinterpret_cast<uint4*>(at + kA16KTile)     = pack16(low);
+    *reinterpret_cast<uint4*>(at + 2 * kA16KTile) = pack16(small);
+}
+
+__device__ __forceinline__ void unpack16(const uint4 v0, const uint4 v1, std::uint16_t (&v)[16]) {
+    const unsigned words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+        v[2 * w]     = static_cast<std::uint16_t>(words[w] & 0xFFFFU);
+        v[2 * w + 1] = static_cast<std::uint16_t>(words[w] >> 16);
+    }
+}
+
+// The largest magnitude's bits of 16 BF16 values (their column-exponent key, canon::a16_column_exponent).
+__device__ __forceinline__ unsigned a16_key(const std::uint16_t (&v)[16]) {
+    unsigned key = 0;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) { key = max(key, static_cast<unsigned>(v[j] & 0x7FFFU)); }
+    return key;
+}
+
+__device__ __forceinline__ int a16_emax(unsigned key) {
+    return key >= 0x7F80U ? canon::kA16NonFinite : max(static_cast<int>(key >> 7), 1);
+}
+
+constexpr int kEncodeXThreads = kHidden / 16; // one 16-element block per thread
+constexpr int kEncodeWarps    = 8;
+
+// Every token's x limbs and column exponent (W4A16 wide calls): one CTA per token.
+__global__ void __launch_bounds__(kEncodeXThreads)
+    encode_x_kernel(const std::uint16_t* __restrict__ x, std::uint8_t* __restrict__ limbs, std::int32_t* __restrict__ emax) {
+    __shared__ unsigned keys[kEncodeXThreads / 32];
+    const int t = static_cast<int>(blockIdx.x), b = static_cast<int>(threadIdx.x);
+    const auto* source = reinterpret_cast<const uint4*>(x + static_cast<std::size_t>(t) * kHidden + 16 * b);
+    std::uint16_t v[16];
+    unpack16(source[0], source[1], v);
+    const unsigned key = __reduce_max_sync(0xFFFFFFFFU, a16_key(v));
+    if (b % 32 == 0) { keys[b / 32] = key; }
+    __syncthreads();
+    unsigned all = 0;
+#pragma unroll
+    for (int w = 0; w < kEncodeXThreads / 32; ++w) { all = max(all, keys[w]); }
+    const int e = a16_emax(all);
+    store_a16_block(limbs + static_cast<std::size_t>(t) * kA16XRowBytes, b, v, e);
+    if (b == 0) { emax[t] = e; }
+}
+
+// The pass's wide entries' h rows rewritten in place from BF16 to limbs, with their exponents: one
+// warp per entry, which holds the whole BF16 row in registers before it writes.
+__global__ void __launch_bounds__(kEncodeWarps * 32)
+    encode_h_kernel(MoeDispatch dispatch, const std::int32_t* __restrict__ tiles, const std::int32_t* __restrict__ pass_tiles,
+                    int pass, std::uint8_t* __restrict__ h_rows, std::int32_t* __restrict__ h_emax) {
+    constexpr int kBlocks = kIntermediate / 16; // 40: lane l holds blocks l and l + 32
+    const int lane = static_cast<int>(threadIdx.x) % 32;
+    const int warp = static_cast<int>(blockIdx.x) * kEncodeWarps + static_cast<int>(threadIdx.x) / 32;
+    const int warps = static_cast<int>(gridDim.x) * kEncodeWarps;
+    const int first_tile = pass_tiles[pass], tile_count = pass_tiles[pass + 1] - first_tile;
+    for (int task = warp; task < tile_count * kTileColumns; task += warps) {
+        const int tile = first_tile + task / kTileColumns, c = task % kTileColumns;
+        const int job = tiles[2 * tile], column = tiles[2 * tile + 1];
+        const int expert = dispatch.jobs[job];
+        const int entry  = dispatch.offsets[expert] + column + c;
+        if (entry >= dispatch.offsets[expert + 1]) { continue; } // warp-uniform
+        std::uint8_t* row = h_rows + static_cast<std::size_t>(entry) * kA16HRowBytes;
+        const auto* source = reinterpret_cast<const uint4*>(row);
+        std::uint16_t v0[16] = {}, v1[16] = {};
+        unpack16(source[2 * lane], source[2 * lane + 1], v0);
+        const bool second = lane + 32 < kBlocks;
+        if (second) { unpack16(source[2 * (lane + 32)], source[2 * (lane + 32) + 1], v1); }
+        const int e = a16_emax(__reduce_max_sync(0xFFFFFFFFU, max(a16_key(v0), a16_key(v1))));
+        __syncwarp();
+        store_a16_block(row, lane, v0, e);
+        if (second) { store_a16_block(row, lane + 32, v1, e); }
+        if (lane == 0) { h_emax[entry] = e; }
+    }
+}
+
+} // namespace
+
+std::size_t experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+                                    ExpertActivation activation) {
+    return offsets(max_jobs, entries, columns, activation).end;
+}
+
+ExpertsWorkspace carve_experts_workspace(void* base, std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,
+                                         ExpertActivation activation) {
+    const Offsets o = offsets(max_jobs, entries, columns, activation);
+    auto* p         = static_cast<std::byte*>(base);
     ExpertsWorkspace w{};
-    w.h_blocks = reinterpret_cast<canon::A4Block*>(p);
-    p += round256(e * kHBlocks * sizeof(canon::A4Block));
-    w.job_records = reinterpret_cast<const std::uint8_t**>(p);
-    p += round256(j * sizeof(void*));
-    w.cpu_flags = reinterpret_cast<std::int32_t*>(p);
-    p += round256(j * sizeof(std::int32_t));
-    w.cpu_call = p;
-    p += kCpuCallBytes;
-    w.x_plane = reinterpret_cast<std::uint8_t*>(p);
-    p += round256(e * kXRowBytes);
-    w.tiles = reinterpret_cast<std::int32_t*>(p);
-    p += round256(static_cast<std::size_t>(max_tiles(max_jobs, entries)) * 2 * sizeof(std::int32_t));
-    w.pass_tiles = reinterpret_cast<std::int32_t*>(p);
+    w.job_records = reinterpret_cast<const std::uint8_t**>(p + o.job_records);
+    w.cpu_flags   = reinterpret_cast<std::int32_t*>(p + o.cpu_flags);
+    w.cpu_call    = p + o.cpu_call;
+    w.tiles       = reinterpret_cast<std::int32_t*>(p + o.tiles);
+    w.pass_tiles  = reinterpret_cast<std::int32_t*>(p + o.pass_tiles);
+    if (activation == ExpertActivation::kA16) {
+        w.x_limbs = reinterpret_cast<std::uint8_t*>(p + o.x_limbs);
+        w.h_rows  = reinterpret_cast<std::uint8_t*>(p + o.h_rows);
+        w.x_emax  = reinterpret_cast<std::int32_t*>(p + o.x_emax);
+        w.h_emax  = reinterpret_cast<std::int32_t*>(p + o.h_emax);
+    } else {
+        w.h_blocks = reinterpret_cast<canon::A4Block*>(p + o.h_blocks);
+        w.x_plane  = reinterpret_cast<std::uint8_t*>(p + o.x_plane);
+    }
     return w;
 }
 
@@ -207,12 +353,16 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
                                                 workspace.tiles, workspace.pass_tiles);
     check_launch("plan");
     if (source.activation == ExpertActivation::kA16) {
-        // BF16 activations: x is read by token, h kept in BF16 in the x plane (1,440 >= 1,280 bytes per
-        // entry); no quantization and no tensor maps.
-        call.a16   = true;
-        call.x     = static_cast<const std::uint16_t*>(x.data);
-        call.h16   = reinterpret_cast<std::uint16_t*>(workspace.x_plane);
-        call.top_k = top_k;
+        // W4A16: every token's x limbs once (a token feeds up to top_k experts); h is encoded per pass.
+        call.a16     = true;
+        call.x_limbs = workspace.x_limbs;
+        call.h_rows  = workspace.h_rows;
+        call.x_emax  = workspace.x_emax;
+        call.h_emax  = workspace.h_emax;
+        call.top_k   = top_k;
+        encode_x_kernel<<<x.ne[1], kEncodeXThreads, 0, stream>>>(static_cast<const std::uint16_t*>(x.data),
+                                                                 workspace.x_limbs, workspace.x_emax);
+        check_launch("encode x");
         return call;
     }
     quantize_kernel<<<persistent_ctas() * 2, kQuantizeThreads, 0, stream>>>(
@@ -232,8 +382,14 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
 void run_pass(const Call& call, std::int32_t pass, cudaStream_t stream) {
     if (pass < 0 || pass >= call.passes) { throw std::out_of_range("offloaded_sparse_moe wide: pass out of range"); }
     if (call.a16) {
-        launch_a16<Matrix::GateUp>(call, pass, GateUpEpilogueA16{call.scales, call.h16}, stream);
-        launch_a16<Matrix::Down>(call, pass, DownEpilogue{call.scales, call.dispatch.entries, call.outputs}, stream);
+        launch_a16<Matrix::GateUp>(
+            call, pass, GateUpEpilogueA16{call.scales, call.dispatch.entries, call.x_emax, call.h_rows, call.top_k},
+            stream);
+        encode_h_kernel<<<persistent_ctas(), kEncodeWarps * 32, 0, stream>>>(call.dispatch, call.tiles, call.pass_tiles,
+                                                                             pass, call.h_rows, call.h_emax);
+        check_launch("encode h");
+        launch_a16<Matrix::Down>(call, pass, DownEpilogueA16{call.scales, call.dispatch.entries, call.h_emax, call.outputs},
+                                 stream);
         return;
     }
     launch<Matrix::GateUp>(call, pass, GateUpEpilogue{call.scales, call.h_plane}, stream);
