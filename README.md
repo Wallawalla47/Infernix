@@ -420,9 +420,13 @@ the Linux filesystem first (reads through `/mnt/` are slow).
   (recommended for the 27B): [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
   converted with the `qwen3_8_27b_nvfp4_nvidia` recipe, with the DFlash2 draft model and a proposal
   head for `--lm-head-draft`.
-- **[Qwen3.8-27B-Quasar-NinferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NinferV3)**:
+- **[Qwen3.8-27B-Quasar-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Quasar-NVFP4-NInferV3)**:
   [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4),
   the QAT-trained NVFP4 checkpoint, with the same draft model and proposal head.
+- **[Qwen3.8-27B-Uncensored-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-Uncensored-NVFP4-NInferV3)**:
+  [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4),
+  an abliterated (refusal-removed) mixed NVFP4/FP8 build of Qwen3.8-27B, with the same draft model
+  and proposal head. Its safety alignment has been substantially removed; see its model card.
 - **Qwen3.8-Flash-Next**, two `.infernix` conversions of
   [nvidia/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4), each
   with the MTP drafter, a proposal head for `--lm-head-draft` and the same 52 GB n-gram volume
