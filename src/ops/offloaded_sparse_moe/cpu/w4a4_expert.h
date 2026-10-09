@@ -46,6 +46,11 @@ struct ExpertScales {
     float alpha_down;
 };
 
+// The activation arithmetic of a layer's experts, fixed by the artifact: W4A4 with each matrix's
+// stored input scale (§16.2), or W4A16 for experts stored without activation scales (§16.2.1,
+// w4a16_expert.h), whose ExpertScales hold zero input scales and the multipliers in alpha_*.
+enum class ExpertActivation : std::uint8_t { kA4, kA16 };
+
 enum class CpuIsa { kScalar, kAvx2, kAvxVnni, kAvx512Vnni };
 
 const char* cpu_isa_name(CpuIsa isa);

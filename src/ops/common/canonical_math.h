@@ -325,6 +325,95 @@ INFERNIX_CANON_HD A4Codes quantize_a4_codes(const std::uint16_t* v_bf16, float i
     return out;
 }
 
+// ---------------------------------------------------------------------------- A16 (W4A16)
+
+// The W4A16 arithmetic of experts stored without activation scales (design §16.2.1). A BF16 column
+// v of K elements is encoded once as integers aligned to its largest exponent:
+//   M_j = 128 | mantissa (normal) or mantissa (subnormal),  e_j = max(E_j, 1)
+//   emax = max e_j over the column,  X_j = sign_j * rne(M_j * 2^15 / 2^(emax - e_j))
+// so v_j = X_j * 2^(emax - 149) exactly whenever emax - e_j <= 15, and |X_j| < 2^23 always.
+// Doubled E2M1 codes times X sum exactly in int32 per 16-element block (|P_b| < 2^31) and in int64
+// over a row, like the A4 products.
+
+inline constexpr int kA16NonFinite = -1; // the column exponent of a column holding Inf or NaN
+
+// emax of a BF16 vector: in [1, 254] (1 for an all-zero column), or kA16NonFinite.
+INFERNIX_CANON_HD int a16_column_exponent(const std::uint16_t* v, int n) {
+    unsigned key = 0; // the largest magnitude's bits: its exponent field is emax
+    for (int j = 0; j < n; ++j) {
+        const unsigned m = v[j] & 0x7FFFU;
+        key              = m > key ? m : key;
+    }
+    if (key >= 0x7F80U) { return kA16NonFinite; }
+    const int e = static_cast<int>(key >> 7);
+    return e == 0 ? 1 : e;
+}
+
+// X of one finite element of a column with exponent emax.
+INFERNIX_CANON_HD std::int32_t a16_value(std::uint16_t v, int emax) {
+    const unsigned field  = (v >> 7) & 0xFFU;
+    const std::uint32_t m = field == 0 ? (v & 0x7FU) : (0x80U | (v & 0x7FU));
+    const int d           = emax - (field == 0 ? 1 : static_cast<int>(field));
+    const std::uint32_t q = m << 15; // < 2^23
+    std::uint32_t x;
+    if (d == 0) {
+        x = q;
+    } else if (d >= 24) {
+        x = 0; // q / 2^d < 1/2
+    } else {
+        x = (q + (1U << (d - 1)) - 1U + ((q >> d) & 1U)) >> d; // round half to even
+    }
+    return (v & 0x8000U) != 0 ? -static_cast<std::int32_t>(x) : static_cast<std::int32_t>(x);
+}
+
+// One encoded 16-element block: X = lo + 256 mid + 65536 hi, with lo and mid the unsigned low bytes
+// of X's two's complement and hi = X >> 16 (arithmetic, in [-128, 127]); hi_sum is the sum of hi
+// (unsigned-times-signed dot products of biased codes subtract 12 * hi_sum).
+struct A16Block {
+    std::uint8_t lo[16];
+    std::uint8_t mid[16];
+    std::int8_t hi[16];
+    std::int32_t hi_sum;
+};
+
+// Encodes 16 elements of a column with exponent emax (a non-finite column encodes as zeros; its
+// outputs are NaN whatever the sums, see a16_row_output).
+INFERNIX_CANON_HD A16Block a16_block(const std::uint16_t* v_bf16, int emax) {
+    A16Block out{};
+    if (emax == kA16NonFinite) { return out; }
+    std::int32_t sum = 0;
+    for (int j = 0; j < 16; ++j) {
+        const std::int32_t x = a16_value(v_bf16[j], emax);
+        const auto u         = static_cast<std::uint32_t>(x);
+        out.lo[j]            = static_cast<std::uint8_t>(u & 0xFFU);
+        out.mid[j]           = static_cast<std::uint8_t>((u >> 8) & 0xFFU);
+        out.hi[j]            = static_cast<std::int8_t>(x >> 16);
+        sum += out.hi[j];
+    }
+    out.hi_sum = sum;
+    return out;
+}
+
+// X of element j of an encoded block.
+INFERNIX_CANON_HD std::int32_t a16_x(const A16Block& b, int j) {
+    return static_cast<std::int32_t>(b.lo[j]) + 256 * static_cast<std::int32_t>(b.mid[j]) +
+           65536 * static_cast<std::int32_t>(b.hi[j]);
+}
+
+// y = bf16_rn((fl32_rn(S) * 2^(emax - 159)) * m), with m = fl32(1 / weight global scale) the
+// record's multiplier. S counts doubled codes, scales times 2^9 and X (2^-1 * 2^-9 * 2^(emax-149)).
+// The power-of-two scaling takes two exact steps, so a subnormal product is rounded once; a
+// non-finite column gives the canonical NaN.
+INFERNIX_CANON_HD std::uint16_t a16_row_output(std::int64_t s, int emax, float multiplier) {
+    if (emax == kA16NonFinite) { return 0x7FC0U; }
+    const int k  = emax - 159; // in [-158, 95]
+    const int k1 = k / 2;
+    const int k2 = k - k1;
+    const float s1 = f32_from_bits(static_cast<std::uint32_t>(k1 + 127) << 23);
+    const float s2 = f32_from_bits(static_cast<std::uint32_t>(k2 + 127) << 23);
+    return f32_to_bf16_rn(mul_rn(mul_rn(mul_rn(i64_to_f32_rn(s), s1), s2), multiplier));
+}
+
 } // namespace infernix::ops::canon
 
 #undef INFERNIX_CANON_HD

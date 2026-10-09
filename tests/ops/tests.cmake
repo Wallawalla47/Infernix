@@ -213,6 +213,11 @@ infernix_add_op_test(infernix_offloaded_moe_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cpu.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
+# Canonical W4A16 arithmetic and its CPU route (experts without activation scales); host-only.
+infernix_add_op_test(infernix_offloaded_moe_a16_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_a16_cpu.cpp"
+  LIBRARIES infernix_offloaded_moe_cpu)
+
 # The CPU worker team: any worker count gives expert_forward's bits.
 infernix_add_op_test(infernix_offloaded_moe_team_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_team.cpp"
