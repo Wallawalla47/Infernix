@@ -1322,6 +1322,7 @@ nonzero value is rejected.
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |
 | No session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged. |
+| A branch supersedes its parent's snapshot | A lineage that continues past the snapshot it resumed from supersedes it, even when another conversation (the branch's parent) still resumes there. With a Host tier the snapshot keeps its Host copy and the parent resumes from it. Device-only (`--host-context-mib 0`) the branch's next snapshot can take its slot, and the parent's next turn recomputes from its deepest remaining snapshot, possibly the root (found 2026-10-09 by the agent-continuation real test). Not yet fixed: supersession could be withheld while another lineage has resumed from the snapshot, as for Boundary snapshots. |
 
 ---
 

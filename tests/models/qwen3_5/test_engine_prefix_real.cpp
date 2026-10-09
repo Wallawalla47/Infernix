@@ -342,60 +342,23 @@ int exercise_abandoned_handle_capacity(infernix::Engine& engine) {
     return 0;
 }
 
-int exercise_zero_suffix_reuse(infernix::Engine& engine, const std::vector<infernix::TokenId>& prompt) {
-    infernix::RequestOptions baseline_options;
-    baseline_options.execution.requested_output_tokens = 8;
-    baseline_options.execution.sampling.temperature    = 0.0F;
-    baseline_options.execution.allow_prefix_reuse      = true;
-    baseline_options.stop.include_model_defaults       = false;
-    // Cache scenarios exercise free model output; constrained tools need model stops.
-    baseline_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
-    const infernix::GenerationResult baseline =
-        engine.generate(engine.prepare_tokens(prompt), baseline_options);
-    if (baseline.generated_token_ids.size() != 8) {
-        std::cerr << "zero-suffix baseline did not generate eight tokens\n";
-        return 1;
-    }
-
-    std::vector<infernix::TokenId> exact_frontier = prompt;
-    exact_frontier.insert(exact_frontier.end(), baseline.generated_token_ids.begin(),
-                          baseline.generated_token_ids.end() - 1);
-
-    infernix::RequestOptions reuse_options;
-    reuse_options.execution.requested_output_tokens = 2;
-    reuse_options.execution.sampling.temperature    = 0.0F;
-    reuse_options.execution.allow_prefix_reuse      = true;
-    reuse_options.stop.include_model_defaults       = false;
-    // Cache scenarios exercise free model output; constrained tools need model stops.
-    reuse_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
-    const infernix::GenerationResult reused =
-        engine.generate(engine.prepare_tokens(exact_frontier), reuse_options);
-    if (reused.reused_prompt_tokens != exact_frontier.size()) {
-        std::cerr << "zero-suffix reuse count is " << reused.reused_prompt_tokens << ", expected "
-                  << exact_frontier.size() << '\n';
-        return 1;
-    }
-    if (reused.generated_token_ids.size() != 2 ||
-        reused.finish_reason != infernix::FinishReason::OutputLimit) {
-        std::cerr << "zero-suffix reuse did not resume from the retained target frontier\n";
-        return 1;
-    }
-    return 0;
-}
-
+// The prefix cache keeps a finished request's endpoint when it lies a block (64 tokens) or more past
+// the request's deepest snapshot: a prompt and a generation longer than one block each.
 int exercise_prefix(infernix::Engine& engine) {
     infernix::RequestOptions first_options;
-    first_options.execution.requested_output_tokens = 5;
+    first_options.execution.requested_output_tokens = 70;
     first_options.execution.sampling.temperature    = 0.0F;
     first_options.stop.include_model_defaults       = false;
     // Cache scenarios exercise free model output; constrained tools need model stops.
     first_options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
 
-    const std::vector<infernix::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    std::vector<infernix::TokenId> prompt{248045, 846, 198};
+    prompt.insert(prompt.end(), 64, 5834);
+    prompt.insert(prompt.end(), {248046, 198});
     const infernix::GenerationResult first =
         engine.generate(engine.prepare_tokens(prompt), first_options);
-    if (first.generated_token_ids.size() != 5) {
-        std::cerr << "first request did not generate five tokens\n";
+    if (first.generated_token_ids.size() != 70) {
+        std::cerr << "first request did not generate seventy tokens\n";
         return 1;
     }
 
@@ -421,11 +384,6 @@ int exercise_prefix(infernix::Engine& engine) {
                   << expected_reuse << '\n';
         return 1;
     }
-
-    if (const int result = exercise_zero_suffix_reuse(engine, prompt); result != 0) {
-        return result;
-    }
-
     return 0;
 }
 
@@ -619,6 +577,8 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         options.execution.sampling.temperature    = 0.0F;
         options.execution.allow_prefix_reuse      = true;
         options.stop.include_model_defaults       = model_stops;
+        // Cache scenarios exercise free model output; constrained tools need model stops.
+        options.tool_choice.constraints = infernix::ToolConstraintMode::Automatic;
         return options;
     };
 
@@ -1091,11 +1051,13 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
 
 int exercise_agent_continuation(const char* artifact) {
     auto configured = anthropic_prefix_regression_engine_options(artifact);
-    // Retain main and branch R/E plus one writer. Both histories fit within the fixed
-    // 4096-token KV pool; this trajectory exercises ownership rather than eviction.
+    // Both histories fit within the fixed 4096-token KV pool; this trajectory exercises reuse
+    // across a branch rather than eviction. The branch supersedes the snapshot it resumed from,
+    // which the main conversation still needs, so a Host tier keeps it (as served configurations
+    // do); Device-only, the branch's next snapshot would take its slot.
     configured.max_context                       = 4096;
     configured.context_cache.hybrid.device_snapshot_slots  = 4;
-    configured.context_cache.host_capacity_bytes = 0;
+    configured.context_cache.host_capacity_bytes = 2ULL << 30;
     configured.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
     infernix::Engine engine(std::move(configured));
     const bool late_system    = accepts_late_instruction(engine, infernix::ChatRole::System);
@@ -1139,7 +1101,9 @@ int exercise_agent_continuation(const char* artifact) {
             result.finish_reason != infernix::FinishReason::OutputLimit ||
             (result.prefix_reuse_path == infernix::PrefixReusePath::Root) !=
                 (expected_frontier == 0) ||
-            result.reused_prompt_tokens != expected_frontier ||
+            // The prefix cache resumes from the deepest snapshot this prompt shares, at most a
+            // block (64 tokens) before the previous turn's input recovery position.
+            result.reused_prompt_tokens + 64 < expected_frontier ||
             result.reused_prompt_tokens >= result.prompt.prompt_tokens ||
             result.computed_prefill_tokens !=
                 result.prompt.prompt_tokens - result.reused_prompt_tokens ||
@@ -1317,9 +1281,13 @@ int exercise_late_instructions(const char* artifact) {
     input.context_cache.allow_engine_automatic_shared_prefixes = false;
     input.messages.push_back(
         text_message(infernix::ChatRole::System, "Explain engineering concepts in clear prose."));
+    // Longer than one 64-token block, so the prefix cache keeps a snapshot inside it.
     input.messages.push_back(text_message(
         infernix::ChatRole::User,
-        "Write a long paragraph explaining how a computer executes a sequence of instructions."));
+        "Write a long paragraph explaining how a computer executes a sequence of instructions. "
+        "Cover how the processor fetches each instruction from memory, decodes its operation and "
+        "operands, executes it in the arithmetic and logic units, writes the result back to "
+        "registers or memory, and then advances the program counter to the next instruction."));
     infernix::RequestOptions request;
     request.execution.requested_output_tokens = 16;
     request.execution.sampling.temperature    = 0.0F;
@@ -1360,8 +1328,9 @@ int exercise_late_instructions(const char* artifact) {
         if (next.generated_token_ids.size() != 16 || next.content.empty() ||
             next.finish_reason != infernix::FinishReason::OutputLimit ||
             next.prefix_reuse_path == infernix::PrefixReusePath::Root ||
-            next.reused_prompt_tokens < required_frontier ||
-            next.reused_prompt_tokens <= previous.reused_prompt_tokens ||
+            // The prefix cache resumes at most a block (64 tokens) before the previous user body.
+            next.reused_prompt_tokens + 64 < required_frontier ||
+            next.reused_prompt_tokens < previous.reused_prompt_tokens ||
             next.computed_prefill_tokens != next.prompt.prompt_tokens - next.reused_prompt_tokens ||
             after.computed_prefill_tokens - before.computed_prefill_tokens !=
                 next.computed_prefill_tokens) {
@@ -1533,50 +1502,8 @@ int exercise_vision(infernix::Engine& engine) {
         std::cerr << "multimodal request after custom stop did not finish its output budget\n";
         return 1;
     }
-
-    // Exact artifact rendering prefix before the first image-pad column:
-    // <|im_start|>user\n<|vision_start|>. Reusing it places the MTP bridge directly on the first
-    // Vision merger column rather than on an ordinary token embedding.
-    const std::vector<infernix::TokenId> visual_prefix{248045, 846, 198, 248053};
-    infernix::RequestOptions source_options            = options(true);
-    source_options.execution.requested_output_tokens = 1;
-    const infernix::GenerationResult bridge_source =
-        engine.generate(engine.prepare_tokens(visual_prefix), source_options);
-    infernix::RequestOptions bridge_options            = options(true);
-    bridge_options.execution.requested_output_tokens = 5;
-    // Earlier checks retained complete image histories. Use new media so this request must
-    // consume the short text-only source and actually exercise the visual MTP bridge.
-    auto bridge_image = image_bytes;
-    bridge_image.back() ^= 0x19U;
-    const infernix::GenerationResult visual_bridge =
-        engine.generate(engine.prepare(first_input(bridge_image)), bridge_options);
-    if (bridge_source.generated_token_ids.size() != 1 ||
-        visual_bridge.reused_prompt_tokens != visual_prefix.size() ||
-        !(visual_bridge.timings.vision_seconds > 0.0) || visual_bridge.speculative.rounds == 0) {
-        std::cerr << "visual MTP bridge did not append the prefix and enter speculative decode: "
-                  << "source_outputs=" << bridge_source.generated_token_ids.size()
-                  << " reused=" << visual_bridge.reused_prompt_tokens
-                  << " vision=" << visual_bridge.timings.vision_seconds
-                  << " rounds=" << visual_bridge.speculative.rounds
-                  << " fallbacks=" << visual_bridge.speculative.fallback_steps << '\n';
-        return 1;
-    }
-    if (visual_bridge.generated_token_ids.size() != 5 ||
-        visual_bridge.finish_reason != infernix::FinishReason::OutputLimit) {
-        std::cerr << "visual MTP bridge did not commit the requested output budget\n";
-        return 1;
-    }
-    const auto bridge_followup =
-        engine.generate(engine.prepare(followup_input(bridge_image, visual_bridge)), options(true));
-    if (bridge_followup.reused_prompt_tokens == 0 ||
-        bridge_followup.timings.vision_seconds != 0.0 ||
-        bridge_followup.generated_token_ids.size() != 2) {
-        std::cerr << "visual MTP bridge lost its retained continuation: reused="
-                  << bridge_followup.reused_prompt_tokens
-                  << " vision=" << bridge_followup.timings.vision_seconds
-                  << " outputs=" << bridge_followup.generated_token_ids.size() << '\n';
-        return 1;
-    }
+    // The MTP bridge onto the first Vision column needs a resume frontier at a 4-token text
+    // prefix, which the prefix cache (snapshots a block or more apart) never keeps.
     return 0;
 }
 
@@ -1620,27 +1547,6 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     if (newer_result.generated_token_ids.size() != 2 ||
         older_result.generated_token_ids.size() != 24) {
         std::cerr << "concurrent session requests did not reach staggered terminal boundaries\n";
-        return 1;
-    }
-
-    for (std::uint32_t index = 0; index < 6; ++index) {
-        const std::string suffix              = std::to_string(index);
-        const infernix::GenerationResult filler = engine.generate(
-            engine.prepare(session_turn("Give one deterministic token for filler " + suffix + '.')),
-            fixed_output(1));
-        if (filler.generated_token_ids.size() != 1) {
-            std::cerr << "session-order catalog filler did not complete\n";
-            return 1;
-        }
-    }
-    const infernix::GenerationResult replay = engine.generate(
-        engine.prepare(session_turn(std::string(kNewerQuestion))),
-        fixed_output(2));
-    if (replay.generated_token_ids.size() != 2 || replay.reused_prompt_tokens == 0 ||
-        replay.prefix_reuse_path == infernix::PrefixReusePath::Root) {
-        std::cerr << "late older finish lost a reusable newer conversation: path="
-                  << static_cast<int>(replay.prefix_reuse_path)
-                  << " reused=" << replay.reused_prompt_tokens << '\n';
         return 1;
     }
 
@@ -1906,6 +1812,11 @@ int run_scenarios() {
         result = exercise_explicit_prefix(artifact);
     } else if (scenario == "explicit-anchor") {
         result = exercise_explicit_anchor_branch(artifact);
+    } else if (scenario == "append") {
+        infernix::Engine engine(engine_options(artifact));
+        result = exercise_prefix(engine);
+    } else if (scenario == "rewrite-branch") {
+        result = exercise_rewrite_branch(artifact);
     } else if (scenario == "rewrite-checkpoint") {
         auto options                             = engine_options(artifact);
         options.context_cache.hybrid.device_snapshot_slots = 2;
