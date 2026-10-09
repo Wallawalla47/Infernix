@@ -170,10 +170,10 @@ Re-measured with the 2026-10-08 kernels on the same prompts, Dense8 was level wi
 than it on the same build.
 
 In a replayed agentic coding workload (three sessions plus subagents, up to eight requests in
-flight, two seeds, measured on 8-9 October against Strata 0.1.41), Infernix averaged 5.7 s to the
-first token against Strata's 33.9 s, served 84.8 % of prompt tokens from its prefix cache against
-54.8 %, decoded one request at 123 tok/s against 85 (draft acceptance level), and finished in 7.7
-minutes against 22.1. Methods and the full tables are in the
+flight, three seeds, measured on 8-9 October against Strata 0.1.41), Infernix averaged 5.9 s to the
+first token against Strata's 32.9 s, served 84.6 % of prompt tokens from its prefix cache against
+53.8 %, decoded one request at 125 tok/s against 86 (with 5.6 % lower draft acceptance, 1.97
+against 2.08 tokens per round), and finished in 7.8 minutes against 22.3. Methods and the full tables are in the
 [Infernix README](https://github.com/Wallawalla47/Infernix/blob/main/README.md#benchmarks).
 
 ## Provenance
