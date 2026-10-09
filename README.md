@@ -401,6 +401,10 @@ Running on another PC needs an RTX 50-series GPU (the build targets `sm_120a`) a
 of 580 or later (CUDA 13); no CUDA toolkit is needed. Copy the DLLs next to `infernix-serve.exe`
 and install the Visual C++ redistributable if it is missing.
 
+`packaging\windows\package_release.ps1` packs the server, its DLLs and the licences of everything
+they contain ([third-party notices](packaging/windows/THIRD_PARTY_NOTICES.md)) into a release zip,
+and FFmpeg's corresponding source (it is LGPL) into a second zip to publish beside it.
+
 ## Quick start (Linux)
 
 Infernix builds and runs on 64-bit Linux too, including WSL2 (tested on Ubuntu 24.04 with CUDA 13.4

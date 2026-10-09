@@ -54,7 +54,10 @@ out/
 tools/freq_corpus/fixtures/*
 !tools/freq_corpus/fixtures/ranking/
 
-# Deploy bench/working files moved out of E:\NInfer-Deploy-V3 (never committed)
+# Release packages (packaging/windows/package_release.ps1)
+/dist/
+
+# Local deploy working files (never committed)
 /deploy-working/
 
 # A/B rig outputs and control build (bench/ab; the scripts and README are tracked)
