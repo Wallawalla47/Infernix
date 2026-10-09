@@ -156,6 +156,9 @@ public:
         double claim = 0.0; // the new snapshot's estimate_priority
         StateImageHeader meta;
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
+        // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
+        // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
+        std::vector<TokenId> continuation;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
     [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);

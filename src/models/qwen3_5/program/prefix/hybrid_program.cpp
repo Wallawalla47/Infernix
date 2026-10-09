@@ -1108,7 +1108,7 @@ void ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
         ++counters.taps_skipped;
         return;
     }
-    hybrid_supersede_resume(lane, frontier);
+    hybrid_supersede_resume(lane, frontier, sequence.ledger);
     hybrid_supersede_tap(lane, frontier);
     const std::optional<std::uint32_t> slot = index.acquire_device_slot(
         index.estimate_priority(lane.last_capture, frontier, frontier % kBlock != 0));
@@ -1169,13 +1169,19 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     hybrid_capture_tap(sequence, cursor, boundary);
 }
 
-void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier) {
+void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                          std::span<const TokenId> ledger) {
     pc::PrefixCacheIndex& index = hybrid_->index();
     if (!lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
         !index.valid(lane.resume_snapshot)) {
         return;
     }
-    index.supersede(lane.resume_snapshot);
+    // The lineage's tokens past its source, so the endpoints it went past are superseded too.
+    const std::size_t end = std::min<std::size_t>(frontier, ledger.size());
+    index.supersede(lane.resume_snapshot,
+                    end > lane.resume_frontier
+                        ? ledger.subspan(lane.resume_frontier, end - lane.resume_frontier)
+                        : std::span<const TokenId>{});
     lane.resume_snapshot = {};
 }
 
@@ -1247,7 +1253,7 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                 pc::PrefixCacheIndex& index = hybrid_->index();
                 // The lineage moves past its source here, so a slot it needs comes from its own
                 // lineage before another conversation's snapshot.
-                hybrid_supersede_resume(lane_state, frontier);
+                hybrid_supersede_resume(lane_state, frontier, sequence.ledger);
                 const std::optional<std::uint32_t> slot =
                     index.acquire_device_slot(index.estimate_priority(
                         lane_state.deepest_snapshot, frontier, frontier % kBlock != 0));
@@ -1291,7 +1297,8 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                         sequence.state = {};
                         ++hybrid_->counters().endpoints_created;
                         // Superseded first, so the Host write below can take its slabs.
-                        hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot);
+                        hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
+                                                sequence.ledger);
                         (void)hybrid_->start_snapshot_host_write(published.snapshot, device.stream,
                                                                  device.transfer_stream);
                     } else {
@@ -1299,7 +1306,8 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                     }
                 }
             }
-            hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot);
+            hybrid_supersede_resume(lane_state, lane_state.deepest_snapshot,
+                                    sequence.ledger);
         }
     } catch (...) {
         // Terminal publication is optional; a failure keeps whatever was published and releases

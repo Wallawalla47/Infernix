@@ -1049,15 +1049,17 @@ int exercise_rewrite_checkpoints(infernix::Engine& engine) {
     return 0;
 }
 
-int exercise_agent_continuation(const char* artifact) {
+int exercise_agent_continuation(const char* artifact, std::uint64_t host_bytes) {
     auto configured = anthropic_prefix_regression_engine_options(artifact);
     // Both histories fit within the fixed 4096-token KV pool; this trajectory exercises reuse
     // across a branch rather than eviction. The branch supersedes the snapshot it resumed from,
-    // which the main conversation still needs, so a Host tier keeps it (as served configurations
-    // do); Device-only, the branch's next snapshot would take its slot.
+    // which the main conversation still needs. With a Host tier it keeps its Host copy. Device-only
+    // (4 slots) it keeps its slot because every turn's endpoint, which the next turn's re-rendered
+    // reply goes past, was superseded before it and gives up its slot first; before that rule the
+    // endpoints held three slots for good and the main turn after the branch resumed from the root.
     configured.max_context                       = 4096;
     configured.context_cache.hybrid.device_snapshot_slots  = 4;
-    configured.context_cache.host_capacity_bytes = 2ULL << 30;
+    configured.context_cache.host_capacity_bytes = host_bytes;
     configured.kv_capacity = infernix::KvCapacityPolicy::explicit_capacity(4096);
     infernix::Engine engine(std::move(configured));
     const bool late_system    = accepts_late_instruction(engine, infernix::ChatRole::System);
@@ -1807,7 +1809,9 @@ int run_scenarios() {
     } else if (scenario == "late-instructions") {
         result = exercise_late_instructions(artifact);
     } else if (scenario == "agent-continuation") {
-        result = exercise_agent_continuation(artifact);
+        result = exercise_agent_continuation(artifact, 2ULL << 30);
+    } else if (scenario == "agent-continuation-device") {
+        result = exercise_agent_continuation(artifact, 0);
     } else if (scenario == "explicit-prefix") {
         result = exercise_explicit_prefix(artifact);
     } else if (scenario == "explicit-anchor") {

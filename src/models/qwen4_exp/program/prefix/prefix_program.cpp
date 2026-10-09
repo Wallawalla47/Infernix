@@ -769,6 +769,12 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
         c.supersedes = previous->snapshot;
     } else if (lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
+        if (prefix_->index().valid(*lane.prefix.resume)) {
+            const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
+            if (from < F) {
+                c.continuation.assign(lane.history.begin() + from, lane.history.begin() + F);
+            }
+        }
     }
     const std::uint64_t id = c.id;
     if (prefix_->capture(index, std::move(c), device_.stream)) {

@@ -708,7 +708,8 @@ public:
     void hybrid_release_lane(std::uint32_t lane) noexcept;
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at
     // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
-    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier,
+                                 std::span<const TokenId> ledger);
     void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 };
 } // namespace infernix::models::qwen3_5::detail
