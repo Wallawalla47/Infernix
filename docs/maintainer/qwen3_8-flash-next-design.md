@@ -5102,6 +5102,20 @@ the same Ops. `hyper_connection_norm`, `_gates` and `_collapse` become private k
 - **PDL for K1** (branch `claude/fn-kernels-2`): weights first, `pdl::wait_for_dependencies`
   before x or the output, `trigger_dependents` after the passes, `pdl::launch_with` (programmatic
   only in captured graphs); a captured producer → K1 case in the Q8 linear test. Measurement pending.
+- **PDL for the fused mixer, and its per-column chain** (2026-10-10, landed): both kernels launch
+  through `pdl::launch_consumer` and call `pdl::enter()` after their weight loads (K1a also loads
+  its norm weights first). K1a issues every column's R loads before using any, keeps each column's
+  per-thread sum of squares in registers and reduces all columns behind one barrier (instead of a
+  block sum with two barriers per column), and scales Rn with preloaded norm weights. K1b loads its
+  norm weights and R before the barrier, and in both kernels lanes 4-7 of each quarter warp read a
+  chunk's two float4 halves in the other order (no 2-way bank conflict). Products and their order
+  are unchanged: outputs are bit-identical. `infernix_hyper_connection_bench` (new: a CUDA graph of
+  48 calls with distinct weights, per-call time), Q8, HEAD → new: T = 1 11.08 → 10.56 µs, T = 2
+  13.66 → 12.35, T = 5 21.53 → 17.88, T = 8 29.42 → 21.92 (BF16: 13.8 → 13.1, 24.8 → 20.9 at
+  T = 5). PDL alone measured 10.34 µs at T = 1 but 20.61 at T = 5; the chain rework alone 11.11
+  and 18.63. End to end (Dense8, INT8 KV, pg1024+256, 4 old/new pairs × 3 reps): MTP decode
+  146.5 → 147.5 tok/s (+0.70 %, pairs +0.57..+0.80 %, ranges disjoint); plain 123.3 → 123.5
+  (+0.10 %, pairs −0.06..+0.29 %: not resolved, the T = 1 op gain does not carry over).
 - Not built yet: the `Weight` L2 class.
 
 #### Phase 3: tensor-core K2 (conditional)
