@@ -81,10 +81,11 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
     constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
     const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
+        constexpr auto kernel_fn = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         CUDA_CHECK(pdl::launch_with(
             dependency,
-            {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel, p,
+            {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel_fn, p,
             output, epilogue, rows, offset));
     });
 }

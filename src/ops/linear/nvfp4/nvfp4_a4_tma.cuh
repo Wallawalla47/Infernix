@@ -434,13 +434,14 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        constexpr auto kernel_fn = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
 #ifdef _WIN32
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(staged, p.alpha, epilogue, output,
-                                                            offset + count, p.rows, p.k, offset);
+        kernel_fn<<<grid, Schedule::kThreads, bytes, stream>>>(staged, p.alpha, epilogue, output,
+                                                               offset + count, p.rows, p.k, offset);
 #else
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
-                                                            offset + count, p.rows, p.k, offset);
+        kernel_fn<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
+                                                               offset + count, p.rows, p.k, offset);
 #endif
         CUDA_CHECK(cudaGetLastError());
     });

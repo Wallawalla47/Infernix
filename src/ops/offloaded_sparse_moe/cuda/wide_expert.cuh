@@ -412,7 +412,8 @@ void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaS
     constexpr int bytes   = static_cast<int>(sizeof(Storage<S>));
     constexpr auto kernel = grouped_kernel<M, Epilogue>;
     static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        CUDA_CHECK(cudaFuncSetAttribute(grouped_kernel<M, Epilogue>,
+                                        cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));
         return true;
     }();

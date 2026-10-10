@@ -26,8 +26,14 @@ void CopyBatch::flush() {
     cudaMemcpyAttributes attributes{};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
     std::size_t first         = 0;
-    CUDA_CHECK(cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(), &attributes,
-                                    &first, 1, stream_));
+    const cudaError_t status = cudaMemcpyBatchAsync(destinations_.data(), sources_.data(), sizes_.data(), sizes_.size(), &attributes,
+                                                    &first, 1, stream_);
+    if (status != cudaSuccess) {
+        (void)cudaGetLastError();
+        for (std::size_t i = 0; i < sizes_.size(); ++i) {
+            CUDA_CHECK(cudaMemcpyAsync(destinations_[i], sources_[i], sizes_[i], cudaMemcpyDefault, stream_));
+        }
+    }
     destinations_.clear();
     sources_.clear();
     sizes_.clear();
