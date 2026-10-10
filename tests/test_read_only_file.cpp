@@ -1,7 +1,9 @@
 // ReadOnlyFile::read_direct_blocks (n-gram step S1, design §19.3.4): unbuffered 4 KiB block reads
 // through a ring of 1, 4 or 64 blocks, offsets in random order with repeats; every index is
 // consumed exactly once with its own block's bytes, and a read past the end throws after the reads
-// in flight have drained. FileMapping::None maps nothing and reads the same bytes.
+// in flight have drained, as does a consumer's exception. Calls from several threads on one file
+// read correctly, and every later call does too. FileMapping::None maps nothing and reads the same
+// bytes.
 
 #include "core/read_only_file.h"
 
@@ -13,6 +15,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -58,6 +61,58 @@ void run(const infernix::ReadOnlyFile& file, std::size_t count, std::size_t ring
     const std::string where = std::to_string(count) + " reads, ring of " + std::to_string(ring_blocks);
     check(once, "every index consumed exactly once (" + where + ")");
     check(bytes_ok, "every block carries its own bytes (" + where + ")");
+}
+
+// Calls from several threads at once on one file (a large n-gram call reads on eight threads; on
+// Linux each holds its own pooled AIO context), repeated so later calls reuse earlier contexts.
+void check_concurrent_calls(const infernix::ReadOnlyFile& file) {
+    constexpr int kThreads = 8;
+    std::vector<int> bad(kThreads, 0);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            std::mt19937 rng(100 + static_cast<unsigned>(t));
+            for (int call = 0; call < 20; ++call) {
+                const std::size_t count = 1 + rng() % 200;
+                std::vector<std::uint64_t> blocks(count), offsets(count);
+                for (std::size_t i = 0; i < count; ++i) {
+                    blocks[i]  = rng() % kBlocks;
+                    offsets[i] = blocks[i] * kBlock;
+                }
+                std::vector<std::byte> storage;
+                const auto ring = aligned_ring(storage, 1 + rng() % 16);
+                std::vector<int> seen(count, 0);
+                file.read_direct_blocks(offsets, kBlock, ring, [&](std::size_t i, std::span<const std::byte> data) {
+                    ++seen[i];
+                    for (std::size_t k = 0; k < kBlock; k += 251) { bad[t] += data[k] == pattern(blocks[i], k) ? 0 : 1; }
+                });
+                for (const int s : seen) { bad[t] += s == 1 ? 0 : 1; }
+            }
+        });
+    }
+    for (auto& thread : threads) { thread.join(); }
+    int total = 0;
+    for (const int b : bad) { total += b; }
+    check(total == 0, "concurrent calls on one file read every block once with its own bytes");
+}
+
+// A consumer that throws stops the call after its reads in flight have drained; the file's later
+// calls (on Linux: the same AIO context, back in the pool) read correctly.
+void check_consume_error(const infernix::ReadOnlyFile& file) {
+    std::vector<std::uint64_t> offsets;
+    for (std::uint64_t b = 0; b < 200; ++b) { offsets.push_back((b * 37 % kBlocks) * kBlock); }
+    std::vector<std::byte> storage;
+    const auto ring = aligned_ring(storage, 64);
+    std::size_t consumed = 0;
+    bool threw           = false;
+    try {
+        file.read_direct_blocks(offsets, kBlock, ring, [&](std::size_t, std::span<const std::byte>) {
+            if (++consumed == 10) { throw std::runtime_error("consumer stop"); }
+        });
+    } catch (const std::runtime_error& error) { threw = std::string(error.what()) == "consumer stop"; }
+    check(threw && consumed == 10, "a consumer's exception ends the call and is rethrown");
+    std::mt19937 rng(3);
+    for (int call = 0; call < 5; ++call) { run(file, 300, 64, rng); }
 }
 
 // read_direct of many 8 MiB blocks (several in flight on Windows): a file of 5 blocks and 3 pages,
@@ -142,6 +197,8 @@ int main() {
         const auto one = aligned_ring(one_storage, 1);
         check(direct.read_direct(5 * kBlock, one) == kBlock && one[0] == pattern(5, 0) && one[4095] == pattern(5, 4095),
               "FileMapping::None read_direct returns the block's bytes");
+        check_concurrent_calls(direct);
+        check_consume_error(direct);
         check_large_reads();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <exception>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -25,6 +26,52 @@ struct ReadOnlyFile::Impl {
     int fd                = -1;
     const std::byte* data = nullptr;
     std::size_t size      = 0;
+
+#if defined(__linux__)
+    // Kernel AIO contexts of finished read_direct_blocks calls, reused by later calls: creating and
+    // destroying one per call (io_setup, io_destroy) measured ~36 ms on Linux 6.18 (WSL2) against
+    // ~0.12 ms for a 4 KiB read, and an n-gram decode round makes a few calls behind the GPU. One
+    // context per concurrent caller (a large n-gram call reads on eight threads).
+    struct AioContext {
+        aio_context_t id = 0;
+        unsigned slots   = 0; // reads it can hold in flight; 0: none (io_setup failed)
+    };
+    static constexpr unsigned kMinAioSlots = 64;
+    std::mutex aio_mutex;
+    std::vector<AioContext> aio_idle;
+
+    // An idle context for `slots` reads in flight, or a new one; none when io_setup fails.
+    AioContext take_aio(std::size_t slots) {
+        {
+            const std::lock_guard<std::mutex> lock(aio_mutex);
+            for (auto it = aio_idle.begin(); it != aio_idle.end(); ++it) {
+                if (it->slots >= slots) {
+                    const AioContext context = *it;
+                    aio_idle.erase(it);
+                    return context;
+                }
+            }
+        }
+        AioContext context;
+        const unsigned want = static_cast<unsigned>(std::max<std::size_t>(slots, kMinAioSlots));
+        if (::syscall(SYS_io_setup, want, &context.id) == 0) { context.slots = want; }
+        return context;
+    }
+
+    // A context with no read in flight goes back to the pool; one that may still have reads in
+    // flight is destroyed (io_destroy waits for them).
+    void put_aio(AioContext context, bool idle) noexcept {
+        if (context.slots == 0) { return; }
+        if (idle) {
+            try {
+                const std::lock_guard<std::mutex> lock(aio_mutex);
+                aio_idle.push_back(context);
+                return;
+            } catch (...) {}
+        }
+        ::syscall(SYS_io_destroy, context.id);
+    }
+#endif
 
     explicit Impl(const std::filesystem::path& path, FileMapping map) {
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
@@ -60,6 +107,9 @@ struct ReadOnlyFile::Impl {
     }
 
     ~Impl() {
+#if defined(__linux__)
+        for (const AioContext& context : aio_idle) { ::syscall(SYS_io_destroy, context.id); }
+#endif
         if (data != nullptr) { ::munmap(const_cast<std::byte*>(data), size); }
         if (fd >= 0) { ::close(fd); }
     }
@@ -96,9 +146,15 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
     // reads do on Windows (an NVMe needs the queue depth: one thread's serial preads reach ~1/16 of
     // the device's random-read rate).
     const std::size_t slots = std::min(ring.size() / block_bytes, offsets.size());
-    aio_context_t context   = 0;
-    if (::syscall(SYS_io_setup, static_cast<unsigned>(slots), &context) == 0) {
-        const auto destroy = [&] { ::syscall(SYS_io_destroy, context); };
+    // The call's context returns to the file's pool once no read is in flight (destroyed otherwise).
+    struct Lease {
+        Impl& impl;
+        Impl::AioContext context;
+        bool idle = false;
+        ~Lease() { impl.put_aio(context, idle); }
+    } lease{*impl_, impl_->take_aio(slots)};
+    if (lease.context.slots != 0) {
+        const aio_context_t context = lease.context.id;
         std::vector<iocb> blocks(slots);
         std::vector<io_event> events(slots);
         std::vector<std::size_t> idle;
@@ -148,7 +204,7 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
                     if (one > 0) { in_flight -= static_cast<std::size_t>(one); }
                     else if (one < 0 && errno != EINTR) { break; }
                 }
-                destroy();
+                lease.idle = in_flight == 0;
                 throw std::system_error(error, std::generic_category(), "direct block read: io_getevents");
             }
             for (long e = 0; e < done; ++e) {
@@ -168,7 +224,7 @@ void ReadOnlyFile::read_direct_blocks(std::span<const std::uint64_t> offsets, st
                 --in_flight;
             }
         }
-        destroy();
+        lease.idle = true; // every submitted read has been reaped
         if (consume_error) { std::rethrow_exception(consume_error); }
         if (failure != 0) { throw std::system_error(failure, std::generic_category(), "direct block read"); }
         if (short_read) { throw std::runtime_error("direct block read: a read did not complete in full"); }
