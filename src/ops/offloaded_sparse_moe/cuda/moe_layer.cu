@@ -12,6 +12,7 @@
 #include "infernix/ops/offloaded_sparse_moe.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 
 #include "ops/common/canonical_math.h"
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
@@ -868,6 +869,9 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
                                  moe::kGateUpBlocks);
             }
             stage_wait();
+            // The down pass (a programmatic dependent in captured graphs) may launch once every CTA has its
+            // slice: its CTAs then fetch their weights while this pass computes and finishes.
+            pdl::trigger_dependents();
             __syncthreads();
             std::int64_t s[kGateUpGroups][Columns];
             if constexpr (Columns == 1) {
@@ -923,18 +927,32 @@ __global__ void __launch_bounds__(kThreads)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared<Columns>*>(smem_raw);
     const int job = job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
-    const int expert = dispatch.jobs[job];
-    const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
-    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    const int tile = blockIdx.x; // down row groups 4*tile .. 4*tile+3
+    // Launched as a programmatic dependent of the gate/up pass: everything read before the PDL wait (the
+    // dispatch, the CPU flags, the job records, the frames and the weights) was written before that pass
+    // started; only h_blocks, its output, is read after the wait. Every CTA waits, so this grid's
+    // completion implies the gate/up pass's.
+    int expert = 0, first = 0, count = 0;
+    const std::uint8_t* record = nullptr;
+    if (job < *dispatch.job_count && (cpu_flags == nullptr || cpu_flags[job] == 0)) {
+        expert = dispatch.jobs[job];
+        record = pass_record(phase, source, expert, job_records, job);
+    }
+    moe::ExpertScales scales{};
+    if (record != nullptr) {
+        scales = source.scales[expert];
+        first  = dispatch.offsets[expert];
+        count  = dispatch.offsets[expert + 1] - first;
+        if (moe::wide_route(count, scales)) { record = nullptr; }
+    }
+    if (record != nullptr) {
+        stage_async(record + moe::kGateUpBytes +
+                        static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes,
+                    sm.stage, kDownSliceBytes);
+    }
+    pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
-    const std::uint8_t* down = record + moe::kGateUpBytes;
-    const moe::ExpertScales scales = source.scales[expert];
-    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
-                kDownSliceBytes);
     for (int pass = 0; pass < count; pass += Columns) {
         const int n = min(Columns, count - pass);
         __syncthreads();
@@ -995,9 +1013,11 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
     gate_up_kernel<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
     check_launch("gate/up");
-    down_kernel<Columns><<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared<Columns>), stream>>>(
-        dispatch, source, moe::kHidden, job_records, flags, base, h_blocks, columns_out, outputs, phase);
-    check_launch("down");
+    // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
+    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared<Columns>), stream},
+                                    down_kernel<Columns>, dispatch, source, static_cast<int>(moe::kHidden), job_records,
+                                    flags, base, static_cast<const canon::A4Block*>(h_blocks), columns_out, outputs,
+                                    phase));
 }
 
 // ------------------------------------------------------------------------ A16 narrow route (§16.2.1)

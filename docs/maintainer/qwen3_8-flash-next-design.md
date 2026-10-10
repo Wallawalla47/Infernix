@@ -9042,6 +9042,20 @@ than the overlap gives). The remaining time is the wait for the slice and the 1.
 CTAs on 340 slots); the CTAs cannot hold a layer's 18.4 MB of gate/up weights at once (2 × 49 KB
 per SM), so only streaming work items can remove the tail.
 
+**down as a programmatic dependent of gate/up (2026-10-10).** A layer runs four expert launches
+(gate/up and down of the resident and the staged phase), each paying its launch ramp and its slice's
+DRAM latency after the previous one ends. `down_kernel` (A4, every width) now launches through
+`pdl::launch_consumer` and issues its weight slice before `pdl::wait_for_dependencies()`; `gate_up_kernel`
+calls `pdl::trigger_dependents()` once its own slice has landed, so down's CTAs fetch their weights
+while gate/up computes and finishes. Everything down reads before the wait (the dispatch, the CPU
+flags, the job records, the frames, the weights) was written before gate/up started; h, its output,
+is read after the wait, and every CTA waits, so down's completion implies gate/up's. Bits unchanged
+(logits byte-identical at `--chunk 1` and `4`; real tests pass). End to end (as above, against
+dd03c8136): plain 127.9 → 132.2 tok/s (+3.31 %, pairs +2.76..+3.66 %), MTP 154.1 → 157.6 (+2.26 %,
+pairs +2.18..+2.32 %), identical speculative counts. gate/up stays an ordinary launch: before a wait
+it could read only immutable weights, and its record pointers come from the dispatch, which its
+predecessor (cpu_plan, fetch_plan or the dispatch kernel itself) may still be writing.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
