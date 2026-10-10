@@ -1179,6 +1179,9 @@ __global__ void __launch_bounds__(kThreads)
         };
         encode_a16_columns<Columns>(column, n, moe::kHidden, sm.acts, sm.emax, sm.key);
         stage_wait();
+        // The down pass (a programmatic dependent in captured graphs) may launch once every CTA has
+        // its slice.
+        pdl::trigger_dependents();
         __syncthreads();
         std::int64_t s[kGateUpGroups][Columns];
         unit_sums_a16<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, sm.acts, n, s);
@@ -1225,18 +1228,30 @@ __global__ void __launch_bounds__(kThreads)
     extern __shared__ __align__(16) unsigned char smem_raw[];
     auto& sm      = *reinterpret_cast<DownShared16<Columns>*>(smem_raw);
     const int job = job_base + static_cast<int>(blockIdx.y);
-    if (job >= *dispatch.job_count || (cpu_flags != nullptr && cpu_flags[job] != 0)) { return; }
-    const int expert = dispatch.jobs[job];
-    const int tile   = blockIdx.x; // down row groups 4*tile .. 4*tile+3
-    const std::uint8_t* record = pass_record(phase, source, expert, job_records, job);
+    const int tile = blockIdx.x; // down row groups 4*tile .. 4*tile+3
+    // A programmatic dependent of the gate/up pass, under down_kernel's contract: only h_plane is read
+    // after the PDL wait, and every CTA waits.
+    int expert = 0, first = 0, count = 0;
+    const std::uint8_t* record = nullptr;
+    if (job < *dispatch.job_count && (cpu_flags == nullptr || cpu_flags[job] == 0)) {
+        expert = dispatch.jobs[job];
+        record = pass_record(phase, source, expert, job_records, job);
+    }
+    moe::ExpertScales scales{};
+    if (record != nullptr) {
+        scales = source.scales[expert];
+        first  = dispatch.offsets[expert];
+        count  = dispatch.offsets[expert + 1] - first;
+        if (moe::wide_route(count, scales)) { record = nullptr; }
+    }
+    if (record != nullptr) {
+        stage_async(record + moe::kGateUpBytes +
+                        static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes,
+                    sm.stage, kDownSliceBytes);
+    }
+    pdl::wait_for_dependencies();
     if (record == nullptr) { return; }
-    const std::uint8_t* down = record + moe::kGateUpBytes;
-    const moe::ExpertScales scales = source.scales[expert];
-    const int first = dispatch.offsets[expert], count = dispatch.offsets[expert + 1] - first;
-    if (moe::wide_route(count, scales)) { return; }
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-    stage_async(down + static_cast<std::size_t>(kDownGroups * tile) * moe::kDownBlocks * moe::kUnitBytes, sm.stage,
-                kDownSliceBytes);
     for (int pass = 0; pass < count; pass += Columns) {
         const int n = min(Columns, count - pass);
         __syncthreads();
@@ -1287,9 +1302,11 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
     gate_up_kernel_a16<Columns><<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared16<Columns>), stream>>>(
         x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
     check_launch("A16 gate/up");
-    down_kernel_a16<Columns><<<dim3(kDownCtas, jobs), kThreads, sizeof(DownShared16<Columns>), stream>>>(
-        dispatch, source, moe::kHidden, job_records, flags, base, h_plane, outputs, phase);
-    check_launch("A16 down");
+    // A programmatic dependent of the gate/up pass in captured graphs (down_kernel's PDL contract).
+    CUDA_CHECK(pdl::launch_consumer({dim3(kDownCtas, jobs), dim3(kThreads), sizeof(DownShared16<Columns>), stream},
+                                    down_kernel_a16<Columns>, dispatch, source, static_cast<int>(moe::kHidden),
+                                    job_records, flags, base, static_cast<const std::uint16_t*>(h_plane), outputs,
+                                    phase));
 }
 
 // One pass of the narrow kernels in the source's arithmetic; `few` selects the one-column kernels
