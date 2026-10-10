@@ -35,6 +35,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -72,6 +73,11 @@ STRATA_DIR = os.environ.get("AB_STRATA_DIR")
 STRATA_CONFIG = os.environ.get("AB_STRATA_CONFIG") or (
     os.path.join(STRATA_DIR, "strata-unsloth-ud-q4_k_xl.json") if STRATA_DIR else None)
 STRATA_EXTRA_ARGS = os.environ.get("AB_STRATA_EXTRA_ARGS", "").split()
+# AB_EXPERT_STATE_RESET="SAVED|TARGET": before every serve arm starts, SAVED is copied over TARGET (the
+# artifact's .expert-state), so each Flash-Next arm starts from the same expert cache state whatever the
+# arm before it learned or saved.
+EXPERT_STATE_RESET = os.environ.get("AB_EXPERT_STATE_RESET", "").split("|") if os.environ.get(
+    "AB_EXPERT_STATE_RESET") else None
 TREATMENT_LABEL = os.environ.get("AB_TREATMENT_LABEL", "")
 HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
@@ -256,6 +262,9 @@ class Serve:
         wait_gpu_idle()
         if os.path.exists(self.request_log):
             os.remove(self.request_log)
+        if EXPERT_STATE_RESET:  # every serve arm starts from the same saved expert state
+            shutil.copyfile(*EXPERT_STATE_RESET)
+            log("expert state: %s -> %s" % tuple(EXPERT_STATE_RESET))
         args = [self.exe, self.model]
         for n, v in self.flags:
             args += [n] if v is None else [n, v]
