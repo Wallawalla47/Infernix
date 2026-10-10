@@ -4,7 +4,8 @@
 
 The trace is synthetic (Zipf popularity with bursts of locality, so scores tie and drift) and
 fully determined by the integer generator below. Each line is ``G <keys...> | <victims...>``:
-one routed group and the residents the replay tool's LFRU evicts for it, in eviction order.
+one routed group and the residents the replay tool's LFRU evicts for it, in eviction order. The
+LFRU halves its counts every HALVING ticks (12 halvings over the trace), as the engine's does.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import sys
 
 from .replay import LFRU
 
-KEYS, CAPACITY, GROUPS, GROUP = 6 * 64, 96, 1200, 10
+KEYS, CAPACITY, GROUPS, GROUP, HALVING = 6 * 64, 96, 1200, 10, 100
 
 
 def _rng(seed):
@@ -41,11 +42,11 @@ def groups():
 
 
 def main(path):
-    sim = LFRU(CAPACITY)
+    sim = LFRU(CAPACITY, HALVING)
     sim.trace = []
     sim.run(list(groups()), True)
     with open(path, "w") as out:
-        out.write(f"# keys {KEYS} capacity {CAPACITY} hits {sim.hits} misses {sim.miss}\n")
+        out.write(f"# keys {KEYS} capacity {CAPACITY} halving {HALVING} hits {sim.hits} misses {sim.miss}\n")
         for g, v in sim.trace:
             out.write("G " + " ".join(map(str, g)) + " | " + " ".join(map(str, v)) + "\n")
 

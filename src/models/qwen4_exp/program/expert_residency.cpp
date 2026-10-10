@@ -5,6 +5,7 @@
 #include "core/copy_batch.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <cstring>
 #include <stdexcept>
@@ -53,7 +54,8 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
         arena_ = std::make_unique<VmmArena>(device, total_bytes, kChunkBytes);
         limit_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(limit_, arena_->reserved_bytes() / stride_));
     }
-    controller_ = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), 0, slack_frames(0), 1, limit_);
+    controller_ = std::make_unique<CacheController>(static_cast<std::uint32_t>(keys), 0, slack_frames(0), 1, limit_,
+                                                    kLfruHalvingPeriod);
     table_device_ = DeviceBuffer(keys * sizeof(std::int32_t));
     table_host_   = PinnedHostBuffer(keys * sizeof(std::int32_t));
     std::fill_n(static_cast<std::int32_t*>(table_host_.data()), keys, -1);
@@ -523,7 +525,10 @@ ExpertResidency::SavedState ExpertResidency::saved_state() const {
     if (!controller_) { return out; }
     const auto& policy = controller_->policy();
     out.counts.resize(policy.num_keys());
-    for (std::uint32_t key = 0; key < policy.num_keys(); ++key) { out.counts[key] = policy.count(key); }
+    // Halved counts are fractions below ~2 kLfruHalvingPeriod; the file keeps them rounded.
+    for (std::uint32_t key = 0; key < policy.num_keys(); ++key) {
+        out.counts[key] = static_cast<std::uint32_t>(std::lround(policy.count(key)));
+    }
     out.ranked.assign(policy.residents().begin(), policy.residents().end());
     std::stable_sort(out.ranked.begin(), out.ranked.end(),
                      [&](std::uint32_t a, std::uint32_t b) { return policy.score(a) > policy.score(b); });

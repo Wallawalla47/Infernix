@@ -1360,8 +1360,29 @@ Further results:
      replay decisions are identical step for step.
    - `f` is a global per-expert count kept for all 24,576 ids, including evicted ones (96 KB, kept by
      the transfer agent on the host).
-   - For long sessions, `f` is halved every 4,096 rounds (196,608 ticks) to bound staleness. This value is untested
-     and is fixed in M1.
+   - `f` halves exactly every 8,192 ticks (~170 plain rounds; `ExpertResidency::kLfruHalvingPeriod`). It is
+     a binary64 fraction, and a halved count below 2^-10 becomes 0. The saved state keeps counts rounded.
+     Evidence (2026-10-10, `local/workdirs/strata-forks-review/research/b4_decay.py`; the replay's
+     `LFRU(cap, halving)` reproduces the engine decision for decision):
+     - The trace was greedy plain decode of 14 mixed requests on the NVIDIA artifact (AIME, code in three
+       languages, stories, translation, SQL/CSV, chat, review, logic).
+     - Each fold warms on 3 requests and scores the next 5.
+     - At 8,000 frames, misses per token against never halving:
+
+       | Fold | Never halving | Halving every 8,192 ticks | LRU |
+       |---|---:|---:|---:|
+       | 0 | 52.99 | 48.10 (−9.2 %) | 50.88 |
+       | 5 | 39.01 | 34.97 (−10.4 %) | 36.89 |
+       | 10 | 44.72 | 39.51 (−11.7 %) | 42.90 |
+
+       Fold 5's 8,192-tick figure comes from the integer-halving run; the fractional run was folds 0 and 10.
+     - At 9,600 frames, halving every 4,096 ticks gives −7.2 %.
+     - On this mixed trace, never-halved LFRU loses to plain LRU by 4-5 %: global counts stay stuck on the
+       previous topic's experts. Periods of 4,096-16,384 ticks are within 1.5 % of each other.
+     - Integer halving (c / 2) is unstable at short periods: at 1,024 ticks it is +12 to +45 % worse,
+       because single uses truncate to 0.
+     - Fractional halving is smooth: 1,024 ticks gives −6 %.
+     - The FreeToken traces above were not re-run with halving (they are not in the tree).
    - No per-layer quotas, because hard partitioning lost 3-34%.
    - Experts of the current and predicted groups are protected.
 2. **Admission: promote on miss, within a promotion budget.**

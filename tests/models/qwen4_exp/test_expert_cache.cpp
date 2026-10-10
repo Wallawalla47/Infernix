@@ -46,10 +46,12 @@ void test_lfru_conformance() {
     }
     std::string line;
     std::getline(in, line);
-    unsigned keys = 0, capacity = 0;
+    unsigned keys = 0, capacity = 0, halving = 0;
     long hits = 0, misses = 0;
-    std::sscanf(line.c_str(), "# keys %u capacity %u hits %ld misses %ld", &keys, &capacity, &hits, &misses);
-    LfruPolicy policy(keys, capacity);
+    std::sscanf(line.c_str(), "# keys %u capacity %u halving %u hits %ld misses %ld", &keys, &capacity, &halving,
+                &hits, &misses);
+    check(halving > 0, "the fixture's LFRU halves its counts");
+    LfruPolicy policy(keys, capacity, halving);
     LfruPolicy::Step step;
     long got_hits = 0, got_misses = 0, groups = 0, mismatches = 0;
     while (std::getline(in, line)) {

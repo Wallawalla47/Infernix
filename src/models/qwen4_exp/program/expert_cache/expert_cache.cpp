@@ -26,7 +26,7 @@ ResidencyEntry ResidencyEntry::next(ResidencyState new_state, std::uint32_t new_
 // ---------------------------------------------------------------------------- LFRU
 
 LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period)
-    : capacity_(capacity), halving_period_(halving_period), count_(num_keys, 0), last_(num_keys, 0),
+    : capacity_(capacity), halving_period_(halving_period), count_(num_keys, 0.0), last_(num_keys, 0),
       slot_(num_keys, kNone), mark_(num_keys, 0) {
     residents_.reserve(capacity);
     resident_count_.reserve(capacity);
@@ -34,13 +34,13 @@ LfruPolicy::LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint
 }
 
 double LfruPolicy::score(std::uint32_t key) const {
-    return static_cast<double>(count_[key]) / static_cast<double>(now_ - last_[key] + 1);
+    return count_[key] / static_cast<double>(now_ - last_[key] + 1);
 }
 
 void LfruPolicy::insert(std::uint32_t key) {
     slot_[key] = static_cast<std::uint32_t>(residents_.size());
     residents_.push_back(key);
-    resident_count_.push_back(static_cast<double>(count_[key]));
+    resident_count_.push_back(count_[key]);
     resident_last_.push_back(static_cast<double>(last_[key]));
 }
 
@@ -107,14 +107,14 @@ void LfruPolicy::step(std::span<const std::uint32_t> group, Step& out, std::size
     out.victims.clear();
     ++now_;
     if (halving_period_ != 0 && now_ % halving_period_ == 0) {
-        for (auto& c : count_) { c /= 2; }
-        for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = static_cast<double>(count_[residents_[i]]); }
+        for (auto& c : count_) { c = c * 0.5 < kCountFloor ? 0.0 : c * 0.5; }
+        for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = count_[residents_[i]]; }
     }
     for (std::uint32_t k : group) {
-        ++count_[k];
+        count_[k] += 1.0;
         last_[k] = now_;
         if (resident(k)) {
-            resident_count_[slot_[k]] = static_cast<double>(count_[k]);
+            resident_count_[slot_[k]] = count_[k];
             resident_last_[slot_[k]]  = static_cast<double>(now_);
             out.hits.push_back(k);
         } else {
@@ -183,7 +183,7 @@ void LfruPolicy::seed(std::span<const std::uint32_t> resident_keys, std::span<co
     if (!counts.empty()) {
         if (counts.size() != count_.size()) { throw std::invalid_argument("LFRU seed: count size mismatch"); }
         std::copy(counts.begin(), counts.end(), count_.begin());
-        for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = static_cast<double>(count_[residents_[i]]); }
+        for (std::size_t i = 0; i < residents_.size(); ++i) { resident_count_[i] = count_[residents_[i]]; }
     }
     for (std::uint32_t k : resident_keys) {
         if (!resident(k) && residents_.size() < capacity_) { insert(k); }
@@ -334,8 +334,9 @@ void FramePool::on_quiescent() {
 // ---------------------------------------------------------------------------- controller
 
 CacheController::CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
-                                 std::uint32_t rounds_in_flight, std::uint32_t max_frames)
-    : policy_(num_keys, frames > slack_frames ? frames - slack_frames : 0), slack_(slack_frames),
+                                 std::uint32_t rounds_in_flight, std::uint32_t max_frames,
+                                 std::uint32_t halving_period)
+    : policy_(num_keys, frames > slack_frames ? frames - slack_frames : 0, halving_period), slack_(slack_frames),
       frames_(frames, rounds_in_flight, max_frames), table_(num_keys), is_queued_(num_keys, 0),
       load_serial_(num_keys, 0), frame_key_(frames_.max_frames(), kNoKey) {}
 
