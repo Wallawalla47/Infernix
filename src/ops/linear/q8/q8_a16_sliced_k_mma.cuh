@@ -26,6 +26,19 @@
 
 namespace infernix::ops::detail {
 
+// Whether Epilogue consumes fully reduced FP32 rows. A decltype partial specialization rather
+// than a requires expression: cicc crashes on a requires expression naming a dependent array
+// reference (Linux CUDA 13.2 and 13.3 on std::declval, 13.4 on a requires parameter list).
+template <class Epilogue, class Output, int Columns, class = void>
+struct Q8SlicedKRowEpilogue : std::false_type {};
+
+template <class Epilogue, class Output, int Columns>
+struct Q8SlicedKRowEpilogue<
+    Epilogue, Output, Columns,
+    std::void_t<decltype(std::declval<Epilogue&>().apply_row(
+        std::declval<Output&>(), 0, 0, std::declval<const float (&)[Columns]>(), 0))>>
+    : std::true_type {};
+
 struct Q8SlicedKIdentityRows {
     static constexpr int kOutputRowsPerCta = 16;
 
@@ -109,11 +122,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     constexpr bool kFragmentEpilogue = requires {
         epilogue.store_fragment(output, 0, 0, float4{}, operands.rows, 0);
     };
-    // std::declval names the row lvalue portably: Linux nvcc 13.4 rejects a dereferenced cast of
-    // nullptr here and crashes on a requires parameter list.
-    constexpr bool kRowEpilogue = requires {
-        epilogue.apply_row(output, 0, 0, std::declval<const float (&)[ActiveCols]>(), 0);
-    };
+    constexpr bool kRowEpilogue = Q8SlicedKRowEpilogue<Epilogue, Output, ActiveCols>::value;
     static_assert(kRowTiles == 1 || (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows> &&
                                      !kFragmentEpilogue && !kRowEpilogue),
                   "two row tiles serve identity rows with the plain tile store only");
