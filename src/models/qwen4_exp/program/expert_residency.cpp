@@ -338,20 +338,22 @@ void ExpertResidency::tier_step(cudaStream_t compute) {
     }
 }
 
-void ExpertResidency::before_round(cudaStream_t compute, bool landing) {
+void ExpertResidency::before_round(cudaStream_t compute, bool landing, bool walking) {
     publish_landed();
     if (tier_ != nullptr) {
         finish_demotions(compute, false);
         // The last chunk's (or layer walk span's) streamed records have been copied: their pins
-        // end here, before this boundary picks victims. A walk's step boundaries (tier_step) keep
-        // them, since its span's later layers still copy from the records it planned.
-        tier_->release_stream_pins();
+        // end here, before this boundary picks victims. A walk's step boundaries (tier_step) and
+        // other lanes' rounds between them keep them, since its span's later layers still copy
+        // from the records it planned.
+        if (!walking) { tier_->release_stream_pins(); }
         // The tier's boundary (landings admitted, RAM victims evicted) and the host pointers it
         // changed, uploaded before this round's kernels: a victim's slot is rewritten only during
         // this round, which no longer reads it. Decode and verification boundaries allow 32
-        // demotions; prefill chunk boundaries any number.
-        tier_->begin_round(landing ? tier_->controller().config().decode_demotions
-                                   : std::numeric_limits<std::uint32_t>::max());
+        // demotions (none inside a walk's span); prefill chunk boundaries any number.
+        tier_->begin_round(walking   ? 0
+                           : landing ? tier_->controller().config().decode_demotions
+                                     : std::numeric_limits<std::uint32_t>::max());
         dirty_.clear();
         tier_->take_dirty(dirty_);
         if (!dirty_.empty()) {

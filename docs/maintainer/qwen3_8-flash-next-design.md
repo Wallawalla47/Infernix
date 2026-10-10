@@ -7593,6 +7593,13 @@ the drive's knee) remains open.
   - Each later `advance_prefill` enqueues ⌈48 / chunks⌉ layers of every chunk (about one call's
     work), synchronizes, and returns zero processed tokens as a service unit.
   - Other lanes, cancellation and decode rounds interleave as between calls.
+  - Each step after the first opens a fresh SSD-tier round (`tier_step`, device idle) before its
+    calls: a decode or verification round between steps closes the tier's round when it settles,
+    and the read agent answers fetch requests only while one is open. Before this (issue #5, fixed
+    2026-10-10) every SSD-only fetch of the next step waited out the 1 s heartbeat and the requests
+    failed as "the host expert service stopped answering". Such a round keeps the walk's stream
+    pins and allows no demotions (`before_round(..., walking)`), as the walk's own steps do. A call
+    that may publish fetch requests outside an open round now fails at once (`require_tier_round`).
   - The last step returns the span's tokens and runs the call-end work once: the route download
     (the span's last chunk), `prefix_after_prefill_call`, and `after_round` with 16 promotions per
     layer per chunk.

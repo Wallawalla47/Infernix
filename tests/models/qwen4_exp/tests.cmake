@@ -91,6 +91,14 @@ infernix_add_test(infernix_qwen4_exp_prefix_cache_real_test
   LIBRARIES infernix_engine)
 set_tests_properties(infernix_qwen4_exp_prefix_cache_real_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A long prompt's layer walk while another lane decodes, with SSD-only experts (issue #5): both
+# requests complete with their solo ids and no call reports a silent host.
+infernix_add_test(infernix_qwen4_exp_walk_interleave_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_walk_interleave_real.cpp"
+  LIBRARIES infernix_engine)
+set_tests_properties(infernix_qwen4_exp_walk_interleave_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
+
 infernix_add_test(infernix_qwen4_exp_preemption_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_preemption_real.cpp"
   LIBRARIES infernix_engine)

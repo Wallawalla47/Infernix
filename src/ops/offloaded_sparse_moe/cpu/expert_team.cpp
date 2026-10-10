@@ -101,7 +101,7 @@ void CpuExpertTeam::barrier() {
 // The A16 round (design §16.2.1): the same item scheme as the A4 round, with x encoded under each
 // column's exponent, h kept in BF16 by Phase A and encoded under its own column exponent in Phase
 // A' (that exponent spans all 40 units of a column), then Phase B on the encoded h.
-void CpuExpertTeam::work_a16() {
+void CpuExpertTeam::work_a16(int w) {
     const int n_jobs = static_cast<int>(jobs_.size());
     constexpr int kRowsPerItem = 4;
     const auto column = [](int job, int col) { return static_cast<std::size_t>(job) * kMaxColumns + col; };
@@ -118,6 +118,7 @@ void CpuExpertTeam::work_a16() {
         const int emax = canon::a16_column_exponent(job.x[c], kHidden);
         if (slice == 0) { x_exp_[column(j, c)] = emax; }
         encode_a16_blocks(job.x[c], emax, slice * kSliceBlocks, (slice + 1) * kSliceBlocks, &x16_[xs_index(j, c)]);
+        beat(w);
     }
     barrier();
     // Phase A: gate/up units with SwiGLU, h in BF16.
@@ -134,6 +135,7 @@ void CpuExpertTeam::work_a16() {
         }
         gate_up_units_a16(isa_, job.record, job.scales, xb, &x_exp_[column(j, 0)], job.ncols, u, u + 1, hv,
                           prefetch_bytes_);
+        beat(w);
     }
     barrier();
     // Phase A': each column's h encoded under its exponent.
@@ -143,6 +145,7 @@ void CpuExpertTeam::work_a16() {
         const int j = i / kMaxColumns, c = i % kMaxColumns;
         if (c >= jobs_[static_cast<std::size_t>(j)].ncols) { continue; }
         h_exp_[column(j, c)] = encode_a16(&hv_[column(j, c) * kIntermediate], kIntermediate, &h16_[h_index(j, c)]);
+        beat(w);
     }
     barrier();
     // Phase B: down row groups.
@@ -155,13 +158,14 @@ void CpuExpertTeam::work_a16() {
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h16_[h_index(j, c)]; }
         down_rows_a16(isa_, job.record, job.scales, hb, &h_exp_[column(j, 0)], job.ncols, rg, rg + kRowsPerItem, job.y,
                       prefetch_bytes_);
+        beat(w);
     }
 }
 
 void CpuExpertTeam::work(int w) {
     (void)w;
     if (activation_ == ExpertActivation::kA16) {
-        work_a16();
+        work_a16(w);
         return;
     }
     const int n_jobs = static_cast<int>(jobs_.size());
@@ -186,6 +190,7 @@ void CpuExpertTeam::work(int w) {
         } else {
             quantize_a4(x, kSliceBlocks * 16, job.scales.input_gate, &x_gate_[first]);
         }
+        beat(w);
     }
     barrier();
     // Phase A: gate/up 16-intermediate units with SwiGLU and A4 of their h block.
@@ -204,6 +209,7 @@ void CpuExpertTeam::work(int w) {
             hb[c] = &h_[h_index(j, c)];
         }
         gate_up_units(isa_, job.record, job.scales, xg, xu, job.ncols, u, u + 1, hb, prefetch_bytes_);
+        beat(w);
     }
     barrier();
     // Phase B: down row groups, reading all of A4(h).
@@ -215,6 +221,7 @@ void CpuExpertTeam::work(int w) {
         const canon::A4Block* hb[kMaxColumns];
         for (int c = 0; c < job.ncols; ++c) { hb[c] = &h_[h_index(j, c)]; }
         down_rows(isa_, job.record, job.scales, hb, job.ncols, rg, rg + kRowsPerItem, job.y, prefetch_bytes_);
+        beat(w);
     }
 }
 
@@ -239,7 +246,7 @@ void CpuExpertTeam::worker_main(int w) {
     }
 }
 
-void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
+void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, Heartbeat heartbeat) {
     if (jobs.empty()) { return; }
     if (static_cast<int>(jobs.size()) > max_jobs_) { throw std::invalid_argument("CpuExpertTeam: too many jobs"); }
     for (const auto& job : jobs) {
@@ -247,7 +254,8 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
             throw std::invalid_argument("CpuExpertTeam: invalid job");
         }
     }
-    jobs_ = jobs;
+    jobs_      = jobs;
+    heartbeat_ = heartbeat;
     finished_.store(0, std::memory_order_relaxed);
     next_quantize_.store(0, std::memory_order_relaxed);
     next_unit_.store(0, std::memory_order_relaxed);
@@ -257,7 +265,8 @@ void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs) {
     if (sleepers_.load(std::memory_order_acquire) > 0) { epoch_.notify_all(); }
     work(0);
     while (finished_.load(std::memory_order_acquire) != workers_ - 1) { cpu_relax(); }
-    jobs_ = {};
+    jobs_      = {};
+    heartbeat_ = {};
 }
 
 } // namespace infernix::ops::offloaded_moe
