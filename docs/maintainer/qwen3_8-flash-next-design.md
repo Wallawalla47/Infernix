@@ -9064,6 +9064,24 @@ is never a CPU job, so the pass reads nothing the plans write). Dense8, against 
 (pairs −0.35..+0.02 %), MTP −0.33 % (all four pairs negative): the early 400-CTA grid takes the SMs
 the plan and the fork stream's staging need.
 
+Also measured and rejected (2026-10-10, Dense8, against the PDL pair):
+- **One ticketed launch per phase**: gate/up items then down items in one grid, each CTA taking a
+  ticket at start, a down item waiting (after staging its weights) only for its own job's gate/up
+  items through per-job counters carried in `MoeDispatch` and zeroed by `moe_dispatch`. Correct
+  (output hashes equal, layer and CUDA tests pass) and faster in the eager op bench (T = 1 cold
+  41.5 → 36.6 µs, against the unchained pair), but end to end plain −0.46 % (pairs −0.78..−0.24 %),
+  MTP −0.52 % (all pairs negative): the PDL chain already overlaps down's weight fetch with gate/up,
+  and the fused grid runs down items at two CTAs per SM instead of three. (A first build lost 2 KB to
+  a static `__shared__` ticket, which dropped it to one CTA per SM.)
+- **The top-k route kernel by warp reductions** (`__reduce_max_sync` on order-preserving keys, the
+  smallest id by `__reduce_min_sync`, one lane rescanning per round; same selection): plain −0.12 %,
+  MTP +0.05 %, noise; the kernel's 4.3 µs is its load and launch, not the selection.
+
+Host time between decode rounds, re-measured without a profiler (a temporary probe, plain pg1024+256 at
+132 tok/s): 82-89 µs per round (`settle_round` 42-49, the decode prologue 26.6, the engine ~13), ~1.1 %
+of a round; nsys had shown 226-360 µs. Pipelined decode (§19.3.9 step 2) is therefore worth at most
+~1.1 % (launch-ahead) or ~0.6 % (deferred settle) and is not pursued.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto
