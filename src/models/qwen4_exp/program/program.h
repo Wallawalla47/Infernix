@@ -363,9 +363,11 @@ struct ProgramOptions {
     // Prefill CPU split (design §19.3.12): a narrow streamed call outside a layer walk copies each
     // layer's experts only once its routing is known, leaving the thinnest non-resident ones (at
     // most 8 columns, the placement-invariant narrow route) to the CPU while the link carries the
-    // rest. The split balances the measured link against the CPU's rates for cpu_expert_workers
-    // workers: experts per second while memory-bound (1-4 columns) and expert columns per second
-    // while compute-bound (i9-13900K, 6 workers, from host_probe). Gating waits for each layer's
+    // rest. The split balances the measured link against the CPU team's rates, measured at startup
+    // with the link busy (cpu_rates.cpp): experts per second on one-column jobs and expert columns
+    // per second on 8-column jobs. cpu_split_*_rate are the reference rates used only when the team
+    // cannot be timed (the SSD tier: no records in host memory; i9-13900K, 6 workers, from
+    // host_probe with the link idle). Gating waits for each layer's
     // routing, an idle link the blind stream does not have: it pays up to cpu_split_columns columns
     // on the reference link (PCIe 5.0 x8, 27.5 GB/s), a limit that scales inversely with the
     // measured link (the bytes it saves cost less on a faster one).
