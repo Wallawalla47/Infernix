@@ -9003,6 +9003,45 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
   resume differed from the original turn at token 30. Synthetic-input equality is not evidence of
   bit-exactness for a different reduction order.
 
+### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
+
+Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,
+`down_kernel<1>`): node-traced, the 8-column instances never appear at W ≤ 4. ncu of the op bench
+(`infernix_offloaded_moe_wide_bench --tokens 1 --placement frames --cold`, which reproduces the
+engine's per-layer time) found them issue-bound, not bandwidth-bound: 0.58 TB/s for a layer's 27.6
+MB, ~70 SASS instructions per 144-byte unit of which 2 are `dp4a` (24 decode the E2M1 codes to
+int8, 7 convert the row scale, 8 rematerialize shared addresses and constants, 6 guard the column
+loop), 0.33 instructions per cycle per scheduler at 2 CTAs per SM.
+
+The one-column instances now take a unit's products with the hardware FP4 conversion instead:
+- A code byte holds rows i and i + 8 at one k, so `cvt.rn.f16x2.e2m1x2` turns it into a half2 of the
+  two rows' E2M1 values. Lane 8q + i takes code word q, i of the unit (rows i and i + 8, k = 4q..4q+3)
+  and forms its share with one HMUL2 and three HFMA2 against the activation, stored per element
+  as its code in both nibbles (the same conversion broadcasts it). Every value is a multiple of 1/2
+  at most 6, so the four-term sum (≤ 144, on the 1/4 grid) is exact in FP16, and four times it is
+  the lane's integer share P_q (≤ 576) of the block product P_b of §16.2.
+- The lane adds (P_q · Sw) · Sa for both rows to int64 sums; the four lanes of a row are reduced by
+  two shuffles at the end. Integer sums are associative, so the row sums, outputs and h blocks are
+  exactly those of `unit_sums` and of the CPU engine.
+- gate/up quantizes its column with `quantize_a4_codes` (the same scale and codes as
+  `quantize_a4_block`); down converts the stored h blocks' doubled values back to codes.
+- The 8-column instances (prefill passes) keep `unit_sums`.
+
+Evidence: output hashes equal at T = 1, 2, 3 (op bench, cold and warm); `infernix_offloaded_moe_cuda_test`
+and `_layer_test` (decode T = 1 and verification T = 4 against the CPU engine) pass; teacher-forced
+FP32 logits of chat.ids (positions 768+) and code.ids (400+) are byte-identical to the previous build
+with every call one column (`--chunk 1`) and four (`--chunk 4`). Executed instructions: gate/up
+12.3 → 8.1 M per layer call, down 6.8 → 3.6 M. Op bench T = 1 cold 47.7 → 41.5 µs (−13 %), T = 3
+84.6 → 72.2 µs (−15 %); warm −15 to −20 %. End to end (Dense8, INT8 KV, pg1024+256 on corpus text,
+4 old/new pairs × 3 reps): plain decode 123.3 → 127.9 tok/s (+3.74 %, pairs +3.26..+4.17 %),
+MTP 147.5 → 154.2 (+4.55 %, pairs +4.51..+4.60 %), identical speculative counts.
+
+Rejected on the way: staging the slice in 4 `cp.async` groups and taking each as it lands, before
+(T = 1 −2.8 %, noise) and after this change (T = 1 +5 %, T = 2 +15 %: the extra barriers cost more
+than the overlap gives). The remaining time is the wait for the slice and the 1.18-wave grid (400
+CTAs on 340 slots); the CTAs cannot hold a layer's 18.4 MB of gate/up weights at once (2 × 49 KB
+per SM), so only streaming work items can remove the tail.
+
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
 The Flash-Next history (dev through `claude/fn-layer-prefill` 91af38dd0) was replayed onto

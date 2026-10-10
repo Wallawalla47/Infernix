@@ -17,6 +17,7 @@
 #include "ops/offloaded_sparse_moe/cuda/wide_expert.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -672,6 +673,145 @@ __device__ void unit_sums(const std::uint8_t* matrix, int blocks, int rg0, const
     }
 }
 
+// ------------------------------------------------- the one-column kernels' half2 unit products
+//
+// A unit's code byte 32q + 4i + j holds rows i (low nibble) and i + 8 (high nibble) at k = 4q + j.
+// cvt.rn.f16x2.e2m1x2 turns it into the two E2M1 values as a half2 (low nibble in .x), so lane
+// l = 8q + i of a warp takes code word q, i of a unit and accumulates rows i and i + 8 over its four
+// k with three HFMA2 against the activation codes, stored with each code in both nibbles so the
+// same conversion broadcasts them. Every value is a multiple of 1/2 at most 6 in magnitude, so the
+// products are multiples of 1/4 at most 36 and a lane's four-term sum, at most 144, is exact in
+// FP16 (ulp 1/8 below 256). Four times it is the lane's share of the doubled-code product sum
+// P_b of design §16.2, an integer of at most 576: (P_q * Sw) * Sa summed over the four lanes of a
+// row equals (P_b * Sw) * Sa, so the int64 row sums are exactly those of unit_sums.
+
+// One column's A4 block for the one-column kernels: in byte j of dup[q] the E2M1 code of element
+// 4q + j in both nibbles, and the block's e4m3_scaled scale.
+struct ActCodes {
+    std::uint32_t dup[4];
+    std::int32_t scale;
+};
+
+__device__ __forceinline__ std::uint32_t dup_nibbles(std::uint32_t codes) { return codes | (codes << 4); }
+
+// The E2M1 code of a doubled value c2 (e2m1_x2's inverse; zero maps to code 0).
+__device__ __forceinline__ std::uint32_t e2m1_code_of_x2(int c2) {
+    const int m = c2 < 0 ? -c2 : c2; // 0, 1, 2, 3, 4, 6, 8, 12
+    const std::uint32_t idx = m <= 4 ? static_cast<std::uint32_t>(m) : m == 6 ? 5U : m == 8 ? 6U : 7U;
+    return idx | (c2 < 0 ? 8U : 0U);
+}
+
+__device__ __forceinline__ ActCodes act_codes_of(const canon::A4Block& a) {
+    ActCodes out;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        std::uint32_t w = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) { w |= e2m1_code_of_x2(a.c2[4 * q + j]) << (8 * j); }
+        out.dup[q] = dup_nibbles(w);
+    }
+    out.scale = a.scale_scaled;
+    return out;
+}
+
+// The four bytes of a word converted from E2M1 pairs to half2 (low nibble in .x).
+__device__ __forceinline__ void e2m1x2_word_to_half2(std::uint32_t word, std::uint32_t (&h)[4]) {
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\t"
+        "mov.b32 {b0, b1, b2, b3}, %4;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %0, b0;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %1, b1;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %2, b2;\n\t"
+        "cvt.rn.f16x2.e2m1x2 %3, b3;\n\t}"
+        : "=r"(h[0]), "=r"(h[1]), "=r"(h[2]), "=r"(h[3])
+        : "r"(word));
+}
+
+// Lane l = 8q + i's integer shares (P_q of rows i and i + 8) of one unit against one activation word.
+__device__ __forceinline__ void unit_shares(std::uint32_t code_word, std::uint32_t act_word, int& lo, int& hi) {
+    std::uint32_t w[4], a[4];
+    e2m1x2_word_to_half2(code_word, w);
+    e2m1x2_word_to_half2(act_word, a);
+    __half2 acc = __hmul2(*reinterpret_cast<const __half2*>(&w[0]), *reinterpret_cast<const __half2*>(&a[0]));
+#pragma unroll
+    for (int j = 1; j < 4; ++j) {
+        acc = __hfma2(*reinterpret_cast<const __half2*>(&w[j]), *reinterpret_cast<const __half2*>(&a[j]), acc);
+    }
+    const __half2 four = __hmul2(acc, __float2half2_rn(4.0F));
+    lo = __half2int_rn(__low2half(four));
+    hi = __half2int_rn(__high2half(four));
+}
+
+// The one-column form of unit_sums: this warp's units over blocks b = warp, warp + kWarps, ... of
+// every one of the Groups row groups (the groups of a block share its activation word), the int64
+// sums of rows i and i + 8 per lane, then the four lanes of a row reduced so that lanes 0..15 hold
+// row (lane & 15) of each group, as unit_sums leaves them.
+template <int Groups>
+__device__ void unit_sums_one(const std::uint8_t* matrix, int blocks, const ActCodes* acts,
+                              std::int64_t (&s)[Groups][1]) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int q = lane >> 3, i = lane & 7;
+    std::int64_t lo[Groups], hi[Groups];
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) { lo[g] = hi[g] = 0; }
+    for (int b = warp; b < blocks; b += kWarps) {
+        const ActCodes& a = acts[b];
+        const std::uint32_t act_word = a.dup[q];
+        const std::int32_t sa        = a.scale;
+#pragma unroll
+        for (int g = 0; g < Groups; ++g) {
+            const std::uint8_t* unit = matrix + (static_cast<std::size_t>(g) * blocks + b) * moe::kUnitBytes;
+            const std::uint32_t code_word = *reinterpret_cast<const std::uint32_t*>(unit + 32 * q + 4 * i);
+            int p_lo, p_hi;
+            unit_shares(code_word, act_word, p_lo, p_hi);
+            // |P_q| <= 576 and Sw < 2^18: P_q * Sw fits int32.
+            lo[g] += static_cast<std::int64_t>(p_lo * canon::e4m3_scaled(unit[128 + i])) * sa;
+            hi[g] += static_cast<std::int64_t>(p_hi * canon::e4m3_scaled(unit[136 + i])) * sa;
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+#pragma unroll
+        for (int offset = 8; offset <= 16; offset <<= 1) {
+            lo[g] += __shfl_xor_sync(0xFFFFFFFFU, lo[g], offset);
+            hi[g] += __shfl_xor_sync(0xFFFFFFFFU, hi[g], offset);
+        }
+        s[g][0] = (lane & 8) != 0 ? hi[g] : lo[g];
+    }
+}
+
+// The activation slot of a kernel's width: the code layout for one column, ActBlock otherwise.
+template <int Columns>
+struct ActSlot {
+    using type = ActBlock;
+};
+template <>
+struct ActSlot<1> {
+    using type = ActCodes;
+};
+template <int Columns>
+using ActOf = typename ActSlot<Columns>::type;
+
+// quantize_columns for one column, into the one-column kernels' code layout.
+__device__ void quantize_column_codes(const bf16* __restrict__ x, int hidden, const std::int32_t* entries, int first,
+                                      int top_k, float scale, ActCodes* acts, int blocks) {
+    const int t = entries[first] / top_k;
+    for (int b = threadIdx.x; b < blocks; b += blockDim.x) {
+        const auto* v = reinterpret_cast<const std::uint16_t*>(x + static_cast<std::size_t>(t) * hidden + 16 * b);
+        const canon::A4Codes c = canon::quantize_a4_codes(v, scale);
+        ActCodes out;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const std::uint32_t w = static_cast<std::uint32_t>(c.code[4 * q]) |
+                                    (static_cast<std::uint32_t>(c.code[4 * q + 1]) << 8) |
+                                    (static_cast<std::uint32_t>(c.code[4 * q + 2]) << 16) |
+                                    (static_cast<std::uint32_t>(c.code[4 * q + 3]) << 24);
+            out.dup[q] = dup_nibbles(w);
+        }
+        out.scale = canon::e4m3_scaled(c.scale_word);
+        acts[b]   = out;
+    }
+}
+
 constexpr int kGateUpSliceBytes = kGateUpGroups * moe::kGateUpBlocks * static_cast<int>(moe::kUnitBytes); // 46,080
 constexpr int kDownSliceBytes   = kDownGroups * moe::kDownBlocks * static_cast<int>(moe::kUnitBytes);     // 23,040
 static_assert(kGateUpSliceBytes % 16 == 0 && kDownSliceBytes % 16 == 0);
@@ -683,7 +823,7 @@ struct GateUpShared {
     // barrier that follows it, so they share storage. That keeps the one-column CTA (49,376 B)
     // under half of an SM's 100 KB, so two of them fit per SM.
     union {
-        ActBlock acts[Columns * moe::kGateUpBlocks];
+        ActOf<Columns> acts[Columns * moe::kGateUpBlocks];
         std::int64_t partial[kWarps][16 * kGateUpGroups][Columns];
     };
     std::uint16_t y[Columns][16 * kGateUpGroups];
@@ -719,13 +859,22 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
         // Gate rows are even, up rows odd; with distinct input scales the up rows use their own A4.
         for (int parity = 0; parity < (split_input ? 2 : 1); ++parity) {
             __syncthreads();
-            quantize_columns(x, hidden, dispatch.entries, first + pass, n, top_k,
-                             parity == 0 ? scales.input_gate : scales.input_up, sm.acts,
-                             moe::kGateUpBlocks);
+            const float input_scale = parity == 0 ? scales.input_gate : scales.input_up;
+            if constexpr (Columns == 1) {
+                quantize_column_codes(x, hidden, dispatch.entries, first + pass, top_k, input_scale, sm.acts,
+                                      moe::kGateUpBlocks);
+            } else {
+                quantize_columns(x, hidden, dispatch.entries, first + pass, n, top_k, input_scale, sm.acts,
+                                 moe::kGateUpBlocks);
+            }
             stage_wait();
             __syncthreads();
             std::int64_t s[kGateUpGroups][Columns];
-            unit_sums<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
+            if constexpr (Columns == 1) {
+                unit_sums_one<kGateUpGroups>(sm.stage, moe::kGateUpBlocks, sm.acts, s);
+            } else {
+                unit_sums<kGateUpGroups, Columns>(sm.stage, moe::kGateUpBlocks, 0, sm.acts, n, s);
+            }
             __syncthreads(); // every warp has read sm.acts before sm.partial overwrites it
             if (lane < 16) {
 #pragma unroll
@@ -761,7 +910,7 @@ __global__ void __launch_bounds__(kThreads, Columns == 1 ? 2 : 1)
 template <int Columns>
 struct DownShared {
     alignas(16) std::uint8_t stage[kDownSliceBytes];
-    ActBlock acts[Columns * kHBlocks];
+    ActOf<Columns> acts[Columns * kHBlocks];
     std::int64_t partial[kWarps][16 * kDownGroups][Columns];
 };
 
@@ -790,12 +939,21 @@ __global__ void __launch_bounds__(kThreads)
         const int n = min(Columns, count - pass);
         __syncthreads();
         for (int i = threadIdx.x; i < n * kHBlocks; i += blockDim.x) {
-            sm.acts[i] = to_act(h_blocks[static_cast<std::size_t>(first + pass) * kHBlocks + i]);
+            const canon::A4Block& h = h_blocks[static_cast<std::size_t>(first + pass) * kHBlocks + i];
+            if constexpr (Columns == 1) {
+                sm.acts[i] = act_codes_of(h);
+            } else {
+                sm.acts[i] = to_act(h);
+            }
         }
         stage_wait();
         __syncthreads();
         std::int64_t s[kDownGroups][Columns];
-        unit_sums<kDownGroups, Columns>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
+        if constexpr (Columns == 1) {
+            unit_sums_one<kDownGroups>(sm.stage, moe::kDownBlocks, sm.acts, s);
+        } else {
+            unit_sums<kDownGroups, Columns>(sm.stage, moe::kDownBlocks, 0, sm.acts, n, s);
+        }
         if (lane < 16) {
 #pragma unroll
             for (int g = 0; g < kDownGroups; ++g) {
