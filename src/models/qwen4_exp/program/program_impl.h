@@ -4200,6 +4200,13 @@ private:
     // Gives the CPU the thinnest non-resident experts of a layer while the link carries the rest:
     // narrow ones (n <= 8) in order of n, then expert id, as many as minimise the later of the
     // CPU's predicted time and the link's time for the experts left to it.
+    // The model charges the link a record's copy per kept expert, but the stream copies most of a
+    // layer's experts ahead, so the GPU side finishes far sooner than modelled and full rates overload
+    // the CPU (traced 2026-10-10: the GPU waited ~the whole CPU time). Planning at kSplitRateShare of
+    // the measured rates was fastest on a 13900K at 6 and at 3 workers (Dense8, pp256-1024; 6 workers
+    // -4 to -6 % against the fitted rates, 3 workers -11 to -19 % against the measured ones). A line
+    // fitted to measured layer times starved the CPU instead (the kept experts' cost is not linear).
+    static constexpr double kSplitRateShare = 0.3;
     class SplitPolicy final : public execution::CpuSplitPolicy {
     public:
         explicit SplitPolicy(const ProgramImpl& program) : program_(program) {}
@@ -4209,10 +4216,10 @@ private:
             const std::uint32_t E      = p.c_.moe.experts;
             const std::int32_t* frames = p.residency_->host_table() + static_cast<std::size_t>(layer) * E;
             const double link          = static_cast<double>(p.residency_->frame_stride()) / p.link_bytes_per_second_;
-            // The team's measured rates (cpu_rates.cpp): one-column jobs fix the per-expert cost,
-            // 8-column jobs the per-column cost.
-            const double per_expert    = 1.0 / p.cpu_expert_rate();
-            const double per_column    = 1.0 / p.cpu_column_rate();
+            // The team's measured rates (cpu_rates.cpp: one-column jobs fix the per-expert cost, 8-column
+            // jobs the per-column cost) at kSplitRateShare, the share of them a gated layer realises.
+            const double per_expert    = 1.0 / (p.cpu_expert_rate() * kSplitRateShare);
+            const double per_column    = 1.0 / (p.cpu_column_rate() * kSplitRateShare);
             constexpr int kNarrow      = ops::offloaded_moe::kMaxCpuColumns;
             std::array<std::uint32_t, kNarrow + 1> width_count{};
             std::uint32_t absent = 0;
