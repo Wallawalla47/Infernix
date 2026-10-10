@@ -45,7 +45,8 @@ public:
         // Tiered requests (design §19.3.7): a job without a record pointer is read through `records`
         // (demanded before the other jobs run, computed after them); without a provider, or when a
         // read fails, the request is answered with an errno in the status word. The service keeps its
-        // heartbeat word changing while it waits for a record, so the device waits as long as needed.
+        // heartbeat word changing while it waits for a record and as its team completes work items,
+        // so the device waits as long as the request makes progress.
         RecordProvider* records = nullptr;
     };
 

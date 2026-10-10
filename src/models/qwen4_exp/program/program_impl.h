@@ -3042,7 +3042,7 @@ private:
         const cudaStream_t s = device_.stream;
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
-        residency_->before_round(s, /*landing=*/true);
+        residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
                [&] { forward_call(batch, 1, batch, nullptr, nullptr, nullptr, &gate); });
@@ -3104,10 +3104,20 @@ private:
                       free_before, trace_free());
     }
 
+    // A call whose MoE layers may publish fetch requests runs inside an open tier round: the read
+    // agent answers them only then, and a closed round would read as a silent host after a second
+    // per layer.
+    void require_tier_round() const {
+        if (fetch_channel_ && !tier_->round_open()) {
+            throw std::logic_error("Qwen4Exp: a call reading SSD-only experts was enqueued outside the tier's round");
+        }
+    }
+
     void forward_call(std::int32_t batch, std::int32_t width, std::int32_t logit_columns,
                       const execution::ForwardVerify* verify = nullptr, const execution::MtpChunk* chunk = nullptr,
                       const execution::VisionInput* vision = nullptr, const execution::NgramRowGate* gate = nullptr,
                       bool streamed = false) {
+        require_tier_round();
         execution::ForwardBatch fb = io_batch(static_cast<std::byte*>(io_device_.p), batch, width, logit_columns);
         fb.ngram_gate    = gate;
         fb.verify        = verify;
@@ -3234,7 +3244,7 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
-        residency_->before_round(s, /*landing=*/true);
+        residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {
             const execution::ForwardVerify view = verify_view(batch, W);

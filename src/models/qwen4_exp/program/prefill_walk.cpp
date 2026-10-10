@@ -263,6 +263,7 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
 }
 
 void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
+    require_tier_round();
     for (std::uint32_t l = walk_.next_layer; l < to_layer; ++l) {
         for (std::size_t c = 0; c < walk_.widths.size(); ++c) { walk_pass(c, l); }
     }
@@ -276,6 +277,14 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
     // The first step already ran layer 0 while staging.
     const std::uint32_t to =
         std::min(L, walk_.next_layer + walk_.layers_per_step - (walk_.steps == 0 ? 1U : 0U));
+    if (walk_.steps > 0) {
+        // A step boundary, before the step's calls: a decode or verification round of another lane
+        // since the last step closed the tier's round when it settled, and the tier answers fetch
+        // requests only while one is open (walk_begin's before_round opened the first step's).
+        device_.synchronize(); // the boundary needs an idle device: that round's commit may still run
+        residency_->tier_step(device_.stream);
+        if (cpu_service_) { cpu_service_->wake(); }
+    }
     {
         const nvtx::ScopedRange step_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                            static_cast<std::uint64_t>(tokens));
@@ -296,7 +305,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
-        residency_->tier_step(device_.stream);
+        check_expert_error();
         PrefillProgress out;
         out.summary                 = prefill_summary(lane);
         out.processed_prompt_tokens = 0;
@@ -325,6 +334,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
             const nvtx::ScopedRange wait_range(nvtx::Name::DeviceWait, nvtx::Category::Prefill);
             device_.synchronize();
         }
+        check_expert_error();
         const nvtx::ScopedRange residency_range(nvtx::Name::PrefillResidency, nvtx::Category::Moe,
                                                 static_cast<std::uint64_t>(width));
         // The route log holds the span's last chunk (every chunk routes nearly every expert).

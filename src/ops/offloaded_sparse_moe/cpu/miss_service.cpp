@@ -213,7 +213,7 @@ void CpuMissService::serve() {
                     status = ENOENT;
                 }
             }
-            team.run(std::span<const CpuExpertJob>(ready.data(), ready.size()));
+            team.run(std::span<const CpuExpertJob>(ready.data(), ready.size()), {volatile_beat, &beat});
             if (!read_jobs.empty()) {
                 read.clear();
                 for (std::size_t i = 0; i < read_jobs.size(); ++i) {
@@ -231,7 +231,7 @@ void CpuMissService::serve() {
                     job.record       = record;
                     read.push_back(job);
                 }
-                team.run(std::span<const CpuExpertJob>(read.data(), read.size()));
+                team.run(std::span<const CpuExpertJob>(read.data(), read.size()), {volatile_beat, &beat});
                 for (const std::uint32_t t : tickets) { options_.records->done(t); }
             }
             *volatile_status = status;

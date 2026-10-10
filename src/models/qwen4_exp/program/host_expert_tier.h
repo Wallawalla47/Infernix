@@ -88,6 +88,11 @@ public:
     void begin_round(std::uint32_t allowance);
     // The round's kernels have completed (or it was abandoned): the agent stops spinning.
     void end_round() noexcept;
+    // Whether a round is open: only then does the agent answer the device's fetch requests.
+    [[nodiscard]] bool round_open() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return open_;
+    }
     // The decayed-LFU clock and the round's routed keys.
     void record_uses(double dt, std::span<const std::uint32_t> keys, double weight) {
         tier_.record_uses(dt, keys, weight);
