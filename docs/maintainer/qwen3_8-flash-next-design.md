@@ -8237,6 +8237,36 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 - With the CPU split, the modelled link-plus-CPU time per call falls 1.7-2.2x against copying the
   touched experts. That is about 2.5-3x against today's full pass, at x8 and x16 alike.
 
+**The split's rates (2026-10-10, `ProgramImpl::SplitPolicy`).** The split now plans with the CPU team's
+rates measured at startup with the link busy (`cpu_rates.cpp`: one-column jobs for the per-expert cost,
+8-column jobs for the per-column cost), at `kSplitRateShare` = 0.3 of them. Measurements were taken on
+Dense8, int8, total time per request, 10 repetitions per arm, i9-13900K with x8 and 6 workers unless noted.
+
+- **The fitted rates overloaded the CPU.**
+  - The rates were 21,000 experts/s and 66,000 columns/s. Scaling both down cut short prompts 5-6 %.
+  - The best scale fell as calls widened: 0.35 at pp256, 0.2-0.35 at pp512, 0.1-0.2 at pp1024.
+  - Turning the split off cost +15 / +7 / +2 %.
+- **The probe's rates alone are not enough.** It measures 16,600 experts/s and 47,300 columns/s, and those
+  rates gave only −3.3 / −0.3 / −0.1 %.
+- **A per-layer trace explained it.**
+  - The CPU estimate is 15-40 % low.
+  - The GPU waits nearly the whole CPU time (pp256 layer 0: CPU 13.1 ms, wait 11.8 ms). Its own side takes
+    1-2 ms, where the model charges a record's link time per kept expert (11-37 ms), because the stream
+    copies most experts ahead.
+- **A fitted model failed.** A line fitted to measured layer times (fixed plus per kept expert) starved the
+  CPU instead (pp256 +13 %). The kept experts' cost is not linear: experts already copied ahead are
+  nearly free, the rest cost a full copy.
+- **The 0.3 share against the alternatives:**
+
+  | Arm | pp256 | pp512 | pp1024 |
+  |---|---|---|---|
+  | 6 workers, against the fitted rates | −4.5 % | −6.2 % | −4.4 % |
+  | 3 workers, against the measured ones (9,700 / 24,200) | −11.1 % | −16.8 % | −18.9 % |
+
+  Shares 0.4 / 0.5 were better only at pp256 with 6 workers.
+- **The 1,536-column cap stays.** At scale 0.2, extending it to 3,072 / 4,096 cost pp2048 +2.4 % with a
+  4,096-chunk prompt. At that width the stream of every touched expert already covers the call.
+
 ### 19.3.13 Preemption (2026-10-06)
 
 Gold's Engine pauses the youngest resident when an older one cannot obtain the KV pages of its next
