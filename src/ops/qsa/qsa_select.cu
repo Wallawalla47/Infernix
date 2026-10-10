@@ -225,28 +225,31 @@ __global__ void __launch_bounds__(kScoreThreads, kScoreCtasPerSm)
 // --------------------------------------------------------------------------- wide-row scoring
 
 // Prompt rows (width >= kWideMinWidth): the same scores as qsa_score_kernel, register-tiled for
-// the FP32 pipes instead of shuffles. A thread owns one column's four head dots against four
-// blocks (16 dots). It forms each dot's 32 lane partials itself, the chain over j from 0 exactly as
+// the FP32 pipes instead of shuffles. A thread owns one column's four head dots against two
+// blocks (8 dots). It forms each dot's 32 lane partials itself, the chain over j from 0 exactly as
 // lane l would, and adds them in the butterfly's tree: the partial of lane l pairs with lane
 // l ^ 16 first, then the pairs at offset 8, 4, 2 and 1. Taking the leaves in bit-reversed lane
 // order turns that tree into a binary counter, so a six-entry stack per dot holds every open
 // subtree. FP32 addition is commutative, so each sum is bitwise the butterfly's.
-// A CTA scores a 16-column row tile against key tiles of 64 blocks: queries and keys are staged as
-// FP32 in shared memory (rows of 32 float4 lanes plus one pad: conflict-free), the next key tile
-// travels in registers while the current one is scored. One key buffer: sm_120 gives a block at
-// most 99 KiB of shared memory, so a second (66 KiB of keys in all) does not fit beside the queries.
+// A CTA scores a 16-column row tile against key tiles of 32 blocks; the next key tile travels in
+// registers while the current one is scored. Queries are staged as FP32 (rows of 32 float4 lanes plus
+// one pad), keys as BF16 in the same lane order (rows of 32 four-element lanes plus one pad), widened
+// to FP32 where they are used (exactly the values the FP32 staging held). Two CTAs fit an SM (42 KiB
+// of shared memory and at most 128 registers per thread each): the kernel is latency-bound on its
+// dependent adds, and 16 warps per SM hide twice what 8 did.
 constexpr int kWideThreads      = 256;
-constexpr int kWideBlocks       = 64;                    // blocks per key tile
+constexpr int kWideCtasPerSm    = 2;
+constexpr int kWideBlocks       = 32;                    // blocks per key tile
 constexpr int kWideLaneBlocks   = 8;                     // consecutive blocks across a warp's lanes
-constexpr int kWideThreadBlocks = 4;                     // a thread's blocks: g + 8 i, i = 0..3
-constexpr int kWideRow          = 32 + 1;                // float4 per staged row (one pad)
+constexpr int kWideThreadBlocks = 2;                     // a thread's blocks: g + 8 i, i = 0..1
+constexpr int kWideRow          = 32 + 1;                // lanes per staged row (one pad)
 constexpr int kWideMinWidth     = 2 * kScoreTileColumns; // rows this narrow keep qsa_score_kernel
 constexpr int kWideStack        = 6;                     // open subtrees per dot, plus the new leaf
 constexpr std::size_t kWideQueryFloat4 = static_cast<std::size_t>(kScoreHeadSlots) * kScoreTileColumns * kWideRow;
-constexpr std::size_t kWideKeyFloat4   = static_cast<std::size_t>(kWideBlocks) * kWideRow;
-constexpr std::size_t kWideSharedBytes = sizeof(float4) * (kWideQueryFloat4 + kWideKeyFloat4);
-static_assert(kWideThreads == kScoreTileColumns * kWideBlocks / kWideThreadBlocks, "one thread per 4 blocks");
-static_assert(kWideThreads * 4 == kWideBlocks * 16, "a thread loads a quarter of one block's key");
+constexpr std::size_t kWideKeyLanes    = static_cast<std::size_t>(kWideBlocks) * kWideRow; // uint2: 4 BF16 each
+constexpr std::size_t kWideSharedBytes = sizeof(float4) * kWideQueryFloat4 + sizeof(uint2) * kWideKeyLanes;
+static_assert(kWideThreads == kScoreTileColumns * kWideBlocks / kWideThreadBlocks, "one thread per 2 blocks");
+static_assert(kWideThreads * 16 == kWideBlocks * kIndexDim, "a thread loads 16 BF16 of one block's key");
 
 __host__ __device__ constexpr int bit_reverse5(int i) {
     return ((i & 1) << 4) | ((i & 2) << 2) | (i & 4) | ((i & 8) >> 2) | ((i & 16) >> 4);
@@ -265,9 +268,15 @@ __host__ __device__ constexpr int trailing_zeros(int n) {
 
 using WideStacks = float[kScoreHeadSlots][kWideThreadBlocks][kWideStack];
 
-// Leaf I (in bit-reversed order: lane l = bit_reverse5(I)) of all 16 dots, pushed and folded.
+// Four BF16 (lane l's elements l + 32 j, j = 0..3) as FP32, exactly.
+__device__ __forceinline__ float4 widen_lane(uint2 raw) {
+    return make_float4(__uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xFFFF0000U), __uint_as_float(raw.y << 16),
+                       __uint_as_float(raw.y & 0xFFFF0000U));
+}
+
+// Leaf I (in bit-reversed order: lane l = bit_reverse5(I)) of all 8 dots, pushed and folded.
 template <int I>
-__device__ __forceinline__ void wide_leaves(const float4* __restrict__ query, const float4* __restrict__ key,
+__device__ __forceinline__ void wide_leaves(const float4* __restrict__ query, const uint2* __restrict__ key,
                                             WideStacks& stack) {
     if constexpr (I < 32) {
         constexpr int l      = bit_reverse5(I);
@@ -277,7 +286,7 @@ __device__ __forceinline__ void wide_leaves(const float4* __restrict__ query, co
 #pragma unroll
         for (int h = 0; h < kScoreHeadSlots; ++h) { q[h] = query[h * kScoreTileColumns * kWideRow + l]; }
 #pragma unroll
-        for (int i = 0; i < kWideThreadBlocks; ++i) { k[i] = key[i * kWideLaneBlocks * kWideRow + l]; }
+        for (int i = 0; i < kWideThreadBlocks; ++i) { k[i] = widen_lane(key[i * kWideLaneBlocks * kWideRow + l]); }
 #pragma unroll
         for (int h = 0; h < kScoreHeadSlots; ++h) {
 #pragma unroll
@@ -300,9 +309,9 @@ __device__ __forceinline__ void wide_leaves(const float4* __restrict__ query, co
 }
 
 // Grid (CTAs per tile, tiles), kWideThreads threads, kWideSharedBytes of dynamic shared memory.
-// Warp w scores columns 4 (w % 4) .. + 3 (lane / 8) against blocks 32 (w / 4) + lane % 8 + 8 i of
+// Warp w scores columns 4 (w % 4) .. + 3 (lane / 8) against blocks 16 (w / 4) + lane % 8 + 8 i of
 // each key tile. Arguments as qsa_score_kernel's.
-__global__ void __launch_bounds__(kWideThreads, 1)
+__global__ void __launch_bounds__(kWideThreads, kWideCtasPerSm)
     qsa_score_wide_kernel(const bf16* __restrict__ index_q, int index_heads, const bf16* __restrict__ pooled,
                           const std::int32_t* __restrict__ tables, int table_stride,
                           const std::int32_t* __restrict__ table_rows, const std::int32_t* __restrict__ positions,
@@ -319,8 +328,8 @@ __global__ void __launch_bounds__(kWideThreads, 1)
         for (int i = begin + tid; i < end; i += kWideThreads) { clear[i] = 0; }
     }
     extern __shared__ float4 wide_shared[];
-    float4* qs = wide_shared;                    // [head][column][kWideRow]: lane l = q[l + 32 j], j = 0..3
-    float4* ks = wide_shared + kWideQueryFloat4; // [block][kWideRow]
+    float4* qs = wide_shared;                                   // [head][column][kWideRow]: lane l = q[l + 32 j], j = 0..3
+    uint2* ks  = reinterpret_cast<uint2*>(wide_shared + kWideQueryFloat4); // [block][kWideRow]: BF16 k[l + 32 j]
     __shared__ int column_blocks[kScoreTileColumns];
 
     const int tile = static_cast<int>(blockIdx.y);
@@ -343,47 +352,41 @@ __global__ void __launch_bounds__(kWideThreads, 1)
         reinterpret_cast<float*>(&qs[(h * kScoreTileColumns + c) * kWideRow + d % 32])[d / 32] = value;
     }
 
-    // Key staging: thread t carries elements 32 (t % 4) .. + 31 of block t / 4 of a tile (four
-    // 16-byte loads; a block's key is 128 contiguous BF16 because its tokens share a page).
+    // Key staging: thread t carries elements 16 (t % 8) .. + 15 of block t / 8 of a tile (two
+    // 16-byte loads; a block's key is 128 contiguous BF16 because its tokens share a page). Element e
+    // goes to lane e % 32 of the block's row, BF16 e / 32 of the lane, as the FP32 rows ordered it.
     const std::int32_t* table = tables + static_cast<std::int64_t>(table_rows[t0 / width]) * table_stride;
     const int slot_width = kIndexDim / ratio;
-    const int load_block = tid / 4, load_quarter = tid % 4;
-    auto load_tile = [&](int key_tile, uint4 (&raw)[4]) {
+    const int load_block = tid / 8, load_part = tid % 8;
+    auto load_tile = [&](int key_tile, uint4 (&raw)[2]) {
         const int b = key_tile * kWideBlocks + load_block;
         if (b < tile_blocks) {
             int local;
             const bf16* plane = qsa_pooled_plane(spaces, pooled, table[(ratio * b) >> kPagedKVPageShift], local);
             const auto* src   = reinterpret_cast<const uint4*>(
                 plane + static_cast<std::int64_t>(slot_width) * kPagedKVPageSize * local +
-                static_cast<std::int64_t>(slot_width) * ((ratio * b) & kPagedKVPageMask) + 32 * load_quarter);
-#pragma unroll
-            for (int u = 0; u < 4; ++u) { raw[u] = src[u]; }
+                static_cast<std::int64_t>(slot_width) * ((ratio * b) & kPagedKVPageMask) + 16 * load_part);
+            raw[0] = src[0];
+            raw[1] = src[1];
         } else {
-#pragma unroll
-            for (int u = 0; u < 4; ++u) { raw[u] = make_uint4(0U, 0U, 0U, 0U); }
+            raw[0] = raw[1] = make_uint4(0U, 0U, 0U, 0U);
         }
     };
-    auto store_tile = [&](const uint4 (&raw)[4], float4* buffer) {
-        float* row = reinterpret_cast<float*>(buffer + load_block * kWideRow);
+    auto store_tile = [&](const uint4 (&raw)[2], uint2* buffer) {
+        auto* row          = reinterpret_cast<std::uint16_t*>(buffer + load_block * kWideRow);
+        const auto* half   = reinterpret_cast<const std::uint16_t*>(raw);
+        const int lane0    = 16 * (load_part % 2), j = load_part / 2;
 #pragma unroll
-        for (int u = 0; u < 4; ++u) {
-            const auto* pair = reinterpret_cast<const __nv_bfloat162*>(&raw[u]);
-#pragma unroll
-            for (int p = 0; p < 4; ++p) {
-                const float2 f = __bfloat1622float2(pair[p]);
-                row[(8 * u + 2 * p) * 4 + load_quarter]     = f.x;
-                row[(8 * u + 2 * p + 1) * 4 + load_quarter] = f.y;
-            }
-        }
+        for (int k = 0; k < 16; ++k) { row[(lane0 + k) * 4 + j] = half[k]; }
     };
 
     const int warp = tid / 32, lane = tid % 32;
     const int column     = 4 * (warp % 4) + lane / kWideLaneBlocks;
-    const int warp_first = 32 * (warp / 4);                       // first block of the warp in a tile
+    const int warp_first = 16 * (warp / 4);                       // first block of the warp in a tile
     const int first      = warp_first + lane % kWideLaneBlocks;    // this thread's first block in a tile
     const float scale    = rsqrtf(static_cast<float>(kIndexDim));
 
-    uint4 raw[4];
+    uint4 raw[2];
     int key_tile = static_cast<int>(blockIdx.x);
     load_tile(key_tile, raw);
     store_tile(raw, ks);
@@ -883,7 +886,7 @@ void qsa_select(const Tensor& index_q, const Tensor& pooled_pages, const QsaBatc
         const std::int32_t n   = std::min(l.group, columns - begin);
         const ScoreTiles tiles = score_tiles(begin, n, batch.width);
         if (wide) {
-            const int ctas = std::clamp(ceil_div(std::int64_t{sms}, tiles.count), 1,
+            const int ctas = std::clamp(ceil_div(std::int64_t{kWideCtasPerSm} * sms, tiles.count), 1,
                                         std::max(1, ceil_div(max_blocks + 1, kWideBlocks)));
             CUDA_CHECK(pdl::launch_consumer(
                 {dim3(static_cast<unsigned>(ctas), static_cast<unsigned>(tiles.count)), dim3(kWideThreads),
