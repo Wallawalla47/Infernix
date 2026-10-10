@@ -9052,9 +9052,17 @@ flags, the job records, the frames, the weights) was written before gate/up star
 is read after the wait, and every CTA waits, so down's completion implies gate/up's. Bits unchanged
 (logits byte-identical at `--chunk 1` and `4`; real tests pass). End to end (as above, against
 dd03c8136): plain 127.9 → 132.2 tok/s (+3.31 %, pairs +2.76..+3.66 %), MTP 154.1 → 157.6 (+2.26 %,
-pairs +2.18..+2.32 %), identical speculative counts. gate/up stays an ordinary launch: before a wait
-it could read only immutable weights, and its record pointers come from the dispatch, which its
-predecessor (cpu_plan, fetch_plan or the dispatch kernel itself) may still be writing.
+pairs +2.18..+2.32 %), identical speculative counts. The W4A16 pair (`gate_up_kernel_a16`,
+`down_kernel_a16`) follows the same contract: on the uncensored W4A16 artifact plain 125.9 → 129.5
+tok/s (+2.83 %, pairs +2.61..+3.05 %), MTP 141.8 → 144.0 (+1.50 %, pairs +1.41..+1.62 %), identical
+speculative counts.
+
+gate/up stays an ordinary launch. Measured and rejected: the fork route's resident pass as a
+programmatic dependent of the plan kernel before it (`cpu_plan_kernel`/`fetch_plan_kernel` triggering
+at entry, gate/up staging its slice before the wait and waiting before its own trigger; a resident job
+is never a CPU job, so the pass reads nothing the plans write). Dense8, against 166158ff5: plain −0.17 %
+(pairs −0.35..+0.02 %), MTP −0.33 % (all four pairs negative): the early 400-CTA grid takes the SMs
+the plan and the fork stream's staging need.
 
 ### 19.4 On the Gold-Star-Infer runtime contract (2026-10-05)
 
