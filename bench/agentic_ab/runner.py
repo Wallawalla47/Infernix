@@ -362,11 +362,10 @@ class StrataServe:
 
 def write_strata_log(arm_dir):
     """request_log.jsonl in the serve's format from the Strata arm's client rows: Strata's own
-    per-request counters (cache_n = prompt tokens it reused, prompt_n/prompt_ms its prefill,
-    predicted_n/predicted_ms its decode, draft_n/draft_n_accepted its MTP drafts) and the client
-    clock for TTFT. Strata runs one request at a time, so the wait before its prefill is queueing
-    (TTFT - prefill), and every request decodes alone: one decode record per request, with one
-    round per committed token less the accepted drafts."""
+    per-request counters (cache_n = prompt tokens it reused, prompt_n the tokens it prefilled, draft_n /
+    draft_n_accepted its MTP drafts). Only counts are taken: the analysis times every engine on the
+    client clock. A request's rounds are its committed tokens less the accepted drafts (one committed
+    token per round besides the accepted ones, solo or in a batch slot)."""
     rows = []
     with open(os.path.join(arm_dir, "client.jsonl"), encoding="utf-8") as f:
         for ln in f:
@@ -377,9 +376,6 @@ def write_strata_log(arm_dir):
             "environment": {"gpu_name": None}, "source": "Strata client rows"}]
     for o in rows:
         t, u = o["timings"], o.get("usage") or {}
-        ttft = (o["t_first"] - o["t_send"]) if o.get("t_first") else None
-        prefill = (t.get("prompt_ms") or 0.0) / 1000.0
-        decode = (t.get("predicted_ms") or 0.0) / 1000.0
         completion = u.get("completion_tokens") or t.get("predicted_n") or 0
         accepted = t.get("draft_n_accepted") or 0
         rounds = max(0, completion - accepted)
@@ -393,16 +389,8 @@ def write_strata_log(arm_dir):
                                "model_thinking_tokens": (u.get("completion_tokens_details") or {})
                                .get("reasoning_tokens") or 0,
                                "prefix_reuse_path": "strata", "finish_reason": o.get("finish")},
-                    "timings_seconds": {"ttft": ttft, "prefill": prefill, "decode": decode,
-                                        "total": o["t_done"] - o["t_send"]},
-                    "engine_timing": {"queue_wait_seconds": max(0.0, (ttft or 0.0) - prefill)},
                     "speculative": {"accepted_tokens": accepted,
                                     "drafted_tokens": t.get("draft_n") or 0, "rounds": rounds}})
-        if decode > 0 and rounds > 0:
-            out.append({"event": "throughput", "timestamp_unix_ms": stamp,
-                        "decode_batch": {"rounds": rounds, "row_rounds": rounds},
-                        "host_work": {"work_class_seconds": {"decode_device_wait": decode}},
-                        "tokens": {"committed_decode": completion}})
     with open(os.path.join(arm_dir, "request_log.jsonl"), "w", encoding="utf-8") as f:
         for o in out:
             f.write(json.dumps(o) + "\n")
@@ -958,7 +946,7 @@ def main():
               "strata_config": STRATA_CONFIG if strata else None,
               "strata_extra_args": STRATA_EXTRA_ARGS if strata else None,
               # Strata's TTFT can only come from the client clock, so every arm uses it.
-              "client_ttft": strata, "request_timeout_s": REQUEST_TIMEOUT_S}
+              "request_timeout_s": REQUEST_TIMEOUT_S}
     flags = {"treatment": treat_flags, "alt": alt_flags, "control": ctrl_flags}
     failures = []
     run_dirs = []

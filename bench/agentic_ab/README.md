@@ -10,12 +10,15 @@ README-style comparison table covering:
 - **time to first token**, split into continuing-session turns (cache retention) and new long
   prompts (prefill speed);
 - **raw prefill tok/s** on requests that had no cache hit in any arm;
-- **output tok/s** per second of engine decode time, with one request decoding, two requests
-  decoding, and at the run's own batching, each with a 95 % interval, split into engine speed
-  (decode rounds/s) and speculative acceptance (tokens per round).
+- **output tok/s** with one request decoding and at the run's own batching, split into engine
+  speed (decode rounds/s) and speculative acceptance (tokens per round).
 
-Metrics come from each serve's own request log (`--request-log-jsonl`); the client only supplies
-the request classification.
+Every time comes from the client's clock (`time.time()` around each streaming request: send, first
+streamed token, last token), the same way for every engine. Engine-internal timers are not used:
+engines place their boundaries differently (NInfer's prefill timer stopped about 8 ms before
+Infernix's does), so they cannot be compared. Token counts, cache hits and verify rounds come from
+each server's own request log (`--request-log-jsonl`); the client also supplies the request
+classification.
 
 ## Files
 
@@ -163,19 +166,16 @@ from `AB_LAUNCH_BAT` as usual.
 
 Strata writes no request log of this kind, so after its arm the runner writes `request_log.jsonl`
 from the client's rows: prompt and output tokens from each response's `usage`; cached tokens,
-prefill time, decode time and drafts from Strata's per-request `timings` (`cache_n`,
-`prompt_ms`, `predicted_ms`, `draft_n`, `draft_n_accepted`), with verify rounds = output tokens −
-accepted drafts; queue wait = TTFT − prefill time (Strata runs one request at a time); and one
-decode record per request (it never decodes two at once). TTFT comes from the client's clock, and
-in a run with a Strata arm the analyzer takes every arm's TTFT from the client's clock
-(`client_ttft` in `config.json`).
+prefilled tokens and drafts from Strata's per-request `timings` (`cache_n`, `prompt_n`, `draft_n`,
+`draft_n_accepted`), with verify rounds = output tokens − accepted drafts. Only counts are taken;
+times come from the client's clock, as for every arm.
 The report also flags when the client's context guard had to clear old tool results to keep a
 prompt 24K tokens under `--max-context`.
 
 ## Reading the report
 
-- **TTFT** includes queueing: two lanes serve up to seven requests in flight. The report also
-  gives the average queue wait and TTFT without it.
+- **TTFT** is the first streamed token (content, thinking or a tool call) less the send, on the
+  client's clock. It includes queueing behind other requests.
 - **Brackets on the TTFT and cache rows** are 95 % block-bootstrap intervals over stretches of
   10 consecutive requests: how much the number moves with which stretches of the run it
   contains. They cannot show how differently another run would interleave; the combined report
@@ -186,26 +186,20 @@ prompt 24K tokens under `--max-context`.
   prompts** are the resumes, compaction and side calls; prefill speed decides theirs.
 - **Re-prefilled turns** are split into main-session and subagent turns: losing a 100K main
   session costs far more tokens than losing a 15K subagent, so the two tell different stories.
-- **Prefill tok/s with no cache hit** is token-weighted (total prefilled tokens over total
-  prefill time) over requests that had no hit in any arm and prefilled at least 4,096 tokens,
-  with a separate 32K+ row; the per-request table shows them by size.
-- **Output tok/s** is the decode tokens the server committed per second of the engine's own
-  decode time: device wait plus host work of decode rounds, from the serve's ~5 s throughput
-  records. Prefill chunks and idle time do not dilute it, and ngram copies count as output.
-  The *one request* and *two requests* rows use only the records in which every decode round ran
-  that many requests, so a build's batching mix cannot move them. The *all* row takes every decode
-  record at the batching the run produced, so faster prefill that keeps both lanes decoding shows
-  up there. Brackets are 95 % block-bootstrap intervals over ~30 s stretches of decoding: how much
-  the rate moves with which turns happened to decode. A row with less than ~150 s of decoding
-  shows its seconds instead of an interval.
-- **Output tok/s = decode rounds/s × tokens per round.** Rounds/s is the engine's own speed at
-  that batch size (kernels and host work) and varies only a few percent across a run. Tokens per
-  round is speculative acceptance: it moves with what the model happened to write (a file copy
-  accepts several times more than fresh reasoning) and carries most of the interval on output
-  tok/s. Compare rounds/s for engine speed and tokens per round for drafting; each arm samples
-  its own text, so acceptance also differs between repeated runs of one build. The notes give
-  each arm's decode seconds per row and per-request completion over decode wall time, which is
-  what one stream saw, including other lanes' batching and prefill.
+- **Prefill tok/s with no cache hit** is token-weighted (total prefilled tokens over total client
+  TTFT) over the requests that, in every arm, had no cache hit, prefilled at least 4,096 tokens and
+  were sent while no other request was in flight (so no queueing hides in their TTFT), with a
+  separate 32K+ row; the per-request table shows them by size.
+- **Output tok/s** is tokens after the first over the client's time from the first streamed token
+  to the last. The *one request* row uses the requests that streamed with no other request in
+  flight from their first token to their last, so batching and other requests' prefill cannot move
+  them; brackets are 95 % bootstrap intervals over those requests. The *all* row is every streamed
+  token over the time at least one request was streaming, at the batching the run produced: other
+  requests' prefill during that time counts against it, as a user would see it.
+- **Output tok/s = decode rounds/s × tokens per round** (one request decoding). Rounds come from
+  the server's round counts. Tokens per round is speculative acceptance: it moves with what the
+  model happened to write (a file copy accepts several times more than fresh reasoning). Each arm
+  samples its own text, so acceptance also differs between repeated runs of one build.
 - **Output volume** is sampled, not controlled: the notes give each arm's completion and thinking
   totals and how many turns ran into the thinking budget. A few long turns shift cache
   pressure, batching and wall time, so compare seeds before attributing them to a build.

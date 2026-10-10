@@ -63,7 +63,7 @@ def load_jsonl(path):
     return rows
 
 
-def load_arm(run_dir, arm, client_ttft=False):
+def load_arm(run_dir, arm):
     d = os.path.join(run_dir, arm)
     client = load_jsonl(os.path.join(d, "client.jsonl"))
     server = load_jsonl(os.path.join(d, "request_log.jsonl"))
@@ -102,18 +102,17 @@ def load_arm(run_dir, arm, client_ttft=False):
                 "thinking": res.get("model_thinking_tokens") or 0,
                 "path": res.get("prefix_reuse_path") or "unknown",
                 "finish_server": res.get("finish_reason"),
-                "ttft": t.get("ttft"), "prefill_s": t.get("prefill") or 0.0,
-                "decode_s": t.get("decode") or 0.0, "total_s": t.get("total") or 0.0,
-                "queue_s": (s.get("engine_timing") or {}).get("queue_wait_seconds") or 0.0,
-                "end": s["timestamp_unix_ms"] / 1000.0,
+                # Every time is the client's: engines place their own timers differently (NInfer's
+                # prefill timer stopped ~8 ms before Infernix's does), so only the client clock
+                # measures every engine the same way. Token counts and cache hits are the server's.
+                "ttft": (c["t_first"] - c["t_send"]) if c.get("t_first") and c.get("t_send") else None,
+                "stream_s": (c["t_done"] - c["t_first"]) if c.get("t_first") and c.get("t_done") else None,
                 "spec_accepted": spec.get("accepted_tokens") or 0,
                 "spec_drafted": spec.get("drafted_tokens") or 0,
                 "ngram_accepted": spec.get("ngram_accepted_tokens") or 0,
                 "ngram_drafted": spec.get("ngram_drafted_tokens") or 0,
                 "rounds": spec.get("rounds") or 0,
             })
-            if client_ttft:  # a run with a Strata arm: TTFT from the client clock in every arm
-                r["ttft"] = (c["t_first"] - c["t_send"]) if c.get("t_first") else None
         reqs.append(r)
     build = "?"
     serve_log = os.path.join(d, "serve.log")
@@ -148,77 +147,69 @@ def pct(v, p):
     return v[lo] + (v[hi] - v[lo]) * (k - lo)
 
 
-def decode_windows(A):
-    """The serve's throughput records as decode samples.
-
-    Each record covers ~5 s and carries the decode tokens committed in it, the engine's own
-    decode time (device wait + host work of decode rounds, which excludes prefill chunks and
-    idle time), the decode rounds, and the request-rows those rounds ran. A record whose rows
-    equal `b` x its rounds decoded `b` requests in every round."""
-    out = []
-    for o in A["throughput"]:
-        batch = o.get("decode_batch") or {}
-        work = (o.get("host_work") or {}).get("work_class_seconds") or {}
-        rounds, rows = batch.get("rounds") or 0, batch.get("row_rounds") or 0
-        busy = (work.get("decode_device_wait") or 0.0) + (work.get("decode_host") or 0.0)
-        if rounds <= 0 or busy <= 0.0:
-            continue
-        out.append({"t": o.get("timestamp_unix_ms", 0) / 1000.0, "rounds": rounds, "rows": rows,
-                    "tokens": (o.get("tokens") or {}).get("committed_decode", 0), "busy": busy})
-    return sorted(out, key=lambda w: w["t"])
-
-
-BOOTSTRAP_BLOCK = 6        # consecutive 5 s records resampled together (~30 s of decoding)
 BOOTSTRAP_RESAMPLES = 2000
 BOOTSTRAP_MIN_BLOCKS = 5   # fewer blocks than this give no meaningful interval
 
 
-def decode_rate(windows):
-    """Output tok/s of engine decode time, split into engine speed and speculative acceptance.
+def in_flight(A):
+    """Every request's (t_send, t_done) on the client clock, aborted ones included: they occupied the server."""
+    return [(x["t_send"], x["t_done"], x["seed"]) for x in A["requests"] if x.get("t_send") and x.get("t_done")]
 
-    tokens / decode time = decode rounds per second (the engine's speed at this batch size)
-    x tokens per round. Rounds per second is what a build's kernels and host work set; tokens
-    per request-round is how many drafted tokens were accepted, which moves with the text being
-    written (a file copy accepts far more than fresh reasoning) as much as with the drafters.
-    Each is a ratio of sums with a 95 % block-bootstrap interval: consecutive records usually
-    decode the same requests, so they are resampled in blocks, and the interval reflects how much
-    the ratio moves with which turns happened to decode. With fewer than BOOTSTRAP_MIN_BLOCKS
-    blocks an estimate has no interval (`lo`/`hi` are None)."""
-    blocks = [windows[i:i + BOOTSTRAP_BLOCK] for i in range(0, len(windows), BOOTSTRAP_BLOCK)]
-    sums = [{k: sum(w[k] for w in b) for k in ("tokens", "busy", "rounds", "rows")}
-            for b in blocks]
-    ratios = {"tps": ("tokens", "busy"), "rounds_per_s": ("rounds", "busy"),
-              "tokens_per_row_round": ("tokens", "rows")}
+
+def alone_while(spans, seed, t0, t1):
+    """No other request was in flight anywhere in [t0, t1]."""
+    return not any(s != seed and a0 < t1 and a1 > t0 for a0, a1, s in spans)
+
+
+def stream_rate(rows):
+    """Output tok/s of client streams: tokens after the first / seconds from the first token to the last,
+    a ratio of sums with a 95 % bootstrap interval over the requests; with it decode rounds/s (the server's
+    round count, not a timer) and tokens per round."""
+    if not rows:
+        return {"n": 0, "seconds": 0.0, "tps": {"value": None, "lo": None, "hi": None},
+                "rounds_per_s": {"value": None, "lo": None, "hi": None},
+                "tokens_per_row_round": {"value": None, "lo": None, "hi": None}}
+    parts = [((x["completion"] - 1), x["stream_s"], x["rounds"], x["completion"]) for x in rows]
+    ratios = {"tps": (0, 1), "rounds_per_s": (2, 1), "tokens_per_row_round": (3, 2)}
     samples = {k: [] for k in ratios}
     rng = random.Random(0)
-    for _ in range(BOOTSTRAP_RESAMPLES if len(sums) >= BOOTSTRAP_MIN_BLOCKS else 0):
-        drawn = [sums[rng.randrange(len(sums))] for _ in sums]
+    for _ in range(BOOTSTRAP_RESAMPLES if len(parts) >= BOOTSTRAP_MIN_BLOCKS else 0):
+        drawn = [parts[rng.randrange(len(parts))] for _ in parts]
         for k, (num, den) in ratios.items():
-            samples[k].append(sum(b[num] for b in drawn) / sum(b[den] for b in drawn))
-    out = {"seconds": sum(b["busy"] for b in sums), "records": len(windows)}
+            den_sum = sum(p[den] for p in drawn)
+            if den_sum:
+                samples[k].append(sum(p[num] for p in drawn) / den_sum)
+    out = {"n": len(parts), "seconds": sum(p[1] for p in parts)}
     for k, (num, den) in ratios.items():
-        total = sum(b[den] for b in sums)
-        out[k] = {"value": sum(b[num] for b in sums) / total if total else None,
+        total = sum(p[den] for p in parts)
+        out[k] = {"value": sum(p[num] for p in parts) / total if total else None,
                   "lo": pct(samples[k], 0.025), "hi": pct(samples[k], 0.975)}
     return out
 
 
-def decode_metrics(A):
-    """Decode rates by how many requests decoded together, from engine decode time.
+def decode_metrics(A, rows):
+    """Decode rates from the client clock.
 
-    `one` and `two` use only records in which every round decoded one (two) requests, so a
-    build's batching mix cannot move them; `all` is every decode record at the batching the
-    run produced. `two_request_rounds` is the share of decode rounds that ran two requests."""
-    windows = decode_windows(A)
-    rounds = sum(w["rounds"] for w in windows)
-    return {
-        "one": decode_rate([w for w in windows if w["rows"] == w["rounds"]]),
-        "two": decode_rate([w for w in windows if w["rows"] == 2 * w["rounds"]]),
-        "all": decode_rate(windows),
-        "two_request_rounds": (sum(w["rows"] - w["rounds"] for w in windows) / rounds
-                               if rounds else None),
-        "mean_decode_batch": sum(w["rows"] for w in windows) / rounds if rounds else None,
-    }
+    `one`: requests that streamed with no other request in flight from their first token to their last, so
+    batching and other requests' prefill cannot move them. `all`: every streamed token over the time at
+    least one request was streaming, at the batching the run produced."""
+    spans = in_flight(A)
+    streams = [x for x in rows if x.get("stream_s") and x["stream_s"] > 0 and x["completion"] > 1]
+    one = [x for x in streams if alone_while(spans, x["seed"], x["t_first"], x["t_done"])]
+    union, cur = 0.0, None
+    for t0, t1 in sorted((x["t_first"], x["t_done"]) for x in streams):
+        if cur and t0 <= cur[1]:
+            cur[1] = max(cur[1], t1)
+        else:
+            if cur:
+                union += cur[1] - cur[0]
+            cur = [t0, t1]
+    if cur:
+        union += cur[1] - cur[0]
+    tokens = sum(x["completion"] - 1 for x in streams)
+    return {"one": stream_rate(one),
+            "all": {"tps": {"value": tokens / union if union else None, "lo": None, "hi": None},
+                    "seconds": union, "n": len(streams)}}
 
 
 REQUEST_BLOCK = 10         # consecutive requests resampled together for request-metric intervals
@@ -263,7 +254,7 @@ def metrics(A, cold_seeds):
     cont = [r for r in rows if r["cls"] in CONTINUING]
     newl = [r for r in rows if r["cls"] in NEW_LONG]
     cold = [r for r in rows if r["seed"] in cold_seeds]
-    dec = [r for r in rows if r["decode_s"] > 0 and r["completion"] > 1]
+    dec = [r for r in rows if r.get("stream_s") and r["stream_s"] > 0 and r["completion"] > 1]
     copy = [r for r in dec if r["copy"]]
     big = [r for r in cold if r["computed"] >= 32768]
     budget = ((A["start"] or {}).get("server") or {}).get("default_thinking_budget")
@@ -275,8 +266,6 @@ def metrics(A, cold_seeds):
         "ttft_mean": mean([r["ttft"] for r in rows]),
         "ttft_median": median([r["ttft"] for r in rows]),
         "ttft_p90": pct([r["ttft"] for r in rows], 0.9),
-        "service_ttft_mean": mean([r["ttft"] - r["queue_s"] for r in rows]),
-        "queue_mean": mean([r["queue_s"] for r in rows]),
         "ttft_cont_mean": mean([r["ttft"] for r in cont]),
         "ttft_cont_median": median([r["ttft"] for r in cont]),
         "ttft_new_mean": mean([r["ttft"] for r in newl]),
@@ -289,25 +278,24 @@ def metrics(A, cold_seeds):
         "n_cont_main": sum(1 for r in cont if r["cls"] != "subagent_loop"),
         "n_cont_sub": sum(1 for r in cont if r["cls"] == "subagent_loop"),
         "cold_prefill_big": (sum(r["computed"] for r in big) /
-                             sum(r["prefill_s"] for r in big)) if big else None,
+                             sum(r["ttft"] for r in big)) if big else None,
         "n_cold_big": len(big),
-        "decode": decode_metrics(A),
+        "decode": decode_metrics(A, rows),
         "thinking_budget_hits": sum(1 for r in rows if budget and r["thinking"] >= budget),
         "budget_hit_ngram": sum(r["ngram_accepted"] for r in rows
                                 if budget and r["thinking"] >= budget),
         "budget_hit_tokens": sum(r["completion"] for r in rows
                                  if budget and r["thinking"] >= budget),
         "cont_hit_rate": (sum(r["hit"] for r in cont) / max(1, sum(r["prompt"] for r in cont))),
-        "cold_prefill_median": median([r["computed"] / r["prefill_s"] for r in cold if r["prefill_s"]]),
+        "cold_prefill_median": median([r["computed"] / r["ttft"] for r in cold if r["ttft"]]),
         "cold_prefill_aggregate": (sum(r["computed"] for r in cold) /
-                                   max(1e-9, sum(r["prefill_s"] for r in cold))) if cold else None,
+                                   max(1e-9, sum(r["ttft"] for r in cold))) if cold else None,
         "n_cold": len(cold),
-        "output_tps": (sum(r["completion"] for r in dec) / sum(r["decode_s"] for r in dec)) if dec else None,
-        "output_tps_copy": (sum(r["completion"] for r in copy) / sum(r["decode_s"] for r in copy)) if copy else None,
+        "output_tps": (sum(r["completion"] - 1 for r in dec) / sum(r["stream_s"] for r in dec)) if dec else None,
+        "output_tps_copy": (sum(r["completion"] - 1 for r in copy) / sum(r["stream_s"] for r in copy)) if copy else None,
         "n_copy": len(copy),
         "completion_tokens": sum(r["completion"] for r in rows),
         "thinking_tokens": sum(r["thinking"] for r in rows),
-        "decode_seconds": sum(r["decode_s"] for r in rows),
         "spec_accept": (sum(r["spec_accepted"] for r in rows) /
                         max(1, sum(r["spec_drafted"] for r in rows))),
         "ngram_accepted": sum(r["ngram_accepted"] for r in rows),
@@ -417,18 +405,12 @@ def headline_specs(c):
         ("Prefill tok/s, requests with no cache hit, 32K+ tokens", ("cold_prefill_big",), ntok,
          "rel", None),
         ("Output tok/s, one request decoding", ("decode", "one", "tps"), ntok, "rel", None),
-        ("Output tok/s, two requests decoding (combined)", ("decode", "two", "tps"), ntok, "rel",
-         None),
         ("Output tok/s, all decoding at the run's own batching", ("decode", "all", "tps"), ntok,
          "rel", None),
         ("Decode rounds/s, one request decoding (engine speed)",
          ("decode", "one", "rounds_per_s"), f1, "rel", None),
-        ("Decode rounds/s, two requests decoding (engine speed)",
-         ("decode", "two", "rounds_per_s"), f1, "rel", None),
         ("Tokens per round, one request decoding (speculative acceptance)",
          ("decode", "one", "tokens_per_row_round"), f2, "rel", None),
-        ("Decode rounds that ran two requests", ("decode", "two_request_rounds"), ppct, "pp",
-         None),
         ("Workload wall time (min, lower is better)", ("wall_seconds",), f1, "rel", 60.0),
     ]
 
@@ -522,8 +504,8 @@ def cold_table(arms, A, cold_seeds):
          "|---|---|---|" + "---|" * (len(arms) + len(others))]
     base = served[arms[0]]
     for s in sorted(cold_seeds, key=lambda s: base[s]["computed"]):
-        rates = [served[a][s]["computed"] / served[a][s]["prefill_s"]
-                 if served[a][s]["prefill_s"] else None for a in arms]
+        rates = [served[a][s]["computed"] / served[a][s]["ttft"]
+                 if served[a][s]["ttft"] else None for a in arms]
         L.append("| %s | %s | %s | %s | %s |" % (
             base[s]["tag"], base[s]["cls"], ntok(base[s]["computed"]),
             " | ".join(ntok(r) for r in rates), " | ".join(chg(rates[0], r) for r in rates[1:])))
@@ -572,16 +554,17 @@ def pressure_table(arms, ms):
 
 
 def per_request(A):
-    L = ["| Tag | Class | Prompt | Cached | Prefilled | Path | Queue s | TTFT s | Out | Decode tok/s | Finish |",
-         "|---|---|---|---|---|---|---|---|---|---|---|"]
+    L = ["| Tag | Class | Prompt | Cached | Prefilled | Path | TTFT s | Out | Stream tok/s | Finish |",
+         "|---|---|---|---|---|---|---|---|---|---|"]
     for r in sorted(A["requests"], key=lambda r: r.get("t_send") or 0):
         if not r.get("server"):
-            L.append("| %s | %s | | | | | | | | | %s |" % (r["tag"], r["cls"], r["status"]))
+            L.append("| %s | %s | | | | | | | | %s |" % (r["tag"], r["cls"], r["status"]))
             continue
-        L.append("| %s | %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
+        L.append("| %s | %s%s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
             r["tag"], r["cls"], " (copy)" if r["copy"] else "", ntok(r["prompt"]), ntok(r["hit"]),
-            ntok(r["computed"]), r["path"], f1(r["queue_s"]), f2(r["ttft"]), ntok(r["completion"]),
-            ntok(r["completion"] / r["decode_s"]) if r["decode_s"] else "n/a", r["finish_server"]))
+            ntok(r["computed"]), r["path"], f2(r["ttft"]), ntok(r["completion"]),
+            ntok((r["completion"] - 1) / r["stream_s"]) if r.get("stream_s") and r["completion"] > 1 else "n/a",
+            r["finish_server"]))
     return "\n".join(L)
 
 
@@ -655,6 +638,7 @@ def aggregate(out_dir, run_dirs):
             ("Average TTFT (s)", ("ttft_mean",), f1, None),
             ("Output tok/s, one request", ("decode", "one", "tps"), ntok, None),
             ("Decode rounds/s, one request", ("decode", "one", "rounds_per_s"), f1, None),
+            ("Output tok/s, run's own batching", ("decode", "all", "tps"), ntok, None),
             ("Completion tokens", ("completion_tokens",), ntok, None),
             ("Wall time (min)", ("wall_seconds",), f1, 60.0)]
     L.append("| Seed | Arm | %s |" % " | ".join(k[0] for k in keys))
@@ -684,11 +668,15 @@ def main(argv):
     arms = [a for a in ARMS if os.path.exists(os.path.join(run_dir, a, "client.jsonl"))]
     if arms[:1] != ["control"] or len(arms) < 2:
         raise SystemExit("%s needs a control arm and at least one other arm" % run_dir)
-    A = {a: load_arm(run_dir, a, cfg.get("client_ttft", False)) for a in arms}
-    # Matched cold set: requests with no cache hit in EVERY arm and a real prefill.
+    A = {a: load_arm(run_dir, a) for a in arms}
+    # Matched cold set: requests with no cache hit and a real prefill in EVERY arm, sent while no other
+    # request was in flight in every arm, so their client TTFT is prefill (no queueing behind others).
     served = [{r["seed"]: r for r in A[a]["requests"] if r.get("server")} for a in arms]
-    cold = {s for s in served[0] if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096
-                                        for d in served)}
+    spans = {a: in_flight(A[a]) for a in arms}
+    cold = {s for s in served[0]
+            if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096 and d[s]["ttft"]
+                   and alone_while(spans[a], s, d[s]["t_send"], d[s]["t_send"] + 1e-6)
+                   for a, d in zip(arms, served))}
     ms = {a: metrics(A[a], cold) for a in arms}
     summary = dict({"config": cfg, "cold_seeds": sorted(cold)}, **ms)
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -735,43 +723,35 @@ def main(argv):
              "summaries) are byte-identical; assistant turns are each arm's own output fed back, "
              "as an agent client does, so prompt totals differ slightly (tokens: %s)."
              % per_arm(lambda m: m["prompt_tokens"], ntok))
-    L.append("- TTFT includes queueing behind other sessions (the serve runs 2 lanes and up to "
-             "7 requests are in flight). Average queue wait (s): %s; average TTFT without queue "
-             "wait (s): %s."
-             % (per_arm(lambda m: m["queue_mean"], f1),
-                per_arm(lambda m: m["service_ttft_mean"], f2)))
+    L.append("- Every time is the client's clock (time.time() around the streaming request), for every "
+             "engine alike: TTFT is the first streamed token less the send, and includes queueing behind "
+             "other sessions. Engine-internal timers are not used, as engines place their boundaries "
+             "differently.")
     L.append("- Continuing-session turns (%d) are tool-loop turns, retries, the post-idle and "
              "post-history-edit turns: cache retention decides their TTFT. New long prompts (%d) "
              "are resumed sessions, compaction and loop-check calls: prefill speed decides theirs."
              % (c["n_cont"], c["n_new"]))
-    L.append("- \"No cache hit\" prefill rates are token-weighted (total prefilled tokens / "
-             "total prefill time) over the %d requests that had no cache hit in *every* arm and "
-             "prefilled at least 4,096 tokens (%d of them 32K+; per-request table below). The "
-             "per-request median (tok/s) is %s: most of those requests are ~11-17K subagent "
-             "prompts, where the prompt-attention kernel matters least."
+    L.append("- \"No cache hit\" prefill rates are token-weighted (total prefilled tokens / total client "
+             "TTFT) over the %d requests that had no cache hit, prefilled at least 4,096 tokens and were sent "
+             "while no other request was in flight, in *every* arm (%d of them 32K+; per-request table "
+             "below). Per-request median (tok/s): %s."
              % (c["n_cold"], c["n_cold_big"], per_arm(lambda m: m["cold_prefill_median"], ntok)))
-    L.append("- Output tok/s is decode tokens the server committed per second of the engine's "
-             "own decode time (device wait plus host work of decode rounds, from the serve's "
-             "~5 s throughput records), so prefill chunks and idle time do not dilute it. The "
-             "one- and two-request rows use only the records in which every decode round ran "
-             "that many requests (seconds of decode time, one / two requests: %s), so a build's "
-             "batching mix cannot move them; the *all* row is every decode record at the batching "
-             "the run produced (mean decode batch: %s). Brackets are 95 %% block-bootstrap "
-             "intervals over ~30 s stretches of decoding."
-             % (per_arm(lambda m: "%s / %s" % (f1(m["decode"]["one"]["seconds"]),
-                                               f1(m["decode"]["two"]["seconds"]))),
-                per_arm(lambda m: m["decode"]["mean_decode_batch"], f2)))
+    L.append("- Output tok/s is tokens after the first over the client's time from the first streamed token "
+             "to the last. The one-request row uses the requests that streamed with no other request in "
+             "flight (requests / seconds: %s); the *all* row is every streamed token over the time at least "
+             "one request was streaming (seconds: %s). Brackets are 95 %% bootstrap intervals over the "
+             "requests."
+             % (per_arm(lambda m: "%d / %s" % (m["decode"]["one"]["n"], f1(m["decode"]["one"]["seconds"]))),
+                per_arm(lambda m: f1(m["decode"]["all"]["seconds"]))))
     L.append("- Output tok/s = decode rounds/s x tokens per round. Rounds/s is the engine's own "
              "speed and barely moves with the text; tokens per round is speculative acceptance, "
              "which moves with what the model happened to write (file copies accept far more than "
              "fresh reasoning), so it carries most of the interval on output tok/s. Compare "
              "rounds/s for kernel and host speed, and tokens per round for drafting; each arm "
              "samples its own text, so acceptance differs between runs as well as builds. Tokens "
-             "per request-round with two requests decoding: %s. Per-request completion / decode "
-             "wall time (tok/s: %s; file-writing turns: %s) is what one stream saw, including "
-             "other lanes' batching and prefill chunks."
-             % (per_arm(lambda m: m["decode"]["two"]["tokens_per_row_round"]["value"], f2),
-                per_arm(lambda m: m["output_tps"], ntok),
+             "per request-round: the server's round counts. Over every streamed request (tok/s: %s; "
+             "file-writing turns: %s), what one stream saw, including other requests' batching and prefill."
+             % (per_arm(lambda m: m["output_tps"], ntok),
                 per_arm(lambda m: m["output_tps_copy"], ntok)))
     L.append("- Output volume differs because the sampled text does: completion tokens %s "
              "(thinking: %s); turns that used the whole thinking budget: %s (ngram copies "
