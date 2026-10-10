@@ -167,9 +167,9 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   changes a bit.
 - The `infernix-serve` statistics panel's `experts` column shows the expert cache's hit rate over
   the session and the last ten requests.
-- After each request the engine logs two Info lines: the expert cache's hit rate, and the
-  request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits, R NVMe reads, T ms
-  of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
+- After each request the engine logs two Debug lines (`--log-level debug`): the expert cache's
+  hit rate, and the request's n-gram row traffic (`n-gram rows: N requested, H% host-cache hits,
+  R NVMe reads, T ms of reads`, and with speculation `; G gated rounds: R NVMe reads (T ms) behind the gate, the GPU
   waited in W (mean X us)`). The row cache outlives requests, so repeated text hits it, while new
   text reads most of its rows from the volume. Rows missing from that cache are read while the
   GPU starts the round (draft tokens' rows while the verification round starts), so most of that

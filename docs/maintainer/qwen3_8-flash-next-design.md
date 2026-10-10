@@ -8255,6 +8255,17 @@ toggle; off = blind stream, on = gated + CPU split at every width up to 4,096):
 - The large n-gram cost was Linux's serial direct reads: 8 reads in flight against 128 on Windows,
   5.8 s against 0.5 s for a 40K prompt. Kernel AIO fixed it (`read_only_file_posix.cpp`, 9.5x more
   random 4 KiB reads in WSL2).
+- That AIO path created and destroyed its kernel context on every call (`io_setup`, `io_destroy`):
+  ~36 ms per call on Linux 6.18 (WSL2), against ~0.12 ms for one 4 KiB read. Bulk prefill calls hid
+  it, but a decode round reads its rows in a few small calls behind the gate, so Linux decode ran
+  at ~10 rounds/s (issue #7: ~20 tok/s and "n-gram rows behind the gate took 103-139 ms" warnings
+  on an RTX PRO 6000). The file now keeps finished calls' contexts for later calls, one per
+  concurrent caller (2026-10-10). Measured in WSL2 (Linux 6.18, a 4 GiB file on the ext4 volume,
+  random 4 KiB blocks, 300 calls per shape, two passes): a decode-like round of three 20-block calls
+  103 ms -> 0.55-0.58 ms (p99 128-132 -> 0.70-1.02 ms); one call of 1, 24 and 64 blocks 34-42 ms ->
+  0.08, 0.20 and 0.47 ms; a large call (8 threads x 512 blocks) 79-83 -> 9.5-9.8 ms. Merging a
+  round's per-lane calls into one would now save about 0.1 ms (three 20-block calls 0.55 ms, one
+  64-block call 0.47 ms), so they stay separate and keep their per-request accounting.
 
 **Expected gain** (cold cache, CPU rate derated for the DRAM the DMA shares):
 
