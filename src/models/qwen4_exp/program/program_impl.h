@@ -3890,15 +3890,22 @@ private:
         diagnostic(text);
     }
 
-    // ---- the CPU expert team's decode rate (design §19.3.12) ----
-    // Experts per second on one-column jobs (memory-bound, as decode's misses are) for
-    // cpu_expert_workers workers, measured at startup while the link copies records (the staging's
-    // DRAM reads compete with the CPU's). Without records in host memory (the SSD tier) the
-    // i9-13900K's 6-worker rate stands. The prefill CPU split keeps its fitted rates
-    // (ProgramOptions::cpu_split_*_rate): on the measured ones it is not yet qualified.
-    static constexpr double kReferenceCpuExpertRate = 21000.0;
-    double cpu_expert_rate_ = kReferenceCpuExpertRate;
+    // ---- the CPU expert team's rates (design §19.3.12) ----
+    // For cpu_expert_workers workers, measured at startup while the link copies records (the staging's
+    // DRAM reads compete with the CPU's): experts per second on one-column jobs (memory-bound, as
+    // decode's misses are) and expert columns per second on 8-column jobs (the narrow route's widest).
+    // The decode miss divisor and the prefill CPU split both use them. Without records in host memory
+    // (the SSD tier) the reference rates stand (ProgramOptions::cpu_split_*_rate, the i9-13900K at 6
+    // workers).
+    double cpu_expert_rate_ = 0.0; // 0 until measured
+    double cpu_column_rate_ = 0.0;
     void measure_cpu_rate(std::uint64_t record_stride);
+    [[nodiscard]] double cpu_expert_rate() const noexcept {
+        return cpu_expert_rate_ > 0.0 ? cpu_expert_rate_ : options_.cpu_split_expert_rate;
+    }
+    [[nodiscard]] double cpu_column_rate() const noexcept {
+        return cpu_column_rate_ > 0.0 ? cpu_column_rate_ : options_.cpu_split_column_rate;
+    }
 
     // The share of a decode call's misses the PCIe stage keeps, misses / d, from C t (C experts per
     // second on the CPU, t seconds per record on the link): d = floor(1.65 + C t). The balance point
@@ -3912,7 +3919,7 @@ private:
         if (options_.cpu_pcie_divisor > 0) { return options_.cpu_pcie_divisor; }
         const double record_seconds =
             static_cast<double>(parameters_.layers.front().moe.bank->planes.record_stride) / link_bytes_per_second_;
-        return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate_ * record_seconds)));
+        return std::max(1, static_cast<int>(std::floor(1.65 + cpu_expert_rate() * record_seconds)));
     }
 
     // The widest call the prefill CPU split takes (ProgramOptions::cpu_split_columns on the reference
@@ -4202,8 +4209,10 @@ private:
             const std::uint32_t E      = p.c_.moe.experts;
             const std::int32_t* frames = p.residency_->host_table() + static_cast<std::size_t>(layer) * E;
             const double link          = static_cast<double>(p.residency_->frame_stride()) / p.link_bytes_per_second_;
-            const double per_expert    = 1.0 / p.options_.cpu_split_expert_rate;
-            const double per_column    = 1.0 / p.options_.cpu_split_column_rate;
+            // The team's measured rates (cpu_rates.cpp): one-column jobs fix the per-expert cost,
+            // 8-column jobs the per-column cost.
+            const double per_expert    = 1.0 / p.cpu_expert_rate();
+            const double per_column    = 1.0 / p.cpu_column_rate();
             constexpr int kNarrow      = ops::offloaded_moe::kMaxCpuColumns;
             std::array<std::uint32_t, kNarrow + 1> width_count{};
             std::uint32_t absent = 0;
