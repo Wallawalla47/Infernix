@@ -1,7 +1,8 @@
 // Resident routed experts (include/infernix/ops/resident_moe.h). One CTA per (row tile, entry):
 // each warp streams whole weight rows in 16-byte chunks against the entry's activation staged in
-// shared memory as FP32, applies each chunk's FP16 group scale once, and reduces by a fixed
-// butterfly, so an output's bits depend only on the shapes, never on the batch or placement.
+// shared memory as FP32 (swizzled, so lanes on different chunks read different banks), applies each
+// chunk's FP16 group scale once, and reduces by a fixed butterfly, so an output's bits depend only
+// on the shapes, never on the batch or placement.
 #include "infernix/ops/resident_moe.h"
 
 #include "core/device.h"
@@ -30,17 +31,26 @@ void require(bool condition, const char* message) {
 }
 
 // Row-split codecs: one 16-byte chunk holds Q4's 32 or Q8's 16 consecutive codes of one group.
+//
+// Lane l of a warp reads chunks l, l + 32, ... of a row, so with the activation stored in order the
+// lanes' reads of one chunk element are a whole number of banks apart (a 32- or 16-way conflict).
+// The staged activation is swizzled instead: chunk c's float4 q lives at float4 c * kQuads +
+// ((q + c / kChunksPerRow) % kQuads), where a row of 32 banks holds kChunksPerRow chunks. A quarter
+// warp's eight 16-byte reads then fall in eight distinct bank groups. The products and their order
+// are unchanged, so the output bits are too.
 struct Q4 {
-    static constexpr int kCodes = 32, kGroup = 64;
-    __device__ static float chunk_dot(uint4 w, const float* x) {
+    static constexpr int kCodes = 32, kGroup = 64, kQuads = kCodes / 4, kChunksPerRow = 1;
+    __device__ static float chunk_dot(uint4 w, const float4* x, int c) {
         const std::uint32_t words[4] = {w.x, w.y, w.z, w.w};
         float dot = 0.0F;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int q = 0; q < kQuads; ++q) {
+            const float4 v    = x[(q + c / kChunksPerRow) % kQuads];
+            const float xs[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int u = static_cast<int>((words[i] >> (4 * j)) & 0xFU);
-                dot = fmaf(static_cast<float>(u >= 8 ? u - 16 : u), x[8 * i + j], dot);
+            for (int j = 0; j < 4; ++j) {
+                const int u = static_cast<int>((words[q / 2] >> (4 * (4 * (q % 2) + j))) & 0xFU);
+                dot = fmaf(static_cast<float>(u >= 8 ? u - 16 : u), xs[j], dot);
             }
         }
         return dot;
@@ -48,15 +58,27 @@ struct Q4 {
 };
 
 struct Q8 {
-    static constexpr int kCodes = 16, kGroup = 32;
-    __device__ static float chunk_dot(uint4 w, const float* x) {
-        const auto* c = reinterpret_cast<const std::int8_t*>(&w);
-        float dot     = 0.0F;
+    static constexpr int kCodes = 16, kGroup = 32, kQuads = kCodes / 4, kChunksPerRow = 2;
+    __device__ static float chunk_dot(uint4 w, const float4* x, int c) {
+        const auto* codes = reinterpret_cast<const std::int8_t*>(&w);
+        float dot         = 0.0F;
 #pragma unroll
-        for (int i = 0; i < 16; ++i) { dot = fmaf(static_cast<float>(c[i]), x[i], dot); }
+        for (int q = 0; q < kQuads; ++q) {
+            const float4 v    = x[(q + c / kChunksPerRow) % kQuads];
+            const float xs[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { dot = fmaf(static_cast<float>(codes[4 * q + j]), xs[j], dot); }
+        }
         return dot;
     }
 };
+
+// Element i of the staged activation, at its swizzled position (in floats).
+template <class Codec>
+__device__ int staged_index(int i) {
+    const int c = i / Codec::kCodes, q = i % Codec::kCodes / 4;
+    return c * Codec::kCodes + 4 * ((q + c / Codec::kChunksPerRow) % Codec::kQuads) + i % 4;
+}
 
 struct Bank {
     const std::uint8_t* codes;
@@ -64,7 +86,8 @@ struct Bank {
     int padded_k;
 };
 
-// Dot product of row `row` of a bank with the FP32 vector x (K = padded_k), reduced over the warp.
+// Dot product of row `row` of a bank with the staged (swizzled) FP32 vector x (K = padded_k), reduced
+// over the warp.
 template <class Codec>
 __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int lane) {
     const int chunks       = bank.padded_k / Codec::kCodes;
@@ -75,7 +98,7 @@ __device__ float row_dot(const Bank& bank, std::int64_t row, const float* x, int
     for (int c = lane; c < chunks; c += 32) {
         const uint4 w     = __ldcs(chunks_row + c);
         const float scale = __half2float(__ldg(scale_row + c * Codec::kCodes / Codec::kGroup));
-        sum               = fmaf(Codec::chunk_dot(w, x + c * Codec::kCodes), scale, sum);
+        sum = fmaf(Codec::chunk_dot(w, reinterpret_cast<const float4*>(x) + c * Codec::kQuads, c), scale, sum);
     }
     for (int offset = 16; offset > 0; offset >>= 1) { sum += __shfl_xor_sync(0xFFFFFFFFU, sum, offset); }
     return sum;
@@ -85,12 +108,12 @@ template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     gate_up_kernel(const bf16* __restrict__ x, const std::int32_t* __restrict__ ids, int top_k, int hidden,
                    int intermediate, Bank bank, float* __restrict__ h) {
-    __shared__ float xs[kMaxHidden];
+    __shared__ __align__(16) float xs[kMaxHidden];
     const int entry = static_cast<int>(blockIdx.y);
     const int t     = entry / top_k;
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        xs[i] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
+        xs[staged_index<Codec>(i)] = i < hidden ? __bfloat162float(x[static_cast<std::int64_t>(t) * hidden + i]) : 0.0F;
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
@@ -108,11 +131,11 @@ template <class Codec>
 __global__ void __launch_bounds__(kThreads)
     down_kernel(const float* __restrict__ h, const std::int32_t* __restrict__ ids, int hidden, int intermediate,
                 Bank bank, bf16* __restrict__ out) {
-    __shared__ float hs[kMaxIntermediate];
+    __shared__ __align__(16) float hs[kMaxIntermediate];
     const int entry = static_cast<int>(blockIdx.y);
     const int e     = ids[entry];
     for (int i = static_cast<int>(threadIdx.x); i < bank.padded_k; i += kThreads) {
-        hs[i] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
+        hs[staged_index<Codec>(i)] = i < intermediate ? h[static_cast<std::int64_t>(entry) * intermediate + i] : 0.0F;
     }
     __syncthreads();
     const int lane = static_cast<int>(threadIdx.x % 32), warp = static_cast<int>(threadIdx.x / 32);
