@@ -488,20 +488,31 @@ class LazyLRFU(Sim):
             self.touched = set()
 
 
+COUNT_FLOOR = 1.0 / 1024.0   # halved counts below this become 0 (LfruPolicy::kCountFloor)
+ENGINE_HALVING = 8192        # the engine's period (ExpertResidency::kLfruHalvingPeriod)
+
+
 class LFRU(Sim):
     """Zhang (arXiv 2608.07911): score = f / (clock - last + 1), f a global count never reset on eviction;
-    evict the lowest score among non-current residents; admit every miss. Clock in layer-call ticks."""
+    evict the lowest score among non-current residents; admit every miss. Clock in layer-call ticks. With
+    `halving` > 0 every count halves exactly each that many ticks (the engine's LfruPolicy, operation for
+    operation in binary64)."""
     name = 'LFRU f/(age+1)'
 
-    def __init__(self, cap):
+    def __init__(self, cap, halving=0):
         super().__init__(cap)
-        self.res = set(); self.f = defaultdict(int); self.last = {}; self.t = 0
+        self.res = set(); self.f = defaultdict(float); self.last = {}; self.t = 0; self.halving = halving
+        if halving:
+            self.name = f'LFRU f/(age+1), halving {halving}'
         self.trace = None   # set to a list to record (group, victims) for conformance fixtures
 
     def step_group(self, g, score):
         self.t += 1; gs = set(g); miss = []
+        if self.halving and self.t % self.halving == 0:
+            for k, c in self.f.items():
+                self.f[k] = 0.0 if c * 0.5 < COUNT_FLOOR else c * 0.5
         for k in g:
-            self.f[k] += 1; self.last[k] = self.t
+            self.f[k] += 1.0; self.last[k] = self.t
             if k in self.res: self.hits += score
             else: miss.append(k)
         self.miss += score * len(miss)
@@ -564,7 +575,7 @@ def main():
     for cap in (int(x) for x in args.capacities.split(',')):
         print(f'\n=== capacity {cap} slots ({cap / (L * E):.1%} of {L * E} experts)')
         print(f'{"policy":66s} {"hit":>6s} {"miss/tok":>9s} {"promo/tok":>9s}')
-        policies = [LRU(cap), LFRU(cap), LRUPerLayer(cap), SLRU(cap), ARC(cap), LRU2(cap), S3FIFO(cap),
+        policies = [LRU(cap), LFRU(cap), LFRU(cap, ENGINE_HALVING), LRUPerLayer(cap), SLRU(cap), ARC(cap), LRU2(cap), S3FIFO(cap),
                     SIEVE(cap), DecayedLFU(cap), WTinyLFU(cap), StrataExchange(cap, warm_counts),
                     LazyLRFU(cap, warm_counts, 128, 0.5, 32), StaticHindsight(cap, scored_counts),
                     Belady(cap, nxt, False), Belady(cap, nxt, True)]

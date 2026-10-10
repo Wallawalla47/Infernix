@@ -37,17 +37,21 @@ struct ResidencyEntry {
 // ---------------------------------------------------------------------------- LFRU
 
 // Zhang (arXiv 2608.07911): score = f / (now - last + 1) with f a global use count that is never
-// reset on eviction; the clock advances once per routed layer call. Victims are the lowest
-// (score, key) residents outside the current group, scores compared as IEEE binary64, which is
-// what tools/expert_cache_replay's LFRU does, decision for decision.
+// reset on eviction; the clock advances once per routed layer call. With a halving period every
+// count halves exactly (a binary64 fraction; below kCountFloor it becomes 0) each that many ticks,
+// so f weighs recent use. Victims are the lowest (score, key) residents outside the current group,
+// scores compared as IEEE binary64, which is what tools/expert_cache_replay's LFRU does, decision
+// for decision.
 class LfruPolicy {
 public:
     // Which missing keys may be admitted (the SSD tier: only keys with a host copy can be loaded).
     // Every routed key counts as used either way.
     using Admissible = std::function<bool(std::uint32_t)>;
 
-    // halving_period > 0 halves every count each that many ticks (design §9.3, untested default).
+    // halving_period > 0 halves every count each that many ticks (design §9.3).
     LfruPolicy(std::uint32_t num_keys, std::uint32_t capacity, std::uint32_t halving_period = 0);
+    // Halved counts below this become 0 (they never reach subnormals, which would slow the scan).
+    static constexpr double kCountFloor = 1.0 / 1024.0;
 
     struct Step {
         std::vector<std::uint32_t> hits;
@@ -76,7 +80,7 @@ public:
     [[nodiscard]] std::uint32_t capacity() const { return capacity_; }
     [[nodiscard]] std::uint64_t now() const { return now_; }
     [[nodiscard]] double score(std::uint32_t key) const;
-    [[nodiscard]] std::uint32_t count(std::uint32_t key) const { return count_[key]; }
+    [[nodiscard]] double count(std::uint32_t key) const { return count_[key]; }
     [[nodiscard]] std::uint32_t num_keys() const { return static_cast<std::uint32_t>(count_.size()); }
     [[nodiscard]] std::span<const std::uint32_t> residents() const { return residents_; }
 
@@ -99,13 +103,13 @@ private:
     std::uint32_t capacity_;
     std::uint32_t halving_period_;
     std::uint64_t now_ = 0;
-    std::vector<std::uint32_t> count_;
+    std::vector<double> count_; // binary64 uses, halved in place (replay.py does the same operations)
     std::vector<std::uint64_t> last_;
     std::vector<std::uint32_t> slot_;      // index into residents_, or kNone
     std::vector<std::uint32_t> residents_; // dense list of resident keys
-    // count_ and last_ of residents_[i] at i, as doubles, so a victim search is one contiguous
-    // floating-point loop. Both are integers below 2^53, so they and now_ - last_ + 1 are exact in
-    // binary64 and every score equals score()'s.
+    // count_ and last_ of residents_[i] at i, so a victim search is one contiguous floating-point
+    // loop. last_ is an integer below 2^53, so it and now_ - last_ + 1 are exact in binary64 and
+    // every score equals score()'s.
     std::vector<double> resident_count_;
     std::vector<double> resident_last_;
     std::vector<std::uint8_t> mark_;       // scratch: keys of the current group
@@ -195,9 +199,9 @@ public:
         std::uint64_t serial = 0; // kCopy: this load's serial (complete_load)
     };
 
-    // `frames` backed now, up to `max_frames` (0: no growth).
+    // `frames` backed now, up to `max_frames` (0: no growth); `halving_period` as LfruPolicy's.
     CacheController(std::uint32_t num_keys, std::uint32_t frames, std::uint32_t slack_frames,
-                    std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0);
+                    std::uint32_t rounds_in_flight, std::uint32_t max_frames = 0, std::uint32_t halving_period = 0);
 
     // The route log of one layer call. `round_started` is the agent's latest sample.
     void on_route(std::span<const std::uint32_t> group, std::uint64_t round_started,

@@ -66,6 +66,9 @@ public:
     // decode or verification round, the round's forked MoE calls copy their first staged misses
     // into them instead of staging slots, and the round's settle adopts them as resident.
     static constexpr std::uint32_t kLandingSlots = 16;
+    // LFRU counts halve every this many ticks (layer calls, ~170 plain rounds; design §9.3): on
+    // greedy decode traces of 14 mixed requests, 9-12 % fewer misses than never halving.
+    static constexpr std::uint32_t kLfruHalvingPeriod = 8192;
 
     using SavedState = expert_cache::SavedState;
     [[nodiscard]] SavedState saved_state() const;
