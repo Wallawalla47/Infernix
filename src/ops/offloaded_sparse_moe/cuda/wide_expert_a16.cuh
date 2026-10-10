@@ -324,8 +324,11 @@ void launch_a16(const Call& call, std::int32_t pass, const Epilogue& epilogue, c
     constexpr int bytes   = static_cast<int>(sizeof(StorageA16));
     constexpr auto kernel = grouped_kernel_a16<M, Epilogue>;
     static const bool configured = [] {
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+        CUDA_CHECK(cudaFuncSetAttribute(grouped_kernel_a16<M, Epilogue>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(sizeof(StorageA16))));
+        CUDA_CHECK(cudaFuncSetAttribute(grouped_kernel_a16<M, Epilogue>,
+                                        cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));
         return true;
     }();
