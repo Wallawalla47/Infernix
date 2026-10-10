@@ -3139,7 +3139,16 @@ As built, which differs from §11.2 where noted:
 - **Experts all resident instead of a pool.** The 512 routed experts are `q4_g64_fp16` (1.34 GB)
   and always in VRAM, so routing is exact and no residency-bounded approximation exists. A new
   Op, `resident_moe_experts`, streams each selected expert's rows (Q4 or Q8 row-split codecs,
-  FP32 accumulation, FP32 SwiGLU); FP64-oracle test `infernix_resident_moe_test`.
+  FP32 accumulation, FP32 SwiGLU); FP64-oracle test `infernix_resident_moe_test`. Lane l reads
+  chunks l, l + 32, ... of a row, so the activation is staged in shared memory **swizzled** per
+  chunk; stored in order, every product's read was a 32-way (Q4) or 16-way (Q8) bank conflict
+  and the Op ran at ~200 GB/s. With the swizzle the products and their order are unchanged (the
+  output bits are identical) and one draft step's call (T = 1, 10 experts, L2 cold,
+  `infernix_resident_moe_bench`) takes 29.2 µs instead of 128.1 µs (Q4; Q8 47.1 instead of
+  70.8). End to end (2026-10-10, Dense8, INT8 KV, MTP 4 drafts with the proposal head,
+  pg1024+256 on corpus text, 4 old/new pairs × 3 reps): decode 144.1 → 146.5 tok/s, +1.61 to
+  +1.70 % per pair, identical speculative counts. Issuing all of a warp's weight loads before its
+  products measured slower (37.5 µs; more registers, fewer resident warps).
 - **Real QSA attention**, not Strata's dense window: the drafter's KV layer is a 13th layer of
   every page group, read through the same block tables; its tails are a 13th slab.
 - **Cells.** Prefill chunks write the drafter's K/V for every cell whose next token is known, from
