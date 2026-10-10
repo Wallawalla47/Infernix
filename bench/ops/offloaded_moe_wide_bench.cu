@@ -5,7 +5,9 @@
 // experts are wide over several 64-column tiles and the tail stays narrow), then times one
 // moe_experts call as the prefill path issues it: 64 staging slots with the double-buffered
 // overlap stream. Experts with more than eight columns take the wide route; the rest the narrow
-// one. Placement:
+// one (decode shapes, T <= 4, take the one-column narrow kernels). --cold flushes the L2 before each
+// call, as decode finds a layer's experts (a small T's few experts would otherwise stay L2-resident
+// across repeats). Placement:
 //   frames : every record in device memory (isolates the expert kernels);
 //   staged : every record in the pinned host bank, staged through the slots each call
 //            (the cold-layer case, bound by the staging copy).
@@ -13,7 +15,7 @@
 // the experts W4A16 arithmetic (no input scales, design §16.2.1).
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
-//                                   [--activation a4|a16] [--warmup 3] [--repeat 10] [--seed N]
+//                                   [--activation a4|a16] [--cold] [--warmup 3] [--repeat 10] [--seed N]
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -30,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -53,6 +56,7 @@ struct Options {
     int repeat            = 10;
     std::uint32_t seed    = 20261004U;
     bool a16              = false;
+    bool cold             = false;
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -87,6 +91,8 @@ Options parse_options(int argc, char** argv) {
             const std::string v = value();
             if (v != "a4" && v != "a16") { throw std::invalid_argument("--activation takes a4 or a16"); }
             options.a16 = v == "a16";
+        } else if (arg == "--cold") {
+            options.cold = true;
         } else if (arg == "--seed") {
             options.seed = static_cast<std::uint32_t>(std::stoul(value()));
         } else {
@@ -214,7 +220,7 @@ struct Fixture {
     }
 };
 
-void run_point(Fixture& fixture, int tokens, const Options& options, cudaStream_t stream) {
+void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2FlushBuffer* flush, cudaStream_t stream) {
     std::mt19937 rng(options.seed + static_cast<std::uint32_t>(tokens));
     const int entries = kTopK * tokens;
     const auto logits = routing_logits(rng, tokens);
@@ -253,14 +259,23 @@ void run_point(Fixture& fixture, int tokens, const Options& options, cudaStream_
         const ops::MoeExpertSource source = fixture.source(staged);
         Tensor tx(x.p, DType::BF16, {moe::kHidden, tokens});
         Tensor out(outputs.p, DType::BF16, {moe::kHidden, entries});
-        const auto timing = bench::measure_launch(
-            [&](cudaStream_t s) { ops::moe_experts(tx, dispatch, source, kTopK, max_jobs, workspace.p, out, s); },
-            stream, options.warmup, options.repeat);
+        const auto launch = [&](cudaStream_t s) {
+            ops::moe_experts(tx, dispatch, source, kTopK, max_jobs, workspace.p, out, s);
+        };
+        const auto timing = options.cold ? bench::measure_cold_launch(launch, *flush, stream, options.warmup, options.repeat)
+                                         : bench::measure_launch(launch, stream, options.warmup, options.repeat);
         const double tflops = kExpertFlops * wide_entries / (timing.median_us * 1e-6) / 1e12;
+        // FNV-1a of the outputs: equal hashes mean bit-identical results across kernel versions.
+        std::vector<std::uint8_t> bytes(outputs.bytes);
+        CUDA_CHECK(cudaMemcpy(bytes.data(), outputs.p, outputs.bytes, cudaMemcpyDeviceToHost));
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (const std::uint8_t b : bytes) { hash = (hash ^ b) * 1099511628211ULL; }
         std::printf("T=%5d placement=%-6s experts used %3d (wide %3d, narrow %3d, largest %4d) wide entries %6d of %6d | "
-                    "moe_experts median %9.1f us (min %9.1f, p95 %9.1f) | x48 layers %7.3f s | wide %.1f TFLOP/s\n",
+                    "moe_experts median %9.1f us (min %9.1f, p95 %9.1f) | x48 layers %7.3f s | wide %.1f TFLOP/s | "
+                    "output fnv1a %016llx\n",
                     tokens, staged ? "staged" : "frames", used, wide_experts, narrow_experts, largest, wide_entries,
-                    entries, timing.median_us, timing.min_us, timing.p95_us, timing.median_us * 48e-6, tflops);
+                    entries, timing.median_us, timing.min_us, timing.p95_us, timing.median_us * 48e-6, tflops,
+                    static_cast<unsigned long long>(hash));
     }
 }
 
@@ -270,10 +285,13 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         DeviceContext context;
-        std::printf("# gpu=%s timed=moe_experts (routing and dispatch untimed) activation=%s staging_slots=%d\n",
-                    context.props.name, options.a16 ? "a16" : "a4", kStagingSlots);
+        std::printf("# gpu=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s staging_slots=%d\n",
+                    context.props.name, options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4",
+                    kStagingSlots);
         Fixture fixture(options.seed, options.a16);
-        for (const int tokens : options.tokens) { run_point(fixture, tokens, options, context.stream); }
+        std::unique_ptr<bench::L2FlushBuffer> flush;
+        if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
+        for (const int tokens : options.tokens) { run_point(fixture, tokens, options, flush.get(), context.stream); }
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "infernix_offloaded_moe_wide_bench: %s\n", error.what());
