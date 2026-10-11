@@ -41,8 +41,8 @@ Setup and tuning: the [Qwen3.8-Flash-Next guide](docs/qwen3_8-flash-next.md).
 - **Hybrid prefix cache** built for Qwen's linear-attention layers: KV cached by content in 64-token
   blocks, snapshots of the recurrent state at the points that get reused, and three tiers (GPU,
   host RAM, and a file that survives restarts). In an agentic workload it serves 85 % of prompt
-  tokens from cache against NInfer's 79 %, reaches the first token 30 % sooner on average and halves
-  the median ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
+  tokens from cache against NInfer's 79 %, reaches the first token a third sooner on average and
+  more than halves the median ([benchmarks](#qwen38-27b-infernix-vs-ninfer)).
 - **Faster prefill**: 1.4-1.5× NInfer's on long prompts (FlashAttention-2 style INT8 prompt
   attention, FP4/FP8 Tensor Core paths, wave-aligned chunks).
 - **Faster decode**: DFlash2 tree verification and n-gram copy drafting alongside DFlash2 and MTP.
@@ -88,7 +88,7 @@ sessions (latest, first, first, latest), pooled per build; the other engine runs
 agentic replay ([`bench/agentic_ab`](bench/agentic_ab/README.md)) interleaves three coding-agent
 sessions and eleven subagents with tool calls, compactions, retries and aborts, up to eight
 requests in flight, sampling at temperature 1.0, at half length (68 requests per seed); cells are
-means over three seeds with the range in brackets.
+means over the seeds with the range in brackets.
 
 ### Qwen3.8-Flash-Next-NVFP4: Infernix vs Strata
 
@@ -112,8 +112,8 @@ which made the walk stream the uncached experts again. At 8K the first latest-bu
 ran straight after another GPU job, was the slowest (2.06-2.10 s); the second took 1.92 s, against
 1.91-1.97 s for the first release.
 
-**Agentic replay** (Strata 0.1.42 with `"parallel": 2` and `--batch-mtp`, so that both engines
-serve two requests at once):
+**Agentic replay** (three seeds; Strata 0.1.42 with `"parallel": 2` and `--batch-mtp`, so that both
+engines serve two requests at once):
 
 | Metric | Strata | Infernix | Infernix first release | Infernix vs Strata | vs first release |
 |---|---:|---:|---:|---:|---:|
@@ -154,26 +154,28 @@ is level (59.5 tok/s against 58.9 at 230K, 79.7 against 78.9 at 8K). NInfer kept
 cached through the two 230K prompts that followed it (a repeat took 0.29 s); Infernix had evicted
 it (0.85 s).
 
-**Agentic replay** (`--max-context 150000` for every engine: the largest at which NInfer starts
-with two requests and DFlash2 on 32 GB):
+**Agentic replay** (five seeds; `--max-context 150000` for every engine: the largest at which
+NInfer starts with two requests and DFlash2 on 32 GB):
 
 | Metric | NInfer | Infernix | Infernix first release | Infernix vs NInfer | vs first release |
 |---|---:|---:|---:|---:|---:|
-| Average time to first token | 3.6 s (3.2-4.1) | **2.5 s** (2.0-2.9) | 2.6 s (2.5-2.7) | −30 % | −4 % |
-| Median time to first token | 0.97 s (0.93-1.00) | 0.45 s (0.43-0.50) | **0.43 s** (0.41-0.46) | −53 % | +5 % |
-| 90th-percentile time to first token | 10.0 s (9.3-11.4) | **7.7 s** (5.0-10.0) | 8.8 s (8.1-9.7) | −24 % | −12 % |
-| Prompt tokens served from cache | 79.1 % (78.7-79.4) | 85.4 % (85.0-85.6) | **85.5 %** (85.3-85.6) | +6.3 points | −0.1 points |
-| Prompt tokens prefilled | 560K | 396K | **394K** | −29 % | +0.4 % |
-| Prefill tok/s, requests with no cache hit | 5,132 | **7,175** | 7,112 | +40 % | +1 % |
-| Output tok/s, one request decoding | 190 (189-192) | 197 (195-201) | **203** (201-205) | +4 % | −3 % |
-| Output tok/s, at the run's own batching | 223 (222-225) | 257 (254-261) | **260** (245-278) | +15 % | −1 % |
-| Workload wall time | 6.7 min (6.2-7.5) | **5.9 min** (5.6-6.5) | 6.2 min (5.9-6.7) | −11 % | −5 % |
+| Average time to first token | 4.1 s (3.2-5.0) | 2.8 s (2.0-3.2) | **2.5 s** (2.3-2.7) | −33 % | +12 % |
+| Median time to first token | 1.10 s (0.93-1.58) | 0.43 s (0.38-0.50) | **0.41 s** (0.35-0.46) | −59 % | +5 % |
+| 90th-percentile time to first token | 12.1 s (9.3-15.2) | 8.4 s (5.0-10.1) | **8.1 s** (6.3-9.7) | −30 % | +4 % |
+| Prompt tokens served from cache | 79.2 % (78.7-79.4) | **85.4 %** (85.0-85.6) | **85.4 %** (85.0-85.6) | +6.2 points | 0 points |
+| Prompt tokens prefilled | 562K | **398K** | 399K | −29 % | −0.2 % |
+| Prefill tok/s, requests with no cache hit | 5,228 | **7,193** | 7,150 | +38 % | +1 % |
+| Output tok/s, one request decoding | 193 (189-202) | **202** (195-213) | 200 (194-205) | +5 % | +1 % |
+| Output tok/s, at the run's own batching | 231 (222-250) | **261** (254-269) | 254 (240-278) | +13 % | +3 % |
+| Workload wall time | 7.1 min (6.2-8.0) | **6.2 min** (5.6-6.6) | 6.3 min (5.9-6.7) | −13 % | −2 % |
 
-Against the first release, one-request decode is 3 % lower on all three seeds while the engine's
-rounds per second are level (62.5 against 62.7): fewer drafted tokens were accepted on these
-sampled outputs (3.16 against 3.23 per round), whereas on the greedy prompts above both builds
-accept the same. Wall time also depends on how much each run wrote (63-84K output tokens per seed
-and arm). Quality is level: on the repository's 1.04M-token perplexity corpus (16K
+Against the first release the engine does the same work at the same speed: each request's prompt
+takes the engine 0.74 s on average on both builds, and the requests hold a lane for 2,253 s in all
+against 2,277 s (5.16 against 5.22 ms per output token). The higher time to the first token is time
+spent waiting for one of the two lanes (2.03 s against 1.81 s per request, more on four of the five
+seeds), which depends on how long the sampled replies ahead of a request ran: both builds wrote
+390K output tokens in all, but in different turns (67-88K per seed). Wall time depends on it too.
+Quality is level: on the repository's 1.04M-token perplexity corpus (16K
 context, INT8 KV cache) Infernix scores 4.468 against 4.479 for NInfer (`master` at `81c8ce09` with
 the Windows port).
 
