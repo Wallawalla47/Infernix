@@ -1835,6 +1835,18 @@ public:
         return timing;
     }
 
+    // The request's cumulative speculative work, which the Engine differences per commit into its
+    // live counters. The round's drafts and acceptance were counted when it was submitted. Without
+    // speculation (max_width_ == 1) every plain round still counts a fallback step in the request's
+    // stats; that is no speculative work, so the live counters stay at zero.
+    CommitRowResult::SpeculativeCounters speculative_counters(const SpeculativeStats& stats) const noexcept {
+        if (max_width_ <= 1) { return {}; }
+        return {.rounds          = stats.rounds,
+                .drafted_tokens  = stats.drafted_tokens,
+                .accepted_tokens = stats.accepted_tokens,
+                .fallback_steps  = stats.fallback_steps};
+    }
+
     CommitResult commit(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions) {
         if (ContractAccess::owner(pending) != this || ContractAccess::transaction(pending) != pending_transaction_ ||
             pending_transaction_ == 0) {
@@ -1855,6 +1867,7 @@ public:
             Lane& lane       = lanes_[index];
             const auto& d    = decisions[row];
             if (commit != nullptr) { commit[row] = 0; }
+            out.rows[row].speculative_counters = speculative_counters(lane.speculative);
             if (d.cancelled) {
                 if (catch_up && lane.mtp_live) {
                     // MR2: decode() advanced the state past the round's position at submission and
@@ -3370,6 +3383,7 @@ private:
             const auto& d    = decisions[static_cast<std::size_t>(row)];
             fold_rows[row]   = {static_cast<std::int32_t>(index), static_cast<std::int32_t>(index), 0};
             commit[row]      = 0;
+            out.rows[row].speculative_counters = speculative_counters(lane.speculative);
             if (d.cancelled) {
                 lane.constraint_round.clear();
                 out.rows[row].timings     = timings(lane);
