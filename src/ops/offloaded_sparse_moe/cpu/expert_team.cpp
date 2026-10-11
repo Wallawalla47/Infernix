@@ -246,7 +246,7 @@ void CpuExpertTeam::worker_main(int w) {
     }
 }
 
-void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, Heartbeat heartbeat) {
+void CpuExpertTeam::run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat heartbeat) {
     if (jobs.empty()) { return; }
     if (static_cast<int>(jobs.size()) > max_jobs_) { throw std::invalid_argument("CpuExpertTeam: too many jobs"); }
     for (const auto& job : jobs) {
