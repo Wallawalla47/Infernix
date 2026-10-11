@@ -83,7 +83,7 @@ HOST = os.environ.get("AB_HOST", "127.0.0.1")
 PORT = int(os.environ.get("AB_PORT", "8080"))
 OUT_ROOT = os.environ.get("AB_OUT", os.path.join(REPO, "profiles", "bench", "agentic_ab"))
 # Context candidates below the bat's own value, tried in order when the control cannot start.
-CTX_FALLBACKS = [200000, 180000, 170000, 160000]
+CTX_FALLBACKS = [200000, 180000, 170000, 160000, 150000, 140000, 131072]
 AGENT_MAX_TOKENS = 64000   # what the production clients request on every agent turn
 # Per-request client timeout; a one-request-at-a-time engine queues the workload's concurrent requests.
 REQUEST_TIMEOUT_S = int(os.environ.get("AB_REQUEST_TIMEOUT_S", "1200"))
