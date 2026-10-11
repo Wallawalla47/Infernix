@@ -395,16 +395,6 @@ void PrefixCache::poll() {
             (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
             index_->supersede(*c.capture.supersedes, c.capture.continuation);
         }
-        // The lineage's previous capture published before this one (captures publish in order).
-        if (c.capture.supersedes_capture != 0) {
-            if (const auto previous = published_.find(c.capture.supersedes_capture); previous != published_.end()) {
-                const pc::SnapshotRef earlier = previous->second.snapshot;
-                if (earlier.valid() && index_->valid(earlier) && (!result.snapshot.valid() || earlier != result.snapshot)) {
-                    index_->supersede(earlier);
-                }
-                published_.erase(previous); // kept for this resolution (ProgramImpl::prefix_capture)
-            }
-        }
         if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
         published_[c.capture.id] = result;
         for (cudaEvent_t event : c.events) { recycle(event); }

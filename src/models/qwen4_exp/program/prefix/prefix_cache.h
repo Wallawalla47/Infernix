@@ -156,9 +156,6 @@ public:
         double claim = 0.0; // the new snapshot's estimate_priority
         StateImageHeader meta;
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
-        // The lineage's previous capture (its id), superseded when this one publishes: captures publish
-        // in order, so the previous one's snapshot is known then even when it was still in flight here.
-        std::uint64_t supersedes_capture = 0;
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
         // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
         std::vector<TokenId> continuation;

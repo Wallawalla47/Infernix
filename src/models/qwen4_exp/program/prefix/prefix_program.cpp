@@ -563,7 +563,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     // The slot no longer holds the endpoint image once anything is admitted into it.
     prefix_->forget_capture(lane.prefix.resident_capture);
     lane.prefix.resident_capture = 0;
-    lane.prefix.lineage_capture  = 0;
+    lane.prefix.captured         = false;
     if (!s.snapshot) { reset_slot(index); }
     // The block table: shared cache pages, then the private leases.
     std::vector<DeviceKVPageHandle> handles;
@@ -747,11 +747,10 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
 }
 
 void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F) {
-    // The lineage's previous capture stays known until this one publishes and supersedes it.
-    if (lane.prefix.capture != lane.prefix.lineage_capture) { prefix_->forget_capture(lane.prefix.capture); }
-    lane.prefix.capture         = id;
-    lane.prefix.lineage_capture = id;
-    lane.prefix.deepest         = F;
+    prefix_->forget_capture(lane.prefix.capture);
+    lane.prefix.capture  = id;
+    lane.prefix.captured = true;
+    lane.prefix.deepest  = F;
 }
 
 prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uint32_t F, pc::SnapshotKind kind,
@@ -779,12 +778,10 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
                     });
     c.meta.mtp_accept = lane.mtp_accept;
-    // The lineage's previous snapshot serves only requests diverging before this one: this request's
-    // last capture (resolved when this one publishes: it may still be in flight), else the snapshot
-    // it resumed from (never an earlier request's capture on the slot).
-    if (lane.prefix.lineage_capture != 0) {
-        c.supersedes_capture = lane.prefix.lineage_capture;
-    } else if (lane.prefix.resume) {
+    // The request's first capture supersedes the snapshot it resumed from, which then serves only
+    // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
+    // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
+    if (!lane.prefix.captured && lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
         if (prefix_->index().valid(*lane.prefix.resume)) {
             const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
