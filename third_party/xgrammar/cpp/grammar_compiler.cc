@@ -423,7 +423,9 @@ int GetPossibleTokenIntervals(
             IntStringPairComparator()
         ) -
         sorted_decoded_vocab.begin();
-    possible_intervals.emplace_back(interval_left_end, sorted_decoded_vocab.size());
+    possible_intervals.emplace_back(
+        interval_left_end, static_cast<int32_t>(sorted_decoded_vocab.size())
+    );
     possible_token_num += sorted_decoded_vocab.size() - interval_left_end;
   }
   return possible_token_num;

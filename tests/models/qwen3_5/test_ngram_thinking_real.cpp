@@ -83,9 +83,9 @@ int main(int argc, char** argv) {
         for (const unsigned budget : {1U, 4U, 15U, 16U, 31U, 32U, 63U}) {
             infernix::RequestOptions request;
             request.execution.requested_output_tokens    = 512;
-            request.execution.sampling.temperature       = 0;
-            request.execution.sampling.presence_penalty  = 0;
-            request.execution.sampling.frequency_penalty = 0;
+            request.execution.sampling.temperature       = 0.0f;
+            request.execution.sampling.presence_penalty  = 0.0f;
+            request.execution.sampling.frequency_penalty = 0.0f;
             request.execution.thinking.budget            = budget;
             request.execution.allow_prefix_reuse         = false;
             const auto fresh = engine.generate(engine.prepare(copy_prompt(source)), request);

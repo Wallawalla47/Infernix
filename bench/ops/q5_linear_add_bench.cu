@@ -34,9 +34,6 @@ constexpr std::size_t kDefaultFlushMiB = 256;
 constexpr int kDefaultWarmup           = 5;
 constexpr int kDefaultRepeat           = 50;
 constexpr double kDramSpecGBs          = 1792.0;
-// NVIDIA's GB202 table reports dense/sparse pairs at boost clock; keep the accumulator precision
-// explicit. SIMT and split-K routes report no Tensor Core ratio.
-constexpr double kBf16Fp32AccumulateTFLOPs = 209.5;
 
 struct Options {
     std::int32_t hidden = 0;

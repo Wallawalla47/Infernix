@@ -34,9 +34,9 @@ std::string copy_prefill(const std::string& source, const std::string& prefix) {
 infernix::RequestOptions request(unsigned output, bool reuse) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens    = output;
-    options.execution.sampling.temperature       = 0;
-    options.execution.sampling.presence_penalty  = 0;
-    options.execution.sampling.frequency_penalty = 0;
+    options.execution.sampling.temperature       = 0.0f;
+    options.execution.sampling.presence_penalty  = 0.0f;
+    options.execution.sampling.frequency_penalty = 0.0f;
     options.execution.allow_prefix_reuse         = reuse;
     options.stop.include_model_defaults          = false;
     return options;

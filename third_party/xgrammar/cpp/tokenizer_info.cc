@@ -317,7 +317,7 @@ TokenizerInfo::Impl::Impl(
       trie_subtree_nodes_range_[top_pair.second] = i;
       prefix_stack.pop();
     }
-    prefix_stack.push({token, i});
+    prefix_stack.push({token, static_cast<int32_t>(i)});
   }
   while (!prefix_stack.empty()) {
     const auto& top_pair = prefix_stack.top();

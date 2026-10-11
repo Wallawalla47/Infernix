@@ -365,7 +365,7 @@ int main(int argc, char** argv) {
         json_prompt.messages[0].parts[0].text = "Return exactly the JSON object {\"ok\":true}.";
         auto object_request                   = json_request;
         object_request.constraint             = infernix::OutputConstraint::json_object();
-        object_request.execution.sampling.temperature = 0;
+        object_request.execution.sampling.temperature = 0.0f;
         record({{"type", "object"}}, engine.generate(engine.prepare(json_prompt), object_request));
 
         const auto fixed  = nlohmann::ordered_json{{"const", {{"text", "你好\n"}, {"n", 2}}}};

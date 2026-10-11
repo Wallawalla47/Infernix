@@ -127,9 +127,9 @@ int main(int argc, char** argv) {
         infernix::Engine engine(options);
         infernix::RequestOptions request;
         request.execution.requested_output_tokens    = 1024;
-        request.execution.sampling.temperature       = 0;
-        request.execution.sampling.presence_penalty  = 0;
-        request.execution.sampling.frequency_penalty = 0;
+        request.execution.sampling.temperature       = 0.0f;
+        request.execution.sampling.presence_penalty  = 0.0f;
+        request.execution.sampling.frequency_penalty = 0.0f;
         request.execution.allow_prefix_reuse         = false;
         request.ngram_session.key                    = "parent";
         auto run                                     = [&] {

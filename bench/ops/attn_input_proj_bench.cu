@@ -437,7 +437,6 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden,
 void run_fp8(const Options& options, bench::L2FlushBuffer& flush, cudaStream_t stream,
              std::vector<Result>& results) {
     auto weight = bench::make_fp8_weight(14336, 5120);
-    auto* data  = static_cast<std::uint8_t*>(weight.storage.p);
     run_four_output(options, "fp8", QType::FP8_E4M3FN_ROW_BF16, options.fp8_policy, false, 5120,
                     6144, 1024, 14336, weight, flush, stream, results);
 }

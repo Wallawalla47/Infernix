@@ -23,9 +23,9 @@ infernix::RequestOptions request(unsigned count, bool reuse) {
     infernix::RequestOptions result;
     result.execution.requested_output_tokens    = count;
     result.execution.allow_prefix_reuse         = reuse;
-    result.execution.sampling.temperature       = 0;
-    result.execution.sampling.presence_penalty  = 0;
-    result.execution.sampling.frequency_penalty = 0;
+    result.execution.sampling.temperature       = 0.0f;
+    result.execution.sampling.presence_penalty  = 0.0f;
+    result.execution.sampling.frequency_penalty = 0.0f;
     // Continue the complete committed prefix, including the caller's stop token.
     result.stop.publish_stop_token = true;
     return result;
