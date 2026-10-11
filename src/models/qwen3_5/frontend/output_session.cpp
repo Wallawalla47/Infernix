@@ -206,10 +206,11 @@ struct SemanticThinkingState {
     bool control_pending                = false;
     bool applied                        = false;
     // Reasoning-loop guard: the words of the round being previewed (the committed history lives in
-    // OutputSession::Impl, outside the per-round copy), a word cut by the last token, the next
-    // check and what fired.
+    // OutputSession::Impl, outside the per-round copy), a word cut by the last token, the recent
+    // reasoning the periodic-tail check reads, the next check and what fired.
     ReasoningLoopAction loop = ReasoningLoopAction::Off;
     std::string loop_partial;
+    std::string loop_tail;
     std::vector<std::uint64_t> loop_round;
     std::uint32_t loop_next_check      = kLoopCheckTokens;
     bool loop_detected                 = false;
@@ -457,6 +458,7 @@ public:
             loop_words.clear();
             loop_words.shrink_to_fit();
             semantic.loop_round.clear();
+            semantic.loop_tail.clear();
             return;
         }
         loop_words.insert(loop_words.end(), semantic.loop_round.begin(), semantic.loop_round.end());
@@ -644,6 +646,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
                 !impl_->preview_semantic.loop_detected) {
                 append_words(decoded.bytes, impl_->preview_semantic.loop_partial,
                              impl_->preview_semantic.loop_round);
+                append_tail(decoded.bytes, impl_->preview_semantic.loop_tail);
             }
             feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         }
@@ -696,7 +699,9 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
     if (semantic.loop != ReasoningLoopAction::Off && semantic.in_reasoning && !semantic.applied &&
         !semantic.loop_detected && semantic.model_thinking_tokens >= semantic.loop_next_check) {
         semantic.loop_next_check = (semantic.model_thinking_tokens / kLoopCheckTokens + 1) * kLoopCheckTokens;
-        const double coverage    = impl_->loop_coverage(semantic.loop_round);
+        // Strata reads a periodic tail as full coverage before its word measure.
+        const double coverage =
+            periodic_tail(semantic.loop_tail) ? 1.0 : impl_->loop_coverage(semantic.loop_round);
         if (coverage >= kLoopCoverage) {
             semantic.loop_detected        = true;
             semantic.loop_thinking_tokens = semantic.model_thinking_tokens;
