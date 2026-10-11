@@ -3970,10 +3970,15 @@ pp16384 2.70 s (+5.0 %), pp32768 4.36 s (-1.5 %), pp131072 19.0 s (0.0 %). Singl
 at a width the fit does not cover. The walk streams the experts once per span, a run of calls of at
 least 256 columns cut at 65,536 tokens, and captures the taps inside a span in place (§19.3.8 F4).
 So a cut costs a call, and a span only where it leaves a narrower call between walk-eligible ones;
-the planner charges every plan its spans (`CallCost::walk_min_columns`, `walk_max_tokens`) and
-demotes automatic exact taps that are not free, and coalescing charges a new tap the same way.
-Until 2026-10-11 a tap ended the span, so every cut and every flexible tap inside a long prompt
-cost a span (a cold 128K prompt's ladder taps added ~2.4 s, 14 %). The old constants overpriced
+the planner charges every plan its spans (`CallCost::walk_min_columns`, `walk_max_tokens`), and
+coalescing charges a new tap the same way. A non-boundary exact tap (the generation opener, an
+automatic marker) is kept only before a CPU-served call (the opener's tail) within the split budget.
+Before a GPU-staged call it adds that call, and an automatic marker's snapshot (the conversation's
+latest turn) is one the turn's endpoint makes redundant: keeping those splits took the agentic
+replay from 84.6 % to 82.9 % of prompt tokens from cache (more snapshots than its 50 slots, so
+history snapshots were evicted) and +14 % average TTFT (2026-10-11). Until 2026-10-11 a tap ended
+the span, so every cut and every flexible tap inside a long prompt cost a span (a cold 128K
+prompt's ladder taps added ~2.7 s, 15 %). The old constants overpriced
 tokens about 50-fold, so predicted coalescing waits exceeded the queue-timeout limit for shared
 prefixes beyond about 4K tokens.
 

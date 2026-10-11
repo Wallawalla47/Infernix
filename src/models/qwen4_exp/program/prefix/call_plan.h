@@ -44,7 +44,8 @@ struct CallPlan {
 // Calls covering [frontier, prompt_tokens): boundaries {frontier} ∪ kept exact taps ∪ {prompt_tokens},
 // each segment running `chunk`-token calls and one remainder call. Boundary exact taps (Explicit,
 // Structural) are always kept; every other exact tap (the generation opener, Automatic) is kept, in
-// position order, when it adds at most `split_budget` to the plan, and otherwise becomes flexible.
+// position order, when the call it starts is CPU-served (at most `served_columns`) and it adds at most
+// `split_budget` to the plan, and otherwise becomes flexible.
 // Without exact taps the calls are frontier, frontier + chunk, ...; for frontier 0 the cold grid.
 // `taps` must be sorted, inside (frontier, prompt_tokens), as plan_taps returns them.
 [[nodiscard]] CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::uint32_t chunk,

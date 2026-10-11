@@ -1,9 +1,10 @@
 // The prefill call planner of Qwen4Exp's prefix cache (program/prefix/call_plan.h; design §19.3.1,
 // test U2), host only. Checks: the cold grid for F = 0 and the shifted grid after a resume; calls
 // cover [F, n) in order without overlap or gaps and never exceed the chunk; kept exact taps end a
-// call; boundary taps are kept at any cost; an automatic tap is kept when it adds at most the split
-// budget (the generation opener's CPU-served tail, a split that only shifts the grid) and demoted to
-// flexible otherwise (a mid-chunk split of a one-call suffix); the layer walk's spans (none for a cut
+// call; boundary taps are kept at any cost; an automatic tap is kept when the call it starts is
+// CPU-served and it adds at most the split budget (the generation opener's tail) and demoted to
+// flexible otherwise (a split before a GPU-staged call, even one that only shifts the grid); the layer
+// walk's spans (none for a cut
 // between walk-eligible calls, one for a cut that leaves a narrow call inside the walk, one per
 // 65,536 tokens); Δ accounting against an independent enumeration of call widths; determinism;
 // refused inputs; Vision span membership. The oracle for
@@ -97,13 +98,17 @@ int main() {
             check(delta > 0 && delta <= cost.split_budget, "the opener's Δ is within the split budget (" +
                                                                 std::to_string(delta) + " s)");
         }
-        // An automatic tap that only shifts the grid (same call count) is kept.
+        // An automatic tap before a GPU-staged call is demoted even where it only shifts the grid (same
+        // call count); a boundary tap there is kept and the next segment's grid starts at it.
         {
             const pc::PlannedTap taps[] = {exact(2000)};
             const q4::CallPlan plan = q4::plan_calls(0, 10000, 4096, taps, cost);
-            check(plan.ends == std::vector<std::uint32_t>{2000, 6096, 10000} &&
-                      plan.taps[0].placement == pc::TapPlacement::Exact,
-                  "a split that keeps the call count is kept, and the next segment's grid starts at it");
+            check(plan.ends == std::vector<std::uint32_t>{4096, 8192, 10000} &&
+                      plan.taps[0].placement == pc::TapPlacement::Flexible,
+                  "an automatic split before a GPU-staged call is demoted");
+            const pc::PlannedTap boundary[] = {exact(2000, true)};
+            check(q4::plan_calls(0, 10000, 4096, boundary, cost).ends == std::vector<std::uint32_t>{2000, 6096, 10000},
+                  "a boundary split starts the next segment's grid");
         }
         // A mid-chunk automatic tap of a one-call suffix costs a whole call: demoted to flexible.
         {
@@ -129,10 +134,8 @@ int main() {
             const auto extra   = [&](std::uint32_t n, std::span<const pc::PlannedTap> taps) {
                 return q4::plan_calls(0, n, 4096, taps, spans).seconds - q4::plan_calls(0, n, 4096, taps, cost).seconds;
             };
-            const pc::PlannedTap shift[] = {exact(2000)};
-            check(q4::plan_calls(0, 10000, 4096, shift, spans).taps[0].placement == pc::TapPlacement::Exact &&
-                      std::fabs(extra(10000, shift) - 1.67) < 1e-9,
-                  "a split between walk-eligible calls keeps the span and is kept");
+            const pc::PlannedTap shift[] = {exact(2000, true)};
+            check(std::fabs(extra(10000, shift) - 1.67) < 1e-9, "a boundary split between walk-eligible calls keeps the span");
             const pc::PlannedTap opener[] = {exact(9995)};
             check(q4::plan_calls(0, 10000, 4096, opener, spans).taps[0].placement == pc::TapPlacement::Exact &&
                       std::fabs(extra(10000, opener) - 1.67) < 1e-9,
@@ -179,9 +182,17 @@ int main() {
                 }
                 std::vector<std::uint32_t> with = cuts;
                 with.insert(std::upper_bound(with.begin(), with.end(), t.position), t.position);
-                const double delta = oracle_seconds(F, oracle_ends(F, n, c, with), cc) -
-                                     oracle_seconds(F, oracle_ends(F, n, c, cuts), cc);
-                if (delta <= cc.split_budget) {
+                const std::vector<std::uint32_t> with_ends = oracle_ends(F, n, c, with);
+                const double delta = oracle_seconds(F, with_ends, cc) - oracle_seconds(F, oracle_ends(F, n, c, cuts), cc);
+                // The call the tap starts: the first end past it.
+                std::uint32_t next = n;
+                for (const std::uint32_t e : with_ends) {
+                    if (e > t.position) {
+                        next = e;
+                        break;
+                    }
+                }
+                if (next - t.position <= cc.served_columns && delta <= cc.split_budget) {
                     cuts = with;
                     placements.push_back(pc::TapPlacement::Exact);
                 } else {

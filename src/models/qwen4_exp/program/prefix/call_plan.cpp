@@ -76,8 +76,15 @@ CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::ui
         if (tap.placement != pc::TapPlacement::Exact || tap.boundary) { continue; }
         std::vector<std::uint32_t> with = cuts;
         with.insert(std::upper_bound(with.begin(), with.end(), tap.position), tap.position);
-        const double seconds = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, with), cost);
-        if (seconds - current <= cost.split_budget) {
+        const std::vector<std::uint32_t> ends = segment_ends(frontier, prompt_tokens, chunk, with);
+        const double seconds                 = seconds_of(frontier, ends, cost);
+        // Only before a CPU-served call (the generation opener's tail): a split before a GPU-staged call
+        // adds that call, and its snapshot (an automatic marker's: the conversation's latest turn) is one
+        // the turn's endpoint makes redundant, which costs a snapshot slot under pressure. Keeping such
+        // splits took the Flash-Next agentic replay from 84.6 % to 82.9 % of prompt tokens served from
+        // cache and +14 % average TTFT (2026-10-11, 3 seeds).
+        const std::uint32_t next = *std::upper_bound(ends.begin(), ends.end(), tap.position);
+        if (next - tap.position <= cost.served_columns && seconds - current <= cost.split_budget) {
             cuts    = std::move(with);
             current = seconds;
         } else {
