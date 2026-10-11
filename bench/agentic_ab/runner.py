@@ -89,8 +89,9 @@ AGENT_MAX_TOKENS = 64000   # what the production clients request on every agent 
 REQUEST_TIMEOUT_S = int(os.environ.get("AB_REQUEST_TIMEOUT_S", "1200"))
 CONTEXT_GUARD_TOKENS = 24000  # keep prompts this far below --max-context
 CREATE_NEW_PROCESS_GROUP = 0x00000200
-# What 97 % of the production requests the workload is modelled on sent.
-SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+# What 97 % of the production requests the workload is modelled on sent. AB_TEMPERATURE overrides the temperature:
+# 0 makes every arm generate the same replies (greedy), so the arms queue alike and their TTFT pairs per request.
+SAMPLING = {"temperature": float(os.environ.get("AB_TEMPERATURE", "1.0")), "top_p": 0.95, "top_k": 20}
 
 _log_lock = threading.Lock()
 _log_path = None

@@ -77,7 +77,10 @@ others and changes which session's prefix is evicted at the device-KV limit, so 
 would partly measure speed.
 
 **Sampling.** Every request sends `temperature 1.0`, `top_p 0.95`, `top_k 20`, as 97 % of the
-production requests did.
+production requests did. `AB_TEMPERATURE=0` runs the replay greedily instead: two builds then write
+the same replies for as long as their numerics agree, so their requests see the same conversations
+and queue alike, and time to first token can be compared request by request (the requests whose
+prompts are identical in both arms). It is a regression check, not the production workload.
 
 What differs between arms is only what should: the model's sampled text (the kernels differ
 numerically, so outputs diverge after a few tokens), and therefore interleaving and queueing.
@@ -98,7 +101,8 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
   control gets the treatment's value unchanged.
 - **Same context.** NInfer keeps a fixed 1 GiB of VRAM spare under `--kv-capacity auto`, so it
   may not start at the bat's context. The runner tries the bat's value first, then 200000,
-  180000, 170000, 160000, and runs every arm at the first one the control starts with.
+  180000, 170000, 160000, 150000, 140000, 131072, and runs every arm at the first one the control
+  starts with.
   Infernix's larger device KV at that context (`--vram-headroom-mib 0` and its measured CUDA Graph
   allowance) is part of what is being compared and is shown in the report header.
 
@@ -148,6 +152,7 @@ Several workload seeds (`--seeds`) show how much a result depends on the particu
 | `AB_STRATA_DIR` / `AB_STRATA_CONFIG` | none, required for a Strata control / its `strata-unsloth-ud-q4_k_xl.json` |
 | `AB_STRATA_EXTRA_ARGS` | none (engine arguments added to the Strata config's) |
 | `AB_REQUEST_TIMEOUT_S` | `1200` (per request; raise it for an engine that queues requests one at a time) |
+| `AB_TEMPERATURE` | `1.0`; `0` replays greedily (see Sampling) |
 | `AB_HOST` / `AB_PORT` | `127.0.0.1` / `8080` |
 | `AB_OUT` | `profiles\bench\agentic_ab` in this checkout |
 | `AB_CORPUS_REPO` / `AB_CORPUS_COMMIT` | this checkout / `e48a0d28` |
