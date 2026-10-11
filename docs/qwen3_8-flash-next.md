@@ -113,7 +113,11 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   the model and raises the context ceiling to 262,144 × F (1,048,576 at 4). It does not raise
   `--max-context` itself: set both. Without a factor, a `--max-context` above 262,144 is refused.
   YaRN also changes shorter contexts slightly (design §19.3.18), so use it only when you need the
-  length.
+  length. Retrieval holds up less far than the ceiling. A catalog test asked for the first, middle
+  and last of thousands of code records (greedy, INT8 KV). At 470K tokens, all three were right at
+  factor 2 and at 4. At 970K tokens and factor 4, the middle one came from a neighbouring record,
+  while the engine's block selection and rotations matched their oracles at that length
+  (GitHub #22).
 - `--prefill-chunk 2048` or `4096` speeds up long prompts by 1.4-1.6×. Each costs ~2-5 % of
   decode speed, because the larger prefill workspace takes expert frames.
 - `--spec mtp --draft-tokens 4 --lm-head-draft` drafts with the model's MTP layer.
