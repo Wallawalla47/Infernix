@@ -33,6 +33,15 @@ struct CpuExpertJob {
     std::uint16_t* y[kMaxColumns]{};        // BF16 [kHidden] per column
 };
 
+// A liveness word the device watches (CpuMissService's heartbeat) and its writer's counter. At
+// namespace scope: a struct nested in CpuExpertTeam cannot carry default member initializers and
+// also be the braced default argument of a CpuExpertTeam member (its initializers are parsed only
+// once the enclosing class is complete; GCC bug 96645, and Clang rejects it the same way).
+struct CpuExpertHeartbeat {
+    volatile std::uint32_t* word = nullptr;
+    std::uint32_t* count         = nullptr;
+};
+
 class CpuExpertTeam {
 public:
     struct Options {
@@ -45,12 +54,6 @@ public:
         std::vector<int> cpus;         // optional: CPU of worker i (worker 0 is the caller, not pinned)
     };
 
-    // A liveness word the device watches (CpuMissService's heartbeat) and its writer's counter.
-    struct Heartbeat {
-        volatile std::uint32_t* word = nullptr;
-        std::uint32_t* count         = nullptr;
-    };
-
     explicit CpuExpertTeam(Options options);
     ~CpuExpertTeam();
     CpuExpertTeam(const CpuExpertTeam&)            = delete;
@@ -59,7 +62,7 @@ public:
     // Computes every job; returns when all outputs are written. Not reentrant. The calling thread
     // advances `heartbeat` after each item it completes, so a long round stays alive to the device
     // while a hung worker (worker 0 then waits at a barrier) still stops it.
-    void run(std::span<const CpuExpertJob> jobs, Heartbeat heartbeat = {});
+    void run(std::span<const CpuExpertJob> jobs, CpuExpertHeartbeat heartbeat = {});
 
     [[nodiscard]] int workers() const { return workers_; }
     [[nodiscard]] CpuIsa isa() const { return isa_; }
@@ -90,7 +93,7 @@ private:
     std::vector<int> x_exp_, h_exp_;   // A16 jobs: column exponents [job][col]
     ExpertActivation activation_;
     std::span<const CpuExpertJob> jobs_;
-    Heartbeat heartbeat_;
+    CpuExpertHeartbeat heartbeat_;
 
     alignas(64) std::atomic<std::uint64_t> epoch_{0};
     alignas(64) std::atomic<int> sleepers_{0};
