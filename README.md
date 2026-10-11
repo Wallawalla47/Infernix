@@ -181,8 +181,9 @@ the Windows port).
 
 ## Quick start (Windows)
 
-Prerequisites: Visual Studio 2026 (MSVC), the CUDA 13 toolkit, and FFmpeg + curl from vcpkg
-(`x64-windows`, at `C:\vcpkg`); adjust the paths at the top of `build_native.bat` for your machine.
+Prerequisites: Visual Studio 2026 (MSVC; the VS 2022 compiler, MSVC 14.44, also builds it), the
+CUDA 13 toolkit, and FFmpeg + curl from vcpkg (`x64-windows`, at `C:\vcpkg`); adjust the paths at
+the top of `build_native.bat` for your machine (and, for Visual Studio 2022, its generator).
 
 ```bat
 build_native.bat configure
