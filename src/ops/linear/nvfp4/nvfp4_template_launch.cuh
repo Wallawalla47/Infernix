@@ -81,8 +81,9 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
         (Schedule::kExactTokens && p.tokens != capacity))
         throw std::invalid_argument(
             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
-    constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
-    const int bytes       = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
+    // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
+    static constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
+    const int bytes              = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);

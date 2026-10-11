@@ -430,8 +430,9 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     const Nvfp4A4TmaDescriptors* staged =
         nvfp4_a4_tma_descriptor_staging().stage(descriptors, stream);
 #endif
-    constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
-    constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
+    constexpr int bytes = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
+    // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
+    static constexpr auto kernel = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));

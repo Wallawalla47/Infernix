@@ -320,9 +320,10 @@ struct DownEpilogueA16 {
 
 template <Matrix M, class Epilogue>
 void launch_a16(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
-    using S               = ScheduleA16;
-    constexpr int bytes   = static_cast<int>(sizeof(StorageA16));
-    constexpr auto kernel = grouped_kernel_a16<M, Epilogue>;
+    using S             = ScheduleA16;
+    constexpr int bytes = static_cast<int>(sizeof(StorageA16));
+    // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
+    static constexpr auto kernel = grouped_kernel_a16<M, Epilogue>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,

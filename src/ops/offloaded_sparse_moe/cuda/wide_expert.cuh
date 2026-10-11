@@ -408,9 +408,10 @@ struct DownEpilogue {
 
 template <Matrix M, class Epilogue>
 void launch(const Call& call, std::int32_t pass, const Epilogue& epilogue, cudaStream_t stream) {
-    using S               = Schedule;
-    constexpr int bytes   = static_cast<int>(sizeof(Storage<S>));
-    constexpr auto kernel = grouped_kernel<M, Epilogue>;
+    using S             = Schedule;
+    constexpr int bytes = static_cast<int>(sizeof(Storage<S>));
+    // Static: MSVC 2022 rejects the lambda's use of an automatic constexpr local (C2326).
+    static constexpr auto kernel = grouped_kernel<M, Epilogue>;
     static const bool configured = [] {
         CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                         cudaSharedmemCarveoutMaxShared));
