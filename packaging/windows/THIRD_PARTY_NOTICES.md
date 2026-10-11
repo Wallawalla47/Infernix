@@ -33,6 +33,12 @@ release as `ffmpeg-<version>-source.zip`: the FFmpeg source release and the vcpk
 script and patches) that built these DLLs. The FFmpeg source is also available from
 [ffmpeg.org](https://ffmpeg.org/download.html).
 
+## Shipped as files
+
+| Files | Component | Licence | Licence file |
+|---|---|---|---|
+| `chat_templates\qwen3_6.jinja`, `chat_templates\qwen3_8.jinja` | Chat templates derived from Qwen's ([Qwen](https://huggingface.co/Qwen)), with Infernix changes | Apache-2.0 | `chat_templates\LICENSE` |
+
 ## Not included
 
 - The NVIDIA driver supplies `nvcuda.dll` and `nvml.dll`.

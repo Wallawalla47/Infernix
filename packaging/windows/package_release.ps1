@@ -1,5 +1,6 @@
-# Packages a Windows release of Infernix: the chosen executables, every DLL beside them, the Infernix
-# licence, THIRD_PARTY_NOTICES.md and the licence of every component they contain or load, plus the
+# Packages a Windows release of Infernix: the chosen executables, every DLL beside them, the
+# maintained chat templates, the Infernix licence, THIRD_PARTY_NOTICES.md and the licence of every
+# component they contain or load, plus the
 # corresponding source of the FFmpeg DLLs (LGPL) as a second zip. A DLL the notices do not cover
 # stops the packaging.
 #
@@ -76,6 +77,11 @@ foreach ($package in $needed.Keys) {
 foreach ($source in $compiled.Keys) { Copy-Item "$repo\$source" "$stage\licenses\$($compiled[$source])" }
 Copy-Item "$repo\LICENSE" "$stage\LICENSE.txt"
 Copy-Item "$PSScriptRoot\THIRD_PARTY_NOTICES.md" $stage
+# The maintained chat templates, for --chat-template with artifacts that store a checkpoint's own.
+New-Item -ItemType Directory -Force "$stage\chat_templates" | Out-Null
+foreach ($template in 'qwen3_6.jinja', 'qwen3_8.jinja', 'LICENSE') {
+    Copy-Item "$repo\tools\chat_templates\$template" "$stage\chat_templates"
+}
 
 $zip = "$OutDir\$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
