@@ -307,7 +307,14 @@ __global__ void __launch_bounds__(kThreads)
 // ------------------------------------------------------------------------------------- staging
 
 constexpr int kStageCtas  = 16;    // with 16 KiB chunks, a 256 KiB window of host reads in flight
-constexpr int kNarrowPassColumns = 4; // calls of at most this many columns use the one-column kernels
+// Calls of at most this many columns (every forked call: decode, MTP and n-gram verification, up to
+// eight decoding requests) use the one-column kernels, which fit two gate/up CTAs per SM. Up to
+// 2026-10-10 the bound was 4, and a 5-column MTP round took the eight-column kernels: gate/up and
+// down 5.3 -> 9.9 ms per round on the 5090 (Dense8), round 17.8 -> 23.4 ms. At 8, W = 5 and 6
+// rounds take 9-17 % less time; C = 8 plain decode +12 %, C = 1 and C = 2 MTP +2 % (W4A4). At
+// op level (frames, cold L2) the one-column kernels are faster at 10-16 columns too: W4A4 2x,
+// W4A16 1-6 % (design, "Decode-round bundle": MTP round profile).
+constexpr int kNarrowPassColumns = moe::kMaxColumns;
 constexpr int kStageChunk = 16384;
 constexpr int kMaxPassJobs = 512;
 
@@ -1310,7 +1317,7 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
 }
 
 // One pass of the narrow kernels in the source's arithmetic; `few` selects the one-column kernels
-// (calls of at most kNarrowPassColumns columns: decode and MTP verification).
+// (calls of at most kNarrowPassColumns columns: decode and verification).
 void launch_pass(bool few, const bf16* x, const MoeDispatch& dispatch, const MoeExpertSource& source, int top_k,
                  const std::uint8_t* const* job_records, const std::int32_t* flags, int base, int jobs,
                  const moe::wide::ExpertsWorkspace& layout, int columns_out, bf16* outputs, cudaStream_t stream,

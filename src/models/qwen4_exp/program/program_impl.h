@@ -4306,7 +4306,9 @@ private:
     std::array<bool, kMaximumConcurrency> from_ngram_{};
     // Draft-length policy: acceptance prior and EWMA weight, and the cost of each draft column in
     // plain rounds (warm tg512 on the 5090: W = 3, 4, 5 rounds took 1.84, 2.13 and 2.54 plain
-    // rounds, design 19.2).
+    // rounds, design 19.2; re-measured 2026-10-10 at 1.61-1.79, 1.89-2.11 and 2.42-2.53 between 8 %
+    // and 20 % expert misses, where a miss-rate cost gained no more than it lost; W = 5 and 6 then
+    // became 9-17 % cheaper with the one-column expert kernels up to 8 columns, not re-fitted here).
     static constexpr double kAcceptancePrior      = 0.75;
     static constexpr double kAcceptanceWeight     = 0.1;
     static constexpr double kWidthCost            = 0.38;

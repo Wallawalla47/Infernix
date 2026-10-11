@@ -3278,6 +3278,56 @@ still 3 % slower than plain, because a cold verify round costs more than the war
 assumes: the story's W = 4 rounds took ~2.6 plain rounds on the cold cache. A cost that follows
 the hit rate is the next refinement.
 
+**Width cost re-measured; a hit-rate cost rejected (2026-10-10).** Prompted by issue #7 (an RTX PRO
+6000 holding every expert in VRAM, where c = 0.38 may under-draft), a temporary hook fixed K and
+timed every C = 1 round from its start to the next round's start, with the unique routed experts and
+misses over all of its columns (rejected drafts included). Dense8, INT8 KV, RTX 5090, six chat
+prompts (code, story, explanation, JSON list, arithmetic with thinking, translation) x 256 greedy
+tokens x 2 repetitions, ~9,600 rounds per cache size:
+
+| W | Default cache (8,727 frames, 8 % misses) | 4,941 frames (20 % misses) | 1 + 0.38 (W - 1) |
+|---|---:|---:|---:|
+| 1 | 9.08 ms (1.00) | 11.17 ms (1.00) | 1.00 |
+| 2 | 1.28-1.35 | 1.37 | 1.38 |
+| 3 | 1.61 | 1.79 | 1.76 |
+| 4 | 1.89 | 2.11 | 2.14 |
+| 5 | 2.42-2.46 | 2.53 | 2.52 |
+| 6 | 2.63-2.70 | 2.81 | 2.90 |
+
+- c = 0.38 is still close to the measured cost: slightly high at 8 % misses, about right at 20 %.
+  Rounds of 5 columns step up (17.2 -> 21.9 ms at the default cache, +4.7 ms against ~+2.5 ms for
+  the other columns). Profiled and removed the same day (next paragraph).
+- **The 5-column step was the expert kernels' route (fixed 2026-10-10).** nsys of warm W = 4 and
+  W = 5 rounds (code prompt, fixed K = 3 and 4): 16.76 -> 21.74 ms per round; `gate_up_kernel` 3.21
+  -> 6.30 ms, `down_kernel` 2.14 -> 3.62 ms, `stage_kernel` +1.1 ms, every dense Q8 kernel together
+  about +0.45 ms. Calls of at most `kNarrowPassColumns` = 4 columns used the one-column kernels;
+  W = 5 switched to the eight-column ones, which take about twice as long per call for decode's one
+  or two columns per expert. The bound is now `moe::kMaxColumns` = 8, the fork route's own. The
+  arithmetic is exact either way (the layer test checks both kernels against the CPU engine at 1,
+  4, 5, 8 and 12 columns). Warm, three repetitions, fixed K: W = 5 rounds 23.40 -> 21.20 ms (code)
+  and 19.74 -> 16.40 ms (story), W = 6 25.99 -> 23.52 and 21.75 -> 17.98 ms, W <= 4 within 0.6 %;
+  fixed K = 4 on code now beats K = 3 (201 against 192 tok/s). End to end (8 prompts x 256 tokens,
+  MTP max 4, four processes alternating the bound, six repetitions each): C = 1 102.5 -> 104.6 tok/s
+  (+2.1 %), C = 2 113.1 -> 115.5 (+2.1 %), C = 8 plain 112.1 -> 125.7 (+12.1 %); three repetitions
+  that overlapped another session's full build (47.8, 30.6 and 93.2 tok/s) are excluded. At op level
+  (`infernix_offloaded_moe_wide_bench`, frames, cold L2, the serial path) the one-column kernels
+  were also faster at 10-16 columns: W4A4 422.6 -> 211.2 us at T = 10, W4A16 329.7 -> 311.5 us. W4A16
+  decode was not measured end to end (no W4A16 artifact on the machine). `kWidthCost` was not
+  re-fitted for the cheaper W = 5 and 6 rounds.
+- t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
+  slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
+  one. A fully resident card's width cost cannot be extrapolated from this machine.
+- The policy beats every fixed K: 159.7 tok/s against 157.0 (K = 2, the best fixed), 153.3 (K = 3),
+  137.4 (K = 4) and 106.8 plain at the default cache; 118.3 against 114.4 (K = 2) at 4,941 frames.
+- **Rejected: measured cost tables interpolated by the live miss rate** (the rows above at 8 % and
+  20 % misses, an EWMA of each round's miss rate between them). Old and new policy ran each prompt
+  back to back, rotated, five repetitions; the second run of a prompt is warm (the same greedy
+  text), so the arms were compared within each position (repeatable to ~0.5 %). Default cache: warm
+  +1.9 % (+0.1 to +3.9 % by prompt), colder -0.3 % (-2.5 to +3.1 %); 4,941 frames: warm -0.3 % (-2.6
+  to +3.3 %), colder -0.7 % (-2.3 to +1.8 %). The expected tokens per round time is flat between
+  K = 2 and 3, so a finer cost mostly flips that choice, gaining on some prompts and losing on
+  others. `kWidthCost` stays 0.38.
+
 **MTP round profile and two fixes.** nsys of warm tg512, MTP max 3, `--lm-head-draft`, per
 generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 % of the time.
 
@@ -3293,7 +3343,8 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
 - **Occupancy (adopted).** A W = 4 verify round has ~30 jobs × 40 gate/up CTAs, about seven
   waves at one CTA per SM. The one-column CTA's activations and partial sums now share storage,
   separated by one more barrier. At 49,376 B, two CTAs fit per SM, and calls of up to four columns
-  use the one-column kernels, one pass per column over the staged weights. The layer-route test
+  (eight since 2026-10-10, see the width-cost paragraphs above) use the one-column kernels, one pass
+  per column over the staged weights. The layer-route test
   gained a four-column case and passes. Greedy ids are unchanged. tg512: plain 83.30 → 85.46,
   MTP max 4 115.06 → **121.20**.
 - **Copy-engine stall (found, fixed below).** On average 4.7 ms per round passed between a

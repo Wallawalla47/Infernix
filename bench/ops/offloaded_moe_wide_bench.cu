@@ -5,7 +5,8 @@
 // experts are wide over several 64-column tiles and the tail stays narrow), then times one
 // moe_experts call as the prefill path issues it: 64 staging slots with the double-buffered
 // overlap stream. Experts with more than eight columns take the wide route; the rest the narrow
-// one (decode shapes, T <= 4, take the one-column narrow kernels). --cold flushes the L2 before each
+// one (calls of T <= 8 without the overlap take the one-column narrow kernels; a call that overlaps
+// its staging, more than 32 jobs at T <= 8, the eight-column ones). --cold flushes the L2 before each
 // call, as decode finds a layer's experts (a small T's few experts would otherwise stay L2-resident
 // across repeats). Placement:
 //   frames : every record in device memory (isolates the expert kernels);
