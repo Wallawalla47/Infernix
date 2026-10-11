@@ -21,6 +21,9 @@ option(INFERNIX_BUILD_BENCHMARKS "Build Infernix benchmarks" OFF)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# No C++20 modules: no dependency scan (MSBuild names its output by source file name, so a
+# target's same-named sources, such as the five causal-cache plan.cpp, overwrite each other's).
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
