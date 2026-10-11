@@ -63,6 +63,36 @@ int main() {
         append_words("lo , world!", pb, b);
         expect(a == b && a.size() == 4, "split and fold");
     }
+    // A non-word character is a word of its own even without separators, whether it arrives whole or
+    // one byte per call.
+    {
+        std::vector<std::uint64_t> a, b;
+        std::string pa, pb;
+        append_words("\xe2\x9a\xa1\xe2\x9a\xa1" "ab", pa, a);
+        append_words(" ", pa, a);
+        append_words("\xe2", pb, b);
+        append_words("\x9a", pb, b);
+        append_words("\xa1", pb, b);
+        append_words("\xe2\x9a\xa1" "ab", pb, b);
+        append_words(" ", pb, b);
+        expect(a == b && a.size() == 3, "unseparated symbol splits per character");
+    }
+    // A run of CJK letters is one word, as `\w+` reads it.
+    {
+        std::vector<std::uint64_t> words;
+        std::string partial;
+        append_words("\xe4\xb8\xad\xe6\x96\x87", partial, words);
+        append_words(" ", partial, words);
+        expect(words.size() == 1, "cjk is one word");
+    }
+    // ASCII punctuation keeps one word per character.
+    {
+        std::vector<std::uint64_t> words;
+        std::string partial;
+        append_words("?!?!?!", partial, words);
+        append_words(" ", partial, words);
+        expect(words.size() == 6, "punctuation per character");
+    }
     // Below a full window nothing is measured.
     expect(repeated_passage_coverage(words_of(varied(20))) == 0.0, "short text");
     // Varied work stays low.
@@ -76,6 +106,15 @@ int main() {
     for (int i = 0; i < 40; ++i) { looping += pass; }
     const double loop = repeated_passage_coverage(words_of(looping));
     expect(loop >= kLoopCoverage, "looping coverage " + std::to_string(loop));
+    // The same loop written as one unseparated run of symbols: every symbol is a word of its own, so
+    // the passage repeats and the measure sees it (a byte-level split makes it a single word).
+    {
+        std::string symbols;
+        for (int i = 0; i < 3000; ++i) { symbols += "\xe2\x9a\xa1"; }
+        const double symbol_loop = repeated_passage_coverage(words_of(varied(150) + symbols, 1));
+        expect(symbol_loop >= kLoopCoverage,
+               "unseparated symbol loop coverage " + std::to_string(symbol_loop));
+    }
     // A passage seen twice is not repeated.
     std::string twice = varied(300) + pass + varied(10) + pass + varied(150);
     const double recap = repeated_passage_coverage(words_of(twice));

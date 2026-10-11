@@ -1,4 +1,5 @@
 #include "models/qwen3_5/frontend/reasoning_loop.h"
+#include "text/unicode.h"
 
 #include <algorithm>
 #include <unordered_map>
@@ -19,7 +20,83 @@ bool word_byte(unsigned char c) {
     return c >= 0x80 || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
-bool space_byte(unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+// Python's `\s`, which Strata's split drops. unicode::is_whitespace covers the Unicode space
+// categories; U+001C-U+001F and U+0085 are whitespace to Python and not to it.
+bool space_codepoint(std::int32_t value) {
+    return (value >= 0x1c && value <= 0x1f) || value == 0x85 ||
+           text::unicode_internal::is_whitespace(value);
+}
+
+// A non-ASCII byte only shows what it is once its whole character has arrived: one token can hold one
+// byte of a multi-byte character. `complete` is false for that trailing part.
+struct Codepoint {
+    std::int32_t value = 0;
+    std::size_t length = 1;
+    bool complete      = true;
+};
+
+// Lenient UTF-8 over raw token bytes: a byte that cannot start a sequence, or one whose sequence runs
+// past the end of the buffer, decodes as a length-1 code point of its own.
+Codepoint codepoint_at(std::string_view text, std::size_t at) {
+    const auto first = static_cast<unsigned char>(text[at]);
+    if (first < 0x80U) { return {first, 1, true}; }
+    std::size_t length = 0;
+    std::int32_t value = 0;
+    if ((first & 0xe0U) == 0xc0U) {
+        length = 2;
+        value  = first & 0x1fU;
+    } else if ((first & 0xf0U) == 0xe0U) {
+        length = 3;
+        value  = first & 0x0fU;
+    } else if ((first & 0xf8U) == 0xf0U) {
+        length = 4;
+        value  = first & 0x07U;
+    } else {
+        return {first, 1, true};
+    }
+    if (at + length > text.size()) { return {first, 1, false}; }
+    for (std::size_t i = 1; i < length; ++i) {
+        const auto next = static_cast<unsigned char>(text[at + i]);
+        if ((next & 0xc0U) != 0x80U) { return {first, 1, true}; }
+        value = (value << 6) | static_cast<std::int32_t>(next & 0x3fU);
+    }
+    return {value, length, true};
+}
+
+// `\w` in Strata's split: a letter, a number, or '_'.
+bool word_codepoint(std::int32_t value) {
+    return value == '_' || text::unicode_internal::is_letter(value) ||
+           text::unicode_internal::is_number(value);
+}
+
+// The bytes accumulated at a word boundary are one word to the byte rule above; Strata's split can
+// make several of them. A run of word characters is one word, every other non-space character is a
+// word of its own, and whitespace separates.
+void flush_word(std::string& partial, std::vector<std::uint64_t>& words) {
+    const std::string_view text = partial;
+    std::size_t begin           = 0;
+    for (std::size_t at = 0; at < text.size();) {
+        const Codepoint point = codepoint_at(text, at);
+        if (!point.complete) { // cut by the last token: the bytes stand as a word of their own
+            if (at > begin) { words.push_back(fnv1a(text.substr(begin, at - begin))); }
+            words.push_back(fnv1a(text.substr(at)));
+            partial.clear();
+            return;
+        }
+        if (word_codepoint(point.value)) {
+            at += point.length;
+            continue;
+        }
+        if (at > begin) { words.push_back(fnv1a(text.substr(begin, at - begin))); }
+        if (!space_codepoint(point.value)) {
+            words.push_back(fnv1a(text.substr(at, point.length)));
+        }
+        at += point.length;
+        begin = at;
+    }
+    if (text.size() > begin) { words.push_back(fnv1a(text.substr(begin))); }
+    partial.clear();
+}
 
 } // namespace
 
@@ -30,11 +107,8 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
             partial.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : raw);
             continue;
         }
-        if (!partial.empty()) {
-            words.push_back(fnv1a(partial));
-            partial.clear();
-        }
-        if (!space_byte(c)) { words.push_back(fnv1a(std::string_view(&raw, 1))); }
+        if (!partial.empty()) { flush_word(partial, words); }
+        if (!space_codepoint(c)) { words.push_back(fnv1a(std::string_view(&raw, 1))); }
     }
 }
 
