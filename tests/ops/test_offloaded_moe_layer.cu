@@ -839,16 +839,17 @@ int main() {
         test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
         test_dispatch(3, 1000, 37);    // few experts, long runs per expert
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
-        test_layer(24, 8, 10, 11); // the widest one-column call: more jobs than one 3-slot pass
-        test_layer(9, 5, 3, 13);   // MTP verification width: one-column kernels, several passes per job
-        test_layer(9, 4, 3, 17);   // as above, four columns
-        test_layer(9, 12, 3, 67);  // the narrowest eight-column call: several columns per expert
+        test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
+        test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job
+        test_layer(9, 4, 3, 17);   // MTP verification width
+        test_layer(9, 12, 3, 67);  // a call past the fork route, several columns per expert
         test_layer(96, 10, 10, 19); // more misses than the largest cap; publishes a subset of ten columns
         test_layer(400, 64, 10, 23); // more than 256 jobs: the plan ranks in several chunks
         test_layer(512, 512, 10, 29);  // a short prompt's call: ~10 columns per expert, hundreds of narrow jobs
         test_layer(512, 2048, 10, 31); // a wider call: x published from thousands of columns
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
-        // a short prompt's call (experts of more than eight columns on the narrow kernels).
+        // a short prompt's call (experts of more than eight columns on the narrow kernels). Calls of
+        // four columns take the one-column kernels and of five or more the multi-column ones.
         constexpr auto kA16 = moe::ExpertActivation::kA16;
         test_layer(12, 1, 10, 41, kA16);
         test_layer(24, 8, 10, 43, kA16);

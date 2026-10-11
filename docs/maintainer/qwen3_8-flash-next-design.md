@@ -3314,6 +3314,25 @@ tokens x 2 repetitions, ~9,600 rounds per cache size:
   were also faster at 10-16 columns: W4A4 422.6 -> 211.2 us at T = 10, W4A16 329.7 -> 311.5 us. W4A16
   decode was not measured end to end (no W4A16 artifact on the machine). `kWidthCost` was not
   re-fitted for the cheaper W = 5 and 6 rounds.
+- **The narrow kernels by expert width (2026-10-11).** `infernix_offloaded_moe_wide_bench
+  --columns-per-expert C` (uniform routing, frames, cold L2, ~160 and ~480 jobs; `--split-scales`
+  keeps experts of more than eight columns narrow) timed both kernel forms per job width, outputs
+  bit-identical. W4A4: the one-column kernels won at every width, eight-column time over
+  one-column 2.25-2.29x at 1 column, 1.91-2.07x at 2, 1.58-1.75x at 3, 1.51-1.62x at 4, 1.36-1.40x
+  at 6, 1.26-1.28x at 8 and 1.27-1.43x at 12-64. They now run every W4A4 narrow job (decode, and
+  prefill calls past the fork route and through the staging overlap, which took the eight-column
+  form), and the eight-column W4A4 form is removed. End to end the prefill change is small: Dense8,
+  one request, prefix cache off, six runs per arm, 100 / 300 / 1K / 4K / 16K prompt tokens, cold
+  expert cache 213.6 / 252.1 / 623.8 / 1,607 / 6,214 -> 212.6 / 250.9 / 627.1 / 1,611 / 6,226
+  tok/s, warm start (4,328 experts) 283.3 / 323.7 / 769.6 / 1,959.5 / 7,520.7 -> 285.4 / 323.3 /
+  772.4 / 1,960.7 / 7,530.8 (-0.5 to +0.7 %): prefill time is staging, CPU-served misses, the wide
+  route and attention. W4A16 is the other way: its one-column kernels win only at one column per
+  expert (18-22 %; 8-10 % slower at 2, 23-34 % at 3-8). On the uncensored W4A16 artifact
+  (`kA16OneColumnCalls` 4 against the 8 of 2026-10-10, MTP max 4, six runs per arm): C = 1 111.9
+  against 112.1 tok/s, C = 2 126.3 against 125.3 (+0.8 % at 4), C = 8 plain 121.7 against 123.7
+  (-1.7 % at 4; eight rows from different requests route apart, an MTP row's drafts alike). W4A16
+  calls of at most four columns take the one-column kernels again; prefill keeps the multi-column
+  ones.
 - t = 7.2 ms + 1.95 ms (W - 1) + 0.04 ms per miss fits each trace (R^2 0.96-0.98), but its zero-miss
   slope is not stable: 0.27 plain rounds per column from the default cache, 0.19 from the smaller
   one. A fully resident card's width cost cannot be extrapolated from this machine.
@@ -3343,8 +3362,8 @@ generated token: 11.0 ms wall against 8.5 ms GPU busy, so the GPU was idle 22.5 
 - **Occupancy (adopted).** A W = 4 verify round has ~30 jobs × 40 gate/up CTAs, about seven
   waves at one CTA per SM. The one-column CTA's activations and partial sums now share storage,
   separated by one more barrier. At 49,376 B, two CTAs fit per SM, and calls of up to four columns
-  (eight since 2026-10-10, see the width-cost paragraphs above) use the one-column kernels, one pass
-  per column over the staged weights. The layer-route test
+  use the one-column kernels, one pass per column over the staged weights (since 2026-10-11 every
+  W4A4 call; see the width-cost paragraphs above). The layer-route test
   gained a four-column case and passes. Greedy ids are unchanged. tg512: plain 83.30 → 85.46,
   MTP max 4 115.06 → **121.20**.
 - **Copy-engine stall (found, fixed below).** On average 4.7 ms per round passed between a

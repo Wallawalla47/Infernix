@@ -5,8 +5,8 @@
 // experts are wide over several 64-column tiles and the tail stays narrow), then times one
 // moe_experts call as the prefill path issues it: 64 staging slots with the double-buffered
 // overlap stream. Experts with more than eight columns take the wide route; the rest the narrow
-// one (calls of T <= 8 without the overlap take the one-column narrow kernels; a call that overlaps
-// its staging, more than 32 jobs at T <= 8, the eight-column ones). --cold flushes the L2 before each
+// one (W4A4: the one-column kernels, a pass per column; W4A16: those in calls of at most four
+// columns, the multi-column kernels above). --cold flushes the L2 before each
 // call, as decode finds a layer's experts (a small T's few experts would otherwise stay L2-resident
 // across repeats). Placement:
 //   frames : every record in device memory (isolates the expert kernels);
@@ -17,6 +17,11 @@
 //
 //   infernix_offloaded_moe_wide_bench [--tokens 64,256,1024,4096] [--placement frames|staged|both]
 //                                   [--activation a4|a16] [--cold] [--warmup 3] [--repeat 10] [--seed N]
+//                                   [--columns-per-expert C] [--split-scales]
+//
+// --columns-per-expert C routes uniformly instead (every used expert gets exactly C columns while
+// 10 T / C <= 512); --split-scales gives every expert distinct gate and up input scales, which keeps
+// experts of more than eight columns off the wide route (W4A4 only).
 
 #include "infernix/ops/offloaded_sparse_moe.h"
 
@@ -58,6 +63,8 @@ struct Options {
     std::uint32_t seed    = 20261004U;
     bool a16              = false;
     bool cold             = false;
+    int columns_per_expert = 0;     // > 0: uniform routing, every used expert has exactly this many columns
+    bool split_scales      = false; // distinct gate and up input scales: no expert takes the wide route
 };
 
 std::vector<int> parse_list(const std::string& text) {
@@ -96,6 +103,11 @@ Options parse_options(int argc, char** argv) {
             options.cold = true;
         } else if (arg == "--seed") {
             options.seed = static_cast<std::uint32_t>(std::stoul(value()));
+        } else if (arg == "--columns-per-expert") {
+            options.columns_per_expert = std::stoi(value());
+            if (options.columns_per_expert < 1) { throw std::invalid_argument("--columns-per-expert must be positive"); }
+        } else if (arg == "--split-scales") {
+            options.split_scales = true;
         } else {
             throw std::invalid_argument("unknown option " + arg);
         }
@@ -122,8 +134,9 @@ std::vector<std::uint8_t> random_records(std::mt19937& rng) {
 }
 
 // Top-10 distinct experts per column under popularity 1 / (rank + 1)^0.7 over a fixed random
-// permutation of the experts.
-std::vector<float> routing_logits(std::mt19937& rng, int columns) {
+// permutation of the experts; with `per_expert` > 0, uniform blocks instead (every used expert gets
+// exactly per_expert columns while 10 * columns / per_expert <= 512).
+std::vector<float> routing_logits(std::mt19937& rng, int columns, int per_expert) {
     std::vector<int> rank(kExperts);
     for (int e = 0; e < kExperts; ++e) { rank[static_cast<std::size_t>(e)] = e; }
     std::shuffle(rank.begin(), rank.end(), rng);
@@ -136,6 +149,14 @@ std::vector<float> routing_logits(std::mt19937& rng, int columns) {
     for (int t = 0; t < columns; ++t) {
         float* column = &logits[static_cast<std::size_t>(t) * (kExperts + 1)];
         for (int e = 0; e <= kExperts; ++e) { column[e] = n(rng); }
+        if (per_expert > 0) {
+            // Uniform: the columns of block t / per_expert all route to that block's ten experts.
+            const int block = t / per_expert;
+            for (int k = 0; k < kTopK; ++k) {
+                column[(block * kTopK + k) % kExperts] = 20.0F + static_cast<float>(kTopK - k);
+            }
+            continue;
+        }
         std::vector<double> w = weight;
         for (int k = 0; k < kTopK; ++k) {
             std::discrete_distribution<int> pick(w.begin(), w.end());
@@ -159,7 +180,7 @@ struct Fixture {
     cudaEvent_t events[5] = {};
     bool a16 = false;
 
-    Fixture(std::uint32_t seed, bool a16) : a16(a16) {
+    Fixture(std::uint32_t seed, bool a16, bool split_scales) : a16(a16) {
         std::mt19937 rng(seed);
         const auto records = random_records(rng);
         const std::size_t bank = static_cast<std::size_t>(kExperts) * moe::kRecordBytes;
@@ -181,6 +202,7 @@ struct Fixture {
         std::uniform_real_distribution<float> lg(-11.0F, -7.0F);
         for (auto& e : s) {
             e.input_gate = e.input_up = std::exp2(lg(rng));
+            if (split_scales) { e.input_up = 1.5F * e.input_gate; }
             e.input_down              = std::exp2(lg(rng));
             e.alpha_gate = e.alpha_up = std::exp2(lg(rng)) * e.input_gate;
             e.alpha_down              = std::exp2(lg(rng)) * e.input_down;
@@ -224,7 +246,7 @@ struct Fixture {
 void run_point(Fixture& fixture, int tokens, const Options& options, bench::L2FlushBuffer* flush, cudaStream_t stream) {
     std::mt19937 rng(options.seed + static_cast<std::uint32_t>(tokens));
     const int entries = kTopK * tokens;
-    const auto logits = routing_logits(rng, tokens);
+    const auto logits = routing_logits(rng, tokens, options.columns_per_expert);
     DeviceBuffer d_logits(logits.size() * sizeof(float));
     CUDA_CHECK(cudaMemcpy(d_logits.p, logits.data(), d_logits.bytes, cudaMemcpyHostToDevice));
     DeviceBuffer ids(sizeof(std::int32_t) * entries), weights(sizeof(float) * entries), gate(sizeof(float) * tokens);
@@ -289,7 +311,7 @@ int main(int argc, char** argv) {
         std::printf("# gpu=%s timed=moe_experts (routing and dispatch untimed%s) activation=%s staging_slots=%d\n",
                     context.props.name, options.cold ? ", L2 flushed before each call" : "", options.a16 ? "a16" : "a4",
                     kStagingSlots);
-        Fixture fixture(options.seed, options.a16);
+        Fixture fixture(options.seed, options.a16, options.split_scales);
         std::unique_ptr<bench::L2FlushBuffer> flush;
         if (options.cold) { flush = std::make_unique<bench::L2FlushBuffer>(256ULL << 20); }
         for (const int tokens : options.tokens) { run_point(fixture, tokens, options, flush.get(), context.stream); }
