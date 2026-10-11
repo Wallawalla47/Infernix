@@ -510,7 +510,7 @@ The official conversion examples select these maintained templates:
 | Model | Template | Defaults |
 |---|---|---|
 | Qwen3.6 Dense/MoE | [qwen3_6.jinja](../tools/chat_templates/qwen3_6.jinja) | thinking on; closed-turn reasoning omitted |
-| Qwen3.8 | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
+| Qwen3.8 27B and Flash-Next | [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja) | thinking on; effort `xhigh`; closed-turn reasoning retained |
 
 Use your own Jinja file to change the artifact's default template. A startup
 [`--chat-template FILE`](cli.md#text-input) overrides the stored template.

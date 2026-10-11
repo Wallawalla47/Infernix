@@ -57,13 +57,15 @@ expert cache and reads fewer bytes per token, so it decodes faster; see
 ```text
 python -m tools.convert --model <nvidia/Qwen3.8-Flash-Next-NVFP4 dir> --recipe qwen3_8_flash_next_nvfp4_dense8 \
   --components text,vision,mtp --proposal --device cpu --name Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
   --out <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix --ngram-out <nvme>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram
 python -m tools.artifact.rename <dir>/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix.infernix --numbered
 ```
 
 The second command names the three files as numbered parts
 (`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Dense8-Infernix-00001-of-00003.infernix` and so on); Infernix
-opens part 1.
+opens part 1. `--resource` stores the maintained Qwen3.8 template, as for Qwen3.8-27B (see
+[Chat template](#chat-template)); keep it in every recipe below.
 
 - **Recipe A.** Use `--recipe qwen3_8_flash_next_nvfp4` and the name without `-Dense8`.
 - **Recipe C, weight-only exports.** `--recipe qwen3_8_flash_next_nvfp4_orcarouter` converts
@@ -174,6 +176,17 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   text reads most of its rows from the volume. Rows missing from that cache are read while the
   GPU starts the round (draft tokens' rows while the verification round starts), so most of that
   read time is hidden.
+
+## Chat template
+
+The conversion above stores [qwen3_8.jinja](../tools/chat_templates/qwen3_8.jinja), the template
+Qwen3.8-27B uses; Flash-Next's own template is Qwen3.8-27B's. Among its Infernix changes, it keeps
+a System or developer message after the first turn in place, as serving documents (Claude Code's
+normal mode sends them). Artifacts converted without it, including the published
+Flash-Next artifacts, store the checkpoint's template, which rejects such a message with
+"System message must be at the beginning". Start them with
+`--chat-template tools/chat_templates/qwen3_8.jinja` (the file is also in the Windows release
+zip's `chat_templates` folder).
 
 ## Prefix cache
 
