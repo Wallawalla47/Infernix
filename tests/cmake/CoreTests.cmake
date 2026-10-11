@@ -52,6 +52,10 @@ infernix_add_test(infernix_copy_batch_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_copy_batch.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_block_copy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_block_copy.cpp"
+  LIBRARIES infernix_core)
+
 infernix_add_test(infernix_host_context_arena_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_context_arena.cpp"
   LIBRARIES infernix_core)
@@ -69,6 +73,7 @@ set_tests_properties(
   infernix_decode_graph_test
   infernix_arena_test
   infernix_copy_batch_test
+  infernix_block_copy_test
   infernix_kv_cache_test
   infernix_host_context_arena_test
   infernix_state_store_test

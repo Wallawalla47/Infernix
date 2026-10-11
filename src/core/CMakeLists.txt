@@ -7,6 +7,7 @@ endif()
 add_library(infernix_core STATIC
   ${INFERNIX_READ_ONLY_FILE_SOURCE}
   arena.cu
+  block_copy.cu
   copy_batch.cpp
   evictable_weight_pool.cu
   vmm_arena.cu

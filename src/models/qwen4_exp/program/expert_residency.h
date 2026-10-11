@@ -195,6 +195,9 @@ private:
     void publish_landed();
     // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
     void issue_loads(cudaStream_t compute);
+    // Applies commands_' relocations and Absent writes to table_host_ and moves the relocated frames of
+    // `base` on `compute` in one launch; returns the number moved. The caller uploads the table.
+    std::uint32_t apply_moves(std::uint8_t* base, cudaStream_t compute);
     // Tier mode: VRAM evictions among commands_ (T3/T5), and Queue pins of the controller's queue.
     void report_evictions();
     void sync_queue_pins();
@@ -230,6 +233,7 @@ private:
 
     std::unique_ptr<expert_cache::CacheController> controller_;
     std::vector<expert_cache::CacheController::Command> commands_;
+    std::vector<std::uint32_t> move_to_, move_from_; // a lend's relocations: destination and source frames
     std::vector<std::uint32_t> group_;
     std::vector<std::uint8_t> seen_;
     std::uint64_t round_ = 0;
