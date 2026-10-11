@@ -216,8 +216,13 @@ private:
         }
         outputs_ = 0;
         for (UINT i = 0;; ++i) {
-            IDXGIOutput* output = nullptr;
-            if (adapter_->EnumOutputs(i, &output) == DXGI_ERROR_NOT_FOUND) { break; }
+            IDXGIOutput* output  = nullptr;
+            const HRESULT status = adapter_->EnumOutputs(i, &output);
+            if (status == DXGI_ERROR_NOT_FOUND) { break; }
+            if (FAILED(status)) { // e.g. DXGI_ERROR_NOT_CURRENTLY_AVAILABLE in Session 0: unknown, not none
+                outputs_ = -1;
+                break;
+            }
             if (output != nullptr) {
                 output->Release();
                 ++outputs_;
