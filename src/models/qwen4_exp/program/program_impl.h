@@ -2653,8 +2653,8 @@ private:
         return static_cast<std::uint64_t>(pool_->available_pages()) + kv_grow_pages() >= need;
     }
 
-    // The pages one growth could add at most: grow_kv takes up to a quarter of the frames, and none
-    // while frames are lent (an estimate; grow_kv decides).
+    // The pages one growth could add at most: grow_kv takes up to every frame, and none while frames
+    // are lent (an estimate; grow_kv decides).
     std::uint32_t kv_grow_pages() const noexcept {
         if (!kv_vmm_ || !residency_ || !residency_->elastic() || residency_->frames() == 0 ||
             residency_->stats().lent_frames != 0) {
@@ -2663,7 +2663,7 @@ private:
         const std::uint32_t room = pool_->capacity_pages() - pool_->backed_pages();
         const std::uint64_t page_bytes =
             std::max<std::uint64_t>(1, kv_span_.bytes / std::max<std::uint32_t>(1, pool_->capacity_pages()));
-        const std::uint64_t frame_room = static_cast<std::uint64_t>(residency_->frames() / 4) * residency_->frame_stride();
+        const std::uint64_t frame_room = static_cast<std::uint64_t>(residency_->frames()) * residency_->frame_stride();
         const std::uint64_t slack      = ExpertResidency::kChunkBytes + 2 * kKvChunkBytes * plan_.pool.planes.size();
         const std::uint64_t usable     = frame_room > slack ? frame_room - slack : 0;
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, usable / page_bytes));
@@ -4001,8 +4001,9 @@ private:
     }
 
     // Raises the pool's backed pages so `need` pages are available, taking the memory from the expert
-    // frames (never below three quarters of them). False when it cannot: a lease holds the frames, or
-    // the pool is at its capacity.
+    // frames, as many as the growth needs: a fixed pool at the capacity would take them all at startup,
+    // and growing in steps reaches the same pool. False when it cannot: a lease holds the frames, the
+    // frames do not cover it, or the pool is at its capacity.
     bool grow_kv(std::uint32_t need) {
         if (!kv_vmm_ || pool_->available_pages() >= need) { return pool_->available_pages() >= need; }
         const std::uint32_t backed = pool_->backed_pages();
@@ -4022,7 +4023,7 @@ private:
         if (added > spare_bytes) {
             give = static_cast<std::uint32_t>((added - spare_bytes + ExpertResidency::kChunkBytes + stride - 1) / stride);
         }
-        if (give > frames / 4) { return false; } // grow by at most a quarter of the cache at once
+        if (give > frames) { return false; }
         device_.synchronize();
         if (give != 0) {
             const auto resized = residency_->resize(frames - give, device_.stream, *vram_);

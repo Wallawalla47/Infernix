@@ -8159,9 +8159,13 @@ elastic pool does the same job with no kernel change:
       units.
     - Growth first uses memory the control law would give the frames anyway. The rest it takes from
       the frames (`ExpertResidency::resize`, one 64 MiB frame chunk over so that much is
-      unmapped), at most a quarter of them per growth.
+      unmapped), as many as the growth needs: a fixed pool at the capacity takes them all.
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
+    - Until 2026-10-11 one growth took at most a quarter of the frames. After the idle shrink this
+      rejected a ~480K resume with HTTP 503 ("more than an idle Engine has"), although resuming a
+      350K request first and then the same 480K request grew the pool to the same size (GitHub
+      #18).
   - **Shrink.**
     - A release lowers the limit to the free top and gives whole frames back at once.
     - After 60 s with every lane free, the maintenance pass releases the cache's idle,
