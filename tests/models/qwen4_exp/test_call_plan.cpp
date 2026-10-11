@@ -3,8 +3,10 @@
 // cover [F, n) in order without overlap or gaps and never exceed the chunk; kept exact taps end a
 // call; boundary taps are kept at any cost; an automatic tap is kept when it adds at most the split
 // budget (the generation opener's CPU-served tail, a split that only shifts the grid) and demoted to
-// flexible otherwise (a mid-chunk split of a one-call suffix); Δ accounting against an independent
-// enumeration of call widths; determinism; refused inputs; Vision span membership. The oracle for
+// flexible otherwise (a mid-chunk split of a one-call suffix); the layer walk's spans (none for a cut
+// between walk-eligible calls, one for a cut that leaves a narrow call inside the walk, one per
+// 65,536 tokens); Δ accounting against an independent enumeration of call widths; determinism;
+// refused inputs; Vision span membership. The oracle for
 // random plans re-derives the calls from the kept taps with a plain loop and re-runs the admission
 // rule with its own cost sum.
 
@@ -117,23 +119,31 @@ int main() {
             check(plan.ends == std::vector<std::uint32_t>{2000, 4096} && plan.taps[0].placement == pc::TapPlacement::Exact,
                   "a boundary tap splits regardless of cost");
         }
-        // With the layer walk's span restart priced: a grid-shifting tap now costs a span and is
-        // demoted, while the opener's cut before a CPU-served tail restarts nothing and is kept.
+        // With the layer walk's spans priced (one per run of calls of at least 256 columns, cut at
+        // 65,536 tokens): a cut between walk-eligible calls is captured inside the span and costs no
+        // span, a cut that leaves a narrower call inside the walk costs one, and the opener's cut
+        // before a CPU-served tail costs none.
         {
             q4::CallCost spans = cost;
             spans.span_seconds = 1.67;
+            const auto extra   = [&](std::uint32_t n, std::span<const pc::PlannedTap> taps) {
+                return q4::plan_calls(0, n, 4096, taps, spans).seconds - q4::plan_calls(0, n, 4096, taps, cost).seconds;
+            };
             const pc::PlannedTap shift[] = {exact(2000)};
-            check(q4::plan_calls(0, 10000, 4096, shift, spans).taps[0].placement == pc::TapPlacement::Flexible,
-                  "a split that restarts the walk's span is demoted");
+            check(q4::plan_calls(0, 10000, 4096, shift, spans).taps[0].placement == pc::TapPlacement::Exact &&
+                      std::fabs(extra(10000, shift) - 1.67) < 1e-9,
+                  "a split between walk-eligible calls keeps the span and is kept");
             const pc::PlannedTap opener[] = {exact(9995)};
-            const q4::CallPlan kept = q4::plan_calls(0, 10000, 4096, opener, spans);
-            check(kept.taps[0].placement == pc::TapPlacement::Exact &&
-                      kept.seconds == q4::plan_calls(0, 10000, 4096, opener, cost).seconds,
+            check(q4::plan_calls(0, 10000, 4096, opener, spans).taps[0].placement == pc::TapPlacement::Exact &&
+                      std::fabs(extra(10000, opener) - 1.67) < 1e-9,
                   "a cut before a CPU-served call costs no span");
-            const pc::PlannedTap boundary[] = {exact(2000, true)};
-            check(std::fabs(q4::plan_calls(0, 10000, 4096, boundary, spans).seconds -
-                            q4::plan_calls(0, 10000, 4096, boundary, cost).seconds - 1.67) < 1e-9,
-                  "a boundary cut before a GPU-staged call is charged one span");
+            const pc::PlannedTap narrow[] = {exact(4196)};
+            check(q4::plan_calls(0, 10000, 4096, narrow, spans).taps[0].placement == pc::TapPlacement::Flexible,
+                  "a cut that leaves a 100-column call inside the walk is demoted");
+            const pc::PlannedTap narrow_boundary[] = {exact(4196, true)};
+            check(std::fabs(extra(10000, narrow_boundary) - 2 * 1.67) < 1e-9,
+                  "a boundary cut that leaves a 100-column call inside the walk is charged a second span");
+            check(std::fabs(extra(140000, {}) - 3 * 1.67) < 1e-9, "a 140,000-token prompt walks three spans");
         }
         // Flexible taps never cut.
         {

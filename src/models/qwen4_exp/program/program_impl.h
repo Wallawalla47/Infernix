@@ -1256,8 +1256,7 @@ public:
             // A state cached at the paused frontier itself leaves nothing to replay.
             selection->plan = selection->frontier < r.target
                                   ? prefix::plan_calls(selection->frontier, r.target, static_cast<std::uint32_t>(chunk_), {},
-                                                       prefix::CallCost{.model = options_.prefix_cost,
-                                                                        .span_seconds = options_.prefix_span_seconds})
+                                                       call_cost())
                                   : prefix::CallPlan{};
             prefix_pin(*selection);
         }
@@ -1318,10 +1317,7 @@ public:
             lane.reservation = std::move(*reservation);
             tables_->publish(lane.row.handle(), 0, std::span<const DeviceKVPageLease>(lane.pages), device_.stream);
             reset_slot(index);
-            lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {},
-                                            prefix::CallCost{.model = options_.prefix_cost,
-                                                             .span_seconds = options_.prefix_span_seconds})
-                             .ends;
+            lane.calls = prefix::plan_calls(0, r.target, static_cast<std::uint32_t>(chunk_), {}, call_cost()).ends;
         }
         lane.next_call = 0;
         if (max_width_ > 1 && options_.ngram_draft_tokens > 0) {
@@ -2879,6 +2875,14 @@ private:
     static constexpr std::int32_t kStreamMinColumns = 256;
     static constexpr std::uint32_t kStreamHalfMin   = 16;
 
+    // The call planner's costs: the fitted call costs, and the walk's spans as walk_span_end forms them.
+    [[nodiscard]] prefix::CallCost call_cost() const {
+        return prefix::CallCost{.model            = options_.prefix_cost,
+                                .span_seconds     = options_.prefix_span_seconds,
+                                .walk_min_columns = static_cast<std::uint32_t>(kStreamMinColumns),
+                                .walk_max_tokens  = kWalkMaxTokens};
+    }
+
     // Whether this chunk streams; lends the ring first when none is held. With `walk_bytes`, the
     // lease also holds a layer walk's area after the ring (stream_walk_bytes_; zero when the
     // lendable frames do not cover it): the experts its frames evict widen each half by their
@@ -3828,6 +3832,16 @@ private:
     [[nodiscard]] std::uint32_t prefix_frontier(const Lane& lane, bool finishing) const noexcept;
     void prefix_publish(Lane& lane, std::uint32_t frontier);
     void prefix_capture(Lane& lane, std::uint32_t index, runtime::prefix_cache::SnapshotKind kind, bool hand_over_tail);
+    // The capture of the lane's state at frontier F (the lane's published path reaches F's anchor);
+    // `mtp_written`: the MTP cell F - 1 is final.
+    [[nodiscard]] prefix::PrefixCache::Capture prefix_capture_at(Lane& lane, std::uint32_t F,
+                                                                 runtime::prefix_cache::SnapshotKind kind,
+                                                                 bool hand_over_tail, bool mtp_written);
+    // Records a capture the cache accepted as the lane's latest.
+    void prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F);
+    // Removes the lane's taps realized at the call boundary B before calls[next_call]; returns whether
+    // any was, and sets `boundary` when one is a boundary tap.
+    bool prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary);
     void prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last);
     void prefix_finish(Lane& lane, std::uint32_t index);
     void prefix_release(Lane& lane) noexcept;
@@ -4174,6 +4188,15 @@ private:
         std::vector<std::optional<execution::VisionInput>> vision;
         std::vector<std::vector<execution::VisionInput>> mtp_vision;
         std::uint64_t steps = 0;
+        // Prefix taps realized at a chunk end inside the span (walk_plan_taps): each chunk's staged
+        // capture (0: none), copied group by group as the walk enqueues that layer of the chunk and
+        // committed after the span; the next chunk's layers wait on its events.
+        struct Tap {
+            std::uint32_t frontier = 0;
+            runtime::prefix_cache::SnapshotKind kind = runtime::prefix_cache::SnapshotKind::Tap;
+            std::uint64_t staged = 0;
+        };
+        std::vector<Tap> taps; // per chunk
     } walk_;
     PinnedHostBuffer walk_host_{1}; // every chunk's io image, uploaded once per span
     // The next span's n-gram rows, read into walk_host_'s chunk slots while the current span's steps
@@ -4200,9 +4223,12 @@ private:
     void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
     PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
     void walk_pass(std::size_t chunk, std::uint32_t layer);
+    // The span's taps: realizes the lane's taps due at its inner chunk ends (as prefix_after_prefill_call
+    // would after chunk-major calls) by opening a staged capture each; committed by walk_commit_taps.
+    void walk_plan_taps(Lane& lane);
+    void walk_commit_taps(Lane& lane);
     void walk_enqueue(std::uint32_t to_layer);
     void walk_abandon() noexcept;
-    [[nodiscard]] bool prefix_tap_due(const Lane& lane, std::size_t next_call) const;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 

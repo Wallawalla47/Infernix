@@ -30,15 +30,22 @@ std::vector<std::uint32_t> segment_ends(std::uint32_t frontier, std::uint32_t n,
     return ends;
 }
 
-double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, std::span<const std::uint32_t> cuts,
-                  const CallCost& cost) {
+// Every call's fixed cost, and a span for each run of walk-eligible calls (cut at walk_max_tokens).
+double seconds_of(std::uint32_t frontier, std::span<const std::uint32_t> ends, const CallCost& cost) {
     double total        = 0.0;
     std::uint32_t begin = frontier;
+    std::uint32_t run   = 0; // tokens of the current span; 0: none open
     for (const std::uint32_t end : ends) {
         const std::uint32_t width = end - begin;
         total += cost.call_seconds(width);
-        if (width > cost.served_columns && std::binary_search(cuts.begin(), cuts.end(), begin)) {
-            total += cost.span_seconds;
+        if (width < cost.walk_min_columns) {
+            run = 0;
+        } else {
+            if (run == 0 || run + width > cost.walk_max_tokens) {
+                total += cost.span_seconds;
+                run = 0;
+            }
+            run += width;
         }
         begin = end;
     }
@@ -64,12 +71,12 @@ CallPlan plan_calls(std::uint32_t frontier, std::uint32_t prompt_tokens, std::ui
     for (const pc::PlannedTap& tap : out.taps) {
         if (tap.placement == pc::TapPlacement::Exact && tap.boundary) { cuts.push_back(tap.position); }
     }
-    double current = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, cuts), cuts, cost);
+    double current = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, cuts), cost);
     for (pc::PlannedTap& tap : out.taps) {
         if (tap.placement != pc::TapPlacement::Exact || tap.boundary) { continue; }
         std::vector<std::uint32_t> with = cuts;
         with.insert(std::upper_bound(with.begin(), with.end(), tap.position), tap.position);
-        const double seconds = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, with), with, cost);
+        const double seconds = seconds_of(frontier, segment_ends(frontier, prompt_tokens, chunk, with), cost);
         if (seconds - current <= cost.split_budget) {
             cuts    = std::move(with);
             current = seconds;

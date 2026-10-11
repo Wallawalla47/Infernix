@@ -20,9 +20,13 @@ struct CallCost {
     std::uint32_t served_columns = 8;            // calls this narrow are CPU-served (no staging)
     double served_call_seconds   = 0.035;        // their fixed cost (estimated, 25-40 ms)
     double split_budget          = 0.1;          // the most an automatic exact tap may add
-    // A cut followed by a GPU-staged call ends the layer walk's span there (a capture needs the
-    // boundary's state in every layer), so the next span streams the experts again.
-    double span_seconds = 0.0;
+    // The layer walk streams the experts once per span: a run of consecutive calls at least
+    // walk_min_columns wide, cut where it would pass walk_max_tokens (prefill_walk.cpp). A cut costs
+    // a span only where it leaves a narrower call between two such calls (taps inside a span are
+    // captured in place).
+    double span_seconds            = 0.0;
+    std::uint32_t walk_min_columns = 256;
+    std::uint32_t walk_max_tokens  = 65536;
 
     [[nodiscard]] double call_seconds(std::uint32_t width) const noexcept;
 };
@@ -33,7 +37,7 @@ struct CallPlan {
     // The taps with their realized placement: an admitted exact tap is the end of a call; a demoted
     // one is flexible.
     std::vector<runtime::prefix_cache::PlannedTap> taps;
-    // Fixed cost of the calls (CallCost::call_seconds summed).
+    // Fixed cost of the calls (CallCost::call_seconds summed) and of the walk's spans.
     double seconds = 0.0;
 };
 

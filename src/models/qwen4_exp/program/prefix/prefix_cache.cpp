@@ -98,6 +98,9 @@ PrefixCache::~PrefixCache() {
     for (PendingCapture& c : captures_) {
         for (cudaEvent_t e : c.events) { (void)cudaEventDestroy(e); }
     }
+    for (auto& [id, s] : staged_) {
+        for (cudaEvent_t e : s.events) { (void)cudaEventDestroy(e); }
+    }
     for (PendingWrite& w : writes_) {
         if (w.done != nullptr) { (void)cudaEventDestroy(w.done); }
     }
@@ -221,29 +224,15 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     CUDA_CHECK(cudaEventRecord(start, producer));
     CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
     recycle(start);
-    std::vector<std::byte*> segments;
-    segments.reserve(host_.image_slabs);
-    for (std::uint32_t i = 0; i < host_.image_slabs; ++i) { segments.push_back(slab(image->slabs[i])); }
+    const std::vector<std::byte*> segments = image_segments(*image);
     write_state_image_header(lanes_->layout(), capture.meta, segments.front());
     const HostImage destination{segments, host_.slab_bytes};
-    const StateImageLayout& layout = lanes_->layout();
-    std::byte* const tail_record[1]  = {tail ? slab(image->slabs.back()) : nullptr};
-    const std::uint32_t tail_group[1] = {tail ? slab_group(image->slabs.back()) : 0U};
-    const DeviceKVPageHandle tail_page[1] = {tail ? *capture.tail_page : DeviceKVPageHandle{}};
-    const auto copy_tail_planes = [&](std::uint32_t kv_layer) {
-        if (!tail) { return; }
-        const PlaneRange planes = kv_layer_planes(geometry_, kv_layer);
-        pool_->copy_to_host_records(tail_page, tail_record, tail_group, host_.page, planes.begin, planes.end, transfer_);
-    };
+    std::byte* const tail_record     = tail ? slab(image->slabs.back()) : nullptr;
+    const std::uint32_t tail_group   = tail ? slab_group(image->slabs.back()) : 0U;
+    const std::optional<DeviceKVPageHandle> tail_page = capture.tail_page;
     PendingCapture pending{std::move(capture), std::move(*image), {}};
-    std::uint32_t attention = 0;
-    for (std::uint32_t g = 0; g < layout.groups(); ++g) {
-        if (g == layout.mtp_group()) {
-            if (geometry_.kv_layers > attention) { copy_tail_planes(attention); }
-        } else if (layout.spec.layer_types[g] == MixerKind::Attention) {
-            copy_tail_planes(attention++);
-        }
-        lanes_->copy_group_to_host(g, lane, destination, transfer_);
+    for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) {
+        copy_capture_group(g, lane, destination, tail_record, tail_group, tail_page);
         cudaEvent_t event = take_event();
         CUDA_CHECK(cudaEventRecord(event, transfer_));
         pending.events.push_back(event);
@@ -252,6 +241,99 @@ bool PrefixCache::capture(std::uint32_t lane, Capture&& capture, cudaStream_t pr
     ++counters_.host_image_writes;
     captures_.push_back(std::move(pending));
     return true;
+}
+
+std::vector<std::byte*> PrefixCache::image_segments(const pc::HostImageReservation& image) const {
+    std::vector<std::byte*> segments;
+    segments.reserve(host_.image_slabs);
+    for (std::uint32_t i = 0; i < host_.image_slabs; ++i) { segments.push_back(slab(image.slabs[i])); }
+    return segments;
+}
+
+void PrefixCache::copy_capture_group(std::uint32_t group, std::uint32_t lane, const HostImage& destination,
+                                     std::byte* tail_record, std::uint32_t tail_group,
+                                     std::optional<DeviceKVPageHandle> tail_page) {
+    const StateImageLayout& layout = lanes_->layout();
+    // KV layer of the group: attention layers in order, then MTP's (when the model keeps one).
+    std::optional<std::uint32_t> kv_layer;
+    std::uint32_t attention = 0;
+    for (std::uint32_t g = 0; g < group && g < layout.spec.layer_types.size(); ++g) {
+        if (layout.spec.layer_types[g] == MixerKind::Attention) { ++attention; }
+    }
+    if (group == layout.mtp_group()) {
+        if (geometry_.kv_layers > attention) { kv_layer = attention; }
+    } else if (layout.spec.layer_types[group] == MixerKind::Attention) {
+        kv_layer = attention;
+    }
+    if (tail_page && kv_layer) {
+        const PlaneRange planes            = kv_layer_planes(geometry_, *kv_layer);
+        std::byte* const records[1]        = {tail_record};
+        const std::uint32_t groups[1]      = {tail_group};
+        const DeviceKVPageHandle pages[1]  = {*tail_page};
+        pool_->copy_to_host_records(pages, records, groups, host_.page, planes.begin, planes.end, transfer_);
+    }
+    lanes_->copy_group_to_host(group, lane, destination, transfer_);
+}
+
+std::optional<std::uint64_t> PrefixCache::open_staged_capture(bool tail, double claim) {
+    auto image = index_->reserve_host_image(tail, claim);
+    if (!image) {
+        ++counters_.taps_skipped;
+        return std::nullopt;
+    }
+    StagedCapture staged{std::move(*image), tail, {}, 0};
+    for (std::uint32_t g = 0; g < lanes_->layout().groups(); ++g) { staged.events.push_back(take_event()); }
+    const std::uint64_t id = next_staged_++;
+    staged_.emplace(id, std::move(staged));
+    return id;
+}
+
+void PrefixCache::capture_group(std::uint64_t staged, std::uint32_t group, std::uint32_t lane,
+                                std::optional<DeviceKVPageHandle> tail_page, cudaStream_t producer) {
+    StagedCapture& s = staged_.at(staged);
+    if (group != s.copied || tail_page.has_value() != s.tail) {
+        throw std::logic_error("Qwen4Exp prefix cache: a staged capture's groups are copied out of order");
+    }
+    cudaEvent_t start = take_event();
+    CUDA_CHECK(cudaEventRecord(start, producer));
+    CUDA_CHECK(cudaStreamWaitEvent(transfer_, start, 0));
+    recycle(start);
+    const std::vector<std::byte*> segments = image_segments(s.image);
+    copy_capture_group(group, lane, HostImage{segments, host_.slab_bytes}, s.tail ? slab(s.image.slabs.back()) : nullptr,
+                       s.tail ? slab_group(s.image.slabs.back()) : 0U, tail_page);
+    CUDA_CHECK(cudaEventRecord(s.events[group], transfer_));
+    ++s.copied;
+}
+
+std::span<const cudaEvent_t> PrefixCache::staged_events(std::uint64_t staged) const {
+    return staged_.at(staged).events;
+}
+
+void PrefixCache::commit_staged_capture(std::uint64_t staged, Capture&& capture) {
+    const auto found = staged_.find(staged);
+    if (found == staged_.end() || found->second.copied != lanes_->layout().groups() ||
+        found->second.tail != !capture.tail.empty() || capture.tail.size() >= pc::kBlockTokens) {
+        throw std::logic_error("Qwen4Exp prefix cache: a staged capture is committed incomplete or with another tail");
+    }
+    StagedCapture s = std::move(found->second);
+    staged_.erase(found);
+    if (capture.anchor.valid()) { index_->pin_node(capture.anchor); }
+    write_state_image_header(lanes_->layout(), capture.meta, slab(s.image.slabs[0]));
+    counters_.host_write_bytes += host_.image_bytes + (s.tail ? host_.page.page_stride : 0U);
+    ++counters_.host_image_writes;
+    captures_.push_back(PendingCapture{std::move(capture), std::move(s.image), std::move(s.events)});
+}
+
+void PrefixCache::abandon_staged_capture(std::uint64_t staged) noexcept {
+    const auto found = staged_.find(staged);
+    if (found == staged_.end()) { return; }
+    // The slabs may still be written: an unrecorded event's synchronize returns at once.
+    for (cudaEvent_t event : found->second.events) {
+        (void)cudaEventSynchronize(event);
+        recycle(event);
+    }
+    index_->release_host_image(std::move(found->second.image));
+    staged_.erase(found);
 }
 
 std::span<const cudaEvent_t> PrefixCache::capture_events(std::uint64_t id) const noexcept {
@@ -312,6 +394,16 @@ void PrefixCache::poll() {
         if (c.capture.supersedes && index_->valid(*c.capture.supersedes) &&
             (!result.snapshot.valid() || *c.capture.supersedes != result.snapshot)) {
             index_->supersede(*c.capture.supersedes, c.capture.continuation);
+        }
+        // The lineage's previous capture published before this one (captures publish in order).
+        if (c.capture.supersedes_capture != 0) {
+            if (const auto previous = published_.find(c.capture.supersedes_capture); previous != published_.end()) {
+                const pc::SnapshotRef earlier = previous->second.snapshot;
+                if (earlier.valid() && index_->valid(earlier) && (!result.snapshot.valid() || earlier != result.snapshot)) {
+                    index_->supersede(earlier);
+                }
+                published_.erase(previous); // kept for this resolution (ProgramImpl::prefix_capture)
+            }
         }
         if (c.capture.anchor.valid()) { index_->unpin_node(c.capture.anchor); }
         published_[c.capture.id] = result;
@@ -527,6 +619,7 @@ void PrefixCache::clear() noexcept {
         for (cudaEvent_t event : batch.events) { recycle(event); }
     }
     landing_.clear();
+    while (!staged_.empty()) { abandon_staged_capture(staged_.begin()->first); }
     captures_.clear();
     writes_.clear();
     published_.clear();

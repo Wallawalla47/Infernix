@@ -13,21 +13,28 @@
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
 // layers of every chunk) and synchronizes, so cancellation and other lanes interleave as between
-// chunk-major calls; the walk's own state stays valid across them. A span ends where a prefix tap
-// is realized (the captured state must be the boundary's in every layer), before a call too narrow
-// to stream, and at kWalkMaxTokens.
+// chunk-major calls; the walk's own state stays valid across them. A span ends before a call too
+// narrow to stream and at kWalkMaxTokens. A prefix tap due at an inner chunk end is captured in place
+// (walk_plan_taps): each layer's state is copied once the walk has enqueued that layer of the chunk,
+// before the next chunk overwrites it, and the snapshot is committed after the span. Ending the span
+// there instead would stream every non-resident expert once more per tap (a cold 128K prompt's taps
+// took ~2.4 s, 14 %, that way).
 
 #include "models/qwen4_exp/program/program_impl.h"
 
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 namespace infernix::models::qwen4_exp::detail {
+
+namespace pc = runtime::prefix_cache;
 
 namespace {
 
 constexpr std::size_t kWalkAlign = 256;
+constexpr std::uint32_t kBlock   = pc::kBlockTokens;
 
 std::size_t walk_align(std::size_t bytes) { return (bytes + kWalkAlign - 1) / kWalkAlign * kWalkAlign; }
 
@@ -56,7 +63,6 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
         from = lane.calls[end];
         ++end;
         tokens.push_back(total);
-        if (prefix_tap_due(lane, end)) { break; }
     }
     if (end - first < 2) { return first; }
     if (stream_lease_.valid() && walk_bytes(tokens[2], 2) > stream_walk_bytes_) {
@@ -100,6 +106,7 @@ void ProgramImpl::walk_begin(Lane& lane, std::uint32_t index, std::size_t end) {
     walk_.mtp.assign(n, std::nullopt);
     walk_.vision.assign(n, std::nullopt);
     walk_.mtp_vision.assign(n, {});
+    walk_plan_taps(lane);
     walk_.host_slot = host_lanes_[0] = static_cast<std::int32_t>(index);
     if (walk_host_.size() < n * walk_.io_stride) {
         walk_host_     = PinnedHostBuffer(n * walk_.io_stride);
@@ -228,7 +235,6 @@ void ProgramImpl::walk_prefetch_rows(Lane& lane, std::uint32_t index, std::size_
         f.widths.push_back(static_cast<std::int32_t>(width));
         f.keys.push_back(window_key());
         tokens += width;
-        if (prefix_tap_due(lane, call + 1)) { f.done = true; }
     }
 }
 
@@ -248,8 +254,13 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
     fb.vision          = walk_.vision[c] ? &*walk_.vision[c] : nullptr;
     // Chunk 0 waits per layer for the lane's restore and in-flight capture. Resolved here, not at the
     // walk's start: the walk spans engine steps, and a poll between them retires a landed batch and
-    // frees its events (a landed batch needs no wait).
-    if (c == 0) { fb.layer_waits = prefix_waits(lanes_[walk_.lane]); }
+    // frees its events (a landed batch needs no wait). A later chunk waits per layer for the tap
+    // captured at the previous chunk's end, whose copy of that layer is enqueued by then.
+    if (c == 0) {
+        fb.layer_waits = prefix_waits(lanes_[walk_.lane]);
+    } else if (walk_.taps[c - 1].staged != 0) {
+        fb.layer_waits[1] = prefix_->staged_events(walk_.taps[c - 1].staged);
+    }
     fb.stream         = true;
     fb.release_stream = c + 1 == n;
     Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
@@ -260,6 +271,51 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
     if (l == 0) { forward_->embed(fb, residual); }
     forward_->layer(l, fb, residual);
     if (l + 1 == L) { forward_->finish(fb, residual, logits_here ? &logits : nullptr); }
+    if (const LayerWalk::Tap& tap = walk_.taps[c]; tap.staged != 0) {
+        // The chunk's end in this layer (and after the last layer, in the MTP block): copy it out.
+        const Lane& lane = lanes_[walk_.lane];
+        std::optional<DeviceKVPageHandle> tail_page;
+        if (tap.frontier % kBlock != 0) { tail_page = lane.pages.at(tap.frontier / kBlock - lane.prefix.page_base).handle(); }
+        prefix_->capture_group(tap.staged, l, walk_.lane, tail_page, device_.stream);
+        if (l + 1 == L) { prefix_->capture_group(tap.staged, L, walk_.lane, tail_page, device_.stream); }
+    }
+}
+
+void ProgramImpl::walk_plan_taps(Lane& lane) {
+    const std::size_t n = walk_.widths.size();
+    walk_.taps.assign(n, {});
+    if (!prefix_ || !lane.prefix.reuse) { return; }
+    // As prefix_after_prefill_call after each inner call of a chunk-major prefill: the taps due at the
+    // chunk's end are realized there, and captured when the lineage's deepest snapshot is a block back.
+    std::uint32_t deepest = lane.prefix.deepest;
+    for (std::size_t c = 0; c + 1 < n; ++c) {
+        const std::uint32_t B = lane.calls[walk_.first_call + c];
+        bool boundary         = false;
+        if (!prefix_take_taps(lane, B, walk_.first_call + c + 1, boundary) || B < deepest + kBlock) { continue; }
+        const bool tail   = B % kBlock != 0;
+        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
+        if (!staged) { continue; }
+        walk_.taps[c] = {B, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, *staged};
+        deepest       = B;
+    }
+}
+
+void ProgramImpl::walk_commit_taps(Lane& lane) {
+    for (LayerWalk::Tap& tap : walk_.taps) {
+        if (tap.staged == 0) { continue; }
+        // The blocks up to the tap first, as after its chunk-major call (its anchor is the last).
+        prefix_publish(lane, tap.frontier);
+        const std::uint64_t staged = std::exchange(tap.staged, 0);
+        if (lane.prefix.path.size() < tap.frontier / kBlock) {
+            prefix_->abandon_staged_capture(staged);
+            continue;
+        }
+        // Every cell up to the span's end is written (the prompt continues past each inner chunk).
+        prefix::PrefixCache::Capture capture = prefix_capture_at(lane, tap.frontier, tap.kind, false, lane.mtp_live);
+        const std::uint64_t id               = capture.id;
+        prefix_->commit_staged_capture(staged, std::move(capture));
+        prefix_captured(lane, id, tap.frontier);
+    }
 }
 
 void ProgramImpl::walk_enqueue(std::uint32_t to_layer) {
@@ -327,6 +383,7 @@ PrefillProgress ProgramImpl::walk_step(Lane& lane, std::uint32_t index, Clock::t
         return_stream_lease();
         return_wide_work();
     }
+    walk_commit_taps(lane);
     prefix_after_prefill_call(lane, index, last);
     if (last && lane.vision) { vision_release(lane); }
     if (!last) {
@@ -357,6 +414,9 @@ void ProgramImpl::walk_abandon() noexcept {
         device_.synchronize();
     } catch (...) {}
     expert_stream_->end();
+    for (const LayerWalk::Tap& tap : walk_.taps) {
+        if (tap.staged != 0) { prefix_->abandon_staged_capture(tap.staged); }
+    }
     walk_          = LayerWalk{};
     walk_prefetch_ = WalkPrefetch{};
 }

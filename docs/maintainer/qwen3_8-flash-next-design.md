@@ -3948,9 +3948,13 @@ span to stream the experts, 0.16 s per further call, 22 us per token and 1.06 ns
 Measured against modelled: pp4096 in 4 and 8 calls 2.55 s and 3.03 s (model -4.8 % and +1.7 %),
 pp16384 2.70 s (+5.0 %), pp32768 4.36 s (-1.5 %), pp131072 19.0 s (0.0 %). Single-call prompts of
 512 to 4096 tokens took 2.1-2.5 s, which the model underestimates by 6-25 %. They pay the whole span
-at a width the fit does not cover. Because the walk ends its span at every cut, a cut followed by a
-GPU-staged call costs a span as well as a call. The planner therefore demotes automatic exact taps
-that are not free, and coalescing charges a new tap the same amount. The old constants overpriced
+at a width the fit does not cover. The walk streams the experts once per span, a run of calls of at
+least 256 columns cut at 65,536 tokens, and captures the taps inside a span in place (§19.3.8 F4).
+So a cut costs a call, and a span only where it leaves a narrower call between walk-eligible ones;
+the planner charges every plan its spans (`CallCost::walk_min_columns`, `walk_max_tokens`) and
+demotes automatic exact taps that are not free, and coalescing charges a new tap the same way.
+Until 2026-10-11 a tap ended the span, so every cut and every flexible tap inside a long prompt
+cost a span (a cold 128K prompt's ladder taps added ~2.4 s, 14 %). The old constants overpriced
 tokens about 50-fold, so predicted coalescing waits exceeded the queue-timeout limit for shared
 prefixes beyond about 4K tokens.
 
@@ -7629,8 +7633,15 @@ the drive's knee) remains open.
   - `Forward::run` is now `begin_call`, `embed`, `layer` × 48 and `finish`; the walk calls the
     same steps per (layer, chunk).
 - **Spans.** Consecutive calls of at least 256 columns, up to `kWalkMaxTokens` = 65,536 tokens.
-  - A span ends at a call whose end realizes a prefix tap: the capture needs the boundary's state
-    in every layer. `prefix_tap_due` mirrors `prefix_after_prefill_call`.
+  - A prefix tap due at an inner chunk end is captured inside the span (`walk_plan_taps`, decided as
+    `prefix_after_prefill_call` decides after a chunk-major call). At the span's start a staged
+    capture reserves the slabs and one event per layer group; when the walk has enqueued layer l of
+    that chunk (and, after the last layer, its MTP block) the transfer stream copies group l and
+    that layer's planes of the tail page, and the next chunk's layer l waits on group l's event
+    before it writes the state (`ForwardBatch::layer_waits`). After the span the blocks are published
+    up to each tap and the captures committed in order (`walk_commit_taps`), then the span's end is
+    handled as before. Until 2026-10-11 a span ended at each such call instead, and every tap
+    streamed the non-resident experts once more.
   - A single call keeps the chunk-major path.
 - **Memory.** The span's residual stream (BF16 [S·H, tokens], 20 KB per token: 1.3 GB at 64K)
   and every chunk's staged io image live in the stream lease after the ring.
@@ -8392,8 +8403,9 @@ unwritten.
   the remaining blocks, the state at the frontier as a Host-born snapshot, and write-through. A
   request the prefix cache does not publish (`allow_prefix_reuse` off, a non-reusable prompt)
   publishes nothing.
-- Inside a layer walk's span the layers are at different positions: the walk is abandoned and
-  nothing past the span's start is published (its taps were).
+- Inside a layer walk's span the layers are at different positions: the walk is abandoned, its
+  staged tap captures are dropped (their slabs return once their copies land), and nothing past
+  the span's start is published.
 - The ResumeState keeps the ledger (prompt and committed output), the frontier, and the request's
   measurements and decisions (timings, speculative statistics, the drafter's acceptance policy,
   `/v1/decide` draws, cache and n-gram counters). The model state is not owned: the cache entry

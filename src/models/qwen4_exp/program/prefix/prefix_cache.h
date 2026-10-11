@@ -156,12 +156,30 @@ public:
         double claim = 0.0; // the new snapshot's estimate_priority
         StateImageHeader meta;
         std::optional<runtime::prefix_cache::SnapshotRef> supersedes;
+        // The lineage's previous capture (its id), superseded when this one publishes: captures publish
+        // in order, so the previous one's snapshot is known then even when it was still in flight here.
+        std::uint64_t supersedes_capture = 0;
         // When `supersedes` is the snapshot the lane resumed from: the lane's tokens from its frontier
         // on, so the endpoints the lineage went past are superseded too (PrefixCacheIndex::supersede).
         std::vector<TokenId> continuation;
     };
     // Returns false when no slabs could be reserved for its claim (the capture is skipped).
     [[nodiscard]] bool capture(std::uint32_t lane, Capture&& capture, cudaStream_t producer);
+    // A capture taken group by group, for a layer walk that passes the frontier inside a span
+    // (prefill_walk.cpp): the walk reaches the frontier in each layer at another point of its queue,
+    // so each group (with that layer's planes of the tail page) is copied once the walk has enqueued
+    // that layer of the frontier's chunk, and the capture is committed after the span. Opening
+    // reserves the slabs (nothing when none could be reserved: the capture is skipped) and the
+    // events the lane's next writes to each group wait on (staged_events, layer order).
+    [[nodiscard]] std::optional<std::uint64_t> open_staged_capture(bool tail, double claim);
+    void capture_group(std::uint64_t staged, std::uint32_t group, std::uint32_t lane,
+                       std::optional<DeviceKVPageHandle> tail_page, cudaStream_t producer);
+    [[nodiscard]] std::span<const cudaEvent_t> staged_events(std::uint64_t staged) const;
+    // Every group copied; `capture` as `capture` takes it (claim and tail as opened). Published when
+    // the copies land (poll), in commit order with every other capture.
+    void commit_staged_capture(std::uint64_t staged, Capture&& capture);
+    // A staged capture that will not be committed: its slabs return once its copies have landed.
+    void abandon_staged_capture(std::uint64_t staged) noexcept;
     // The capture's copy-out events in layer order (decoder layers, then MTP): each is recorded once
     // that layer's state (and its planes of the tail page) has been read. Empty once it has landed.
     [[nodiscard]] std::span<const cudaEvent_t> capture_events(std::uint64_t id) const noexcept;
@@ -231,6 +249,17 @@ private:
         runtime::prefix_cache::HostImageReservation image;
         std::vector<cudaEvent_t> events; // decoder layers, then MTP
     };
+    struct StagedCapture {
+        runtime::prefix_cache::HostImageReservation image;
+        bool tail = false;
+        std::vector<cudaEvent_t> events; // decoder layers, then MTP; each recorded once its group is copied
+        std::uint32_t copied = 0;        // groups copied
+    };
+    // The image's segments, as HostImage takes them.
+    [[nodiscard]] std::vector<std::byte*> image_segments(const runtime::prefix_cache::HostImageReservation& image) const;
+    // Group g's copy-out (its layer's planes of a tail page first) on the transfer stream.
+    void copy_capture_group(std::uint32_t group, std::uint32_t lane, const HostImage& destination,
+                            std::byte* tail_record, std::uint32_t tail_group, std::optional<DeviceKVPageHandle> tail_page);
     struct PendingWrite {
         std::vector<runtime::prefix_cache::NodeRef> nodes;
         cudaEvent_t done = nullptr;
@@ -274,6 +303,8 @@ private:
     std::vector<std::int32_t> node_mtp_next_;      // by node index
     std::vector<StateImageHeader> snapshot_meta_;  // by snapshot index
     std::deque<PendingCapture> captures_;
+    std::unordered_map<std::uint64_t, StagedCapture> staged_;
+    std::uint64_t next_staged_ = 1;
     std::deque<PendingWrite> writes_;
     std::unordered_map<std::uint64_t, runtime::prefix_cache::PublishResult> published_;
     RestoreBatch restore_;

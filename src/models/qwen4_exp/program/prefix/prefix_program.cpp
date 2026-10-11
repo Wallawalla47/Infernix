@@ -431,10 +431,10 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
             continue;
         }
         // Waiting saves this request's prefill of the shared tokens; a new tap costs the sibling what
-        // its cut adds: a call unless the tap is a call end already, and a span restart when
-        // walk-eligible calls meet there (nothing at a running walk's span end). The sibling's
-        // remaining prefill to the snapshot is the wait, doubled because other lanes' decode rounds
-        // interleave with it.
+        // its cut adds: a call unless the tap is a call end already, and a span restart when the cut
+        // leaves a call too narrow to walk (a tap between walk-eligible calls is captured inside the
+        // span; nothing at a running walk's span end). The sibling's remaining prefill to the snapshot
+        // is the wait, doubled because other lanes' decode rounds interleave with it.
         const double saved     = cost.prefill_seconds(reuse, wait->target - reuse);
         const double predicted = 2.0 * cost.prefill_seconds(lane.state_tokens, wait->target - lane.state_tokens);
         double split           = 0.0;
@@ -449,7 +449,9 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
             const std::uint32_t right = *std::next(tap); // the tap is before the prompt's end
             const auto streamed       = static_cast<std::uint32_t>(kStreamMinColumns);
             if (cut) { split += cost.chunk_seconds; }
-            if (wait->target - left >= streamed && right - wait->target >= streamed) { split += options_.prefix_span_seconds; }
+            if (cut && right - left >= streamed && (wait->target - left < streamed || right - wait->target < streamed)) {
+                split += options_.prefix_span_seconds;
+            }
         }
         if (saved > split && predicted <= options_.prefix_coalesce_wait_seconds) {
             consider(*wait);
@@ -605,8 +607,7 @@ prefix::CallPlan ProgramImpl::plan_prefill(const qwen3_5::PreparedPromptData& pr
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         planned = pc::plan_taps(n, frontier, prompt.tap_hints.hints, existing, spans, prefix_->taps());
     }
-    return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned,
-                              prefix::CallCost{.model = options_.prefix_cost, .span_seconds = options_.prefix_span_seconds});
+    return prefix::plan_calls(frontier, n, static_cast<std::uint32_t>(chunk_), planned, call_cost());
 }
 
 HybridPrefixCacheStats ProgramImpl::prefix_stats() const noexcept {
@@ -739,6 +740,23 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     const std::uint32_t F = lane.state_tokens;
     const std::uint32_t k = F / kBlock;
     if (F == 0 || lane.prefix.path.size() < k) { return; }
+    prefix::PrefixCache::Capture c =
+        prefix_capture_at(lane, F, kind, hand_over_tail, lane.mtp_live && lane.mtp_cells == F);
+    const std::uint64_t id = c.id;
+    if (prefix_->capture(index, std::move(c), device_.stream)) { prefix_captured(lane, id, F); }
+}
+
+void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F) {
+    // The lineage's previous capture stays known until this one publishes and supersedes it.
+    if (lane.prefix.capture != lane.prefix.lineage_capture) { prefix_->forget_capture(lane.prefix.capture); }
+    lane.prefix.capture         = id;
+    lane.prefix.lineage_capture = id;
+    lane.prefix.deepest         = F;
+}
+
+prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uint32_t F, pc::SnapshotKind kind,
+                                                            bool hand_over_tail, bool mtp_written) {
+    const std::uint32_t k = F / kBlock;
     prefix::PrefixCache::Capture c;
     c.id       = ++next_capture_;
     c.anchor   = k == 0 ? pc::NodeRef{} : lane.prefix.path[k - 1];
@@ -752,7 +770,7 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
     c.kind             = kind;
     c.claim            = prefix_->index().estimate_priority(lane.prefix.deepest, F, !c.tail.empty());
     c.meta.frontier    = F;
-    c.meta.mtp_written = lane.mtp_live && lane.mtp_cells == F;
+    c.meta.mtp_written = mtp_written;
     c.meta.mtp_next    = lane.history.size() > F ? lane.history[F] : -1;
     c.meta.lineage_echo = lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume) &&
                           prefix_->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
@@ -762,11 +780,10 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
                     });
     c.meta.mtp_accept = lane.mtp_accept;
     // The lineage's previous snapshot serves only requests diverging before this one: this request's
-    // last capture, else the snapshot it resumed from (never an earlier request's capture on the slot).
-    if (const auto previous = lane.prefix.lineage_capture != 0 ? prefix_->capture_result(lane.prefix.lineage_capture)
-                                                               : std::nullopt;
-        previous && previous->snapshot.valid()) {
-        c.supersedes = previous->snapshot;
+    // last capture (resolved when this one publishes: it may still be in flight), else the snapshot
+    // it resumed from (never an earlier request's capture on the slot).
+    if (lane.prefix.lineage_capture != 0) {
+        c.supersedes_capture = lane.prefix.lineage_capture;
     } else if (lane.prefix.resume) {
         c.supersedes = *lane.prefix.resume;
         if (prefix_->index().valid(*lane.prefix.resume)) {
@@ -776,13 +793,24 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
             }
         }
     }
-    const std::uint64_t id = c.id;
-    if (prefix_->capture(index, std::move(c), device_.stream)) {
-        prefix_->forget_capture(lane.prefix.capture);
-        lane.prefix.capture         = id;
-        lane.prefix.lineage_capture = id;
-        lane.prefix.deepest         = F;
-    }
+    return c;
+}
+
+bool ProgramImpl::prefix_take_taps(Lane& lane, std::uint32_t B, std::size_t next_call, bool& boundary) {
+    if (lane.prefix.taps.empty()) { return false; }
+    // A boundary inside a Vision item cannot be resumed from: its flexible taps wait for the next.
+    if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return false; }
+    // An exact tap ends a call; a flexible one is realized at the first boundary at or past it, or
+    // at the start of the prompt's final call.
+    const bool final_next = next_call + 1U == lane.calls.size();
+    bool due              = false;
+    std::erase_if(lane.prefix.taps, [&](const pc::PlannedTap& tap) {
+        if (tap.position > B && !(final_next && tap.placement == pc::TapPlacement::Flexible)) { return false; }
+        due      = true;
+        boundary = boundary || tap.boundary;
+        return true;
+    });
+    return due;
 }
 
 // After a prefill call ending at the lane's frontier: publish its blocks and realize the taps due
@@ -790,39 +818,12 @@ void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKi
 void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, bool last) {
     if (!prefix_ || !lane.prefix.reuse) { return; }
     prefix_publish(lane, prefix_frontier(lane, false));
-    if (last || lane.prefix.taps.empty()) { return; }
+    if (last) { return; }
     const std::uint32_t B = lane.state_tokens;
-    // A boundary inside a Vision item cannot be resumed from: its flexible taps wait for the next.
-    if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return; }
-    // An exact tap ends a call; a flexible one is realized at the first boundary at or past it, or
-    // at the start of the prompt's final call.
-    const bool final_next = lane.next_call + 1U == lane.calls.size();
-    bool due              = false;
     bool boundary         = false;
-    std::erase_if(lane.prefix.taps, [&](const pc::PlannedTap& tap) {
-        const bool now = tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
-        due            = due || now;
-        boundary       = boundary || (now && tap.boundary);
-        return now;
-    });
-    if (due && B >= lane.prefix.deepest + kBlock) {
+    if (prefix_take_taps(lane, B, lane.next_call, boundary) && B >= lane.prefix.deepest + kBlock) {
         prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
     }
-}
-
-// Whether prefix_after_prefill_call after the call that ends at calls[next_call - 1] would realize a
-// tap (the layer walk ends its span there: the capture needs that boundary's state in every layer).
-bool ProgramImpl::prefix_tap_due(const Lane& lane, std::size_t next_call) const {
-    if (!prefix_ || !lane.prefix.reuse || lane.prefix.taps.empty() || next_call == 0 ||
-        next_call >= lane.calls.size()) {
-        return false;
-    }
-    const std::uint32_t B = lane.calls[next_call - 1];
-    if (prefix::inside_exclusion(B, lane.prefix.exclusions)) { return false; }
-    const bool final_next = next_call + 1U == lane.calls.size();
-    return std::any_of(lane.prefix.taps.begin(), lane.prefix.taps.end(), [&](const pc::PlannedTap& tap) {
-        return tap.position <= B || (final_next && tap.placement == pc::TapPlacement::Flexible);
-    });
 }
 
 // Finish or a consistent abort: the M3 flush, the remaining blocks, the endpoint and write-through.
