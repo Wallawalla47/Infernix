@@ -24,10 +24,11 @@ inline constexpr std::size_t kLoopWindowWords     = 2000;  // the recent words w
 inline constexpr std::size_t kLoopHistoryWords    = 30000; // how far back passages are counted
 inline constexpr double kLoopCoverage             = 0.25;  // coverage at which the guard fires
 
-// Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of ASCII letters
-// and digits, '_' and non-ASCII bytes (ASCII letters lower-cased); every other non-space ASCII
-// character is a word of its own; whitespace separates. `partial` holds a word a token boundary
-// cut, completed by the next call.
+// Appends the words of UTF-8 `bytes` to `words` as 64-bit hashes. A word is a run of letters, digits
+// and '_' (ASCII letters lower-cased); every other non-space character is a word of its own, so an
+// unseparated run of emoji or punctuation contributes one word per character, as it does under
+// Strata's `\w+|[^\w\s]`. A character is classified once all of its bytes have arrived, so `partial`
+// holds the bytes of a word a token boundary cut, completed by the next call.
 void append_words(std::string_view bytes, std::string& partial, std::vector<std::uint64_t>& words);
 
 // The share of the last kLoopWindowWords of `words` covered by kLoopPassageWords-word passages that
