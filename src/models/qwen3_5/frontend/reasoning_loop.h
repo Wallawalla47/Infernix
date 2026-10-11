@@ -45,7 +45,7 @@ void append_words(std::string_view bytes, std::string& partial, std::vector<std:
 void append_tail(std::string_view bytes, std::string& tail);
 
 // True when the last kLoopTailChars characters of `text` are one period of at most kLoopTailPeriod
-// repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which no loop
+// characters repeated (Strata's #1753). The comparison is byte-exact where Strata folds case, which no loop
 // this catches depends on. False while fewer than kLoopTailChars characters have been emitted.
 [[nodiscard]] bool periodic_tail(std::string_view text);
 

@@ -183,7 +183,13 @@ bool periodic_tail(std::string_view text) {
     const TailSpan span = tail_span(text, kLoopTailChars);
     if (span.characters < kLoopTailChars) { return false; }
     const std::string_view tail = text.substr(span.begin);
-    for (std::size_t period = 1; period <= kLoopTailPeriod && period < tail.size(); ++period) {
+    // Strata's period counts characters: the bytes of the tail's first 1..kLoopTailPeriod characters.
+    // The tail starts on a character, so a byte shift by a whole number of characters that repeats
+    // the tail is exactly a character period.
+    std::size_t period = 0;
+    for (std::size_t characters = 1; characters <= kLoopTailPeriod; ++characters) {
+        do { ++period; } while (period < tail.size() && (static_cast<unsigned char>(tail[period]) & 0xc0U) == 0x80U);
+        if (period >= tail.size()) { return false; }
         if (tail.substr(period) == tail.substr(0, tail.size() - period)) { return true; }
     }
     return false;

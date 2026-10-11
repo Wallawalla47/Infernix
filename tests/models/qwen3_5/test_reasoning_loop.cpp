@@ -127,6 +127,24 @@ int main() {
         expect(!periodic_tail("58747693387"), "tail below the window");
         expect(!periodic_tail(varied(200)), "varied tail is not periodic");
     }
+    // The period counts characters, not bytes: 30 CJK characters (90 bytes) repeat, 65 do not.
+    {
+        const auto cjk = [](int n) {
+            std::string unit;
+            for (int i = 0; i < n; ++i) {
+                const int c = 0x4e00 + i; // three UTF-8 bytes each
+                unit += static_cast<char>(0xe0 | (c >> 12));
+                unit += static_cast<char>(0x80 | ((c >> 6) & 0x3f));
+                unit += static_cast<char>(0x80 | (c & 0x3f));
+            }
+            std::string text;
+            while (text.size() < 3U * (kLoopTailChars + 2U * n)) { text += unit; }
+            return text;
+        };
+        expect(periodic_tail(cjk(30)), "30-character period of 3-byte characters");
+        expect(periodic_tail(cjk(64)), "64-character period of 3-byte characters");
+        expect(!periodic_tail(cjk(65)), "65-character period is beyond the limit");
+    }
     // The tail stays bounded and keeps its characters however the bytes arrive.
     {
         std::string tail;
