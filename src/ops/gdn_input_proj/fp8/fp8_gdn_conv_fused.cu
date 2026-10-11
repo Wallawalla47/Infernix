@@ -18,11 +18,11 @@ namespace {
 
 template <int Tokens, class Publish>
 struct Fp8GdnConvEpilogue {
-    [[maybe_unused]] static constexpr int kRowTokens = Tokens;
+    static constexpr int kRowTokens = Tokens;
 
     template <class Output>
     __device__ __forceinline__ void apply_row(const Output& output, int row, int,
-                                              const float (&values)[Tokens], int) const {
+                                              const float (&values)[kRowTokens], int) const {
         output.store_row(row, values);
     }
 };
