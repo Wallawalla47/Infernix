@@ -98,6 +98,25 @@ void flush_word(std::string& partial, std::vector<std::uint64_t>& words) {
     partial.clear();
 }
 
+struct TailSpan {
+    std::size_t begin      = 0;
+    std::size_t characters = 0;
+};
+
+// Where the last `limit` characters of `text` begin, walking back over continuations so that a
+// multi-byte character is never cut in half.
+TailSpan tail_span(std::string_view text, std::size_t limit) {
+    TailSpan span;
+    span.begin = text.size();
+    while (span.begin > 0 && span.characters < limit) {
+        std::size_t at = span.begin - 1U;
+        while (at > 0 && (static_cast<unsigned char>(text[at]) & 0xc0U) == 0x80U) { --at; }
+        span.begin = at;
+        ++span.characters;
+    }
+    return span;
+}
+
 } // namespace
 
 void append_words(std::string_view bytes, std::string& partial, std::vector<std::uint64_t>& words) {
@@ -150,6 +169,24 @@ double repeated_passage_coverage(std::span<const std::uint64_t> words) {
         covered += depth > 0 ? 1U : 0U;
     }
     return static_cast<double>(covered) / static_cast<double>(kLoopWindowWords);
+}
+
+void append_tail(std::string_view bytes, std::string& tail) {
+    tail.append(bytes);
+    // A character is at most four bytes, so the last 4 * kLoopTailChars bytes always hold the last
+    // kLoopTailChars characters; the buffer is cut only once it is twice that.
+    constexpr std::size_t kKeep = 4U * kLoopTailChars;
+    if (tail.size() > 2U * kKeep) { tail.erase(0, tail.size() - kKeep); }
+}
+
+bool periodic_tail(std::string_view text) {
+    const TailSpan span = tail_span(text, kLoopTailChars);
+    if (span.characters < kLoopTailChars) { return false; }
+    const std::string_view tail = text.substr(span.begin);
+    for (std::size_t period = 1; period <= kLoopTailPeriod && period < tail.size(); ++period) {
+        if (tail.substr(period) == tail.substr(0, tail.size() - period)) { return true; }
+    }
+    return false;
 }
 
 } // namespace infernix::models::qwen3_5

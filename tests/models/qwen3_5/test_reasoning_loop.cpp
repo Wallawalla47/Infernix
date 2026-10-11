@@ -119,6 +119,22 @@ int main() {
     std::string twice = varied(300) + pass + varied(10) + pass + varied(150);
     const double recap = repeated_passage_coverage(words_of(twice));
     expect(recap < kLoopCoverage, "recap coverage " + std::to_string(recap));
+    // A loop written as one long word: a periodic tail reads as full coverage.
+    {
+        std::string digits;
+        for (int i = 0; i < 200; ++i) { digits += "58747693387"; } // 2200 characters, period 11
+        expect(periodic_tail(digits), "periodic tail");
+        expect(!periodic_tail("58747693387"), "tail below the window");
+        expect(!periodic_tail(varied(200)), "varied tail is not periodic");
+    }
+    // The tail stays bounded and keeps its characters however the bytes arrive.
+    {
+        std::string tail;
+        const std::string symbol = "\xe2\x9a\xa1";
+        for (int i = 0; i < 8000; ++i) { append_tail(symbol, tail); }
+        expect(periodic_tail(tail), "bounded tail is periodic");
+        expect(tail.size() <= 8U * kLoopTailChars, "tail stays bounded");
+    }
     if (failures != 0) { return 1; }
     std::cout << "OK reasoning loop (varied " << novel << ", looping " << loop << ", recap " << recap << ")\n";
     return 0;
