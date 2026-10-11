@@ -385,8 +385,10 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     require(first_result->engine_request_id != second_result.engine_request_id,
             "concurrent requests lost their independent identity");
 
-    // The memory summary also waits for the completed worker boundary before we inspect its
-    // published counters; wait() may return as soon as the terminal response is available.
+    // The memory summary waits for the completed worker boundary (it takes the execution lock), so
+    // the counters published there are inspected; wait() may return as soon as the terminal
+    // response is available, before the worker publishes them.
+    (void)engine.memory_summary();
     const auto after            = engine.runtime_stats();
     settled(after);
     require(first_token_counts[0] == 1 && first_token_counts[1] == 1,
@@ -477,6 +479,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     require(probe.generated_token_ids.size() == 4 &&
                 probe.finish_reason == infernix::FinishReason::OutputLimit,
             "request after recovery could not reuse the released execution resources");
+    (void)engine.memory_summary(); // the worker boundary, as above
     settled(engine.runtime_stats());
     require(engine.is_available(), "Engine became unavailable after recovery");
 }
