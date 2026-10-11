@@ -176,7 +176,10 @@ def gpu_memory_mib():
         return None
 
 
-def wait_gpu_idle(timeout=240, threshold=6000):
+def wait_gpu_idle(timeout=240, threshold=1500):
+    """Until the previous server's VRAM is released (the display keeps a few hundred MiB): a server
+    started earlier sizes itself against the leftover, and NInfer's minimum reservation then fails
+    (2026-10-11: 9.5 GB free 13 s after an Infernix arm stopped)."""
     deadline = time.time() + timeout
     mib = None
     while time.time() < deadline:
