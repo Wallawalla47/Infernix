@@ -56,15 +56,13 @@ function(infernix_stage_runtime_dlls target)
     endif()
     return()
   endif()
-  get_target_property(_infernix_rt_out ${target} RUNTIME_OUTPUT_DIRECTORY_RELEASE)
-  if(NOT _infernix_rt_out)
-    set(_infernix_rt_out ${CMAKE_BINARY_DIR}/apps/Release)
-  endif()
+  # TARGET_FILE_DIR is the directory the linker actually wrote the executable to: apps/<Config>/
+  # under a multi-config generator (Visual Studio), apps/ under a single-config one (Ninja).
   add_custom_command(TARGET ${target} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${_infernix_rt_out}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      ${_infernix_rt_dlls} ${_infernix_rt_out}
-    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to ${target}")
+      ${_infernix_rt_dlls} "$<TARGET_FILE_DIR:${target}>"
+    COMMENT "Staging runtime DLLs (ffmpeg/curl) next to ${target}"
+    VERBATIM)
 endfunction()
 
 # Stage the shared FFMPEG/curl closure once next to the test executables. All test
