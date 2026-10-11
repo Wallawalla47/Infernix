@@ -261,12 +261,12 @@ std::vector<double> pooled_oracle(const std::vector<std::uint16_t>& raw,
 
 // ------------------------------------------------------------------------------ index query
 
-void test_index_query(int columns, std::uint32_t seed) {
+void test_index_query(int columns, std::uint32_t seed, int last_position = 8191) {
     std::mt19937 rng(seed);
     const auto q = random_bf16(rng, static_cast<std::size_t>(kDi) * kIndexHeads * columns, 2.0);
     const auto weight = random_bf16(rng, kDi, 0.3);
     // Distinct axes per column (axis a of column c at word a * columns + c).
-    std::uniform_int_distribution<int> position(0, 8191);
+    std::uniform_int_distribution<int> position(0, last_position);
     std::vector<std::int32_t> rope(3 * static_cast<std::size_t>(columns));
     for (auto& p : rope) { p = position(rng); }
     DeviceBuffer dq = upload(q), dw = upload(weight), dp = upload(rope);
@@ -289,8 +289,11 @@ void test_index_query(int columns, std::uint32_t seed) {
         }
     }
     g_failures += t::verify_reduction(std::string("qsa_index_query") +
-                                          (g_index_geometry.yarn_factor > 1.0F ? " yarn" : "") +
-                                          " T=" + std::to_string(columns),
+                                          (g_index_geometry.yarn_factor > 1.0F
+                                               ? " yarn L=" + std::to_string(g_index_geometry.original_positions)
+                                               : std::string()) +
+                                          " T=" + std::to_string(columns) +
+                                          " positions<=" + std::to_string(last_position),
                                       got, ref,
                                       kKeyCriterion);
 }
@@ -1379,6 +1382,9 @@ int main() {
         g_index_geometry.original_positions = 4096;
         for (const int columns : {1, 64}) { test_index_query(columns, 200U + columns); }
         test_pool(9);
+        // Qwen3.8-Flash-Next's YaRN x4: an original span of 262144, positions up to the last of 1M.
+        g_index_geometry.original_positions = 262144;
+        for (const int columns : {1, 64}) { test_index_query(columns, 300U + columns, 1048575); }
         g_index_geometry = kGeometry;
         // Decode across the dense/selected boundary (2,051 visible tokens is the last dense one),
         // verification across a page boundary, prefill columns crossing the boundary inside one

@@ -6,11 +6,11 @@
 //     `top` highest scores, equal scores taken in ascending block order, written ascending;
 //   - an FP64 oracle of the scores from the same BF16 inputs: FP32 scores within an accumulation
 //     bound, and no unselected block above a selected one in FP64 beyond both bounds.
-// Cases: 0.5K-131K blocks per column; both sides of the 512-block budget (dense columns write
-// count -1), also inside one row; widths 1-1024 and 1-9 rows, groups beyond 128 columns; index
-// heads 1-4; ratios 4, 8, 64 and 128 (a pooled key across two pages); exact ties across the
-// threshold, zero-score ties, bins larger than the candidate buffer, near ties; and CUDA Graph
-// capture replayed with new positions over garbage scratch.
+// Cases: 0.5K-262K blocks per column (up to 1M tokens); both sides of the 512-block budget (dense
+// columns write count -1), also inside one row; widths 1-1024 and 1-9 rows, groups beyond 128
+// columns; index heads 1-4; ratios 4, 8, 64 and 128 (a pooled key across two pages); exact ties
+// across the threshold, zero-score ties, bins larger than the candidate buffer, near ties; and CUDA
+// Graph capture replayed with new positions over garbage scratch.
 #include "infernix/ops/qsa.h"
 #include "core/paged_kv_cache.h"
 #include "ops/host_parallel.h"
@@ -742,6 +742,13 @@ std::vector<Case> cases() {
     // Beyond 262K tokens.
     auto* far = add("beyond: 131K blocks", 1, 2, {524286});
     far->max_context = 524288 + 1024;
+    // Toward YaRN x4's 1M tokens: a ~970K-token prompt (242K blocks) and the last position.
+    auto* near_1m = add("beyond: 242K blocks", 1, 2, {970352});
+    near_1m->max_context = 1048576 + 1024;
+    auto* full_1m = add("beyond: 262K blocks", 1, 1, {1048575});
+    full_1m->max_context = 1048576 + 1024;
+    auto* prefill_1m = add("beyond: prefill W=64 at 242K blocks", 1, 64, {970000});
+    prefill_1m->max_context = 1048576 + 1024;
     // Geometries: index heads 1 and 3; ratios 8 (top 64), 64 (top 32), 128 (blocks span two pages).
     auto* h1 = add("index heads 1", 2, 3, {12000, 3000});
     h1->index_heads = 1;
