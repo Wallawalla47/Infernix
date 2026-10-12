@@ -8,6 +8,7 @@
 #include "ops/common/bf16_vector.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -35,6 +36,7 @@ __global__ void sigmoid_gate_mul_scalar_kernel(const __nv_bfloat16* gate, __nv_b
 
 __launch_bounds__(256) __global__
     void sigmoid_gate_mul_bf16x8_kernel(const Bf16x8Pack* gate, Bf16x8Pack* x, std::int64_t packs) {
+    pdl::enter(); // launched as a programmatic dependent
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     for (std::int64_t i = start; i < packs; i += stride) {

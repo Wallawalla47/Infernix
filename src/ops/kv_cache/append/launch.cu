@@ -1,6 +1,7 @@
 #include "ops/kv_cache/append/launch.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/kernel.cuh"
 
@@ -73,13 +74,12 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
             const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-            kv_cache_append_full_i8_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(k.data),
-                static_cast<const __nv_bfloat16*>(v.data),
+            CUDA_CHECK(pdl::launch_consumer(
+                {dim3(fill_grid), dim3(kBlock), 0, stream}, kv_cache_append_full_i8_kernel<Geometry, Metadata>,
+                static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
                 static_cast<const std::int32_t*>(positions.data), metadata,
                 static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
-                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
-                tokens);
+                static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data), tokens));
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -227,15 +227,14 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
         if (cache.storage == KvCacheStorage::Int8Group64 && k.ne[3] > 1) {
             const auto append = [&]<class Geometry>() {
                 const dim3 grid(div_up(k.ne[2] * Geometry::KVHeads, 8), 1, k.ne[3]);
-                kv_cache_append_full_i8_kernel<Geometry, PagedKVBatchMetadata<Masked>, true>
-                    <<<grid, kBlock, 0, stream>>>(
-                        static_cast<const __nv_bfloat16*>(k.data),
-                        static_cast<const __nv_bfloat16*>(v.data),
-                        static_cast<const std::int32_t*>(positions.data), metadata,
-                        static_cast<std::int8_t*>(cache.k_pages.data),
-                        static_cast<std::int8_t*>(cache.v_pages.data),
-                        static_cast<__half*>(cache.k_scale_pages.data),
-                        static_cast<__half*>(cache.v_scale_pages.data), k.ne[2]);
+                CUDA_CHECK(pdl::launch_consumer(
+                    {grid, dim3(kBlock), 0, stream},
+                    kv_cache_append_full_i8_kernel<Geometry, PagedKVBatchMetadata<Masked>, true>,
+                    static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
+                    static_cast<const std::int32_t*>(positions.data), metadata,
+                    static_cast<std::int8_t*>(cache.k_pages.data), static_cast<std::int8_t*>(cache.v_pages.data),
+                    static_cast<__half*>(cache.k_scale_pages.data), static_cast<__half*>(cache.v_scale_pages.data),
+                    static_cast<std::int32_t>(k.ne[2])));
             };
             if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads)
                 append.template operator()<KVCacheAppendD256Kv4>();

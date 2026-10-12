@@ -2,6 +2,7 @@
 #include "ops/launcher/rope.h"
 
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 #include "ops/kernel/rope.cuh"
 
 #include <type_traits>
@@ -199,12 +200,19 @@ void launch_generic(const Tensor& positions, int rotary_dim, float theta, Tensor
     constexpr int block = 128;
     Tensor& sample      = q != nullptr ? *q : *k;
     const int tokens    = sample.ne[2];
-    rope_generic_kernel<Coefficients><<<tokens, block, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data), positions.ne[1],
-        q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
-        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), sample.ne[0], rotary_dim,
-        theta, q == nullptr ? 0 : q->ne[1], k == nullptr ? 0 : k->ne[1], tokens, token_stride(q),
-        token_stride(k), coefficients);
+    const int heads     = (q == nullptr ? 0 : q->ne[1]) + (k == nullptr ? 0 : k->ne[1]);
+    // One warp per head: a token's heads are spread over CTAs (each with the whole coefficient
+    // table) instead of one CTA's 4 warps taking them in turn, which was a 3.2 us latency chain
+    // per Qwen3.8-Flash-Next attention layer at decode.
+    const int groups = (heads + block / 32 - 1) / (block / 32);
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(static_cast<unsigned>(tokens), static_cast<unsigned>(groups)), dim3(block), 0, stream},
+        rope_generic_kernel<Coefficients>, static_cast<const std::int32_t*>(positions.data),
+        static_cast<std::int32_t>(positions.ne[1]), q == nullptr ? nullptr : static_cast<__nv_bfloat16*>(q->data),
+        k == nullptr ? nullptr : static_cast<__nv_bfloat16*>(k->data), static_cast<std::int32_t>(sample.ne[0]),
+        static_cast<std::int32_t>(rotary_dim), theta, static_cast<std::int32_t>(q == nullptr ? 0 : q->ne[1]),
+        static_cast<std::int32_t>(k == nullptr ? 0 : k->ne[1]), static_cast<std::int32_t>(tokens), token_stride(q),
+        token_stride(k), coefficients));
 }
 
 } // namespace

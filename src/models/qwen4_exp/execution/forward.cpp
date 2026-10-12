@@ -224,9 +224,12 @@ void Forward::layer(std::uint32_t layer, const ForwardBatch& batch, Tensor& resi
         }
         ops::hyper_connection_inject(y, inject, residual, s);
         Tensor xm = mix(block.mlp_hc, residual, &inject);
+        // The combine injects its output directly unless a tap records it.
+        const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
         Tensor ym = moe(block.moe, xm, layer,
-                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch);
-        ops::hyper_connection_inject(ym, inject, residual, s);
+                        tap != nullptr && tap->routes != nullptr ? &tap->routes->at(layer) : nullptr, &batch,
+                        fused_inject ? &inject : nullptr, fused_inject ? &residual : nullptr);
+        if (!fused_inject) { ops::hyper_connection_inject(ym, inject, residual, s); }
         if (tap != nullptr) {
             const std::pair<std::vector<Tensor>*, const Tensor*> copies[] = {
                 {tap->mixer_inputs, &xa}, {tap->mixer_outputs, &y}, {tap->moe_inputs, &xm}, {tap->moe_outputs, &ym}};
@@ -528,7 +531,7 @@ Tensor Forward::attention(const AttentionParameters& p, const Tensor& x, const A
 }
 
 Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-                    const ForwardBatch* batch) {
+                    const ForwardBatch* batch, const Tensor* inject, Tensor* residual) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -546,7 +549,12 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     }
     const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
     ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s);
+    // Without a route tap or a streamed prefill chunk (whose host-side split reads the dispatch), the
+    // route waits until the experts' source is known, so its kernel also plans the CPU-served misses.
+    const bool streamed_chunk = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
+                                experts_.stream->active();
+    const bool route_plans = route_tap == nullptr && !streamed_chunk;
+    if (!route_plans) { ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s); }
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
             cudaSuccess) {
@@ -632,10 +640,7 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
         }
     }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
-    ExpertStream* const streaming = eager_chunk_ && batch != nullptr && batch->stream && experts_.stream != nullptr &&
-                                            experts_.stream->active()
-                                        ? experts_.stream
-                                        : nullptr;
+    ExpertStream* const streaming = streamed_chunk ? experts_.stream : nullptr;
     if (streaming != nullptr && streaming->gated()) {
         // A gated call (design §19.3.12): the layer's routing decides which experts the link copies
         // and which the CPU serves. The CPU takes exactly the experts the stream leaves out: every
@@ -672,8 +677,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor outputs = work_.alloc(DType::BF16, {H, K * T});
     const std::int32_t max_jobs = std::min(E, K * T);
     const DeviceSpan expert_ws  = work_.alloc_bytes(ops::moe_experts_workspace_bytes(max_jobs, K * T, T, source.activation));
+    const bool planned = route_plans && ops::moe_route_dispatch_plan(logits, K, routing, dispatch, route_log, x, source,
+                                                                     max_jobs, expert_ws.data, outputs, s);
     // The shared expert runs while the host computes the CPU-served misses.
-    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false);
+    ops::moe_experts(x, dispatch, source, K, max_jobs, expert_ws.data, outputs, s, /*wait_for_cpu=*/false, planned);
     if (streaming != nullptr && batch->release_stream) { streaming->after_experts(layer, s); }
 
     const std::int32_t I = dim(m.shared_intermediate);
@@ -682,6 +689,10 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     Tensor shared = work_.alloc(DType::BF16, {H, T});
     project(product, p.shared_down, shared, work_, s);
     ops::moe_experts_cpu_wait(x, dispatch, source, max_jobs, expert_ws.data, outputs, s);
+    if (inject != nullptr) {
+        ops::moe_combine_inject(outputs, routing, shared, *inject, *residual, s);
+        return Tensor{};
+    }
     Tensor y = work_.alloc(DType::BF16, {H, T});
     ops::moe_combine(outputs, routing, shared, y, s);
     return y;
@@ -769,9 +780,7 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         shared_swiglu(xm, p.shared_gate_up, product, work_, s);
         Tensor shared = work_.alloc(DType::BF16, {H, T});
         project(product, p.shared_down, shared, work_, s);
-        Tensor ym = work_.alloc(DType::BF16, {H, T});
-        ops::moe_combine(outputs, routing, shared, ym, s);
-        ops::hyper_connection_inject(ym, inject, residual, s);
+        ops::moe_combine_inject(outputs, routing, shared, inject, residual, s);
         CUDA_CHECK(cudaMemcpyAsync(call.residual_out.data, residual.data, residual.bytes(), cudaMemcpyDeviceToDevice, s));
 
         // The draft token: argmax of the draft head (the proposal head's rows mapped to token ids,

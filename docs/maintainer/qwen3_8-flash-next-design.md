@@ -9257,6 +9257,49 @@ rank order through distributed shared memory) 36.2-37.6 µs with 640 or 320 CTAs
 help: the kernel is not limited by occupancy. For FP8 [5120, 6144], 16 or 32 values per lane, 8
 chains, one row per warp, `.cg` and `.L2::256B` loads all measured 21.09 µs (nsys 19.4-19.7 µs).
 
+### 19.3.20f The CPU plan in the route kernel; the combine injects; one warp per rope head (2026-10-12)
+
+Bit-exact launch-boundary changes of the decode chain, chosen from the per-layer kernel sequence
+(nsys, dense8 tg512):
+- `moe_route_dispatch_plan`: a CPU-served call of at most 32 columns plans its misses in the route
+  and dispatch kernel. After a barrier of the whole 1024-thread CTA its first 256 threads run the
+  plan body of `cpu_plan_kernel` (named barrier, same results), so the host's request follows the
+  dispatch with no kernel boundary; `moe_experts` then skips its plan (`cpu_planned`). The Program
+  routes there unless a route tap or a streamed prefill chunk needs the dispatch first.
+  `test_offloaded_moe_layer` routes its CPU-served calls through it.
+- `moe_combine_inject`: the combine keeps y in a register and injects it into the residual streams
+  as `hyper_connection_inject` does (one kernel after the CPU wait instead of two; bit-equal in its
+  test). Taps that record the MoE output keep the two calls.
+- The generic RoPE kernel spreads a token's heads over CTAs, one warp per head (each CTA builds the
+  token's coefficient table): one CTA's four warps took every query and key head in turn, 3.2 µs
+  per attention layer.
+- `split_rows`' vector kernel, the INT8 KV append, the QSA index-query, pool and tail kernels,
+  `sigmoid_gate_mul` and the serial stage kernel became programmatic dependents.
+
+One binary with temporary switches, MTP K = 4, one ABBA round each (reverted → adopted): combine
+and inject 178.49 → 179.37 tok/s (+0.5 %), plan in the route 178.57 → 179.07 (+0.3 %), the
+programmatic dependents 178.98 → 179.42 (+0.25 %), RoPE 179.00 → 179.31 (+0.17 %); acceptance
+0.8049 and 573/72 rounds in every run, forward fingerprint unchanged. On the 27B, whose decode
+chain shares `sigmoid_gate_mul`, plain tg256 85.23 → 85.31 (+0.1 %, every adopted run ahead).
+All four against the §19.3.20e build (frozen binaries, ABBA ×2): plain 128.60 → 130.51 tok/s
+(+1.5 %, every adopted run ahead), MTP 177.86 → 179.50 (+0.9 %), 27B plain 85.27 → 85.32.
+
+Measured and rejected the same day:
+- Gated RMSNorm inside the recurrent update: the eight CTAs of a (value head, sequence) as one
+  cluster, rank 0 gathering the head's 128 outputs through distributed shared memory and reducing
+  them as `rmsnorm_warp_bf16x2_kernel` does (bit-equal to the two calls in its test). Plain decode
+  fell on both models: 27B 85.30 → 84.37 tok/s (−1.1 %), Flash-Next 130.69 → 129.28 (−1.1 %), MTP
+  unchanged. The update is DRAM-bound (its 3 MB of state per token read and written in 3.5 µs), and
+  the cluster launch with three cluster barriers costs more than the 1.25 µs norm kernel it removes.
+- The GDN control projection launched before the input projection, so the 48-CTA BF16 GEMV would
+  run beside the Q8 projection's weight stream: plain 128.94 → 128.95, MTP 179.38 → 179.47.
+- The BF16 A16 GEMV and skinny GEMV as programmatic dependents loading their first weights before
+  the wait: plain 129.17 → 129.07, MTP 179.20 → 179.25.
+- At decode width the INT8 grouped attention splits KV every 128 keys; 64-key splits measured 27B
+  plain 85.29 → 85.48 (+0.23 %, three rounds, every split run ahead) and pass the attention oracle,
+  but change the softmax merge order, so they await a numerics decision. 32-key splits are below
+  the grouped kernel's schedule minimum.
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,

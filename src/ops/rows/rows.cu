@@ -1,5 +1,8 @@
 #include "infernix/ops/rows.h"
 
+#include "core/device.h"
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -40,6 +43,7 @@ __global__ void split_kernel(const __nv_bfloat16* __restrict__ in, int rows, Spl
 // Eight rows (16 bytes) per thread: every output boundary, the row count and every pointer are
 // multiples of eight elements, so a thread's rows lie in one output and both accesses are aligned.
 __global__ void split_vector_kernel(const uint4* __restrict__ in, int rows8, SplitTargets targets) {
+    pdl::enter(); // launched as a programmatic dependent
     const int r = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (r >= rows8) { return; }
@@ -81,8 +85,8 @@ void split_rows(const Tensor& in, std::span<Tensor* const> outs, cudaStream_t st
     }
     if (vector) {
         const int rows8 = in.ne[0] / 8;
-        split_vector_kernel<<<dim3((rows8 + kThreads - 1) / kThreads, in.ne[1]), kThreads, 0, stream>>>(
-            static_cast<const uint4*>(in.data), rows8, targets);
+        CUDA_CHECK(pdl::launch_consumer({dim3((rows8 + kThreads - 1) / kThreads, in.ne[1]), dim3(kThreads), 0, stream},
+                                        split_vector_kernel, static_cast<const uint4*>(in.data), rows8, targets));
     } else {
         split_kernel<<<dim3((in.ne[0] + kThreads - 1) / kThreads, in.ne[1]), kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(in.data), in.ne[0], targets);

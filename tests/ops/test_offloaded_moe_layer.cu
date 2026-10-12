@@ -13,6 +13,7 @@
 // moe_dispatch has its own exact oracle (test_dispatch). Layers of W4A16 experts (§16.2.1) run the
 // same configurations against expert_forward_a16, which every W4A16 output equals bit for bit (its
 // wide route is exact as well).
+#include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/offloaded_sparse_moe.h"
 #include "ops/offloaded_moe_fixtures.h"
 #include "ops/offloaded_sparse_moe/cpu/fetch_channel.h"
@@ -547,7 +548,16 @@ void test_layer(int experts, int columns, int top_k, std::uint32_t seed,
             }
         }
         const std::uint64_t served_before = config.service != nullptr ? config.service->served_experts() : 0;
-        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr);
+        // A served call routes again through moe_route_dispatch_plan, which plans the CPU-served misses
+        // in its own kernel at decode and verification widths (and otherwise routes as before), so
+        // the checks below cover the fused plan.
+        bool planned = false;
+        if (config.service != nullptr) {
+            planned = infernix::ops::moe_route_dispatch_plan(Tensor(d_logits, DType::FP32, {experts + 1, columns}),
+                                                             top_k, routing, dispatch, nullptr, tx, source, max_jobs,
+                                                             d_workspace, out, nullptr);
+        }
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, true, planned);
         cuda_check(cudaDeviceSynchronize(), "moe_experts");
         if (config.service != nullptr) {
             // The service counts after answering, so its count may trail the device by a moment.
@@ -828,6 +838,62 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaFree(d_ids);
 }
 
+// moe_combine_inject against moe_combine followed by hyper_connection_inject (each qualified against
+// its own oracle): the residual streams bit-equal.
+void test_combine_inject(int columns, int top_k, int streams, std::uint32_t seed) {
+    constexpr int hidden = moe::kHidden;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    const auto bf16s = [&](std::size_t count) {
+        std::vector<std::uint16_t> v(count);
+        for (auto& x : v) { x = infernix::test::f32_to_bf16(n(rng)); }
+        return v;
+    };
+    const auto floats = [&](std::size_t count) {
+        std::vector<float> v(count);
+        for (auto& x : v) { x = n(rng); }
+        return v;
+    };
+    const auto outputs = bf16s(static_cast<std::size_t>(hidden) * columns * top_k);
+    const auto shared  = bf16s(static_cast<std::size_t>(hidden) * columns);
+    const auto weights = floats(static_cast<std::size_t>(top_k) * columns);
+    const auto gate = floats(columns), inject = floats(static_cast<std::size_t>(streams) * columns);
+    const auto residual = bf16s(static_cast<std::size_t>(streams) * hidden * columns);
+    auto* d_outputs = device_copy(outputs);
+    auto* d_shared  = device_copy(shared);
+    auto* d_weights = device_copy(weights);
+    auto* d_gate    = device_copy(gate);
+    auto* d_inject  = device_copy(inject);
+    auto* d_split   = device_copy(residual);
+    auto* d_fused   = device_copy(residual);
+    std::uint16_t* d_y = nullptr;
+    cuda_check(cudaMalloc(&d_y, shared.size() * sizeof(std::uint16_t)), "cudaMalloc");
+    const infernix::ops::MoeRouting routing{Tensor{}, Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                            Tensor(d_gate, DType::FP32, {columns})};
+    const Tensor t_outputs(d_outputs, DType::BF16, {hidden, columns * top_k});
+    const Tensor t_shared(d_shared, DType::BF16, {hidden, columns});
+    const Tensor t_inject(d_inject, DType::FP32, {streams, columns});
+    Tensor t_y(d_y, DType::BF16, {hidden, columns});
+    Tensor t_split(d_split, DType::BF16, {streams * hidden, columns});
+    Tensor t_fused(d_fused, DType::BF16, {streams * hidden, columns});
+    infernix::ops::moe_combine(t_outputs, routing, t_shared, t_y, nullptr);
+    infernix::ops::hyper_connection_inject(t_y, t_inject, t_split, nullptr);
+    infernix::ops::moe_combine_inject(t_outputs, routing, t_shared, t_inject, t_fused, nullptr);
+    cuda_check(cudaDeviceSynchronize(), "combine inject");
+    std::vector<std::uint16_t> split(residual.size()), fused(residual.size());
+    cuda_check(cudaMemcpy(split.data(), d_split, split.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    cuda_check(cudaMemcpy(fused.data(), d_fused, fused.size() * 2, cudaMemcpyDeviceToHost), "copy");
+    const bool same = split == fused && split != residual;
+    std::printf("combine_inject T=%d k=%d S=%d: %s\n", columns, top_k, streams,
+                same ? "bit-equal to combine + inject" : "DIFFERENT");
+    check(same, "moe_combine_inject equals moe_combine followed by hyper_connection_inject");
+    for (void* p : {static_cast<void*>(d_outputs), static_cast<void*>(d_shared), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_gate), static_cast<void*>(d_inject), static_cast<void*>(d_split),
+                    static_cast<void*>(d_fused), static_cast<void*>(d_y)}) {
+        cudaFree(p);
+    }
+}
+
 // moe_route_dispatch, captured (so its kernel runs as a programmatic dependent) and replayed on new
 // logits, against the oracles: ids exactly the top-k with lower-id ties (the logits repeat values
 // so ties occur), weights and shared gate against the FP64 formula, the dispatch exact as in
@@ -988,6 +1054,7 @@ int main() {
         for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
         test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
         test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
+        for (const int columns : {1, 5}) { test_combine_inject(columns, 10, 4, 300U + columns); }
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job

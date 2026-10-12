@@ -104,6 +104,7 @@ __global__ void index_query_kernel(bf16* __restrict__ q, const bf16* __restrict_
                                    float theta, PreparedRope yarn, float eps) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
+    pdl::enter(); // launched as a programmatic dependent
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     bf16* row     = q + (static_cast<std::size_t>(t) * heads + h) * kIndexDim;
     const float x = __bfloat162float(row[d]);
@@ -142,6 +143,7 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
                             bf16* __restrict__ pooled, QsaPageSpaces spaces) {
     __shared__ float scratch[4];
     __shared__ float normed[kIndexDim];
+    pdl::enter(); // launched as a programmatic dependent
     const int t = blockIdx.x, d = threadIdx.x;
     const int p = positions[t];
     if ((p + 1) % ratio != 0) { return; }
@@ -183,6 +185,7 @@ __global__ void pool_kernel(const bf16* __restrict__ raw, const bf16* __restrict
 __global__ void tail_kernel(const bf16* __restrict__ raw, const std::int32_t* __restrict__ positions,
                             const std::int32_t* __restrict__ tail_slots, int width, int ratio,
                             bf16* __restrict__ tails) {
+    pdl::enter(); // launched as a programmatic dependent
     const int sequence = blockIdx.x, d = threadIdx.x;
     const int start    = positions[sequence * width];
     const int last     = positions[sequence * width + width - 1];
@@ -995,10 +998,11 @@ void qsa_index_query(Tensor& q, const Tensor& norm_weight, const Tensor& rope_po
                 rope_positions.numel() == 3 * static_cast<std::int64_t>(columns) &&
                 norm_weight.numel() == kIndexDim && columns > 0,
             "index query shapes disagree (RoPE positions are [T, 3])");
-    index_query_kernel<<<dim3(geometry.index_heads, columns), kIndexDim, 0, stream>>>(
+    require(pdl::launch_consumer({dim3(geometry.index_heads, columns), dim3(kIndexDim), 0, stream}, index_query_kernel,
         static_cast<bf16*>(q.data), static_cast<const bf16*>(norm_weight.data),
         static_cast<const std::int32_t*>(rope_positions.data), geometry.index_heads, geometry.rotary_dim,
-        geometry.theta, index_rope(geometry), geometry.eps);
+        geometry.theta, index_rope(geometry), geometry.eps) == cudaSuccess,
+            "index query launch failed");
     check_launch("index query");
 }
 
@@ -1018,7 +1022,7 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
                 contiguous(batch.block_start_rope, DType::I32) && batch.block_start_rope.ne[0] == batch.batch &&
                 batch.block_start_rope.numel() == 3 * static_cast<std::int64_t>(batch.batch),
             "pool RoPE positions are [T, 3] and block starts [batch, 3]");
-    pool_kernel<<<columns, kIndexDim, 0, stream>>>(
+    require(pdl::launch_consumer({dim3(columns), dim3(kIndexDim), 0, stream}, pool_kernel,
         static_cast<const bf16*>(raw_keys.data), static_cast<const bf16*>(norm_weight.data),
         static_cast<const bf16*>(tails.data), static_cast<const std::int32_t*>(batch.block_tables.data),
         batch.block_tables.ne[0], static_cast<const std::int32_t*>(batch.table_rows.data),
@@ -1026,13 +1030,15 @@ void qsa_pool_keys(const Tensor& raw_keys, const Tensor& norm_weight, Tensor& ta
         static_cast<const std::int32_t*>(batch.rope_positions.data),
         static_cast<const std::int32_t*>(batch.block_start_rope.data), batch.batch, batch.width, geometry.ratio,
         geometry.rotary_dim, geometry.theta, index_rope(geometry), geometry.eps,
-        static_cast<bf16*>(layer.pooled_pages.data), layer.spaces);
+        static_cast<bf16*>(layer.pooled_pages.data), layer.spaces) == cudaSuccess,
+            "pool launch failed");
     check_launch("pool");
     if (!batch.update_tails) { return; }
-    tail_kernel<<<batch.batch, kIndexDim, 0, stream>>>(
+    require(pdl::launch_consumer({dim3(batch.batch), dim3(kIndexDim), 0, stream}, tail_kernel,
         static_cast<const bf16*>(raw_keys.data), static_cast<const std::int32_t*>(batch.positions.data),
         static_cast<const std::int32_t*>(batch.tail_slots.data), batch.width, geometry.ratio,
-        static_cast<bf16*>(tails.data));
+        static_cast<bf16*>(tails.data)) == cudaSuccess,
+            "tail launch failed");
     check_launch("tail");
 }
 

@@ -8,6 +8,7 @@
 #include "ops/launcher/rope.h"
 
 #include "ops/common/dflash_rope.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 
@@ -223,6 +224,7 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
                                            float theta, std::int32_t q_heads, std::int32_t k_heads,
                                            std::int32_t tokens, std::int64_t q_token_stride,
                                            std::int64_t k_token_stride, Coefficients coefficients = {}) {
+    pdl::enter(); // launched as a programmatic dependent
     const int token = static_cast<int>(blockIdx.x);
     if (token >= tokens) { return; }
     const int half = rotary_dim / 2;
@@ -251,9 +253,10 @@ __global__ void rope_generic_kernel(const std::int32_t* positions, std::int32_t 
 
     const int lane        = static_cast<int>(threadIdx.x) & 31;
     const int warp        = static_cast<int>(threadIdx.x) >> 5;
+    // gridDim.y CTAs share a token's heads (each with the token's whole coefficient table).
     const int block_warps = static_cast<int>(blockDim.x) >> 5;
-    for (int combined_head = warp; combined_head < q_heads + k_heads;
-         combined_head += block_warps) {
+    for (int combined_head = static_cast<int>(blockIdx.y) * block_warps + warp; combined_head < q_heads + k_heads;
+         combined_head += block_warps * static_cast<int>(gridDim.y)) {
         const bool is_q             = combined_head < q_heads;
         const int head              = is_q ? combined_head : combined_head - q_heads;
         __nv_bfloat16* data         = is_q ? q : k;

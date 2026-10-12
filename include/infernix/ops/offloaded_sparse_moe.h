@@ -216,7 +216,15 @@ struct MoeExpertSource {
 /// arguments before reading `outputs`. The workspace stays reserved until then.
 void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                  std::int32_t top_k, std::int32_t max_jobs, void* workspace, Tensor& outputs,
-                 cudaStream_t stream, bool wait_for_cpu = true);
+                 cudaStream_t stream, bool wait_for_cpu = true, bool cpu_planned = false);
+
+/// moe_route_dispatch and, for a CPU-served call of decode or verification width, the CPU plan of
+/// the moe_experts call with these x, source, max_jobs, workspace and outputs, in one kernel.
+/// Returns true when it planned; that moe_experts call then passes cpu_planned = true.
+[[nodiscard]] bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRouting& routing,
+                                           MoeDispatch& dispatch, std::int32_t* route_log, const Tensor& x,
+                                           const MoeExpertSource& source, std::int32_t max_jobs, void* workspace,
+                                           const Tensor& outputs, cudaStream_t stream);
 
 /// Waits for the host's answer to a moe_experts call made with wait_for_cpu == false and places
 /// its outputs; a no-op when that call published no request.
@@ -226,5 +234,10 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
 /// y = bf16(sum_slot w * outputs + shared_gate * shared), BF16 [H, T].
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream);
+/// moe_combine followed by hyper_connection_inject(y, inject, residual) without materializing y:
+/// residual[s*H+d, t] = bf16(residual[s*H+d, t] + inject[s, t] * y[d, t]), y the BF16 combine of
+/// column t, with the same bits as the two calls. inject: FP32 [S, T]; residual: BF16 [S*H, T].
+void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
+                        const Tensor& inject, Tensor& residual, cudaStream_t stream);
 
 } // namespace infernix::ops

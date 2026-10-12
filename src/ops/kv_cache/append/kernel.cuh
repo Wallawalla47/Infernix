@@ -3,6 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "core/pdl.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
@@ -200,6 +201,7 @@ __launch_bounds__(256) __global__
                                         std::int8_t* __restrict__ cache_v,
                                         __half* __restrict__ scale_k, __half* __restrict__ scale_v,
                                         std::int32_t width) {
+    pdl::enter(); // launched as a programmatic dependent
     if constexpr (MultiBatch) {
         const int batch = blockIdx.z;
         metadata.table_rows += batch;

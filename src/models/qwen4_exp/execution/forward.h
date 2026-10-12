@@ -274,8 +274,10 @@ private:
         std::int32_t batch = 0, width = 0;
     };
     Tensor attention(const AttentionParameters& p, const Tensor& x, const AttentionCall& call);
+    // With inject and residual, the output is injected into the residual streams (and not returned).
     Tensor moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
-               const ForwardBatch* batch = nullptr);
+               const ForwardBatch* batch = nullptr, const Tensor* inject = nullptr,
+               Tensor* residual = nullptr);
     void wait_layer(const ForwardBatch& batch, std::size_t entry);
     void mtp_block(const MtpCall& call, Tensor& residual);
 

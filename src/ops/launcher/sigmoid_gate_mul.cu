@@ -6,6 +6,7 @@
 #include "ops/common/math.h"
 #include "ops/kernel/sigmoid_gate_mul.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "core/pdl.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -17,9 +18,9 @@ void sigmoid_gate_mul_bf16x8_launch(const Tensor& gate, Tensor& x, int block, cu
     constexpr int kMaxGrid   = 4096;
     const int grid           = static_cast<int>(std::min<std::int64_t>(
         kMaxGrid, std::max<std::int64_t>(1, div_up(packs, static_cast<std::int64_t>(block)))));
-    sigmoid_gate_mul_bf16x8_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data), packs);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(grid), dim3(block), 0, stream}, sigmoid_gate_mul_bf16x8_kernel,
+                                    static_cast<const Bf16x8Pack*>(gate.data), static_cast<Bf16x8Pack*>(x.data),
+                                    packs));
 }
 
 void sigmoid_gate_mul_launch(const Tensor& gate, Tensor& x, cudaStream_t stream) {
