@@ -9112,6 +9112,36 @@ schedules (TEMP `INFERNIX_TMP_UP7`):
   resume differed from the original turn at token 30. Synthetic-input equality is not evidence of
   bit-exactness for a different reduction order.
 
+### 19.3.20a GDN projections without copies; NInfer's Q8 routes re-measured (2026-10-12)
+
+**GDN front end without `split_rows` (adopted, bit-exact).** Each GDN layer copied its projections
+three times (2.5 + 1.7 + 1.2 µs per layer at T = 1, listed under "Phase 0: bit-exact non-Q8 fixes"). Now `gdn_gating` reads a and b as
+row slices of the [96, T] control output; the conv's snapshot and from-states forms write q/k/v
+through the split output map (`causal_conv1d_silu_snapshot_split`, `_from_states_split`); and the Q8
+[16384, 2560] projection writes q/k/v (or the replay record) and z itself (`gdn_input_proj`, Q8
+[16384, 2560] form), on the routes `linear` selects for that shape, so qkv and z are linear's bits.
+BF16 and FP8 projections keep the packed write and its split. End to end (dense8, INT8 KV,
+`infernix_bench` tg512, frozen binaries, two ABBA rounds): plain 118.64 → 120.81 tok/s (+1.8 %,
+every B run above every A run), MTP K = 4 170.32 → 172.13 (+1.1 %, identical acceptance 0.8049 and
+573/72 rounds in all eight runs); pp4096 1630.6 → 1628.9 (−0.1 %, within the ±0.9 spread).
+
+**NInfer 81c8ce09's Q8 routes for [16384, 2560] and [2560, 6144], re-measured; not adopted (§19.3.20
+stands).** Cold-L2 graph sweep: [16384, 2560] −6 to −33 % at T = 1-8 on its 8-column sliced-K tile
+(one route over 1-8, column-invariant), −14 to −37 % at 9-48, neutral at 49-64, −17 % at 65-96, −5 %
+at 2048/4096 (worst +4.1 % at 384); [2560, 6144] −26 to −75 % at 9-128 but +37-56 % at 129-256. In
+the decode graph (nsys, per call): [16384, 2560] 26.6 → 23.4 µs at T = 1, 27.8 → 22.2 µs at MTP
+verification widths; [2560, 6144] at T ≤ 8 no faster (11.5 → 11.8 µs at T = 1: its 15.7 MB stays in
+L2), so the microbench's T ≤ 8 gain there is a cold-L2 artifact. Together about 0.1 ms per plain
+token (~1.2 %). Quality, teacher-forced at `--chunk 8` (two 1,535-token bench-corpus texts, last
+1,023 positions): dNLL +0.0003 ± 0.011 and −0.0011 ± 0.006 nats, KL 0.029 / 0.017, argmax agreement
+94.3 / 96.9 %, top-1 against the next token −0.9 / −0.8 points; within a rounding-order control but,
+as in §19.3.20, not shown harmless. tg512 fell to 100.8 tok/s with it because the changed text
+dropped the expert hit rate from 93.3 to 84.4 % (the measurement caveat above), not because of the
+kernels.
+
+**NVFP4 linear_add [5120, 17408] at T = 9-32 (NInfer issue #364).** The 4-stage M32N32 tile against
+today's 3-stage M32N64: 37.5-38.2 µs both, three interleaved runs; not adopted.
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,

@@ -47,6 +47,17 @@ struct CausalConvContiguousOutput {
     }
 };
 
+// The contiguous map for entries whose contract makes the destination disjoint from every input.
+template <class Element>
+struct CausalConvDisjointOutput {
+    Element* __restrict__ out;
+    std::int32_t rows;
+
+    __device__ __forceinline__ CausalConvOutputColumn<Element> column(std::int64_t row) const {
+        return {out + row, rows};
+    }
+};
+
 // Output address map for three destinations partitioned by row. The partition is a template
 // parameter: the registered geometries are the only ones the wrapper admits, so the boundaries and
 // the three leading dimensions are constants here. Callers writing pairs pass halved row counts,
@@ -286,10 +297,14 @@ __global__ void causal_conv1d_decode_distinct_kernel(
     }
 }
 
+// The snapshot and from-states kernels write output column `batch * width + column` (one column per
+// request position) through an address map, so the q/k/v split of a GDN projection can be written
+// straight to its three destinations.
+template <class Output>
 __global__ void causal_conv1d_snapshot_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
-    const std::int32_t* __restrict__ snapshot_base_slot, __nv_bfloat16* __restrict__ out,
+    const std::int32_t* __restrict__ snapshot_base_slot, Output out,
     std::int32_t C, std::int64_t slot_stride) {
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
@@ -310,7 +325,7 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
         acc += __bfloat162float(weight[2 * C64 + c]) * __bfloat162float(s2);
         acc += __bfloat162float(weight[3 * C64 + c]) * __bfloat162float(x0);
 
-        out[c] = __float2bfloat16_rn(silu(acc));
+        *out.column(c64).at(0) = __float2bfloat16_rn(silu(acc));
         __nv_bfloat16* snapshot =
             conv_states + static_cast<std::int64_t>(*snapshot_base_slot) * slot_stride;
         snapshot[c]           = s1;
@@ -319,10 +334,11 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
     }
 }
 
+template <class Output>
 __global__ void
 causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                        __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
-                                       const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
+                                       const std::int32_t* snapshot_base_slot, Output out,
                                        std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64 = static_cast<std::int64_t>(C);
@@ -348,7 +364,7 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
         acc += w2 * __bfloat162float(s2);
         acc += w3 * __bfloat162float(x0);
 
-        out[out_idx] = __float2bfloat16_rn(silu(acc));
+        *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
         s0           = s1;
         s1           = s2;
         s2           = x0;
@@ -364,11 +380,11 @@ causal_conv1d_sequence_snapshot_kernel(const __nv_bfloat16* x, const __nv_bfloat
 // Batched serial-column form. One block row owns one request and one thread owns a channel, so
 // request-local state is loaded before that row publishes any snapshot. It is used for W=1 and
 // for masked B=1 widths outside the parallel small-W domain.
-template <bool Masked>
+template <bool Masked, class Output>
 __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
-    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
+    const std::int32_t* snapshot_base_slots, Output out, std::int32_t C, std::int32_t width,
     std::int64_t slot_stride) {
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -386,11 +402,13 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const float w2              = __bfloat162float(weight[2 * C64 + c64]);
     const float w3              = __bfloat162float(weight[3 * C64 + c64]);
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    const auto destination      = out.column(c64);
 
     for (std::int32_t column = 0; column < width; ++column) {
         const std::int64_t out_idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
+        __nv_bfloat16* const y     = destination.at(batch * width + column);
         if (column >= valid) {
-            out[out_idx] = __float2bfloat16(0.0f);
+            *y = __float2bfloat16(0.0f);
             continue;
         }
 
@@ -400,7 +418,7 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
         acc += w1 * __bfloat162float(s1);
         acc += w2 * __bfloat162float(s2);
         acc += w3 * __bfloat162float(x0);
-        out[out_idx] = __float2bfloat16_rn(silu(acc));
+        *y = __float2bfloat16_rn(silu(acc));
         s0           = s1;
         s1           = s2;
         s2           = x0;
@@ -416,11 +434,12 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
 
 // Read-only batched form: one block row per request, one thread per channel, serial columns. No
 // state is written; the per-column arithmetic is the snapshot kernels'.
+template <class Output>
 __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict__ x,
                                                  const __nv_bfloat16* __restrict__ weight,
                                                  const __nv_bfloat16* __restrict__ conv_states,
                                                  const std::int32_t* __restrict__ initial_state_slots,
-                                                 __nv_bfloat16* __restrict__ out, std::int32_t C,
+                                                 Output out, std::int32_t C,
                                                  std::int32_t width, std::int64_t slot_stride) {
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
@@ -436,6 +455,7 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
     const float w2              = __bfloat162float(weight[2 * C64 + c64]);
     const float w3              = __bfloat162float(weight[3 * C64 + c64]);
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
+    const auto destination      = out.column(c64);
     for (std::int32_t column = 0; column < width; ++column) {
         const std::int64_t idx = row_base + static_cast<std::int64_t>(column) * C64 + c64;
         const __nv_bfloat16 x0 = x[idx];
@@ -444,7 +464,7 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
         acc += w1 * __bfloat162float(s1);
         acc += w2 * __bfloat162float(s2);
         acc += w3 * __bfloat162float(x0);
-        out[idx] = __float2bfloat16_rn(silu(acc));
+        *destination.at(batch * width + column) = __float2bfloat16_rn(silu(acc));
         s0       = s1;
         s1       = s2;
         s2       = x0;
@@ -454,10 +474,11 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
 // Small-T snapshot form. A CTA owns all token outputs for one channel tile. The selected history
 // is cached before any snapshot slot is written, so initial_slot may name any slot, including one
 // overwritten by this call.
+template <class Output>
 __global__ void
 causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
                                      __nv_bfloat16* conv_states, const std::int32_t* initial_slot,
-                                     const std::int32_t* snapshot_base_slot, __nv_bfloat16* out,
+                                     const std::int32_t* snapshot_base_slot, Output out,
                                      std::int32_t C, std::int32_t T, std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
@@ -500,7 +521,7 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
-    out[out_idx] = __float2bfloat16_rn(silu(acc));
+    *out.column(c64).at(t) = __float2bfloat16_rn(silu(acc));
 
     __nv_bfloat16* snapshot =
         conv_states + static_cast<std::int64_t>(*snapshot_base_slot + t) * slot_stride;
@@ -511,11 +532,11 @@ causal_conv1d_snapshot_smallt_kernel(const __nv_bfloat16* x, const __nv_bfloat16
     }
 }
 
-template <bool Masked>
+template <bool Masked, class Output>
 __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     const __nv_bfloat16* x, const __nv_bfloat16* weight, __nv_bfloat16* conv_states,
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
-    const std::int32_t* snapshot_base_slots, __nv_bfloat16* out, std::int32_t C, std::int32_t width,
+    const std::int32_t* snapshot_base_slots, Output out, std::int32_t C, std::int32_t width,
     std::int64_t slot_stride) {
     __shared__ __nv_bfloat16 history[3][kCausalConvChannelTile];
     __shared__ __nv_bfloat16 weights[4][kCausalConvChannelTile];
@@ -545,8 +566,9 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     const std::int32_t valid    = Masked ? valid_columns[batch] : width;
     const std::int64_t row_base = static_cast<std::int64_t>(batch) * width * C64;
     const std::int64_t out_idx  = row_base + static_cast<std::int64_t>(column) * C64 + c64;
+    __nv_bfloat16* const y      = out.column(c64).at(batch * width + column);
     if (column >= valid) {
-        out[out_idx] = __float2bfloat16(0.0f);
+        *y = __float2bfloat16(0.0f);
         return;
     }
 
@@ -566,7 +588,7 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     acc += __bfloat162float(weights[1][lane]) * __bfloat162float(x1);
     acc += __bfloat162float(weights[2][lane]) * __bfloat162float(x2);
     acc += __bfloat162float(weights[3][lane]) * __bfloat162float(x3);
-    out[out_idx] = __float2bfloat16_rn(silu(acc));
+    *y = __float2bfloat16_rn(silu(acc));
 
     __nv_bfloat16* snapshot =
         conv_states + static_cast<std::int64_t>(snapshot_base_slots[batch] + column) * slot_stride;

@@ -11,6 +11,7 @@
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_plan.h"
+#include "ops/linear/q8/q8_shapes.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
@@ -325,6 +326,25 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& qkv, 
             throw std::invalid_argument("fp8 gdn_input_proj: unsupported weight shape");
         }
         detail::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        return;
+    }
+
+    if (weight.qtype == QType::Q8_G32_FP16 && weight.k == 2560) {
+        // Qwen3.8-Flash-Next: the [16384,2560] parent on the routes linear selects for that shape,
+        // with the q/k/v and z rows written to their own destinations.
+        constexpr std::int32_t kHidden  = 2560;
+        constexpr std::int32_t kQkvRows = 10240;
+        constexpr std::int32_t kZRows   = 6144;
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(qkv, kQkvRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_single_parent_nonoverlap(x, qkv, z);
+        if (weight.n != kQkvRows + kZRows || weight.scale_dtype != DType::FP16 || weight.group_size != 32 ||
+            weight.ndim != 2 || weight.padded_shape[1] != kHidden || weight.qhigh != nullptr ||
+            !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 16)) {
+            throw std::invalid_argument("gdn_input_proj: invalid query/key/value/z weight");
+        }
+        detail::launch_q8_n16384_k2560_split(x, weight, qkv, z, stream);
         return;
     }
 
@@ -754,6 +774,10 @@ std::size_t gdn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int
             throw std::invalid_argument("gdn_input_proj workspace: unsupported FP8 profile");
         }
         return detail::fp8_gdn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 16384 &&
+        input_rows == 2560) {
+        return 0;
     }
     if (parent_qtype == QType::Q8_G32_FP16 && parent_rows == 12288 && input_rows == 2048) {
         (void)detail::q8_gdn_input_resolve_plan(

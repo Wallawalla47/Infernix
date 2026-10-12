@@ -4,6 +4,7 @@
 #include "ops/launcher/causal_conv1d.h" // detail::causal_conv1d_*_launch
 
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -146,8 +147,10 @@ void require_accessible(const Tensor& tensor, const char* label) {
     }
 }
 
-detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Tensor& out0,
-                                                       const Tensor& out1, const Tensor& out2) {
+// `channels` rows of x over `columns` output columns (T, or W*B for the snapshot forms).
+detail::CausalConvSplitGeometry resolve_split_geometry(std::int32_t channels, std::int32_t columns,
+                                                       const Tensor& out0, const Tensor& out1,
+                                                       const Tensor& out2) {
     if (out0.dtype != DType::BF16 || out1.dtype != DType::BF16 || out2.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: split destinations must be BF16");
     }
@@ -155,17 +158,40 @@ detail::CausalConvSplitGeometry resolve_split_geometry(const Tensor& x, const Te
         out2.ne[2] != 1 || out2.ne[3] != 1) {
         throw std::invalid_argument("causal_conv1d: split destinations must be rank-2");
     }
-    if (out0.ne[1] != x.ne[1] || out1.ne[1] != x.ne[1] || out2.ne[1] != x.ne[1]) {
+    if (out0.ne[1] != columns || out1.ne[1] != columns || out2.ne[1] != columns) {
         throw std::invalid_argument("causal_conv1d: split destinations must match the x column "
                                     "count");
     }
-    if (x.ne[0] == 8192 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 4096) {
+    if (channels == 8192 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 4096) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x4096;
     }
-    if (x.ne[0] == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
+    if (channels == 10240 && out0.ne[0] == 2048 && out1.ne[0] == 2048 && out2.ne[0] == 6144) {
         return detail::CausalConvSplitGeometry::Rows2048x2048x6144;
     }
     throw std::invalid_argument("causal_conv1d: split received an unregistered row profile");
+}
+
+// The split snapshot and from-states destinations: contiguous, non-null, disjoint from each other
+// and from every operand the call reads or writes.
+void require_split_destinations(std::initializer_list<const Tensor*> others, const Tensor& out0,
+                                const Tensor& out1, const Tensor& out2) {
+    const Tensor* const outs[3] = {&out0, &out1, &out2};
+    const char* const labels[3] = {"out0", "out1", "out2"};
+    for (int i = 0; i < 3; ++i) {
+        require_accessible(*outs[i], labels[i]);
+        for (int j = i + 1; j < 3; ++j) {
+            if (overlaps(*outs[i], *outs[j])) {
+                throw std::invalid_argument(
+                    "causal_conv1d: split destinations must not overlap each other");
+            }
+        }
+        for (const Tensor* other : others) {
+            if (other->data != nullptr && overlaps(*outs[i], *other)) {
+                throw std::invalid_argument(
+                    "causal_conv1d: split destinations must not overlap an operand");
+            }
+        }
+    }
 }
 
 // The prefill split route reads and writes __nv_bfloat162. The requirement is stated uniformly for
@@ -285,7 +311,8 @@ void causal_conv1d_silu_split(const Tensor& x, const Tensor& weight, const Tenso
     require_weight_shape(weight, x.ne[0]);
     require_state_shape(conv_state_in, x.ne[0]);
     require_state_shape(conv_state_out, x.ne[0]);
-    const detail::CausalConvSplitGeometry geometry = resolve_split_geometry(x, out0, out1, out2);
+    const detail::CausalConvSplitGeometry geometry =
+        resolve_split_geometry(x.ne[0], x.ne[1], out0, out1, out2);
 
     const std::int64_t n = numel_allow_zero(x, "x");
     (void)numel_allow_zero(weight, "weight");
@@ -338,13 +365,14 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_stat
     }
 }
 
-void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
-                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                 const Tensor& snapshot_base_slots, Tensor& out,
-                                 cudaStream_t stream) {
+namespace {
+
+// Everything the snapshot forms require except their destinations. False for an empty call.
+bool validate_snapshot_inputs(const Tensor& x, const Tensor& weight, const Tensor& conv_states,
+                              const Tensor& valid_columns, const Tensor& initial_state_slots,
+                              const Tensor& snapshot_base_slots) {
     const bool masked = valid_columns.data != nullptr;
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
-        out.dtype != DType::BF16) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16) {
         throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
     }
     if (initial_state_slots.dtype != DType::I32 || snapshot_base_slots.dtype != DType::I32 ||
@@ -358,7 +386,6 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     if (masked) { (void)numel_allow_zero(valid_columns, "valid_columns"); }
     (void)numel_allow_zero(initial_state_slots, "initial_state_slots");
     (void)numel_allow_zero(snapshot_base_slots, "snapshot_base_slots");
-    (void)numel_allow_zero(out, "out");
 
     require_snapshot_x_shape(x);
     const std::int32_t batch = x.ne[2];
@@ -367,28 +394,26 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
     if (masked) { require_selector_shape(valid_columns, batch, "valid_columns"); }
     require_selector_shape(initial_state_slots, batch, "initial_state_slots");
     require_selector_shape(snapshot_base_slots, batch, "snapshot_base_slots");
-    require_out_shape(x, out);
-    if (n == 0) { return; }
+    if (n == 0) { return false; }
 
-    require_non_empty_accessible(x, weight, conv_states, out);
+    require_accessible(x, "x");
+    require_accessible(weight, "weight");
+    require_accessible(conv_states, "conv_states");
     if (masked) { require_metadata_accessible(valid_columns, "valid_columns"); }
     require_metadata_accessible(initial_state_slots, "initial_state_slots");
     require_metadata_accessible(snapshot_base_slots, "snapshot_base_slots");
-    detail::causal_conv1d_snapshot_launch(x, weight, conv_states, valid_columns,
-                                          initial_state_slots, snapshot_base_slots, out, stream);
+    return true;
 }
 
-void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
-                                    const Tensor& conv_states, const Tensor& initial_state_slots,
-                                    Tensor& out, cudaStream_t stream) {
+void validate_from_states_inputs(const Tensor& x, const Tensor& weight, const Tensor& conv_states,
+                                 const Tensor& initial_state_slots) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_states.dtype != DType::BF16 ||
-        out.dtype != DType::BF16 || initial_state_slots.dtype != DType::I32) {
+        initial_state_slots.dtype != DType::I32) {
         throw std::invalid_argument("causal_conv1d: from-states operands must be BF16 with I32 slots");
     }
     const std::int32_t width = x.ne[1], batch = x.ne[2];
     if (x.ne[0] <= 0 || width <= 0 || width > 64 || batch <= 0 || batch > 8 || x.ne[3] != 1 ||
-        !x.is_contiguous() || !out.is_contiguous() || !conv_states.is_contiguous() ||
-        !initial_state_slots.is_contiguous()) {
+        !x.is_contiguous() || !conv_states.is_contiguous() || !initial_state_slots.is_contiguous()) {
         throw std::invalid_argument("causal_conv1d: unsupported from-states [C,W,B] shape");
     }
     require_weight_shape(weight, x.ne[0]);
@@ -397,10 +422,72 @@ void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
         throw std::invalid_argument("causal_conv1d: conv_states must have shape [C,3,S]");
     }
     require_selector_shape(initial_state_slots, batch, "initial_state_slots");
-    require_out_shape(x, out);
-    require_non_empty_accessible(x, weight, conv_states, out);
+    require_accessible(x, "x");
+    require_accessible(weight, "weight");
+    require_accessible(conv_states, "conv_states");
     require_metadata_accessible(initial_state_slots, "initial_state_slots");
+}
+
+} // namespace
+
+void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& out,
+                                 cudaStream_t stream) {
+    if (out.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: x/weight/conv_states/out must be BF16");
+    }
+    (void)numel_allow_zero(out, "out");
+    require_out_shape(x, out);
+    if (!validate_snapshot_inputs(x, weight, conv_states, valid_columns, initial_state_slots,
+                                  snapshot_base_slots)) {
+        return;
+    }
+    require_accessible(out, "out");
+    detail::causal_conv1d_snapshot_launch(x, weight, conv_states, valid_columns,
+                                          initial_state_slots, snapshot_base_slots, out, stream);
+}
+
+void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                       const Tensor& snapshot_base_slots, Tensor& out0, Tensor& out1,
+                                       Tensor& out2, cudaStream_t stream) {
+    const detail::CausalConvSplitGeometry geometry =
+        resolve_split_geometry(x.ne[0], x.ne[1] * x.ne[2], out0, out1, out2);
+    if (!validate_snapshot_inputs(x, weight, conv_states, valid_columns, initial_state_slots,
+                                  snapshot_base_slots)) {
+        return;
+    }
+    require_split_destinations(
+        {&x, &weight, &conv_states, &valid_columns, &initial_state_slots, &snapshot_base_slots},
+        out0, out1, out2);
+    detail::causal_conv1d_snapshot_split_launch(x, weight, conv_states, valid_columns,
+                                                initial_state_slots, snapshot_base_slots, out0, out1,
+                                                out2, geometry, stream);
+}
+
+void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
+                                    const Tensor& conv_states, const Tensor& initial_state_slots,
+                                    Tensor& out, cudaStream_t stream) {
+    if (out.dtype != DType::BF16) {
+        throw std::invalid_argument("causal_conv1d: from-states operands must be BF16 with I32 slots");
+    }
+    validate_from_states_inputs(x, weight, conv_states, initial_state_slots);
+    require_out_shape(x, out);
+    require_accessible(out, "out");
     detail::causal_conv1d_from_states_launch(x, weight, conv_states, initial_state_slots, out, stream);
+}
+
+void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
+                                          const Tensor& conv_states,
+                                          const Tensor& initial_state_slots, Tensor& out0,
+                                          Tensor& out1, Tensor& out2, cudaStream_t stream) {
+    validate_from_states_inputs(x, weight, conv_states, initial_state_slots);
+    const detail::CausalConvSplitGeometry geometry =
+        resolve_split_geometry(x.ne[0], x.ne[1] * x.ne[2], out0, out1, out2);
+    require_split_destinations({&x, &weight, &conv_states, &initial_state_slots}, out0, out1, out2);
+    detail::causal_conv1d_from_states_split_launch(x, weight, conv_states, initial_state_slots, out0,
+                                                   out1, out2, geometry, stream);
 }
 
 } // namespace infernix::ops

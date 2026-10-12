@@ -5,6 +5,7 @@
 #include "infernix/ops/gated_delta_net.h"
 #include "infernix/ops/gated_rmsnorm.h"
 #include "infernix/ops/gdn_gating.h"
+#include "infernix/ops/gdn_input_proj.h"
 #include "infernix/ops/hyper_connection.h"
 #include "infernix/ops/kv_cache_append.h"
 #include "infernix/ops/linear.h"
@@ -360,28 +361,25 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     const std::int32_t C = dim(g.conv_channels()), KW = dim(g.key_width()), VW = dim(g.value_width());
     const std::int32_t NV = dim(g.value_heads), NK = dim(g.key_heads), DK = dim(g.key_head_dim),
                        DV = dim(g.value_head_dim);
-    Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
-    project(x, p.projection, projected, work_, s);
     // A verification call projects its convolution inputs straight into the replay records.
     GdnReplayRecordLayer records;
     if (batch.verify != nullptr) { records = batch.verify->gdn.layer(static_cast<std::int32_t>(index), batch.batch); }
     Tensor qkv = batch.verify != nullptr ? records.conv.view({C, T}) : work_.alloc(DType::BF16, {C, T});
     Tensor z   = work_.alloc(DType::BF16, {VW, T});
-    {
+    if (p.projection.weight.qtype == QType::Q8_G32_FP16) {
+        // Q8 (Dense8): the projection writes q/k/v and z to their destinations itself.
+        ops::gdn_input_proj(x, p.projection.weight, qkv, z, s);
+    } else {
+        Tensor projected = work_.alloc(DType::BF16, {C + VW, T});
+        project(x, p.projection, projected, work_, s);
         Tensor* parts[] = {&qkv, &z};
         ops::split_rows(projected, parts, s);
     }
     Tensor ab = work_.alloc(DType::BF16, {2 * NV, T});
     project(x, p.control, ab, work_, s);
-    Tensor a = work_.alloc(DType::BF16, {NV, T});
-    Tensor b = work_.alloc(DType::BF16, {NV, T});
-    {
-        Tensor* parts[] = {&a, &b};
-        ops::split_rows(ab, parts, s);
-    }
     Tensor gate = work_.alloc(DType::FP32, {NV, T});
     Tensor beta = work_.alloc(DType::FP32, {NV, T});
-    ops::gdn_gating(a, b, p.a_log, p.dt_bias, gate, beta, s);
+    ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
 
     Tensor q = work_.alloc(DType::BF16, {KW, T});
     Tensor k = work_.alloc(DType::BF16, {KW, T});
@@ -393,11 +391,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         // without changing them, and the recurrence's inputs are recorded for the commit fold.
         const std::int32_t Wd = batch.width, B = batch.batch;
         auto layer = state_.gdn->layer_view(index);
-        Tensor conv_out = work_.alloc(DType::BF16, {C, Wd, B});
-        ops::causal_conv1d_silu_from_states(qkv.view({C, Wd, B}), p.convolution, layer.conv, batch.slots,
-                                            conv_out, s);
-        Tensor* parts[] = {&q, &k, &v};
-        ops::split_rows(conv_out.view({C, T}), parts, s);
+        ops::causal_conv1d_silu_from_states_split(qkv.view({C, Wd, B}), p.convolution, layer.conv,
+                                                  batch.slots, q, k, v, s);
         Tensor o_rows = o.view({DV, NV, Wd, B});
         ops::gated_delta_net_replay_record(q.view({DK, NK, Wd, B}), k.view({DK, NK, Wd, B}), v.view({DV, NV, Wd, B}),
                                            gate.view({NV, Wd, B}), beta.view({NV, Wd, B}), scale, layer.recurrent,
@@ -416,11 +411,8 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     } else {
         // One position per sequence (decode): the recurrent update with device-chosen slots.
         auto layer = state_.gdn->layer_view(index);
-        Tensor conv_out = work_.alloc(DType::BF16, {C, 1, T});
-        ops::causal_conv1d_silu_snapshot(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{}, batch.slots,
-                                         batch.slots, conv_out, s);
-        Tensor* parts[] = {&q, &k, &v};
-        ops::split_rows(conv_out.view({C, T}), parts, s);
+        ops::causal_conv1d_silu_snapshot_split(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{},
+                                               batch.slots, batch.slots, q, k, v, s);
         Tensor o_batch = o.view({DV, NV, 1, T});
         ops::gated_delta_net_batch_update(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
                                           gate.view({NV, 1, T}), beta.view({NV, 1, T}), scale,

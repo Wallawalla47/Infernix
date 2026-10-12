@@ -17,9 +17,14 @@ void gdn_gating_launch(const Tensor& a, const Tensor& b, const Tensor& A_log, co
     const int grid =
         static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
 
+    // A single column has no stride of its own; its heads are contiguous either way.
+    const auto column_stride = [](const Tensor& t) {
+        return t.ne[1] == 1 ? std::int64_t{48} : t.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+    };
     gdn_gating_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(a.data), static_cast<const __nv_bfloat16*>(b.data),
-        static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+        column_stride(a), column_stride(b), static_cast<const float*>(A_log.data),
+        static_cast<const float*>(dt_bias.data),
         static_cast<float*>(g.data), static_cast<float*>(beta.data), n);
     CUDA_CHECK(cudaGetLastError());
 }

@@ -60,6 +60,10 @@ using Q8N248320K5120 = Q8LinearGeometry<248320, 5120>;
 [[nodiscard]] Q8Launch select_q8_n2560_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n1280_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k6144(std::int32_t tokens);
+// The [16384,2560] GDN projection on the same routes, rows [0,10240) written to qkv [10240,T] and
+// rows [10240,16384) to z [6144,T] (gdn_input_proj).
+void launch_q8_n16384_k2560_split(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                  cudaStream_t stream);
 [[nodiscard]] Q8Launch select_q8_n324_k10240(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n320_k10240(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n10240_k320(std::int32_t tokens);

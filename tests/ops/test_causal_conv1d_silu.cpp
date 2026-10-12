@@ -693,6 +693,102 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     return failures;
 }
 
+// The split snapshot and from-states entries against their contiguous forms on identical inputs:
+// every output row and every state slot must carry the same bits (the arithmetic is shared; only
+// where an output value is stored differs). C = 10240 split (2048, 2048, 6144).
+int split_snapshot_case(std::int32_t width, const std::vector<std::int32_t>& initial_slots,
+                        const std::vector<std::int32_t>& snapshot_bases,
+                        const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
+                        std::uint32_t seed) {
+    constexpr std::int32_t C = 10240, kRows0 = 2048, kRows1 = 2048, kRows2 = 6144;
+    const std::int32_t batch   = static_cast<std::int32_t>(initial_slots.size());
+    const std::int32_t columns = width * batch;
+    const bool masked          = !valid_columns.empty();
+    const LogicalInput input   = make_input(C, columns, seed);
+    std::vector<float> states(static_cast<std::size_t>(C) * 3U * static_cast<std::size_t>(slots));
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        const std::vector<float> one = make_state(C, seed + 10U + static_cast<std::uint32_t>(slot));
+        std::copy(one.begin(), one.end(), states.begin() + static_cast<std::size_t>(slot) * C * 3U);
+    }
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits  = bf16_bits(states);
+
+    DeviceBuffer x = to_device(x_bits), weight = to_device(weight_bits);
+    DeviceBuffer state_a = to_device(state_bits), state_b = to_device(state_bits);
+    DeviceBuffer initial = to_device(initial_slots), bases = to_device(snapshot_bases);
+    DeviceBuffer valid   = to_device(masked ? valid_columns : initial_slots);
+    GuardedDeviceBuffer packed(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out0(static_cast<std::size_t>(kRows0) * columns * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out1(static_cast<std::size_t>(kRows1) * columns * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out2(static_cast<std::size_t>(kRows2) * columns * sizeof(std::uint16_t));
+
+    Tensor tx(x.p, DType::BF16, {C, width, batch});
+    Tensor tw(weight.p, DType::BF16, {C, 4});
+    Tensor ta(state_a.p, DType::BF16, {C, 3, slots});
+    Tensor tb(state_b.p, DType::BF16, {C, 3, slots});
+    Tensor tinitial(initial.p, DType::I32, {batch});
+    Tensor tbases(bases.p, DType::I32, {batch});
+    Tensor tvalid = masked ? Tensor(valid.p, DType::I32, {batch}) : Tensor{};
+    Tensor tpacked(packed.data(), DType::BF16, {C, width, batch});
+    Tensor t0(out0.data(), DType::BF16, {kRows0, columns});
+    Tensor t1(out1.data(), DType::BF16, {kRows1, columns});
+    Tensor t2(out2.data(), DType::BF16, {kRows2, columns});
+
+    const auto compare_rows = [&](const std::string& tag) {
+        const std::vector<std::uint16_t> whole = from_device<std::uint16_t>(packed.data(), x_bits.size());
+        const std::vector<std::uint16_t> parts[3] = {
+            from_device<std::uint16_t>(out0.data(), static_cast<std::size_t>(kRows0) * columns),
+            from_device<std::uint16_t>(out1.data(), static_cast<std::size_t>(kRows1) * columns),
+            from_device<std::uint16_t>(out2.data(), static_cast<std::size_t>(kRows2) * columns)};
+        const std::int32_t rows[3] = {kRows0, kRows1, kRows2}, begins[3] = {0, kRows0, kRows0 + kRows1};
+        std::int64_t mismatches = 0;
+        for (std::int32_t column = 0; column < columns; ++column) {
+            for (int part = 0; part < 3; ++part) {
+                for (std::int32_t row = 0; row < rows[part]; ++row) {
+                    mismatches += parts[part][static_cast<std::size_t>(column) * rows[part] + row] !=
+                                  whole[static_cast<std::size_t>(column) * C + begins[part] + row];
+                }
+            }
+        }
+        int failures = verify_buffer_guards(tag + " out0", out0) + verify_buffer_guards(tag + " out1", out1) +
+                       verify_buffer_guards(tag + " out2", out2) + verify_buffer_guards(tag + " packed", packed);
+        if (mismatches != 0) {
+            std::cerr << tag << ": " << mismatches << " split outputs differ from the contiguous form\n";
+            ++failures;
+        }
+        return failures;
+    };
+
+    const std::string shape = " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+                              (masked ? " masked" : " dense");
+    packed.fill(kOutputPoison);
+    out0.fill(kOutputPoison);
+    out1.fill(kOutputPoison);
+    out2.fill(kOutputPoison);
+    ops::causal_conv1d_silu_snapshot(tx, tw, ta, tvalid, tinitial, tbases, tpacked, nullptr);
+    ops::causal_conv1d_silu_snapshot_split(tx, tw, tb, tvalid, tinitial, tbases, t0, t1, t2, nullptr);
+    cuda_synchronize();
+    int failures = compare_rows("causal_conv1d_silu snapshot split" + shape);
+    failures += verify_bits("causal_conv1d_silu snapshot split" + shape + " states", state_b.p,
+                            from_device<std::uint16_t>(state_a.p, state_bits.size()));
+
+    // The read-only form, from the same (untouched) initial windows.
+    DeviceBuffer state_c = to_device(state_bits);
+    Tensor tc(state_c.p, DType::BF16, {C, 3, slots});
+    packed.fill(kOutputPoison);
+    out0.fill(kOutputPoison);
+    out1.fill(kOutputPoison);
+    out2.fill(kOutputPoison);
+    ops::causal_conv1d_silu_from_states(tx, tw, tc, tinitial, tpacked, nullptr);
+    ops::causal_conv1d_silu_from_states_split(tx, tw, tc, tinitial, t0, t1, t2, nullptr);
+    cuda_synchronize();
+    failures += compare_rows("causal_conv1d_silu from-states split" + shape);
+    failures += verify_bits("causal_conv1d_silu from-states split" + shape + " states preserved", state_c.p,
+                            state_bits);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -767,6 +863,16 @@ int main() {
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, true,
                                7200U + static_cast<std::uint32_t>(T));
     }
+
+    // The split snapshot and from-states entries (Qwen3.8-Flash-Next's GDN decode and verification):
+    // the single-step decode kernel, the batched one-column kernel, the batched small-W kernel with
+    // and without masking, and the single-sequence small-T and sequence kernels.
+    failures += split_snapshot_case(1, {3}, {0}, {}, 4, 8001U);
+    failures += split_snapshot_case(1, {8, 9, 10, 11, 12}, {0, 1, 2, 3, 4}, {}, 13, 8002U);
+    failures += split_snapshot_case(5, {10, 11}, {0, 5}, {}, 12, 8003U);
+    failures += split_snapshot_case(5, {10, 11}, {0, 5}, {5, 2}, 12, 8004U);
+    failures += split_snapshot_case(7, {9}, {1}, {}, 10, 8005U);
+    failures += split_snapshot_case(40, {41}, {0}, {}, 42, 8006U);
 
     // Argument rejection, on both sides of the route bound.
     failures += split_rejection_case(16);

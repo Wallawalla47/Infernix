@@ -12,7 +12,9 @@ namespace infernix::ops {
  *   g[h,t]    = -exp(A_log[h]) * softplus(a[h,t] + dt_bias[h])
  *   beta[h,t] = sigmoid(b[h,t]).
  *
- * `a` and `b` are contiguous BF16 [48,T], `A_log` and `dt_bias` are contiguous FP32 [48], and
+ * `a` and `b` are BF16 [48,T] whose columns are contiguous at any column stride of at least 48
+ * elements (so both may be row slices of one [96,T] control projection), `A_log` and `dt_bias` are
+ * contiguous FP32 [48], and
  * `g` and `beta` are contiguous FP32 [48,T]. The oracle evaluates the formula naively in FP64;
  * transcendental implementation and intermediate precision are private kernel choices. Inputs and
  * the two outputs must be mutually non-overlapping. There is no workspace or persistent state side

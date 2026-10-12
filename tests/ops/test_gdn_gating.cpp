@@ -56,7 +56,8 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
     }
 }
 
-int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals) {
+// `parent`: a and b are the two row halves of one [96,T] control projection, passed as slices.
+int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals, bool parent = false) {
     const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
     std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
     fill_uniform(a, seed, -8.0F, 8.0F);
@@ -78,6 +79,13 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
 
     const std::vector<std::uint16_t> a_bits = bf16_bits(a);
     const std::vector<std::uint16_t> b_bits = bf16_bits(b);
+    std::vector<std::uint16_t> parent_bits(parent ? 2 * elements : 0);
+    for (std::size_t i = 0; parent && i < elements; ++i) {
+        const std::size_t column = i / kHeads, head = i % kHeads;
+        parent_bits[column * 2 * kHeads + head]          = a_bits[i];
+        parent_bits[column * 2 * kHeads + kHeads + head] = b_bits[i];
+    }
+    DeviceBuffer device_parent              = to_device(parent ? parent_bits : a_bits);
     DeviceBuffer device_a                   = to_device(a_bits);
     DeviceBuffer device_b                   = to_device(b_bits);
     DeviceBuffer device_a_log               = to_device(a_log);
@@ -87,8 +95,11 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     device_g.fill(0xff);
     device_beta.fill(0xff);
 
-    Tensor tensor_a(device_a.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_b(device_b.p, DType::BF16, {kHeads, tokens});
+    const Tensor tensor_parent(device_parent.p, DType::BF16, {2 * kHeads, tokens});
+    Tensor tensor_a = parent ? tensor_parent.slice(0, 0, kHeads)
+                             : Tensor(device_a.p, DType::BF16, {kHeads, tokens});
+    Tensor tensor_b = parent ? tensor_parent.slice(0, kHeads, kHeads)
+                             : Tensor(device_b.p, DType::BF16, {kHeads, tokens});
     Tensor tensor_a_log(device_a_log.p, DType::FP32, {kHeads});
     Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {kHeads});
     Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
@@ -99,7 +110,8 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     cuda_synchronize();
 
     const std::string label = std::string("gdn_gating T=") + std::to_string(tokens) +
-                              (stress_transcendentals ? " transcendental-range" : "");
+                              (stress_transcendentals ? " transcendental-range" : "") +
+                              (parent ? " parent slices" : "");
     int failures = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);
@@ -107,10 +119,15 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
                                  reference_beta, kGdnGatingFp32);
     failures += device_g.verify_guards((label + " g").c_str());
     failures += device_beta.verify_guards((label + " beta").c_str());
-    failures += verify_exact((label + " a immutable").c_str(),
-                             from_device<std::uint16_t>(device_a, elements), a_bits);
-    failures += verify_exact((label + " b immutable").c_str(),
-                             from_device<std::uint16_t>(device_b, elements), b_bits);
+    if (parent) {
+        failures += verify_exact((label + " a/b immutable").c_str(),
+                                 from_device<std::uint16_t>(device_parent, 2 * elements), parent_bits);
+    } else {
+        failures += verify_exact((label + " a immutable").c_str(),
+                                 from_device<std::uint16_t>(device_a, elements), a_bits);
+        failures += verify_exact((label + " b immutable").c_str(),
+                                 from_device<std::uint16_t>(device_b, elements), b_bits);
+    }
     failures += verify_exact((label + " A_log immutable").c_str(),
                              from_device<float>(device_a_log, a_log.size()), a_log);
     failures += verify_exact((label + " dt_bias immutable").c_str(),
@@ -132,6 +149,10 @@ int main() {
     failures += run_case(128, 0x303u, false);
     failures += run_case(4096, 0x404u, false);
     failures += run_case(17, 0x505u, true);
+    // Qwen3.8-Flash-Next reads a and b straight out of its [96,T] control projection.
+    failures += run_case(1, 0x606u, false, true);
+    failures += run_case(5, 0x707u, false, true);
+    failures += run_case(4096, 0x808u, false, true);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

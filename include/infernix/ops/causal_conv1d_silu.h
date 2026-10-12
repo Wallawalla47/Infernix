@@ -59,6 +59,14 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
                                  const Tensor& snapshot_base_slots, Tensor& out,
                                  cudaStream_t stream);
 
+// Split-output snapshot form: the snapshot form with its output rows written to out0, out1, out2 in
+// row order, under the split form's row profiles. Each destination is contiguous BF16 [rows, W*B]
+// (output column b*W+j), and none overlaps another, x, weight, metadata or conv_states.
+void causal_conv1d_silu_snapshot_split(const Tensor& x, const Tensor& weight, Tensor& conv_states,
+                                       const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                       const Tensor& snapshot_base_slots, Tensor& out0, Tensor& out1,
+                                       Tensor& out2, cudaStream_t stream);
+
 /**
  * Read-only batched form, for speculative verification whose state is committed later by a
  * replay fold. `x` and `out` are contiguous BF16 [C,W,B], `conv_states` is contiguous BF16
@@ -71,5 +79,11 @@ void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& 
 void causal_conv1d_silu_from_states(const Tensor& x, const Tensor& weight,
                                     const Tensor& conv_states, const Tensor& initial_state_slots,
                                     Tensor& out, cudaStream_t stream);
+
+// Split-output read-only form, with the destinations of causal_conv1d_silu_snapshot_split.
+void causal_conv1d_silu_from_states_split(const Tensor& x, const Tensor& weight,
+                                          const Tensor& conv_states,
+                                          const Tensor& initial_state_slots, Tensor& out0,
+                                          Tensor& out1, Tensor& out2, cudaStream_t stream);
 
 } // namespace infernix::ops

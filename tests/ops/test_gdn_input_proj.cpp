@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "infernix/ops/gdn_input_proj.h"
+#include "infernix/ops/linear.h"
 
 #include "ops/input_projection_test_common.h"
 
@@ -30,12 +31,13 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
                         std::int32_t full_rows, std::int32_t output_row_offset,
                         std::int32_t output_rows, const quantized_weight::PackedWeight& weight,
                         std::int32_t weight_row_offset, const std::vector<float>& activation,
-                        std::int32_t hidden, std::int32_t tokens) {
+                        std::int32_t hidden, std::int32_t tokens,
+                        const ReductionCriterion& criterion = kGdnInputProjA16Tolerance) {
     const std::vector<double> actual =
         gather_rows(output.values(), full_rows, output_row_offset, output_rows, tokens);
     const std::vector<double> expected =
         projection_oracle(weight, weight_row_offset, output_rows, activation, hidden, tokens);
-    return compare(label, actual, expected, kGdnInputProjA16Tolerance);
+    return compare(label, actual, expected, criterion);
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
@@ -209,6 +211,69 @@ int run_q8() {
         quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 12288, kHidden, 503U));
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 97}) { failures += run_q8_case(parent, tokens); }
+    return failures;
+}
+
+// Qwen3.8-Flash-Next's [16384,2560] parent: the oracle criterion, and the exact bits of the rows of
+// linear's packed [16384,T] result, which the model used before it wrote the split itself.
+int run_q8_flash_next_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden  = 2560;
+    constexpr std::int32_t kQkvRows = 10240;
+    constexpr std::int32_t kZRows   = 6144;
+    constexpr std::int32_t kRows    = kQkvRows + kZRows;
+    const std::vector<float> activation = make_bf16_activation(kHidden, tokens, 521U + tokens);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation                   = to_device(activation_bits);
+    GuardedBf16Tensor qkv(kQkvRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    GuardedBf16Tensor packed(kRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor qkv_output    = qkv.tensor();
+    Tensor z_output      = z.tensor();
+    Tensor packed_output = packed.tensor();
+    ops::gdn_input_proj(x, parent.view(), qkv_output, z_output, nullptr);
+    ops::linear(x, parent.view(), packed_output, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " Q8 [16384,2560] T=" + std::to_string(tokens);
+    int failures             = qkv.verify_guards("gdn qkv" + suffix);
+    failures += z.verify_guards("gdn z" + suffix);
+    failures += qkv.verify_fully_written("gdn qkv" + suffix);
+    failures += z.verify_fully_written("gdn z" + suffix);
+    // The form is linear's [16384,2560] result, so linear's A16 criterion applies: one BF16 unit
+    // roundoff in relative L2, two in the gross bound.
+    constexpr ReductionCriterion kLinearA16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+    failures += verify_output_range("gdn qkv" + suffix, qkv, kQkvRows, 0, kQkvRows, parent.host, 0,
+                                    activation, kHidden, tokens, kLinearA16);
+    failures += verify_output_range("gdn z" + suffix, z, kZRows, 0, kZRows, parent.host, kQkvRows,
+                                    activation, kHidden, tokens, kLinearA16);
+    const std::vector<std::uint16_t> linear_bits = packed.bits(), qkv_bits = qkv.bits(), z_bits = z.bits();
+    std::int64_t mismatches = 0;
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t row = 0; row < kRows; ++row) {
+            const std::uint16_t actual = row < kQkvRows ? qkv_bits[static_cast<std::size_t>(t) * kQkvRows + row]
+                                                        : z_bits[static_cast<std::size_t>(t) * kZRows + row - kQkvRows];
+            mismatches += actual != linear_bits[static_cast<std::size_t>(t) * kRows + row];
+        }
+    }
+    if (mismatches != 0) {
+        std::cerr << "gdn qkv/z" << suffix << ": " << mismatches << " values differ from linear\n";
+        ++failures;
+    }
+    failures += verify_preserved("gdn x" + suffix, device_activation, activation_bits);
+    failures += parent.verify_preserved("gdn parent weight" + suffix);
+    return failures;
+}
+
+int run_q8_flash_next() {
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::Q8_G32_FP16, 16384, 2560, 509U));
+    int failures = 0;
+    // Each route of the shape and its neighbours: register-streamed to 4 and to 8 columns, then the
+    // 32x64, 32x96 and 64x128 MMA tiles.
+    for (const std::int32_t tokens : {1, 2, 4, 5, 8, 9, 64, 65, 96, 97, 300}) {
+        failures += run_q8_flash_next_case(parent, tokens);
+    }
     return failures;
 }
 
@@ -458,6 +523,7 @@ int main() {
     int failures = 0;
     failures += run_q4_q5();
     failures += run_q8();
+    failures += run_q8_flash_next();
     failures += run_nvfp4();
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj\n";
