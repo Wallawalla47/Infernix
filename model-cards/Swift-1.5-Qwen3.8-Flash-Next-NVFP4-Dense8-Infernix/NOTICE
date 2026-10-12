@@ -1,0 +1,59 @@
+Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix
+A conversion of ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4 for Infernix, by Wallawalla47.
+
+Copyright 2026 UkisAI. Swift Contribution licensed under the Swift Open
+License v1.0 (https://huggingface.co/ukisai/Swift-Qwen3.8-Flash-Next/blob/main/LICENSE).
+Derivative of Qwen3.8-Flash-Next, Copyright (c) 2026 Qwen, Qwen Community License 1.0.
+
+------------------------------------------------------------------------------
+NOTICE of the Work (UkisAI), reproduced unchanged:
+
+Swift-Qwen3.8-Flash-Next
+Copyright 2026 UkisAI
+
+UkisAI's contribution (the "Swift Contribution") is licensed under the
+Swift Open License v1.0. See LICENSE.
+
+This model is a derivative work of Qwen3.8-Flash-Next
+  https://huggingface.co/Qwen/Qwen3.8-Flash-Next
+  Copyright (c) 2026 Qwen
+  Licensed under the Qwen Community License 1.0. See LICENSE-QWEN.
+
+Changes made by UkisAI:
+  - model-*.safetensors: model weights were modified by UkisAI through fine-tuning.
+  - tokenizer.json, tokenizer_config.json: re-serialized from UkisAI's training
+    base. Vocabulary and merges are unchanged; the file format, some metadata
+    fields and the pre-tokenizer pattern differ from the Base Model files.
+  - README.md: replaced. LICENSE (Swift Open License v1.0), NOTICE,
+    benchmarks/ and ukisai-banner.png added.
+  - The Base Model's license text was moved from LICENSE to LICENSE-QWEN.
+  - All other files (config.json, generation_config.json, chat_template.jinja,
+    model.safetensors.index.json, vocab.json, merges.txt,
+    preprocessor_config.json, video_preprocessor_config.json) are unmodified
+    from Qwen3.8-Flash-Next and remain under the Qwen Community License 1.0.
+
+------------------------------------------------------------------------------
+Changes made in this conversion (Swift Open License v1.0, Section 4(b)):
+
+Source: ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4, revision
+3ff0520224f264a2d0ac4ab56ece8f2f13aadb38 (UkisAI's ModelOpt NVFP4 quantization of
+Swift 1.5 Qwen3.8-Flash-Next).
+
+  - All model files (*.safetensors, config, tokenizer, chat template, generation and
+    processor configs) were converted into one Infernix v3 artifact, stored as the
+    three files Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix-0000N-of-00003.infernix,
+    with Infernix's tools.convert recipe qwen3_8_flash_next_nvfp4_dense8.
+  - Routed experts: NVFP4 codes and scales copied unchanged, repacked into Infernix's
+    expert layout.
+  - Dense projections (GDN, QSA output, shared experts, hyper-connection mixers, PLE
+    key/value projections) and lm_head: re-quantized from BF16 to 8-bit integers with
+    one FP16 scale per 32 weights (q8_g32_fp16).
+  - MTP drafter: re-quantized from BF16 (projections q8_g32_fp16, routed experts
+    q4_g64_fp16).
+  - Added a proposal head: q4_g64_fp16 copies of 131,072 lm_head rows.
+  - PLE n-gram table: not included; the artifact binds to a separately distributed FP8
+    n-gram volume, verified equal row for row to this model's table quantized to FP8.
+  - GDN A_log and dt_bias widened from BF16 to FP32; other tensors kept as stored.
+  - tokenizer.json: pre-tokenizer split pattern rewritten to the standard Qwen pattern;
+    tokenizer_config.json: added_tokens_decoder built and prefix settings normalized.
+  - README.md replaced; NGRAM-VOLUME.md and the conversion report added.

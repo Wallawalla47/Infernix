@@ -1,0 +1,65 @@
+Swift-Qwen3.8-27B-NVFP4-NInferV3
+A conversion of ukisai/Swift-Qwen3.8-27B-NVFP4 for Infernix and NInfer, by Wallawalla47.
+
+Copyright 2026 UkisAI. Swift Contribution licensed under the Swift Open
+License v1.0 (https://huggingface.co/ukisai/Swift-Qwen3.8-27b/blob/main/LICENSE).
+Derivative of Qwen3.8-27B, Copyright 2026 Alibaba Cloud, Apache License 2.0.
+
+------------------------------------------------------------------------------
+NOTICE of the Work (UkisAI), reproduced unchanged:
+
+Swift-Qwen3.8-27B
+Copyright 2026 UkisAI
+
+UkisAI's contribution (the "Swift Contribution") is licensed under the
+Swift Open License v1.0. See LICENSE.
+
+This model is a Derivative Work of Qwen3.8-27B
+  https://huggingface.co/Qwen/Qwen3.8-27B
+  Copyright 2026 Alibaba Cloud
+  Licensed under the Apache License, Version 2.0. See LICENSE-APACHE-2.0.
+
+Changes made by UkisAI (Apache License 2.0, Section 4(b) change notice):
+  - model-*.safetensors, model.safetensors.index.json: model weights were
+    fine-tuned by UkisAI (LoRA adapter trained by UkisAI and merged into the
+    Base Model weights).
+  - generation_config.json: added "min_p": 0 and "repetition_penalty": 1.0.
+  - README.md: replaced. ukisai-banner.png and swift-speed-demo.mp4 added.
+  - All other files (config.json, chat_template.jinja, tokenizer.json,
+    tokenizer_config.json, vocab.json, merges.txt, preprocessor_config.json,
+    video_preprocessor_config.json) are unmodified from Qwen3.8-27B and
+    remain under the Apache License, Version 2.0.
+
+------------------------------------------------------------------------------
+Third-party component:
+
+The DFlash2 draft model in this artifact is z-lab/Qwen3.8-27B-DFlash2
+(https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2, revision
+50307d4c4cde6860d4eee73e2547cd786fe8e8a4), licensed under the Apache License,
+Version 2.0 (see LICENSE-APACHE-2.0). It was copied byte for byte from the
+author's Qwen3.8-27B-NVIDIA-NVFP4-NInferV3 artifact, where it is stored with
+its MLP projections in q8_g32_fp16 and its other tensors in BF16.
+
+------------------------------------------------------------------------------
+Changes made in this conversion (Swift Open License v1.0, Section 4(b);
+Apache License 2.0, Section 4(b)):
+
+Source: ukisai/Swift-Qwen3.8-27B-NVFP4, revision
+17d5f9dfcb6e1e6ccbd11d93da2b60b7754f7fe4 (UkisAI's ModelOpt mixed NVFP4/FP8
+quantization of Swift-Qwen3.8-27B).
+
+  - All model files (*.safetensors, config, tokenizer, chat template, generation and
+    processor configs) were converted into the single NInfer v3 artifact
+    Swift-Qwen3.8-27B-NVFP4-NInfer.ninfer with the qwen3_8_27b_nvfp4_nvidia recipe of
+    Infernix's tools.convert.
+  - MLP projections (NVFP4) and attention/GDN projections (FP8, row scales): codes and
+    scales copied unchanged.
+  - Output head: dequantized from NVFP4 and re-quantized to FP8 with one BF16 scale per
+    row; token embedding: quantized from BF16 to FP8 with one BF16 scale per row.
+  - MTP companion and vision tower: some projections re-quantized from BF16 to grouped
+    8/6/5/4-bit integer formats with FP16 scales; other tensors kept as stored.
+  - Added the DFlash2 draft model above and a proposal head (q4_g64_fp16 copies of
+    131,072 output-head rows).
+  - Tokenizer, chat template, generation and processor configs: stored unchanged as
+    artifact resources.
+  - README.md replaced; the conversion report added.
