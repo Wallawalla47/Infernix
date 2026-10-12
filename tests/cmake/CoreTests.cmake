@@ -44,6 +44,9 @@ infernix_add_test(infernix_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 infernix_add_test(infernix_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_layout_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_layout.cpp"
+  LIBRARIES infernix_core)
+
 infernix_add_test(infernix_kv_cache_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache.cpp"
   LIBRARIES infernix_core)
