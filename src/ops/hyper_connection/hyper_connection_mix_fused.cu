@@ -30,6 +30,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -134,7 +135,11 @@ __global__ __launch_bounds__(kDownThreads, 1) void hc_down_partials_kernel(
     float w_bias[kOwned];
 #pragma unroll
     for (int j = 0; j < kOwned; ++j) { w_bias[j] = 1.0F + __bfloat162float(w[threadIdx.x + kDownThreads * j]); }
-    pdl::enter(); // launched as a programmatic dependent: the weights load while the producer finishes
+    // Launched as a programmatic dependent: the weights load while the producer finishes. The up
+    // collapse may launch beside this grid at once and fetch its own weights meanwhile; it reads the
+    // partials only after this grid completes.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     // Lanes 4-7 of each quarter warp read a chunk's two float4 halves of Rn in the other order, so a
     // quarter warp's eight 16-byte reads cover all 32 banks.
     const int first_half = (lane >> 2) & 1;
@@ -397,8 +402,11 @@ void launch(const Tensor& residual, const Tensor& norm_weight, typename Codec::P
     auto* inv = reinterpret_cast<float*>(static_cast<std::byte*>(partials) + partial_bytes);
     // Both kernels read their weights before pdl::enter(), so as programmatic dependents in a captured
     // graph they fetch them while the kernel before them finishes.
+    // Rn for the columns of one pass only, so the up collapse fits beside a down CTA on its SM.
+    const std::size_t rn_bytes =
+        static_cast<std::size_t>(std::min(columns, kPassColumns)) * kHidden * sizeof(float);
     check_launch(pdl::launch_consumer({dim3((down_rows + kDownRows - 1) / kDownRows, streams), dim3(kDownThreads),
-                                       kDownSharedBytes, stream},
+                                       rn_bytes, stream},
                                       hc_down_partials_kernel<Codec>, static_cast<const bf16*>(residual.data),
                                       static_cast<const bf16*>(norm_weight.data), down, down_rows, columns, eps,
                                       partial, inv),

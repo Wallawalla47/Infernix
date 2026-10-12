@@ -9180,6 +9180,29 @@ decode graph is 97 % busy with 0.18 µs gaps, and the weight GEMVs already run a
 bandwidth (gate/up 94 %, FP8 projections 95-97 %, drafter and head 97-100 %) except the NVFP4 down
 projection at T = 1 (79 %) and FP8 [5120, 6144] (83-90 %).
 
+### 19.3.20d The mixers' up collapse fetches its weights during the down partials (2026-10-12)
+
+Each mixer was a strict chain: `inject_kernel` (a plain launch) → K1a → K1b, with K1b's 3.3 MB of
+weights fetched only after every K1a CTA exited (K1a's `enter()` does not trigger a grid wider than
+half the SMs, and its 80 KB of Rn shared memory, sized for 8 columns at every width, left no room for
+a K1b CTA beside it). Now `inject_kernel` is a programmatic dependent whose small grid triggers at
+once, so K1a launches and fetches its weights while the inject runs; K1a sizes Rn to the call's
+columns of one pass and triggers its dependents right after its weight loads, so K1b's CTAs launch
+beside it and fetch their weights during K1a's reductions (K1b still reads the partials only after
+K1a completes). Products and orders are unchanged.
+
+`infernix_hyper_connection_bench --codec q8 --layers 48`, three rounds, output hashes identical:
+T = 1 10.58 → 10.07 µs per mixer, T = 2 12.36 → 11.87, T = 5 17.90 → 17.28. End to end (dense8, INT8
+KV, tg512, frozen binaries, ABBA): plain 123.6/124.2 → 126.6/126.5 tok/s (+2.2 %), MTP K = 4
+174.0/174.0 → 176.2/176.2 (+1.3 %), MTP acceptance 0.8049 and 573/72 rounds in every run.
+
+Also measured and rejected the same day, for the 27B's two GEMVs below 90 % of DRAM bandwidth (cold-L2
+op bench, three rounds): CTA shapes with the same per-row arithmetic for the NVFP4 A16 down projection
+[5120, 17408] (8 warps × 1/2/4 rows, 4 warps × 1/2/4 rows, 16 warps × 1 row, 1-4 blocks per SM): the
+shipped 8 × 2 measured 33.4-34.1 µs, 4 × 2 and 8 × 2 at three blocks the same, every other shape 37.5-
+50.6 µs; and for FP8 [5120, 6144] at T = 1 (rows per warp, warps, phase unroll 2/4, blocks per SM) all
+21.1-21.6 µs.
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,

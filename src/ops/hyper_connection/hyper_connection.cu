@@ -2,6 +2,8 @@
 
 #include "ops/hyper_connection/hyper_connection_mix_fused.h"
 
+#include "core/pdl.cuh"
+
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -111,6 +113,8 @@ __global__ void collapse_kernel(const bf16* __restrict__ logits, const bf16* __r
 
 __global__ void inject_kernel(const bf16* __restrict__ y, const float* __restrict__ inject, int hidden,
                               int streams, int columns, bf16* __restrict__ residual) {
+    // A programmatic dependent; its small grid lets the next mixer launch and fetch its weights at once.
+    pdl::enter();
     const int d = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
     if (d >= hidden || t >= columns) { return; }
@@ -256,10 +260,11 @@ void hyper_connection_inject(const Tensor& y, const Tensor& inject, Tensor& resi
     require(inject.ne[1] == columns && residual.ne[0] == streams * hidden && residual.ne[1] == columns &&
                 columns > 0,
             "inject shapes disagree");
-    inject_kernel<<<dim3((hidden + kThreads - 1) / kThreads, columns), kThreads, 0, stream>>>(
-        static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data), hidden, streams,
-        columns, static_cast<bf16*>(residual.data));
-    check_launch("inject");
+    if (pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, columns), dim3(kThreads), 0, stream},
+                             inject_kernel, static_cast<const bf16*>(y.data), static_cast<const float*>(inject.data),
+                             hidden, streams, columns, static_cast<bf16*>(residual.data)) != cudaSuccess) {
+        check_launch("inject");
+    }
 }
 
 void hyper_connection_expand(const Tensor& x, std::int32_t streams, Tensor& residual,
