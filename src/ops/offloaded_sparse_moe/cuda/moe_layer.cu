@@ -421,19 +421,16 @@ __global__ void __launch_bounds__(kThreads)
 
 // -------------------------------------------------------------------------------------- routing
 
-// One warp per column: exact top-k by repeated arg-max with lower-id ties, then the weights.
-// Every array index is a compile-time constant (unrolled loops guarded by top_k), so the values,
-// the selection and the weights stay in registers; the selection and softmax order are fixed.
-__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
-                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
-                             float* __restrict__ shared_gate) {
-    pdl::enter(); // launched as a programmatic dependent of the router projection
-    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int lane = threadIdx.x % 32;
-    if (warp >= columns) { return; }
-    const float* column = logits + static_cast<std::size_t>(warp) * (experts + 1);
+// One warp routes column t: exact top-k by repeated arg-max with lower-id ties, then the weights.
+// Every array index is a compile-time constant (unrolled loops), so the values stay in registers;
+// the selection and softmax order are fixed. Lane k < top_k returns the k-th selected id.
+__device__ __forceinline__ int route_column(const float* __restrict__ logits, int experts, int top_k, int t,
+                                            std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                            float* __restrict__ shared_gate) {
+    const int lane      = threadIdx.x % 32;
+    const float* column = logits + static_cast<std::size_t>(t) * (experts + 1);
     // 512 experts: 16 per lane.
-    constexpr int kPerLane = 16, kMaxTopK = 16;
+    constexpr int kPerLane = 16;
     float values[kPerLane];
 #pragma unroll
     for (int i = 0; i < kPerLane; ++i) {
@@ -441,11 +438,10 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
         values[i]   = e < experts ? column[e] : -INFINITY;
     }
     const float score = lane == 0 ? column[experts] : 0.0F;
-    float selected[kMaxTopK];
-    int chosen[kMaxTopK];
-#pragma unroll
-    for (int k = 0; k < kMaxTopK; ++k) {
-        if (k >= top_k) { break; }
+    // Lane k keeps the k-th selection.
+    float selected = -INFINITY;
+    int chosen     = 0;
+    for (int k = 0; k < top_k; ++k) {
         float best   = -INFINITY;
         int best_id  = 0x7FFFFFFF;
 #pragma unroll
@@ -464,31 +460,34 @@ __global__ void route_kernel(const float* __restrict__ logits, int experts, int 
                 best_id = other_id;
             }
         }
-        selected[k] = best;
-        chosen[k]   = best_id;
+        if (lane == k) {
+            selected = best;
+            chosen   = best_id;
+        }
 #pragma unroll
         for (int i = 0; i < kPerLane; ++i) {
             if (lane + 32 * i == best_id) { values[i] = -INFINITY; }
         }
     }
-    if (lane == 0) {
-        // softmax over all experts then renormalized over the selected ones equals the softmax of
-        // the selected logits.
-        const float top = selected[0];
-        float sum       = 0.0F;
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) { sum += expf(selected[k] - top); }
-        }
-#pragma unroll
-        for (int k = 0; k < kMaxTopK; ++k) {
-            if (k < top_k) {
-                ids[static_cast<std::size_t>(warp) * top_k + k]     = chosen[k];
-                weights[static_cast<std::size_t>(warp) * top_k + k] = expf(selected[k] - top) / sum;
-            }
-        }
-        shared_gate[warp] = 1.0F / (1.0F + expf(-score));
+    // softmax over all experts then renormalized over the selected ones equals the softmax of the
+    // selected logits. Every lane sums them in selection order.
+    const float top = __shfl_sync(0xFFFFFFFFU, selected, 0);
+    float sum       = 0.0F;
+    for (int k = 0; k < top_k; ++k) { sum += expf(__shfl_sync(0xFFFFFFFFU, selected, k) - top); }
+    if (lane < top_k) {
+        ids[static_cast<std::size_t>(t) * top_k + lane]     = chosen;
+        weights[static_cast<std::size_t>(t) * top_k + lane] = expf(selected - top) / sum;
     }
+    if (lane == 0) { shared_gate[t] = 1.0F / (1.0F + expf(-score)); }
+    return chosen;
+}
+
+__global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                             std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                             float* __restrict__ shared_gate) {
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    if (warp < columns) { route_column(logits, experts, top_k, warp, ids, weights, shared_gate); }
 }
 
 // ------------------------------------------------------------------------------------- dispatch
@@ -557,17 +556,13 @@ __device__ __forceinline__ void dispatch_scan(int c, int experts, std::int32_t* 
 // shared atomics (so no array needs clearing between calls and no memset node precedes it), the
 // scan, the scatter, and the optional route-log copy of the ids. Same results as the three-kernel
 // route below.
-__global__ void __launch_bounds__(kDispatchThreads)
-    dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
-                          std::int32_t* __restrict__ route_log) {
-    __shared__ std::int32_t count[kDispatchThreads];
-    __shared__ std::int32_t cursor[kDispatchThreads];
-    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
-    pdl::enter(); // launched as a programmatic dependent of the route
+// The caller has cleared `count` and synchronized; thread i < entries holds entry i's expert `id`.
+__device__ __forceinline__ void dispatch_small(int id, int entries, int experts, const MoeDispatch& dispatch,
+                                               std::int32_t* __restrict__ route_log,
+                                               std::int32_t (&count)[kDispatchThreads],
+                                               std::int32_t (&cursor)[kDispatchThreads],
+                                               std::int32_t (&warp_totals)[2][kDispatchThreads / 32]) {
     const int i = threadIdx.x;
-    count[i]    = 0;
-    __syncthreads();
-    const int id = i < entries ? ids[i] : 0;
     if (i < entries) {
         atomicAdd(&count[id], 1);
         if (route_log != nullptr) { route_log[i] = id; }
@@ -578,6 +573,45 @@ __global__ void __launch_bounds__(kDispatchThreads)
     dispatch_scan(c, experts, dispatch.offsets, cursor, dispatch.jobs, dispatch.job_count, warp_totals);
     __syncthreads();
     if (i < entries) { dispatch.entries[atomicAdd(&cursor[id], 1)] = i; }
+}
+
+__global__ void __launch_bounds__(kDispatchThreads)
+    dispatch_small_kernel(const std::int32_t* __restrict__ ids, int entries, int experts, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the route
+    const int i = threadIdx.x;
+    count[i]    = 0;
+    __syncthreads();
+    dispatch_small(i < entries ? ids[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
+}
+
+// Calls of at most this many columns (and kDispatchThreads entries) route and dispatch in one CTA,
+// one warp per column: the dispatch reads the ids from shared memory, with no kernel boundary
+// between the two. Same results as route_kernel followed by dispatch_small_kernel.
+constexpr int kRouteDispatchColumns = kDispatchThreads / 32;
+
+__global__ void __launch_bounds__(kDispatchThreads)
+    route_dispatch_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
+                          std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                          float* __restrict__ shared_gate, MoeDispatch dispatch,
+                          std::int32_t* __restrict__ route_log) {
+    __shared__ std::int32_t count[kDispatchThreads];
+    __shared__ std::int32_t cursor[kDispatchThreads];
+    __shared__ std::int32_t routed[kDispatchThreads];
+    __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the router projection
+    const int i = threadIdx.x, warp = i / 32, lane = i % 32;
+    count[i]    = 0;
+    if (warp < columns) {
+        const int id = route_column(logits, experts, top_k, warp, ids, weights, shared_gate);
+        if (lane < top_k) { routed[warp * top_k + lane] = id; }
+    }
+    __syncthreads();
+    const int entries = columns * top_k;
+    dispatch_small(i < entries ? routed[i] : 0, entries, experts, dispatch, route_log, count, cursor, warp_totals);
 }
 
 __global__ void count_kernel(const std::int32_t* __restrict__ ids, int entries,
@@ -1587,6 +1621,29 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     scatter_kernel<<<(entries + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
         ids, entries, dispatch.cursor, dispatch.entries);
     check_launch("scatter");
+}
+
+void moe_route_dispatch(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, MoeDispatch& dispatch,
+                        std::int32_t* route_log, cudaStream_t stream) {
+    const int experts = logits.ne[0] - 1, columns = logits.ne[1];
+    if (columns > kRouteDispatchColumns || static_cast<std::int64_t>(columns) * top_k > kDispatchThreads) {
+        moe_route(logits, top_k, routing, stream);
+        moe_dispatch(routing, experts, dispatch, route_log, stream);
+        return;
+    }
+    require(contiguous(logits, DType::FP32) && contiguous(routing.ids, DType::I32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "route requires contiguous FP32 logits and I32/FP32 outputs");
+    require(experts > 0 && experts <= 512 && top_k > 0 && top_k <= 16 && top_k <= experts && columns > 0,
+            "route supports up to 512 experts and top-16");
+    require(routing.ids.ne[0] == top_k && routing.ids.ne[1] == columns && routing.weights.ne[0] == top_k &&
+                routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
+            "route output shapes disagree");
+    CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream}, route_dispatch_kernel,
+                                    static_cast<const float*>(logits.data), experts, columns,
+                                    static_cast<int>(top_k), static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data), dispatch, route_log));
 }
 
 std::size_t moe_experts_workspace_bytes(std::int32_t max_jobs, std::int32_t entries, std::int32_t columns,

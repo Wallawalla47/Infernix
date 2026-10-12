@@ -4,6 +4,7 @@
 #include "core/pdl.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/kernel/gdn_gate_values.cuh"
 #include "infernix/ops/speculative_tree.h"
 
 #include <cuda_bf16.h>
@@ -298,6 +299,13 @@ struct BatchUpdateAccess {
     head_map heads;
     std::int64_t state_slot_stride;
     float scale;
+    // gated_delta_net_batch_update_gating: g and beta are evaluated from these instead of read.
+    const __nv_bfloat16* gate_a = nullptr;
+    const __nv_bfloat16* gate_b = nullptr;
+    std::int64_t gate_a_ld      = 0;
+    std::int64_t gate_b_ld      = 0;
+    const float* a_log          = nullptr;
+    const float* dt_bias        = nullptr;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -335,6 +343,14 @@ struct BatchUpdateAccess {
 
     __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
                                                      std::int32_t token) const {
+        if (gate_a != nullptr) {
+            const std::int64_t c = column(coord, token);
+            const int h          = coord.value_head;
+            float g_value = 0.0f, beta_value = 0.0f;
+            gdn_gate_values(gate_a[c * gate_a_ld + h], gate_b[c * gate_b_ld + h], a_log[h], dt_bias[h], g_value,
+                            beta_value);
+            return {make_uint2(__float_as_uint(g_value), __float_as_uint(beta_value)), g_value, beta_value};
+        }
         return load_source_gate(g, beta, column(coord, token) * heads.H_v + coord.value_head);
     }
 

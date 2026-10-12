@@ -5,6 +5,7 @@
 
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
+#include "ops/kernel/gdn_gate_values.cuh"
 
 #include <cuda_bf16.h>
 
@@ -24,11 +25,7 @@ __global__ void gdn_gating_kernel(const __nv_bfloat16* a, const __nv_bfloat16* b
     for (std::int64_t i = start; i < n; i += stride) {
         const int h           = static_cast<int>(i % 48);
         const std::int64_t t  = i / 48;
-        const float av        = __bfloat162float(a[t * a_ld + h]);
-        const float bv        = __bfloat162float(b[t * b_ld + h]);
-        const float sp = softplus(av + dt_bias[h]);
-        g[i]           = -expf(A_log[h]) * sp;
-        beta[i]        = sigmoid(bv);
+        gdn_gate_values(a[t * a_ld + h], b[t * b_ld + h], A_log[h], dt_bias[h], g[i], beta[i]);
     }
 }
 

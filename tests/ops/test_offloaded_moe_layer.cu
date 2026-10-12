@@ -28,6 +28,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -827,6 +828,152 @@ void test_dispatch(int experts, int entries, std::uint32_t seed) {
     cudaFree(d_ids);
 }
 
+// moe_route_dispatch, captured (so its kernel runs as a programmatic dependent) and replayed on new
+// logits, against the oracles: ids exactly the top-k with lower-id ties (the logits repeat values
+// so ties occur), weights and shared gate against the FP64 formula, the dispatch exact as in
+// test_dispatch, and every output bit equal to moe_route followed by moe_dispatch. Up to 32
+// columns take the one-kernel route, 33 the two calls.
+void test_route_dispatch(int experts, int columns, int top_k, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int entries = columns * top_k;
+    const std::size_t logit_count = static_cast<std::size_t>(experts + 1) * columns;
+    const auto random_logits = [&] {
+        std::uniform_int_distribution<int> level(-64, 64);
+        std::vector<float> logits(logit_count);
+        for (auto& v : logits) { v = static_cast<float>(level(rng)) / 16.0F; } // 129 levels: many ties
+        return logits;
+    };
+    const auto alloc = [](std::size_t bytes) {
+        void* p = nullptr;
+        cuda_check(cudaMalloc(&p, bytes), "cudaMalloc");
+        cuda_check(cudaMemset(p, 0x5A, bytes), "cudaMemset");
+        return p;
+    };
+    const std::size_t dispatch_bytes = infernix::ops::moe_dispatch_bytes(experts, entries);
+    auto* d_logits = static_cast<float*>(alloc(sizeof(float) * logit_count));
+    struct Outputs {
+        infernix::ops::MoeRouting routing;
+        infernix::ops::MoeDispatch dispatch;
+        void* dispatch_base;
+        std::int32_t* log;
+    };
+    const auto make = [&] {
+        Outputs o;
+        o.routing = {Tensor(alloc(sizeof(std::int32_t) * entries), DType::I32, {top_k, columns}),
+                     Tensor(alloc(sizeof(float) * entries), DType::FP32, {top_k, columns}),
+                     Tensor(alloc(sizeof(float) * columns), DType::FP32, {columns})};
+        o.dispatch_base = alloc(dispatch_bytes);
+        o.dispatch      = infernix::ops::carve_moe_dispatch(o.dispatch_base, experts, entries);
+        o.log           = static_cast<std::int32_t*>(alloc(sizeof(std::int32_t) * entries));
+        return o;
+    };
+    Outputs fused = make(), split = make();
+    const Tensor logits(d_logits, DType::FP32, {experts + 1, columns});
+    const auto host = [](const void* p, std::size_t bytes) {
+        std::vector<std::uint8_t> out(bytes);
+        cuda_check(cudaMemcpy(out.data(), p, bytes, cudaMemcpyDeviceToHost), "copy");
+        return out;
+    };
+    const auto verify = [&](const std::vector<float>& values, const char* phase) {
+        infernix::ops::moe_route(logits, top_k, split.routing, nullptr);
+        infernix::ops::moe_dispatch(split.routing, experts, split.dispatch, split.log, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "route and dispatch");
+        std::vector<std::int32_t> ids(entries);
+        std::vector<float> weights(entries), gate(columns);
+        cuda_check(cudaMemcpy(ids.data(), fused.routing.ids.data, sizeof(std::int32_t) * entries, cudaMemcpyDeviceToHost),
+                   "copy");
+        cuda_check(cudaMemcpy(weights.data(), fused.routing.weights.data, sizeof(float) * entries,
+                              cudaMemcpyDeviceToHost), "copy");
+        cuda_check(cudaMemcpy(gate.data(), fused.routing.shared_gate.data, sizeof(float) * columns,
+                              cudaMemcpyDeviceToHost), "copy");
+        bool ids_ok = true, values_ok = true;
+        for (int t = 0; t < columns; ++t) {
+            const float* column = &values[static_cast<std::size_t>(t) * (experts + 1)];
+            std::vector<int> order(experts);
+            for (int e = 0; e < experts; ++e) { order[e] = e; }
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return column[a] > column[b]; });
+            double sum = 0.0;
+            for (int k = 0; k < top_k; ++k) { sum += std::exp(static_cast<double>(column[order[k]]) - column[order[0]]); }
+            for (int k = 0; k < top_k; ++k) {
+                const std::size_t i = static_cast<std::size_t>(t) * top_k + k;
+                ids_ok = ids_ok && ids[i] == order[k];
+                const double want = std::exp(static_cast<double>(column[order[k]]) - column[order[0]]) / sum;
+                values_ok = values_ok && std::abs(weights[i] - want) <= 2e-6 * want;
+            }
+            const double want_gate = 1.0 / (1.0 + std::exp(-static_cast<double>(column[experts])));
+            values_ok = values_ok && std::abs(gate[t] - want_gate) <= 2e-6 * want_gate;
+        }
+        // The dispatch: counts, offsets, jobs and job count exact, each expert's entries as a set.
+        const auto words = [&](const std::int32_t* p, int n) {
+            std::vector<std::int32_t> out(n);
+            cuda_check(cudaMemcpy(out.data(), p, sizeof(std::int32_t) * n, cudaMemcpyDeviceToHost), "copy");
+            return out;
+        };
+        const auto counts = words(fused.dispatch.counts, experts), offsets = words(fused.dispatch.offsets, experts + 1);
+        const auto jobs = words(fused.dispatch.jobs, experts), got = words(fused.dispatch.entries, entries);
+        const auto log = words(fused.log, entries);
+        const int job_count = words(fused.dispatch.job_count, 1)[0];
+        bool dispatch_ok = log == ids && offsets[experts] == entries;
+        int used = 0;
+        for (int e = 0, start = 0; e < experts; ++e) {
+            std::vector<std::int32_t> want;
+            for (int i = 0; i < entries; ++i) {
+                if (ids[i] == e) { want.push_back(i); }
+            }
+            const int c = static_cast<int>(want.size());
+            std::vector<std::int32_t> mine(got.begin() + start, got.begin() + start + c);
+            std::sort(mine.begin(), mine.end());
+            dispatch_ok = dispatch_ok && counts[e] == c && offsets[e] == start && mine == want &&
+                          (c == 0 || jobs[used++] == e);
+            start += c;
+        }
+        dispatch_ok = dispatch_ok && job_count == used;
+        // Bit-equal to the two calls (entry order within an expert is unspecified, so as sets above).
+        const bool same =
+            host(fused.routing.ids.data, sizeof(std::int32_t) * entries) ==
+                host(split.routing.ids.data, sizeof(std::int32_t) * entries) &&
+            host(fused.routing.weights.data, sizeof(float) * entries) ==
+                host(split.routing.weights.data, sizeof(float) * entries) &&
+            host(fused.routing.shared_gate.data, sizeof(float) * columns) ==
+                host(split.routing.shared_gate.data, sizeof(float) * columns);
+        std::printf("route_dispatch E=%d T=%d k=%d (%s): ids %s, weights/gate %s, dispatch %s, %s the two calls\n",
+                    experts, columns, top_k, phase, ids_ok ? "exact" : "MISMATCH", values_ok ? "ok" : "MISMATCH",
+                    dispatch_ok ? "exact" : "MISMATCH", same ? "equal to" : "DIFFERENT from");
+        check(ids_ok && values_ok && dispatch_ok && same, "moe_route_dispatch equals its oracles and the two calls");
+    };
+
+    auto values = random_logits();
+    cuda_check(cudaMemcpy(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice), "copy");
+    infernix::ops::moe_route_dispatch(logits, top_k, fused.routing, fused.dispatch, fused.log, nullptr);
+    verify(values, "eager");
+
+    cudaStream_t stream  = nullptr;
+    cudaGraph_t graph    = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    infernix::ops::moe_route_dispatch(logits, top_k, fused.routing, fused.dispatch, fused.log, stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    values = random_logits();
+    cuda_check(cudaMemcpyAsync(d_logits, values.data(), sizeof(float) * logit_count, cudaMemcpyHostToDevice, stream),
+               "copy");
+    cuda_check(cudaGraphLaunch(exec, stream), "launch");
+    cuda_check(cudaStreamSynchronize(stream), "replay");
+    verify(values, "graph replay");
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    for (auto* o : {&fused, &split}) {
+        cudaFree(o->routing.ids.data);
+        cudaFree(o->routing.weights.data);
+        cudaFree(o->routing.shared_gate.data);
+        cudaFree(o->dispatch_base);
+        cudaFree(o->log);
+    }
+    cudaFree(d_logits);
+}
+
 } // namespace
 
 int main() {
@@ -838,6 +985,9 @@ int main() {
         for (const int entries : {1, 10, 1024, 1025, 40960}) { test_dispatch(512, entries, 100U + entries); }
         test_dispatch(1024, 1024, 31); // every expert slot of the one-CTA kernel
         test_dispatch(3, 1000, 37);    // few experts, long runs per expert
+        for (const int columns : {1, 5, 32, 33}) { test_route_dispatch(512, columns, 10, 200U + columns); }
+        test_route_dispatch(512, 64, 16, 233); // 1024 entries past the one-kernel column count
+        test_route_dispatch(9, 3, 3, 239);     // few experts: lanes past E in every selection
         test_layer(12, 1, 10, 7);  // decode: one column, ten experts
         test_layer(24, 8, 10, 11); // the widest forked call: more jobs than one 3-slot pass
         test_layer(9, 5, 3, 13);   // several columns per expert: several passes per job

@@ -378,9 +378,14 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
     }
     Tensor ab = work_.alloc(DType::BF16, {2 * NV, T});
     project(x, p.control, ab, work_, s);
-    Tensor gate = work_.alloc(DType::FP32, {NV, T});
-    Tensor beta = work_.alloc(DType::FP32, {NV, T});
-    ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
+    // Verification and prefill chunks evaluate the gates once for their recurrence; decode evaluates
+    // them inside the recurrent update.
+    Tensor gate, beta;
+    if (batch.verify != nullptr || batch.width > 1) {
+        gate = work_.alloc(DType::FP32, {NV, T});
+        beta = work_.alloc(DType::FP32, {NV, T});
+        ops::gdn_gating(ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, gate, beta, s);
+    }
 
     Tensor q = work_.alloc(DType::BF16, {KW, T});
     Tensor k = work_.alloc(DType::BF16, {KW, T});
@@ -415,10 +420,11 @@ Tensor Forward::gdn(const GdnParameters& p, const Tensor& x, std::uint32_t index
         ops::causal_conv1d_silu_snapshot_split(qkv.view({C, 1, T}), p.convolution, layer.conv, Tensor{},
                                                batch.slots, batch.slots, q, k, v, s);
         Tensor o_batch = o.view({DV, NV, 1, T});
-        ops::gated_delta_net_batch_update(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
-                                          gate.view({NV, 1, T}), beta.view({NV, 1, T}), scale,
-                                          /*normalize_qk=*/true, layer.recurrent, batch.slots, batch.slots,
-                                          o_batch, s);
+        // The gates are evaluated inside the update from the control projection (no gdn_gating kernel).
+        ops::gated_delta_net_batch_update_gating(q.view({DK, NK, 1, T}), k.view({DK, NK, 1, T}), v.view({DV, NV, 1, T}),
+                                                 ab.slice(0, 0, NV), ab.slice(0, NV, NV), p.a_log, p.dt_bias, scale,
+                                                 /*normalize_qk=*/true, layer.recurrent, batch.slots, batch.slots,
+                                                 o_batch, s);
     }
     Tensor normed      = work_.alloc(DType::BF16, {DV, NV * T});
     const Tensor rows  = o.view({DV, NV * T});
@@ -531,22 +537,21 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     ops::projection_fp32(x, rows, logits, s);
     ops::MoeRouting routing{work_.alloc(DType::I32, {K, T}), work_.alloc(DType::FP32, {K, T}),
                             work_.alloc(DType::FP32, {T})};
-    ops::moe_route(logits, K, routing, s);
     std::int32_t* route_log = nullptr;
     if (experts_.route_log != nullptr) {
         if (static_cast<std::size_t>(K) * T > experts_.route_stride) {
             throw std::invalid_argument("Qwen4Exp MoE: route log is too small for this call");
         }
-        route_log = experts_.route_log + layer * experts_.route_stride; // written by moe_dispatch
+        route_log = experts_.route_log + layer * experts_.route_stride; // written by the dispatch
     }
+    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
+    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
+    ops::moe_route_dispatch(logits, K, routing, dispatch, route_log, s);
     if (route_tap != nullptr &&
         cudaMemcpyAsync(route_tap->data, routing.ids.data, routing.ids.bytes(), cudaMemcpyDeviceToDevice, s) !=
             cudaSuccess) {
         throw std::runtime_error("Qwen4Exp forward: route tap copy failed");
     }
-    const DeviceSpan dispatch_bytes = work_.alloc_bytes(ops::moe_dispatch_bytes(E, K * T));
-    ops::MoeDispatch dispatch       = ops::carve_moe_dispatch(dispatch_bytes.data, E, K * T);
-    ops::moe_dispatch(routing, E, dispatch, route_log, s);
     ops::MoeExpertSource source{.frame_base   = experts_.frame_base,
                                 .frames       = experts_.frames.at(layer),
                                 .host_records = reinterpret_cast<const std::uint8_t*>(p.bank->planes.device_records),

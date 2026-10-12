@@ -1,4 +1,5 @@
 #include "infernix/ops/gated_delta_net.h"
+#include "infernix/ops/gdn_gating.h"
 
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
@@ -626,6 +627,67 @@ int batch_update_case(const Case& test_case, const std::vector<int>& source_slot
     return failures;
 }
 
+// gated_delta_net_batch_update_gating against gdn_gating followed by gated_delta_net_batch_update
+// (each qualified against its own oracle): out and the written state slots bit-equal, untouched
+// slots unchanged, with a and b strided row slices of one [2 Hv, B] control projection. Hv = 48,
+// gdn_gating's geometry; the inputs span softplus's linear branch (a + dt_bias > 20).
+int batch_update_gating_case(int batch, std::uint32_t seed) {
+    constexpr int qk_heads = 16, value_heads = 48;
+    const int slots    = 2 * batch + 1; // sources and destinations disjoint, one slot untouched
+    const float scale  = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    std::vector<float> q(static_cast<std::size_t>(kStateDim) * qk_heads * batch);
+    std::vector<float> k(q.size()), v(static_cast<std::size_t>(kStateDim) * value_heads * batch);
+    std::vector<float> control(static_cast<std::size_t>(2 * value_heads) * batch), a_log(value_heads),
+        dt_bias(value_heads);
+    std::vector<float> states(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots);
+    std::mt19937 generator(seed);
+    fill_uniform(q, generator, -1.0f, 1.0f);
+    fill_uniform(k, generator, -1.0f, 1.0f);
+    fill_uniform(v, generator, -1.0f, 1.0f);
+    fill_uniform(control, generator, -6.0f, 24.0f);
+    fill_uniform(a_log, generator, -3.0f, 1.0f);
+    fill_uniform(dt_bias, generator, -1.0f, 1.0f);
+    fill_uniform(states, generator, -0.5f, 0.5f);
+    std::vector<int> source(batch), destination(batch);
+    for (int i = 0; i < batch; ++i) {
+        source[i]      = i;
+        destination[i] = 2 * batch - i;
+    }
+    DeviceBuffer dq = to_device_bf16(q), dk = to_device_bf16(k), dv = to_device_bf16(v);
+    DeviceBuffer dcontrol = to_device_bf16(control), da_log = to_device_f32(a_log), ddt = to_device_f32(dt_bias);
+    DeviceBuffer dsource = to_device_i32(source), ddestination = to_device_i32(destination);
+    DeviceBuffer dg(sizeof(float) * value_heads * batch), dbeta(sizeof(float) * value_heads * batch);
+    DeviceBuffer split_states = to_device_f32(states), fused_states = to_device_f32(states);
+    DeviceBuffer split_out(sizeof(std::uint16_t) * v.size()), fused_out(sizeof(std::uint16_t) * v.size());
+
+    const Tensor tq(dq.p, DType::BF16, {kStateDim, qk_heads, 1, batch});
+    const Tensor tk(dk.p, DType::BF16, {kStateDim, qk_heads, 1, batch});
+    const Tensor tv(dv.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+    const Tensor ab(dcontrol.p, DType::BF16, {2 * value_heads, batch});
+    const Tensor ta = ab.slice(0, 0, value_heads), tb = ab.slice(0, value_heads, value_heads);
+    const Tensor ta_log(da_log.p, DType::FP32, {value_heads}), tdt(ddt.p, DType::FP32, {value_heads});
+    Tensor tg(dg.p, DType::FP32, {value_heads, batch}), tbeta(dbeta.p, DType::FP32, {value_heads, batch});
+    const Tensor tsource(dsource.p, DType::I32, {batch}), tdestination(ddestination.p, DType::I32, {batch});
+    Tensor split_state_tensor(split_states.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
+    Tensor fused_state_tensor(fused_states.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
+    Tensor split_out_tensor(split_out.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+    Tensor fused_out_tensor(fused_out.p, DType::BF16, {kStateDim, value_heads, 1, batch});
+
+    ops::gdn_gating(ta, tb, ta_log, tdt, tg, tbeta, nullptr);
+    ops::gated_delta_net_batch_update(tq, tk, tv, tg.view({value_heads, 1, batch}), tbeta.view({value_heads, 1, batch}),
+                                      scale, true, split_state_tensor, tsource, tdestination, split_out_tensor,
+                                      nullptr);
+    ops::gated_delta_net_batch_update_gating(tq, tk, tv, ta, tb, ta_log, tdt, scale, true, fused_state_tensor,
+                                             tsource, tdestination, fused_out_tensor, nullptr);
+    cuda_synchronize();
+    const bool same_out = from_device<std::uint16_t>(split_out, v.size()) == from_device<std::uint16_t>(fused_out, v.size());
+    const bool same_states =
+        from_device<float>(split_states, states.size()) == from_device<float>(fused_states, states.size());
+    std::cout << "batch update gating B=" << batch << ": out " << (same_out ? "bit-equal" : "DIFFERS")
+              << ", states " << (same_states ? "bit-equal" : "DIFFER") << " to gdn_gating + batch update\n";
+    return same_out && same_states ? 0 : 1;
+}
+
 int contract_rejection_cases() {
     DeviceBuffer q_buffer(kStateDim * 8 * sizeof(std::uint16_t));
     DeviceBuffer k_buffer(kStateDim * 8 * sizeof(std::uint16_t));
@@ -695,6 +757,7 @@ int main() {
         ++failures;
     } catch (const std::invalid_argument&) {}
     failures += contract_rejection_cases();
+    for (const int batch : {1, 3, 8}) { failures += batch_update_gating_case(batch, 31000U + batch); }
 
     failures += run_case({"27b recurrent", 16, 48, 1, true}, 12001U, InputPattern::Ordinary, true);
     failures += run_case({"27b recurrent", 16, 48, 7, false}, 12007U);

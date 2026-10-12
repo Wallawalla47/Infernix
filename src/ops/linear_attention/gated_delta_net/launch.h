@@ -31,12 +31,22 @@ void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, c
                             const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                             cudaStream_t stream);
 
+// The gating inputs of gated_delta_net_batch_update_gating (validated by the caller); a and b
+// columns may be strided.
+struct BatchUpdateGating {
+    const Tensor& a;
+    const Tensor& b;
+    const Tensor& a_log;
+    const Tensor& dt_bias;
+};
+
+// With `gating`, g and beta are evaluated from it (and the g/beta tensors are not read).
 void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream);
+                                   cudaStream_t stream, const BatchUpdateGating* gating = nullptr);
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                              const Tensor& beta, float scale, const Tensor& ssm_states,

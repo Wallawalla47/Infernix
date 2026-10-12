@@ -41,14 +41,14 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
                                          const Tensor& g, const Tensor& beta, float scale,
                                          Tensor& ssm_states, const Tensor& source_state_slots,
                                          const Tensor& destination_state_slots, Tensor& out,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, const BatchUpdateGating* gating) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
     const dim3 block(kWarpSize, kNumWarps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const BatchUpdateAccess access{
+    BatchUpdateAccess access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -63,6 +63,18 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         state_slot_stride,
         scale,
     };
+    if (gating != nullptr) {
+        // A single column has no stride of its own; its heads are contiguous either way.
+        const auto column_stride = [&](const Tensor& t) {
+            return t.ne[1] == 1 ? std::int64_t{heads.H_v} : t.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+        };
+        access.gate_a    = static_cast<const __nv_bfloat16*>(gating->a.data);
+        access.gate_b    = static_cast<const __nv_bfloat16*>(gating->b.data);
+        access.gate_a_ld = column_stride(gating->a);
+        access.gate_b_ld = column_stride(gating->b);
+        access.a_log     = static_cast<const float*>(gating->a_log.data);
+        access.dt_bias   = static_cast<const float*>(gating->dt_bias.data);
+    }
     CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_batch_update_kernel<NormalizeInputs>, access));
 }
 
@@ -160,15 +172,15 @@ void launch_recurrent_batch_update(const Tensor& q, const Tensor& k, const Tenso
                                    bool normalize_qk, Tensor& ssm_states,
                                    const Tensor& source_state_slots,
                                    const Tensor& destination_state_slots, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const BatchUpdateGating* gating) {
     if (normalize_qk) {
         launch_recurrent_batch_update_fixed<true>(q, k, v, g, beta, scale, ssm_states,
                                                   source_state_slots, destination_state_slots, out,
-                                                  stream);
+                                                  stream, gating);
     } else {
         launch_recurrent_batch_update_fixed<false>(q, k, v, g, beta, scale, ssm_states,
                                                    source_state_slots, destination_state_slots, out,
-                                                   stream);
+                                                   stream, gating);
     }
 }
 

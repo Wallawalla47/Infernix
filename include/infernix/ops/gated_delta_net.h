@@ -81,6 +81,17 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
                                   cudaStream_t stream);
 
 /**
+ * gated_delta_net_batch_update with the gates evaluated in the update from gdn_gating's inputs:
+ * g = -exp(A_log) * softplus(a + dt_bias) and beta = sigmoid(b), with the same bits as gdn_gating
+ * produces. a and b are BF16 [Hv, B] whose columns are contiguous at any element stride of at least
+ * Hv (row slices of one control projection qualify); A_log and dt_bias are contiguous FP32 [Hv].
+ */
+void gated_delta_net_batch_update_gating(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& a,
+                                         const Tensor& b, const Tensor& A_log, const Tensor& dt_bias, float scale,
+                                         bool normalize_qk, Tensor& ssm_states, const Tensor& source_state_slots,
+                                         const Tensor& destination_state_slots, Tensor& out, cudaStream_t stream);
+
+/**
  * Op: gated_delta_net_replay_record
  *
  * Evaluates B independent normalized Gated DeltaNet recurrences from absolute state-pool slots
