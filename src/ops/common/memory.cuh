@@ -3,6 +3,8 @@
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 namespace infernix::ops {
 
 enum class Cache { ca, cg };
@@ -44,6 +46,18 @@ __device__ __forceinline__ V ld_nc_na(const T* ptr) {
             : "l"(ptr));
         return *reinterpret_cast<const V*>(&value);
     }
+}
+
+// ld_nc_na for bytes read once per call that should leave L2 first: an L2 evict-first policy, so a
+// large stream (a full-vocabulary head) does not push out data other kernels reuse.
+__device__ __forceinline__ uint2 ld_nc_na_evict_first(const void* ptr) {
+    std::uint64_t policy;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    uint2 value;
+    asm("ld.global.nc.L1::no_allocate.L2::cache_hint.v2.u32 {%0, %1}, [%2], %3;"
+        : "=r"(value.x), "=r"(value.y)
+        : "l"(ptr), "l"(policy));
+    return value;
 }
 
 template <class T, class V>

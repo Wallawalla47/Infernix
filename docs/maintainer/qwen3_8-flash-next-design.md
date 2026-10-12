@@ -9202,6 +9202,15 @@ loads, and K1b triggers its dependents after its own: chained mixer bench 10.06 
 MTP 176.10 → 176.25 (noise), since the CPU-wait warming (§19.3.20b) already holds most of those
 weights in L2.
 
+The GDN decode chain's remaining plain launches (`gdn_gating`, the conv snapshot and from-states
+kernels, the recurrent batch update, which loads its state tile before the wait as the record kernel
+does) became programmatic dependents: plain 126.98 → 127.33 tok/s (+0.3 %), MTP 176.0 → 176.65
+(+0.4 %); on the 27B, which shares the update and conv kernels, plain 84.35 → 84.28 (−0.08 %) and
+DFlash2 125.52 → 125.56. Then the head's Q8 weight loads (`projection_q8_kernel`, 636 MB read once per
+forward) take an L2 evict-first cache policy, so the stream does not flush what other kernels reuse
+(the MTP drafter's weights): MTP 176.77 → 177.32 (+0.3 %, both runs ahead), plain 127.65 → 127.71
+(noise).
+
 Also measured and rejected the same day, for the 27B's two GEMVs below 90 % of DRAM bandwidth (cold-L2
 op bench, three rounds): CTA shapes with the same per-row arithmetic for the NVFP4 A16 down projection
 [5120, 17408] (8 warps × 1/2/4 rows, 4 warps × 1/2/4 rows, 16 warps × 1 row, 1-4 blocks per SM): the

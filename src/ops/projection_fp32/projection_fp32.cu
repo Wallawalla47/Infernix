@@ -1,6 +1,7 @@
 #include "infernix/ops/projection_fp32.h"
 #include "ops/projection_fp32/projection_fp32_route.h"
 #include "ops/projection_fp32/projection_fp32_mma.h"
+#include "ops/common/memory.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -279,7 +280,8 @@ __global__ void projection_q8_kernel(const bf16* __restrict__ x, int k, int padd
         const __half* srow = scales + static_cast<std::size_t>(row) * (padded_k / 32);
         float sums[kColumns] = {};
         for (int chunk = lane; chunk < chunks; chunk += 32) {
-            const uint2 packed = w[chunk];
+            // Read once per call (a full-vocabulary head is 636 MB): it leaves L2 first.
+            const uint2 packed = ld_nc_na_evict_first(w + chunk);
             const float scale  = __half2float(srow[chunk / 4]);
             const auto* wv     = reinterpret_cast<const std::int8_t*>(&packed);
             float wf[8];
