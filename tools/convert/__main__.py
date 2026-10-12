@@ -147,6 +147,13 @@ def main(argv=None):
     parser.add_argument("--name", help="public instance name saved in metadata")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="parallel CPU weight conversion workers (--device cpu only); each of up to "
+        "2 x WORKERS objects in flight is held whole in RAM",
+    )
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
     parser.add_argument(
@@ -232,6 +239,7 @@ def main(argv=None):
             provenance=provenance,
             device=args.device,
             rows_per_chunk=args.rows_per_chunk,
+            workers=args.workers,
             max_file_bytes=args.max_file_bytes,
             progress=progress,
         )

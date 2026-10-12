@@ -56,6 +56,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Callable
 
 import numpy as np
@@ -107,6 +108,9 @@ class GGUFSource:
         self._tensors = {tensor.name: tensor for tensor in self._reader.tensors}
         self.config: dict = {}
         self.bytes_read = 0
+        # Parallel conversion workers share this source; the memmap reads are
+        # independent, only the byte counter is shared.
+        self._count_lock = threading.Lock()
 
     def has(self, name: str) -> bool:
         return name in self._tensors
@@ -144,7 +148,8 @@ class GGUFSource:
         flat = np.ascontiguousarray(decoded.reshape(-1), dtype=np.float32)
         offset = begin - row_begin * row_width
         result = flat[offset : offset + (end - begin)].copy()
-        self.bytes_read += result.nbytes
+        with self._count_lock:
+            self.bytes_read += result.nbytes
         return torch.from_numpy(result)
 
     def list_tensors(self):
@@ -230,13 +235,12 @@ class HFAliasSource:
         # row group decoded regardless of the requested [begin, end) range,
         # since the reorder isn't expressible on a row subset alone. Cache
         # the last one so a tensor's own sequential produce() chunk reads
-        # don't repeat that decode+transform per chunk; a single slot is
-        # enough because the writer processes one parameter at a time and
-        # this is never the same tensor recipe.prepare()'s preflight already
-        # decoded (that pass and the write pass are far enough apart in
+        # don't repeat that decode+transform per chunk; one slot per thread is
+        # enough because each conversion worker processes one parameter at a
+        # time and this is never the same tensor recipe.prepare()'s preflight
+        # already decoded (that pass and the write pass are far enough apart in
         # tensor order that nothing would still be cached anyway).
-        self._transform_cache_name: str | None = None
-        self._transform_cache_values: torch.Tensor | None = None
+        self._transform_cache = threading.local()
 
     def _resolve(self, hf_name: str) -> str:
         try:
@@ -281,11 +285,12 @@ class HFAliasSource:
         if transform is None:
             return self._source.read_flat(gguf_name, begin, end)
         shape = self._source.describe(gguf_name).shape
-        if self._transform_cache_name == name and self._transform_cache_values is not None:
-            values = self._transform_cache_values
+        cache = self._transform_cache
+        if getattr(cache, "name", None) == name:
+            values = cache.values
         else:
             values, _ = transform(self._source.read_flat(gguf_name), shape)
-            self._transform_cache_name, self._transform_cache_values = name, values
+            cache.name, cache.values = name, values
         elements = values.numel()
         end = elements if end is None else end
         if not 0 <= begin <= end <= elements:
@@ -293,7 +298,7 @@ class HFAliasSource:
         return values[begin:end].clone()
 
     def close(self) -> None:
-        self._transform_cache_name, self._transform_cache_values = None, None
+        self._transform_cache = threading.local()
 
     def __enter__(self) -> "HFAliasSource":
         return self

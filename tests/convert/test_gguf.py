@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
+
 import numpy as np
 import pytest
 import torch
@@ -105,6 +108,52 @@ def test_hf_alias_source_transform_and_shape_override(tmp_path):
         partial = alias.read_flat("model.layers.0.input_layernorm.weight", 1, 3)
         assert torch.equal(partial, torch.full((2,), 1.5))
         assert alias.describe("model.layers.0.input_layernorm.weight").shape == (2, 2)
+
+
+def test_hf_alias_source_transform_cache_is_per_thread(tmp_path):
+    # Parallel conversion workers each produce one transformed tensor while
+    # another worker produces a different one, chunk by chunk. Neither may read
+    # the other's cached values or evict them (which would re-decode the whole
+    # tensor for every chunk).
+    path = tmp_path / "model.gguf"
+    _write_gguf(
+        path,
+        {
+            "blk.0.attn_norm.weight": np.full(64, 0.5, dtype=np.float32),
+            "blk.1.attn_norm.weight": np.full(64, -0.5, dtype=np.float32),
+        },
+    )
+    names = {
+        "model.layers.0.input_layernorm.weight": "blk.0.attn_norm.weight",
+        "model.layers.1.input_layernorm.weight": "blk.1.attn_norm.weight",
+    }
+    expected = {
+        "model.layers.0.input_layernorm.weight": 1.5,
+        "model.layers.1.input_layernorm.weight": 0.5,
+    }
+    decodes = []
+
+    def shift_up(values, shape):
+        decodes.append(shape)
+        return values + 1.0, shape
+
+    with GGUFSource(path) as source:
+        alias = HFAliasSource(source, names, transforms={name: shift_up for name in names})
+        barrier = threading.Barrier(2)
+
+        def read_chunks(name):
+            chunks = []
+            for begin in range(0, 64, 8):
+                barrier.wait()  # both workers read a chunk of their own tensor in lockstep
+                chunks.append(alias.read_flat(name, begin, begin + 8))
+            return chunks
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = {name: executor.submit(read_chunks, name) for name in names}
+            for name, future in results.items():
+                for chunk in future.result():
+                    assert torch.equal(chunk, torch.full((8,), expected[name]))
+    assert len(decodes) == 2
 
 
 def test_hf_alias_source_composite_stitches_two_tensors(tmp_path):
