@@ -22,10 +22,9 @@ void launch_q8_a16_stream(const Q8LinearOperands& operands, Output output, Epilo
         const auto launch = [&]<bool FullRows>() {
             constexpr auto kernel = q8_a16_stream_kernel<Schedule, FullRows, Output, Epilogue>;
             const int shared      = q8_prepare_shared<Schedule::kSharedBytes, kernel>();
-            kernel<<<grid, Schedule::kThreads, static_cast<std::size_t>(shared), stream>>>(
-                x, operands.codes, operands.scales, output, epilogue, operands.rows, operands.padded_k, count,
-                offset);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads), static_cast<std::size_t>(shared), stream},
+                                            kernel, x, operands.codes, operands.scales, output, epilogue,
+                                            operands.rows, operands.padded_k, count, offset));
         };
         if (operands.rows % Schedule::kBlockRows == 0)
             launch.template operator()<true>();

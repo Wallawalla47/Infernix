@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -75,6 +76,9 @@ __global__ __launch_bounds__(S::kThreads, S::kMinBlocksPerSm) void q8_a16_stream
             }
         }
     }
+    // Launched as a programmatic dependent: the weights above load while the producer finishes; x and
+    // the output wait for it.
+    pdl::wait_for_dependencies();
 
 #pragma unroll 1
     for (int pass = 0; pass < S::kPasses; ++pass) {

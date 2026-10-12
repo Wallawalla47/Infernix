@@ -9196,6 +9196,12 @@ T = 1 10.58 → 10.07 µs per mixer, T = 2 12.36 → 11.87, T = 5 17.90 → 17.2
 KV, tg512, frozen binaries, ABBA): plain 123.6/124.2 → 126.6/126.5 tok/s (+2.2 %), MTP K = 4
 174.0/174.0 → 176.2/176.2 (+1.3 %), MTP acceptance 0.8049 and 573/72 rounds in every run.
 
+Then K1 (the register-streamed Q8 linear) became a programmatic dependent that waits after its weight
+loads, and K1b triggers its dependents after its own: chained mixer bench 10.06 → 8.51 µs at T = 1,
+17.26 → 15.77 at T = 5 (hashes identical), but end to end only plain 126.84 → 127.22 tok/s (+0.3 %) and
+MTP 176.10 → 176.25 (noise), since the CPU-wait warming (§19.3.20b) already holds most of those
+weights in L2.
+
 Also measured and rejected the same day, for the 27B's two GEMVs below 90 % of DRAM bandwidth (cold-L2
 op bench, three rounds): CTA shapes with the same per-row arithmetic for the NVFP4 A16 down projection
 [5120, 17408] (8 warps × 1/2/4 rows, 4 warps × 1/2/4 rows, 16 warps × 1 row, 1-4 blocks per SM): the

@@ -280,7 +280,10 @@ __global__ __launch_bounds__(kUpThreads, 1) void hc_up_collapse_kernel(
     for (int s = 0; s < kStreams; ++s) {
         w_bias[s] = 1.0F + __bfloat162float(norm_weight[static_cast<std::int64_t>(s) * kHidden + dl]);
     }
-    pdl::enter(); // launched as a programmatic dependent: the weights load while the down partials finish
+    // Launched as a programmatic dependent: the weights load while the down partials finish. The next
+    // projection may launch beside this grid at once and fetch its weights meanwhile.
+    pdl::trigger_dependents();
+    pdl::wait_for_dependencies();
     float r_held[2];
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
