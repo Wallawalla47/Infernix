@@ -9142,6 +9142,24 @@ kernels.
 **NVFP4 linear_add [5120, 17408] at T = 9-32 (NInfer issue #364).** The 4-stage M32N32 tile against
 today's 3-stage M32N64: 37.5-38.2 µs both, three interleaved runs; not adopted.
 
+### 19.3.20b The CPU wait warms the next layer's whole dense chain at T = 1 (2026-10-12)
+
+A plain decode layer (nsys, dense8, INT8 KV) runs its GPU experts and shared expert in ~37 µs after
+`cpu_plan`, then `cpu_wait_kernel` idles ~27 µs for the CPU-served misses with DRAM nearly unused;
+the next layer's dense chain (attention mixer 7 MB, GDN q/k/v/z 44.5 MB or QSA 71 MB, output
+projection 16.7 MB, MLP mixer 7 MB, router, shared expert) streams ~80 MB after it. Phase 2's warm
+set (both attention-mixer projections and 16 MiB of the input projection, ~23 MB) used about half of
+that window. `MoeL2Warm` now holds 12 spans and Forward lists the chain in reading order; a one-column
+call warms it up to a 40 MiB budget, a wider call keeps the Phase 2 set.
+
+Budget sweep (one build, a temporary environment toggle, tg512 plain, two mirrored rounds; hit rate
+93.4 % in every arm, ids unchanged): Phase 2 set 121.6/122.0 tok/s, 32 MiB 122.7/122.5, 40 MiB
+123.1/123.6, 48 MiB 123.4/123.1/123.0/123.5, 56 MiB 123.0/123.0, 64 MiB 122.6/122.2, 80 MiB 121.1/121.1.
+MTP K = 4 (verification width 5, shorter waits): Phase 2 173.4/172.1, 32 MiB 173.5/171.5, 48 MiB
+172.8/171.4, 64 MiB 170.9/170.0, so wider calls keep the Phase 2 set. As landed against HEAD (frozen
+binaries, ABBA ×2): plain 120.0-121.5 → 122.2-123.0 tok/s (+1.6 %, every run above every HEAD run),
+MTP 172.6-172.8 both. The 27B has no such window: its decode graph is 97 % busy with 0.18 µs gaps.
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,

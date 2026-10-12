@@ -118,7 +118,7 @@ struct MoeCpuChannel {
 /// Phase 2): typically the next layer's first weights. Spans start 16-byte aligned; a span's bytes
 /// are rounded down to 16. Warming changes no result.
 struct MoeL2Warm {
-    static constexpr int kSpans = 4;
+    static constexpr int kSpans = 12;
     const void* ptr[kSpans]   = {};
     std::size_t bytes[kSpans] = {};
 };

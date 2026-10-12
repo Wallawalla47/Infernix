@@ -25,6 +25,7 @@
 #include "infernix/ops/silu_mul.h"
 
 #include <algorithm>
+#include <array>
 #include <vector>
 #include <cmath>
 #include <stdexcept>
@@ -577,25 +578,52 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
             source.landing_slots = experts_.landing_slots;
         }
     }
-    // While the host computes this call's misses, the CPU wait warms the next layer's first weights
-    // into L2: its attention-mixer down and up projections and the start of its input projection.
+    // While the host computes this call's misses, the CPU wait warms the next layer's weights into L2
+    // in the order its dense chain reads them. A one-column call (plain decode) warms the chain up to
+    // 40 MiB: tg512 plain 121.8 -> 123.3 tok/s against the attention mixer and 16 MiB of input (32 MiB
+    // +0.7 %, 48-56 MiB alike, 64-80 MiB less). A wider call keeps that smaller set: under MTP the
+    // wait is shorter and 48-64 MiB measured 0.4-1.4 % slower (design §19.3.20b).
     if (source.cpu.max_jobs > 0 && layer + 1 < config_.num_hidden_layers) {
         const auto& next = parameters_.layers[layer + 1];
-        const Weight& input = config_.layer_types[layer + 1] == MixerKind::Gdn
-                                  ? std::get<GdnParameters>(next.mixer).projection.weight
-                                  : std::get<AttentionParameters>(next.mixer).projection.weight;
-        constexpr std::size_t kInputWarm = 16ULL << 20;
-        const std::pair<const Weight*, std::size_t> spans[] = {
-            {&next.attn_hc.down.weight, next.attn_hc.down.weight.payload_bytes},
-            {&next.attn_hc.up.weight, next.attn_hc.up.weight.payload_bytes},
-            {&input, std::min<std::size_t>(input.payload_bytes, kInputWarm)}};
+        const bool whole_chain = T == 1;
+        constexpr std::size_t kChainWarm = 40ULL << 20, kInputWarm = 16ULL << 20;
+        std::array<std::pair<const void*, std::size_t>, 11> chain{};
+        std::size_t spans = 0;
+        const auto add = [&](const void* p, std::size_t bytes) { chain[spans++] = {p, bytes}; };
+        add(next.attn_hc.down.weight.payload, next.attn_hc.down.weight.payload_bytes);
+        add(next.attn_hc.up.weight.payload, next.attn_hc.up.weight.payload_bytes);
+        const LinearParameters* input  = nullptr;
+        const LinearParameters* output = nullptr;
+        const LinearParameters* extra  = nullptr; // GDN control or the separate QSA index projection
+        if (config_.layer_types[layer + 1] == MixerKind::Gdn) {
+            const auto& g = std::get<GdnParameters>(next.mixer);
+            input = &g.projection, extra = &g.control, output = &g.output;
+        } else {
+            const auto& a = std::get<AttentionParameters>(next.mixer);
+            input = &a.projection, output = &a.output;
+            if (a.index_projection) { extra = &*a.index_projection; }
+        }
+        add(input->weight.payload,
+            whole_chain ? input->weight.payload_bytes : std::min<std::size_t>(input->weight.payload_bytes, kInputWarm));
+        if (whole_chain) {
+            if (extra != nullptr) { add(extra->weight.payload, extra->weight.payload_bytes); }
+            add(output->weight.payload, output->weight.payload_bytes);
+            add(next.mlp_hc.down.weight.payload, next.mlp_hc.down.weight.payload_bytes);
+            add(next.mlp_hc.up.weight.payload, next.mlp_hc.up.weight.payload_bytes);
+            add(next.moe.router.data, next.moe.router.bytes());
+            add(next.moe.shared_gate_up.weight.payload, next.moe.shared_gate_up.weight.payload_bytes);
+            add(next.moe.shared_down.weight.payload, next.moe.shared_down.weight.payload_bytes);
+        }
+        std::size_t left = whole_chain ? kChainWarm : ~std::size_t{0};
         int i = 0;
-        for (const auto& [w, bytes] : spans) {
-            if (w->payload != nullptr && reinterpret_cast<std::uintptr_t>(w->payload) % 16 == 0) {
-                source.l2_warm.ptr[i]   = w->payload;
-                source.l2_warm.bytes[i] = bytes;
-                ++i;
-            }
+        for (std::size_t n = 0; n < spans && i < ops::MoeL2Warm::kSpans && left >= 16; ++n) {
+            const auto [p, bytes] = chain[n];
+            if (p == nullptr || reinterpret_cast<std::uintptr_t>(p) % 16 != 0 || bytes < 16) { continue; }
+            const std::size_t take  = std::min(bytes, left);
+            source.l2_warm.ptr[i]   = p;
+            source.l2_warm.bytes[i] = take;
+            left -= take;
+            ++i;
         }
     }
     // A streamed prefill chunk: the layer's copied-ahead experts are read from the ring.
