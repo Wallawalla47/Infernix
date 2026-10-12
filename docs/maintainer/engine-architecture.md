@@ -352,10 +352,13 @@ raises after a stable boundary when a unit's inputs were unavailable rather than
 (Qwen3.8-Flash-Next: an expert record that could not be read, or a host expert service that missed
 its heartbeat). The Engine raises it itself for the capacity contract error
 ([resource scheduling](resource-scheduling-and-context-cache.md) §3), which fires before the unit
-runs. The Engine fails the requests holding lanes with it, the Program releases those
-lanes without publishing anything and empties a prefix cache the failed round may have published
-into, and queued requests keep waiting; if the Engine is binding, materializing or holding a
-paused request at that moment it fails everything instead. A service or read thread that has itself
+runs. The Engine fails the requests holding lanes and the paused requests with it (a paused
+request's suspended state is released first, as for a cancellation), the Program releases the
+lanes, and queued requests keep waiting. Qwen3.8-Flash-Next releases them without publishing
+anything and empties a prefix cache the failed round may have published into; Qwen3.5, whose only
+recoverable error is the Engine's own between units, releases them as `abort` does and keeps its
+cache, and refuses while a pending batch exists. If the Engine is binding or materializing at that
+moment, or the Program refuses, it fails everything instead. A service or read thread that has itself
 stopped makes every later unit fail, so the Program reports that as an ordinary (fatal) error with
 its cause. CUDA errors are never recoverable: the context state is unknown.
 

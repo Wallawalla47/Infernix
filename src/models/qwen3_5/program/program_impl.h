@@ -342,6 +342,7 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&&) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle) noexcept;
+    [[nodiscard]] bool recover_after_failure() noexcept;
     void fail_all_cleanup() noexcept;
     void shutdown_cleanup() noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;

@@ -17,6 +17,16 @@
 #include <variant>
 
 namespace infernix::models::qwen3_5::detail {
+namespace {
+
+// A released lane's committed state is publishable as an endpoint when no model unit is in flight.
+bool endpoint_consistent(const RequestControl& request, const SequenceState& sequence) noexcept {
+    return request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
+           (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
+            sequence.text_kv_valid == request.prefill->cursor);
+}
+
+} // namespace
 
 PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
                                        const runtime::BatchedGeneratedRound& round) {
@@ -526,18 +536,27 @@ AbortResult ProgramImpl::abort(SequenceHandle handle) noexcept {
         abort_context();
     }
     if (requests[lane].lifecycle != Lifecycle::Empty) {
-        // The committed state is publishable as an endpoint when no model unit is in flight.
-        const auto& request  = requests[lane];
-        const auto& sequence = sequences[lane];
-        const bool consistent =
-            (request.lifecycle == Lifecycle::Active || request.lifecycle == Lifecycle::Finishable ||
-             (request.lifecycle == Lifecycle::Prefilling && request.prefill &&
-              sequence.text_kv_valid == request.prefill->cursor));
-        hybrid_finish_lane(sequences[lane], consistent);
+        hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
     }
     clear_lane(sequences[lane], requests[lane]);
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
+}
+
+bool ProgramImpl::recover_after_failure() noexcept {
+    // The Engine raises the error between units, so only a pending batch would leave a lane's
+    // state undefined.
+    if (pending_transaction_) { return false; }
+    try {
+        device.synchronize();
+    } catch (...) { return false; }
+    abort_context();
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (requests[lane].lifecycle == Lifecycle::Empty) { continue; }
+        hybrid_finish_lane(sequences[lane], endpoint_consistent(requests[lane], sequences[lane]));
+        clear_lane(sequences[lane], requests[lane]);
+    }
+    return true;
 }
 
 void ProgramImpl::fail_all_cleanup() noexcept {

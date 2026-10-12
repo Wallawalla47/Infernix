@@ -107,9 +107,9 @@ One request can temporarily hold most of the KV. If, after evicting cached block
 requests, the only request still cannot acquire a legal unit, the Engine reports a capacity contract
 error instead of waiting for a releaser that does not exist. The error names the request, the unit
 kind and the KV pages still short. No part of the unit has run, so it is a
-`RecoverableExecutionError` (engine architecture, failure handling): the residents fail with it and
-the Engine keeps serving, unless a binding, materialization or paused request is in flight or the
-Program cannot recover (Qwen3.5 has no recovery), when everything fails.
+`RecoverableExecutionError` (engine architecture, failure handling): the residents and paused
+requests fail with it and the Engine keeps serving, unless a binding or materialization is in flight
+or the Program cannot recover, when everything fails.
 
 <a id="sources"></a>
 ## 4. Admission sources and binding

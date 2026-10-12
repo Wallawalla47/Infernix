@@ -168,6 +168,8 @@ FinishResult Program::finish(SequenceHandle s) noexcept { return impl_->finish(s
 
 AbortResult Program::abort(SequenceHandle s) noexcept { return impl_->abort(s); }
 
+bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
+
 void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
 
 void Program::shutdown_cleanup() noexcept { impl_->shutdown_cleanup(); }

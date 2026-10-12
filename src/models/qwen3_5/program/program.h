@@ -389,6 +389,11 @@ public:
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    // After a runtime::RecoverableExecutionError, which the Engine raises between units (a resident
+    // that cannot obtain its legal unit, resource-scheduling §3): every lane is released as abort()
+    // releases it and the prefix cache is kept. False when a pending batch or the device makes that
+    // unsafe; the Engine then fails everything.
+    [[nodiscard]] bool recover_after_failure() noexcept;
     void fail_all_cleanup() noexcept;
     // fail_all_cleanup for the Engine's orderly stop. With a hybrid cache file attached, the Host
     // tier is saved once every lane has written its blocks through and before the cleanup drops

@@ -1852,8 +1852,9 @@ private:
                     // failed rows wait or yield their own lane; they cannot block ready rows.
                     // The same shortage has already exhausted the cache.
                     if (pause_reclaim_victim(request->id)) { break; }
-                    // The capacity contract error (resource-scheduling ?3): nothing of the unit
-                    // ran, so only the residents fail and the Engine keeps serving.
+                    // The capacity contract error (resource-scheduling §3): nothing of the unit
+                    // ran, so only the residents and paused requests fail and the Engine keeps
+                    // serving (recover_locked).
                     const char* kind = unit.kind == UnitKind::Control  ? "control"
                                        : unit.kind == UnitKind::Decode ? "decode"
                                        : unit.kind == UnitKind::Replay ? "replay"
@@ -1999,20 +2000,29 @@ private:
         publish_runtime_stats();
     }
 
-    // A unit failed with a RecoverableExecutionError (an expert record that could not be read): the
-    // requests holding lanes fail with it, the Program discards their state, and queued requests
-    // keep waiting. False when this state is not one it handles (a binding, materialization
-    // or paused request in flight) or the Program's cleanup failed; the caller then fails
-    // everything, as for any other worker error.
+    // A RecoverableExecutionError (an expert record that could not be read, or a resident that
+    // cannot obtain its legal unit): the requests holding lanes and the paused requests fail with
+    // it, the Program discards their state, and queued requests keep waiting. False when this state
+    // is not one it handles (a binding or materialization in flight) or the Program's cleanup
+    // failed; the caller then fails everything, as for any other worker error.
     bool recover_locked(const std::exception_ptr& error) noexcept {
         if constexpr (!requires { instance_.program->recover_after_failure(); }) {
             return false;
         } else {
             try {
-                if (materializing_ || context_owner_ || !paused_.empty()) { return false; }
+                if (materializing_ || context_owner_) { return false; }
+                // A paused request releases its suspended state as a cancelled one does, while the
+                // Program still owns it.
+                std::uint32_t failed = 0;
+                for (auto& request : paused_) {
+                    request->suspended.reset();
+                    complete_error(request, error);
+                    scheduler_.capacity_released();
+                    ++failed;
+                }
+                paused_.clear();
                 if (!instance_.program->recover_after_failure()) { return false; }
                 admission_decision_.reset();
-                std::uint32_t failed = 0;
                 for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                     if (slots_[lane] == nullptr) { continue; }
                     complete_error(slots_[lane], error);
