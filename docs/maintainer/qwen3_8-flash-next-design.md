@@ -9218,6 +9218,45 @@ shipped 8 × 2 measured 33.4-34.1 µs, 4 × 2 and 8 × 2 at three blocks the sam
 50.6 µs; and for FP8 [5120, 6144] at T = 1 (rows per warp, warps, phase unroll 2/4, blocks per SM) all
 21.1-21.6 µs.
 
+### 19.3.20e Route and dispatch in one kernel; gates inside the recurrent update (2026-10-12)
+
+Three more launch boundaries of the decode chain, all bit-exact:
+- `moe_route_dispatch`: calls of at most 32 columns and 1024 entries route (one warp per column) and
+  dispatch in one 1024-thread CTA, the dispatch reading the ids from shared memory. The route keeps
+  the k-th selection in lane k instead of two register arrays, with the same selection, softmax order
+  and expressions; `test_offloaded_moe_layer` checks it against the top-k oracle with ties, the FP64
+  weights and gate, the exact dispatch and the two-kernel route, eager and graph-replayed.
+- The router's FP32 projection (`projection_kernel`) is a programmatic dependent: it loads its weight
+  rows, then waits for the mixer, so the router's DRAM trip overlaps the mixer's tail.
+- At decode `gated_delta_net_batch_update_gating` evaluates g and beta from the control projection
+  inside the recurrent update (the same `gdn_gate_values` as `gdn_gating`), so no gating kernel runs
+  between the convolution and the update; verification and prefill chunks still run `gdn_gating`.
+
+Dense8, INT8 KV, tg512, one binary with temporary switches, ABBA ×2: all three against none, plain
+127.88 → 128.90 tok/s (+0.8 %), MTP K = 4 177.63 → 177.64 (no change), acceptance 0.8049 and 573/72
+rounds in every run. Each alone (plain, reverted → adopted): projection 128.29 → 128.85 (+0.4 %, one
+adopted-arm run at 123.9 excluded), gates 128.40 → 128.77 (+0.3 %), route and dispatch 128.74 → 128.82
+(+0.07 %, within noise). Letting the projection's dependents launch once its weights are requested
+measured 128.82 → 128.98 (within noise) and was not adopted (its grid is wider than half the SMs).
+
+On the 27B, the NVFP4 and FP8 A16 GEMVs (T = 1) became programmatic dependents the same way: the
+NVFP4 kernel stages its scales before the wait, both trigger after their main loop. Plain tg256
+85.27 → 85.42 tok/s (+0.16 %, every adopted run ahead), DFlash2 K = 7 125.62 → 125.62, acceptance
+unchanged. Its NVFP4 A4 linear_add (o_proj and MLP down) takes the TMA route from 513 tokens instead
+of 1024: op bench 144.7 against 187.7 µs at 513 tokens (K = 17408), 17-26 % less from 640 to 1000
+tokens, with the 512-token pipelined tile still faster below; top-32 logprobs over 640-token chunks
+are byte-identical, pp768 12,596 → 13,541 tok/s (+7.5 %) and pp2560 12,429 → 12,754 (+2.6 %, one round).
+
+Measured and rejected for the two 27B GEMVs below 90 % of DRAM bandwidth (cold-L2 op bench, three
+rounds, each variant within the FP64 oracle's criteria): for the NVFP4 down projection [5120, 17408]
+(shipped 33.4-34.0 µs), code loads with an `.L2::256B` prefetch size 34.1, `.cg` loads 33.5-34.1, 32
+values per lane 37.5-38.0, 16 values with 8 accumulator chains 33.4-34.0 (a rounding-order change for
+no gain), and split-K over a two-CTA cluster (each CTA one K half, rank 0 adding the two partials in
+rank order through distributed shared memory) 36.2-37.6 µs with 640 or 320 CTAs and 42.3-43.6 with
+1280; at K = 6144 the same split 19.1-21.3 against 17.2-17.8. Doubling the threads in flight does not
+help: the kernel is not limited by occupancy. For FP8 [5120, 6144], 16 or 32 values per lane, 8
+chains, one row per warp, `.cg` and `.L2::256B` loads all measured 21.09 µs (nsys 19.4-19.7 µs).
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,

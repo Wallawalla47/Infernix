@@ -27,8 +27,12 @@ using M128N128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
 // This projection selects its own route, so the layout the quantizer writes below must be derived
-// from the same predicate; the two are read together at the call site for that reason.
-constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 1024; }
+// from the same predicate; the two are read together at the call site for that reason. Past 512
+// tokens the TMA route is faster than the resident 128x128 tile (RTX 5090, cold weights): 513 tokens
+// take 144.7 instead of 187.7 us at K=17408 and 62.0 instead of 70.9 us at K=6144, 640-1000 tokens
+// 17-26 % less; at 512 and below the MMA tiles stay faster (114.0 against 133.7 us at K=17408).
+// Both routes give the same bits (27B top-32 logprobs over 640-token chunks are byte-identical).
+constexpr bool uses_tma(std::int32_t tokens) { return tokens > 512; }
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
@@ -53,10 +57,8 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace wor
         launch_gemm<Geometry, M64N128>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 384) {
         launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
-    } else if (tokens <= 512) {
+    } else { // at most 512 tokens: larger calls take the TMA route
         launch_gemm<Geometry, M128N128Pipelined>(weight, residual, workspace, tokens, stream);
-    } else {
-        launch_gemm<Geometry, M128N128Resident>(weight, residual, workspace, tokens, stream);
     }
 }
 
