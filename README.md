@@ -252,6 +252,11 @@ first; reads through `/mnt/` are slow.
   activations; the other dense classes are stored in 8 bits as in Dense8. Perplexity 4.772 (Strata's
   base-model GGUF 4.844, NVIDIA Dense8 4.653: abliteration changes the weights). It needs Infernix
   `windows-2026.10.09.2` or later; earlier releases refuse it.
+- **[Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix](https://huggingface.co/Wallawalla47/Swift-1.5-Qwen3.8-Flash-Next-NVFP4-Dense8-Infernix)**:
+  [ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4),
+  UkisAI's fine-tune of Qwen3.8-Flash-Next that thinks with fewer tokens (see its model card),
+  converted like NVIDIA Dense8: experts bit-exact, dense projections in 8 bits. Smoke-tested; its
+  quality and speed are not yet measured.
 - **[Qwen3.8-27B-NVIDIA-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Qwen3.8-27B-NVIDIA-NVFP4-NInferV3)**
   (**recommended** for the 27B): [nvidia/Qwen3.8-27B-NVFP4](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4)
   with a DFlash2 draft model and a proposal head for `--lm-head-draft`.
@@ -262,10 +267,15 @@ first; reads through `/mnt/` are slow.
   [orcarouter/Qwen3.8-27B-Uncensored-NVFP4](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored-NVFP4),
   an abliterated build of Qwen3.8-27B whose safety alignment has been substantially removed (see its
   model card), with the same draft model and proposal head.
+- **[Swift-Qwen3.8-27B-NVFP4-NInferV3](https://huggingface.co/Wallawalla47/Swift-Qwen3.8-27B-NVFP4-NInferV3)**:
+  [ukisai/Swift-Qwen3.8-27B-NVFP4](https://huggingface.co/ukisai/Swift-Qwen3.8-27B-NVFP4), UkisAI's
+  token-efficient fine-tune of Qwen3.8-27B in NVIDIA's NVFP4/FP8 layout, converted like the NVIDIA
+  artifact with the same draft model and proposal head. Smoke-tested on Infernix and NInfer; its
+  quality and speed are not yet measured.
 
-All three Flash-Next conversions use the same 52 GB n-gram volume,
+All four Flash-Next conversions use the same 52 GB n-gram volume,
 [`Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram`](https://huggingface.co/Wallawalla47/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix/blob/main/Qwen3.8-Flash-Next-NVIDIA-NVFP4-Infernix.ngram)
-(the uncensored repo does not carry its own copy). `python -m tools.convert` converts
+(the uncensored and Swift repos do not carry their own copy). `python -m tools.convert` converts
 your own checkpoints ([weight conversion](docs/weight-conversion.md)).
 
 ## Documentation
