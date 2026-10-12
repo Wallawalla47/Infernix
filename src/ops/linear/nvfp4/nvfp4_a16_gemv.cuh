@@ -8,6 +8,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "core/pdl.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -257,7 +258,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     static_assert(!Rows::kPaired || Schedule::kRowsPerWarp % 2 == 0);
     __shared__ Nvfp4A16GemvSharedStorage<Geometry, Schedule> shared;
     const int block = blockIdx.x, lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    // The scales and codes are immutable: a programmatic dependent stages the scales before it waits.
     nvfp4_stage_a16_scales<Geometry, Schedule>(scales, shared, block, rows, policy);
+    pdl::enter_streaming();
     const int local0 = warp * Schedule::kRowsPerWarp;
     int parent[Schedule::kRowsPerWarp];
 #pragma unroll
@@ -266,6 +269,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
                                            accumulators);
+    pdl::trigger_dependents();
     float totals[Schedule::kRowsPerWarp];
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r) {

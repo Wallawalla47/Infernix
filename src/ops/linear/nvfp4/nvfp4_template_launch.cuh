@@ -18,10 +18,9 @@ void launch_nvfp4_a16_gemv(const Nvfp4A16Operands& p, Output output, Epilogue ep
         p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("NVFP4 GEMV requires T=1 and complete row/K tiles");
     static_assert(Schedule::kStaticK > 0, "SIMT phase specialization requires a static K instance");
-    nvfp4_a16_gemv_kernel<Schedule>
-        <<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
-            p.x, p.codes, p.scales, p.alpha, output, epilogue, rows, p.rows);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(p.rows / Schedule::kBlockRows), dim3(Schedule::kThreads), 0, stream},
+                                    nvfp4_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x, p.codes, p.scales,
+                                    p.alpha, output, epilogue, rows, p.rows));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>

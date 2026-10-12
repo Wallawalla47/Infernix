@@ -9,6 +9,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "core/pdl.cuh"
 #include "ops/linear/fp8/fp8_schedule.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/fp8/fp8_operands.h"
@@ -120,6 +121,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
         static_cast<int>(blockIdx.x) * kStoredRowsPerCta + warp * kStoredRowsPerWarp;
     const auto* activation_pairs = reinterpret_cast<const std::uint32_t*>(x);
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
+    pdl::enter_streaming(); // launched as a programmatic dependent
 
 #pragma unroll Schedule::kPhaseUnroll
     for (int phase = 0; phase < kPhases; ++phase) {
@@ -139,6 +141,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ge
         }
         accumulate_rows(row_codes, activation_pairs + value_begin / 2, accumulators);
     }
+    pdl::trigger_dependents();
 
     const auto destination = linear_output_tile<kStoredRowsPerCta>(
         output, static_cast<int>(blockIdx.x) * kStoredRowsPerCta);

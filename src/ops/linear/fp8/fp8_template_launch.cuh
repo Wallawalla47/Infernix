@@ -17,9 +17,9 @@ void launch_fp8_a16_gemv(const Fp8A16Operands& p, Output output, Epilogue epilog
     validate_fp8_operands<Schedule>(p);
     if (p.tokens != 1 || p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane))
         throw std::invalid_argument("FP8 GEMV requires T=1 and complete row/K tiles");
-    fp8_a16_gemv_kernel<Schedule><<<p.rows / Schedule::kBlockRows, Schedule::kThreads, 0, stream>>>(
-        p.x, p.codes, p.scales, output, epilogue, rows, p.rows, p.k);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({dim3(p.rows / Schedule::kBlockRows), dim3(Schedule::kThreads), 0, stream},
+                                    fp8_a16_gemv_kernel<Schedule, Output, Epilogue, Rows>, p.x, p.codes, p.scales,
+                                    output, epilogue, rows, p.rows, p.k));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
