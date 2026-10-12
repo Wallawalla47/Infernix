@@ -43,6 +43,14 @@ void contracts(infernix::text::GrammarCompiler& compiler) {
         check(accepts(compiler, object, text), "JSON object rejected valid content");
     for (const std::string text : {"[]", "1", "{}{}", R"({"x":})"})
         check(!accepts(compiler, object, text), "JSON object admitted invalid content");
+    // The layout a model writes on its own: with only compact JSON admitted, Qwen3.8 without thinking
+    // closed the first key empty (`{"":"ok"}`, NInfer #392). Whitespace runs are bounded at 32.
+    const std::string pretty = "{\n  \"status\": \"ok\",\n  \"list\": [\n    1,\n    2\n  ]\n}";
+    check(accepts(compiler, object, pretty), "JSON object rejected pretty-printed content");
+    check(accepts(compiler, object, "{" + std::string(32, ' ') + "\"x\":1}"),
+          "JSON object rejected a 32-character whitespace run");
+    check(!accepts(compiler, object, "{" + std::string(33, ' ') + "\"x\":1}"),
+          "JSON object admitted an unbounded whitespace run");
     auto schema = Constraint::json_schema(
         R"({"type":"object","properties":{"description":{"const":"first"},"second":{"const":{"description":"second"}}},"required":["description","second"],"additionalProperties":false})");
     check(accepts(compiler, schema, R"({"description":"first","second":{"description":"second"}})"),

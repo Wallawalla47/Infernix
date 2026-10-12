@@ -341,7 +341,9 @@ backslashes in JSON strings must be escaped legally. Finite const/enum candidate
 and recursive definitions with no generating branch are unsatisfiable at compilation or the initial
 mask check, rather than having the constraint dropped.
 
-JSON uses compact `,` / `:` separators and the declared field order. String length and pattern grammars
+JSON uses the declared field order and admits insignificant whitespace between tokens in runs of at most
+32 characters. A compact-only grammar forces a model that prefers pretty-printed output off its layout:
+Qwen3.8 without thinking then closed the first key empty (`{"":"ok"}`, NInfer #392). String length and pattern grammars
 use canonical JSON escapes; a continuation must be a prefix of this generation language. `pattern`
 searches the string value with classes, groups, alternatives, repetition and `^` / `$` at the ends of
 top-level alternatives. Dot and whitespace classes follow ECMAScript; back-references, zero-width

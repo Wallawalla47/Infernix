@@ -407,9 +407,11 @@ xgrammar::Grammar build_json_grammar(const OutputConstraint& constraint) {
         else
             throw RequestError(Kind::InvalidJsonSchema,
                                "expected JSON object or schema constraint");
-        return xgrammar::Grammar::FromJSONSchema(source, false, std::nullopt,
-                                                 std::pair<std::string, std::string>{",", ":"},
-                                                 false, std::nullopt, false, false);
+        // Any insignificant whitespace, in runs of at most 32 characters: a compact-only grammar forced
+        // Qwen3.8 off its pretty-printed layout and it closed the first key empty (NInfer #392).
+        return xgrammar::Grammar::FromJSONSchema(source, /*any_whitespace=*/true, std::nullopt,
+                                                 std::nullopt, /*strict_mode=*/false,
+                                                 /*max_whitespace_cnt=*/32, false, false);
     } catch (const xgrammar::JSONSchemaCompileError& error) {
         const auto kind = error.kind == xgrammar::SchemaErrorType::kUnsupportedSchema
                               ? Kind::UnsupportedJsonSchema
