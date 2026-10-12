@@ -65,6 +65,9 @@ other references own narrower contracts:
 | [Linear benchmark](maintainer/linear-benchmark.md) | pure Linear measurement, metrics and suites |
 | [Linear tuning and reports](maintainer/linear-tuning.md) | tuning ranges, priority points, dispatch tradeoffs and final performance report format |
 | [Qwen3.8-Flash-Next design](maintainer/qwen3_8-flash-next-design.md) | temporary design proposal (partly implemented; status in §19.1): bit-exact import of NVIDIA's NVFP4 checkpoint with exact W4A4 expert arithmetic, host-resident experts with CPU miss service and a VRAM expert cache, NVMe n-gram table, QSA over every KV profile (262K `int8` first), performance model and milestones |
+| [Flash-Next GSQ-RCO IQ3_S plan](maintainer/qwen3_8-flash-next-iq3s-plan.md) | temporary plan (not implemented): bit-exact import of ISTA-DASLab's GSQ-RCO IQ3_S GGUF (per-layer i-quant expert records, k-quant dense, exact integer arithmetic), IQ4_NL n-gram volume with optional whole-table RAM residency, MTP drafter fetched from Qwen's checkpoint |
+| [Flash-Next official FP8 plan](maintainer/qwen3_8-flash-next-fp8-plan.md) | temporary plan (not implemented): bit-exact import of Qwen's block-FP8 experts with exact W8A16 arithmetic, three-tier VRAM/RAM/SSD residency over striped expert volumes, BF16 or 8-bit dense recipes |
+| [GLM-5.3-Flash design](maintainer/glm5_3-flash-design.md) | temporary design proposal (not implemented): the EXL3 3.05 bpw GLM-5.3-Flash builds (MikeRoz's uncensored, turboderp's base) on one RTX 5090 with exact E3A16 experts in VRAM, pinned RAM and expert volumes striped over several NVMe drives; sparse MLA, pooled indexer, KDA and mHC Ops; measured storage topology, performance model and milestones |
 
 Model cards contain official artifact facts and source provenance. The
 [conversion guide](weight-conversion.md) is the entry point for making an artifact. Exact config
