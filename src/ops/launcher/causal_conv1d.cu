@@ -1,6 +1,7 @@
 // infernix::ops - causal_conv1d launcher: grid/block/stream configuration + kernel launch.
 #include "ops/launcher/causal_conv1d.h"
 
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/kernel/causal_conv1d.cuh"
 #include "core/device.h" // CUDA_CHECK
@@ -228,12 +229,13 @@ void launch_batched_sequence_snapshot(const Tensor& x, const Tensor& weight, Ten
     const int block          = width == 1 ? 256 : 32;
     const dim3 grid(grid_for(C, block, "batched sequence snapshot"),
                     static_cast<unsigned int>(batch));
-    causal_conv1d_batched_sequence_snapshot_kernel<Masked><<<grid, block, 0, stream>>>(
+    CUDA_CHECK(pdl::launch_consumer(
+        {grid, dim3(block), 0, stream}, causal_conv1d_batched_sequence_snapshot_kernel<Masked, Output>,
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
         static_cast<__nv_bfloat16*>(conv_states.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
-        static_cast<const std::int32_t*>(snapshot_base_slots.data), out, C, width, slot_stride);
+        static_cast<const std::int32_t*>(snapshot_base_slots.data), out, C, width, slot_stride));
 }
 
 template <bool Masked, class Output>
@@ -268,13 +270,12 @@ void snapshot_launch(const Tensor& x, const Tensor& weight, Tensor& conv_states,
 
     if (B == 1 && valid_columns.data == nullptr && T == 1) {
         constexpr int kBlock = 256;
-        causal_conv1d_snapshot_decode_kernel<<<grid_for(C, kBlock, "snapshot decode"), kBlock, 0,
-                                               stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(weight.data),
-            static_cast<__nv_bfloat16*>(conv_states.data),
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(grid_for(C, kBlock, "snapshot decode")), dim3(kBlock), 0, stream},
+            causal_conv1d_snapshot_decode_kernel<Disjoint>, static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(weight.data), static_cast<__nv_bfloat16*>(conv_states.data),
             static_cast<const std::int32_t*>(initial_state_slots.data),
-            static_cast<const std::int32_t*>(snapshot_base_slots.data), disjoint, C, slot_stride);
+            static_cast<const std::int32_t*>(snapshot_base_slots.data), disjoint, C, slot_stride));
     } else if (B == 1 && valid_columns.data == nullptr && T <= kCausalConvParallelMaxTokens) {
         const dim3 block(kCausalConvChannelTile, static_cast<unsigned int>(T));
         const int grid = grid_for(C, kCausalConvChannelTile, "small-T snapshot");
@@ -335,11 +336,12 @@ void from_states_launch(const Tensor& x, const Tensor& weight, const Tensor& con
         static_cast<std::int64_t>(conv_states.ne[0]) * static_cast<std::int64_t>(conv_states.ne[1]);
     constexpr int kBlock = 128;
     const dim3 grid(grid_for(C, kBlock, "from-states"), static_cast<unsigned int>(batch));
-    causal_conv1d_from_states_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.data),
-        static_cast<const __nv_bfloat16*>(conv_states.data),
-        static_cast<const std::int32_t*>(initial_state_slots.data), out, C, width, slot_stride);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(kBlock), 0, stream}, causal_conv1d_from_states_kernel<Output>,
+                                    static_cast<const __nv_bfloat16*>(x.data),
+                                    static_cast<const __nv_bfloat16*>(weight.data),
+                                    static_cast<const __nv_bfloat16*>(conv_states.data),
+                                    static_cast<const std::int32_t*>(initial_state_slots.data), out, C, width,
+                                    slot_stride));
 }
 
 template <std::int32_t Rows0, std::int32_t Rows1, std::int32_t Rows2>

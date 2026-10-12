@@ -63,8 +63,7 @@ void launch_recurrent_batch_update_fixed(const Tensor& q, const Tensor& k, const
         state_slot_stride,
         scale,
     };
-    recurrent_batch_update_kernel<NormalizeInputs><<<grid, block, 0, stream>>>(access);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer({grid, block, 0, stream}, recurrent_batch_update_kernel<NormalizeInputs>, access));
 }
 
 template <bool Masked>

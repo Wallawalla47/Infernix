@@ -671,7 +671,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_batch_update_kernel(BatchUpdateAccess access) {
     const RecurrentCoordinates coord = access.coordinates();
     __align__(16) float state[kDvPerWarp][kQkPerLane];
+    // As in the record kernel: the state tile was last written by an earlier round and its slot comes
+    // from the round's ingress, so it loads before waiting on the kernels that feed q/k/v and the gates.
     load_state_tile(state, access.state_read_base(coord), coord);
+    pdl::enter_streaming();
     run_recurrent_sequence<NormalizeInputs, OutputEffects>(state, access, coord, 1);
     store_state_tile(state, access.state_write_base(coord), coord);
 }

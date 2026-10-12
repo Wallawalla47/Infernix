@@ -3,6 +3,7 @@
 // infernix::ops - causal_conv1d kernel: depthwise causal k=4 with fused SiLU.
 // SiLU is computed as x / (1 + exp(-x)) in fp32, with no polynomial approximation.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 
 #include <cuda_bf16.h>
@@ -306,6 +307,7 @@ __global__ void causal_conv1d_snapshot_decode_kernel(
     __nv_bfloat16* __restrict__ conv_states, const std::int32_t* __restrict__ initial_slot,
     const std::int32_t* __restrict__ snapshot_base_slot, Output out,
     std::int32_t C, std::int64_t slot_stride) {
+    pdl::enter(); // launched as a programmatic dependent (snapshot launcher)
     const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
     const std::int64_t C64    = static_cast<std::int64_t>(C);
@@ -386,6 +388,7 @@ __global__ void causal_conv1d_batched_sequence_snapshot_kernel(
     const std::int32_t* valid_columns, const std::int32_t* initial_state_slots,
     const std::int32_t* snapshot_base_slots, Output out, std::int32_t C, std::int32_t width,
     std::int64_t slot_stride) {
+    pdl::enter(); // launched as a programmatic dependent
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64   = static_cast<std::int64_t>(C);
@@ -441,6 +444,7 @@ __global__ void causal_conv1d_from_states_kernel(const __nv_bfloat16* __restrict
                                                  const std::int32_t* __restrict__ initial_state_slots,
                                                  Output out, std::int32_t C,
                                                  std::int32_t width, std::int64_t slot_stride) {
+    pdl::enter(); // launched as a programmatic dependent
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
     const std::int64_t c64   = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
     const std::int64_t C64   = static_cast<std::int64_t>(C);
