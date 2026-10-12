@@ -427,6 +427,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void route_kernel(const float* __restrict__ logits, int experts, int columns, int top_k,
                              std::int32_t* __restrict__ ids, float* __restrict__ weights,
                              float* __restrict__ shared_gate) {
+    pdl::enter(); // launched as a programmatic dependent of the router projection
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int lane = threadIdx.x % 32;
     if (warp >= columns) { return; }
@@ -562,6 +563,7 @@ __global__ void __launch_bounds__(kDispatchThreads)
     __shared__ std::int32_t count[kDispatchThreads];
     __shared__ std::int32_t cursor[kDispatchThreads];
     __shared__ std::int32_t warp_totals[2][kDispatchThreads / 32];
+    pdl::enter(); // launched as a programmatic dependent of the route
     const int i = threadIdx.x;
     count[i]    = 0;
     __syncthreads();
@@ -1247,6 +1249,7 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ short published[offloaded_moe::kMaxCpuXColumns];         // compact index -> column
     __shared__ int slot_first[offloaded_moe::kMaxCpuJobs];               // a chosen job's first dispatch entry
     __shared__ int misses, chosen, publish_count;
+    pdl::enter(); // launched as a programmatic dependent of the dispatch
     const auto& channel = source.cpu;
     const int jobs      = min(*dispatch.job_count, max_jobs);
     const int max_width = channel.max_job_columns;
@@ -1537,11 +1540,11 @@ void moe_route(const Tensor& logits, std::int32_t top_k, MoeRouting& routing, cu
                 routing.weights.ne[1] == columns && routing.shared_gate.numel() == columns,
             "route output shapes disagree");
     const int warps_per_block = kThreads / 32;
-    route_kernel<<<(columns + warps_per_block - 1) / warps_per_block, kThreads, 0, stream>>>(
-        static_cast<const float*>(logits.data), experts, columns, top_k,
-        static_cast<std::int32_t*>(routing.ids.data), static_cast<float*>(routing.weights.data),
-        static_cast<float*>(routing.shared_gate.data));
-    check_launch("route");
+    CUDA_CHECK(pdl::launch_consumer({dim3((columns + warps_per_block - 1) / warps_per_block), dim3(kThreads), 0, stream},
+                                    route_kernel, static_cast<const float*>(logits.data), experts, columns,
+                                    static_cast<int>(top_k), static_cast<std::int32_t*>(routing.ids.data),
+                                    static_cast<float*>(routing.weights.data),
+                                    static_cast<float*>(routing.shared_gate.data)));
 }
 
 std::size_t moe_dispatch_bytes(std::int32_t experts, std::int32_t entries) {
@@ -1569,8 +1572,8 @@ void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& 
     const auto* ids   = static_cast<const std::int32_t*>(routing.ids.data);
     if (entries <= kDispatchThreads) {
         // Decode and verification widths (k * T <= 1024): one kernel and no memset node.
-        dispatch_small_kernel<<<1, kDispatchThreads, 0, stream>>>(ids, entries, experts, dispatch, route_log);
-        check_launch("dispatch");
+        CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kDispatchThreads), 0, stream}, dispatch_small_kernel, ids,
+                                        entries, experts, dispatch, route_log));
         return;
     }
     require(cudaMemsetAsync(dispatch.counts, 0, sizeof(std::int32_t) * experts, stream) == cudaSuccess,
@@ -1668,9 +1671,9 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
                     reinterpret_cast<std::uintptr_t>(x.data) % 16 == 0 &&
                     reinterpret_cast<std::uintptr_t>(source.cpu.x) % 16 == 0,
                 "CPU channel is incomplete");
-        cpu_plan_kernel<<<1, kThreads, 0, stream>>>(dispatch, source, static_cast<const bf16*>(x.data), x.ne[1], top_k,
-                                                    max_jobs, cpu_flags, cpu_call);
-        check_launch("cpu plan");
+        CUDA_CHECK(pdl::launch_consumer({dim3(1), dim3(kThreads), 0, stream}, cpu_plan_kernel, dispatch, source,
+                                        static_cast<const bf16*>(x.data), static_cast<int>(x.ne[1]), top_k,
+                                        static_cast<int>(max_jobs), cpu_flags, cpu_call));
     }
     FetchCall* fetch = nullptr;
     if (fetch_served(source)) {

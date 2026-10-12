@@ -9160,6 +9160,26 @@ MTP K = 4 (verification width 5, shorter waits): Phase 2 173.4/172.1, 32 MiB 173
 binaries, ABBA ×2): plain 120.0-121.5 → 122.2-123.0 tok/s (+1.6 %, every run above every HEAD run),
 MTP 172.6-172.8 both. The 27B has no such window: its decode graph is 97 % busy with 0.18 µs gaps.
 
+### 19.3.20c Router chain as programmatic dependents; weight self-prefetch rejected (2026-10-12)
+
+**Route, dispatch and CPU plan as PDL consumers (adopted, bit-exact).** `route_kernel`,
+`dispatch_small_kernel` and `cpu_plan_kernel` were plain launches between the router projection and
+the miss staging (~11.6-14 µs of one-CTA kernels per layer); each now calls `pdl::enter()` first and
+launches through `pdl::launch_consumer`. Against the §19.3.20b build (frozen binaries, ABBA ×2): MTP
+K = 4 173.54-173.81 → 173.94-174.08 tok/s (+0.2 %, every run above every control run), plain
+122.9-123.7 → 122.7-124.1 (+0.2 to +0.4 %, mixed in the first round).
+
+**Weight self-prefetch at kernel start (rejected).** Each CTA of the NVFP4 A16 GEMV, the FP8 A16 GEMV
+and the FP8 / NVFP4 A4 small-T MMA kernels issued `cp.async.bulk.prefetch.L2` for its own code rows
+(before the scale staging, or before the PDL wait), so DRAM would stream from the first cycle. Cold-L2
+op bench against HEAD, two rounds: NVFP4 linear_add [5120, 17408] A16 T = 1 34.1 → 43.8-44.3 µs
+(+29 %), FP8 [5120, 6144] 21.1 → 23.1 µs (T = 1) and 23.1 → 25.2 (T = 8), FP8 [16384, 5120]
+49.8 → 51.8 / 51.8 → 53.9, NVFP4 A4 [5120, 17408] T = 8 37.5 → 37.6: the whole-row bulk requests
+compete with the kernels' own ordered streams. For the 27B this was the main remaining lead: its
+decode graph is 97 % busy with 0.18 µs gaps, and the weight GEMVs already run at 90-97 % of DRAM
+bandwidth (gate/up 94 %, FP8 projections 95-97 %, drafter and head 97-100 %) except the NVFP4 down
+projection at T = 1 (79 %) and FP8 [5120, 6144] (83-90 %).
+
 ### 19.3.21 One-column expert kernels: FP4 half2 unit products (2026-10-10)
 
 Decode and MTP verification run only the one-column narrow kernels (`gate_up_kernel<1>`,
