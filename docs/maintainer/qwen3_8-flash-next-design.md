@@ -376,7 +376,7 @@ Literature mechanisms relevant to batch-1 decode with a hot GPU cache:
 | SP-MoE (2510.10302) | Prefetch the experts implied by draft tokens before verification | §11.4 |
 | Fiddler (2402.07033), KTransformers (SOSP'25), FreeToken q\* | CPU computes misses in place, or a balanced CPU/PCIe split | §10, §8.6 |
 | HOBBIT (2411.01433) | Low-precision copies for less important missed experts | Rejected: it changes NVIDIA's weights (§1.1) |
-| AdapMoE (2408.10284), FATE | Per-layer cache allocation; shallow layers miss more | One global pool. Hard per-layer quotas lost 1-35% in replay (§9.3). |
+| AdapMoE (2408.10284), FATE | Per-layer cache allocation; shallow layers miss more | One global pool: hard per-layer quotas lost 3-34% in replay (§9.3), and a capacity allocator fitted to the replayed hit-rate curves recovered parity, not more (+0.05% at 6.45% of the pool reallocated, §9.3). |
 | Zhang, "Reproducible evaluation of MoE expert caching" (2608.07911) | Event-atomic replay. LFRU, f / (age + 1), is the best causal policy in 12 of 13 workloads. 84-97% of the Belady gap comes from victim ranking. A learned next-use predictor did **worse** than LFRU. | Base policy of §9.3 |
 | SeqMoE (2609.12978) | A sequence predictor of expert activations several tokens ahead drives a probabilistic Belady (reported 91.7% / 97.0% hits at 25% / 45% residency) | Research option behind M1's predictor evaluation (§9.3) |
 | Local routing consistency (2505.16056) | Models with shared experts show weaker token-to-token expert reuse | Explains the modest LRU hit rates; Belady's gap is the headroom (§9.3) |
@@ -472,7 +472,8 @@ single-client decode tokens, English technical writing) were replayed through ca
 An independent data point: llama.cpp's per-layer LRU on this model (PR #27861) reports 81% / 86.9%
 / 90.2% / 98.5% at 64 / 96 / 128 / 384 slots per layer. Recipes A and B correspond to ~170 and ~200
 slots per layer, between the 90.2% and 98.5% points; LFRU over one global pool should do better
-than per-layer LRU. Other replay findings:
+than per-layer LRU — measured at the deployed capacity, a *fitted* per-layer split returns +0.05%
+against global LFRU (§9.3). Other replay findings:
 
 - Reuse distance has a median of 3 tokens.
 - Verify windows of 1, 2 and 4 tokens give the same misses per **accepted** token.
@@ -1383,7 +1384,30 @@ Further results:
        because single uses truncate to 0.
      - Fractional halving is smooth: 1,024 ticks gives −6 %.
      - The FreeToken traces above were not re-run with halving (they are not in the tree).
-   - No per-layer quotas, because hard partitioning lost 3-34%.
+   - No per-layer quotas. Hard partitioning lost 3-34% in replay, and the fitted alternative does no
+     better: a per-layer capacity allocator over replayed hit-rate response curves (MoE-CORE,
+     arXiv 2610.01950 §3.1) recovers the partition loss and stops there — **+0.05%** misses per
+     generated token for **6.45%** of the pool reallocated (≈0.0078% per 1% of pool) — while an
+     entropy-weighted LFRU score skew is −0.21% at best and a loss above it, against a per-access
+     replay control 8.9% worse (equal partition: +4.55%). The premise was not that routing is
+     unstructured — per-layer routing entropy spans 1.50 bits with a split-half Spearman of 0.94 —
+     but that structure is static popularity (entropy vs top-64 share −0.99), while the order the
+     cache exploits is temporal, which global LFRU already tracks. The one arm that wins is a
+     warm-start seed prior (−19%), which is placement, not budgeting, and is **not** a measured
+     result for this engine: it is a leave-one-out upper bound for a seed keyed by session category
+     (a size-matched random seed gives −0.52%), and its delta over the existing warm-start seed
+     (item 4, §19.3.5) was never measured; MoE-CORE's own ablation puts a domain-keyed
+     initialization at 1.4%. Evaluated by Fedor Suchkov on the `kido5217/Infernix` fork
+     ([issue #1](https://github.com/kido5217/Infernix/issues/1), map
+     [#7](https://github.com/kido5217/Infernix/issues/7); replay prototype
+     [#12](https://github.com/kido5217/Infernix/issues/12), seed follow-up
+     [#24](https://github.com/kido5217/Infernix/issues/24)), offline under the event-atomic replay
+     contract on eight greedy coding-agent sessions recorded with `--route-trace` on an RTX 5090
+     (4 × ≥ 32K-token, 4 × ≤ 2K-token); the uniform-LFRU arm reproduced `host_tier.py
+     --vram-budget recorded` exactly (66.142 misses per generated token). No live A/B was run, since
+     no arm cleared the pre-registered offline bar (≥ 5% fewer misses). The prototype
+     (`tools/expert_cache_replay/per_layer_skew.py`) and the traces' recorder live only on that
+     fork's unmerged `proto/per-layer-residency-skew` branch and its `bench/route_traces/`.
    - Experts of the current and predicted groups are protected.
 2. **Admission: promote on miss, within a promotion budget.**
    - Every CPU-served miss is a promotion candidate. The transfer agent (§9.4) copies it into a frame
@@ -7047,7 +7071,7 @@ and worst case.
 | Explicit tier with unbuffered reads of the artifact in place on `E:` | An OS mapped-file tier (Strata's `--mmap-experts`: 7.54 vs 12.18 tok/s with identical flags); a copy on `G:` (63 GiB, contention with the n-gram volume and page file); any SSD expert cache, spill or swap file (U3: SSD writes and wear for no gain, since the artifact already holds the exact bytes) |
 | Exclusive residency with shadows, pins and admission throttling | Inclusive or independent tier (2-2.5× more SSD reads in the 512-token replay); a fixed demotion cap that drops victims |
 | SSD-only experts as CPU jobs in decode; fetch channel for prefill and overflow | Fetch channel for every call (exposed wait on the serial route); CPU jobs only (caps, no prefill) |
-| Decayed LFU with O(1) updates and lazy heaps, h by replay | LFRU for RAM (time-varying order); long-half-life LFU (+30 % reads in the 512-token replay); per-layer quotas |
+| Decayed LFU with O(1) updates and lazy heaps, h by replay | LFRU for RAM (time-varying order); long-half-life LFU (+30 % reads in the 512-token replay); per-layer quotas (fitted or entropy-weighted: +0.05 % / −0.21 % at best, §9.3) |
 | Full mode keeps today's pinned Model banks and kernel code (null host table) | An identity table in full mode |
 | No precision change for SSD experts; deny-write handles | Lower-bit SSD copies; per-read hashing (~0.25 ms CPU) |
 | RAM tier sized at startup only | Runtime RAM grow and shrink (Q10) |
