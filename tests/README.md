@@ -255,7 +255,8 @@ INFERNIX_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
 
 The agent entry checks multi-turn continuation and branching. The preemption entry exercises
 Replay recovery and cancellation while paused or replaying; `INFERNIX_PREEMPTION_REAL_SCENARIO`
-selects `all`, `replay`, `cancel-paused` or `cancel-replay`. Native transaction tests cover pause and
+selects `all`, `replay`, `cancel-paused`, `cancel-replay` or `cache-replay` (the prefix cache on,
+each resume binding from a snapshot of its own prompt; skipped by `all` under a test constraint). Native transaction tests cover pause and
 Replay with the exact ledger splits, grammar-row failure and replayed sampling counts; their
 positional backend is `none`, `mtp`, `dflash` or `dflash2`. Each backend requires an artifact containing that component.
 Public-HTTP latency and output gaps are measured separately by the

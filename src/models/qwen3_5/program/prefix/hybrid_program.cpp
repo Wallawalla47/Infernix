@@ -891,7 +891,9 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     }
     install_binding(tx);
     // The snapshot image's continuation hidden belongs to the snapshot, not to a committed tail.
-    state.tail_hidden_valid = false;
+    // A resume's Replay bridges MTP from it: every snapshot image holds the target hidden of the
+    // column before its frontier, as the lane that published it did.
+    state.tail_hidden_valid = tx.resume != nullptr && reuse != 0;
     if (!hybrid_) {
         // Without a prefix cache the lane publishes nothing.
         out.sequence  = sequence_handle(lane);

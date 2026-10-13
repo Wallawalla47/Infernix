@@ -56,11 +56,12 @@ std::string grammar_prefix() {
     return prefix;
 }
 
-infernix::RequestOptions request(std::uint32_t outputs) {
+infernix::RequestOptions request(std::uint32_t outputs, bool prefix_cache = false) {
     infernix::RequestOptions options;
     options.execution.requested_output_tokens = outputs;
     options.execution.sampling.temperature    = 0.0F;
-    options.execution.allow_prefix_reuse      = false;
+    // The prompts share no block, so the cache serves only each request's own snapshots.
+    options.execution.allow_prefix_reuse      = prefix_cache;
     options.stop.include_model_defaults       = false;
     options.output.raw                        = true;
     if (setting("INFERNIX_TEST_CONSTRAINT", "none") != "none") {
@@ -87,7 +88,8 @@ infernix::RequestOptions request(std::uint32_t outputs) {
 }
 
 infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
-                                     infernix::SpeculativeBackend selected) {
+                                     infernix::SpeculativeBackend selected,
+                                     bool prefix_cache = false) {
     infernix::EngineOptions options;
     options.artifact_path        = artifact;
     options.max_context          = kCapacity;
@@ -100,8 +102,16 @@ infernix::EngineOptions engine_options(const std::filesystem::path& artifact,
         options.speculative.draft_tokens  = 3;
         options.speculative.proposal_head = infernix::ProposalHead::Optimized;
     }
-    // History is deliberately disabled: the cases exercise only the requests' own recovery.
-    options.context_cache.enabled = false;
+    // History is deliberately disabled: the cases exercise only the requests' own recovery. With
+    // the cache that recovery resumes from a snapshot of the request's own prompt: a 64-token
+    // ladder taps the 192-token prompts at 128, the prefill chunk boundary, and the Host tier keeps
+    // the paused lane's blocks while the other request evicts their Device copies.
+    options.context_cache.enabled = prefix_cache;
+    if (prefix_cache) {
+        options.context_cache.host_capacity_bytes       = std::size_t{1} << 30U;
+        options.context_cache.hybrid.tap_ladder_tokens  = 64;
+        options.context_cache.hybrid.tap_min_gap_tokens = 64;
+    }
     return options;
 }
 
@@ -266,24 +276,27 @@ private:
     std::string reasoning_;
 };
 
-void settled(const infernix::RuntimeStats& stats) {
+void settled(const infernix::RuntimeStats& stats, bool prefix_cache = false) {
     require(stats.running_requests == 0 && stats.waiting_requests == 0 &&
                 stats.paused_requests == 0 && stats.replaying_requests == 0 &&
                 stats.prefilling_requests == 0 && stats.decode_ready_requests == 0 &&
                 stats.materializing_requests == 0 && stats.terminal_pending_requests == 0,
             "completed recovery left live scheduling membership");
-    require(stats.device_state_occupied_slots == 0 && stats.device_main_kv_occupied_pages == 0 &&
-                stats.device_backend_kv_occupied_pages == 0,
+    // The prefix cache keeps finished contexts on the Device as cache.
+    require(prefix_cache ||
+                (stats.device_state_occupied_slots == 0 && stats.device_main_kv_occupied_pages == 0 &&
+                 stats.device_backend_kv_occupied_pages == 0),
             "completed recovery retained physical resources with history disabled");
 }
 
 void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBackend selected,
-              std::string_view backend_name, CancelStage cancel_stage = CancelStage::None) {
-    infernix::Engine engine(engine_options(artifact, selected));
+              std::string_view backend_name, CancelStage cancel_stage = CancelStage::None,
+              bool prefix_cache = false) {
+    infernix::Engine engine(engine_options(artifact, selected, prefix_cache));
     const auto memory = engine.memory_summary();
     require(memory.max_context == kCapacity && memory.kv_capacity == kCapacity,
             "Engine changed the fixed pressure workload's context capacity");
-    require(engine.runtime_stats().hybrid_host_capacity_bytes == 0,
+    require(prefix_cache || engine.runtime_stats().hybrid_host_capacity_bytes == 0,
             "Engine reserved Host context memory without a prefix cache");
     const auto before = engine.runtime_stats();
     std::array<unsigned, 2> first_token_counts{};
@@ -316,7 +329,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     ObservationSink first_sink(timeline, 0, [&] {
         // OutputSink runs in wait()'s consumer thread. This gate submits already prepared input
         // at the observed first admission without holding up the Engine or a model callback.
-        auto handle = engine.submit(std::move(second_prepared), request(kOutputTokens),
+        auto handle = engine.submit(std::move(second_prepared), request(kOutputTokens, prefix_cache),
                                     infernix::OutputConsumerMode::Streaming, observations[1]);
         {
             std::lock_guard lock(handoff_mutex);
@@ -325,7 +338,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
         handoff.notify_one();
     });
     ObservationSink second_sink(timeline, 1);
-    auto first_handle = engine.submit(std::move(first_prepared), request(kOutputTokens),
+    auto first_handle = engine.submit(std::move(first_prepared), request(kOutputTokens, prefix_cache),
                                       infernix::OutputConsumerMode::Streaming, observations[0]);
     std::jthread first_consumer([&] {
         try {
@@ -390,7 +403,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     // response is available, before the worker publishes them.
     (void)engine.memory_summary();
     const auto after            = engine.runtime_stats();
-    settled(after);
+    settled(after, prefix_cache);
     require(first_token_counts[0] == 1 && first_token_counts[1] == 1,
             "recovery or cancellation duplicated/lost first-token observations");
     require(after.prompt_tokens - before.prompt_tokens == 2 * kPromptTokens &&
@@ -427,6 +440,7 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
     }
     const char* label = cancel_stage == CancelStage::Paused   ? "cancel-paused"
                         : cancel_stage == CancelStage::Replay ? "cancel-replay"
+                        : prefix_cache                        ? "cache-replay"
                                                               : "replay";
     std::cout << label << " backend=" << backend_name << " preemptions=" << totals.preemptions
               << " snapshot_restores=" << totals.snapshot_restores
@@ -467,6 +481,14 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                         second_result.scheduling.replayed_tokens != 0,
                     "replay cancellation lost work performed before cancellation");
         }
+    } else if (prefix_cache) {
+        // Each resume bound from the prompt's own tap at 128 and replayed only past it; an MTP
+        // lane bridges its drafter from the snapshot's continuation hidden.
+        require(totals.replay_restores == totals.preemptions,
+                "growth pressure did not restore every affected request");
+        require(after.hybrid_reused_tokens - before.hybrid_reused_tokens >=
+                    std::uint64_t{128} * totals.preemptions,
+                "a resume did not bind from the request's own prompt snapshot");
     } else {
         require(totals.snapshot_restores == 0 && totals.replay_restores != 0 &&
                     totals.replayed_tokens > kPromptTokens,
@@ -475,12 +497,12 @@ void exercise(const std::filesystem::path& artifact, infernix::SpeculativeBacken
                 "growth pressure did not restore every affected request");
     }
 
-    const auto probe = engine.generate(engine.prepare_tokens({198, 1002, 198}), request(4));
+    const auto probe = engine.generate(engine.prepare_tokens({198, 1002, 198}), request(4, prefix_cache));
     require(probe.generated_token_ids.size() == 4 &&
                 probe.finish_reason == infernix::FinishReason::OutputLimit,
             "request after recovery could not reuse the released execution resources");
     (void)engine.memory_summary(); // the worker boundary, as above
-    settled(engine.runtime_stats());
+    settled(engine.runtime_stats(), prefix_cache);
     require(engine.is_available(), "Engine became unavailable after recovery");
 }
 
@@ -500,15 +522,20 @@ int main() {
         const auto selected     = backend(backend_name);
         const auto scenario     = setting("INFERNIX_PREEMPTION_REAL_SCENARIO", "all");
         require(scenario == "all" || scenario == "replay" || scenario == "cancel-paused" ||
-                    scenario == "cancel-replay",
-                "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused or "
-                "cancel-replay");
+                    scenario == "cancel-replay" || scenario == "cache-replay",
+                "INFERNIX_PREEMPTION_REAL_SCENARIO must be all, replay, cancel-paused, "
+                "cancel-replay or cache-replay");
         if (scenario == "all" || scenario == "replay") { exercise(artifact, selected, backend_name); }
         if (scenario == "all" || scenario == "cancel-paused") {
             exercise(artifact, selected, backend_name, CancelStage::Paused);
         }
         if (scenario == "all" || scenario == "cancel-replay") {
             exercise(artifact, selected, backend_name, CancelStage::Replay);
+        }
+        // Constrained requests pause like any other; the cache case runs without a constraint.
+        if ((scenario == "all" && setting("INFERNIX_TEST_CONSTRAINT", "none") == "none") ||
+            scenario == "cache-replay") {
+            exercise(artifact, selected, backend_name, CancelStage::None, true);
         }
     } catch (const std::exception& error) {
         std::cerr << "real Engine preemption test failed: " << error.what() << '\n';
