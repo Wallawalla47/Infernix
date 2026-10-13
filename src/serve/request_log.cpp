@@ -518,6 +518,7 @@ std::string format_server_start_json(
              {"media_live_bytes", options.media_live_bytes},
              {"media_preprocess_threads", options.media_preprocess_threads},
              {"request_log_jsonl", options.request_log_jsonl},
+             {"route_trace", options.route_trace.empty() ? Json(nullptr) : Json(options.route_trace.string())},
              {"default_output_tokens", options.default_max_tokens},
              {"default_thinking",
               options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},

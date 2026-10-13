@@ -186,6 +186,11 @@ public:
                      std::span<const std::uint8_t> live = {});
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    // The layer split of stats().routed and stats().hits: cumulative routed (layer, expert) uses
+    // and resident-at-round-start hits per layer, indexed by layer. Exact counters, fixed at
+    // construction, so the decode path only adds to them.
+    [[nodiscard]] std::span<const std::uint64_t> routed_by_layer() const noexcept { return routed_by_layer_; }
+    [[nodiscard]] std::span<const std::uint64_t> hits_by_layer() const noexcept { return hits_by_layer_; }
 
 private:
     void upload_table(cudaStream_t compute);
@@ -253,6 +258,7 @@ private:
     // Promotions per completion event (~6 ms of link at x8): a large promotion publishes in steps.
     static constexpr std::size_t kLoadsPerEvent = 64;
     Stats stats_;
+    std::vector<std::uint64_t> routed_by_layer_, hits_by_layer_; // per layer, indexed by layer
 
     HostExpertTier* tier_ = nullptr;
     expert_cache::LfruPolicy::Admissible admissible_;

@@ -1196,6 +1196,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--request-log-keep N` | rotated request-log files kept (`0..1000`); requires `--request-log-max-mib` | `4` |
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
+| `--route-trace PATH` | Qwen3.8-Flash-Next only: write the expert-routing trace `tools/expert_cache_replay/host_tier.py` replays — a header, one record per prefill, forced, decode and verify round, and one per CUDA-graph instantiation; no decode-path work when unset | disabled |
 | `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)) | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |

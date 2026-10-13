@@ -349,6 +349,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             FILE.1, older files shift up (default: one file\n"
            "                             without a size limit)\n"
            "  --request-log-keep N       rotated files kept, 0-1000 (default 4)\n"
+           "  --route-trace FILE         write the model's internal per-round expert route\n"
+           "                             trace to FILE (Qwen3.8-Flash-Next only)\n"
            "  --response-store-max-records N Responses-state record cap (default 1024)\n"
            "  --response-store-max-mib N      Responses-state byte cap in MiB (default 256)\n"
            "  --log-stats-interval-ms N  throughput-log interval in ms\n"
@@ -610,6 +612,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.request_log_rotation.keep = static_cast<std::uint32_t>(keep);
             request_log_keep_explicit         = true;
+        } else if (arg == "--route-trace") {
+            options.route_trace = require_value("--route-trace");
+            if (options.route_trace.empty()) {
+                throw std::invalid_argument("--route-trace must not be empty");
+            }
         } else if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");

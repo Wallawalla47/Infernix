@@ -120,6 +120,7 @@ void Program::fail_all_cleanup() noexcept { impl_->release_all(); }
 bool Program::recover_after_failure() noexcept { return impl_->recover_after_failure(); }
 
 void Program::shutdown_cleanup() noexcept {
+    impl_->report_cache_layers();
     impl_->release_all();
     impl_->save_expert_state();
     impl_->save_prefix_cache_for_shutdown();

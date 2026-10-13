@@ -11,9 +11,9 @@ import numpy as np
 from tools.expert_cache_replay import host_tier as ht
 
 
-def _record(kind, rows, width, tokens, budget, position, lanes, live, routes):
+def _record(kind, rows, width, tokens, budget, position, lanes, live, routes, frames=0):
     columns = rows * width
-    out = struct.pack('<8I', kind, columns, rows, width, tokens, budget, position, 0)
+    out = struct.pack('<8I', kind, columns, rows, width, tokens, budget, position, frames)
     out += struct.pack(f'<{rows}i', *lanes)
     out += bytes(live) + bytes((-columns) % 4)
     out += np.asarray(routes, np.int32).tobytes()
@@ -21,15 +21,15 @@ def _record(kind, rows, width, tokens, budget, position, lanes, live, routes):
 
 
 def test_parser_reads_the_engine_record_layout(tmp_path):
-    # route_trace.h: 64-byte header, rounds with lanes, a padded live mask and [layers][top_k * columns]
-    # routes, and payload-free graph records.
-    header = struct.pack('<8s14I', b'NRTRACE1', 1, 2, 8, 2, 5, 4, 2, 2, 1, 0, 3, 0, 0, 0)
+    # route_trace.h: 64-byte header (version 2), rounds with lanes, a padded live mask,
+    # [layers][top_k * columns] routes and the round's pool frame count, and payload-free graphs.
+    header = struct.pack('<8s14I', b'NRTRACE1', 2, 2, 8, 2, 5, 4, 2, 2, 1, 0, 3, 0, 0, 0)
     prefill = [[[0, 1], [2, 3], [4, 5]], [[6, 7], [0, 2], [1, 3]]]
     verify = [[[7, 6], [5, 4], [3, 2], [1, 0]], [[0, 7], [1, 6], [2, 5], [3, 4]]]
     data = header
-    data += _record(0, 1, 3, 3, 16, 0, [1], [1, 1, 1], prefill)
+    data += _record(0, 1, 3, 3, 16, 0, [1], [1, 1, 1], prefill, frames=8340)
     data += struct.pack('<8I', 4, 1, 2, 2, 0, 5, 0x40000000, 4)  # graph: verify, batch 2, width 2
-    data += _record(3, 2, 2, 2, 1, ht.UNKNOWN_POSITION, [1, 0], [1, 1, 1, 0], verify)
+    data += _record(3, 2, 2, 2, 1, ht.UNKNOWN_POSITION, [1, 0], [1, 1, 1, 0], verify, frames=8321)
     path = tmp_path / 'trace.bin'
     path.write_bytes(data)
 
@@ -42,6 +42,7 @@ def test_parser_reads_the_engine_record_layout(tmp_path):
     assert second.kind == ht.VERIFY and second.rows == 2 and second.width == 2 and second.tokens == 2
     assert second.live.tolist() == [True, True, True, False]
     assert second.routes[0, 3].tolist() == [1, 0]
+    assert first.frames == 8340 and second.frames == 8321
     g = trace.graphs[0]
     assert (g['family'], g['batch'], g['width']) == (1, 2, 2)
     assert g['free_before'] == 5 << 32 and g['free_after'] == 0x40000000 | 4 << 32

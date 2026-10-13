@@ -9,12 +9,16 @@
 // memory outside graph capture, so it never changes execution.
 //
 // File, little-endian. A 64-byte header:
-//   char magic[8] = "NRTRACE1"; u32 version = 1, layers, experts, top_k, frames, max_columns,
+//   char magic[8] = "NRTRACE1"; u32 version = 2, layers, experts, top_k, frames, max_columns,
 //   lanes, max_width, mtp_draft_tokens, ngram_draft_tokens, prefill_chunk; u32 reserved[3] = 0
+//   (version 1 stamped each round's eighth word 0; version 2 stamps the round's frame count
+//   there, since the elastic pool's size changes over the run.)
 // then one record per event, in execution order, each starting with eight u32 words whose first
 // is the kind:
 //   Round (kind 0-3, RouteTraceKind):
-//     u32 kind, columns, rows, width, tokens, budget, position, reserved = 0
+//     u32 kind, columns, rows, width, tokens, budget, position, frames
+//     frames is the expert pool's frame count when the round was appended — the capacity the round
+//     ran with (the pool grows and shrinks as the KV extent takes memory back and returns it).
 //     u32 lanes[rows]
 //     u8 live[columns], zero-padded to a multiple of 4 bytes (1: the column's experts count as uses)
 //     i32 routes[layers][top_k * columns] (column c's top_k experts at c * top_k)
@@ -52,6 +56,7 @@ struct RouteTraceRound {
     std::uint32_t tokens   = 0;
     std::uint32_t budget   = 0;
     std::uint32_t position = 0;
+    std::uint32_t frames   = 0; // the expert pool's frame count this round ran with
 };
 
 class RouteTrace {

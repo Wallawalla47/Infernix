@@ -322,6 +322,10 @@ struct EngineOptions {
     // before the first request (warm start), written at stop and every 10 minutes between requests.
     // Empty: no warm start (the cache starts empty and nothing is saved).
     std::filesystem::path expert_state_path;
+    // Qwen3.8-Flash-Next: writes the internal per-round route trace (route_trace.h) to this file,
+    // truncating it at startup. Empty (default): no trace is written and the run is numerically
+    // unchanged. Other architectures ignore it.
+    std::filesystem::path route_trace_path;
     std::size_t grammar_cache_bytes    = 256ULL * 1024 * 1024;
     // Message the model receives when it hits its thinking budget, before the canonical
     // </think> close the frontend appends when the message lacks it. Empty preserves the

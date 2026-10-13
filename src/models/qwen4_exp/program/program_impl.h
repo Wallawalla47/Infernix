@@ -2358,6 +2358,33 @@ public:
         save_expert_state();
     }
 
+    // At the end of a run: reports the expert cache's routed uses and hits per layer (the whole
+    // run, not one request) as one Engine diagnostic, beside report_cache's per-request line.
+    void report_cache_layers() noexcept {
+        if (!residency_) { return; }
+        try {
+            const std::span<const std::uint64_t> routed = residency_->routed_by_layer();
+            const std::span<const std::uint64_t> hits   = residency_->hits_by_layer();
+            if (routed.empty()) { return; }
+            std::string text = "expert cache per layer (hit% of routed uses):";
+            char part[40];
+            std::uint64_t total_routed = 0, total_hits = 0;
+            for (std::size_t layer = 0; layer < routed.size(); ++layer) {
+                total_routed += routed[layer];
+                total_hits += hits[layer];
+                std::snprintf(part, sizeof(part), " %zu:%.1f%%(%llu)", layer,
+                              routed[layer] ? 100.0 * static_cast<double>(hits[layer]) / static_cast<double>(routed[layer]) : 0.0,
+                              static_cast<unsigned long long>(routed[layer]));
+                text += part;
+            }
+            std::snprintf(part, sizeof(part), "; run %.1f%% of %llu",
+                          total_routed ? 100.0 * static_cast<double>(total_hits) / static_cast<double>(total_routed) : 0.0,
+                          static_cast<unsigned long long>(total_routed));
+            text += part;
+            diagnostic(text, DiagnosticLevel::Debug);
+        } catch (...) {}
+    }
+
 private:
     // A seeded count is capped, so an expert used heavily in an old session yields to new uses.
     static constexpr std::uint32_t kSeedCountCap = 16;
@@ -2419,7 +2446,8 @@ private:
                         .width    = static_cast<std::uint32_t>(width),
                         .tokens   = tokens,
                         .budget   = static_cast<std::uint32_t>(std::min<std::size_t>(budget, 0xFFFFFFFFU)),
-                        .position = position},
+                        .position = position,
+                        .frames   = residency_->frames()},
                        std::span<const std::int32_t>(host_lanes_.data(), static_cast<std::size_t>(rows)), live,
                        residency_->route_host(), residency_->route_stride());
     }

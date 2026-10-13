@@ -210,7 +210,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // kept well inside its queue timeout.
         program_options.prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0;
     }
-    program_options.route_trace   = models::qwen4_exp::testing::route_trace();
+    program_options.route_trace   = options.route_trace_path.empty()
+                                        ? models::qwen4_exp::testing::route_trace()
+                                        : options.route_trace_path;
     program_options.vram_grow_delay_seconds = models::qwen4_exp::testing::vram_grow_delay();
     program_options.vram_headroom = options.vram_headroom_bytes;
     program_options.vram_past_budget = options.vram_past_budget;

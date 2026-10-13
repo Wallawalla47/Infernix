@@ -75,6 +75,8 @@ ExpertResidency::ExpertResidency(const TextConfig& config, std::vector<const std
     landed_device_.copy_from_host(landed_host_.data(), landing_bytes);
     seen_.assign(experts_, 0);
     group_.reserve(experts_);
+    routed_by_layer_.assign(layers_, 0);
+    hits_by_layer_.assign(layers_, 0);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     CUDA_CHECK(cudaEventCreateWithFlags(&table_ready_, cudaEventDisableTiming));
     table_dirty_ = false;
@@ -452,7 +454,11 @@ void ExpertResidency::after_round(cudaStream_t compute, std::int32_t columns, st
         for (const auto key : group_) {
             seen_[key - layer * experts_] = 0;
             ++stats_.routed;
-            if (table[key] >= 0) { ++stats_.hits; }
+            ++routed_by_layer_[layer];
+            if (table[key] >= 0) {
+                ++stats_.hits;
+                ++hits_by_layer_[layer];
+            }
         }
         // The layer's landed experts become resident in their frames; the rest of its reserved
         // frames return to the pool.

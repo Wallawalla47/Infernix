@@ -313,6 +313,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
                                                                     : std::filesystem::path(options_.artifact_path +
                                                                                             ".expert-state");
     engine_options.thinking_budget_message  = options_.thinking_budget_message;
+    engine_options.route_trace_path        = options_.route_trace;
     engine_options.device                   = options_.device;
     engine_options.max_context              = options_.max_context;
     engine_options.rope_yarn_factor          = options_.rope_yarn_factor;

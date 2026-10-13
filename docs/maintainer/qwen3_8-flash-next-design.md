@@ -7089,13 +7089,17 @@ change at merge time.
 
 #### R0 implementation decisions
 
-- **Route trace** (`program/route_trace.{h,cpp}`, internal `ProgramOptions::route_trace`, set only
-  through the process-wide `testing::set_route_trace` seam that `construct_qwen4_exp` reads). The
-  format is documented in `route_trace.h`: a 64-byte header (layers, experts, top-k, frames, max
-  columns, lanes, max width, MTP and n-gram draft tokens, prefill chunk), then one record per
+- **Route trace** (`program/route_trace.{h,cpp}`, internal `ProgramOptions::route_trace`, set through
+  the serve option `--route-trace FILE` (`EngineOptions::route_trace_path`) or the process-wide
+  `testing::set_route_trace` seam that `construct_qwen4_exp` reads). The format (version 2) is
+  documented in `route_trace.h`: a 64-byte header (version, layers, experts, top-k, startup frames,
+  max columns, lanes, max width, MTP and n-gram draft tokens, prefill chunk), then one record per
   round (kind, rows, width, tokens advanced, the promotion budget the cache applied, row 0's first
-  position for prefill chunks, lanes, live mask, every layer's routes) written right before
-  `after_round` applies the same host route log, so the trace is exactly what the VRAM policy saw.
+  position for prefill chunks, the expert pool's frame count the round ran with, lanes, live mask,
+  every layer's routes) written right before `after_round` applies the same host route log, so the
+  trace is exactly what the VRAM policy saw. The per-round frame count exists because the pool is
+  elastic (it shrinks and regrows as the KV extent takes memory and returns it), so the header's
+  startup value is not the capacity a long session ran with.
   It also records each CUDA graph executable the Program instantiates (family, batch, width,
   device free before its capture and after its instantiation and first launch), which is RM0d's
   measurement; the family and shape follow from the graph's slot, so no call site changes. Both

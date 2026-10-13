@@ -11,7 +11,7 @@
 namespace infernix::models::qwen4_exp {
 namespace {
 
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
 constexpr std::size_t kBufferBytes = std::size_t{4} << 20;
 
 std::mutex& seam_mutex() {
@@ -75,7 +75,7 @@ void RouteTrace::append(const RouteTraceRound& round, std::span<const std::int32
                                             round.tokens,
                                             round.budget,
                                             round.position,
-                                            0U};
+                                            round.frames};
     write(head.data(), sizeof(head));
     write(lanes.data(), lanes.size_bytes());
     std::vector<std::uint8_t> mask((columns + 3) / 4 * 4, 0);

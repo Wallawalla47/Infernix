@@ -40,6 +40,8 @@ struct ServeOptions {
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
     RequestLogRotation request_log_rotation;
+    // --route-trace FILE: writes the model's internal per-round route trace (route_trace.h).
+    std::filesystem::path route_trace;            // empty => no trace written
     float rope_yarn_factor             = 1.0F;
     std::uint32_t max_context          = 8192;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);

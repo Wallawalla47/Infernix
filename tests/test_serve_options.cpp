@@ -831,6 +831,12 @@ int main() {
     failures +=
         check(serve_usage_text("infernix-serve").find("--request-log-jsonl") != std::string::npos,
               "serve help omits --request-log-jsonl");
+    const ServeOptions traced = parse({"infernix-serve", "model.ninfer", "--route-trace", "trace.bin"});
+    failures += check(traced.route_trace == "trace.bin", "--route-trace did not preserve its path");
+    failures += check(defaults.route_trace.empty(), "--route-trace must default to off");
+    failures +=
+        check(serve_usage_text("infernix-serve").find("--route-trace") != std::string::npos,
+              "serve help omits --route-trace");
     failures += check(logged.request_log_rotation.max_bytes == 0 &&
                           logged.request_log_rotation.keep == kDefaultRequestLogKeep,
                       "the request log must not rotate unless --request-log-max-mib is given");

@@ -84,6 +84,9 @@ RESIDENT, SHADOW = 1, 2
 
 HEADER_FIELDS = ('version', 'layers', 'experts', 'top_k', 'frames', 'max_columns', 'lanes', 'max_width',
                  'mtp_draft_tokens', 'ngram_draft_tokens', 'prefill_chunk')
+# The engine's route-trace version (route_trace.h). Version 2 stamps each round's eighth header word
+# with the round's expert-pool frame count; version 1 left it reserved (0).
+TRACE_VERSION = 2
 DEFAULT_POLICIES = 'lfu:8,lfu:16,lfu:32,lfu:64,lfu:128,lfu:256,lru,clock'
 
 
@@ -100,6 +103,7 @@ class Round:
     lanes: np.ndarray   # int32 [rows]
     live: np.ndarray    # bool [columns]
     routes: np.ndarray  # int32 [layers, columns, top_k]
+    frames: int = 0     # the expert pool's frame count this round ran with (0: not recorded)
 
 
 @dataclass
@@ -116,8 +120,8 @@ def read_trace(path):
     if len(data) < 64:
         raise ValueError(f'{path}: too short for a route trace header')
     magic, *words = struct.unpack_from('<8s14I', data, 0)
-    if magic != b'NRTRACE1' or words[0] != 1:
-        raise ValueError(f'{path}: not a version 1 route trace')
+    if magic != b'NRTRACE1' or words[0] != TRACE_VERSION:
+        raise ValueError(f'{path}: not a version {TRACE_VERSION} route trace')
     header = dict(zip(HEADER_FIELDS, words[:len(HEADER_FIELDS)]))
     layers, top_k = header['layers'], header['top_k']
     trace = Trace(header)
@@ -134,7 +138,7 @@ def read_trace(path):
             continue
         if kind > VERIFY:
             raise ValueError(f'{path}: unknown record kind {kind}')
-        columns, rows, width, tokens, budget, position = head[1:7]
+        columns, rows, width, tokens, budget, position, frames = head[1:8]
         if columns == 0 or rows * width != columns:
             raise ValueError(f'{path}: malformed round at byte {off - 32}')
         need = 4 * rows + (columns + 3) // 4 * 4 + 4 * layers * top_k * columns
@@ -146,19 +150,20 @@ def read_trace(path):
         off += (columns + 3) // 4 * 4
         routes = np.frombuffer(data, np.int32, layers * top_k * columns, off).reshape(layers, columns, top_k)
         off += 4 * layers * top_k * columns
-        trace.rounds.append(Round(kind, rows, width, tokens, budget, position, lanes, live, routes))
+        trace.rounds.append(Round(kind, rows, width, tokens, budget, position, lanes, live, routes, frames))
     return trace
 
 
 def write_trace(path, header, rounds):
     """Writes rounds in the engine's route-trace format (for synthetic traces and tests)."""
     words = [header.get(name, 0) for name in HEADER_FIELDS]
-    words[0] = 1
+    words[0] = TRACE_VERSION
     with open(path, 'wb') as f:
         f.write(struct.pack('<8s14I', b'NRTRACE1', *words, 0, 0, 0))
         for r in rounds:
             columns = r.rows * r.width
-            f.write(struct.pack('<8I', r.kind, columns, r.rows, r.width, r.tokens, r.budget, r.position, 0))
+            f.write(struct.pack('<8I', r.kind, columns, r.rows, r.width, r.tokens, r.budget, r.position,
+                                getattr(r, 'frames', 0)))
             f.write(np.asarray(r.lanes, np.int32).tobytes())
             live = np.zeros((columns + 3) // 4 * 4, np.uint8)
             live[:columns] = np.asarray(r.live, bool)
@@ -879,6 +884,12 @@ def main(argv=None):
         s = result['total']
         print(f'full mode, {header["frames"]} frames, recorded budgets: VRAM hits {100 * s["vram_hit_live"]:.2f} % '
               f'of live routed experts (engine report: "since start" hit rate), {s["promotions"]} promotions')
+        recorded = [r for t in traces for r in t.rounds if r.frames]
+        if recorded:
+            weights = [max(r.tokens, 1) for r in recorded]
+            print(f'per-round pool: {min(r.frames for r in recorded)}..{max(r.frames for r in recorded)} frames '
+                  f'over {len(recorded)} rounds; mean {sum(r.frames for r in recorded) / len(recorded):.0f}; '
+                  f'token-weighted {sum(r.frames * w for r, w in zip(recorded, weights)) / sum(weights):.0f}')
         return 0
 
     n = header['layers'] * header['experts']

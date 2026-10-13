@@ -220,7 +220,7 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
     }
     std::uint32_t header[16]{};
     in.read(reinterpret_cast<char*>(header), sizeof(header));
-    if (!in || std::memcmp(header, "NRTRACE1", 8) != 0 || header[2] != 1) {
+    if (!in || std::memcmp(header, "NRTRACE1", 8) != 0 || header[2] != 2) {
         std::cerr << "trace header is invalid\n";
         return 1;
     }
@@ -246,6 +246,7 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
     std::vector<Graph> graphs;
     std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>> graph_slots;
     std::uint64_t records = 0, bytes = sizeof(header);
+    std::uint32_t frames_min = 0xFFFFFFFFU, frames_max = 0;
     std::vector<std::uint8_t> live;
     std::vector<std::int32_t> routes;
     const auto fail = [&](const std::string& what) {
@@ -271,10 +272,13 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
             continue;
         }
         const std::uint32_t columns = head[1], rows = head[2], width = head[3], tokens = head[4], position = head[6];
+        const std::uint32_t frames  = head[7];
         if (kind > 3 || columns == 0 || rows == 0 || rows > lanes || rows * width != columns) {
             return fail("malformed round");
         }
         std::vector<std::int32_t> row_lanes(rows);
+        frames_min = std::min(frames_min, frames);
+        frames_max = std::max(frames_max, frames);
         in.read(reinterpret_cast<char*>(row_lanes.data()), 4LL * rows);
         live.resize((columns + 3) / 4 * 4);
         in.read(reinterpret_cast<char*>(live.data()), static_cast<std::streamsize>(live.size()));
@@ -330,6 +334,8 @@ int check_trace(const std::filesystem::path& path, const std::vector<PromptSpec>
         bytes += sizeof(head) + 4ULL * rows + live.size() + routes.size() * 4;
     }
     int failures = 0;
+    std::printf("trace: expert pool %u..%u frames across %llu records\n", frames_min == 0xFFFFFFFFU ? 0 : frames_min,
+                frames_max, static_cast<unsigned long long>(records));
     if (requests.size() != outcomes.size()) {
         std::cerr << "trace holds " << requests.size() << " requests, expected " << outcomes.size() << '\n';
         ++failures;
