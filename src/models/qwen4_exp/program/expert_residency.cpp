@@ -4,6 +4,7 @@
 
 #include "core/block_copy.h"
 #include "core/copy_batch.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <cmath>
@@ -585,7 +586,13 @@ std::uint32_t ExpertResidency::apply_moves(std::uint8_t* base, cudaStream_t comp
 
 ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStream_t compute,
                                                   std::span<const cudaStream_t> writers) {
-    if (count == 0 || count > lendable()) { throw std::logic_error("expert residency: cannot lend that many frames"); }
+    // A RecoverableExecutionError, not a logic_error: the frame count is a resource condition (the
+    // elastic monitor may have shrunk the cache between the caller's snapshot and this check), and
+    // a plain logic_error would fail the whole engine core instead of the one request. The engine
+    // recovers, keeps serving, and the request retries at the next boundary.
+    if (count == 0 || count > lendable()) {
+        throw runtime::RecoverableExecutionError("expert residency: cannot lend that many frames");
+    }
     finish_demotions(compute, true); // a held frame must not be lent
     // The run's experts move by device copies, which need every promotion landed and published.
     CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
@@ -593,7 +600,7 @@ ExpertResidency::FrameLease ExpertResidency::lend(std::uint32_t count, cudaStrea
     release_reservations();
     const std::vector<std::uint8_t> busy(frames_, 0);
     const auto first = controller_->choose_run(count, busy);
-    if (!first) { throw std::logic_error("expert residency: no run of frames to lend"); }
+    if (!first) { throw runtime::RecoverableExecutionError("expert residency: no run of frames to lend"); }
     commands_.clear();
     stats_.lend_evictions += controller_->lend(*first, count, commands_);
     report_evictions();

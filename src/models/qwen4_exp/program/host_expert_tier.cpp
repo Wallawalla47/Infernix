@@ -83,6 +83,7 @@ HostExpertTier::HostExpertTier(const ExpertStore& store, Options options)
             }
             chunks_.push_back(p);
         }
+        slots_now_ = options_.slots;
         queue_ = std::make_unique<DirectReadQueue>(options_.io);
         for (const auto& path : store_.files()) { files_.push_back(queue_->open(path)); }
     } catch (...) {
@@ -115,6 +116,189 @@ HostExpertTier::~HostExpertTier() {
 const std::uint8_t* HostExpertTier::slot_bytes(std::uint32_t slot) const noexcept {
     return reinterpret_cast<const std::uint8_t*>(chunks_[slot / per_chunk_]) +
            static_cast<std::size_t>(slot % per_chunk_) * store_.record_bytes();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Runtime Host-memory residency: the pinned slots are the largest thing this process holds, and
+// the only way to give that memory back to the OS without stopping the engine. Retiring a chunk
+// makes its keys artifact-only, which is a state the tier already serves (a key the startup fill
+// never reached), so nothing here is on a path the engine was not built to take.
+// ---------------------------------------------------------------------------------------------
+
+std::uint64_t HostExpertTier::host_bytes() const noexcept {
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < chunks_.size(); ++i) {
+        const std::uint32_t first = static_cast<std::uint32_t>(i) * per_chunk_;
+        const std::uint32_t here  = std::min(per_chunk_, slots_now_ - first);
+        total += static_cast<std::uint64_t>(here) * store_.record_bytes();
+    }
+    return total;
+}
+
+std::uint64_t HostExpertTier::host_bytes_max() const noexcept {
+    const std::uint64_t cap = std::min<std::uint64_t>(options_.slots, keys());
+    return cap * store_.record_bytes();
+}
+
+std::uint64_t HostExpertTier::host_bytes_floor() const noexcept {
+    return static_cast<std::uint64_t>(host_slot_floor()) * store_.record_bytes();
+}
+
+bool HostExpertTier::round_open() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return open_;
+}
+
+std::vector<std::uint32_t> HostExpertTier::rank_keys() const {
+    const std::uint32_t layers = store_.layers(), experts = store_.experts();
+    // A key's place in the layer-interleaved order: expert e of every layer before expert e + 1.
+    const auto spread = [&](std::uint32_t key) { return (key % experts) * layers + key / experts; };
+    const auto& lfu   = tier_.lfu();
+    const std::uint32_t count = keys();
+    std::vector<std::uint32_t> order(count);
+    for (std::uint32_t key = 0; key < count; ++key) { order[key] = key; }
+    std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+        const double va = lfu.value(a), vb = lfu.value(b);
+        return va != vb ? va > vb : spread(a) < spread(b);
+    });
+    return order;
+}
+
+HostExpertTier::HostChange HostExpertTier::drop_top_chunks(std::uint32_t chunks) {
+    HostChange out;
+    const auto started     = Clock::now();
+    const std::uint32_t floor_slots = host_slot_floor();
+    std::uint32_t retired = 0;
+    for (std::uint32_t i = 0; i < chunks; ++i) {
+        if (chunks_.empty() || slots_now_ <= floor_slots) {
+            out.stopped = "the slot floor is reached (" + std::to_string(slots_now_) + " slots left, floor " +
+                          std::to_string(floor_slots) + ")";
+            break;
+        }
+        const auto last = static_cast<std::uint32_t>(chunks_.size() - 1);
+        const std::uint32_t chunk_slots = slots_now_ - last * per_chunk_;
+        if (slots_now_ - chunk_slots < floor_slots) {
+            out.stopped = "the next chunk would go below the slot floor (" + std::to_string(floor_slots) +
+                          " slots)";
+            break;
+        }
+        // A landing list, or a pin, still holds a slot of this chunk: its memory cannot go. A Host
+        // release retires whole chunks from the top, so one such slot stops the release there and the
+        // engine says which key and which holder it was. A list member is only there by accident (its
+        // list was replenished from an evicted victim when no free slot was left) and can be moved
+        // below the frontier; a pin or a landing in flight cannot.
+        if (!tier_.tail_retirable(chunk_slots)) {
+            tier_.rehome_lists(slots_now_ - chunk_slots);
+        }
+        if (!tier_.tail_retirable(chunk_slots)) {
+            out.stopped = "the top chunk still has a slot the tier may not retire - " +
+                          tier_.tail_blocker(chunk_slots);
+            break;
+        }
+        out.keys += tier_.retire_tail(chunk_slots);
+        out.slots += chunk_slots;
+        out.bytes += static_cast<std::uint64_t>(chunk_slots) * store_.record_bytes();
+        options_.release(chunks_.back());
+        chunks_.pop_back();
+        slots_now_ -= chunk_slots;
+        ++retired;
+    }
+    out.seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    if (out.slots != 0) { last_host_op_seconds_ = out.seconds; }
+    if (!out.stopped.empty() && retired == chunks) { out.stopped.clear(); } // it went all the way
+    return out;
+}
+
+HostExpertTier::HostChange HostExpertTier::release_host(std::uint64_t bytes) {
+    const std::uint32_t floor_slots = host_slot_floor();
+    if (slots_now_ <= floor_slots) { return {}; }
+    drain(); // no read of a ring slot is in flight
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_) { return {}; } // a round is reading the slots: the caller skipped the idle check
+    }
+    // A release only runs at an idle boundary, so any hold the prefill stream still has belongs to a
+    // copy that is long done: the boundary that releases it (ExpertResidency::before_round) has not
+    // run since the last stream, and leaving the pin set would block its chunk for the life of the
+    // process - one pin costs 1.3 GiB of Host memory that can never be handed back.
+    tier_.release_stream_pins();
+    const std::uint32_t chunk_slots = std::min(per_chunk_, slots_now_);
+    const std::uint64_t chunk_bytes = static_cast<std::uint64_t>(chunk_slots) * store_.record_bytes();
+    const std::uint32_t removable   = (slots_now_ - floor_slots) / per_chunk_;
+    std::uint32_t wanted            = removable;
+    if (bytes != 0) {
+        wanted = static_cast<std::uint32_t>((bytes + chunk_bytes - 1) / chunk_bytes);
+        wanted = std::min(wanted, removable);
+    }
+    return drop_top_chunks(wanted);
+}
+
+HostExpertTier::HostChange HostExpertTier::restore_host(std::uint64_t bytes) {
+    HostChange out;
+    const std::uint32_t cap_slots = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(options_.slots, static_cast<std::uint64_t>(keys())));
+    if (slots_now_ >= cap_slots) { return out; }
+    drain();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (open_) { return out; }
+    }
+    std::uint32_t wanted_slots = cap_slots - slots_now_;
+    if (bytes != 0) {
+        wanted_slots = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(bytes / store_.record_bytes(), wanted_slots));
+    }
+    if (wanted_slots == 0) { return out; }
+    const auto started = Clock::now();
+    const std::uint32_t chunks = (wanted_slots + per_chunk_ - 1) / per_chunk_;
+    std::vector<std::byte*> fresh;
+    std::vector<std::uint32_t> fresh_slots;
+    fresh.reserve(chunks);
+    fresh_slots.reserve(chunks);
+    try {
+        for (std::uint32_t i = 0; i < chunks; ++i) {
+            const std::uint32_t added = slots_now_ + static_cast<std::uint32_t>(fresh_slots.size()) * per_chunk_;
+            const std::uint32_t here  = std::min(per_chunk_, cap_slots - added);
+            if (here == 0) { break; }
+            auto* p = static_cast<std::byte*>(options_.allocate(static_cast<std::size_t>(here) * store_.record_bytes()));
+            if (reinterpret_cast<std::uintptr_t>(p) % DirectReadQueue::kAlignment != 0) {
+                options_.release(p);
+                throw std::runtime_error("SSD tier: expert slots must be 4 KiB-aligned");
+            }
+            fresh.push_back(p);
+            fresh_slots.push_back(here);
+        }
+    } catch (...) {
+        for (auto* p : fresh) { options_.release(p); }
+        throw;
+    }
+    if (fresh.empty()) { return out; }
+    std::uint32_t added = 0;
+    for (const std::uint32_t here : fresh_slots) { added += here; }
+    for (auto* p : fresh) { chunks_.push_back(p); }
+    slots_now_ += added;
+    tier_.grow_slots(slots_now_);
+    out.slots = added;
+    out.bytes = static_cast<std::uint64_t>(added) * store_.record_bytes();
+    try {
+        out.keys = prefill(rank_keys());
+    } catch (...) {
+        // A record that never landed would be served as garbage: give the fresh slots back, which
+        // drops their keys to artifact-only, and let the caller report the failure.
+        const HostChange undone = drop_top_chunks(static_cast<std::uint32_t>(fresh.size()));
+        out.read_failed = true;
+        out.slots -= undone.slots;
+        out.bytes -= undone.bytes;
+        out.seconds = std::chrono::duration<double>(Clock::now() - started).count();
+        last_host_op_seconds_ = out.seconds;
+        throw;
+    }
+    stats_.prefill_reads += out.keys;
+    stats_.run_reads   = agent_run_reads_.load(std::memory_order_relaxed);
+    stats_.run_records = agent_run_records_.load(std::memory_order_relaxed);
+    out.seconds = std::chrono::duration<double>(Clock::now() - started).count();
+    last_host_op_seconds_ = out.seconds;
+    return out;
 }
 
 const std::uint8_t* HostExpertTier::record(std::uint32_t key) const noexcept {

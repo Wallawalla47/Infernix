@@ -615,6 +615,56 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+ResidencyStatus Engine::residency_status() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->residency_status(); }) {
+                return core->residency_status();
+            } else {
+                // The causal-scoring core has no Program and therefore no expert cache to
+                // evict; report "unsupported" rather than failing the whole call.
+                return ResidencyStatus{};
+            }
+        },
+        impl_->core);
+}
+
+void Engine::request_residency(bool release, std::uint32_t frames) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->request_residency(release, frames); }) {
+                core->request_residency(release, frames);
+            } else {
+                throw std::logic_error("the active engine core has no evictable residency");
+            }
+        },
+        impl_->core);
+}
+
+void Engine::request_host_residency(bool release, std::uint64_t bytes) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [&](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (requires { core->request_host_residency(false, std::uint64_t{}); }) {
+                core->request_host_residency(release, bytes);
+            } else {
+                throw std::logic_error("the active engine core has no pinned host expert tier");
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

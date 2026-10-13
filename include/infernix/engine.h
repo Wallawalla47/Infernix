@@ -110,6 +110,21 @@ public:
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
 
+    // Elastic Device expert-cache control (Qwen3.8-Flash-Next, design §19.3.7). A release hands
+    // Device memory back and a restore takes it again, both applied between requests while the
+    // engine keeps running, so another program can have the GPU in between. Engines without an
+    // elastic cache report ResidencyStatus::supported == false and ignore requests.
+    [[nodiscard]] ResidencyStatus residency_status() const;
+    void request_residency(bool release, std::uint32_t frames);
+
+    // The SSD expert tier's pinned Host memory (design §19.3.7), the level its expert records live
+    // in. A release hands `bytes` of it back to the OS (0: as much as the tier may give) and a
+    // restore takes it again and refills it from the artifact; both run between requests while the
+    // engine keeps serving, so a machine that runs out of physical memory can be relieved without
+    // stopping the engine. Engines whose model has no SSD tier report
+    // ResidencyStatus::host.supported == false and ignore the request.
+    void request_host_residency(bool release, std::uint64_t bytes);
+
     void reset_memory_peaks() noexcept;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active

@@ -60,6 +60,11 @@ struct ServeOptions {
     std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
     std::uint64_t ram_headroom_bytes       = kDefaultRamHeadroomBytes;
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
+    bool expert_host_release               = false; // --expert-host-release
+    bool host_guard                        = true;  // --host-guard off
+    std::uint64_t host_guard_release_bytes = 0;     // --host-guard-mib LOW:TARGET:HIGH
+    std::uint64_t host_guard_target_bytes  = 0;
+    std::uint64_t host_guard_restore_bytes = 0;
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;

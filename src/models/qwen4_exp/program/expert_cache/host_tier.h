@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace infernix::models::qwen4_exp::expert_cache {
@@ -107,6 +108,36 @@ public:
 
     // Keys whose host slot changed since the last call (the device pointer table's dirty set).
     void take_dirty(std::vector<std::uint32_t>& keys);
+
+    // ---- runtime size changes (engine thread, no round in flight)
+    // The slots the ring, prefetch and demotion lists occupy; a shrink must leave more than this.
+    [[nodiscard]] std::uint32_t list_slots() const {
+        return config_.ring + config_.prefetch + config_.demotion;
+    }
+    // Whether the highest `count` slots are all free or unpinned residents outside every list, so a
+    // shrink can retire them. Checked by the caller, which may then rely on retire_tail.
+    [[nodiscard]] bool tail_retirable(std::uint32_t count) const;
+    // Why the highest `count` slots cannot be retired: empty when they are all retirable, otherwise
+    // one line naming the first slot that blocks the shrink and what holds it. A Host release gives
+    // up on that slot's whole chunk, so an engine that stops short of the requested bytes has to
+    // say which key and which holder stopped it.
+    [[nodiscard]] std::string tail_blocker(std::uint32_t count) const;
+    // Retires the highest `count` slots: every key whose record lived there loses its Host copy
+    // (SSD-only from here, and in the dirty set for the device table) and the slots are gone for
+    // good, so the caller may hand their pinned bytes back to the OS. Returns how many keys lost
+    // their copy. Throws when the tail is not retirable or would leave no resident slots.
+    std::uint32_t retire_tail(std::uint32_t count);
+    // Takes `slots` slots back (more than the controller holds now): the new ones start free, taken
+    // lowest first, as at construction. Returns how many slots were added.
+    std::uint32_t grow_slots(std::uint32_t slots);
+    // Moves every ring, prefetch and demotion member at or above `keep` to a free slot below it, so
+    // the slots above `keep` can be retired. A list only needs its members to exist somewhere; one
+    // that drifted high (a list is replenished from an evicted victim when no free slot is left)
+    // would otherwise block the retirement of its whole chunk for the life of the process. Returns
+    // how many members moved, or leaves the tier untouched and returns 0 when no free slot below
+    // `keep` is left to move one to. Only safe with no round in flight - the caller is the Host
+    // release, which runs at an idle boundary.
+    std::uint32_t rehome_lists(std::uint32_t keep);
 
     // ---- startup
     // Places `key`'s record into a free resident slot (the warm pre-fill); false when none is left

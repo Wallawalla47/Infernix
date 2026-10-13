@@ -104,6 +104,10 @@ private:
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
+    // GET/POST /v1/internal/residency: read, release or restore the elastic Device expert cache
+    // (Qwen3.8-Flash-Next). POST blocks until the request is applied or its wait_ms deadline passes.
+    void handle_residency_status(const httplib::Request& req, httplib::Response& res) const;
+    void handle_residency_request(const httplib::Request& req, httplib::Response& res);
 
     void record_request_start(const RequestLogContext& context);
     [[nodiscard]] infernix::GenerationSchedulingObserver

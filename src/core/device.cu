@@ -253,7 +253,18 @@ void CudaEventTimer::record_stop() { CUDA_CHECK(cudaEventRecord(stop_, stream_))
 
 float CudaEventTimer::elapsed_ms() const {
     float ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start_, stop_));
+    const cudaError_t err = cudaEventElapsedTime(&ms, start_, stop_);
+    if (err == cudaErrorNotReady) {
+        // The stop event has not completed yet (observed under VRAM pressure when
+        // another program squeezes the device). Timing is a metric, not
+        // correctness: wait for the event once and re-query instead of aborting.
+        const cudaError_t wait = cudaEventSynchronize(stop_);
+        const cudaError_t retry = (wait == cudaSuccess) ? cudaEventElapsedTime(&ms, start_, stop_) : wait;
+        if (retry == cudaErrorNotReady || retry == cudaErrorInvalidResourceHandle) { return 0.0f; }
+        if (retry != cudaSuccess) { CUDA_CHECK(retry); }
+        return ms;
+    }
+    CUDA_CHECK(err);
     return ms;
 }
 

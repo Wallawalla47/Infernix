@@ -158,6 +158,16 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    // Elastic Device expert-cache control (Qwen3.8-Flash-Next, design §19.3.7); see
+    // Engine::request_residency. A release runs between requests, so it never disturbs one.
+    [[nodiscard]] infernix::ResidencyStatus residency_status() const { return engine_->residency_status(); }
+    void request_residency(bool release, std::uint32_t frames) { engine_->request_residency(release, frames); }
+    // Engine::request_host_residency: the SSD tier's pinned Host memory, released and taken back
+    // between requests with the engine still serving (the freed experts come from the artifact).
+    void request_host_residency(bool release, std::uint64_t bytes) {
+        engine_->request_host_residency(release, bytes);
+    }
+
     [[nodiscard]] infernix::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

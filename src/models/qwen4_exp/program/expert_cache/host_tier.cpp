@@ -81,6 +81,145 @@ bool HostTier::eligible(const Slot& s, Victims kind) const {
            s.state == (kind == Victims::kShadow ? SlotState::kShadow : SlotState::kResident);
 }
 
+bool HostTier::tail_retirable(std::uint32_t count) const {
+    if (count > config_.slots) { return false; }
+    for (std::uint32_t s = config_.slots - count; s < config_.slots; ++s) {
+        const Slot& slot = slots_[s];
+        if (slot.pins != 0 || slot.list != SlotList::kNone ||
+            (slot.state != SlotState::kFree && slot.state != SlotState::kResident &&
+             slot.state != SlotState::kShadow)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string HostTier::tail_blocker(std::uint32_t count) const {
+    static const char* const kListNames[]  = {"none", "ring", "prefetch", "demotion"};
+    static const char* const kStateNames[] = {"free", "landing", "resident", "shadow"};
+    if (count > config_.slots) { return "the tail is larger than the slot count"; }
+    for (std::uint32_t s = config_.slots - count; s < config_.slots; ++s) {
+        const Slot& slot = slots_[s];
+        if (slot.pins == 0 && slot.list == SlotList::kNone &&
+            (slot.state == SlotState::kFree || slot.state == SlotState::kResident ||
+             slot.state == SlotState::kShadow)) {
+            continue;
+        }
+        return "slot " + std::to_string(s) + " of " + std::to_string(config_.slots) + " holds key " +
+               std::to_string(slot.key) + ": pins 0x" +
+               std::to_string(static_cast<unsigned>(slot.pins)) + " (" +
+               std::string(slot.pins & kPinH2D ? "H2D " : "") + std::string(slot.pins & kPinQueue ? "queue " : "") +
+               std::string(slot.pins & kPinD2H ? "D2H " : "") + std::string(slot.pins & kPinUse ? "use " : "") +
+               std::string(slot.pins & kPinPrefetch ? "prefetch " : "") +
+               std::string(slot.pins & kPinStream ? "stream " : "") + "), list " +
+               kListNames[static_cast<std::size_t>(slot.list)] + ", state " +
+               kStateNames[static_cast<std::size_t>(slot.state)];
+    }
+    return {};
+}
+
+std::uint32_t HostTier::retire_tail(std::uint32_t count) {
+    if (count == 0) { return 0; }
+    if (count >= config_.slots || config_.slots - count <= list_slots()) {
+        throw std::invalid_argument("HostTier: a shrink must leave more slots than the landing lists");
+    }
+    if (!tail_retirable(count)) { throw std::logic_error("HostTier: the retired tail is not retirable"); }
+    const std::uint32_t keep = config_.slots - count;    std::uint32_t dropped    = 0;
+    for (std::uint32_t s = keep; s < config_.slots; ++s) {
+        Slot& slot = slots_[s];
+        if (slot.state == SlotState::kResident || slot.state == SlotState::kShadow) {
+            // The key keeps no Host copy from here: the artifact is its source, as for any key the
+            // fill never reached. mark_dirty publishes the null pointer to the device's table.
+            slot_of_[slot.key] = -1;
+            mark_dirty(slot.key);
+            --resident_count_;
+            if (slot.state == SlotState::kShadow) { --shadow_count_; }
+            ++dropped;
+        }
+        slot.state = SlotState::kFree;
+        slot.key   = 0;
+        push_victim(s); // ++stamp: no heap entry may name this slot again
+    }
+    slots_.resize(keep);
+    config_.slots = keep;
+    free_resident_.erase(std::remove_if(free_resident_.begin(), free_resident_.end(),
+                                        [keep](std::uint32_t s) { return s >= keep; }),
+                         free_resident_.end());
+    // Heap entries above the new end would read past it; push_victim already stale-marked them.
+    const auto heap_order = [](const HeapEntry& a, const HeapEntry& b) {
+        return heap_after(a.value, a.slot, b.value, b.slot);
+    };
+    for (auto& heap : heap_) {
+        heap.erase(std::remove_if(heap.begin(), heap.end(),
+                                  [keep](const HeapEntry& e) { return e.slot >= keep; }),
+                   heap.end());
+        std::make_heap(heap.begin(), heap.end(), heap_order);
+    }
+    return dropped;
+}
+
+std::uint32_t HostTier::grow_slots(std::uint32_t slots) {
+    if (slots <= config_.slots) { return 0; }
+    const std::uint32_t old = config_.slots;
+    // The new slots start free and in no list, exactly as the constructor leaves them.
+    slots_.resize(slots);
+    config_.slots = slots;
+    for (std::uint32_t s = slots; s-- > old;) { free_resident_.push_back(s); }
+    return slots - old;
+}
+
+std::uint32_t HostTier::rehome_lists(std::uint32_t keep) {
+    if (keep >= config_.slots) { return 0; }
+    // A free slot below the frontier: the lowest first, the same end free_resident_ is taken from.
+    const auto take_free = [&]() -> std::int32_t {
+        for (auto it = free_resident_.end(); it != free_resident_.begin();) {
+            --it;
+            if (*it >= keep) { continue; }
+            const std::uint32_t slot = *it;
+            free_resident_.erase(it);
+            return static_cast<std::int32_t>(slot);
+        }
+        return -1;
+    };
+    std::uint32_t moved = 0;
+    const auto rehome = [&](std::vector<std::uint32_t>& list, SlotList tag) {
+        for (std::uint32_t i = 0; i < list.size();) {
+            const std::uint32_t entry = list[i];
+            if (entry < keep) { ++i; continue; }
+            const std::int32_t fresh = take_free();
+            if (fresh >= 0) {
+                const std::uint32_t to = static_cast<std::uint32_t>(fresh);
+                slots_[entry].list = SlotList::kNone;
+                // The member's new slot keeps the tag and the serial a landing for the old one carried.
+                slots_[to].list   = tag;
+                slots_[to].state  = SlotState::kFree;
+                slots_[to].serial = slots_[entry].serial;
+                push_victim(to);
+                list[i] = to;
+                ++moved;
+                ++i;
+                continue;
+            }
+            // No free slot below the frontier to swap in: a member that carries nothing (a free,
+            // unpinned slot - the ring and the candidate lists hold exactly that between rounds)
+            // can simply leave its list, so a whole-chunk release may retire the tail. Anything
+            // that holds data or a copy in flight stays and stops the release, as before.
+            Slot& stale = slots_[entry];
+            if (stale.state == SlotState::kFree && stale.pins == 0) {
+                stale.list = SlotList::kNone;
+                list.erase(list.begin() + static_cast<std::ptrdiff_t>(i));
+                ++moved;
+                continue;
+            }
+            return; // no room below the frontier: the tail keeps its member
+        }
+    };
+    rehome(ring_, SlotList::kRing);
+    rehome(prefetch_, SlotList::kPrefetch);
+    rehome(demotion_, SlotList::kDemotion);
+    return moved;
+}
+
 void HostTier::push_victim(std::uint32_t slot) {
     Slot& s = slots_[slot];
     ++s.stamp;

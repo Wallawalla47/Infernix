@@ -402,6 +402,21 @@ struct ProgramOptions {
     // free memory must stay above the cache's target before it grows.
     bool vram_monitor              = true;
     double vram_grow_delay_seconds = 30.0;
+    // Host-memory guard for the SSD expert tier. The tier pins the whole expert bank (tens of GiB)
+    // and holds it for the life of the process, so this engine is what runs the machine out of
+    // physical memory when something else (a media job, another model) loads. With the guard on,
+    // every VRAM monitor reading also checks the OS's free Host memory and, below
+    // `host_guard_release_bytes`, hands pinned slots back until it reaches `host_guard_target_bytes`
+    // — and takes them back once free memory passes `host_guard_restore_bytes`. A release never
+    // stops the engine: the retired experts are read from the artifact when a round needs them.
+    // The guard only undoes a release it made itself: one an outside caller asked for
+    // (request_host_residency) stays in force until that caller restores it, because on a machine
+    // with room to spare the freed bytes make free memory look comfortable again immediately.
+    bool host_guard                        = true;
+    std::uint64_t host_guard_release_bytes = 10ULL << 30; // free Host memory below this releases slots
+    std::uint64_t host_guard_target_bytes  = 30ULL << 30; // a release aims at this much free memory
+    std::uint64_t host_guard_restore_bytes = 34ULL << 30; // free Host memory above this takes them back
+    double host_guard_cooldown_seconds     = 120.0;       // least wait between guard actions
     // Internal (measurement tools and tests): when set, every round's routed experts and every CUDA
     // graph executable's device memory are appended to this file for the expert-cache replay and
     // the graph-memory measurement (program/route_trace.h). Changes no result.
@@ -426,6 +441,24 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+
+    // Explicit residency control over the same idle maintenance boundary. `release` asks the cache
+    // to reshape to `frames` frames at the next boundary (0 keeps every expert in pinned Host RAM);
+    // `restore` withdraws the request so the control law sizes the cache again. A release only
+    // takes effect while no request is active, so it can never interrupt a round. Both are
+    // idempotent and callable from any thread; residency_status() reports what happened.
+    void request_residency(bool release, std::uint32_t frames);
+    [[nodiscard]] ResidencyStatus residency_status() const;
+
+    // Explicit control over the SSD expert tier's pinned Host memory, applied at the same idle
+    // maintenance boundary (the tier's slots must not be read while they are retired, so a request
+    // waits for the engine to be idle, exactly as a Device-memory release does). `release` gives
+    // `bytes` of pinned Host memory back to the OS (0: as much as the tier may give, keeping the
+    // landing lists and one chunk of residents); `restore` takes it back and refills it from the
+    // artifact, best-ranked keys first. Neither stops the engine nor interrupts a request. Engines
+    // whose model has no SSD tier report HostResidencyStatus::supported == false.
+    void request_host_residency(bool release, std::uint64_t bytes);
+
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

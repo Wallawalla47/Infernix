@@ -367,6 +367,18 @@ struct EngineOptions {
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
     std::optional<std::uint64_t> expert_ram_bytes;
+    // Qwen3.8-Flash-Next (--expert-host-release): hold the expert records in the SSD tier's chunked
+    // pinned slots even when every expert fits in RAM. The RAM cost and the read rate are the same
+    // (a warm machine reads nothing extra), but the slots are what the engine can hand back to the
+    // OS while it runs, which is what the Host-memory guard needs to work at all.
+    bool expert_host_release = false;
+    // Qwen3.8-Flash-Next (--host-guard-mib): free Host memory that releases pinned expert slots
+    // (below), the free memory a release aims at, and the free memory above which they are taken
+    // back (--host-guard off disables it). Zero keeps the defaults.
+    bool host_guard                       = true;
+    std::uint64_t host_guard_release_bytes = 0;
+    std::uint64_t host_guard_target_bytes  = 0;
+    std::uint64_t host_guard_restore_bytes = 0;
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
@@ -1320,6 +1332,58 @@ struct MemorySummary {
     // after instantiating, uploading and launching every executable); 0 without CUDA Graphs.
     std::size_t cuda_graph_measured_bytes         = 0;
     std::size_t kv_payload_bytes                  = 0;
+};
+
+// Explicit control of an elastic Device expert cache (Qwen3.8-Flash-Next, design §19.3.7). The
+// cache normally sizes itself from free VRAM; a release asks it to give Device memory back now
+// because another program needs it, and a restore withdraws that request. Both are applied at an
+// idle maintenance boundary, with no request active and no round's kernels in flight, so the
+// engine keeps running and only the expert cache changes size. Frames are the cache's fixed-size
+// expert slots; a release to zero keeps every expert in pinned Host RAM.
+// The SSD expert tier's pinned Host memory (design §19.3.7), the level the engine's expert records
+// live in. It is the largest thing the process holds and the one a machine runs out of physical
+// memory on; unlike the Device cache it can be handed to the OS with the engine still running (the
+// freed experts are read from the artifact when used), which is what these counters report.
+struct HostResidencyStatus {
+    bool supported                = false; // the model has an SSD expert tier with pinned Host slots
+    // `forced`/`restore_pending` are transient here: they are set while a caller's (or the guard's)
+    // Host-memory request is being carried out and clear once it has been applied at an idle
+    // boundary. The Device block's `forced` instead stays set for as long as the release is in
+    // force. An engine that has handed its pinned slots back is recognised by `bytes` (down to
+    // `bytes_floor`) and `released_bytes`, and `guard_owned` says who may take them back.
+    bool forced                   = false; // a Host-memory request is in flight right now
+    bool restore_pending          = false; // a refill of Host memory is in flight right now
+    std::uint64_t bytes           = 0;     // pinned Host bytes the tier holds now
+    std::uint64_t bytes_max       = 0;     // the ceiling the tier's options allow
+    std::uint64_t bytes_floor     = 0;     // the least a release may leave
+    std::uint64_t released_bytes  = 0;     // pinned bytes releases and the guard gave back
+    std::uint32_t slots           = 0;     // slots backed now
+    std::uint32_t slot_limit      = 0;     // the most slots the tier may back
+    std::uint32_t slot_bytes      = 0;     // one slot's record size
+    std::uint32_t slots_per_chunk = 0;     // slots one pinned chunk holds
+    std::uint32_t resident_keys   = 0;     // keys with a Host copy now
+    std::uint32_t key_count       = 0;     // every expert key of the model
+    bool guard                    = false; // the tier releases Host memory by itself under pressure
+    std::uint64_t guard_releases  = 0;     // releases the guard made without being asked
+    bool guard_owned              = false; // the release in effect is the guard's, so it may undo it
+    std::uint32_t last_slots      = 0;     // slots the most recent operation retired or added
+    std::uint64_t last_keys       = 0;     // keys the most recent operation dropped or took back
+    double last_op_seconds        = 0.0;   // wall time of the most recent operation
+};
+
+struct ResidencyStatus {
+    bool supported                 = false; // the model has an elastic Device expert cache
+    bool forced                    = false; // an explicit release is in effect
+    bool restore_pending           = false; // an unforced resize back to the control law is due
+    std::uint32_t requested_frames = 0;     // the frame count a release asked for
+    std::uint32_t frames           = 0;     // frames backed now
+    std::uint32_t startup_frames   = 0;     // frames the startup sizing gave
+    std::uint32_t control_target   = 0;     // the control law's most recent goal
+    std::uint32_t frame_limit      = 0;     // the most frames the cache may hold
+    std::uint64_t frame_bytes      = 0;     // one frame's bytes
+    std::uint64_t pool_bytes       = 0;     // Device bytes the frames hold now
+    double last_resize_seconds     = 0.0;   // wall time of the most recent resize
+    HostResidencyStatus host;                // the tier's pinned Host memory, when it has one
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

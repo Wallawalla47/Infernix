@@ -185,14 +185,17 @@ public:
     void after_round(cudaStream_t compute, std::int32_t columns, std::size_t per_layer_budget,
                      std::span<const std::uint8_t> live = {});
 
+    // Publishes the promotions whose copies have completed. Public so an idle boundary that needs
+    // the Host tier quiescent (a Host release) can retire the pins of copies that landed after the
+    // last round: an H2D pin lives until its copy is published, and at idle nobody else publishes.
+    void publish_landed();
+
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     void upload_table(cudaStream_t compute);
     // Returns every reserved landing frame to the pool.
     void release_reservations();
-    // Publishes the promotions whose copies have completed.
-    void publish_landed();
     // Issues commands_' promotion copies on the copy stream, after the table update on `compute`.
     void issue_loads(cudaStream_t compute);
     // Applies commands_' relocations and Absent writes to table_host_ and moves the relocated frames of

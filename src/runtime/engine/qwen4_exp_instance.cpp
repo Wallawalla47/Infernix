@@ -139,7 +139,16 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     // The SSD tier (design §19.3.7): the banks stay in the artifact; the Program pins RAM slots for
     // the experts the ledger leaves room for (less their lock overhead) and reads the rest on use.
-    const bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    // --expert-host-release takes the tier even when every expert fits as a monolithic bank: the RAM
+    // cost and the read rate are the same, but only the tier's chunked slots can be handed back to
+    // the OS while the engine runs (the Host-memory guard), which a full bank never can.
+    bool tier = ledger.placement == models::qwen4_exp::ExpertPlacement::Tier;
+    if (!tier && options.expert_host_release) {
+        tier = true;
+        report(options, DiagnosticLevel::Info,
+               "the SSD expert tier is used although every expert fits in RAM, so the pinned slots "
+               "can be handed back while the engine runs");
+    }
     if (tier) {
         auto streamed           = models::load_options(options, models::Architecture::Qwen4Exp);
         streamed.stream_experts = true;
@@ -218,6 +227,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         program_options.expert_ram_bytes =
             static_cast<std::uint64_t>(static_cast<double>(ledger.expert_ram) / (1.0 + demand.lock_overhead));
     }
+    // The Host-memory guard: this engine pins the expert records for the life of the process, so it
+    // releases them by itself when the OS runs out (a release never stops it).
+    program_options.host_guard = options.host_guard;
+    if (options.host_guard_release_bytes != 0) { program_options.host_guard_release_bytes = options.host_guard_release_bytes; }
+    if (options.host_guard_target_bytes != 0) { program_options.host_guard_target_bytes = options.host_guard_target_bytes; }
+    if (options.host_guard_restore_bytes != 0) { program_options.host_guard_restore_bytes = options.host_guard_restore_bytes; }
 
     // The VRAM check (design §19.3.7), before the weights are read: the dense weights, the
     // Program's fixed allocations, the reserve for graph executables and the display headroom

@@ -38,6 +38,16 @@ void Program::maintain() {
     impl_->maintain_expert_state();
 }
 
+void Program::request_residency(bool release, std::uint32_t frames) {
+    impl_->request_residency(release, frames);
+}
+
+ResidencyStatus Program::residency_status() const { return impl_->residency_status(); }
+
+void Program::request_host_residency(bool release, std::uint64_t bytes) {
+    impl_->request_host_residency(release, bytes);
+}
+
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 
 RequestBasePlan Program::plan_request(PreparedPrompt&& prompt, const runtime::ResolvedExecutionOptions& options) {
