@@ -1197,8 +1197,35 @@ How each part handles the profiles:
   - While the visible context is ≤ 2,051 tokens, every token is selected, and QSA equals dense
     causal attention. The existing prompt kernels serve it, with their P×V options
     (`--prefill-8bit-pv`) unchanged.
-  - Beyond that, the prompt kernel processes a tile of queries against the union of their selected
-    blocks with a per-query mask. It uses the same tile loaders.
+  - Beyond that, the built prompt kernel is one CTA per `(column, kv_head)`: each column gathers its
+    own selected blocks. A shared tile over the union of a query tile's selected blocks with a
+    per-query mask (the QUILT idea, arXiv 2610.11134) was evaluated and **rejected** by Fedor
+    Suchkov on the `kido5217/Infernix` fork ([issue #2](https://github.com/kido5217/Infernix/issues/2),
+    map [#45](https://github.com/kido5217/Infernix/issues/45), 2026-10-13). Iterating the union in
+    ascending block id keeps every query's accumulation order, so the design is legal under the
+    width-invariance contract (`qsa_prompt.h`); what kills it is the register file. A column's state
+    is four warps with 255 registers per thread, so an exactness-preserving shared CTA can keep at
+    most two columns' accumulators live (width 4 needs 130,560 of 65,536 registers). The fraction of
+    per-query block loads a tile-wide union removes, measured on prompt selections captured from the
+    engine with `--prefill-chunk 4096`
+    ([#48](https://github.com/kido5217/Infernix/issues/48)):
+
+    | tile width | 2 | 4 | 8 | 16 | whole chunk |
+    |---|---|---|---|---|---|
+    | 16K | 31.8 % | 54.6 % | 70.4 % | 81.1 % | 99.8 % |
+    | 140K | 27.5 % | 46.0 % | 58.7 % | 67.8 % | 98.4 % |
+
+    At width 2 the saving at >= 128K is below the 30 % the evaluation set as its trigger, and the
+    widths that clear it cannot launch; the whole-chunk figure is an asymptote no CTA can stage.
+    Neighbouring queries here are less correlated than QUILT's models (blocks selected by both
+    queries of a pair: 63.6 % / 55.0 % at 16K / 140K, against the paper's > 85.9 %). With NVFP4 KV
+    a chunk's per-layer working set (12 MiB at 16K, 74-78 MiB at 140K) already fits the 5090's
+    96 MiB L2, so the removed re-reads are mostly load-issue traffic rather than DRAM (INT8 and BF16
+    at 140K exceed L2). No prototype kernel or timing A/B was run. Worth reopening only if the
+    two-column saving rises above ~30 %, if the gather is shown to dominate the prompt attention
+    call where the working set exceeds L2 (no bench separates gather from compute today), or for a thread-block-cluster design (one CTA
+    per column keeps its registers; members share staged union blocks through distributed shared
+    memory), which was not built.
 - **Cost.** K3b reads 2.2 MB per layer per token with `int8`, 4.2 MB with `bf16` and 0.54 MB with
   `vq2`. The decode-time difference across profiles is ≤ 0.04 ms per token. The profiles' real
   effect is **VRAM**: at 256K, `int8` KV is 3.8 GB, 1,381 frames, before the host tier (§9.6) takes
