@@ -7768,7 +7768,8 @@ the drive's knee) remains open.
 #### F5: QSA prompt attention on Tensor Cores
 
 - **Route.** Exactly the calls the FP32 kernel would run unsplit (`ops/qsa/qsa_prompt.{h,cu}`,
-  inside `qsa_attention` after the selection): columns × KV heads above 170, i.e. 86+ columns.
+  inside `qsa_attention` after the selection): `attention_splits` returns 1 once columns × KV heads
+  exceeds half the SMs (`170 / (columns × 2) < 2`), i.e. 43+ columns on an RTX 5090.
   Decode, verification and short suffixes keep the FP32 kernel.
   - **Why this rule and not a width.** Within that class a column's FP32 result never depended on
     its call's width (the kernel's only width dependence is its split count). The prefix cache
