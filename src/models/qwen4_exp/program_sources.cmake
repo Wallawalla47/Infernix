@@ -21,6 +21,7 @@ target_sources(infernix_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/prefill_walk.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/cpu_rates.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/constraint.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/score.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/vision_window.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/route_trace.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/host_expert_tier.cpp"

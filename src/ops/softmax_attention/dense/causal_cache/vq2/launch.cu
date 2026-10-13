@@ -67,6 +67,8 @@ struct VqKvCausalPlan {
 
 VqKvCausalPlan make_vq_kv_causal_plan(int heads, int width, int batch,
                                       CausalAttentionExecutionEnvelope envelope) {
+    // VQ2 plans with the INT8 partition but runs none of its fast-path schedules.
+    envelope.decode_split64 = false;
     VqKvCausalPlan out{
         make_int8_kv_causal_plan(heads, width, batch, envelope, fast_prompt_multiprocessors()), 0};
     out.prompt_split_workspace_bytes = envelope.prompt_split_workspace_bytes;

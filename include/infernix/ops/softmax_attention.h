@@ -44,6 +44,13 @@ struct CausalAttentionExecutionEnvelope {
     // would need more runs fewer splits. The split count changes only rounding. It sizes the
     // workspace, so workspace planning and execution must use the same value.
     std::size_t prompt_split_workspace_bytes = kCausalPromptSplitWorkspaceDefaultBytes;
+    // The decode-split64 fast path (FastPath::DecodeSplit64): INT8-G64 single-column rows with 24
+    // query heads split their keys from 64 instead of 128 per split (more splits at short context,
+    // a different softmax merge order). It meets the storage's criterion against the oracle, but
+    // its arithmetic differs from the default schedule, which stays bit-exact without it. It sizes
+    // the workspace, so workspace planning and execution must use the same value. Other routes and
+    // cache formats ignore it.
+    bool decode_split64 = false;
 };
 
 struct ContextAttentionExecutionEnvelope {

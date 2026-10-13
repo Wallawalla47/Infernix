@@ -12,7 +12,13 @@
 // (Qwen3.8-Flash-Next): it isolates what decoding changes (KV format, chunking, speculation,
 // batching) but not the cost of the stored activation precision itself.
 //
-// Usage: infernix_decode_quality_judge [--stored-activations] <artifact> <corpus.txt> <gen_file>...
+// --report FILE also writes each build's per-segment counts as JSON (segments are independent
+// samples: tools/quality/fast_path_gate.py pairs them between builds).
+//
+// --ngram-volume FILE names a Qwen3.8-Flash-Next n-gram volume (default <artifact>.ngram).
+//
+// Usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>]
+//                                      [--ngram-volume <file>] <artifact> <corpus.txt> <gen_file>...
 
 #include "infernix/engine.h"
 
@@ -50,16 +56,41 @@ std::vector<Segment> read_generation(const std::string& path) {
     return segments;
 }
 
+struct SegmentScore {
+    std::uint64_t tokens = 0;
+    std::uint64_t agree  = 0;
+    double logprob       = 0.0;
+    double regret        = 0.0;
+};
+
 } // namespace
 
 int main(int argc, char** argv) {
-    const bool stored = argc > 1 && std::string(argv[1]) == "--stored-activations";
-    if (stored) {
+    bool stored = false;
+    std::string report_path;
+    std::string ngram_volume;
+    while (argc > 1 && std::string(argv[1]).starts_with("--")) {
+        const std::string option = argv[1];
+        if (option == "--stored-activations") {
+            stored = true;
+        } else if (option == "--report" && argc > 2) {
+            report_path = argv[2];
+            ++argv;
+            --argc;
+        } else if (option == "--ngram-volume" && argc > 2) {
+            ngram_volume = argv[2];
+            ++argv;
+            --argc;
+        } else {
+            std::cerr << "unknown option " << option << '\n';
+            return 2;
+        }
         ++argv;
         --argc;
     }
     if (argc < 4) {
-        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] <artifact> <corpus.txt> <gen_file>...\n";
+        std::cerr << "usage: infernix_decode_quality_judge [--stored-activations] [--report <file.json>] "
+                     "[--ngram-volume <file>] <artifact> <corpus.txt> <gen_file>...\n";
         return 2;
     }
     try {
@@ -82,6 +113,9 @@ int main(int argc, char** argv) {
         options.prefill_chunk   = context;
         options.kv_cache        = infernix::KvCacheStorage::BFloat16;
         options.a16_activations = !stored;
+        // The reference runs the exact route.
+        options.fast_paths      = false;
+        if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
         infernix::Engine engine(options);
 
         std::ifstream corpus(argv[2], std::ios::binary);
@@ -91,6 +125,7 @@ int main(int argc, char** argv) {
         const std::vector<infernix::TokenId> tokens = engine.tokenize_text(text.str());
 
         std::cout << std::fixed << std::setprecision(4);
+        std::vector<std::vector<SegmentScore>> scores(runs.size());
         for (std::size_t run = 0; run < runs.size(); ++run) {
             std::uint64_t count = 0;
             std::uint64_t agree = 0;
@@ -98,6 +133,7 @@ int main(int argc, char** argv) {
             double regret       = 0.0;
             std::vector<std::uint32_t> first_disagreement;
             for (const Segment& segment : runs[run]) {
+                SegmentScore& score = scores[run].emplace_back();
                 if (segment.offset + segment.prompt_tokens > tokens.size()) {
                     throw std::runtime_error("a segment lies outside the corpus: was it the same "
                                              "corpus and artifact tokenizer?");
@@ -111,15 +147,19 @@ int main(int argc, char** argv) {
                     engine.score_tokens(std::move(sequence), segment.prompt_tokens, {.top_k = 1});
                 auto first = static_cast<std::uint32_t>(segment.generated.size());
                 for (std::size_t i = 0; i < segment.generated.size(); ++i) {
-                    ++count;
-                    logprob += scored.logprobs[i];
-                    regret += scored.top_logprobs[i] - scored.logprobs[i];
+                    ++score.tokens;
+                    score.logprob += scored.logprobs[i];
+                    score.regret += scored.top_logprobs[i] - scored.logprobs[i];
                     if (scored.top_ids[i] == segment.generated[i]) {
-                        ++agree;
+                        ++score.agree;
                     } else if (first == segment.generated.size()) {
                         first = static_cast<std::uint32_t>(i);
                     }
                 }
+                count += score.tokens;
+                agree += score.agree;
+                logprob += score.logprob;
+                regret += score.regret;
                 first_disagreement.push_back(first);
             }
             std::sort(first_disagreement.begin(), first_disagreement.end());
@@ -148,6 +188,33 @@ int main(int argc, char** argv) {
                           << ": mean " << shared / static_cast<double>(std::max<std::size_t>(n, 1))
                           << " tokens\n";
             }
+        }
+        if (!report_path.empty()) {
+            std::ofstream report(report_path);
+            if (!report) { throw std::runtime_error("cannot write " + report_path); }
+            report << std::setprecision(17) << "{\"reference\": \""
+                   << (stored ? "stored_activations" : "a16_activations")
+                   << "\", \"runs\": [";
+            for (std::size_t run = 0; run < runs.size(); ++run) {
+                // Generation files are paths the user chose; JSON-escape the two characters a
+                // Windows path may hold that JSON reserves.
+                std::string name;
+                for (const char c : std::string(argv[3 + run])) {
+                    if (c == '\\' || c == '"') { name.push_back('\\'); }
+                    name.push_back(c);
+                }
+                report << (run ? ", " : "") << "{\"file\": \"" << name << "\", \"segments\": [";
+                for (std::size_t s = 0; s < scores[run].size(); ++s) {
+                    const SegmentScore& score = scores[run][s];
+                    report << (s ? ", " : "") << "{\"offset\": " << runs[run][s].offset
+                           << ", \"tokens\": " << score.tokens << ", \"agree\": " << score.agree
+                           << ", \"logprob\": " << score.logprob << ", \"regret\": " << score.regret
+                           << '}';
+                }
+                report << "]}";
+            }
+            report << "]}\n";
+            if (!report) { throw std::runtime_error("cannot write " + report_path); }
         }
         return 0;
     } catch (const std::exception& error) {

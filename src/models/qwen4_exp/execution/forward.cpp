@@ -45,6 +45,16 @@ void project(const Tensor& x, const LinearParameters& p, Tensor& out, WorkspaceA
     ops::linear(x, p.weight, out, p.policy, work, s);
 }
 
+// FP32 logits of the text head (BF16 or Q8) for the columns of x.
+void text_head_logits(const Parameters& parameters, const Tensor& x, Tensor& logits, cudaStream_t s) {
+    if (parameters.output_head_q8) {
+        ops::projection_fp32(x, parameters.output_head_q8->weight, logits, s);
+    } else {
+        const Tensor* head[] = {&parameters.output_head};
+        ops::projection_fp32(x, head, logits, s);
+    }
+}
+
 // The shared expert's SiLU(gate) * up: one fused call for Q8 weights (gate and up stay FP32); BF16
 // weights (recipe A) project, split and multiply.
 void shared_swiglu(const Tensor& x, const LinearParameters& gate_up, Tensor& out, WorkspaceArena& work,
@@ -313,12 +323,20 @@ void Forward::finish(const ForwardBatch& batch, Tensor& residual, Tensor* logits
     Tensor final_x = mix(parameters_.final_mixer, residual, nullptr);
     Tensor last    = work_.alloc(DType::BF16, {H, batch.logit_columns.ne[0]});
     ops::gather_columns(final_x, batch.logit_columns, last, s);
-    if (parameters_.output_head_q8) {
-        ops::projection_fp32(last, parameters_.output_head_q8->weight, *logits, s);
-    } else {
-        const Tensor* head[] = {&parameters_.output_head};
-        ops::projection_fp32(last, head, *logits, s);
+    text_head_logits(parameters_, last, *logits, s);
+}
+
+void Forward::head_logits(const Tensor& residuals, Tensor& logits) {
+    if (residuals.dtype != DType::BF16 || residuals.ne[0] != dim(config_.residual_width()) ||
+        logits.dtype != DType::FP32 || logits.ne[0] != dim(config_.vocab_size) ||
+        logits.ne[1] != residuals.ne[1]) {
+        throw std::invalid_argument(
+            "Qwen4Exp forward: head logits need BF16 [S*H, n] residuals and FP32 [V, n] logits");
     }
+    work_.reset();
+    auto scope           = work_.scope();
+    const Tensor final_x = mix(parameters_.final_mixer, residuals, nullptr);
+    text_head_logits(parameters_, final_x, logits, device_.stream);
 }
 
 Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, Tensor* inject) {
@@ -791,11 +809,8 @@ void Forward::mtp_block(const MtpCall& call, Tensor& rows) {
         Tensor head_logits = work_.alloc(DType::FP32, {rows_out, T});
         if (head.rows) {
             ops::projection_fp32(final_x, head.rows->weight, head_logits, s);
-        } else if (parameters_.output_head_q8) {
-            ops::projection_fp32(final_x, parameters_.output_head_q8->weight, head_logits, s);
         } else {
-            const Tensor* text_head[] = {&parameters_.output_head};
-            ops::projection_fp32(final_x, text_head, head_logits, s);
+            text_head_logits(parameters_, final_x, head_logits, s);
         }
         Tensor narrow = work_.alloc(DType::BF16, {rows_out, T});
         ops::cast_fp32_to_bf16(head_logits, narrow, s);

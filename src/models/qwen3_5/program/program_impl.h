@@ -55,10 +55,12 @@ struct PreparedNgramIndex {
 
 // A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written
 // into the lane's set columns when the request binds) and each step's descriptor relative to
-// the lane (a set index, or the forced-token encoding -2 - token).
+// the lane (a set index, or the forced-token encoding -2 - token), and each step's observed
+// tokens (empty when the request observes nothing).
 struct RequestConstraintPlan {
     std::vector<std::vector<TokenId>> sets;
     std::vector<std::int32_t> step_descriptors;
+    std::vector<std::vector<TokenId>> observe;
     // Unique per planned request, so a lane's uploaded sets are never mistaken for a later
     // request's.
     std::uint64_t serial = 0;
@@ -390,7 +392,7 @@ public:
     const std::uint32_t max_concurrency;
     const ContextCacheOptions context_cache;
     const std::uint32_t prefill_chunk;
-    const PromptAttention prompt_attention;
+    const AttentionSchedule attention_schedule;
     const std::uint32_t draft_window;
     const std::uint32_t neural_draft_window;
     // DFlash2 tree verification: the tree widths each batch size may verify and the most
@@ -449,6 +451,8 @@ public:
     // columns may hold a constraint, and which plan each lane's set columns were written for.
     std::vector<std::int32_t> constraint_descriptors_host_;
     std::size_t constraint_device_columns_ = 0;
+    // The host mirror of the device observe lists (staged only for rounds that observe).
+    std::vector<std::int32_t> constraint_observe_host_;
     std::array<std::uint64_t, kMaximumConcurrency> constraint_bound_serials_{};
     std::uint64_t next_constraint_serial_ = 1;
     std::array<RequestControl, kMaximumConcurrency> requests;
@@ -614,6 +618,7 @@ public:
     // Writes the round's descriptors (row-major, `width` columns per row) for every
     // constrain_logits call the round makes, and resets columns an earlier round constrained.
     void stage_constraint_columns(std::span<const ConstraintRow> rows, std::uint32_t width);
+    void stage_constraint_observations(std::span<const ConstraintRow> rows, std::uint32_t width);
     void bind_constraint_sets(std::uint32_t lane, const RequestConstraintPlan* plan);
     // After the round completed: the draws of `tokens`, produced by consecutive columns from
     // `first_column` for output steps from `first_step`.

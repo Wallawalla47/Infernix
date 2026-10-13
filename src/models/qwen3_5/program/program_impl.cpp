@@ -28,7 +28,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity), max_concurrency(plan.max_concurrency),
       context_cache(plan.context_cache), prefill_chunk(plan.prefill_chunk),
-      prompt_attention(plan.prompt_attention), draft_window(plan.draft_window),
+      attention_schedule(plan.attention_schedule), draft_window(plan.draft_window),
       neural_draft_window(plan.neural_draft_window), tree_widths(plan.tree_widths),
       draft_tree_paths(plan.draft_tree_paths), ngram_draft_window(plan.ngram_draft_window),
       ngram_min_match(plan.ngram_min_match), speculative_backend(plan.speculative_backend),
@@ -158,7 +158,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // Every column starts unconstrained (-1); the choice tables are written per request.
         CUDA_CHECK(cudaMemsetAsync(io.constraint->descriptors.data, 0xff,
                                    io.constraint->descriptors.bytes(), device.stream));
+        CUDA_CHECK(cudaMemsetAsync(io.constraint->observe.data, 0xff,
+                                   io.constraint->observe.bytes(), device.stream));
         constraint_descriptors_host_.assign(kTokenConstraintColumns, -1);
+        constraint_observe_host_.assign(
+            static_cast<std::size_t>(ops::kTokenObserveTokens) * kTokenConstraintColumns, -1);
     }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (plan.persistent.score_hidden) {
@@ -394,7 +398,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             execution::PrefillContext schedule_state{
                 {device, parameters, work, *state_images, nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, prompt_attention},
+                 prefill_chunk, proposal_head, attention_schedule},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,

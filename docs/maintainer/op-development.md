@@ -471,6 +471,15 @@ model-level claim follows [Model-level numerical quality](model-quality.md): sev
 sizes, KL divergence to the 16-bit-activation reference, and the decode-quality judge for decode
 paths.
 
+The oracle leaves private arithmetic free, but the product does not: the exact route's output is
+bit-exact from release to release ([acceptance policy](model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+A schedule or route change that alters an exact-route Op's output bits for speed is a fast path
+(`infernix::FastPath`). The Op exposes it through an envelope or policy field named for the path
+(for example `CausalAttentionExecutionEnvelope::decode_split64`) that model planning sets from the
+configuration's fast-path selection (`models/qwen3_5/program/planning/fast_paths.h`), sizes its
+workspace from the same field, and qualifies it in its suite against the same oracle and criterion
+as the exact schedule. Without the field the exact schedule is unchanged.
+
 ## 7. Performance evidence
 
 An Op microbenchmark measures the public semantic operation at an exact shape, format, layout,

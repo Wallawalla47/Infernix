@@ -95,6 +95,12 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
         constraint.records     = add_tensor(builder, DType::FP32,
                                             {ops::kTokenConstraintRecord, kTokenConstraintColumns},
                                             "constraint records");
+        constraint.observe     = add_tensor(builder, DType::I32,
+                                            {ops::kTokenObserveTokens, kTokenConstraintColumns},
+                                            "constraint observe");
+        constraint.observed    = add_tensor(builder, DType::FP32,
+                                            {ops::kTokenObserveRecord, kTokenConstraintColumns},
+                                            "constraint observed");
     }
     return layout;
 }
@@ -493,13 +499,18 @@ void constrain_round_logits(const RoundState& io, const Tensor& logits, const Te
     Tensor matrix(logits.data, DType::BF16, {rows, count});
     Tensor descriptors = io.constraint->descriptor_view(count);
     Tensor records     = io.constraint->record_view(count);
+    // Observation is always on: its staged lists are -1 for columns nothing observes.
+    const Tensor observe = io.constraint->observe_view(count);
+    Tensor observed      = io.constraint->observed_view(count);
     if (argmax != nullptr) {
         Tensor flat(argmax->data, DType::I32, {count});
         ops::constrain_logits(matrix, &flat, descriptors, io.constraint->choices,
-                              io.constraint->counts, token_domain, records, stream);
+                              io.constraint->counts, token_domain, records, &observe, &observed,
+                              stream);
     } else {
         ops::constrain_logits(matrix, nullptr, descriptors, io.constraint->choices,
-                              io.constraint->counts, token_domain, records, stream);
+                              io.constraint->counts, token_domain, records, &observe, &observed,
+                              stream);
     }
 }
 
@@ -523,6 +534,8 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
             .counts      = layout.constraint->counts.bind(backing),
             .descriptors = layout.constraint->descriptors.bind(backing),
             .records     = layout.constraint->records.bind(backing),
+            .observe     = layout.constraint->observe.bind(backing),
+            .observed    = layout.constraint->observed.bind(backing),
         });
     }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }

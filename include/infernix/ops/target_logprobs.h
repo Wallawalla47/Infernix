@@ -24,13 +24,13 @@ namespace infernix::ops {
  *   [valid_rows,physical_rows) do not participate in either the denominator or target lookup.
  *
  * Supported domain:
- *   logits is contiguous finite BF16, target_ids is contiguous I32, and output is contiguous
+ *   logits is contiguous finite BF16 or FP32, target_ids is contiguous I32, and output is contiguous
  *   FP32. Storage has its dtype's natural alignment.
  *
  * Numeric:
  *   output is the FP32 numerical approximation of ideal. Reduction association and private
  *   accumulator precision are implementation choices; the independent oracle evaluates the full
- *   formula in FP64 from the represented BF16 inputs.
+ *   formula in FP64 from the represented BF16 or FP32 inputs.
  *
  * Effects:
  *   Writes every output element and preserves both inputs. Output must not overlap logits or

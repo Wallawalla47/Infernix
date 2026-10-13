@@ -39,7 +39,8 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 
 void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
                       const Tensor& choices, const Tensor& choice_counts, std::int32_t valid_rows,
-                      Tensor& records, cudaStream_t stream) {
+                      Tensor& records, const Tensor* observe, Tensor* observed,
+                      cudaStream_t stream) {
     if (logits.ne[0] <= 0 || logits.ne[1] <= 0) {
         throw std::invalid_argument("constrain_logits: logits must have positive dimensions");
     }
@@ -54,8 +55,15 @@ void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
     if (valid_rows <= 0 || valid_rows > logits.ne[0]) {
         throw std::invalid_argument("constrain_logits: valid_rows must be in [1, physical_rows]");
     }
-    const Tensor* outputs[] = {&logits, &records, argmax};
-    const Tensor* inputs[]  = {&descriptors, &choices, &choice_counts};
+    if ((observe == nullptr) != (observed == nullptr)) {
+        throw std::invalid_argument("constrain_logits: observe and observed come together");
+    }
+    if (observe != nullptr) {
+        require(*observe, DType::I32, kTokenObserveTokens, columns, "observe");
+        require(*observed, DType::FP32, kTokenObserveRecord, columns, "observed");
+    }
+    const Tensor* outputs[] = {&logits, &records, argmax, observed};
+    const Tensor* inputs[]  = {&descriptors, &choices, &choice_counts, observe};
     if (argmax != nullptr) { require(*argmax, DType::I32, columns, 1, "argmax"); }
     for (const Tensor* output : outputs) {
         if (output == nullptr) { continue; }
@@ -65,13 +73,13 @@ void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
             }
         }
         for (const Tensor* input : inputs) {
-            if (overlaps(*output, *input)) {
+            if (input != nullptr && overlaps(*output, *input)) {
                 throw std::invalid_argument("constrain_logits: outputs must not overlap inputs");
             }
         }
     }
     detail::constrain_logits_launch(logits, argmax, descriptors, choices, choice_counts,
-                                    valid_rows, records, stream);
+                                    valid_rows, records, observe, observed, stream);
 }
 
 } // namespace infernix::ops

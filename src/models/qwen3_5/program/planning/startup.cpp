@@ -2,6 +2,7 @@
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/program/planning/fast_paths.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -399,12 +400,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto chunk  = static_cast<std::int32_t>(chunk_u32);
     const auto drafts = static_cast<std::int32_t>(plan.draft_window);
     const auto verify = drafts + 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks run the selected prompt kernel, which may split keys into workspace (see
+    // Every launch takes the schedule's fast-path permission, which sizes partials (see
     // execution/text.cpp).
+    const ops::CausalAttentionExecutionEnvelope text_envelope =
+        plan.attention_schedule.apply({1, plan.capacity});
+    // Prefill chunks run the selected prompt kernel, which may split keys into workspace.
     const ops::CausalAttentionExecutionEnvelope prefill_envelope =
-        plan.prompt_attention.envelope(1, plan.capacity);
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{1, plan.capacity};
+        plan.attention_schedule.envelope(1, plan.capacity);
+    const ops::CausalAttentionExecutionEnvelope verify_envelope =
+        plan.attention_schedule.apply({1, plan.capacity});
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -1029,7 +1033,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency      = inputs.max_concurrency;
     impl->prefill_chunk        = inputs.prefill_chunk;
-    impl->prompt_attention     = inputs.prompt_attention;
+    impl->attention_schedule   = inputs.attention_schedule;
     impl->draft_window         = inputs.draft_window;
     impl->neural_draft_window  = inputs.neural_draft_window;
     impl->round_shapes         = inputs.round_shapes;
@@ -1127,23 +1131,17 @@ static_assert(std::size_t{kDefaultPrefillSplitWorkspaceMiB} << 20 ==
               ops::kCausalPromptSplitWorkspaceDefaultBytes);
 
 // INT8 and NVFP4 KV prefill with their fast prompt kernels unless the original was selected.
-// Those kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel run their PV in 8 bits
-// when prefill_8bit_pv asks for it or leaves the choice to the KV format.
-PromptAttention prompt_attention(const EngineOptions& options) {
-    const bool fast = uses_fast_int8_prefill(options) ||
-                      (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
-                       !options.original_nvfp4_prefill_kernel);
-    const bool pv8_capable = fast || options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
-                             options.kv_cache == KvCacheStorage::Vq2 ||
-                             options.kv_cache == KvCacheStorage::Q4KeyVq2Value;
-    const bool pv8_auto = options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
-                          options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value ||
-                          options.kv_cache == KvCacheStorage::Vq2;
-    const bool pv8 = options.prefill_8bit_pv == PrefillPv8::On ||
-                     (options.prefill_8bit_pv == PrefillPv8::Auto && pv8_auto);
-    return {.fast = fast,
-            .pv8  = pv8 && pv8_capable,
-            .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20};
+// Prompt P*V runs in FP16 unless the prompt-pv8 fast path is selected, and single-column decode
+// keeps 128-key splits unless decode-split64 is (fast_paths.h).
+AttentionSchedule attention_schedule(const execution::Parameters& parameters,
+                                     const EngineOptions& options) {
+    const FastPathSelection fast_paths = select_fast_paths(parameters.model, options);
+    return {.fast = uses_fast_int8_prefill(options) ||
+                    (options.kv_cache == KvCacheStorage::Nvfp4Group16 &&
+                     !options.original_nvfp4_prefill_kernel),
+            .pv8                   = fast_paths.selected(FastPath::PromptPv8),
+            .split_workspace_bytes = std::size_t{options.prefill_split_workspace_mib} << 20,
+            .decode_split64        = fast_paths.selected(FastPath::DecodeSplit64)};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV
 // run one 128-row CTA of one query head per SM; BF16 KV and the original INT8 and NVFP4 kernels use
@@ -1204,7 +1202,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .capacity            = options.max_context,
         .max_concurrency     = options.max_concurrency,
         .prefill_chunk       = effective_prefill_chunk(parameters, options),
-        .prompt_attention     = prompt_attention(options),
+        .attention_schedule   = attention_schedule(parameters, options),
         .draft_window         = draft_window,
         .speculative_backend  = options.speculative.backend,
         .kv_storage           = options.kv_cache,

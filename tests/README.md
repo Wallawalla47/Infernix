@@ -163,7 +163,7 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/convert tests/bench/ttft \
+  tests/artifact tests/convert tests/bench/ttft tests/quality \
   tests/test_serve_corpus.py
 ```
 

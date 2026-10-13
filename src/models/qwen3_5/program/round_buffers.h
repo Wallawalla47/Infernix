@@ -196,12 +196,15 @@ struct DFlashDecodeStateLayout {
 };
 
 // Constrained-generation controls (TokenConstraint): each lane's permitted sets, the per-column
-// descriptors of the round being executed and the probability records it produces.
+// descriptors of the round being executed and the probability records it produces, and the
+// tokens it observes with their log-probabilities.
 struct TokenConstraintStateLayout {
     TensorRegion choices;
     TensorRegion counts;
     TensorRegion descriptors;
     TensorRegion records;
+    TensorRegion observe;
+    TensorRegion observed;
 };
 
 // Most logits columns one round constrains: every row at the widest verification.
@@ -374,6 +377,10 @@ struct TokenConstraintState {
     Tensor descriptors;
     // FP32 [kTokenConstraintRecord, kTokenConstraintColumns].
     Tensor records;
+    // I32 [kTokenObserveTokens, kTokenConstraintColumns], -1 where nothing is observed, and FP32
+    // [kTokenObserveRecord, kTokenConstraintColumns] (ops::constrain_logits observations).
+    Tensor observe;
+    Tensor observed;
 
     // The first `columns` descriptors and records, for a logits view of that many columns.
     [[nodiscard]] Tensor descriptor_view(std::int32_t columns) const {
@@ -381,6 +388,12 @@ struct TokenConstraintState {
     }
     [[nodiscard]] Tensor record_view(std::int32_t columns) const {
         return records.slice(1, 0, columns);
+    }
+    [[nodiscard]] Tensor observe_view(std::int32_t columns) const {
+        return observe.slice(1, 0, columns);
+    }
+    [[nodiscard]] Tensor observed_view(std::int32_t columns) const {
+        return observed.slice(1, 0, columns);
     }
 };
 

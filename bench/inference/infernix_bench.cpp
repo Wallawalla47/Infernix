@@ -199,7 +199,8 @@ int main(int argc, char** argv) {
         engine_options.kv_cache                          = options.kv_cache;
         engine_options.rope_yarn_factor                  = options.rope_yarn_factor;
         engine_options.original_nvfp4_prefill_kernel     = options.original_nvfp4_prefill_kernel;
-        engine_options.prefill_8bit_pv                   = options.prefill_8bit_pv;
+        engine_options.fast_paths                        = options.fast_paths;
+        engine_options.fast_path_candidates              = options.fast_path_candidates;
         engine_options.prefill_split_workspace_mib       = options.prefill_split_workspace_mib;
         engine_options.ngram_volume_path = options.ngram_volume_path;
         engine_options.ram_headroom_bytes = options.ram_headroom_bytes;
@@ -219,9 +220,9 @@ int main(int argc, char** argv) {
         env.rope_yarn_factor         = options.rope_yarn_factor;
         env.prefill_chunk            = options.prefill_chunk;
         env.original_int8_prefill_kernel = options.original_int8_prefill_kernel;
-        env.prefill_8bit_pv              = options.prefill_8bit_pv;
         env.prefill_split_workspace_mib  = options.prefill_split_workspace_mib;
         env.original_nvfp4_prefill_kernel = options.original_nvfp4_prefill_kernel;
+        env.fast_paths                   = options.fast_paths;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
         env.use_cuda_graph           = options.use_cuda_graph;

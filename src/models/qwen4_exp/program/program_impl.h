@@ -75,10 +75,12 @@ struct VisionAdmission {
 
 // A TokenConstraint compiled for ops::constrain_logits: its distinct multi-token sets (written into
 // the lane's set columns when it is first constrained) and each output step's descriptor relative to
-// the lane (a set index, or the forced-token encoding -2 - token).
+// the lane (a set index, or the forced-token encoding -2 - token), and each step's observed tokens
+// (empty when the request observes nothing).
 struct ConstraintPlan {
     std::vector<std::vector<TokenId>> sets;
     std::vector<std::int32_t> steps;
+    std::vector<std::vector<TokenId>> observe;
     std::uint64_t serial = 0; // unique per planned request: a lane's uploaded sets name their plan
 };
 
@@ -280,8 +282,18 @@ struct DeviceLayout {
     bool kv_elastic             = false;
     std::uint32_t kv_base_pages = 0;
     std::size_t mtp_column_bytes = 0, mtp_ones = 0;
+    // Causal scoring: the window's final residuals (BF16 [S*H, max_context]), one tile's FP32 logits
+    // and its targets, log-probabilities and distributions (ProgramImpl::causal_score).
+    std::size_t score_residuals = 0, score_logits = 0, score_io = 0;
     ProgramDevicePlan bytes;
 };
+
+// Causal scoring's logits tile: 64 columns of FP32 logits (64 MB at 248,320 rows).
+inline constexpr std::int32_t kScoreTileColumns = 64;
+// The tile's I32/FP32 words: targets and their log-probabilities, then top ids and log-probabilities
+// and candidate ids and log-probabilities of up to kMaximumScoreTopTokens per column.
+inline constexpr std::size_t kScoreIoWords =
+    static_cast<std::size_t>(kScoreTileColumns) * (2 + 4 * kMaximumScoreTopTokens);
 
 inline std::uint64_t elapsed_ns(Clock::time_point start) {
     return static_cast<std::uint64_t>(
@@ -480,6 +492,11 @@ public:
         d.logits32     = sizeof(float) * c.vocab_size * lanes * W;
         d.logits16     = 2ULL * c.vocab_size * lanes * W;
         d.token_counts = 4ULL * static_cast<std::size_t>(d.token_domain) * lanes;
+        if (o.causal_scoring) {
+            d.score_residuals = align(2ULL * width * o.max_context);
+            d.score_logits    = align(sizeof(float) * c.vocab_size * kScoreTileColumns);
+            d.score_io        = align(4ULL * kScoreIoWords);
+        }
 
         // The workspace arena (the forward pass, sampling, draft acceptance and the drafter) covers
         // decode, verification and calls of up to kStaticWorkColumns columns; a wider prefill call
@@ -556,7 +573,7 @@ public:
         b.io = d.io.bytes + d.logits32 + d.logits16 + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + kGateStatsBytes * lanes + constraint_bytes(lanes, W) +
-               grammar_mask_bytes(d.token_domain, lanes, W);
+               grammar_mask_bytes(d.token_domain, lanes, W) + d.score_residuals + d.score_logits + d.score_io;
         b.residency            = ExpertResidency::table_bytes(c, d.columns);
         b.expert_record_stride = d.record_stride;
         b.max_frames           = ExpertResidency::max_frames(c);
@@ -694,6 +711,12 @@ public:
         allocate(constraint_, constraint_bytes(lanes, max_width_), allocated);
         allocate(grammar_masks_, grammar_mask_bytes(token_domain_, lanes, max_width_), allocated);
         grammar_host_ = PinnedHostBuffer(grammar_mask_bytes(token_domain_, lanes, max_width_));
+        if (options_.causal_scoring) {
+            allocate(score_residuals_, plan_.score_residuals, allocated);
+            allocate(score_logits_, plan_.score_logits, allocated);
+            allocate(score_io_, plan_.score_io, allocated);
+            score_host_ = PinnedHostBuffer(plan_.score_io);
+        }
         constraint_host_.assign(static_cast<std::size_t>(lanes * max_width_), -1);
         publish_pinned_word(gate_ready(), 0); // pinned memory starts undefined; 0 is never a round's word
 
@@ -1620,6 +1643,7 @@ public:
         // a copy-out of this lane's state still in flight (design §19.3.1).
         next_waits_ = prefix_waits(lane);
         const bool streamed = !walk_.active && stream_chunk(width);
+        score_column_       = begin;
         run(1, width, 1, chunk ? &*chunk : nullptr, stage_vision(lane, static_cast<std::uint32_t>(begin), width), streamed);
         if (last && !prefilling_besides(index)) {
             return_stream_lease();
@@ -3240,6 +3264,8 @@ private:
         // Decode and verification rounds export their final residuals for the MTP catch-up.
         const std::int32_t cols = batch * width;
         if (mtp_ && chunk == nullptr) { fb.residual_out = Tensor(mtp_residuals_.p, DType::BF16, {width_, cols}); }
+        // A scored prompt's calls keep their final residuals for the LM head (causal_score).
+        if (scoring_) { fb.residual_out = score_residuals(score_column_, cols); }
         Tensor logits(logits32_.p, DType::FP32, {vocab_, logit_columns});
         forward_->run(fb, logits);
     }
@@ -4177,19 +4203,41 @@ private:
     }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
 
+    // ---- causal scoring (score.cpp) ----
+    // While a scored prompt prefills, each call's final residuals land in score_residuals_ at its
+    // first position (score_column_ for forward_call; a layer walk's chunks carry their own).
+    DeviceBuffer score_residuals_, score_logits_, score_io_;
+    PinnedHostBuffer score_host_{1};
+    bool scoring_              = false;
+    std::int32_t score_column_ = 0;
+    // Columns [begin, begin + columns) of score_residuals_.
+    [[nodiscard]] Tensor score_residuals(std::int32_t begin, std::int32_t columns) const {
+        return Tensor(static_cast<std::byte*>(score_residuals_.p) +
+                          2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(begin),
+                      DType::BF16, {width_, columns});
+    }
+
+public:
+    ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target, const ScoreOptions& options);
+
+private:
     // ---- /v1/decide (constraint.cpp) ----
     // The constraint controls: each lane's kMaximumConstraintSets sets of up to
-    // ops::kTokenConstraintChoices tokens and their counts, then one descriptor and one probability
-    // record per round column (lanes x max width).
+    // ops::kTokenConstraintChoices tokens and their counts, then one descriptor, one probability
+    // record, one observe list and one observation record per round column (lanes x max width).
     static std::size_t constraint_bytes(std::int32_t lanes, std::int32_t width) noexcept {
         const auto sets    = static_cast<std::size_t>(lanes) * kMaximumConstraintSets;
         const auto columns = static_cast<std::size_t>(lanes) * static_cast<std::size_t>(width);
-        return 4ULL * (sets * ops::kTokenConstraintChoices + sets + columns + columns * ops::kTokenConstraintRecord);
+        return 4ULL * (sets * ops::kTokenConstraintChoices + sets +
+                       columns * (1 + ops::kTokenConstraintRecord + ops::kTokenObserveTokens +
+                                  ops::kTokenObserveRecord));
     }
     [[nodiscard]] std::shared_ptr<const ConstraintPlan> compile_constraint(const TokenConstraint& constraint);
     // Writes the round's descriptors (`width` columns per row, rows in `lanes` order) and the
     // constrained lanes' sets; false (and nothing written) when no row is constrained.
     bool stage_constraints(std::span<const std::uint32_t> lanes, std::int32_t width);
+    // The word offset of the observe lists in constraint_ (the observation records follow them).
+    [[nodiscard]] std::size_t observe_offset() const noexcept;
     // Masks the staged round's columns of `logits` [vocab, columns] and rewrites `argmax` for them.
     void constrain(Tensor& logits, Tensor* argmax);
     // After the round synchronized: the draws of `tokens`, chosen by consecutive columns from

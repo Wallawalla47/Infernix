@@ -39,10 +39,10 @@ KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`
 prompt-attention kernel, and `nvfp4` with its fast kernel over more than 768 visible keys, as
 `infernix-serve` prefills them by default; `--use-original-int8-prefill-kernel` and
 `--use-original-nvfp4-prefill-kernel` score them with the original kernels and require the matching
-`--kv-dtype`. Prompt attention's P×V form follows `infernix-serve`'s per-format default: the fast
-NVFP4 kernel, `k8v4` and `vq2` use their 8-bit forms; INT8 and `k4v2` keep FP16. `--prefill-8bit-pv` and
-`--no-prefill-8bit-pv` force either form. `report.json` records them as
-`original_int8_prefill_kernel`, `prefill_8bit_pv` and `original_nvfp4_prefill_kernel`.
+`--kv-dtype`. As in `infernix-serve`, the fast paths qualified for the artifact and KV format run
+unless `--disable-fast-paths` selects the exact route; `--a16-activations` always runs the exact
+route. `report.json` records the kernels as `original_int8_prefill_kernel` and
+`original_nvfp4_prefill_kernel`, and the fast paths that ran as `fast_paths`.
 
 ```bash
 ./build/apps/infernix-perplexity models/qwen3_8_27b.ninfer \
@@ -74,9 +74,9 @@ each next-token distribution moved. First record a reference, normally with `--k
   --kv-dtype bf16 --save-top-tokens ref-bf16-64k.bin
 ```
 
-`--save-top-tokens FILE` writes each scored position's 32 most probable tokens and their
-log-probabilities (about 270 MB for the full corpus). Then score the setting under test with the
-same corpus, mode, context and stride:
+`--save-top-tokens FILE` writes each scored position's 64 most probable tokens (the most scoring
+returns) and their log-probabilities (about 540 MB for the full corpus). Then score the setting
+under test with the same corpus, mode, context and stride:
 
 ```bash
 ./build/apps/infernix-perplexity models/qwen3_8_27b.ninfer \
@@ -84,16 +84,25 @@ same corpus, mode, context and stride:
   --kv-dtype nvfp4 --kl-reference ref-bf16-64k.bin
 ```
 
-The run scores the reference's 32 tokens at every position and reports KL(reference ‖ this run)
+The run scores the reference's tokens at every position and reports KL(reference ‖ this run)
 over those tokens plus one bucket for all other tokens. Merging the other tokens can only lower the
 divergence, so the result is a lower bound of the full KL divergence; `mean_reference_top_mass`
-shows how much probability the 32 tokens cover. It also reports top-1 agreement (the same most
-probable token) and the mean target-token NLL change. `report.json` gains a `kl_divergence`
+shows how much probability they cover (95 % for 32 tokens on Qwen3.8-27B; references written
+before 2026-10-12 hold 32). It also reports top-1 agreement (the same most probable token) and the
+mean target-token NLL change. `report.json` gains a `kl_divergence`
 object: overall mean, standard deviation and quantiles, and the same statistics by context length,
 the number of tokens before the predicted one, in buckets `[0,1K)`, `[1K,2K)`, `[2K,4K)` and so on.
-Each stream carries its own `kl_divergence`, so stream-level paired comparisons are possible. The
+Each stream and each window carries its own `kl_divergence` (a window's has the overall statistics
+without quantiles or buckets), so stream- and window-level paired comparisons are possible. The
 evaluator refuses a reference recorded for a different corpus, mode, context or stride, or whose
 windows hold different tokens.
+
+`--fast-path NAME` (repeatable) also runs that fast path whether or not it is qualified for the
+configuration; it exists to measure a candidate. Qwen3.8-Flash-Next artifacts score through the
+same route as generation; `--ngram-volume FILE` names their n-gram volume when it is not
+`<artifact>.ngram`, and `--a16-activations` runs every expert bank W4A16. `tools/quality/fast_path_gate.py` pairs an
+exact-route run and a fast-path run window by window to decide the
+[numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
 
 ## Runtime YaRN override
 

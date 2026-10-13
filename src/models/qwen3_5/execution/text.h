@@ -98,9 +98,10 @@ public:
         prefill_split_frontier_ = position;
     }
 
-    // Prompt-attention settings of prefill chunks.
-    void set_prompt_attention(PromptAttention settings) noexcept {
-        prompt_attention_ = settings;
+    // Causal-attention settings: prefill chunks' prompt kernels and every launch's fast-path
+    // permission. Unset, every launch runs the default schedule.
+    void set_attention_schedule(AttentionSchedule settings) noexcept {
+        attention_schedule_ = settings;
     }
     void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
         rewrite_checkpoint_hidden_output_ = output;
@@ -263,7 +264,7 @@ private:
     // Borrowed from Program; every measured chunk retires before this pair is reused.
     CudaEventTimer* prefill_gpu_timer_ = nullptr;
     std::uint32_t prefill_chunk_;
-    PromptAttention prompt_attention_;
+    AttentionSchedule attention_schedule_;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
     const Tensor* active_rope_positions_                                           = nullptr;

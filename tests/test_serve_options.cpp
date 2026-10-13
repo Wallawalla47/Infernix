@@ -905,19 +905,13 @@ int main() {
     failures += check(serve_usage_text("infernix-serve").find("--use-original-nvfp4-prefill-kernel") !=
                           std::string::npos,
                       "serve help omits --use-original-nvfp4-prefill-kernel");
-    failures += check(archive.prefill_8bit_pv == infernix::PrefillPv8::Auto,
-                      "8-bit prefill P*V must default to auto");
-    failures += check(parse({"infernix-serve", "model.ninfer", "--no-prefill-8bit-pv"}).prefill_8bit_pv ==
-                          infernix::PrefillPv8::Off,
-                      "--no-prefill-8bit-pv was not preserved");
-    failures += check(parse({"infernix-serve", "model.ninfer", "--prefill-8bit-pv"}).prefill_8bit_pv ==
-                          infernix::PrefillPv8::On,
-                      "--prefill-8bit-pv was not preserved");
-    failures += check(serve_usage_text("infernix-serve").find("--no-prefill-8bit-pv") !=
-                              std::string::npos &&
-                          serve_usage_text("infernix-serve").find("--prefill-8bit-pv") !=
-                              std::string::npos,
-                      "serve help omits the 8-bit prefill P*V flags");
+    failures += check(archive.fast_paths, "fast paths must default on");
+    failures += check(!parse({"infernix-serve", "model.ninfer", "--disable-fast-paths"}).fast_paths,
+                      "--disable-fast-paths was not preserved");
+    failures += check(serve_usage_text("infernix-serve").find("--disable-fast-paths") != std::string::npos,
+                      "serve help omits --disable-fast-paths");
+    failures += check(serve_usage_text("infernix-serve").find("prefill-8bit-pv") == std::string::npos,
+                      "serve help still lists the removed 8-bit prefill P*V flags");
     failures += check(archive.prefill_split_workspace_mib == infernix::kDefaultPrefillSplitWorkspaceMiB,
                       "the prompt split workspace must default to its product default");
     failures += check(parse({"infernix-serve", "model.ninfer", "--prefill-split-workspace-mib", "0"})

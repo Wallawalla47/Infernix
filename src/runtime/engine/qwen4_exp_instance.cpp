@@ -64,18 +64,28 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
 }
 
 void validate(const EngineOptions& options) {
-    if (options.purpose != EnginePurpose::Generation) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next serves generation only (causal scoring is not wired yet)");
+    if (options.purpose != EnginePurpose::Generation && options.purpose != EnginePurpose::CausalScoring) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next serves generation and causal scoring");
     }
     if ((options.speculative.backend != SpeculativeBackend::None &&
          options.speculative.backend != SpeculativeBackend::Mtp) ||
         options.speculative.ngram_archive_bytes != 0) {
         throw std::invalid_argument("Qwen3.8-Flash-Next speculates with its MTP drafter and n-gram copy proposals");
     }
-    // Its loader binds the stored activation permissions as recorded (canonical W4A4 experts); a
-    // 16-bit-activation reference route is not built, so the option is refused, not ignored.
-    if (options.a16_activations) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next has no 16-bit-activation reference route (a16_activations)");
+    // 16-bit activations run every linear A16 and every expert bank W4A16 (the exact W4A16
+    // arithmetic of design §16.2.1): the quality reference, so causal scoring only, on the exact
+    // route.
+    if (options.a16_activations && options.purpose != EnginePurpose::CausalScoring) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next runs 16-bit activations (the quality reference) for causal scoring only");
+    }
+    if (options.a16_activations && options.fast_paths) {
+        throw std::invalid_argument(
+            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    }
+    // No fast path applies to Qwen3.8-Flash-Next (docs/maintainer/model-quality.md section 6.7).
+    if (!options.fast_path_candidates.empty()) {
+        throw std::invalid_argument("no fast path applies to Qwen3.8-Flash-Next");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
@@ -164,6 +174,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     models::qwen4_exp::ProgramOptions program_options;
     program_options.max_context     = options.max_context;
     program_options.max_concurrency = options.max_concurrency;
+    program_options.causal_scoring  = options.purpose == EnginePurpose::CausalScoring;
     program_options.prefill_chunk   = options.prefill_chunk;
     program_options.kv_cache        = options.kv_cache;
     program_options.diagnostics     = options.diagnostic_observer;
@@ -360,6 +371,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     summary.host_object_count    = stats.host_object_count;
     summary.weight_formats       = {"bf16", "fp32", "nvfp4_mul"};
     summary.prefix_cache         = std::move(restore);
+    summary.fast_path_configuration = "Qwen3.8-Flash-Next";
+    summary.fast_paths_disabled     = !options.fast_paths;
 
     ModelMetadata metadata;
     metadata.model_id       = instance->model->info().name;

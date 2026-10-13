@@ -1,0 +1,1 @@
+{"stream_id": "wikitext-00", "domain": "wikitext", "source": {"repository": "Salesforce/wikitext", "revision": "f776294184f13b8ff2337b3841cf9269a6216d1e", "input": "wikitext-103-raw-v1/validation-00000-of-00001.parquet", "selection": "the whole split"}, "segments": [{"source_id": "wikitext-103-raw-v1/validation", "bytes": 1144245}]}

@@ -23,8 +23,17 @@ constexpr ReductionCriterion kRecordCriterion{
     /*gross_relative_to_max_reference=*/0.0,
 };
 
+// Log-probabilities: the FP32 full-vocabulary log-sum-exp is good to about 1e-6 nat.
+constexpr ReductionCriterion kObservedCriterion{
+    /*relative_l2=*/1.0e-6,
+    /*gross_absolute=*/2.0e-5,
+    /*gross_relative_to_max_reference=*/0.0,
+};
+
 constexpr std::int32_t kChoices = ops::kTokenConstraintChoices;
 constexpr std::int32_t kRecord  = ops::kTokenConstraintRecord;
+constexpr std::int32_t kObserve = ops::kTokenObserveTokens;
+constexpr std::int32_t kObserved = ops::kTokenObserveRecord;
 const std::uint16_t kNegativeInfinity = 0xff80;
 
 std::vector<std::uint16_t> random_logits(std::int32_t physical_rows, std::int32_t valid_rows,
@@ -47,16 +56,21 @@ struct Expected {
     std::vector<std::uint16_t> logits;
     std::vector<double> records;
     std::vector<std::int32_t> argmax;
+    // NaN where the Op leaves the observation untouched.
+    std::vector<double> observed;
 };
 
 // Independent FP64 evaluation of the contract from the represented BF16 inputs.
 Expected oracle(const std::vector<std::uint16_t>& logits, std::int32_t physical_rows,
                 std::int32_t valid_rows, const std::vector<std::int32_t>& descriptors,
                 const std::vector<std::int32_t>& choices, const std::vector<std::int32_t>& counts,
-                std::int32_t untouched_argmax, double untouched_record) {
+                const std::vector<std::int32_t>& observe, std::int32_t untouched_argmax,
+                double untouched_record) {
     Expected expected{logits,
                       std::vector<double>(descriptors.size() * kRecord, untouched_record),
-                      std::vector<std::int32_t>(descriptors.size(), untouched_argmax)};
+                      std::vector<std::int32_t>(descriptors.size(), untouched_argmax),
+                      std::vector<double>(descriptors.size() * kObserved,
+                                          std::numeric_limits<double>::quiet_NaN())};
     for (std::size_t column = 0; column < descriptors.size(); ++column) {
         const std::int32_t descriptor = descriptors[column];
         if (descriptor == -1) { continue; }
@@ -98,6 +112,16 @@ Expected oracle(const std::vector<std::uint16_t>& logits, std::int32_t physical_
         }
         expected.records[column * kRecord + kChoices] = restricted / full;
         expected.argmax[column]                       = best;
+        if (!observe.empty()) {
+            const double log_full = top + std::log(full);
+            for (std::int32_t i = 0; i < kObserve; ++i) {
+                const std::int32_t token = observe[column * kObserve + i];
+                if (token >= 0 && token < valid_rows) {
+                    expected.observed[column * kObserved + i] = value(token) - log_full;
+                }
+            }
+            expected.observed[column * kObserved + kObserve] = top - log_full;
+        }
         for (std::int32_t row = 0; row < valid_rows; ++row) {
             if (std::find(permitted.begin(), permitted.end(), row) == permitted.end()) {
                 expected.logits[base + row] = kNegativeInfinity;
@@ -110,7 +134,7 @@ Expected oracle(const std::vector<std::uint16_t>& logits, std::int32_t physical_
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
              const std::vector<std::uint16_t>& logits, const std::vector<std::int32_t>& descriptors,
              const std::vector<std::int32_t>& choices, const std::vector<std::int32_t>& counts,
-             bool with_argmax) {
+             bool with_argmax, const std::vector<std::int32_t>& observe = {}) {
     const auto columns = static_cast<std::int32_t>(descriptors.size());
     const auto sets    = static_cast<std::int32_t>(counts.size());
     // Unwritten outputs keep the 0xcd fill: argmax 0xcdcdcdcd, records the float of that pattern.
@@ -123,7 +147,8 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
         return value;
     }();
     const Expected expected = oracle(logits, physical_rows, valid_rows, descriptors, choices,
-                                     counts, kFilledI32, static_cast<double>(filled_f32));
+                                     counts, observe, kFilledI32, static_cast<double>(filled_f32));
+    const bool observing = !observe.empty();
 
     GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer device_descriptors(descriptors.size() * sizeof(std::int32_t));
@@ -131,6 +156,10 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     GuardedDeviceBuffer device_counts(counts.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_argmax(descriptors.size() * sizeof(std::int32_t));
     GuardedDeviceBuffer device_records(descriptors.size() * kRecord * sizeof(float));
+    GuardedDeviceBuffer device_observe(descriptors.size() * kObserve * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_observed(descriptors.size() * kObserved * sizeof(float));
+    if (observing) { device_observe.copy_from_host(observe.data(), device_observe.bytes()); }
+    device_observed.fill(0xcd);
     device_logits.copy_from_host(logits.data(), device_logits.bytes());
     device_descriptors.copy_from_host(descriptors.data(), device_descriptors.bytes());
     device_choices.copy_from_host(choices.data(), device_choices.bytes());
@@ -144,8 +173,12 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     Tensor count_tensor(device_counts.data(), DType::I32, {sets});
     Tensor argmax_tensor(device_argmax.data(), DType::I32, {columns});
     Tensor record_tensor(device_records.data(), DType::FP32, {kRecord, columns});
+    Tensor observe_tensor(device_observe.data(), DType::I32, {kObserve, columns});
+    Tensor observed_tensor(device_observed.data(), DType::FP32, {kObserved, columns});
     ops::constrain_logits(logits_tensor, with_argmax ? &argmax_tensor : nullptr, descriptor_tensor,
-                          choice_tensor, count_tensor, valid_rows, record_tensor, nullptr);
+                          choice_tensor, count_tensor, valid_rows, record_tensor,
+                          observing ? &observe_tensor : nullptr,
+                          observing ? &observed_tensor : nullptr, nullptr);
     cuda_synchronize();
 
     const auto records = from_device<float>(device_records.data(), expected.records.size());
@@ -183,10 +216,50 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     failures += verify_exact((label + " preserves descriptors").c_str(),
                              from_device<std::int32_t>(device_descriptors.data(), descriptors.size()),
                              descriptors);
+    // Observations: written exactly where the oracle defines them, the 0xcd fill elsewhere.
+    const auto observed = from_device<float>(device_observed.data(), expected.observed.size());
+    std::vector<double> observed_values;
+    std::vector<double> observed_expected;
+    std::vector<std::uint32_t> unobserved_bits;
+    for (std::size_t index = 0; index < observed.size(); ++index) {
+        if (std::isnan(expected.observed[index])) {
+            std::uint32_t bits = 0;
+            std::memcpy(&bits, &observed[index], sizeof(bits));
+            unobserved_bits.push_back(bits);
+        } else {
+            observed_values.push_back(observed[index]);
+            observed_expected.push_back(expected.observed[index]);
+        }
+    }
+    if (!observed_values.empty()) {
+        failures += verify_reduction(label + " observed log-probabilities", observed_values,
+                                     observed_expected, kObservedCriterion);
+    }
+    failures += verify_exact((label + " leaves unobserved entries").c_str(), unobserved_bits,
+                             std::vector<std::uint32_t>(unobserved_bits.size(), 0xcdcdcdcdu));
     failures += device_logits.verify_guards(label + " logits guards");
     failures += device_argmax.verify_guards(label + " argmax guards");
     failures += device_records.verify_guards(label + " record guards");
+    failures += device_observed.verify_guards(label + " observed guards");
     return failures;
+}
+
+// Observe lists for `columns` columns: column c names `count(c)` tokens spread over the valid rows
+// (including row 0 and the last valid row), then -1; `stray` (if not -1) replaces one entry.
+std::vector<std::int32_t> observe_lists(std::int32_t columns, std::int32_t valid_rows,
+                                        std::int32_t stray) {
+    std::vector<std::int32_t> observe(static_cast<std::size_t>(columns) * kObserve, -1);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::int32_t count = column % 3 == 0 ? kObserve : (column % 3 == 1 ? 1 : 17);
+        for (std::int32_t i = 0; i < count; ++i) {
+            const std::int64_t spread = static_cast<std::int64_t>(i) * (valid_rows - 1) /
+                                        std::max(1, kObserve - 1);
+            observe[column * kObserve + i] =
+                i == count - 1 && count > 1 ? valid_rows - 1 : static_cast<std::int32_t>(spread);
+        }
+    }
+    if (stray != -1) { observe[kObserve + 3] = stray; }
+    return observe;
 }
 
 template <class Function>
@@ -215,23 +288,46 @@ int run_validation_cases() {
 
     int failures = 0;
     failures += expect_invalid("constrain_logits rejects valid_rows=0", [&] {
-        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 0, records, nullptr);
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 0, records,
+                              nullptr, nullptr, nullptr);
     });
     failures += expect_invalid("constrain_logits rejects a descriptor count mismatch", [&] {
         Tensor wrong(descriptor_data.p, DType::I32, {2});
-        ops::constrain_logits(logits, nullptr, wrong, choices, counts, 8, records, nullptr);
+        ops::constrain_logits(logits, nullptr, wrong, choices, counts, 8, records,
+                              nullptr, nullptr, nullptr);
     });
     failures += expect_invalid("constrain_logits rejects a choice table of the wrong width", [&] {
         Tensor wrong(choice_data.p, DType::I32, {kChoices - 1, 2});
-        ops::constrain_logits(logits, nullptr, descriptors, wrong, counts, 8, records, nullptr);
+        ops::constrain_logits(logits, nullptr, descriptors, wrong, counts, 8, records,
+                              nullptr, nullptr, nullptr);
     });
     failures += expect_invalid("constrain_logits rejects a short record", [&] {
         Tensor wrong(record_data.p, DType::FP32, {kChoices, 3});
-        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, wrong, nullptr);
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, wrong,
+                              nullptr, nullptr, nullptr);
     });
     failures += expect_invalid("constrain_logits rejects records aliasing logits", [&] {
         Tensor alias(logits_data.p, DType::FP32, {kRecord, 3});
-        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, alias, nullptr);
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, alias,
+                              nullptr, nullptr, nullptr);
+    });
+    DeviceBuffer observe_data(kObserve * 3 * sizeof(std::int32_t));
+    DeviceBuffer observed_data(kObserved * 3 * sizeof(float));
+    Tensor observe(observe_data.p, DType::I32, {kObserve, 3});
+    Tensor observed(observed_data.p, DType::FP32, {kObserved, 3});
+    failures += expect_invalid("constrain_logits rejects observe without observed", [&] {
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, records, &observe,
+                              nullptr, nullptr);
+    });
+    failures += expect_invalid("constrain_logits rejects a short observation record", [&] {
+        Tensor wrong(observed_data.p, DType::FP32, {kObserve, 3});
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, records, &observe,
+                              &wrong, nullptr);
+    });
+    failures += expect_invalid("constrain_logits rejects observed aliasing records", [&] {
+        Tensor alias(record_data.p, DType::FP32, {kObserved, 3});
+        ops::constrain_logits(logits, nullptr, descriptors, choices, counts, 8, records, &observe,
+                              &alias, nullptr);
     });
     return failures;
 }
@@ -279,6 +375,14 @@ int main() {
     bad_choices[1]                        = 515;
     failures += run_case("constrain_logits ignores tokens beyond the valid rows", 523, 509,
                          random_logits(523, 509, 3, 3), {-2 - 515, 0, -1}, bad_choices, {4}, true);
+    // Observations at the production vocabulary: full, single and partial lists, on constrained
+    // columns only, one entry beyond the valid rows (left untouched).
+    failures += run_case("constrain_logits observes a full vocabulary", 248320, 248077,
+                         random_logits(248320, 248077, 8, 11), mixed, choices, counts, true,
+                         observe_lists(8, 248077, 248100));
+    // Equal logits: every observed token and the maximum share one log-probability, -log(V).
+    failures += run_case("constrain_logits observes equal logits", 523, 509, flat, {0, -1, 0, -2 - 508},
+                         small_choices, {4}, true, observe_lists(4, 509, -1));
     failures += run_validation_cases();
     if (failures == 0) { std::cout << "constrain_logits tests passed\n"; }
     return failures == 0 ? 0 : 1;

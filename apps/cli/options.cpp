@@ -149,14 +149,6 @@ std::string usage_text(const char* argv0) {
            "  --use-original-int8-prefill-kernel\n"
            "                           prefill INT8 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
-           "  --prefill-8bit-pv        INT8 and K4V2 KV: run prompt attention's P*V on 8-bit\n"
-           "                           Tensor Cores (up to 5-7 % faster long-prompt prefill,\n"
-           "                           but a measurable KL divergence from a BF16 KV\n"
-           "                           reference, so FP16 P*V is the default)\n"
-           "  --no-prefill-8bit-pv     NVFP4, K8V4 and VQ2 KV: run prompt attention's P*V in\n"
-           "                           FP16 instead of 8 bits (5-7 % slower long-prompt\n"
-           "                           prefill; the default 8-bit form stays within 1.1x\n"
-           "                           FP16's KL divergence from BF16 KV)\n"
            "  --use-original-nvfp4-prefill-kernel\n"
            "                           prefill NVFP4 KV with the original prompt kernel\n"
            "                           (default: the fast kernel)\n"
@@ -167,6 +159,10 @@ std::string usage_text(const char* argv0) {
            "; 128-384 recommended). Less frees KV cache but\n"
            "                           slows 1-2K-token chunks over long context (64: up\n"
            "                           to 27% slower attention; 0: no splitting)\n"
+           "  --disable-fast-paths     run the exact route: without it, every faster kernel\n"
+           "                           qualified for this model's activation precision and\n"
+           "                           KV type runs (within Infernix's numerical quality\n"
+           "                           policy; startup lists them; docs/cli.md)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2 speculative backend\n"
@@ -385,15 +381,13 @@ Options parse_options(int argc, char** argv) {
             options.use_cuda_graph = false;
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::On;
-        } else if (arg == "--no-prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::Off;
         } else if (arg == "--prefill-split-workspace-mib") {
             options.prefill_split_workspace_mib =
                 parse_u32(value(arg), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
+        } else if (arg == "--disable-fast-paths") {
+            options.fast_paths = false;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

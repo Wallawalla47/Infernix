@@ -5,6 +5,11 @@ infernix_add_test(infernix_ngram_archive_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_ngram_archive.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/ngram.cpp")
 
+# Fast-path selection rules: where each path applies and which configurations qualify it.
+infernix_add_test(infernix_qwen3_5_fast_paths_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fast_paths.cpp"
+  LIBRARIES infernix_engine infernix::json)
+
 infernix_add_test(infernix_qwen3_5_tree_width_controller_test SOURCES
   "${CMAKE_CURRENT_LIST_DIR}/test_tree_width_controller.cpp"
   "${PROJECT_SOURCE_DIR}/src/models/qwen3_5/program/speculative/tree_width_controller.cpp")

@@ -1,0 +1,25 @@
+{
+  "corpus_id": "infernix-decode-v1",
+  "streams": [
+    {
+      "id": "pg19-00",
+      "domain": "pg19",
+      "path": "data/pg19/00.txt"
+    },
+    {
+      "id": "wikitext-00",
+      "domain": "wikitext",
+      "path": "data/wikitext/00.txt"
+    },
+    {
+      "id": "zhwiki-00",
+      "domain": "zhwiki",
+      "path": "data/zhwiki/00.txt"
+    },
+    {
+      "id": "sglang-00",
+      "domain": "sglang",
+      "path": "data/sglang/00.txt"
+    }
+  ]
+}

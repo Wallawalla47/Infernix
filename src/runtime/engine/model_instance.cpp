@@ -4,6 +4,7 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/qwen3_5/program/planning/fast_paths.h"
 
 #include <algorithm>
 #include <system_error>
@@ -85,6 +86,11 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
         throw std::invalid_argument(
             "the original NVFP4 prefill kernel requires the NVFP4 KV cache (--kv-dtype nvfp4)");
     }
+    // 16-bit activations are the reference the fast paths are measured against.
+    if (options.a16_activations && (options.fast_paths || !options.fast_path_candidates.empty())) {
+        throw std::invalid_argument(
+            "16-bit activations (the quality reference) run the exact route: disable fast paths");
+    }
 }
 
 namespace {
@@ -136,6 +142,9 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";yarn=" + std::to_string(options.rope_yarn_factor);
     out += ";host_state=" +
            std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
+    // Fast paths change the numbers cached KV and state hold.
+    out += ";fast=" + std::to_string(options.fast_paths ? 1 : 0);
+    for (const FastPath path : options.fast_path_candidates) { out += std::string(",") + fast_path_name(path); }
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }
@@ -369,6 +378,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         }
     }
     summary.weight_formats.assign(formats.begin(), formats.end());
+    {
+        const models::qwen3_5::FastPathSelection fast =
+            models::qwen3_5::select_fast_paths(*instance->model, options);
+        summary.fast_path_configuration = models::qwen3_5::describe(fast.configuration);
+        for (const FastPath path : fast.paths) { summary.fast_paths.emplace_back(fast_path_name(path)); }
+        summary.fast_paths_disabled = !options.fast_paths;
+    }
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

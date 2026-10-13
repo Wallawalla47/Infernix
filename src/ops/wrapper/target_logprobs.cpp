@@ -45,8 +45,8 @@ bool overlaps(const Tensor& lhs, const Tensor& rhs) {
 
 void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_t valid_rows,
                      Tensor& output, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) {
-        throw std::invalid_argument("target_logprobs: logits must be BF16");
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("target_logprobs: logits must be BF16 or FP32");
     }
     if (target_ids.dtype != DType::I32) {
         throw std::invalid_argument("target_logprobs: target_ids must be I32");
@@ -70,7 +70,7 @@ void target_logprobs(const Tensor& logits, const Tensor& target_ids, std::int32_
     (void)logits.bytes();
     (void)target_ids.bytes();
     (void)output.bytes();
-    require_accessible(logits, alignof(std::uint16_t), "logits");
+    require_accessible(logits, logits.dtype == DType::FP32 ? alignof(float) : alignof(std::uint16_t), "logits");
     require_accessible(target_ids, alignof(std::int32_t), "target_ids");
     require_accessible(output, alignof(float), "output");
     if (overlaps(output, logits) || overlaps(output, target_ids)) {

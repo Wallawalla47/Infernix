@@ -11,19 +11,24 @@
 
 #include <algorithm>
 #include <iterator>
+#include <utility>
+#include <vector>
 
 namespace infernix::models::qwen4_exp::detail {
 
 namespace {
 
-constexpr std::size_t kSets    = kMaximumConstraintSets;
-constexpr std::size_t kChoices = ops::kTokenConstraintChoices;
-constexpr std::size_t kRecord  = ops::kTokenConstraintRecord;
+constexpr std::size_t kSets     = kMaximumConstraintSets;
+constexpr std::size_t kChoices  = ops::kTokenConstraintChoices;
+constexpr std::size_t kRecord   = ops::kTokenConstraintRecord;
+constexpr std::size_t kObserve  = ops::kTokenObserveTokens;
+constexpr std::size_t kObserved = ops::kTokenObserveRecord;
 
 } // namespace
 
 // The constraint_ buffer: choices [kChoices, lanes x kSets], counts [lanes x kSets], descriptors
-// [columns], records [kRecord, columns] (all 4-byte words).
+// [columns], records [kRecord, columns], observe [kObserve, columns], observed [kObserved, columns]
+// (all 4-byte words; columns = lanes x max width).
 std::shared_ptr<const ConstraintPlan> ProgramImpl::compile_constraint(const TokenConstraint& constraint) {
     if (constraint.empty()) { return nullptr; }
     auto plan = std::make_shared<ConstraintPlan>();
@@ -47,7 +52,16 @@ std::shared_ptr<const ConstraintPlan> ProgramImpl::compile_constraint(const Toke
         }
         plan->steps.push_back(static_cast<std::int32_t>(set - plan->sets.begin()));
     }
-    plan->serial = next_constraint_serial_++;
+    for (const std::vector<TokenId>& observed : constraint.observe) {
+        if (observed.size() > kObserve) { throw std::invalid_argument("constraint step observes too many tokens"); }
+        for (const TokenId id : observed) {
+            if (id < 0 || id >= token_domain_) {
+                throw std::invalid_argument("observed token is outside the public token domain");
+            }
+        }
+    }
+    plan->observe = constraint.observe;
+    plan->serial  = next_constraint_serial_++;
     return plan;
 }
 
@@ -90,8 +104,28 @@ bool ProgramImpl::stage_constraints(std::span<const std::uint32_t> lanes, std::i
     }
     CUDA_CHECK(cudaMemcpyAsync(words + sets_total * (kChoices + 1), constraint_host_.data(), 4ULL * columns,
                                cudaMemcpyHostToDevice, s));
+    // Every constrained round stages its observe lists: -1 where the step observes nothing.
+    std::vector<std::int32_t> observe(columns * kObserve, -1);
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        const Lane& lane = lanes_[lanes[row]];
+        if (!lane.constraint || lane.constraint->observe.empty()) { continue; }
+        const std::size_t first = lane.history.size() - lane.prompt_tokens;
+        for (std::size_t j = 0; j < static_cast<std::size_t>(width) && first + j < lane.constraint->observe.size();
+             ++j) {
+            const std::vector<TokenId>& tokens = lane.constraint->observe[first + j];
+            std::copy(tokens.begin(), tokens.end(),
+                      observe.begin() + static_cast<std::ptrdiff_t>((row * static_cast<std::size_t>(width) + j) * kObserve));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(words + observe_offset(), observe.data(), 4ULL * observe.size(), cudaMemcpyHostToDevice,
+                               s));
     constraint_columns_ = static_cast<std::int32_t>(columns);
     return true;
+}
+
+std::size_t ProgramImpl::observe_offset() const noexcept {
+    const std::size_t sets_total = static_cast<std::size_t>(options_.max_concurrency) * kSets;
+    return sets_total * (kChoices + 1) + constraint_host_.size() * (1 + kRecord);
 }
 
 void ProgramImpl::constrain(Tensor& logits, Tensor* argmax) {
@@ -104,7 +138,11 @@ void ProgramImpl::constrain(Tensor& logits, Tensor* argmax) {
     const Tensor descriptors(words + sets_total * (kChoices + 1), DType::I32, {columns});
     Tensor records(words + sets_total * (kChoices + 1) + constraint_host_.size(), DType::FP32,
                    {static_cast<std::int32_t>(kRecord), columns});
-    ops::constrain_logits(logits, argmax, descriptors, choices, counts, token_domain_, records, device_.stream);
+    const Tensor observe(words + observe_offset(), DType::I32, {static_cast<std::int32_t>(kObserve), columns});
+    Tensor observed(words + observe_offset() + constraint_host_.size() * kObserve, DType::FP32,
+                    {static_cast<std::int32_t>(kObserved), columns});
+    ops::constrain_logits(logits, argmax, descriptors, choices, counts, token_domain_, records, &observe, &observed,
+                          device_.stream);
 }
 
 void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, std::span<const std::int32_t> tokens) {
@@ -119,6 +157,14 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
                           first_column * kRecord;
     std::vector<float> host(tokens.size() * kRecord);
     CUDA_CHECK(cudaMemcpy(host.data(), records, 4ULL * host.size(), cudaMemcpyDeviceToHost));
+    std::vector<float> observed;
+    if (!plan.observe.empty()) {
+        observed.resize(tokens.size() * kObserved);
+        const auto* values = reinterpret_cast<const float*>(static_cast<const std::int32_t*>(constraint_.p) +
+                                                            observe_offset() + constraint_host_.size() * kObserve) +
+                             first_column * kObserved;
+        CUDA_CHECK(cudaMemcpy(observed.data(), values, 4ULL * observed.size(), cudaMemcpyDeviceToHost));
+    }
     const std::size_t first = lane.history.size() - lane.prompt_tokens;
     lane.constraint_round.clear();
     for (std::size_t i = 0; i < tokens.size(); ++i) {
@@ -128,9 +174,15 @@ void ProgramImpl::take_constraint_draws(Lane& lane, std::size_t first_column, st
         const std::int32_t d     = plan.steps[first + i];
         const std::size_t count  = d >= 0 ? plan.sets[static_cast<std::size_t>(d)].size() : 1U;
         const float* record      = host.data() + i * kRecord;
-        lane.constraint_round.push_back(ConstrainedDraw{.token         = tokens[i],
-                                                        .probabilities = std::vector<float>(record, record + count),
-                                                        .mass          = record[kChoices]});
+        ConstrainedDraw draw{.token         = tokens[i],
+                             .probabilities = std::vector<float>(record, record + count),
+                             .mass          = record[kChoices]};
+        if (!plan.observe.empty()) {
+            const float* values = observed.data() + i * kObserved;
+            draw.observed_logprobs.assign(values, values + plan.observe[first + i].size());
+            draw.top_logprob = values[kObserve];
+        }
+        lane.constraint_round.push_back(std::move(draw));
     }
 }
 

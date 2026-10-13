@@ -27,13 +27,13 @@ namespace infernix::ops {
  *   the selection nor lse.
  *
  * Supported domain:
- *   logits is contiguous finite BF16, ids is contiguous I32, and output is contiguous FP32.
- *   Storage has its dtype's natural alignment.
+ *   logits is contiguous finite BF16 or FP32, ids is contiguous I32, and output is contiguous
+ *   FP32. Storage has its dtype's natural alignment.
  *
  * Numeric:
  *   ids is exact. output is the FP32 numerical approximation of ideal; reduction association and
  *   private accumulator precision are implementation choices, and the independent oracle
- *   evaluates lse in FP64 from the represented BF16 inputs.
+ *   evaluates lse in FP64 from the represented BF16 or FP32 inputs.
  *
  * Effects:
  *   Writes every ids and output element and preserves logits. Neither output overlaps logits or

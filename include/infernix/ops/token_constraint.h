@@ -13,6 +13,11 @@ inline constexpr std::int32_t kTokenConstraintChoices = 16;
 // Probability record per constrained column: the restricted distribution over the permitted
 // tokens in their declared order, padded with zeros, then the permitted tokens' total mass.
 inline constexpr std::int32_t kTokenConstraintRecord = kTokenConstraintChoices + 1;
+// Most tokens one constrained column may observe.
+inline constexpr std::int32_t kTokenObserveTokens = 64;
+// Observation record per constrained column: the observed tokens' log-probabilities in their
+// declared order, then the column's largest log-probability.
+inline constexpr std::int32_t kTokenObserveRecord = kTokenObserveTokens + 1;
 
 /**
  * Op: Constrain logits to a permitted token set
@@ -33,24 +38,36 @@ inline constexpr std::int32_t kTokenConstraintRecord = kTokenConstraintChoices +
  *   So a sampler reading the column afterwards (greedy or stochastic, with or without penalties)
  *   can only draw a permitted token, and a greedy fast path reading argmax agrees with it.
  *
+ *   With observe and observed (both or neither), a constrained column also reports, from the
+ *   unmasked logits, with L = log sum_{r<V} exp(l[r]):
+ *
+ *     observed[i,c]  = l[t] - L  for t = observe[i,c] in [0,V); entries with t == -1 are left
+ *                      untouched;
+ *     observed[64,c] = max_{r<V} l[r] - L.
+ *
+ *   So a reader can compare the column's distribution with a reference's top tokens (KL over
+ *   them) and tell whether a given token is the column's most probable.
+ *
  * Logical shapes:
  *   logits is [physical_rows,C], descriptors and argmax are [C], choices is
  *   [kTokenConstraintChoices,S] and choice_counts is [S] with S>0, and records is
- *   [kTokenConstraintRecord,C].
+ *   [kTokenConstraintRecord,C]; observe is [kTokenObserveTokens,C] and observed is
+ *   [kTokenObserveRecord,C].
  *
  * Supported domain:
  *   logits is contiguous finite BF16; descriptors, choices, choice_counts and argmax are
  *   contiguous I32; records is contiguous FP32. Every descriptor is -1, below -1 naming a token in
  *   [0,V), or a set index in [0,S); every used count is in [1,16] and its tokens are distinct
- *   members of [0,V). A column whose descriptor or set breaks this is left untouched.
+ *   members of [0,V). A column whose descriptor or set breaks this is left untouched. observe is
+ *   contiguous I32 with every entry -1 or in [0,V); observed is contiguous FP32.
  *
  * Numeric:
- *   records are FP32 approximations of the formulas above from the represented BF16 logits; the
- *   independent oracle evaluates them in FP64. argmax and the masked logits are exact.
+ *   records and observed are FP32 approximations of the formulas above from the represented BF16
+ *   logits; the independent oracle evaluates them in FP64. argmax and the masked logits are exact.
  *
  * Effects:
- *   Mutates logits in place; writes argmax (when non-null) and records for constrained columns
- *   only. No output may overlap another argument.
+ *   Mutates logits in place; writes argmax (when non-null), records and observed (when non-null)
+ *   for constrained columns only. No output may overlap another argument.
  *
  * Workspace:
  *   None.
@@ -61,6 +78,7 @@ inline constexpr std::int32_t kTokenConstraintRecord = kTokenConstraintChoices +
  */
 void constrain_logits(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
                       const Tensor& choices, const Tensor& choice_counts, std::int32_t valid_rows,
-                      Tensor& records, cudaStream_t stream);
+                      Tensor& records, const Tensor* observe, Tensor* observed,
+                      cudaStream_t stream);
 
 } // namespace infernix::ops

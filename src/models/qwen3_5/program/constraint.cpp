@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -75,6 +76,35 @@ void ProgramImpl::stage_constraint_columns(std::span<const ConstraintRow> rows,
                                extent * sizeof(std::int32_t), cudaMemcpyHostToDevice,
                                device.stream));
     constraint_device_columns_ = constrained ? columns : 0;
+    stage_constraint_observations(rows, width);
+}
+
+void ProgramImpl::stage_constraint_observations(std::span<const ConstraintRow> rows,
+                                                std::uint32_t width) {
+    // Lists a round stages for columns it does not observe are -1; the observations a column
+    // left from an earlier round are never read, since only observing steps read theirs back.
+    const bool observing = std::any_of(rows.begin(), rows.end(), [](const ConstraintRow& row) {
+        return row.plan != nullptr && !row.plan->observe.empty();
+    });
+    if (!observing) { return; }
+    constexpr std::size_t kObserve = ops::kTokenObserveTokens;
+    const std::size_t columns      = rows.size() * width;
+    std::vector<std::int32_t>& host = constraint_observe_host_;
+    std::fill(host.begin(), host.begin() + static_cast<std::ptrdiff_t>(columns * kObserve), -1);
+    for (std::size_t index = 0; index < rows.size(); ++index) {
+        const ConstraintRow& row = rows[index];
+        if (row.plan == nullptr || row.plan->observe.empty()) { continue; }
+        for (std::uint32_t column = 0; column < width; ++column) {
+            const std::size_t step = static_cast<std::size_t>(row.first_step) + column;
+            if (step >= row.plan->observe.size()) { break; }
+            const std::vector<TokenId>& tokens = row.plan->observe[step];
+            std::copy(tokens.begin(), tokens.end(),
+                      host.begin() + static_cast<std::ptrdiff_t>((index * width + column) * kObserve));
+        }
+    }
+    CUDA_CHECK(cudaMemcpyAsync(io.constraint->observe.data, host.data(),
+                               columns * kObserve * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                               device.stream));
 }
 
 std::vector<ConstrainedDraw>
@@ -89,6 +119,15 @@ ProgramImpl::read_constraint_draws(const RequestConstraintPlan& plan, std::uint3
                           static_cast<const float*>(io.constraint->records.data) +
                               first_column * kRecord,
                           records.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    constexpr std::size_t kObserved = ops::kTokenObserveRecord;
+    std::vector<float> observed;
+    if (!plan.observe.empty()) {
+        observed.resize(tokens.size() * kObserved);
+        CUDA_CHECK(cudaMemcpy(observed.data(),
+                              static_cast<const float*>(io.constraint->observed.data) +
+                                  first_column * kObserved,
+                              observed.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    }
     std::vector<ConstrainedDraw> draws;
     draws.reserve(tokens.size());
     for (std::size_t index = 0; index < tokens.size(); ++index) {
@@ -100,11 +139,17 @@ ProgramImpl::read_constraint_draws(const RequestConstraintPlan& plan, std::uint3
         const std::size_t permitted =
             descriptor >= 0 ? plan.sets[static_cast<std::size_t>(descriptor)].size() : 1U;
         const float* record = records.data() + index * kRecord;
-        draws.push_back(ConstrainedDraw{
+        ConstrainedDraw draw{
             .token         = tokens[index],
             .probabilities = std::vector<float>(record, record + permitted),
             .mass          = record[ops::kTokenConstraintChoices],
-        });
+        };
+        if (!plan.observe.empty()) {
+            const float* values = observed.data() + index * kObserved;
+            draw.observed_logprobs.assign(values, values + plan.observe[step].size());
+            draw.top_logprob = values[ops::kTokenObserveTokens];
+        }
+        draws.push_back(std::move(draw));
     }
     return draws;
 }

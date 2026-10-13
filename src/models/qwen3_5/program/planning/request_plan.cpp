@@ -103,6 +103,18 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
         constraint.step_descriptors.push_back(
             static_cast<std::int32_t>(set - constraint.sets.begin()));
     }
+    for (const std::vector<TokenId>& observed : options.constraint.observe) {
+        if (observed.size() > ops::kTokenObserveTokens) {
+            throw std::invalid_argument("constraint step observes too many tokens");
+        }
+        for (const TokenId id : observed) {
+            if (id < 0 ||
+                id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                throw std::invalid_argument("observed token is outside the public token domain");
+            }
+        }
+    }
+    constraint.observe = options.constraint.observe;
     if (const auto& rewrite = prompt.identity.rewrite_checkpoint;
         rewrite &&
         (rewrite->recovery_frontier == 0 || rewrite->recovery_frontier > rewrite->frontier ||

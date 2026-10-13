@@ -17,8 +17,9 @@
 
 namespace infernix::perplexity {
 
-// Most probable tokens a reference keeps per scored position.
-inline constexpr std::uint32_t kReferenceTopTokens = 32;
+// Most probable tokens a reference keeps per scored position: the most Engine::score_tokens returns,
+// so the KL lower bound resolves as much of the distribution as scoring can.
+inline constexpr std::uint32_t kReferenceTopTokens = kMaximumScoreTopTokens;
 
 // The scoring a reference describes; a comparison must repeat it exactly.
 struct ReferenceHeader {
@@ -102,6 +103,8 @@ public:
     [[nodiscard]] double top1_agreement() const;
     // Overall statistics with KL quantiles, and per-bucket statistics.
     [[nodiscard]] nlohmann::json to_json() const;
+    // Overall statistics only (one window's entry in the report).
+    [[nodiscard]] nlohmann::json summary_json() const { return overall_.to_json(); }
     // Mean KL by bucket, "label mean" pairs for a log line.
     [[nodiscard]] std::string bucket_summary() const;
 

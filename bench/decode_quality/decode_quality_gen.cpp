@@ -1,15 +1,20 @@
 // End-to-end decode quality, generator half. Greedy continuations of fixed segments of a UTF-8
 // corpus, written as token ids, through the production decode path: DFlash2 with 7 drafts and the
 // optimized proposal head, INT8 KV, CUDA Graph decode; with `mtp`, Qwen3.8-Flash-Next's: its MTP
-// drafter with 4 drafts and the optimized proposal head. infernix_decode_quality_judge scores the
-// output of any number of builds against one reference.
+// drafter with 4 drafts and the optimized proposal head; with `plain`, no speculation (one token per
+// round, the single-column decode kernels). Fast paths run as in infernix-serve; `exact` runs the
+// exact route (EngineOptions::fast_paths off) and `path=NAME` also runs that fast path whether or
+// not it is qualified (qualification).
+// infernix_decode_quality_judge scores the output of any number of builds against one reference.
 //
 // This file uses only Engine API that NInfer also has, so the same source builds in an
 // NInfer checkout (define INFERNIX_DECODE_QUALITY_NINFER there: it drops n-gram and MTP drafting,
-// which NInfer lacks). That is how bench/README.md compares Infernix's decode with NInfer's.
+// and the fast-path options, which NInfer lacks). That is how bench/README.md compares Infernix's
+// decode with NInfer's.
 //
 // Usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> <prompt_tokens>
-//                                  <new_tokens> [ngram] [mtp]
+//                                  <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]...
+//                                  [ngram-volume=FILE] (Qwen3.8-Flash-Next; default <artifact>.ngram)
 // Output, one line per segment: <corpus token offset> <prompt_tokens> <generated ids...>
 
 #include "infernix/engine.h"
@@ -26,27 +31,42 @@
 int main(int argc, char** argv) {
     if (argc < 7) {
         std::cerr << "usage: infernix_decode_quality_gen <artifact> <corpus.txt> <out.txt> <segments> "
-                     "<prompt_tokens> <new_tokens> [ngram] [mtp]\n";
+                     "<prompt_tokens> <new_tokens> [ngram] [mtp] [plain] [exact] [path=NAME]...\n";
         return 2;
     }
     try {
         const auto segments      = static_cast<std::uint32_t>(std::stoul(argv[4]));
         const auto prompt_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         const auto new_tokens    = static_cast<std::uint32_t>(std::stoul(argv[6]));
-        bool ngram = false, mtp = false;
+        bool ngram = false, mtp = false, plain = false, exact = false;
+        std::vector<std::string> paths;
+        std::string ngram_volume;
         for (int i = 7; i < argc; ++i) {
             const std::string flag = argv[i];
             if (flag == "ngram") {
                 ngram = true;
             } else if (flag == "mtp") {
                 mtp = true;
+            } else if (flag == "plain") {
+                plain = true;
+            } else if (flag == "exact") {
+                exact = true;
+            } else if (flag.starts_with("ngram-volume=")) {
+                ngram_volume = flag.substr(13);
+            } else if (flag.starts_with("path=")) {
+                paths.push_back(flag.substr(5));
             } else {
-                std::cerr << "unknown option " << flag << " (ngram, mtp)\n";
+                std::cerr << "unknown option " << flag
+                          << " (ngram, mtp, plain, exact, path=NAME, ngram-volume=FILE)\n";
                 return 2;
             }
         }
         if (segments == 0 || prompt_tokens == 0 || new_tokens == 0) {
             std::cerr << "segments, prompt_tokens and new_tokens must be positive\n";
+            return 2;
+        }
+        if (plain && (mtp || ngram)) {
+            std::cerr << "plain decoding drafts nothing (no mtp or ngram)\n";
             return 2;
         }
 
@@ -81,6 +101,24 @@ int main(int argc, char** argv) {
             options.speculative.ngram_min_match    = 12;
 #endif
         }
+        if (plain) { options.speculative = {}; }
+#if defined(INFERNIX_DECODE_QUALITY_NINFER)
+        if (exact || !paths.empty()) {
+            std::cerr << "fast-path options are not available in NInfer\n";
+            return 2;
+        }
+#else
+        options.fast_paths = !exact;
+        for (const std::string& name : paths) {
+            const std::optional<infernix::FastPath> path = infernix::parse_fast_path(name);
+            if (!path) {
+                std::cerr << "unknown fast path " << name << '\n';
+                return 2;
+            }
+            options.fast_path_candidates.push_back(*path);
+        }
+#endif
+        if (!ngram_volume.empty()) { options.ngram_volume_path = ngram_volume; }
         infernix::Engine engine(options);
 
         std::ifstream corpus(argv[2], std::ios::binary);

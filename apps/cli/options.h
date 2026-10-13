@@ -42,9 +42,10 @@ struct Options {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    // Off with --disable-fast-paths (EngineOptions::fast_paths).
+    bool fast_paths = true;
     SpeculativeOptions speculative;
     bool enable_vision                     = false;
     VisionOffload vision_offload                    = VisionOffload::Auto;

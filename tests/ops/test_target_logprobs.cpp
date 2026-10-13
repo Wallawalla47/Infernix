@@ -171,6 +171,53 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
     return failures;
 }
 
+// FP32 logits (the Qwen3.8-Flash-Next head's) with detail below BF16 precision, so a kernel that read
+// them as BF16 would miss the criterion; the oracle evaluates the formula in FP64 from the FP32 values.
+int run_case_fp32(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
+                  std::int32_t columns, std::int32_t per_column = 1) {
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (std::int32_t row = 0; row < physical_rows; ++row) {
+            const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 2654435761u +
+                                        static_cast<std::uint32_t>(column + 1) * 40503u;
+            logits[base + static_cast<std::size_t>(row)] =
+                row < valid_rows ? -20.0f + static_cast<float>(mixed % 1000003u) * (24.0f / 1000003.0f) : 90.0f;
+        }
+    }
+    const auto targets = make_targets(valid_rows, columns, per_column);
+    std::vector<double> expected(targets.size());
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        double maximum         = -std::numeric_limits<double>::infinity();
+        for (std::int32_t row = 0; row < valid_rows; ++row) { maximum = std::max(maximum, static_cast<double>(logits[base + row])); }
+        double sum = 0.0;
+        for (std::int32_t row = 0; row < valid_rows; ++row) { sum += std::exp(static_cast<double>(logits[base + row]) - maximum); }
+        for (std::int32_t target = 0; target < per_column; ++target) {
+            const std::size_t index = static_cast<std::size_t>(column) * per_column + target;
+            expected[index] = static_cast<double>(logits[base + targets[index]]) - maximum - std::log(sum);
+        }
+    }
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(float));
+    GuardedDeviceBuffer device_targets(targets.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer device_output(targets.size() * sizeof(float));
+    device_logits.copy_from_host(logits.data(), device_logits.bytes());
+    device_targets.copy_from_host(targets.data(), device_targets.bytes());
+    device_output.fill(0xcd);
+    Tensor logits_tensor(device_logits.data(), DType::FP32, {physical_rows, columns});
+    Tensor targets_tensor(device_targets.data(), DType::I32, {per_column, columns});
+    Tensor output_tensor(device_output.data(), DType::FP32, {per_column, columns});
+    ops::target_logprobs(logits_tensor, targets_tensor, valid_rows, output_tensor, nullptr);
+    cuda_synchronize();
+    int failures = verify_reduction(label, fp32_as_double(device_output.data(), targets.size()), expected,
+                                    kTargetLogprobsFp32Criterion);
+    failures += verify_exact((label + " preserves logits").c_str(), from_device<float>(device_logits.data(), logits.size()),
+                             logits);
+    failures += device_logits.verify_guards(label + " logits guards");
+    failures += device_output.verify_guards(label + " output guards");
+    return failures;
+}
+
 template <class Function>
 int expect_invalid(const char* label, Function&& function) {
     try {
@@ -203,6 +250,10 @@ int run_validation_cases() {
     failures += expect_invalid("target_logprobs rejects output target-count mismatch", [&] {
         Tensor wrong_output(output_data.p, DType::FP32, {3, 1});
         ops::target_logprobs(logits, targets, 8, wrong_output, nullptr);
+    });
+    failures += expect_invalid("target_logprobs rejects I32 logits", [&] {
+        Tensor wrong_logits(logits_data.p, DType::I32, {8, 3});
+        ops::target_logprobs(wrong_logits, targets, 8, output, nullptr);
     });
     failures += expect_invalid("target_logprobs rejects output dtype", [&] {
         Tensor wrong_output(output_data.p, DType::BF16, {1, 3});
@@ -256,6 +307,8 @@ int main() {
                          make_shift_logits(257, 257, 31, 0.0f));
     failures += run_case("target_logprobs shifted logits", 257, 257, 31,
                          make_shift_logits(257, 257, 31, 32.0f));
+    failures += run_case_fp32("target_logprobs FP32 full vocabulary C=3", 248320, 248077, 3);
+    failures += run_case_fp32("target_logprobs FP32 T=40 C=257", 523, 509, 257, 40);
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " target_logprobs\n";

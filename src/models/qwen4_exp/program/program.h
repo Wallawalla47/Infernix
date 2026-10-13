@@ -324,6 +324,9 @@ struct PrefixCachePersistence {
 struct ProgramOptions {
     std::uint32_t max_context     = 0;
     std::uint32_t max_concurrency = 1;
+    // Teacher-forced scoring (EnginePurpose::CausalScoring, causal_score): the device plan adds the
+    // final-mixer output of a max_context window and one tile of FP32 logits.
+    bool causal_scoring = false;
     std::uint32_t prefill_chunk   = 1024;
     // Main KV capacity in tokens, shared by every lane.
     std::uint32_t kv_capacity_tokens = 0;
@@ -530,6 +533,12 @@ public:
     // when it has been written since the last save or load (Engine periodic save,
     // HybridPrefixCacheOptions::persistent_save_interval). Absent without a file or a change.
     [[nodiscard]] std::optional<PrefixCachePersistence> save_prefix_cache_now(const CancellationView& abandoned);
+
+    // Teacher-forced scoring of a text prompt (ProgramOptions::causal_scoring; an idle Program): the
+    // log-probability of each token from first_target on given the tokens before it, with the
+    // top_k distribution and the candidates' log-probabilities (ScoreOptions).
+    [[nodiscard]] ScoreResult causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                           const ScoreOptions& options);
 
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;

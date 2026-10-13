@@ -51,24 +51,37 @@ enum class KvCacheStorage : std::uint8_t {
     Q4KeyVq2Value,
 };
 
-// How prompt attention runs P*V where its kernel has an 8-bit form (the fast INT8 and NVFP4
-// prompt kernels, K8V4's tiled kernel and the VQ2 and K4V2 prompt kernel). Auto keeps FP16 P*V
-// for INT8 and K4V2 KV, whose 8-bit forms cost measurable KL divergence against FP16's at 64K
-// context, and uses the 8-bit form for NVFP4, K8V4 and VQ2 KV, where it is numerically equivalent
-// or nearly so (see the README).
-enum class PrefillPv8 : std::uint8_t {
-    Auto,
-    On,
-    Off,
+// A fast path: a route whose arithmetic differs from the default route's, run only under
+// EngineOptions::fast_paths and only for the configurations it is qualified for
+// (docs/maintainer/model-quality.md section 6.7 lists each with its evidence).
+enum class FastPath : std::uint8_t {
+    // Prompt attention runs P*V in 8 bits where the KV format's prompt kernel has that form: the
+    // fast INT8 kernel rounds each probability times its key's V group scale to a u8 code per
+    // 64-key tile; the fast NVFP4 kernel (over more than 768 visible keys) and K8V4's tiled kernel
+    // round probabilities and decoded V to E4M3; the VQ2 and K4V2 prompt kernel uses its integer
+    // form over the tile's INT8 V rows. The default route runs FP16 P*V.
+    PromptPv8,
+    // INT8 KV with 24 query heads: single-column decode rows split their keys from 64 rather than
+    // 128 (a different softmax merge order).
+    DecodeSplit64,
 };
 
-[[nodiscard]] constexpr const char* prefill_pv8_name(PrefillPv8 policy) noexcept {
-    switch (policy) {
-    case PrefillPv8::Auto: return "auto";
-    case PrefillPv8::On: return "on";
-    case PrefillPv8::Off: return "off";
+inline constexpr std::array<FastPath, 2> kFastPaths{FastPath::PromptPv8, FastPath::DecodeSplit64};
+
+[[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
+    switch (path) {
+    case FastPath::PromptPv8: return "prompt-pv8";
+    case FastPath::DecodeSplit64: return "decode-split64";
     }
-    return "auto";
+    return "unknown";
+}
+
+// The fast path named by fast_path_name, or empty.
+[[nodiscard]] constexpr std::optional<FastPath> parse_fast_path(std::string_view name) noexcept {
+    for (const FastPath path : kFastPaths) {
+        if (name == fast_path_name(path)) { return path; }
+    }
+    return std::nullopt;
 }
 
 enum class EnginePurpose : std::uint8_t {
@@ -355,13 +368,6 @@ struct EngineOptions {
     // prompt-attention waves. True selects the original INT8 prompt kernel at the requested chunk;
     // it requires the INT8 KV cache.
     bool original_int8_prefill_kernel  = false;
-    // Prompt attention's P*V form where its kernel has both: the fast INT8 kernel's 8-bit form
-    // rounds each probability (times its key's V group scale) to a u8 code per 64-key tile and
-    // multiplies the stored V codes exactly, and the fast NVFP4 and the K8V4 prompt kernels round
-    // probabilities and decoded V to E4M3; both are faster long-prompt prefill for a precision
-    // change of P (and NVFP4/K8V4 V). BF16 and FP8 KV and the original INT8 and NVFP4 prompt
-    // kernels have only FP16 P*V, which this setting leaves alone.
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     // Workspace (MiB, [0,16384]) the FP32 partials of one prompt-attention launch may take when
     // it splits its keys across SMs (the INT8 and NVFP4 fast prompt kernels, FP8 and K8V4).
     // Larger budgets speed up prompt chunks of about 1-2K tokens over long cached context and take
@@ -376,6 +382,17 @@ struct EngineOptions {
     // measuring what activation quantization costs (infernix-perplexity --a16-activations, the
     // decode-quality judge). On the Qwen3.8-27B NVFP4 artifacts prefill is at least 3x slower.
     bool a16_activations               = false;
+    // Run every fast path qualified for this configuration (model geometry, activation precision
+    // and KV format): routes whose arithmetic differs from the exact route but whose measured cost
+    // stays within Infernix's numerical acceptance policy (docs/maintainer/model-quality.md
+    // section 6; the registry is 6.7). LoadSummary::fast_paths reports the selection. False
+    // (--disable-fast-paths) runs the exact route, which is bit-exact from release to release and
+    // is the quality reference's route; 16-bit activations (a16_activations) require it.
+    bool fast_paths                    = true;
+    // Qualification only (the quality tools, never a product route): also run these fast paths
+    // whether or not they are qualified for this configuration, so their cost can be measured.
+    // Each must apply to the configuration (its kernel must run in it).
+    std::vector<FastPath> fast_path_candidates;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -499,12 +516,18 @@ inline constexpr std::uint32_t kMaximumReadoutTokens = 256;
 inline constexpr std::uint32_t kMaximumConstraintSteps   = 64;
 inline constexpr std::uint32_t kMaximumConstraintChoices = 16;
 inline constexpr std::uint32_t kMaximumConstraintSets    = 4;
+// Most tokens one constrained step may observe.
+inline constexpr std::uint32_t kMaximumObservedTokens    = 64;
 
 // Output step i may only produce a token of steps[i]; a one-token step forces it. Generation
 // stops after the last step at the latest, so requested_output_tokens must not exceed the step
 // count. Sampling still chooses among the permitted tokens (greedy picks the most probable).
 struct TokenConstraint {
     std::vector<std::vector<TokenId>> steps;
+    // Empty, or one list per step: distinct tokens (at most kMaximumObservedTokens) whose
+    // log-probabilities under the step's whole next-token distribution its ConstrainedDraw
+    // reports. Measurement only: observing never changes what a step may produce.
+    std::vector<std::vector<TokenId>> observe;
 
     [[nodiscard]] bool empty() const noexcept { return steps.empty(); }
 };
@@ -517,6 +540,11 @@ struct ConstrainedDraw {
     std::vector<float> probabilities;
     // The permitted tokens' share of the whole next-token distribution.
     float mass = 0.0F;
+    // For a step with an observe list: the log-probabilities of its tokens in their order, and
+    // the step's largest log-probability (both over the whole distribution, temperature 1, from
+    // the logits the sampler reads, before penalties). Empty and 0 otherwise.
+    std::vector<float> observed_logprobs;
+    float top_logprob = 0.0F;
 };
 
 struct ExecutionOptions {
@@ -1518,6 +1546,12 @@ struct LoadSummary {
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;
     ContextCostSummary context_cost;
+    // The configuration fast paths are qualified by (for example "24 heads, 4-bit activations,
+    // int8 KV"), the fast paths this Engine runs (fast_path_name; empty when none is qualified or
+    // they are disabled), and whether EngineOptions::fast_paths was off.
+    std::string fast_path_configuration;
+    std::vector<std::string> fast_paths;
+    bool fast_paths_disabled = false;
 
     // Hybrid prefix cache restored from its persistent file at startup.
     struct PrefixCacheRestore {

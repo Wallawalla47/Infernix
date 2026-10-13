@@ -85,8 +85,8 @@ infernix_bench --weights <artifact.ninfer>
           [--mixed-constraints]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|vq2|k4v2>] [--use-original-int8-prefill-kernel]
-          [--prefill-8bit-pv | --no-prefill-8bit-pv] [--use-original-nvfp4-prefill-kernel]
-          [--prefill-split-workspace-mib <n>]
+          [--use-original-nvfp4-prefill-kernel] [--prefill-split-workspace-mib <n>]
+          [--disable-fast-paths] [--fast-path <name>]...
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
@@ -148,8 +148,39 @@ remains neural-only unless its cases explicitly request ngram.
 
 ## Decode quality
 
+`infernix_decode_quality_forced` measures the decode route teacher-forced: each segment prefills a
+corpus prompt and forces the following corpus tokens through the production decode path, one
+constrained step per token, recording each token's log-probability from the round's full
+distribution (`ConstrainedDraw::mass`). Positions pair exactly between builds, which makes it the
+sensitive decode measure of the [acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths):
+
+```bat
+infernix_decode_quality_forced model.ninfer corpus.txt exact.json --segments 256 ^
+  --prompts 512,2048,8192 --mode plain --kv-dtype int8 --disable-fast-paths
+infernix_decode_quality_forced model.ninfer corpus.txt fast.json --segments 256 ^
+  --prompts 512,2048,8192 --mode plain --kv-dtype int8
+```
+
+Segments lie back to back from the corpus's first token, so no two share text, and the tool stops
+if the corpus is too short for them. `--forced N` sets the forced tokens per segment (at most 64,
+the constraint step limit); `--mode`
+is `plain`, `dflash2`, `ngram` or `mtp`. `--reference` writes the reference for the same segments
+instead (the 16-bit-activation, BF16-KV scoring route in one pass: each forced token's
+log-probability and the 64 most probable tokens there), and `--observe REFERENCE.json` makes every
+forced step also record the log-probabilities of those tokens and its own largest one
+(`TokenConstraint::observe`), from which the gate computes decode KL and top-1 agreement. Fast paths run as in `infernix-serve` unless
+`--disable-fast-paths`; `--fast-path NAME` also runs a candidate path (qualification).
+
+The log-probabilities are printed exactly, so the same segments also measure request invariance:
+`tools/quality/fast_path_gate.py identical a.json b.json` compares two exact-route runs bit for
+bit. `--concurrency N` (1-8) submits the segments in groups of N that run together (their prompt
+lengths differ, so prefills overlap decodes), `--prefill-chunk N` sets the prompt chunk (default
+4096, rounded down to the prompt-attention wave), and `--prefix-reuse` runs each segment's prompt
+alone first (with `--warm-tokens N`, only its first N tokens) and then the measured request from
+the prefix cache (the report's `reused_prompt_tokens` counts the restored tokens).
+
 `infernix_decode_quality_gen` and `infernix_decode_quality_judge` measure what a build's decode path
-does to output quality, end to end. Perplexity scoring runs prefill only, so this is the check for
+does to output quality, end to end, free-running. Perplexity scoring runs prefill only, so this is the check for
 decode kernels, speculative verification and n-gram drafting. The method and the recorded results
 are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
 
@@ -157,26 +188,31 @@ are in [Model-level numerical quality](../docs/maintainer/model-quality.md).
   and continues each greedily for `new_tokens` tokens through the production decode path:
   DFlash2 with 7 drafts and the optimized proposal head, INT8 KV, CUDA Graph decode, prefix reuse
   off. `ngram` adds the production n-gram drafting (15 drafts, minimum match 12); `mtp` drafts with
-  the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path. It writes one line per
-  segment: the corpus token offset, the prompt length and the generated token ids.
+  the MTP layer instead (4 drafts), Qwen3.8-Flash-Next's production path; `plain` drafts nothing
+  (one token per round through the single-column decode kernels). Fast paths run as in
+  `infernix-serve`; `exact` runs the exact route and `path=NAME` also runs a candidate fast path.
+  It writes one line per segment: the corpus token offset, the prompt length and the generated
+  token ids.
 - The judge scores any number of generator outputs with one reference: a CausalScoring Engine with
   16-bit activations in every linear (`EngineOptions::a16_activations`), BF16 KV, each sequence in
   one pass. For each build it reports how often the generated token is the reference's most
   probable token given that build's own prefix, the mean reference log-probability and the mean
   regret (top log-probability minus the generated token's); for each pair, the generated prefix
-  they share exactly.
-- Qwen3.8-Flash-Next has no 16-bit-activation route, so its judge runs with
-  `--stored-activations`: the reference keeps the artifact's recorded activations (BF16 KV, one
-  pass). It measures what decoding changes (KV format, chunking, speculation, batching), not the
-  cost of the stored activation precision; [model quality](../docs/maintainer/model-quality.md)
-  records that cost separately.
+  they share exactly. `--report FILE` also writes each build's per-segment counts as JSON, which
+  `tools/quality/fast_path_gate.py decode` pairs between a default and a fast-path build
+  ([acceptance policy](../docs/maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)).
+- `--stored-activations` judges with the artifact's recorded activations instead (BF16 KV, one
+  pass): it measures what decoding changes (KV format, chunking, speculation, batching), not the
+  cost of the stored activation precision. Qwen3.8-Flash-Next's 16-bit-activation reference runs
+  every expert bank W4A16; `--ngram-volume FILE` (judge) and `ngram-volume=FILE` (generator) name
+  its n-gram volume when it is not `<artifact>.ngram`.
 
 ```bat
 infernix_decode_quality_gen model.ninfer corpus.txt base.txt 32 1536 384
 infernix_decode_quality_gen model.ninfer corpus.txt base-ngram.txt 32 1536 384 ngram
 infernix_decode_quality_judge model.ninfer corpus.txt base.txt base-ngram.txt other.txt
-infernix_decode_quality_gen flash-next.infernix corpus.txt fn.txt 32 1536 384 mtp
-infernix_decode_quality_judge --stored-activations flash-next.infernix corpus.txt fn.txt
+infernix_decode_quality_gen flash-next.infernix corpus.txt fn.txt 32 1536 384 mtp ngram-volume=v.ngram
+infernix_decode_quality_judge --ngram-volume v.ngram flash-next.infernix corpus.txt fn.txt
 ```
 
 Use the same artifact and corpus for every build. The generator uses only Engine API that NInfer
@@ -657,9 +693,10 @@ so broad Graph-envelope measurements can be distinguished from exact-length meas
 `--fast-prompt` sets every envelope's fast prompt-kernel hint (INT8 and NVFP4 KV),
 `--fast-prompt-pv8` also selects the 8-bit P×V forms (INT8, NVFP4, K8V4, VQ2 and K4V2), and
 `--split-workspace-mib N` sets the prompt split-workspace bound (default 256, as
-`--prefill-split-workspace-mib`). `--prefill-8bit-pv` / `--no-prefill-8bit-pv` override the
-per-format P×V default of `infernix-bench` itself (8-bit for NVFP4, K8V4 and VQ2; FP16 for INT8
-and K4V2).
+`--prefill-split-workspace-mib`). `--decode-split64` selects the decode-split64 fast path's
+schedule (INT8 KV: 64-key splits for 24-head single-column rows). In `infernix_bench`, the fast
+paths qualified for the configuration run unless `--disable-fast-paths`, and `--fast-path NAME`
+also runs a candidate path; the report records the paths that ran as `fast_paths`.
 
 ```bash
 cmake --build build --parallel --target infernix_causal_softmax_attention_bench

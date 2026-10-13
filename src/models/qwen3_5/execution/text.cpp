@@ -447,7 +447,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_batch_layer(), envelope, work_, a_batch, ctx_.execution_view());
+            mtp_kv_batch_layer(), attention_schedule_.apply(envelope), work_, a_batch,
+            ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
             qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
@@ -455,7 +456,8 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_batch_layer(), envelope, work_, a, ctx_.execution_view());
+            mtp_kv_batch_layer(), attention_schedule_.apply(envelope), work_, a,
+            ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -607,7 +609,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            mtp_kv_layer(), envelope, work_, a, ctx_.execution_view());
+            mtp_kv_layer(), attention_schedule_.apply(envelope), work_, a, ctx_.execution_view());
         ops::sigmoid_mul(gate, a, s);
 
         Tensor o = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
@@ -994,7 +996,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            text_kv_layer(static_cast<std::uint32_t>(fidx)), *active_causal_attention_envelope_,
+            text_kv_layer(static_cast<std::uint32_t>(fidx)),
+            attention_schedule_.apply(*active_causal_attention_envelope_),
             work_, a_batch, ctx_.execution_view());
     } else {
         ops::causal_softmax_attention(
@@ -1003,7 +1006,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            text_kv_layer(static_cast<std::uint32_t>(fidx)), *active_causal_attention_envelope_,
+            text_kv_layer(static_cast<std::uint32_t>(fidx)),
+            attention_schedule_.apply(*active_causal_attention_envelope_),
             work_, a, ctx_.execution_view());
     }
     ops::sigmoid_mul(gate, a, s);
@@ -1353,7 +1357,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedPositions scoped_rope(active_rope_positions_, rope_positions);
             const auto visible = static_cast<std::uint32_t>(base_i + t0 + len);
             const ops::CausalAttentionExecutionEnvelope chunk_envelope =
-                prompt_attention_.envelope(visible, visible);
+                attention_schedule_.envelope(visible, visible);
             ScopedEnvelope scoped_envelope(active_causal_attention_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;

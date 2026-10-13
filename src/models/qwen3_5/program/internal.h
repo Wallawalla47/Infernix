@@ -13,23 +13,33 @@ inline constexpr std::uint32_t kPrefillChunkAlignment    = 128;
 inline constexpr std::uint32_t kMaximumMtpDraftTokens    = 5;
 inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 
-// Prompt-attention settings of every prefill chunk (CausalAttentionExecutionEnvelope): fast selects
-// the storage's fast prompt kernel (INT8 or NVFP4 KV); pv8 runs the prompt kernel's PV on 8-bit
-// Tensor Cores (the fast INT8 or NVFP4 kernel, or K8V4's prompt kernel, which ignores fast); and
-// split_workspace_bytes bounds the FP32 partials of a launch's key splits. Workspace planning and
-// every chunk use the same settings.
-struct PromptAttention {
+// Causal-attention settings of a Program (CausalAttentionExecutionEnvelope). For prefill chunks:
+// fast selects the storage's fast prompt kernel (INT8 or NVFP4 KV); pv8 runs the prompt kernel's
+// PV in 8 bits (the prompt-pv8 fast path); and split_workspace_bytes bounds the FP32 partials of a
+// launch's key splits. For every launch (prefill, decode, verification, MTP): decode_split64 is the
+// decode-split64 fast path. Workspace planning and every launch use the same settings.
+struct AttentionSchedule {
     bool fast                         = false;
     bool pv8                          = false;
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
+    bool decode_split64               = false;
 
+    // A prefill chunk's envelope.
     [[nodiscard]] ops::CausalAttentionExecutionEnvelope
     envelope(std::uint32_t min_visible_keys, std::uint32_t max_visible_keys) const noexcept {
         return {.min_visible_keys             = min_visible_keys,
                 .max_visible_keys             = max_visible_keys,
                 .fast_prompt_kernel           = fast,
                 .fast_prompt_pv8              = pv8,
-                .prompt_split_workspace_bytes = split_workspace_bytes};
+                .prompt_split_workspace_bytes = split_workspace_bytes,
+                .decode_split64               = decode_split64};
+    }
+
+    // Any launch's envelope with this schedule's decode fast path.
+    [[nodiscard]] ops::CausalAttentionExecutionEnvelope
+    apply(ops::CausalAttentionExecutionEnvelope envelope) const noexcept {
+        envelope.decode_split64 = decode_split64;
+        return envelope;
     }
 };
 

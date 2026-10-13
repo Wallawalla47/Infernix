@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/infernix/ops/top_logprobs.h
-// Match: contiguous BF16 [physical_rows,C], I32 [K,C], and FP32 [K,C].
+// Match: contiguous BF16 or FP32 [physical_rows,C], I32 [K,C], and FP32 [K,C].
 // Algorithm assumptions: one 256-thread CTA per column computes the column's logsumexp, then each
 // of K passes selects the largest (value, -row) key below the previous pass's.
 
@@ -53,13 +53,13 @@ __device__ __forceinline__ unsigned long long top_logprobs_block_max(unsigned lo
     return result;
 }
 
-template <int BlockSize>
+template <int BlockSize, class Logit>
 __launch_bounds__(BlockSize) __global__
-    void top_logprobs_kernel(const __nv_bfloat16* logits, std::int32_t* ids, float* output,
+    void top_logprobs_kernel(const Logit* logits, std::int32_t* ids, float* output,
                              std::int32_t valid_rows, std::int32_t physical_rows,
                              std::int32_t count) {
-    const std::int32_t column   = static_cast<std::int32_t>(blockIdx.x);
-    const __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
+    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
+    const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
     const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
 
     unsigned long long previous = ~0ULL;
@@ -67,7 +67,7 @@ __launch_bounds__(BlockSize) __global__
         unsigned long long best = 0;
         for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
              row += BlockSize) {
-            const unsigned long long key = top_logprobs_key(__bfloat162float(values[row]), row);
+            const unsigned long long key = top_logprobs_key(logprob_logit(values[row]), row);
             if (key < previous && key > best) { best = key; }
         }
         best = top_logprobs_block_max<BlockSize>(best);
@@ -75,7 +75,7 @@ __launch_bounds__(BlockSize) __global__
             const auto row = static_cast<std::int32_t>(0xffffffffu - static_cast<unsigned>(best));
             const std::int64_t index = static_cast<std::int64_t>(column) * count + rank;
             ids[index]               = row;
-            output[index] = __bfloat162float(values[row]) - lse.maximum - lse.log_sum;
+            output[index] = logprob_logit(values[row]) - lse.maximum - lse.log_sum;
         }
         previous = best;
     }

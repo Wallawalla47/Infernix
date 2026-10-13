@@ -245,6 +245,11 @@ public:
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
 
+    // FP32 logits [V, n] of n final residuals (BF16 [S*H, n], ForwardBatch::residual_out): the final
+    // mixer and the LM head, as finish() applies them to a call's logit columns. Teacher-forced
+    // scoring runs it in tiles over a prompt's saved residuals. Uses the workspace (no call open).
+    void head_logits(const Tensor& residuals, Tensor& logits);
+
     [[nodiscard]] static std::size_t workspace_bytes(const TextConfig& config, std::int32_t columns,
                                                      std::int32_t max_context, KvCacheStorage storage);
     // Extra workspace of the MTP drafter: K/V-only calls over up to `kv_columns` columns (chunks

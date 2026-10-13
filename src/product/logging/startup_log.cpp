@@ -316,6 +316,17 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
         format_pretty_bytes(load.host_to_device_bytes),
         format_pretty_bytes(load.peak_staging_bytes), format_pretty_count(load.device_object_count),
         format_pretty_count(load.host_object_count));
+    // The fast paths that run, and the configuration they are qualified for.
+    if (!load.fast_path_configuration.empty()) {
+        std::string paths;
+        for (const std::string& path : load.fast_paths) {
+            paths += (paths.empty() ? "" : ", ") + path;
+        }
+        if (paths.empty()) {
+            paths = load.fast_paths_disabled ? "disabled (exact route)" : "none qualified";
+        }
+        impl_->logger->info("fast paths | {} | {}", paths, load.fast_path_configuration);
+    }
     impl_->logger->debug("context cost | transfer {} | prefill {} | signature {}",
                          context_cost_preset_source_name(load.context_cost.transfer_source),
                          context_cost_preset_source_name(load.context_cost.prefill_source),

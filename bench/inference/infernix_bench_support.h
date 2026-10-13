@@ -72,9 +72,10 @@ struct BenchOptions {
     float rope_yarn_factor = 1.0F;
     std::optional<std::uint32_t> max_context;
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    bool fast_paths                    = true;
+    std::vector<FastPath> fast_path_candidates;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -125,9 +126,9 @@ struct BenchEnvironment {
     std::uint32_t max_context   = 0;
     std::uint32_t prefill_chunk       = kDefaultPrefillChunk;
     bool original_int8_prefill_kernel = false;
-    PrefillPv8 prefill_8bit_pv         = PrefillPv8::Auto;
     std::uint32_t prefill_split_workspace_mib = kDefaultPrefillSplitWorkspaceMiB;
     bool original_nvfp4_prefill_kernel = false;
+    bool fast_paths                    = true;
     KvCacheStorage kv_cache           = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool use_cuda_graph                            = true;

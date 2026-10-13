@@ -3,8 +3,8 @@
 // Implements: include/infernix/ops/token_constraint.h
 // Match: contiguous BF16 [physical_rows,C] logits, I32 descriptors/choices, FP32 records.
 // Algorithm assumptions: one 256-thread CTA per column; the full-vocabulary log-sum-exp is the
-// target_logprobs single-pass reduction, and the permitted set (at most 16 tokens) is resolved by
-// one thread.
+// target_logprobs single-pass reduction, the permitted set (at most 16 tokens) is resolved by
+// one thread, and each observed token by its own thread.
 
 #include "infernix/ops/token_constraint.h"
 #include "ops/kernel/target_logprobs.cuh"
@@ -24,7 +24,7 @@ __launch_bounds__(BlockSize) __global__
                                  const std::int32_t* descriptors, const std::int32_t* choices,
                                  const std::int32_t* choice_counts, std::int32_t sets,
                                  std::int32_t valid_rows, std::int32_t physical_rows,
-                                 float* records) {
+                                 float* records, const std::int32_t* observe, float* observed) {
     const std::int32_t column     = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t descriptor = descriptors[column];
     if (descriptor == -1) { return; }
@@ -55,6 +55,22 @@ __launch_bounds__(BlockSize) __global__
 
     __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
     const TargetLogprobsColumn full = target_logprobs_column<BlockSize>(values, valid_rows);
+
+    // Observations read the unmasked column: the masking below waits for the barrier after this.
+    static_assert(BlockSize >= kTokenObserveRecord);
+    if (observe != nullptr && static_cast<std::int32_t>(threadIdx.x) < kTokenObserveRecord) {
+        const std::int32_t index = static_cast<std::int32_t>(threadIdx.x);
+        float* const out = observed + static_cast<std::int64_t>(column) * kTokenObserveRecord;
+        if (index == kTokenObserveTokens) {
+            out[index] = -full.log_sum;
+        } else {
+            const std::int32_t token =
+                observe[static_cast<std::int64_t>(column) * kTokenObserveTokens + index];
+            if (token >= 0 && token < valid_rows) {
+                out[index] = __bfloat162float(values[token]) - full.maximum - full.log_sum;
+            }
+        }
+    }
 
     if (threadIdx.x == 0) {
         float maximum = -CUDART_INF_F;

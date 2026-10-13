@@ -154,6 +154,8 @@ struct AttentionCase {
     bool fast_prompt_pv8 = false;
     // Envelope bound on the FP32 partials of a prompt launch's key splits.
     std::size_t split_workspace_bytes = ops::kCausalPromptSplitWorkspaceDefaultBytes;
+    // The decode-split64 fast path (FastPath::DecodeSplit64).
+    bool decode_split64 = false;
 };
 
 enum class MappingPattern { Identity, Offset, Fragmented };
@@ -1863,6 +1865,7 @@ std::string case_label(const char* entry, const Geometry& geometry, KvCacheStora
                 : std::string()) +
            (test_case.fast_prompt_kernel ? " fast-prompt" : "") +
            (test_case.fast_prompt_pv8 ? " pv8" : "") +
+           (test_case.decode_split64 ? " decode-split64" : "") +
            (test_case.graph_replay ? " graph-replay" : "");
 }
 
@@ -1952,6 +1955,7 @@ int run_a1_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
     envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
     envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
+    envelope.decode_split64               = test_case.decode_split64;
 
     const HostCache initial = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                          amplitude, test_case.value_amplitude);
@@ -2080,6 +2084,7 @@ int run_a3_case(DeviceExecutionView execution, const Geometry& geometry, KvCache
     envelope.fast_prompt_kernel           = test_case.fast_prompt_kernel;
     envelope.fast_prompt_pv8              = test_case.fast_prompt_pv8;
     envelope.prompt_split_workspace_bytes = test_case.split_workspace_bytes;
+    envelope.decode_split64               = test_case.decode_split64;
 
     const HostCache cache_host = make_cache(geometry, storage, total + 3, test_case.seed + 10u,
                                             amplitude, test_case.value_amplitude);
@@ -2147,6 +2152,7 @@ struct BatchAttentionCase {
     std::vector<std::vector<std::int32_t>> replay_contexts;
     bool fast_prompt_kernel = false;
     bool fast_prompt_pv8    = false;
+    bool decode_split64     = false;
     // Speculative verification-tree ancestor masks, [B][W] row-major (one per column of every
     // row); empty is the causal Op.
     std::vector<std::uint32_t> tree_masks;
@@ -2213,6 +2219,7 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         static_cast<unsigned>(std::max(maximum_visible, envelope_max))};
     envelope.fast_prompt_kernel = test_case.fast_prompt_kernel;
     envelope.fast_prompt_pv8    = test_case.fast_prompt_pv8;
+    envelope.decode_split64     = test_case.decode_split64;
     const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
                       kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
     const std::size_t columns            = std::size_t(width) * batch;
@@ -2352,7 +2359,8 @@ int run_batch_case(DeviceExecutionView execution, const Geometry& geometry, KvCa
         const std::string label = std::string(tree ? "causal tree batch " : "causal batch ") +
                                   geometry.name + " " + cache_name(storage) +
                                   " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
-                                  " phase=" + std::to_string(phase);
+                                  " phase=" + std::to_string(phase) +
+                                  (test_case.decode_split64 ? " decode-split64" : "");
         const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage, test_case.fast_prompt_pv8));
@@ -3146,6 +3154,62 @@ int run_int8_fast_prompt_cases(DeviceExecutionView execution, bool pv8) {
         return failures;
 }
 
+// The decode-split64 fast path: 24-head single-column rows split from 64 keys. Contexts sit around
+// 64-key split and 32-key tile boundaries, from a single key to past the split target's
+// saturation, appended and cached, on fragmented pages, under graph replay across short and long
+// envelopes, and in batched decode with mixed lengths. 16-head rows keep their schedule.
+int run_int8_decode_split64_cases(DeviceExecutionView execution) {
+    constexpr KvCacheStorage storage = KvCacheStorage::Int8Group64;
+    int failures                     = 0;
+    const auto fast                  = [](AttentionCase test_case) {
+        test_case.decode_split64 = true;
+        return test_case;
+    };
+    const Geometry& h24 = kGeometries[0];
+    const Geometry& h16 = kGeometries[1];
+    std::uint32_t seed  = 3400u;
+    for (const std::int32_t base : {0, 63, 64, 65, 127, 191, 1000, 4095, 8191, 30000}) {
+        const auto keys = static_cast<std::uint32_t>(base + 1);
+        failures += run_a1_case(execution, h24, storage, fast({1, base, keys, seed++}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(execution, h24, storage, fast({1, base, keys, seed++}),
+                                MappingPattern::Offset);
+    }
+    // An envelope far past the populated keys leaves late splits without a visible key.
+    failures += run_a1_case(execution, h24, storage, fast({1, 200, 131072, seed++}),
+                            MappingPattern::Identity);
+    failures += run_a1_case(execution, h16, storage, fast({1, 1000, 1001, seed++}),
+                            MappingPattern::Fragmented);
+    constexpr std::array<std::uint32_t, 5> short_limits{64, 128, 2048, 64, 2048};
+    constexpr std::array<std::uint32_t, 4> long_limits{32769, 65536, 131072, 32769};
+    failures += run_a1_case(execution, h24, storage, fast({1, 17, 2048, seed++}),
+                            MappingPattern::Fragmented, {}, short_limits);
+    failures += run_a1_case(execution, h24, storage, fast({1, 32768, 131072, seed++}),
+                            MappingPattern::Fragmented, {}, long_limits);
+    for (const std::vector<std::int32_t>& contexts :
+         {std::vector<std::int32_t>{0, 31, 63, 127, 511, 1023, 2047, 4095},
+          std::vector<std::int32_t>{64, 2000}, std::vector<std::int32_t>{30000, 17, 700, 9000}}) {
+        const auto batch = static_cast<std::int32_t>(contexts.size());
+        std::vector<std::int32_t> rows(contexts.size());
+        for (std::int32_t row = 0; row < batch; ++row) rows[row] = (row * 5 + 3) % batch;
+        BatchAttentionCase test_case{1, contexts, std::vector<std::int32_t>(contexts.size(), 1),
+                                     rows, MappingPattern::Fragmented, seed++};
+        test_case.decode_split64 = true;
+        failures += run_batch_case(execution, h24, storage, test_case);
+    }
+    BatchAttentionCase replay{1,
+                              {17, 31, 0},
+                              {1, 1, 1},
+                              {2, 0, 1},
+                              MappingPattern::Fragmented,
+                              seed++,
+                              true,
+                              {{17, 31, 0}, {32764, 8192, 127}, {127, 17, 0}}};
+    replay.decode_split64 = true;
+    failures += run_batch_case(execution, h24, storage, replay, 65536);
+    return failures;
+}
+
 // The fast NVFP4 prompt kernel over prompt-route widths above 768 visible keys: partial and full
 // row blocks, launches over enough key pages to split them across CTAs (including an envelope far
 // past the populated keys, so late splits own no visible key), V magnitudes whose group scales need
@@ -3372,6 +3436,7 @@ int run_storage_cases(DeviceExecutionView execution, KvCacheStorage storage) {
     if (storage == KvCacheStorage::Int8Group64) {
         failures += run_int8_fast_prompt_cases(execution, false);
         failures += run_int8_fast_prompt_cases(execution, true);
+        failures += run_int8_decode_split64_cases(execution);
     }
     failures += run_tree_mask_cases(execution, storage);
     if (storage == KvCacheStorage::Nvfp4Group16) {

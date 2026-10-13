@@ -308,6 +308,15 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
         << "\"total_seconds\": " << number(timings.total_seconds) << '}';
 }
 
+// The fast paths the Engine runs, comma-separated; "off" on the exact route, "none" when none is
+// qualified for the configuration.
+std::string fast_path_list(const BenchEnvironment& env) {
+    std::string out;
+    for (const std::string& path : env.load.fast_paths) { out += (out.empty() ? "" : ",") + path; }
+    if (out.empty()) { out = env.load.fast_paths_disabled ? "off" : "none"; }
+    return out;
+}
+
 } // namespace
 
 std::uint32_t BenchTest::requested_output_tokens() const {
@@ -368,13 +377,12 @@ std::string usage_text(std::string_view program) {
         << "  --use-original-int8-prefill-kernel  original INT8-KV prompt kernel at the\n"
         << "                              requested chunk (default: fast kernel, wave-aligned\n"
         << "                              chunks); requires --kv-dtype int8\n"
-        << "  --prefill-8bit-pv           INT8 and K4V2 KV: 8-bit P*V in the prompt kernel\n"
-        << "                              (default FP16; faster but a measurable KL divergence\n"
-        << "                              from a BF16 KV reference)\n"
-        << "  --no-prefill-8bit-pv        NVFP4, K8V4 and VQ2 KV: FP16 P*V (default 8-bit,\n"
-        << "                              5-7 % faster at long context)\n"
         << "  --use-original-nvfp4-prefill-kernel  tiled NVFP4-KV prompt kernel (default:\n"
         << "                              fast kernel); requires --kv-dtype nvfp4\n"
+        << "  --disable-fast-paths        the exact route (default: every fast path qualified\n"
+        << "                              for the configuration)\n"
+        << "  --fast-path <name>          qualification: also run this fast path, qualified\n"
+        << "                              or not (prompt-pv8, decode-split64)\n"
         << "  --prefill-split-workspace-mib <n>  prompt-attention split workspace (default: "
         << kDefaultPrefillSplitWorkspaceMiB << ";\n"
         << "                              128-384 recommended, 0 = no splitting)\n"
@@ -529,15 +537,18 @@ BenchOptions parse_args(int argc, char** argv) {
             options.kv_cache = parse_kv_cache(value("--kv-dtype"));
         } else if (arg == "--use-original-int8-prefill-kernel") {
             options.original_int8_prefill_kernel = true;
-        } else if (arg == "--prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::On;
-        } else if (arg == "--no-prefill-8bit-pv") {
-            options.prefill_8bit_pv = PrefillPv8::Off;
         } else if (arg == "--prefill-split-workspace-mib") {
             options.prefill_split_workspace_mib =
                 parse_u32(value("--prefill-split-workspace-mib"), "prefill-split-workspace-mib", true);
         } else if (arg == "--use-original-nvfp4-prefill-kernel") {
             options.original_nvfp4_prefill_kernel = true;
+        } else if (arg == "--disable-fast-paths") {
+            options.fast_paths = false;
+        } else if (arg == "--fast-path") {
+            const std::string name(value("--fast-path"));
+            const std::optional<FastPath> path = parse_fast_path(name);
+            if (!path) { throw std::invalid_argument("unknown fast path: " + name); }
+            options.fast_path_candidates.push_back(*path);
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value("--spec"));
         } else if (arg == "--draft-tokens") {
@@ -815,9 +826,9 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " concurrency=" << env.concurrency << " constraint=" << constraint_name(env.constraint)
         << (env.mixed_constraints ? " (mixed)" : "")
         << " original_int8_prefill_kernel=" << (env.original_int8_prefill_kernel ? "on" : "off")
-        << " prefill_8bit_pv=" << prefill_pv8_name(env.prefill_8bit_pv)
         << " prefill_split_workspace_mib=" << env.prefill_split_workspace_mib
         << " original_nvfp4_prefill_kernel=" << (env.original_nvfp4_prefill_kernel ? "on" : "off")
+        << " fast_paths=" << fast_path_list(env)
         << " rope_yarn_factor=" << env.rope_yarn_factor
         << " kv_cache=" << kv_cache_name(env.kv_cache)
         << " spec=" << product::speculative_backend_name(env.speculative.backend)
@@ -955,11 +966,10 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"original_int8_prefill_kernel\": "
         << (env.original_int8_prefill_kernel ? "true" : "false") << ",\n"
-        << "    \"prefill_8bit_pv\": \"" << prefill_pv8_name(env.prefill_8bit_pv) << "\""
-        << ",\n"
         << "    \"prefill_split_workspace_mib\": " << env.prefill_split_workspace_mib << ",\n"
         << "    \"original_nvfp4_prefill_kernel\": "
         << (env.original_nvfp4_prefill_kernel ? "true" : "false") << ",\n"
+        << "    \"fast_paths\": \"" << fast_path_list(env) << "\",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << product::speculative_backend_name(env.speculative.backend) << "\",\n"

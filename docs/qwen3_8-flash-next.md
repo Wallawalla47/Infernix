@@ -10,7 +10,11 @@ design, measurements and open work are in the
 
 Generation works through `infernix`, `infernix-serve` and `infernix_bench`, with the model's MTP
 drafter (`--spec mtp`), n-gram copy proposals, images and video (`--vision`), and in
-`infernix-serve` the hybrid prefix cache. Not yet supported: CausalScoring (perplexity).
+`infernix-serve` the hybrid prefix cache. Causal scoring (`infernix-perplexity`, the
+decode-quality judge) runs teacher-forced through the generation path; `--a16-activations` scores
+with 16-bit activations in every linear and every expert bank (the exact W4A16 expert
+arithmetic): the [quality reference](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths).
+Pass the n-gram volume with `--ngram-volume` when it is not `<artifact>.ngram`.
 
 ## Requirements
 

@@ -63,19 +63,39 @@ float signed_zero_value(std::int32_t row, std::int32_t column) {
     }
 }
 
+// FP32 logits (the Qwen3.8-Flash-Next head's): values 2^-20 apart that BF16 would merge, so reading
+// them as BF16 breaks the exact ids.
+std::vector<float> make_fp32_logits(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t columns) {
+    std::vector<float> logits(static_cast<std::size_t>(physical_rows) * columns);
+    for (std::int32_t column = 0; column < columns; ++column) {
+        const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
+        for (std::int32_t row = 0; row < physical_rows; ++row) {
+            const std::uint32_t mixed = static_cast<std::uint32_t>(row) * 2654435761u +
+                                        static_cast<std::uint32_t>(column + 1) * 40503u;
+            logits[base + static_cast<std::size_t>(row)] =
+                row < valid_rows ? 1.0f + static_cast<float>(mixed % 4096u) * 0x1p-20f : kPaddingValue;
+        }
+    }
+    return logits;
+}
+
+double logit_value(std::uint16_t bf16) { return static_cast<double>(bf16_to_f32(bf16)); }
+double logit_value(float fp32) { return static_cast<double>(fp32); }
+
 struct Expected {
     std::vector<std::int32_t> ids;
     std::vector<double> logprobs;
 };
 
-Expected oracle(const std::vector<std::uint16_t>& logits, std::int32_t physical_rows,
+template <class Storage>
+Expected oracle(const std::vector<Storage>& logits, std::int32_t physical_rows,
                 std::int32_t valid_rows, std::int32_t columns, std::int32_t count) {
     Expected expected;
     std::vector<std::int32_t> rows(static_cast<std::size_t>(valid_rows));
     for (std::int32_t column = 0; column < columns; ++column) {
         const std::size_t base = static_cast<std::size_t>(column) * physical_rows;
         const auto value       = [&](std::int32_t row) {
-            return static_cast<double>(bf16_to_f32(logits[base + static_cast<std::size_t>(row)]));
+            return logit_value(logits[base + static_cast<std::size_t>(row)]);
         };
         double maximum = -std::numeric_limits<double>::infinity();
         for (std::int32_t row = 0; row < valid_rows; ++row) { maximum = std::max(maximum, value(row)); }
@@ -93,19 +113,21 @@ Expected oracle(const std::vector<std::uint16_t>& logits, std::int32_t physical_
     return expected;
 }
 
+template <class Storage>
 int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t valid_rows,
-             std::int32_t columns, std::int32_t count, const std::vector<std::uint16_t>& logits) {
+             std::int32_t columns, std::int32_t count, const std::vector<Storage>& logits) {
     const Expected expected = oracle(logits, physical_rows, valid_rows, columns, count);
     const std::size_t outputs = static_cast<std::size_t>(count) * columns;
+    constexpr DType kLogits   = sizeof(Storage) == 4 ? DType::FP32 : DType::BF16;
 
-    GuardedDeviceBuffer device_logits(logits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer device_logits(logits.size() * sizeof(Storage));
     GuardedDeviceBuffer device_ids(outputs * sizeof(std::int32_t));
     GuardedDeviceBuffer device_output(outputs * sizeof(float));
     device_logits.copy_from_host(logits.data(), device_logits.bytes());
     device_ids.fill(0xcd);
     device_output.fill(0xcd);
 
-    Tensor logits_tensor(device_logits.data(), DType::BF16, {physical_rows, columns});
+    Tensor logits_tensor(device_logits.data(), kLogits, {physical_rows, columns});
     Tensor ids_tensor(device_ids.data(), DType::I32, {count, columns});
     Tensor output_tensor(device_output.data(), DType::FP32, {count, columns});
     ops::top_logprobs(logits_tensor, valid_rows, ids_tensor, output_tensor, nullptr);
@@ -118,7 +140,7 @@ int run_case(const std::string& label, std::int32_t physical_rows, std::int32_t 
                                  expected.logprobs, kTopLogprobsFp32Criterion);
     failures +=
         verify_exact((label + " preserves logits").c_str(),
-                     from_device<std::uint16_t>(device_logits.data(), logits.size()), logits);
+                     from_device<Storage>(device_logits.data(), logits.size()), logits);
     failures += device_logits.verify_guards(label + " logits guards");
     failures += device_ids.verify_guards(label + " ids guards");
     failures += device_output.verify_guards(label + " output guards");
@@ -160,6 +182,10 @@ int run_validation_cases() {
         Tensor wrong_output(output_data.p, DType::FP32, {3, 3});
         ops::top_logprobs(logits, 8, ids, wrong_output, nullptr);
     });
+    failures += expect_invalid("top_logprobs rejects I32 logits", [&] {
+        Tensor wrong_logits(logits_data.p, DType::I32, {8, 3});
+        ops::top_logprobs(wrong_logits, 8, ids, output, nullptr);
+    });
     failures += expect_invalid("top_logprobs rejects output dtype", [&] {
         Tensor wrong_output(output_data.p, DType::BF16, {4, 3});
         ops::top_logprobs(logits, 8, ids, wrong_output, nullptr);
@@ -199,6 +225,10 @@ int main() {
                          make_logits(263, 257, 17, extreme_value));
     failures += run_case("top_logprobs signed zeros rank by row", 70, 64, 5, 30,
                          make_logits(70, 64, 5, signed_zero_value));
+    failures += run_case("top_logprobs FP32 full vocabulary K=32", 248320, 248077, 3, 32,
+                         make_fp32_logits(248320, 248077, 3));
+    failures += run_case("top_logprobs FP32 below BF16 spacing C=129 K=8", 523, 509, 129, 8,
+                         make_fp32_logits(523, 509, 129));
     failures += run_validation_cases();
 
     std::cout << (failures ? "FAIL" : "OK") << " top_logprobs\n";

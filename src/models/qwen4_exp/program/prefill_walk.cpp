@@ -263,6 +263,8 @@ void ProgramImpl::walk_pass(std::size_t c, std::uint32_t l) {
     }
     fb.stream         = true;
     fb.release_stream = c + 1 == n;
+    // A scored prompt keeps each chunk's final residuals at its positions (causal_score).
+    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); }
     Tensor residual(area + 2ULL * static_cast<std::size_t>(width_) * static_cast<std::size_t>(walk_.offsets[c]),
                     DType::BF16, {width_, w});
     const bool logits_here = l + 1 == L && prompt_end && c + 1 == n;

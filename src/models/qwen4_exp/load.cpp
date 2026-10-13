@@ -38,7 +38,9 @@ struct PendingWeight {
 // Logical demands of the selected model; each parameter is declared exactly once.
 class Bindings {
 public:
-    explicit Bindings(artifact::Binder& binder) : binder_(binder) {}
+    // a16_activations binds every Use A16Only (LoadOptions::a16_activations).
+    Bindings(artifact::Binder& binder, bool a16_activations)
+        : binder_(binder), a16_activations_(a16_activations) {}
 
     WeightId parameter(std::string name, Shape shape, std::string_view input = {},
                        std::optional<QType> exact_format = {},
@@ -54,7 +56,8 @@ public:
             if (!use.auxiliaries.empty()) {
                 throw ArtifactError(name + ": Qwen4Exp weights carry no Use auxiliaries");
             }
-            pending.policy = linear_policy(*use.activation_policy);
+            pending.policy = a16_activations_ ? ops::LinearPolicy::A16Only
+                                              : linear_policy(*use.activation_policy);
         }
         const WeightId id{weights.size()};
         ids_.emplace(std::move(name), id);
@@ -70,6 +73,7 @@ public:
 
 private:
     artifact::Binder& binder_;
+    bool a16_activations_ = false;
     std::map<std::string, WeightId, std::less<>> ids_;
 };
 
@@ -409,7 +413,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = bind_resources(binder, out->config);
-    Bindings bindings(binder);
+    Bindings bindings(binder, options.a16_activations);
     out->weights = bind_text(bindings, out->config.text,
                              options.stream_experts ? Residency::Streamed : Residency::HostPinned);
     if (out->config.vision) {
@@ -437,16 +441,17 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
             out->weights.proposal = proposal;
         }
     }
-    // Every layer's bank has the same arithmetic: the activation policy of the first.
+    // Every layer's bank has the same arithmetic: the activation policy of the first. The
+    // 16-bit-activation reference runs W4A4 banks W4A16 and leaves their activation scales unused.
     const bool a16 = !out->weights.layers.front().moe.input_scales.valid();
-    if (a16 != out->config.text.moe.a16_experts) {
+    if (a16 != out->config.text.moe.a16_experts && !options.a16_activations) {
         throw ArtifactError("Qwen4Exp: the expert banks' activation policy disagrees with their activation scales");
     }
     for (const auto& layer : out->weights.layers) {
         if (layer.moe.input_scales.valid() == a16) {
             throw ArtifactError("Qwen4Exp: every layer's expert bank needs the same activation policy");
         }
-        if (!a16) {
+        if (!out->config.text.moe.a16_experts) {
             out->input_scales.push_back(
                 binder.values(bindings.weights.at(layer.moe.input_scales.index).reference.binding, QType::FP32));
         }
@@ -525,7 +530,7 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
             bank.planes.intermediate != data->config.text.moe.intermediate) {
             throw ArtifactError("expert bank geometry differs from the text config");
         }
-        if (layers[i].moe.input_scales.valid()) {
+        if (!data->config.text.moe.a16_experts) {
             bank.scales = expert_scales(bank.planes, data->input_scales.at(i),
                                         bound.at(layers[i].moe.input_scales.index).name);
         } else {

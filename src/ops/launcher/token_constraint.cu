@@ -10,7 +10,8 @@ namespace infernix::ops::detail {
 
 void constrain_logits_launch(Tensor& logits, Tensor* argmax, const Tensor& descriptors,
                              const Tensor& choices, const Tensor& choice_counts,
-                             std::int32_t valid_rows, Tensor& records, cudaStream_t stream) {
+                             std::int32_t valid_rows, Tensor& records, const Tensor* observe,
+                             Tensor* observed, cudaStream_t stream) {
     const auto columns = static_cast<unsigned int>(logits.ne[1]);
     constrain_logits_kernel<kTokenConstraintBlock><<<columns, kTokenConstraintBlock, 0, stream>>>(
         static_cast<__nv_bfloat16*>(logits.data),
@@ -18,7 +19,9 @@ void constrain_logits_launch(Tensor& logits, Tensor* argmax, const Tensor& descr
         static_cast<const std::int32_t*>(descriptors.data),
         static_cast<const std::int32_t*>(choices.data),
         static_cast<const std::int32_t*>(choice_counts.data), choice_counts.ne[0], valid_rows,
-        logits.ne[0], static_cast<float*>(records.data));
+        logits.ne[0], static_cast<float*>(records.data),
+        observe != nullptr ? static_cast<const std::int32_t*>(observe->data) : nullptr,
+        observed != nullptr ? static_cast<float*>(observed->data) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 

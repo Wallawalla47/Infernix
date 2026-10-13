@@ -100,35 +100,9 @@ int main() {
     const std::string nvfp4_what = construction_error(options, nvfp4_invalid);
     failures += check(nvfp4_what.find("NVFP4 KV") == std::string::npos,
                       "the original NVFP4 prefill kernel was rejected with the NVFP4 KV cache");
-    // 8-bit prefill P*V is chosen per KV format by default and every KV cache and prompt kernel
-    // accepts either form.
-    options.original_nvfp4_prefill_kernel = false;
-    failures += check(infernix::EngineOptions{}.prefill_8bit_pv == infernix::PrefillPv8::Auto,
-                      "8-bit prefill P*V must default to auto");
-    for (const auto pv8 : {infernix::PrefillPv8::Auto, infernix::PrefillPv8::On, infernix::PrefillPv8::Off}) {
-        options.prefill_8bit_pv = pv8;
-        for (const auto storage :
-             {infernix::KvCacheStorage::BFloat16, infernix::KvCacheStorage::Int8Group64,
-              infernix::KvCacheStorage::Fp8E4M3Row256, infernix::KvCacheStorage::Nvfp4Group16,
-              infernix::KvCacheStorage::Fp8KeyNvfp4Value, infernix::KvCacheStorage::Vq2,
-              infernix::KvCacheStorage::Q4KeyVq2Value}) {
-            for (const bool original : {false, true}) {
-                options.kv_cache = storage;
-                options.original_int8_prefill_kernel =
-                    original && storage == infernix::KvCacheStorage::Int8Group64;
-                options.original_nvfp4_prefill_kernel =
-                    original && storage == infernix::KvCacheStorage::Nvfp4Group16;
-                bool pv8_invalid       = false;
-                const std::string text = construction_error(options, pv8_invalid);
-                failures += check(text.find("P*V") == std::string::npos,
-                                  "the 8-bit prefill P*V setting was rejected");
-            }
-        }
-    }
     // The prompt split workspace is bounded and applies to every KV cache.
     options.original_int8_prefill_kernel  = false;
     options.original_nvfp4_prefill_kernel = false;
-    options.prefill_8bit_pv               = infernix::PrefillPv8::Off;
     options.kv_cache                      = infernix::KvCacheStorage::BFloat16;
     for (const std::uint32_t mib : {0U, infernix::kMaximumPrefillSplitWorkspaceMiB}) {
         options.prefill_split_workspace_mib = mib;
@@ -143,6 +117,42 @@ int main() {
     failures += check(split_invalid && split_text.find("prefill_split_workspace_mib") !=
                                            std::string::npos,
                       "a prompt split workspace above 16384 MiB was accepted");
+    // Fast paths are on by default and accepted with every KV cache, but the 16-bit-activation
+    // quality reference runs the exact route: it refuses fast paths and qualification candidates.
+    options.prefill_split_workspace_mib = infernix::kDefaultPrefillSplitWorkspaceMiB;
+    failures += check(infernix::EngineOptions{}.fast_paths, "fast paths must default to on");
+    options.fast_paths = true;
+    for (const auto storage : {infernix::KvCacheStorage::BFloat16, infernix::KvCacheStorage::Int8Group64,
+                               infernix::KvCacheStorage::Nvfp4Group16}) {
+        options.kv_cache       = storage;
+        bool fast_invalid      = false;
+        const std::string text = construction_error(options, fast_invalid);
+        failures += check(text.find("fast paths") == std::string::npos,
+                          "fast paths were rejected without 16-bit activations");
+    }
+    options.a16_activations          = true;
+    bool reference_invalid           = false;
+    const std::string reference_text = construction_error(options, reference_invalid);
+    failures += check(reference_invalid && reference_text.find("fast paths") != std::string::npos,
+                      "fast paths were accepted with the 16-bit-activation reference");
+    options.fast_paths           = false;
+    options.fast_path_candidates = {infernix::FastPath::DecodeSplit64};
+    bool candidate_invalid       = false;
+    const std::string candidate_text = construction_error(options, candidate_invalid);
+    failures += check(candidate_invalid && candidate_text.find("fast paths") != std::string::npos,
+                      "a fast-path candidate was accepted with the 16-bit-activation reference");
+    options.fast_path_candidates.clear();
+    bool exact_invalid     = false;
+    const std::string exact_text = construction_error(options, exact_invalid);
+    failures += check(exact_text.find("fast paths") == std::string::npos,
+                      "the exact route was rejected with the 16-bit-activation reference");
+    // Every fast path round-trips through its name.
+    for (const infernix::FastPath path : infernix::kFastPaths) {
+        failures += check(infernix::parse_fast_path(infernix::fast_path_name(path)) == path,
+                          "a fast path name does not round-trip");
+    }
+    failures += check(!infernix::parse_fast_path("unknown").has_value(),
+                      "an unknown fast path name parsed");
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " Engine option validation\n";
     return failures == 0 ? 0 : 1;
 }

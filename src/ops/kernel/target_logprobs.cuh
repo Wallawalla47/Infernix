@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/infernix/ops/target_logprobs.h
-// Match: contiguous BF16 [physical_rows,C], I32 [T,C], and FP32 [T,C].
+// Match: contiguous BF16 or FP32 [physical_rows,C], I32 [T,C], and FP32 [T,C].
 // Algorithm assumptions: one 256-thread CTA performs a single-pass online logsumexp per column.
 
 #include "ops/common/warp.cuh"
@@ -44,14 +44,18 @@ struct TargetLogprobsColumn {
     float log_sum;
 };
 
-template <int BlockSize>
+// A logit as FP32 (exact for both storage types).
+__device__ __forceinline__ float logprob_logit(__nv_bfloat16 value) { return __bfloat162float(value); }
+__device__ __forceinline__ float logprob_logit(float value) { return value; }
+
+template <int BlockSize, class Logit>
 __device__ __forceinline__ TargetLogprobsColumn
-target_logprobs_column(const __nv_bfloat16* values, std::int32_t valid_rows) {
+target_logprobs_column(const Logit* values, std::int32_t valid_rows) {
     float local_max = -CUDART_INF_F;
     float local_sum = 0.0f;
     for (std::int32_t row = static_cast<std::int32_t>(threadIdx.x); row < valid_rows;
          row += BlockSize) {
-        const float value   = __bfloat162float(values[row]);
+        const float value   = logprob_logit(values[row]);
         const float new_max = fmaxf(local_max, value);
         if (new_max > local_max) {
             local_sum *= expf(local_max - new_max);
@@ -70,18 +74,18 @@ target_logprobs_column(const __nv_bfloat16* values, std::int32_t valid_rows) {
     return {maximum, log_sum};
 }
 
-template <int BlockSize>
+template <int BlockSize, class Logit>
 __launch_bounds__(BlockSize) __global__
-    void target_logprobs_kernel(const __nv_bfloat16* logits, const std::int32_t* target_ids,
+    void target_logprobs_kernel(const Logit* logits, const std::int32_t* target_ids,
                                 float* output, std::int32_t valid_rows,
                                 std::int32_t physical_rows, std::int32_t targets) {
-    const std::int32_t column   = static_cast<std::int32_t>(blockIdx.x);
-    const __nv_bfloat16* values = logits + static_cast<std::int64_t>(column) * physical_rows;
+    const std::int32_t column = static_cast<std::int32_t>(blockIdx.x);
+    const Logit* values       = logits + static_cast<std::int64_t>(column) * physical_rows;
     const TargetLogprobsColumn lse = target_logprobs_column<BlockSize>(values, valid_rows);
     for (std::int32_t target = static_cast<std::int32_t>(threadIdx.x); target < targets;
          target += BlockSize) {
         const std::int64_t index = static_cast<std::int64_t>(column) * targets + target;
-        output[index] = __bfloat162float(values[target_ids[index]]) - lse.maximum - lse.log_sum;
+        output[index] = logprob_logit(values[target_ids[index]]) - lse.maximum - lse.log_sum;
     }
 }
 
