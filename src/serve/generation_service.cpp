@@ -339,6 +339,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.ram_headroom_bytes       = options_.ram_headroom_bytes;
     engine_options.expert_ram_bytes         = options_.expert_ram_bytes;
+    engine_options.expert_host_release      = options_.expert_host_release;
+    engine_options.host_guard               = options_.host_guard;
+    engine_options.host_guard_release_bytes = options_.host_guard_release_bytes;
+    engine_options.host_guard_target_bytes  = options_.host_guard_target_bytes;
+    engine_options.host_guard_restore_bytes = options_.host_guard_restore_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_options.diagnostic_observer      = std::move(diagnostic_observer);

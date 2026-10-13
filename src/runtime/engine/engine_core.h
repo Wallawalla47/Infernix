@@ -149,6 +149,44 @@ public:
         queue_cv_.notify_all();
     }
 
+    // A Program whose Device expert cache is elastic (Qwen4Exp, design §19.3.7) also takes explicit
+    // residency requests: the cache hands Device memory back and takes it again without the engine
+    // stopping, for a program that needs the VRAM in between. A Program without one reports an
+    // unsupported status and ignores the request, so callers need no model-specific switch.
+    static constexpr bool kProgramResidency = requires(typename Instance::ModelContract::Program& program) {
+        program.request_residency(false, std::uint32_t{});
+        program.residency_status();
+    };
+
+    // Records the request and wakes the worker, which applies it under the execution lock at its
+    // next idle boundary. Returns immediately; poll residency_status() for the outcome.
+    void request_residency(bool release, std::uint32_t frames) {
+        if constexpr (kProgramResidency) {
+            instance_.program->request_residency(release, frames);
+        }
+    }
+
+    [[nodiscard]] ResidencyStatus residency_status() const {
+        if constexpr (kProgramResidency) {
+            return instance_.program->residency_status();
+        } else {
+            return ResidencyStatus{};
+        }
+    }
+
+    // The Program's SSD expert tier holds its expert records in pinned Host memory (design
+    // §19.3.7), which is the machine's largest single holding and the level a release can hand back
+    // to the OS with the engine still running. A Program without a tier ignores the request.
+    static constexpr bool kProgramHostResidency = requires(typename Instance::ModelContract::Program& program) {
+        program.request_host_residency(false, std::uint64_t{});
+    };
+
+    void request_host_residency(bool release, std::uint64_t bytes) {
+        if constexpr (kProgramHostResidency) {
+            instance_.program->request_host_residency(release, bytes);
+        }
+    }
+
     // Refuses new submissions. At its next unit boundary the worker ends every queued and active
     // request with an Unavailable error and runs the Program's orderly Shutdown cleanup.
     void stop() noexcept {

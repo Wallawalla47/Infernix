@@ -23,6 +23,7 @@
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
 #include "models/qwen4_exp/memory_plan.h"
+#include "core/host_memory.h"
 #include "models/qwen4_exp/program/expert_residency.h"
 #include "models/qwen4_exp/program/host_expert_tier.h"
 #include "models/qwen4_exp/program/expert_cache/expert_state.h"
@@ -2142,8 +2143,14 @@ private:
     // pool, warns once per pressure episode that nothing absorbs it.
     void on_vram_snapshot(const VramSnapshot& snapshot) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
+        // The same reading drives the Host-memory guard: the expert slots this engine pins are the
+        // machine's largest single holding, and nothing outside the process can give them back.
+        host_guard_tick();
         if (kv_idle_due() && waker_) { waker_(); }
         if (control_) {
+            // An explicit release owns the cache size until a restore, so the control law must not
+            // wake the engine once a second for a resize it is not allowed to perform.
+            if (residency_forced_.load()) { return; }
             const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
             if ((d.shrink || d.grow) && waker_) { waker_(); }
             return;
@@ -2166,6 +2173,201 @@ public:
     void set_maintenance_waker(std::function<void()> waker) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         waker_ = std::move(waker);
+    }
+
+    // ---- explicit residency control (Program::request_residency) ----------------------------
+    // Another program needs the Device memory: this only records the request and wakes the engine,
+    // which runs maintain() at an idle boundary and applies it there. Nothing here touches CUDA.
+    void request_residency(bool release, std::uint32_t frames) {
+        std::function<void()> wake;
+        {
+            const std::lock_guard<std::mutex> lock(vram_mutex_);
+            residency_forced_  = release;
+            residency_restore_ = !release;
+            residency_target_  = frames;
+            wake               = waker_;
+        }
+        if (wake) { wake(); }
+    }
+
+    [[nodiscard]] ResidencyStatus residency_status() const {
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        ResidencyStatus out;
+        out.supported           = residency_ != nullptr && residency_->elastic();
+        out.forced              = residency_forced_;
+        out.restore_pending     = residency_restore_;
+        out.requested_frames    = residency_target_;
+        out.frames              = frames_now_;
+        out.startup_frames      = startup_frames_;
+        out.control_target      = control_target_;
+        out.frame_limit         = residency_ != nullptr ? residency_->frame_limit() : 0U;
+        out.frame_bytes         = residency_ != nullptr ? residency_->frame_stride() : 0U;
+        out.pool_bytes          = pool_now_;
+        out.last_resize_seconds = last_resize_seconds_;
+        if (tier_ != nullptr) {
+            HostResidencyStatus& host = out.host;
+            host.supported        = true;
+            host.forced           = host_forced_;
+            host.restore_pending  = host_restore_;
+            host.bytes            = tier_->host_bytes();
+            host.bytes_max        = tier_->host_bytes_max();
+            host.bytes_floor      = tier_->host_bytes_floor();
+            host.released_bytes   = host_released_bytes_;
+            host.slots            = tier_->host_slots();
+            host.slot_limit       = tier_->host_slot_limit();
+            host.slot_bytes       = tier_->host_slot_bytes();
+            host.slots_per_chunk  = tier_->host_slots_per_chunk();
+            host.resident_keys    = tier_->host_resident_keys();
+            host.key_count        = tier_->keys();
+            host.guard            = options_.host_guard;
+            host.guard_releases   = host_guard_releases_;
+            host.guard_owned      = host_guard_owned_.load();
+            host.last_slots       = host_last_slots_;
+            host.last_keys        = host_last_keys_;
+            host.last_op_seconds  = host_last_op_seconds_;
+        }
+        return out;
+    }
+
+    // ---- SSD tier Host memory (Program::request_host_residency, and the guard) ----------------
+    void request_host_residency(bool release, std::uint64_t bytes) {
+        std::function<void()> wake;
+        {
+            const std::lock_guard<std::mutex> lock(vram_mutex_);
+            host_forced_       = release;
+            host_restore_      = !release;
+            host_target_bytes_ = bytes;
+            // An outside caller owns this request: the guard must not take the slots back on its
+            // own judgement, only the caller decides when they are wanted again.
+            host_guard_owned_  = false;
+            wake               = waker_;
+        }
+        if (wake) { wake(); }
+    }
+
+    // Runs on the VRAM monitor's thread (once a second) with vram_mutex_ held. The tier pins every
+    // expert record it holds — tens of GiB — for the life of the process, so this engine is what
+    // runs the machine out of physical memory when another job loads its own weights. Nothing
+    // outside the process can give that memory back without stopping the engine, so the engine
+    // watches the OS's free memory itself: below `host_guard_release_bytes` it asks for a release
+    // (the worker applies it at its next idle boundary), above `host_guard_restore_bytes` it asks
+    // for the slots back. Both are ordinary residency requests; neither stops the engine.
+    //
+    // The guard only undoes its OWN release (`host_guard_owned_`). A release an outside caller
+    // asked for — the ComfyUI node before a job, the DSH skill, an operator with curl — stays in
+    // force until that caller restores it: on this machine "free memory is comfortable again" is
+    // true the instant such a release lands, so a guard that restored on free memory alone would
+    // hand the tens of GiB straight back and the caller's job would run out of RAM anyway.
+    void host_guard_tick() {
+        if (tier_ == nullptr || !options_.host_guard) { return; }
+        if (host_forced_.load() || host_restore_.load()) { return; } // a request is already in flight
+        const auto now = Clock::now();
+        if (host_guard_last_action_.time_since_epoch().count() != 0 &&
+            now - host_guard_last_action_ <
+                std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::duration<double>(options_.host_guard_cooldown_seconds))) {
+            return;
+        }
+        std::uint64_t free_host = 0;
+        try {
+            free_host = available_host_memory_bytes();
+        } catch (...) {
+            return;
+        }
+        if (free_host >= options_.host_guard_restore_bytes) {
+            if (host_released_bytes_ == 0 || !host_guard_owned_.load()) { return; }
+            host_restore_           = true;
+            host_target_bytes_      = 0;
+            host_guard_last_action_ = now;
+            diagnostic("host memory guard: " + std::to_string(free_host >> 30) + " GiB free, taking the " +
+                       std::to_string(host_released_bytes_ >> 30) + " GiB of pinned expert slots back");
+            if (waker_) { waker_(); }
+            return;
+        }
+        if (free_host >= options_.host_guard_release_bytes) { return; }
+        host_forced_                = true;
+        host_target_bytes_          = options_.host_guard_target_bytes > free_host
+                                          ? options_.host_guard_target_bytes - free_host
+                                          : 0;
+        host_guard_release_pending_ = true;
+        host_guard_last_action_     = now;
+        diagnostic("host memory guard: only " + std::to_string(free_host >> 20) +
+                       " MiB of Host memory free; giving pinned expert slots back at the next idle boundary",
+                   DiagnosticLevel::Warning);
+        if (waker_) { waker_(); }
+    }
+
+    // Applies a Host-memory request at an idle boundary. `idle_ready` is the same gate the Device
+    // cache uses: no request active and every lane free, so no round can be reading a slot that is
+    // about to be retired. A request that cannot run stays pending and is retried at the next
+    // boundary - the engine never interrupts a round to honour one.
+    void apply_host_request(bool idle_ready) {
+        if (tier_ == nullptr) { return; }
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        const bool release = host_forced_.load(), restore = host_restore_.load();
+        if (!release && !restore) { return; }
+        if (!idle_ready || tier_->round_open()) { return; }
+        if (release) {
+            const bool guard_owned = host_guard_release_pending_;
+            // A promotion's H2D pin lives until its copy is published, and publishing happens only
+            // at a round boundary. At an idle boundary the copies are long done but nobody has
+            // published them, so their pins would block the top chunk's retirement for good - one
+            // pin costs 1.3 GiB of Host memory that can never be handed back. Publish first.
+            if (residency_) { residency_->publish_landed(); }
+            const HostExpertTier::HostChange change = tier_->release_host(host_target_bytes_);
+            host_released_bytes_ += change.bytes;
+            host_last_slots_      = change.slots;
+            host_last_keys_       = change.keys;
+            host_last_op_seconds_ = change.seconds;
+            if (guard_owned) {
+                ++host_guard_releases_;
+                host_guard_release_pending_ = false;
+            }
+            // The guard may only undo a release it caused, and only one that actually moved bytes.
+            host_guard_owned_  = guard_owned && change.bytes != 0;
+            host_forced_       = false;
+            host_target_bytes_ = 0;
+            if (change.bytes != 0) {
+                diagnostic("Host expert slots released: " + std::to_string(change.slots) + " slots (" +
+                               std::to_string(change.bytes >> 20) + " MiB) handed to the OS, " +
+                               std::to_string(change.keys) + " experts now read from the artifact in " +
+                               std::to_string(change.seconds) +
+                               " s; the engine keeps serving from its remaining slots",
+                           DiagnosticLevel::Info);
+            }
+            if (!change.stopped.empty()) {
+                // A release retires whole chunks, so a slot the tier may not retire costs its chunk.
+                // Saying which one it was is the only way to tell a caller why it got less than it
+                // asked for.
+                diagnostic("Host expert slots released: " + std::to_string(change.slots) + " slots (" +
+                               std::to_string(change.bytes >> 20) + " MiB) - the release stopped early: " +
+                               change.stopped,
+                           DiagnosticLevel::Warning);
+            }
+            return;
+        }
+        try {
+            const HostExpertTier::HostChange change = tier_->restore_host(host_target_bytes_);
+            host_released_bytes_ =
+                host_released_bytes_ > change.bytes ? host_released_bytes_ - change.bytes : 0;
+            host_last_slots_      = change.slots;
+            host_last_keys_       = change.keys;
+            host_last_op_seconds_ = change.seconds;
+            if (change.bytes != 0) {
+                diagnostic("Host expert slots restored: " + std::to_string(change.slots) + " slots (" +
+                               std::to_string(change.bytes >> 20) + " MiB) pinned, " +
+                               std::to_string(change.keys) + " experts read back from the artifact in " +
+                               std::to_string(change.seconds) + " s",
+                           DiagnosticLevel::Info);
+            }
+        } catch (const std::exception& error) {
+            host_last_op_seconds_ = tier_->last_host_op_seconds();
+            diagnostic(std::string("Host expert slot restore failed and the slots were given back: ") + error.what(),
+                       DiagnosticLevel::Warning);
+        }
+        host_restore_      = false;
+        host_guard_owned_  = false;
+        host_target_bytes_ = 0;
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
@@ -2374,27 +2576,88 @@ public:
     static constexpr int kAssistMaxColumns = 255;
 
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
-    // cache to the control law's decision.
+    // cache to the control law's decision, or to an explicit residency request when one is in
+    // effect. An explicit request only runs with the engine genuinely idle, so it can never
+    // interrupt a round or a request.
     void apply_vram_target(bool idle) {
-        if (idle && kv_idle_due() &&
-            std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
+        const bool idle_ready =
+            idle && std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; });
+        // Host memory first: it is the tier's own pinned slots (the largest holding on the machine)
+        // and it is released without touching the Device cache the rest of this function sizes.
+        apply_host_request(idle_ready);
+        const bool forced = residency_forced_.load();
+        if ((forced || residency_restore_.load()) && residency_ == nullptr) {
+            // No elastic cache to resize (e.g. it is disabled for this artifact); drop the
+            // request instead of dereferencing an empty pool.
+            residency_forced_.store(false);
+            residency_restore_.store(false);
+            residency_target_.store(0);
+            return;
+        }
+        if (forced && !idle) {
+            // Work arrived while the Device memory was handed to another process: the caller needs
+            // the engine, so withdraw the explicit release and let the next idle boundary size the
+            // cache again. Without this the control law stays bypassed for the whole round and the
+            // engine would serve with the released cache (every expert streamed from host memory).
+            residency_forced_.store(false);
+            residency_restore_.store(true);
+            residency_target_.store(0);
+            return;
+        }
+        if (idle_ready && (forced || kv_idle_due())) {
             kv_busy(); // one attempt per idle period: blocks without host copies may still hold the top
             shrink_kv(true);
         }
         if (!control_) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
-        if (d.frames == frames_now_) { return; }
+        std::uint32_t want = frames_now_;
+        bool shrink        = false;
+        if (forced) {
+            // An explicit release waits for the engine to be genuinely idle, then gives the Device
+            // memory back - KV's Device tier included, since the caller is handing it to someone else.
+            if (!idle_ready) { return; }
+            want = std::min(residency_target_.load(), residency_->frame_limit());
+        } else if (residency_restore_.load()) {
+            if (!idle_ready) { return; }
+            // A restore skips the control law's grow delay and hysteresis: the caller asked for the
+            // Device memory back, so it takes the target the sizing function gives right now.
+            control_target_ = control_->target(monitor_->latest(), pool_now_);
+            want            = control_target_;
+        } else {
+            const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
+            control_target_ = d.frames;
+            if (d.frames == frames_now_) { return; }
+            want   = d.frames;
+            shrink = d.shrink;
+        }
+        if (want == frames_now_) {
+            if (!forced && residency_restore_.load() && frames_now_ >= control_target_) {
+                residency_restore_.store(false);
+            }
+            return;
+        }
         const std::uint32_t before = frames_now_;
-        const auto resized         = residency_->resize(d.frames, device_.stream, *vram_);
+        const double started       = vram_seconds();
+        const auto resized         = residency_->resize(want, device_.stream, *vram_);
+        last_resize_seconds_       = vram_seconds() - started;
         frames_now_                = resized.frames;
         pool_now_                  = residency_->pool_bytes();
         const VramSnapshot after   = monitor_->refresh();
-        diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
+        if (forced || residency_restore_.load()) {
+            diagnostic(std::string(forced ? "explicit residency release: expert cache "
+                                          : "explicit residency restore: expert cache ") +
+                           std::to_string(before) + " -> " + std::to_string(frames_now_) + " frames (" +
+                           std::to_string(pool_now_ >> 20) + " MiB on the device) in " +
+                           std::to_string(last_resize_seconds_) + " s",
+                       DiagnosticLevel::Info);
+            residency_restore_.store(false);
+            return;
+        }
+        diagnostic(std::string(shrink ? "free VRAM fell to " : "free VRAM rose to ") +
                    std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
                    " -> " + std::to_string(frames_now_) + " frames" +
                    (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
-        if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
+        if (shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
             diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) +
                        " frames, so decode is slower until that memory is released", DiagnosticLevel::Warning);
@@ -3796,11 +4059,36 @@ private:
     DeviceLayout plan_;
     std::unique_ptr<VramBudgetSource> vram_;
     VramSizing sizing_;
-    std::mutex vram_mutex_; // the control law, the waker and the cache size the monitor reads
+    mutable std::mutex vram_mutex_; // the control law, the waker and the cache size the monitor reads
     std::optional<VramControl> control_;
     std::function<void()> waker_;
     std::uint32_t frames_now_ = 0, startup_frames_ = 0;
     std::uint64_t pool_now_   = 0;
+    // Explicit residency control (Program::request_residency). Written from another thread, read
+    // and honoured by apply_vram_target at an idle boundary; `forced` pins the cache at `target`
+    // until a restore withdraws it, which then resizes once without the control law's hysteresis.
+    // Atomic so the idle path can test them before it takes vram_mutex_.
+    std::atomic<bool> residency_forced_{false};
+    std::atomic<bool> residency_restore_{false};
+    std::atomic<std::uint32_t> residency_target_{0};
+    // The SSD tier's pinned Host memory (Program::request_host_residency, and the guard that acts on
+    // its own). Same protocol as the Device cache: written from another thread, applied by
+    // apply_host_request at an idle boundary, cleared once it has been carried out.
+    std::atomic<bool> host_forced_{false};
+    std::atomic<bool> host_restore_{false};
+    std::uint64_t host_target_bytes_  = 0;
+    std::uint64_t host_released_bytes_ = 0; // pinned bytes given back and not yet taken again
+    std::uint32_t host_last_slots_    = 0;
+    std::uint64_t host_last_keys_     = 0;
+    double host_last_op_seconds_      = 0.0;
+    std::uint64_t host_guard_releases_ = 0;
+    bool host_guard_release_pending_  = false; // the pending release is the guard's, not a caller's
+    // True while the slots are released *because the guard released them*, so the guard may take
+    // them back on its own. A release an outside caller asked for clears it (request_host_residency).
+    std::atomic<bool> host_guard_owned_{false};
+    Clock::time_point host_guard_last_action_{};
+    std::uint32_t control_target_ = 0;
+    double last_resize_seconds_   = 0.0;
     bool low_frames_warned_   = false;
     bool pressure_warned_     = false;
     Clock::time_point vram_epoch_{};

@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -205,6 +206,18 @@ std::string serve_usage_text(const char* argv0) {
            "                             experts (auto: what --ram-headroom-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
            "                             rest from the artifact (the SSD tier)\n"
+           "  --expert-host-release      Qwen3.8-Flash-Next: keep the experts in the SSD tier's\n"
+           "                             chunked pinned slots even when every expert fits in\n"
+           "                             RAM, so the engine can hand that memory back while it\n"
+           "                             runs (same RAM cost and read rate; what the Host\n"
+           "                             guard needs)\n"
+           "  --host-guard on|off        Qwen3.8-Flash-Next: release pinned expert slots by\n"
+           "                             itself when the OS runs out of Host memory, and take\n"
+           "                             them back when it has room again (default on; a\n"
+           "                             release never stops the engine)\n"
+           "  --host-guard-mib L:T:H     free Host memory in MiB below which the guard releases\n"
+           "                             slots, the free memory a release aims at, and the free\n"
+           "                             memory above which they are taken back\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto       KV-cache capacity in tokens (default auto, or\n"
@@ -614,6 +627,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 }
                 options.expert_ram_bytes = mib << 20;
             }
+        } else if (arg == "--expert-host-release") {
+            options.expert_host_release = true;
+        } else if (arg == "--host-guard") {
+            const std::string text = require_value("--host-guard");
+            if (text == "off" || text == "on") {
+                options.host_guard = text == "on";
+            } else {
+                throw std::invalid_argument("--host-guard takes on or off");
+            }
+        } else if (arg == "--host-guard-mib") {
+            // LOW:TARGET:HIGH - free Host memory (MiB) below which pinned expert slots are released,
+            // the free memory a release aims at, and the free memory above which they are taken back.
+            const std::string text = require_value("--host-guard-mib");
+            unsigned long long low = 0, target = 0, high = 0;
+            if (std::sscanf(text.c_str(), "%llu:%llu:%llu", &low, &target, &high) != 3 || low == 0 ||
+                target < low || high < target) {
+                throw std::invalid_argument("--host-guard-mib takes LOW:TARGET:HIGH in MiB, ascending");
+            }
+            options.host_guard_release_bytes = static_cast<std::uint64_t>(low) << 20;
+            options.host_guard_target_bytes  = static_cast<std::uint64_t>(target) << 20;
+            options.host_guard_restore_bytes = static_cast<std::uint64_t>(high) << 20;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {

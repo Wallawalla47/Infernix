@@ -28,6 +28,7 @@
 #include <deque>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -109,6 +110,53 @@ public:
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
     [[nodiscard]] const std::uint8_t* slot_bytes(std::uint32_t slot) const noexcept;
 
+    // ---- runtime Host-memory residency (Program::request_host_residency) ----
+    // The tier pins its slots for the whole process (design §19.3.7: the Host level of the SSD tier
+    // keeps the records the VRAM frames load from), which is what a machine runs out of physical
+    // memory on. These give pinned bytes back to the OS and take them again without stopping the
+    // engine: a retired slot's keys are read from the artifact exactly like the keys the fill never
+    // reached, so the engine keeps serving, only slower.
+    struct HostChange {
+        std::uint64_t bytes = 0; // pinned bytes given back (release) or taken (restore)
+        std::uint32_t keys  = 0; // keys that lost (release) or recovered (restore) their Host copy
+        std::uint32_t slots = 0; // slots retired (release) or added (restore)
+        bool read_failed    = false; // a restore whose records did not land: it was rolled back
+        double seconds      = 0.0;
+        // A release retires whole chunks and stops at the first chunk it may not retire, so it can
+        // hand back less than asked. Empty when it went as far as it was asked to; otherwise the
+        // engine thread logs it (HostTier::tail_blocker says which key and which holder stopped it).
+        std::string stopped;
+    };
+    // Pinned Host bytes the tier holds now, the ceiling its options allow, and the least a release
+    // may leave (the landing lists plus one chunk of residents).
+    [[nodiscard]] std::uint64_t host_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t host_bytes_max() const noexcept;
+    [[nodiscard]] std::uint64_t host_bytes_floor() const noexcept;
+    // The least slots a shrink may leave: the landing lists plus one chunk of residents.
+    [[nodiscard]] std::uint32_t host_slot_floor() const noexcept {
+        return tier_.list_slots() + per_chunk_;
+    }
+    [[nodiscard]] std::uint32_t host_slots() const noexcept { return slots_now_; }
+    [[nodiscard]] std::uint32_t host_slot_limit() const noexcept { return options_.slots; }
+    [[nodiscard]] std::uint32_t host_slot_bytes() const noexcept {
+        return static_cast<std::uint32_t>(store_.record_bytes());
+    }
+    [[nodiscard]] std::uint32_t host_slots_per_chunk() const noexcept { return per_chunk_; }
+    [[nodiscard]] std::uint32_t host_resident_keys() const noexcept {
+        return static_cast<std::uint32_t>(tier_.resident_count() + tier_.shadow_count());
+    }
+    [[nodiscard]] double last_host_op_seconds() const noexcept { return last_host_op_seconds_; }
+    // A round is open (the tier's slots are being read: a shrink waits for its end).
+    [[nodiscard]] bool round_open() const;
+    // Gives pinned Host memory back by retiring whole chunks from the top. `bytes == 0` gives back
+    // as much as the floor allows. Engine thread only, with no round in flight and every read
+    // landed; returns what happened (bytes == 0 when nothing could be given back).
+    HostChange release_host(std::uint64_t bytes);
+    // Takes pinned Host memory back and refills it from the artifact, the keys with the highest
+    // decayed-LFU score first. `bytes == 0` takes as much as the ceiling allows. On a read failure
+    // the fresh slots are given back again, so no key is ever left pointing at unwritten bytes.
+    HostChange restore_host(std::uint64_t bytes);
+
     // ---- RecordProvider: the CPU service thread, during a round
     std::uint32_t demand(int layer, int expert) noexcept override;
     [[nodiscard]] bool landed(std::uint32_t ticket) const noexcept override;
@@ -163,12 +211,19 @@ private:
     bool take_slot(std::uint32_t t);
     // Waits until every request handed to the agent has completed.
     void drain();
+    // The keys in the order a refill should take them: the tier's decayed LFU, best first, and the
+    // keys it never ranked spread across the layers so no layer is left wholly on the artifact.
+    [[nodiscard]] std::vector<std::uint32_t> rank_keys() const;
+    // Retires and frees the top `chunks` chunks (never below the floor).
+    HostChange drop_top_chunks(std::uint32_t chunks);
 
     const ExpertStore& store_;
     Options options_;
     expert_cache::HostTier tier_;
     std::vector<std::byte*> chunks_;
     std::uint32_t per_chunk_ = 0;
+    std::uint32_t slots_now_ = 0;        // slots the chunks hold: the controller's live size
+    double last_host_op_seconds_ = 0.0;  // wall time of the last release/restore
 
     // Agent state. Guarded by mutex_: the queues of new work and the round's ring.
     mutable std::mutex mutex_;

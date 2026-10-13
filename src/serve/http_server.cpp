@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 namespace infernix::serve {
@@ -196,6 +197,19 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
     return path;
 }
 
+// /v1/internal/* is the local control plane (the yield broker asks the engine to hand its
+// Device expert cache to another GPU tenant). It is not part of the OpenAI-compatible
+// surface, so it is exempt from the API key exactly like /health - but it is refused off
+// loopback, so a server bound to a routable interface cannot be told to drop its cache by
+// a stranger.
+bool is_internal_control_path(std::string_view path) {
+    return canonical_api_path(path).starts_with("/v1/internal/");
+}
+
+bool is_loopback_peer(std::string_view addr) {
+    return addr == "127.0.0.1" || addr == "::1" || addr == "::ffff:127.0.0.1";
+}
+
 HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> logger,
                        std::shared_ptr<product::TerminalPanel> panel)
     : options_(std::move(options)), openai_responses_store_(options_.response_store_max_records,
@@ -367,7 +381,8 @@ void HttpServer::register_routes() {
 
     server_.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         ensure_http_request_id(req, res);
-        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS") {
+        if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
+            is_internal_control_path(req.path)) {
             return httplib::Server::HandlerResponse::Unhandled;
         }
         // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -456,6 +471,14 @@ void HttpServer::register_routes() {
         res.set_content(metrics_.render(stats, service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
+    server_.Get(api_route_pattern("/internal/residency"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_residency_status(req, res);
+                });
+    server_.Post(api_route_pattern("/internal/residency"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_residency_request(req, res);
+                 });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_model(req, res);
@@ -531,8 +554,192 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
                     "application/json");
 }
 
-bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
+namespace {
 
+// The elastic expert cache's state as the internal residency endpoint reports it, including the
+// SSD tier's pinned Host memory (the level a release can hand back to the OS with the engine
+// still serving, design §19.3.7).
+nlohmann::json residency_json(const infernix::ResidencyStatus& status) {
+    const infernix::HostResidencyStatus& host = status.host;
+    return nlohmann::json{
+        {"supported", status.supported},
+        {"forced", status.forced},
+        {"restore_pending", status.restore_pending},
+        {"requested_frames", status.requested_frames},
+        {"frames", status.frames},
+        {"startup_frames", status.startup_frames},
+        {"control_target", status.control_target},
+        {"frame_limit", status.frame_limit},
+        {"frame_bytes", status.frame_bytes},
+        {"pool_bytes", status.pool_bytes},
+        {"pool_mib", static_cast<std::uint64_t>(status.pool_bytes >> 20)},
+        {"last_resize_seconds", status.last_resize_seconds},
+        {"host",
+         nlohmann::json{
+             {"supported", host.supported},
+             {"forced", host.forced},
+             {"restore_pending", host.restore_pending},
+             {"bytes", host.bytes},
+             {"mib", host.bytes >> 20},
+             {"bytes_max", host.bytes_max},
+             {"bytes_floor", host.bytes_floor},
+             {"released_bytes", host.released_bytes},
+             {"slots", host.slots},
+             {"slot_limit", host.slot_limit},
+             {"slot_bytes", host.slot_bytes},
+             {"slots_per_chunk", host.slots_per_chunk},
+             {"resident_keys", host.resident_keys},
+             {"key_count", host.key_count},
+             {"guard", host.guard},
+             {"guard_releases", host.guard_releases},
+             {"guard_owned", host.guard_owned},
+             {"last_slots", host.last_slots},
+             {"last_keys", host.last_keys},
+             {"last_op_seconds", host.last_op_seconds},
+         }},
+    };
+}
+
+void write_residency_error(httplib::Response& res, int status, const char* message) {
+    ApiError error;
+    error.status  = status;
+    error.type    = "invalid_request_error";
+    error.message = message;
+    write_openai_error(res, error);
+}
+
+} // namespace
+
+void HttpServer::handle_residency_status(const httplib::Request& req, httplib::Response& res) const {
+    res.set_header("Cache-Control", "no-store");
+    if (!is_loopback_peer(req.remote_addr)) {
+        write_residency_error(res, 403, "the residency control plane is loopback-only");
+        return;
+    }
+    if (service_ == nullptr) {
+        ApiError error;
+        error.status  = 503;
+        error.type    = "internal_error";
+        error.message = "inference engine is not attached";
+        write_openai_error(res, error);
+        return;
+    }
+    res.set_content(residency_json(service_->residency_status()).dump(), "application/json");
+}
+
+void HttpServer::handle_residency_request(const httplib::Request& req, httplib::Response& res) {
+    res.set_header("Cache-Control", "no-store");
+    if (!is_loopback_peer(req.remote_addr)) {
+        write_residency_error(res, 403, "the residency control plane is loopback-only");
+        return;
+    }
+    if (service_ == nullptr) {
+        ApiError error;
+        error.status  = 503;
+        error.type    = "internal_error";
+        error.message = "inference engine is not attached";
+        write_openai_error(res, error);
+        return;
+    }
+    std::string action   = "release";
+    std::uint32_t frames = 0;
+    long long wait_ms    = 120000;
+    // The SSD tier's pinned Host memory is untouched unless the body names it, so the plain
+    // {"action":"release"} of the Device cache keeps meaning exactly that.
+    std::string host_memory  = "keep"; // "keep" | "release" | "restore"
+    std::uint64_t host_bytes = 0;
+    if (!req.body.empty()) {
+        try {
+            const auto body = nlohmann::json::parse(req.body);
+            if (body.contains("action")) { action = body.at("action").get<std::string>(); }
+            if (body.contains("frames")) { frames = body.at("frames").get<std::uint32_t>(); }
+            if (body.contains("wait_ms")) { wait_ms = body.at("wait_ms").get<long long>(); }
+            if (body.contains("host")) { host_memory = body.at("host").get<std::string>(); }
+            if (body.contains("host_bytes")) {
+                host_bytes = body.at("host_bytes").get<std::uint64_t>();
+                if (!body.contains("host") && host_bytes != 0) { host_memory = action; }
+            }
+        } catch (const std::exception& error) {
+            write_residency_error(res, 400,
+                                  (std::string("invalid request body: ") + error.what()).c_str());
+            return;
+        }
+    }
+    if (action != "release" && action != "restore") {
+        write_residency_error(res, 400, "action must be \"release\" or \"restore\"");
+        return;
+    }
+    if (host_memory != "keep" && host_memory != "release" && host_memory != "restore") {
+        write_residency_error(res, 400, "host must be \"keep\", \"release\" or \"restore\"");
+        return;
+    }
+
+    const bool release    = action == "release";
+    const bool host_want  = host_memory != "keep";
+    const auto started = std::chrono::steady_clock::now();
+    const infernix::ResidencyStatus before = service_->residency_status();
+    if (!before.supported) {
+        res.status = 409;
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(nlohmann::json{{"ok", false},
+                                       {"action", action},
+                                       {"error", "this engine has no elastic Device expert cache"},
+                                       {"before", residency_json(before)}}
+                            .dump(),
+                        "application/json");
+        return;
+    }
+    if (host_want && !before.host.supported) {
+        res.status = 409;
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(nlohmann::json{{"ok", false},
+                                       {"action", action},
+                                       {"host_action", host_memory},
+                                       {"error", "this engine has no SSD expert tier with pinned Host slots"},
+                                       {"before", residency_json(before)}}
+                            .dump(),
+                        "application/json");
+        return;
+    }
+
+    service_->request_residency(release, frames);
+    if (host_want) { service_->request_host_residency(host_memory == "release", host_bytes); }
+    const auto deadline = started + std::chrono::milliseconds(wait_ms < 0 ? 0 : wait_ms);
+    const auto settled  = [&](const infernix::ResidencyStatus& status) {
+        // A release is done once the frames are down to what was asked and no restore is queued; a
+        // restore is done once the request is withdrawn (the control law may grow the cache later).
+        const bool vram_done = release ? (status.frames <= frames && !status.restore_pending)
+                                       : (!status.forced && !status.restore_pending);
+        // A Host-memory request is done once it has been carried out at an idle boundary; the
+        // caller reads the bytes it moved from the before/after blocks.
+        const bool host_done = !host_want || (!status.host.forced && !status.host.restore_pending);
+        return vram_done && host_done;
+    };
+    infernix::ResidencyStatus after;
+    for (;;) {
+        after = service_->residency_status();
+        if (settled(after) || std::chrono::steady_clock::now() >= deadline) { break; }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    const bool done = settled(after);
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - started)
+                            .count();
+    res.status = done ? 200 : 202;
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(nlohmann::json{{"ok", done},
+                                   {"action", action},
+                                   {"requested_frames", frames},
+                                   {"host_action", host_memory},
+                                   {"host_bytes_requested", host_bytes},
+                                   {"waited_ms", waited},
+                                   {"before", residency_json(before)},
+                                   {"after", residency_json(after)}}
+                        .dump(),
+                    "application/json");
+}
+
+bool HttpServer::bind() { return server_.bind_to_port(options_.host, options_.port); }
 void HttpServer::attach(GenerationService& service) {
     if (service_ != nullptr) {
         throw std::logic_error("HTTP generation service is already attached");
