@@ -85,7 +85,11 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
-          queue_holds_(options.context_cache.enabled && options.context_cache.hybrid.queue_holds) {
+          queue_holds_(options.context_cache.enabled && options.context_cache.hybrid.queue_holds),
+          tool_call_hold_(options.context_cache.enabled
+                              ? options.context_cache.hybrid.tool_call_hold.value_or(
+                                    std::chrono::milliseconds{0})
+                              : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -949,6 +953,13 @@ private:
             request->constrained_draws  = std::move(finished.constrained_draws);
             if constexpr (requires { finished.expert_cache; }) { request->expert_cache = finished.expert_cache; }
             request->terminal_reason.reset();
+            // A reply that hands the client a tool call is followed by the conversation's next
+            // turn once the tool has run: what that turn resumes from is held meanwhile.
+            if (tool_call_hold_.count() > 0 && reason != FinishReason::Cancelled &&
+                request->output.has_tool_calls()) {
+                // Applied by the next admission pass's queue holds.
+                resources_.hold_continuation(*instance_.program, Clock::now() + tool_call_hold_);
+            }
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             complete_success(request, reason);
@@ -1539,7 +1550,8 @@ private:
     // request furthest back first (hybrid-prefix-cache-spec §9.6). Paused requests restore before
     // fresh ones, so they come first. A request no admission pass has planned yet is skipped.
     void hold_queued_sources() {
-        if (!queue_holds_) { return; }
+        // Tool-call holds share the queue holds' ranks, after every queued request.
+        if (!queue_holds_ && tool_call_hold_.count() == 0) { return; }
         std::vector<std::shared_ptr<Request>> queue(paused_.begin(), paused_.end());
         {
             std::lock_guard lock(queue_mutex_);
@@ -2343,6 +2355,8 @@ private:
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;
+    // How long a tool-call hold lasts (zero: none).
+    const std::chrono::milliseconds tool_call_hold_;
     std::chrono::seconds prefix_save_interval_{0}; // zero: the Host tier is saved only at shutdown
     Clock::time_point next_prefix_save_{};
     ResourceManagement resources_;

@@ -5,6 +5,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -190,6 +191,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_device_evictions      = 0;
     std::uint64_t held_snapshot_losses       = 0;
     std::uint64_t held_host_refusals         = 0;
+    std::uint64_t tool_call_holds            = 0;
 };
 
 class ResumeState {
@@ -421,6 +423,11 @@ public:
     // Holds the snapshot each queued request would resume from now, in admission order
     // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // Tool-call hold: what the request finished last resumes its next turn from is held after
+    // every queued request's source until `deadline`.
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);
+    // Whether hybrid_hold_queue must run again for a tool-call hold added, served or expired.
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;

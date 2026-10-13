@@ -242,6 +242,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             },
         .hidden = dimension(config.hidden_size),
     };
+    // Only the prefix cache's Host tier holds the Host form, so without it the exact form stays.
+    if (plan.context_cache.enabled) {
+        switch (plan.context_cache.hybrid.host_state_precision) {
+        case HybridHostStatePrecision::Fp32:
+            state_image_spec.recurrent_host = qwen3_5::RecurrentHostFormat::Fp32;
+            break;
+        case HybridHostStatePrecision::Fp24:
+            state_image_spec.recurrent_host = qwen3_5::RecurrentHostFormat::Fp24;
+            break;
+        case HybridHostStatePrecision::Bf16:
+            state_image_spec.recurrent_host = qwen3_5::RecurrentHostFormat::Bf16;
+            break;
+        }
+    }
     {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;

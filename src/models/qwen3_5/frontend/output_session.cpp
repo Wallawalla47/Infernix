@@ -890,6 +890,10 @@ std::vector<GeneratedToolCall> OutputSession::take_tool_calls() noexcept {
     return impl_ != nullptr ? std::move(impl_->tool_calls) : std::vector<GeneratedToolCall>{};
 }
 
+bool OutputSession::has_tool_calls() const noexcept {
+    return impl_ != nullptr && !impl_->tool_calls.empty();
+}
+
 ToolCallParseDiagnostics OutputSession::tool_call_parse_diagnostics() const noexcept {
     return impl_ != nullptr ? impl_->tool_call_parse : ToolCallParseDiagnostics{};
 }

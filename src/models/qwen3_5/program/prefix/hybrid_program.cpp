@@ -439,7 +439,9 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
     if (!hybrid_) { return; }
     pc::PrefixCacheIndex& index = hybrid_->index();
     std::vector<pc::SnapshotRef> holds;
-    for (const RequestBasePlan* base : queue) {
+    for (const RequestBasePlan* base : context_cache.hybrid.queue_holds
+                                           ? queue
+                                           : std::span<const RequestBasePlan* const>{}) {
         if (holds.size() == pc::kMaxQueueHolds) { break; }
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->prompt ||
             !base->impl_->allow_prefix_reuse || !base->impl_->prompt->identity.reusable) {
@@ -458,7 +460,51 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
         const pc::AdmissionChoice choice = index.choose(match, n);
         if (choice.candidate) { holds.push_back(match.candidates[*choice.candidate].snapshot); }
     }
+    // Tool-call holds rank after every waiting request: a conversation whose client has not come
+    // back yet gives way before any that has. The earliest deadline (the oldest tool call, the
+    // soonest return) ranks first.
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(hybrid_tool_holds_, [&](const HybridToolHold& hold) {
+        return hold.deadline <= now ||
+               std::none_of(hold.sources.begin(), hold.sources.end(),
+                            [&](pc::SnapshotRef source) { return index.valid(source); });
+    });
+    for (const HybridToolHold& hold : hybrid_tool_holds_) {
+        for (const pc::SnapshotRef source : hold.sources) {
+            if (holds.size() < pc::kMaxQueueHolds && index.valid(source)) {
+                holds.push_back(source);
+            }
+        }
+    }
+    hybrid_tool_holds_changed_ = false;
     index.set_queue_holds(holds);
+}
+
+void ProgramImpl::hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline) {
+    if (!hybrid_) { return; }
+    const std::array<pc::SnapshotRef, 2> sources = std::exchange(hybrid_finished_sources_, {});
+    const pc::PrefixCacheIndex& index            = hybrid_->index();
+    if (std::none_of(sources.begin(), sources.end(),
+                     [&](pc::SnapshotRef source) { return index.valid(source); })) {
+        return;
+    }
+    hybrid_tool_holds_.push_back(HybridToolHold{.sources = sources, .deadline = deadline});
+    std::stable_sort(hybrid_tool_holds_.begin(), hybrid_tool_holds_.end(),
+                     [](const HybridToolHold& left, const HybridToolHold& right) {
+                         return left.deadline < right.deadline;
+                     });
+    if (hybrid_tool_holds_.size() > pc::kMaxQueueHolds) {
+        hybrid_tool_holds_.resize(pc::kMaxQueueHolds);
+    }
+    hybrid_tool_holds_changed_ = true;
+    ++hybrid_->counters().tool_call_holds;
+}
+
+bool ProgramImpl::hybrid_holds_stale() const noexcept {
+    if (hybrid_tool_holds_changed_) { return true; }
+    const auto now = std::chrono::steady_clock::now();
+    return std::any_of(hybrid_tool_holds_.begin(), hybrid_tool_holds_.end(),
+                       [&](const HybridToolHold& hold) { return hold.deadline <= now; });
 }
 
 std::uint64_t ProgramImpl::hybrid_cache_epoch() const noexcept {
@@ -943,6 +989,8 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     lane_state.deepest_snapshot = reuse;
     lane_state.resume_snapshot  = reuse != 0 ? quote.snapshot : pc::SnapshotRef{};
     lane_state.resume_frontier  = reuse;
+    lane_state.latest_snapshot  = lane_state.resume_snapshot;
+    lane_state.latest_frontier  = reuse;
     lane_state.last_capture     = reuse;
     lane_state.restore_ticket   = ticket;
     lane_state.restore_layers_pending = ticket != 0;
@@ -955,6 +1003,13 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
         counters.reused_tokens += reuse;
         index.unpin_snapshot(quote.snapshot);
         hb.snapshot_pinned = false;
+        // The lane resumes its own conversation now: a hold for its next turn has served.
+        if (std::erase_if(hybrid_tool_holds_, [&](const HybridToolHold& hold) {
+                return std::find(hold.sources.begin(), hold.sources.end(), quote.snapshot) !=
+                       hold.sources.end();
+            }) != 0) {
+            hybrid_tool_holds_changed_ = true;
+        }
     }
     out.sequence  = sequence_handle(lane);
     out.replaying = requests[lane].lifecycle == Lifecycle::Replaying;
@@ -1088,6 +1143,10 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         }
         hybrid_->attach_image(published.snapshot, tap.image);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
+        if (tap.frontier >= lane.latest_frontier) {
+            lane.latest_snapshot = published.snapshot;
+            lane.latest_frontier = tap.frontier;
+        }
         ++counters.taps_created;
         if (!tap.boundary) {
             // A previous tap still pending when this one was captured is superseded here, before
@@ -1234,8 +1293,18 @@ void ProgramImpl::hybrid_release_lane(std::uint32_t lane) noexcept {
 
 void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept {
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
-    const std::uint32_t lane    = sequence.lane;
-    HybridLaneState& lane_state = hybrid_lanes_[lane];
+    const pc::SnapshotRef published = hybrid_publish_endpoint(sequence, endpoint);
+    const HybridLaneState& lane     = hybrid_lanes_[sequence.lane];
+    hybrid_finished_sources_[0]     = published.valid() ? published : lane.latest_snapshot;
+    hybrid_finished_sources_[1]     = lane.tap_snapshot;
+    hybrid_release_lane(sequence.lane);
+}
+
+pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence,
+                                                     bool endpoint) noexcept {
+    pc::SnapshotRef out;
+    if (!hybrid_ || sequence.lane >= max_concurrency) { return out; }
+    HybridLaneState& lane_state = hybrid_lanes_[sequence.lane];
     try {
         if (lane_state.active && lane_state.publish && sequence.kv) {
             hybrid_publish_blocks(sequence);
@@ -1293,6 +1362,7 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                     if (published.snapshot.valid()) {
                         lane_state.deepest_snapshot =
                             std::max(lane_state.deepest_snapshot, frontier);
+                        out = published.snapshot;
                     }
                     if (published.created) {
                         hybrid_->attach_image(published.snapshot, image);
@@ -1312,10 +1382,10 @@ void ProgramImpl::hybrid_finish_lane(SequenceState& sequence, bool endpoint) noe
                                     sequence.ledger);
         }
     } catch (...) {
-        // Terminal publication is optional; a failure keeps whatever was published and releases
-        // the lane normally.
+        // Terminal publication is optional; a failure keeps whatever was published and the lane
+        // is released normally.
     }
-    hybrid_release_lane(lane);
+    return out;
 }
 
 // ---- Device pressure and statistics ------------------------------------------------------------
@@ -1383,6 +1453,7 @@ HybridPrefixCacheStats ProgramImpl::hybrid_stats() const noexcept {
     out.held_device_evictions           = index.held_device_evictions;
     out.held_snapshot_losses            = index.held_snapshot_losses;
     out.held_host_refusals              = index.held_host_refusals;
+    out.tool_call_holds                 = counters.tool_call_holds;
     return out;
 }
 

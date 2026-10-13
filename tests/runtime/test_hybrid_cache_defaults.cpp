@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "runtime/engine/model_instance.h"
 
+#include <chrono>
 #include <iostream>
 #include <stdexcept>
 
@@ -135,12 +136,42 @@ int main() {
         failures += check(qwen35.host_capacity_bytes == infernix::kDefaultHybridHostCacheBytes &&
                               qwen35.hybrid.device_snapshot_slots == 3U,
                           "Qwen3.5 prefix cache defaults changed");
+        // Tool-call holds: on by default for Qwen3.5, absent for Qwen3.8-Flash-Next, explicit
+        // values (zero turns them off) kept, and a disabled cache has none.
+        failures += check(qwen35.hybrid.tool_call_hold == infernix::kDefaultToolCallHold &&
+                              qwen4.hybrid.tool_call_hold == std::chrono::milliseconds{0},
+                          "tool-call hold defaults are wrong");
+        EngineOptions off = options;
+        off.context_cache.hybrid.tool_call_hold = std::chrono::milliseconds{0};
+        failures += check(normalize_engine_options(off).context_cache.hybrid.tool_call_hold ==
+                              std::chrono::milliseconds{0},
+                          "an explicit zero tool-call hold was not kept");
+        EngineOptions disabled;
+        disabled.context_cache.enabled = false;
+        failures += check(normalize_engine_options(disabled).context_cache.hybrid.tool_call_hold ==
+                              std::chrono::milliseconds{0},
+                          "a disabled prefix cache kept a tool-call hold");
     }
-    // ... and refuses what its binding cannot serve: no Host tier and Device snapshot slots.
-    for (int variant = 0; variant < 2; ++variant) {
+    for (int variant = 0; variant < 3; ++variant) {
+        EngineOptions options;
+        options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(variant == 0 ? -1 : 30);
+        if (variant == 2) { options.context_cache.enabled = false; }
+        bool rejected = false;
+        try {
+            (void)normalize_engine_options(options);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected == (variant != 1), "a tool-call hold was misjudged");
+    }
+    // ... and refuses what its binding cannot serve: no Host tier, Device snapshot slots, a
+    // tool-call hold and a packed Host state.
+    for (int variant = 0; variant < 4; ++variant) {
         EngineOptions options;
         if (variant == 0) { options.context_cache.host_capacity_bytes = 0; }
         if (variant == 1) { options.context_cache.hybrid.device_snapshot_slots = 1; }
+        if (variant == 2) { options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(30); }
+        if (variant == 3) {
+            options.context_cache.hybrid.host_state_precision = infernix::HybridHostStatePrecision::Fp24;
+        }
         bool rejected = false;
         try {
             (void)normalize_engine_options(options, infernix::models::Architecture::Qwen4Exp);

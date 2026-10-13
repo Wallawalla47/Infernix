@@ -265,6 +265,15 @@ std::string serve_usage_text(const char* argv0) {
            "                             ahead of other cache entries (default on: what a\n"
            "                             queued request resumes from is evicted last, the\n"
            "                             request furthest back first)\n"
+           "  --cache-tool-hold-secs N   after a reply that ends in a tool call, keep that\n"
+           "                             conversation's cached prefix ahead of other cache\n"
+           "                             entries for N seconds (default 30, 0 turns it off;\n"
+           "                             Qwen3.8-Flash-Next has none)\n"
+           "  --cache-host-state fp32|fp24|bf16\n"
+           "                             host tier form of snapshot recurrent state: fp24\n"
+           "                             and bf16 shrink each 27B snapshot by 36 and 72 MiB\n"
+           "                             but resume host-restored snapshots from a rounded\n"
+           "                             state (default fp32: exact)\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2    speculative decoding backend\n"
@@ -552,6 +561,26 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--no-queue-holds") {
             options.context_cache.hybrid.queue_holds = false;
             cache_option_flag                        = "--no-queue-holds";
+        } else if (arg == "--cache-tool-hold-secs") {
+            const int seconds = parse_nonnegative_int(require_value("--cache-tool-hold-secs"),
+                                                      "cache-tool-hold-secs");
+            if (seconds > 3600) {
+                throw std::invalid_argument("--cache-tool-hold-secs must be in [0,3600]");
+            }
+            options.context_cache.hybrid.tool_call_hold = std::chrono::seconds(seconds);
+            cache_option_flag                           = "--cache-tool-hold-secs";
+        } else if (arg == "--cache-host-state") {
+            const std::string value = require_value("--cache-host-state");
+            if (value == "fp32") {
+                options.context_cache.hybrid.host_state_precision = HybridHostStatePrecision::Fp32;
+            } else if (value == "fp24") {
+                options.context_cache.hybrid.host_state_precision = HybridHostStatePrecision::Fp24;
+            } else if (value == "bf16") {
+                options.context_cache.hybrid.host_state_precision = HybridHostStatePrecision::Bf16;
+            } else {
+                throw std::invalid_argument("--cache-host-state must be fp32, fp24 or bf16");
+            }
+            cache_option_flag = "--cache-host-state";
         } else if (arg == "--cache-tap-min-gap") {
             options.context_cache.hybrid.tap_min_gap_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));

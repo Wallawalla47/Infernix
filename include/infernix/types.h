@@ -35,6 +35,9 @@ inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
 // Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given.
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
+// How long the prefix cache holds a conversation's state after a reply ending in a tool call,
+// when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
+inline constexpr std::chrono::milliseconds kDefaultToolCallHold{30'000};
 
 enum class KvCacheStorage : std::uint8_t {
     BFloat16,
@@ -239,6 +242,12 @@ private:
     std::shared_ptr<State> state_;
 };
 
+// How a snapshot's linear-attention recurrent state (FP32 on the Device) is stored on the Host
+// tier. Fp32 is exact; Fp24 (sign, exponent and the 15 high mantissa bits, rounded to nearest
+// even) and Bf16 shrink the Host image, and a snapshot restored from the Host then resumes from a
+// rounded state. Device snapshots stay exact.
+enum class HybridHostStatePrecision : std::uint8_t { Fp32, Fp24, Bf16 };
+
 // Prefix-cache tuning. Every field is optional: Engine construction derives the unset ones from
 // max_concurrency, prefill_chunk and whether a Host tier exists (host_capacity_bytes, default
 // kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
@@ -275,6 +284,13 @@ struct HybridPrefixCacheOptions {
     // and Host block writes that would need a held snapshot's slabs are skipped instead. False
     // restores plain LRU/GDSF eviction.
     bool queue_holds = true;
+    // Tool-call holds: after a request ends with a tool call, the snapshot its next turn resumes
+    // from and its path are held like a queued request's (after every queued one) for this long,
+    // since the client usually returns within the tool's run time. Zero disables them. Default
+    // kDefaultToolCallHold on Qwen3.5; Qwen3.8-Flash-Next has none.
+    std::optional<std::chrono::milliseconds> tool_call_hold;
+    // Host form of snapshot recurrent state (Qwen3.5). Changing it changes the Host image size.
+    HybridHostStatePrecision host_state_precision = HybridHostStatePrecision::Fp32;
 };
 
 // The prefix cache: a content-addressed block tree with sparse state snapshots
@@ -1433,6 +1449,8 @@ struct RuntimeStats {
     std::uint64_t hybrid_held_device_evictions   = 0;
     std::uint64_t hybrid_held_snapshot_losses    = 0;
     std::uint64_t hybrid_held_host_refusals      = 0;
+    // Holds placed after a reply ending in a tool call (HybridPrefixCacheOptions::tool_call_hold).
+    std::uint64_t hybrid_tool_call_holds         = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

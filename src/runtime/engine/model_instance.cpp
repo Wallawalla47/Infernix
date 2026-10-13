@@ -134,6 +134,8 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";kv=" + std::to_string(static_cast<int>(options.kv_cache));
     out += ";speculative=" + std::to_string(static_cast<int>(options.speculative.backend));
     out += ";yarn=" + std::to_string(options.rope_yarn_factor);
+    out += ";host_state=" +
+           std::to_string(static_cast<int>(options.context_cache.hybrid.host_state_precision));
     out += ";build=" + options.context_cache.hybrid.persistent_identity;
     return out;
 }
@@ -203,7 +205,19 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
                     "Qwen3.8-Flash-Next's prefix cache has no Device snapshot slots");
             }
             hybrid.device_snapshot_slots = 0U;
+            if (hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache keeps snapshot state exact on the Host tier");
+            }
+            // Its endpoints publish asynchronously, after the lane that captured them may be
+            // reused; holding them needs a capture-to-snapshot handover it does not have.
+            if (hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0) {
+                throw std::invalid_argument(
+                    "Qwen3.8-Flash-Next's prefix cache has no tool-call holds");
+            }
         }
+        hybrid.tool_call_hold =
+            hybrid.tool_call_hold.value_or(qwen4_exp ? std::chrono::milliseconds{0} : kDefaultToolCallHold);
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
         // their Host copies are written. Without a Host tier these slots are the only snapshot
@@ -224,6 +238,9 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if ((!qwen4_exp && *hybrid.device_snapshot_slots == 0) || *hybrid.device_snapshot_slots > 64) {
             throw std::invalid_argument("hybrid device snapshot slots must be in [1,64]");
         }
+        if (hybrid.tool_call_hold->count() < 0) {
+            throw std::invalid_argument("hybrid tool-call hold must not be negative");
+        }
         if (*hybrid.max_new_taps > 64) {
             throw std::invalid_argument("hybrid taps per request must be at most 64");
         }
@@ -239,8 +256,13 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
             throw std::invalid_argument(
                 "prefix cache capacities require the context cache to be enabled");
         }
+        if (cache.hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0 ||
+            cache.hybrid.host_state_precision != HybridHostStatePrecision::Fp32) {
+            throw std::invalid_argument("prefix cache policies require the context cache to be enabled");
+        }
         cache.host_capacity_bytes          = 0U;
         cache.hybrid.device_snapshot_slots = 0U;
+        cache.hybrid.tool_call_hold        = std::chrono::milliseconds{0};
     }
     return options;
 }

@@ -59,6 +59,7 @@ other value is derived from the rest of the configuration (§14.2).
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
 | §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
+| §5.6 Host state precision, §9.7 tool-call holds | implemented 2026-10-12 with branch-point taps and pause snapshots, measured by agentic A/B (§16.8); tool-call holds on by default (30 s) since 2026-10-13, packed Host state an option (default `fp32`), branch-point taps and pause snapshots removed. An Op test for the state codec, a state-image test, option tests and a `cache-replay` preemption real scenario |
 | §13.3 real-artifact scenarios | `infernix_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart, cancellation mid-prefill (with and without DFlash2); `INFERNIX_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `infernix_qwen3_5_prefix_real_test`, `infernix_ngram_concurrent_real` and the other real tests run on the cache as well |
 
 ## 0. Summary
@@ -425,6 +426,36 @@ directory, or `--host-cache-mib 0`, so an unusable location fails before any cac
 - The startup log shows the read of an accepted file as a progress phase (`loading prefix cache`,
   then `prefix cache read | bytes | time | rate`), then reports what was restored or why nothing
   was; the shutdown log reports the save.
+
+### 5.6 Host state precision
+
+Snapshot images take most of a full Host tier: in NInfer's production runs of this cache (27B,
+DFlash2, a full 52 GB tier) images held a median 34–79 % of the used bytes per run, and the FP32
+Gated DeltaNet recurrent state is 144 of an image's 186.8 MiB (§3.2). `--cache-host-state`
+(`HybridPrefixCacheOptions::host_state_precision`, Qwen3.5 only) chooses its Host form:
+
+| form | recurrent state per 27B image | image (DFlash2) | restore |
+|---|---:|---:|---|
+| `fp32` (default) | 144 MiB | 186.8 MiB | exact |
+| `fp24`: sign, exponent, 15 mantissa bits | 108 MiB | 150.8 MiB | relative error ≤ 2^-16 per value |
+| `bf16` | 72 MiB | 114.8 MiB | relative error ≤ 2^-8 per value |
+
+- The StateImage's Host layout (`StateImageSpec::recurrent_host`) carries the packed form, so Host
+  slab counts, GDSF sizes, restore bytes and the persistent file's geometry all use the smaller
+  image; the file fingerprint also records the form.
+- Writes pack each layer's state with `ops::pack_fp32_state` (round to nearest even) into a Device
+  staging buffer on the transfer stream and copy it out; restores copy it into a second staging
+  buffer on the restore stream and unpack it with `ops::unpack_fp32_state` (exact) before that
+  layer's event, so the layer-pipelined restore (§6.5) is unchanged. Both buffers hold one layer's
+  packed state (2.25 MiB for 27B `fp24`) and are planned with the StateImage pool. Conv state,
+  continuation hidden, DFlash rings and the KV window stay exact.
+- Device snapshots stay exact, so the same snapshot resumes exactly from its Device slot and
+  rounded from the Host. Each Host restore rounds once; a conversation restored from the Host every
+  turn accumulates one rounding per turn on state that the GDN decay partly forgets. On 18
+  Host-restored 27B turns both forms met the resume-equivalence criterion of §13.3 (greedy
+  agreement no worse than a different prefill chunking); NLL was not measured. The agentic A/B
+  showed no consistent gain at a 16 GB Host tier (§16.8), so `fp32` stays the default and the packed
+  forms are an option for Host tiers too small for the working set.
 
 ---
 
@@ -852,7 +883,8 @@ policy lives:
 - `reclaim` evicts cached Device blocks (`hybrid_reclaim`); when nothing is evictable it reports
   `Blocked`, and the Engine pauses a younger request.
 - A paused request recovers by Replay, from the deepest source the tree then holds; a pause
-  publishes nothing beyond the blocks and snapshots the lane already committed.
+  publishes nothing beyond the blocks and snapshots the lane already committed. An MTP lane's
+  Replay bridges its drafter from the snapshot's continuation hidden, which every image holds.
 - While the FIFO head waits, the Engine asks for a prefetch of its Host-only path (§6.6).
 - After each admission pass the Engine passes the queue to `hold_queue`, which recomputes the
   Program's queue holds when the queue or the snapshot epoch changed (§9.6).
@@ -1046,6 +1078,32 @@ Holds cannot make room that does not exist: with more queued context than the ca
 requests at the back of the queue still lose theirs. They change who loses it, from every waiting
 request partly to the furthest-back requests wholly, and they remove the miss cascade.
 `--no-queue-holds` restores plain LRU/GDSF eviction for comparison.
+
+### 9.7 Tool-call holds
+
+Queue holds (§9.6) know only the requests already queued. An agent whose reply ends in a tool call
+returns with the next turn once the tool has run, typically seconds later, while other
+conversations' admissions push its blocks off the Device (KVFlow, NeurIPS 2025; Continuum, ICLR
+2026, which pins a request's KV across tool calls). `--cache-tool-hold-secs N`
+(`HybridPrefixCacheOptions::tool_call_hold`, Qwen3.5 only; default 30 s, `0` turns it off):
+
+- When a finished request produced tool calls (`OutputSession::has_tool_calls`), the Engine holds
+  what its next turn resumes from: the endpoint the finish published (an echoing client) and the
+  prompt's last tap (a client re-rendering the reply), until `N` seconds have passed. A reply too
+  short for an endpoint (fewer than 64 tokens past the deepest snapshot) holds the deepest snapshot
+  the lane resumed from or published instead.
+- The holds share the queue holds' ranks after every queued request's source, earliest deadline
+  first, within `kMaxQueueHolds`, and so share their effect: the held paths' Device copies are
+  evicted after every unheld entry, and a held snapshot is never a Host victim. A hold ends when
+  the conversation's next request binds from one of its snapshots, or at its deadline; it never
+  blocks an admission or a unit reservation.
+- Qwen3.8-Flash-Next publishes endpoints asynchronously, after the lane may have been reused, so
+  it has no tool-call holds: its default is zero and `normalize_engine_options` refuses another
+  value.
+- A hold changes which snapshot a conversation's next turn resumes from, not how any computation
+  runs, but a different resume point is a different prefill decomposition and can move a greedy
+  near-tie (§13.3), like any change of cache contents.
+- `tool_call_holds` counts holds placed.
 
 ---
 
@@ -1295,6 +1353,8 @@ struct HybridPrefixCacheOptions {
     std::string persistent_identity;                        // set by the product binary
     PrefixCacheSaveControl persistent_save;                 // abandons the save (§5.5)
     bool queue_holds = true;                                // --no-queue-holds turns off (§9.6)
+    std::optional<std::chrono::milliseconds> tool_call_hold; // --cache-tool-hold-secs (§9.7)
+    HybridHostStatePrecision host_state_precision = Fp32;   // --cache-host-state (§5.6)
 };
 
 struct ContextCacheOptions {
@@ -1578,6 +1638,168 @@ Measured with the Qwen3.5 prefix real test on NInfer's official NVFP4 Qwen3.8-27
 |---|---|---|---|
 | A lineage resuming from a non-Boundary snapshot supersedes the never-resumed endpoints below it that it goes past (passed endpoints) | §9.3 | `agent-continuation-device` (4 Device slots, no Host tier; 16 main turns that re-render the reply, one branch at turn 8): before, the endpoints of turns 3 and 6 and the one below the system-block boundary held three slots for good, the branch's endpoint took the slot of the tap the main conversation resumes from, and the main turn after the branch recomputed all 784 prompt tokens (reused 0, expected 720). After, that turn computes 64, and the trajectory's totals (11,148 tokens reused, 1,784 computed) equal those with a 2 GiB Host tier (`agent-continuation`). Every other prefix scenario, the hybrid prefix test and the Qwen4Exp prefix test (Uncensored and Dense8) pass | kept |
 | Qwen4Exp: a request's captures do not supersede its own earlier taps; only its first capture supersedes the resume snapshot (§17) | §9.3, §17 | Flash-Next Dense8 agentic replay (seeds 42-44, scale 0.5, two lanes, 8 GiB Host tier) against 1090adf29, whose in-prompt supersession took effect only when the previous tap had already published (rarely inside a long prefill). With in-walk taps resolving it always, each seed lost the main session's system-block boundary (8,343 tokens) before its history-edit turn and the 45K ladder tap of its first loop-detection call before the second: 82.9 % of prompt tokens from cache against 84.7 %. Without in-prompt supersession: 84.8 % (seed range −0.4 to +0.5 points), average TTFT −8.7 % (−12.1 to −5.9), continuing turns −13.2 %, wall time −7.4 %; median TTFT +11.9 % (seed 43 +34.7 %, the other two +1.7 and −0.6 %) | kept |
+
+### 16.8 Trial policies (2026-10-12 to 10-13)
+
+Four policies from a review of the cache against recent work (Marconi, KVFlow, Continuum, state
+compression), each tried behind its own flag. Three A/B series below (sampled, greedy with two
+lanes, greedy with one lane, the last also with a fixed send order) have not consistently separated
+any policy from run-to-run noise: `bf16`'s gain at one lane reversed with the fixed order, and
+tool-call holds' gain appears only there. Decision (2026-10-13): tool-call holds on by default for
+Qwen3.5 (30 s, `--cache-tool-hold-secs 0` turns them off), as the only policy with a gain in the
+most controlled series and no exactness cost; the packed Host state stays an option with `fp32` the
+default; branch-point taps and pause snapshots are removed (no gain; branch taps lost cache hits on
+both seeds of the last series, and pause snapshots need two lanes under pressure to act at all).
+The pause-snapshot work found and fixed an MTP Replay that failed when it resumed from any cached
+snapshot (§8: the bridge now uses the snapshot's continuation hidden), now covered by the
+`cache-replay` preemption scenario.
+
+| policy | expected effect | measurement that decided it | outcome |
+|---|---|---|---|
+| Host state precision (§5.6) | 19 % (`fp24`) or 39 % (`bf16`) smaller 27B DFlash2 images: more snapshots per Host byte, fewer restore bytes | resume equivalence on real 27B prompts against `fp32` (greedy agreement), then `bench/agentic_ab` at a 16 GB Host tier: prompt tokens prefilled, Host restore bytes, TTFT | option, default `fp32` |
+| Branch-point taps (Marconi's speculative insertion: a snapshot where a prompt leaves a cached path that another conversation continued) | third and later prompts sharing a prefix that no structural boundary marks resume at the branch | `bench/agentic_ab`: prompt tokens prefilled, TTFT, split count | removed |
+| Pause snapshots (a Qwen3.5 pause publishing its state, as Qwen3.8-Flash-Next does) | a paused request resumes without recomputation | preemption runs: replayed tokens; `bench/agentic_ab` | removed |
+| Tool-call holds (§9.7) | an agent's next turn finds its blocks on the Device after its tool ran | `bench/agentic_ab`: TTFT of continuing turns, cache hits, at a 30 s hold | on by default |
+
+First A/B (2026-10-12, `bench/agentic_ab`, seeds 42 and 43, 130 requests per arm): the production
+launcher's flags (27B official NVFP4, DFlash2 with n-gram drafting, INT8 KV, two lanes,
+`--preserve-thinking`) at the cache-pressure scale of §16.3 (`--kv-capacity 160000`,
+`--max-context 160000`, `--host-context-mib 16000`), sampling at temperature 1.0. Every arm ran the
+same build; the runner adds the alt arm's flags to the treatment's, so run 1's alt arm is tool-call
+holds plus branch taps and run 2's is pause snapshots plus `fp24`.
+
+| arm (run) | prompt tokens from cache, seeds 42 / 43 | prompt tokens prefilled | avg TTFT, continuing turns | counters (both seeds) |
+|---|---|---|---|---|
+| base (1) | 77.6 / 79.8 % | 1.28 M / 1.10 M | 4.60 s | — |
+| tool-call holds 30 s (1) | 81.0 / 79.7 % | 1.06 M / 1.12 M | 4.15 s (−35 % / +22 % per seed) | 200 holds |
+| + branch taps (1) | 75.1 / 83.5 % | 1.49 M / 0.92 M | 4.39 s | 11 branch taps |
+| base (2) | 79.2 / 84.1 % | 1.18 M / 0.93 M | 4.47 s | — |
+| pause snapshots (2) | 79.8 / 77.6 % | 1.11 M / 1.27 M | 4.29 s | 12 pause snapshots, 3 resumes from them |
+| + `fp24` (2) | 81.0 / 80.1 % | 1.06 M / 1.17 M | 3.79 s (−15.3 % / −15.0 % per seed against base) | 15 pause snapshots, 6 resumes |
+
+None of these differences is distinguishable from noise. The two base arms of the same seeds
+differ by up to 4.3 points of cache hits and 18 % of prefilled tokens between runs, and at
+temperature 1.0 each arm generates its own replies (132–195 K completion tokens per arm), so the
+arms replay different conversations. The counters show the mechanisms engage but rarely: branch
+taps fire 5–6 times per 130 requests (the subagents' shared prefix ends at a structural boundary
+the base already taps), and pauses publish 4–10 snapshots per seed, of which a quarter to 40 % are
+resumed from (the rest are evicted, or the request resumes from a deeper snapshot). Tool-call holds
+raise `held_device_evictions` from 5–6 K to 14–18 K: the held paths are evicted anyway under this
+pool size. The one consistent signal is `fp24`'s continuing-turn TTFT (−15 % against base in both
+seeds); the greedy reruns below do not reproduce it. The
+production request log of 2026-09-26 to 10-03 (37,759 requests) bounds what tool-call holds can
+gain: 11 % of replies end in a tool call, 87 % of their clients return within 5 s with no other
+prefill in between, and continuations already take 97.9 % of their prompt tokens from cache.
+
+Greedy A/B (2026-10-13, same launcher, workload and seeds, `AB_TEMPERATURE=0`, every arm one
+policy against the base flags, a base arm in each of three runs). With two lanes (two runs; the
+third was stopped) greedy did not pair the arms: only 17–30 of 131 requests generated the same
+tokens in two base runs. Among requests with an identical prompt and cache hit, none of 25 that
+ran alone differed, against 27 of 49 that overlapped another request. Two lanes share one decode
+and verification batch per round, the NVFP4 linear routes change with its column count (GEMV at
+1, SIMT to 5, sliced-K at 8, 16, 24, 32 and 64, A4 MMA tiles from 8; for example
+`ops/linear/nvfp4/shapes/n5120_k17408.cu`), and which rounds two requests share depends on wall
+time, so near-ties flip and the conversation diverges from there. The two-lane results are noise
+of the same size as the effects (base against base: up to 20 % average TTFT, 6.5 points of cache
+hits, 44 % of prefilled tokens on one seed) and are not tabulated.
+
+With one lane (`--max-concurrency 1`, three runs) base reproduces itself wherever the requests
+arrive in the same order: 0 of 172 and 3 of 202 requests with an identical prompt and cache hit
+differed between base runs. The arms still diverge because the workload's subagent fan-out
+reaches the server in a client-thread order that varies per run (in every base pair the first
+service-order difference comes at or before the first cache-hit difference, and that at or before
+the first output difference), so whichever subagent arrives first prefills the shared prefix cold
+and later cache hits differ. Since then the runner sends every request of a seed in one order
+fixed by the plan (`bench/agentic_ab/README.md`, "Fixed send order"); these runs predate that.
+Per seed (42 / 43), with the three base runs as a range:
+
+| arm | avg TTFT (s) | p90 TTFT (s) | prompt tokens from cache | prompt tokens prefilled | counters (both seeds) |
+|---|---|---|---|---|---|
+| base, three runs | 6.1–6.6 / 7.5–7.9 | 12.3–13.9 / 16.6–18.5 | 83.9–86.1 / 85.2–87.5 % | 0.80–0.93 M / 0.71–0.84 M | — |
+| tool-call holds 30 s | 5.4 / 8.5 | 12.2 / 20.0 | 85.5 / 84.3 % | 0.83 / 0.90 M | 190 holds |
+| branch taps | 6.5 / 6.3 | 17.4 / 20.0 | 84.9 / 86.1 % | 0.85 / 0.80 M | 9 branch taps |
+| pause snapshots | 5.9 / 7.7 | 12.6 / 16.7 | 87.0 / 85.7 % | 0.74 / 0.82 M | 0 (no second lane to pause for) |
+| `fp24` | 7.0 / 5.6 | 16.5 / 12.2 | 85.8 / 87.8 % | 0.81 / 0.68 M | — |
+| `bf16` | 6.4 / 6.4 | 14.4 / 12.1 | 89.0 / 88.9 % | 0.64 / 0.65 M | — |
+| all four, `fp24` | 5.8 / 10.2 | 17.1 / 26.4 | 83.9 / 87.2 % | 0.94 / 0.73 M | 190 holds, 11 branch taps, 0 pauses |
+
+Only `bf16` falls outside the base range in the same direction on both seeds, for cache hits and
+prefilled tokens (+1.4 to +5.1 points, −8.5 to −31 % against the run's own base), as halving the
+image bytes predicts at a 16 GB Host tier; its TTFT is inside the range on seed 42, and it is one
+run per seed. Three base runs understate the noise: the pause-snapshot arm, which cannot act with
+one lane and so is a fourth base, is better than every base run on seed 42 in TTFT, cache hits and
+prefilled tokens. Tool-call holds are worse than every base run on seed 43 in TTFT, cache hits and
+prefilled tokens and better on seed 42 in TTFT. Branch taps have a p90 TTFT above every base run
+on both seeds, and so does the combined arm, which also has a 10.2 s average TTFT on seed 43.
+`fp24` is better than every base run on seed 43 and worse on seed 42 in TTFT. Output equality against base on
+requests with an identical prompt that ran alone: tool-call holds 1 of 32 and pause snapshots 1 of
+34 differ (base against base 0–1), `fp24` and `bf16` 3 of 15 each, branch taps 8 of 10 (the tap
+splits the cold prefill call).
+
+The same one-lane series with the fixed send order (2026-10-13 evening, same flags and seeds):
+the server now receives every arm's requests in one order, and every request with an identical
+prompt and cache hit generated identical tokens in all three base runs (0 of 165 and 0 of 170
+differ against the first base run). Base runs still diverge where a cache hit length differs,
+first at request 21–80 of 131 (for example B#16 of seed 42: 8,343 against 79,301 tokens restored
+after a 21 s gap, with the same requests sent before it), so a cache decision still depends on
+wall time; which one (queue holds of requests that arrive around an eviction, Host write
+completion) is not established. Base runs agree on 69–109 of 131 requests, no better than before
+the fixed order. Per seed (42 / 43):
+
+| arm | avg TTFT (s) | p90 TTFT (s) | prompt tokens from cache | prompt tokens prefilled | counters (both seeds) |
+|---|---|---|---|---|---|
+| base, three runs | 7.6–8.4 / 9.2–9.7 | 13.7–17.2 / 18.6–21.2 | 86.9–87.7 / 83.0–86.8 % | 0.70–0.75 M / 0.75–0.97 M | — |
+| tool-call holds 30 s | 6.3 / 8.1 | 12.2 / 17.8 | 87.6 / 87.6 % | 0.71 / 0.71 M | 198 holds |
+| branch taps | 8.6 / 7.8 | 16.8 / 15.7 | 85.0 / 82.5 % | 0.91 / 1.01 M | 9 branch taps |
+| pause snapshots | 7.6 / 8.7 | 15.3 / 17.0 | 88.4 / 85.7 % | 0.67 / 0.81 M | 0 (no second lane) |
+| `fp24` | 7.4 / 8.4 | 18.7 / 17.6 | 86.0 / 83.1 % | 0.80 / 1.02 M | — |
+| `bf16` | 10.0 / 8.8 | 32.3 / 19.6 | 83.7 / 84.2 % | 0.98 / 0.91 M | — |
+| all four, `fp24` | 7.3 / 10.6 | 22.1 / 36.7 | 85.2 / 81.5 % | 0.86 / 1.08 M | 189 holds, 14 branch taps, 0 pauses |
+
+Tool-call holds are better than every base run on both seeds in average and p90 TTFT (−12 to
+−17 % and −4 to −11 % against the nearest base run) and in wall time, and on seed 43 in cache hits and prefilled
+tokens; in the unordered series they were worse on seed 43, so this is one run per seed against an
+improved but not exact baseline. The inert pause-snapshot arm (a fourth base) is again outside the
+base range, better, in several metrics, so three base runs still understate the noise. Branch taps
+lose cache hits and prefill more on both seeds. `bf16` is the worst single arm on seed 42 (p90
+32.3 s, 0.98 M prefilled), reversing its unordered result, and the combined arm is worse than every
+base run on seed 43 in every column. `fp24` and `bf16` change the generated text (2 of 14 alone
+requests differ), so their conversations differ from base and their results include that.
+
+Resume quality of the packed Host forms (2026-10-12, same artifact, no speculation, greedy, one
+lane, one Device snapshot slot, 8K KV): 18 follow-up turns over 9 documents, each restoring its
+conversation (3,564 tokens on average) and its state image from the Host, 128 output tokens, each
+arm compared with exact `fp32` at prefill chunk 4096:
+
+| arm | identical outputs | first token equal | common greedy prefix (mean / median / min) | Host restore bytes |
+|---|---:|---:|---|---:|
+| `fp32`, prefill chunk 2048 (the §13.3 baseline: another prefill decomposition) | 0 / 18 | 15 / 18 | 25.1 / 21 / 0 | 4.47 GB |
+| `fp24` | 3 / 18 | 16 / 18 | 56.8 / 41 / 0 | 3.67 GB |
+| `bf16` | 1 / 18 | 16 / 18 | 47.9 / 35 / 0 | 2.54 GB |
+| `fp32` reference | — | — | — | 4.19 GB |
+
+Both packed forms stay closer to the exact restore than a different prefill chunking does, so by
+the resume-equivalence criterion of §13.3 (greedy agreement no worse than the chunk-decomposition
+baseline) both pass on this sample. The sample is small and greedy agreement is a coarse measure;
+NLL over a held-out continuation was not measured.
+
+Functional checks of the trial builds (Qwen3.8-27B official NVFP4, RTX 5090, greedy; the
+`pause-snapshot` scenario and the branch-tap flag went with those policies):
+
+- `pause-snapshot` preemption scenario, backends none, MTP and DFlash2: each run paused once and
+  resumed from its pause snapshot with 0 replayed tokens; the `replay` scenario of the same
+  workload replays 252–255.
+- An `infernix-serve` smoke (one lane, one Device snapshot slot, 8K KV, 3 GiB Host tier): three
+  prompts sharing a 2.5K-token user-message prefix reuse 0 tokens on the third without branch
+  taps and 2,560 with them. The branch tap's split changed the second prompt's greedy output after
+  38 of 48 tokens and the third prompt's from its first token (a coherent answer either way): the
+  ordinary effect of a different prefill decomposition, not a wrong state. A tool-calling reply
+  placed one hold.
+- In the same smoke a Host-restored follow-up turn (3,672 tokens restored, image from the Host)
+  matched the default configuration's run on all 128 greedy tokens with `fp32`, and on the first 3 of 128
+  with `fp24` and `bf16`. One prompt says nothing about the distribution, but it shows that even
+  `fp24` rounding changes greedy trajectories immediately; whether it degrades answers is what the
+  resume-equivalence measurement has to establish.
 
 ## 17. Qwen4Exp binding (Qwen3.8-Flash-Next)
 

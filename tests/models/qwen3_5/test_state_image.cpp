@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <span>
@@ -38,7 +39,8 @@ struct PlannedPool {
 };
 
 PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
-                      bool window = false) {
+                      bool window = false,
+                      q36::RecurrentHostFormat recurrent_host = q36::RecurrentHostFormat::Fp32) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -63,6 +65,7 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
                                       .layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
     if (window) { spec.kv_window = q36::KVWindowStateSpec{.layers = 3, .kv_heads = 2}; }
+    spec.recurrent_host = recurrent_host;
     infernix::LayoutBuilder builder;
     q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     return {.layout = std::move(layout), .bytes = builder.finish(256)};
@@ -311,6 +314,101 @@ void test_segmented_roundtrip(bool dflash, infernix::DeviceContext& device, bool
     expect(short_rejected || segments == 1, "segments that do not cover the image were accepted");
 }
 
+// The recurrent state rounded to nearest even on its dropped low bits, as the packed Host form
+// stores it (ops::pack_fp32_state); a NaN is not produced by these inputs.
+std::uint32_t rounded_bits(std::uint32_t bits, std::uint32_t dropped) {
+    const std::uint32_t half = 1U << (dropped - 1U);
+    return (bits + (half - 1U) + ((bits >> dropped) & 1U)) & ~((1U << dropped) - 1U);
+}
+
+// A packed recurrent Host form (hybrid prefix cache --cache-host-state): every other component
+// round-trips exactly, the recurrent state comes back rounded, and the Host image is smaller.
+void test_packed_recurrent(q36::RecurrentHostFormat format, infernix::DeviceContext& device) {
+    const PlannedPool exact  = plan_pool(true, 2);
+    const PlannedPool packed = plan_pool(true, 2, false, false, format);
+    const std::size_t width  = format == q36::RecurrentHostFormat::Fp24 ? 3U : 2U;
+    const std::uint32_t dropped = format == q36::RecurrentHostFormat::Fp24 ? 8U : 16U;
+    expect(packed.layout.host.linear_recurrent_layer_bytes ==
+                   exact.layout.host.linear_recurrent_layer_bytes / 4U * width &&
+               packed.layout.host.linear_recurrent.bytes ==
+                   packed.layout.host.linear_recurrent_layer_bytes * 2U &&
+               packed.layout.host.image_bytes <= exact.layout.host.image_bytes &&
+               packed.layout.recurrent_staging && !exact.layout.recurrent_staging,
+           "a packed recurrent Host form must shrink the Host image and stage on the Device");
+
+    infernix::DeviceArena arena(packed.bytes);
+    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, packed.layout);
+    fill_slot(pool, 0, 0x29);
+    // Recurrent state of a realistic scale, with exact ties on both parities.
+    std::vector<std::vector<std::uint32_t>> source(pool.linear().layer_count());
+    for (std::uint32_t layer = 0; layer < pool.linear().layer_count(); ++layer) {
+        const infernix::Tensor state = pool.linear().recurrent_slot(layer, 0);
+        std::vector<std::uint32_t>& bits = source[layer];
+        bits.resize(state.bytes() / 4U);
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            const float value = 0.01F * static_cast<float>(i + 1U) - 0.1F;
+            std::memcpy(&bits[i], &value, 4);
+        }
+        bits[0] = 0x3f800000U | (1U << (dropped - 1U));                      // tie, even: down
+        bits[1] = 0x3f800000U | (1U << dropped) | (1U << (dropped - 1U));    // tie, odd: up
+        CUDA_CHECK(cudaMemcpy(state.data, bits.data(), state.bytes(), cudaMemcpyHostToDevice));
+    }
+    pool.zero_slot(1, device.stream);
+
+    const std::size_t image_bytes   = packed.layout.host.image_bytes;
+    const std::size_t segment_bytes = 777;
+    const std::size_t segments      = (image_bytes + segment_bytes - 1) / segment_bytes;
+    infernix::PinnedHostBuffer backing(segments * segment_bytes);
+    auto* base = static_cast<std::byte*>(backing.data());
+    std::vector<std::byte*> scattered;
+    for (std::size_t segment = 0; segment < segments; ++segment) {
+        scattered.push_back(base + (segments - 1U - segment) * segment_bytes);
+    }
+    pool.copy_to_host_segments(0, scattered, segment_bytes, device.stream);
+    device.synchronize();
+    const std::vector<const std::byte*> sources(scattered.begin(), scattered.end());
+    // Part by part, as a hybrid restore lands them.
+    pool.copy_from_host_segments(sources, segment_bytes, 1,
+                                 q36::StateImagePart{.kind = q36::StateImagePart::Kind::Rest},
+                                 device.stream);
+    for (std::uint32_t layer = 0; layer < pool.linear().layer_count(); ++layer) {
+        pool.copy_from_host_segments(
+            sources, segment_bytes, 1,
+            q36::StateImagePart{.kind = q36::StateImagePart::Kind::LinearLayer, .layer = layer},
+            device.stream);
+    }
+    device.synchronize();
+
+    for (std::uint32_t layer = 0; layer < pool.linear().layer_count(); ++layer) {
+        expect_bytes(pool.linear().conv_slot(layer, 1), static_cast<unsigned char>(0x29 + layer),
+                     "packed Host form keeps the conv state exact");
+        const infernix::Tensor state = pool.linear().recurrent_slot(layer, 1);
+        std::vector<std::uint32_t> got(state.bytes() / 4U);
+        CUDA_CHECK(cudaMemcpy(got.data(), state.data, state.bytes(), cudaMemcpyDeviceToHost));
+        bool equal = true;
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            equal = equal && got[i] == rounded_bits(source[layer][i], dropped);
+        }
+        expect(equal, "packed Host form must restore the recurrent state rounded to nearest even");
+    }
+    expect_bytes(pool.continuation_hidden_slot(1), 0x29 + 0x20,
+                 "packed Host form keeps the continuation hidden exact");
+    for (std::uint32_t layer = 0; layer < pool.dflash_local()->layer_count(); ++layer) {
+        const auto view = pool.dflash_local()->layer_view(layer);
+        expect_bytes(view.k.slice(3, 1, 1), static_cast<unsigned char>(0x29 + 0x30 + layer),
+                     "packed Host form keeps the DFlash local state exact");
+    }
+
+    infernix::HostContextArena contiguous_backing(image_bytes, image_bytes);
+    auto contiguous = contiguous_backing.allocate(image_bytes);
+    bool unsegmented_rejected = false;
+    try {
+        pool.copy_to_host(0, {.data = contiguous->data(), .layout = &packed.layout.host},
+                          device.stream);
+    } catch (const std::logic_error&) { unsegmented_rejected = true; }
+    expect(unsegmented_rejected, "an unsegmented copy of a packed Host form was accepted");
+}
+
 } // namespace
 
 int main() {
@@ -360,6 +458,8 @@ int main() {
     test_segmented_roundtrip(false, device);
     test_segmented_roundtrip(true, device);
     test_segmented_roundtrip(true, device, true);
+    test_packed_recurrent(q36::RecurrentHostFormat::Fp24, device);
+    test_packed_recurrent(q36::RecurrentHostFormat::Bf16, device);
 
     return failures == 0 ? 0 : 1;
 }

@@ -4,6 +4,7 @@
 #include "runtime/contract/resources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -88,6 +89,7 @@ public:
         out.hybrid_held_device_evictions   = hybrid.held_device_evictions;
         out.hybrid_held_snapshot_losses    = hybrid.held_snapshot_losses;
         out.hybrid_held_host_refusals      = hybrid.held_host_refusals;
+        out.hybrid_tool_call_holds         = hybrid.tool_call_holds;
     }
 
     // Holds the sources of the requests waiting for admission, in admission order
@@ -97,7 +99,7 @@ public:
     void hold_queue(Program& program, std::span<const std::uint64_t> ids,
                     std::span<const Base* const> queue) {
         const std::uint64_t epoch = program.hybrid_cache_epoch();
-        if (hold_valid_ && epoch == hold_epoch_ &&
+        if (hold_valid_ && epoch == hold_epoch_ && !program.hybrid_holds_stale() &&
             std::equal(ids.begin(), ids.end(), hold_ids_.begin(), hold_ids_.end())) {
             return;
         }
@@ -105,6 +107,12 @@ public:
         hold_ids_.assign(ids.begin(), ids.end());
         hold_epoch_ = epoch;
         hold_valid_ = true;
+    }
+
+    // A tool-call hold (HybridPrefixCacheOptions::tool_call_hold): the request finished last
+    // ended with a tool call, so its client returns with the next turn within the tool's run time.
+    void hold_continuation(Program& program, std::chrono::steady_clock::time_point deadline) {
+        program.hybrid_hold_continuation(deadline);
     }
 
 private:

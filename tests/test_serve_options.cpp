@@ -553,6 +553,39 @@ int main() {
     failures += check(!parse({"infernix-serve", "model.ninfer", "--no-queue-holds"})
                            .context_cache.hybrid.queue_holds,
                       "--no-queue-holds did not turn queue holds off");
+    // The tool-call hold is left to the Engine's per-model default unless given (0 turns it off),
+    // and the Host state stays exact unless a packed form is chosen.
+    failures += check(!hybrid_minimal.context_cache.hybrid.tool_call_hold.has_value() &&
+                          hybrid_minimal.context_cache.hybrid.host_state_precision ==
+                              infernix::HybridHostStatePrecision::Fp32,
+                      "serving must leave the tool-call hold to the Engine and keep exact Host state");
+    {
+        const ServeOptions policies = parse({"infernix-serve", "model.ninfer", "--cache-tool-hold-secs",
+                                             "45", "--cache-host-state", "fp24"});
+        failures += check(policies.context_cache.hybrid.tool_call_hold == std::chrono::seconds(45) &&
+                              policies.context_cache.hybrid.host_state_precision ==
+                                  infernix::HybridHostStatePrecision::Fp24,
+                          "the prefix-cache policy flags did not reach serving options");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--cache-tool-hold-secs", "0"})
+                                  .context_cache.hybrid.tool_call_hold == std::chrono::milliseconds{0},
+                          "--cache-tool-hold-secs 0 did not turn the tool-call hold off");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--cache-host-state", "bf16"})
+                                  .context_cache.hybrid.host_state_precision ==
+                              infernix::HybridHostStatePrecision::Bf16,
+                          "--cache-host-state bf16 was not parsed");
+        for (const std::vector<std::string>& bad :
+             std::vector<std::vector<std::string>>{{"--cache-host-state", "fp16"},
+                                                   {"--cache-tool-hold-secs", "3601"},
+                                                   {"--cache-tool-hold-secs", "-1"}}) {
+            std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};
+            arguments.insert(arguments.end(), bad.begin(), bad.end());
+            bool rejected = false;
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::exception&) { rejected = true; }
+            failures += check(rejected, "a malformed prefix-cache policy value was accepted");
+        }
+    }
     const ServeOptions hybrid_headroom =
         parse({"infernix-serve", "model.ninfer", "--vram-headroom-mib", "2048"});
     failures += check(hybrid_headroom.kv_capacity.mode == infernix::KvCapacityMode::Automatic &&
@@ -643,6 +676,8 @@ int main() {
                                                {"--cache-tap-ladder", "2048"},
                                                {"--cache-tap-min-gap", "64"},
                                                {"--no-queue-holds"},
+                                               {"--cache-tool-hold-secs", "30"},
+                                               {"--cache-host-state", "bf16"},
                                                {"--host-context-mib", "64"}}) {
         for (const bool disable_first : {false, true}) {
             std::vector<std::string> arguments{"infernix-serve", "model.ninfer"};

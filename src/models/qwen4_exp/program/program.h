@@ -25,9 +25,11 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <stdexcept>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -97,6 +99,7 @@ struct HybridPrefixCacheStats {
     std::uint64_t held_device_evictions   = 0;
     std::uint64_t held_snapshot_losses    = 0;
     std::uint64_t held_host_refusals      = 0;
+    std::uint64_t tool_call_holds         = 0;
 };
 
 class SequenceHandle {
@@ -458,6 +461,13 @@ public:
     // Holds the snapshot each queued request would resume from now, in admission order
     // (hybrid-prefix-cache-spec §9.6); an empty queue releases every hold.
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // No tool-call holds (HybridPrefixCacheOptions::tool_call_hold is zero for this architecture
+    // and normalize_engine_options refuses another value), so the queue holds go stale only with
+    // the queue or the snapshots.
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point) {
+        throw std::logic_error("Qwen4Exp: the prefix cache has no tool-call holds");
+    }
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept { return false; }
     // Changes when a queued request's choice of snapshot may have changed.
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;

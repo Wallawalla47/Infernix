@@ -33,11 +33,16 @@ struct KVWindowStateSpec {
     std::int32_t kv_heads = 0;
 };
 
+// The Host form of the FP32 linear-attention recurrent state: exact, or packed by
+// ops::pack_fp32_state (a Host copy then restores a rounded state).
+enum class RecurrentHostFormat : std::uint8_t { Fp32, Fp24, Bf16 };
+
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
     std::optional<KVWindowStateSpec> kv_window;
+    RecurrentHostFormat recurrent_host = RecurrentHostFormat::Fp32;
 };
 
 struct StateImageHostLayout {
@@ -70,6 +75,9 @@ struct StateImageDeviceLayout {
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
     std::optional<KVWindowDeviceLayout> kv_window;
+    // A packed Host recurrent form stages one layer's packed bytes on the Device: [bytes, 2], the
+    // first for copies to the Host and the second for copies from it (one stream each).
+    std::optional<TensorRegion> recurrent_staging;
     StateImageHostLayout host;
 };
 
@@ -168,6 +176,9 @@ public:
                         cudaStream_t stream = nullptr);
     // Segmented host images: the packed host image byte o lives at
     // segments[o / segment_bytes] + o % segment_bytes (fixed-size slabs of a shared pinned pool).
+    // A packed recurrent Host form is packed and unpacked through the Device staging buffers:
+    // every copy to the Host runs on one stream and every copy from it on another. The unsegmented
+    // copies above support only the exact form.
     void copy_to_host_segments(std::int32_t source, std::span<std::byte* const> segments,
                                std::size_t segment_bytes, cudaStream_t stream = nullptr) const;
     void copy_from_host_segments(std::span<const std::byte* const> segments,
@@ -187,10 +198,13 @@ private:
     std::optional<CyclicKVCache> dflash_local_;
     std::optional<PagedKVWindowView> kv_window_;
     std::uint32_t kv_window_layers_ = 0;
+    // [packed layer bytes, 2] for a packed recurrent Host form; empty for the exact one.
+    Tensor recurrent_staging_;
     StateImageHostLayout host_layout_;
 
     void copy_kv_window(std::int32_t source, std::int32_t destination, cudaStream_t stream);
-    // Visits every Device component of `slot` (or of one part) with its Host image offset.
+    // Visits every Device component of `slot` (or of one part) with its Host image offset and
+    // whether it is a recurrent state (Host bytes per its RecurrentHostFormat).
     template <class Visit>
     void for_each_host_component(std::int32_t slot, Visit&& visit) const;
     template <class Visit>

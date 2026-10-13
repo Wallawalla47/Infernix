@@ -85,6 +85,7 @@ public:
     [[nodiscard]] std::uint64_t grammar_masks(std::span<const TokenId> drafts,
                                               std::span<std::uint32_t> words);
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
+    [[nodiscard]] bool has_tool_calls() const noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept;

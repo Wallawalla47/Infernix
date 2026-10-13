@@ -59,6 +59,7 @@ struct HybridCacheCounters {
     std::uint64_t host_write_bytes    = 0;
     std::uint64_t host_restore_bytes  = 0;
     std::uint64_t evicted_blocks      = 0;
+    std::uint64_t tool_call_holds     = 0; // tool-call holds placed
 };
 
 // One layer of the model's forward pass, in execution order, as a restore sees it: whether it

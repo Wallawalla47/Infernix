@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -297,6 +298,10 @@ struct HybridLaneState {
     // the reply resumes from the prompt-end tap.
     runtime::prefix_cache::SnapshotRef tap_snapshot;
     std::uint32_t tap_frontier = 0;
+    // The deepest snapshot this sequence resumed from or published, of any kind: what a
+    // tool-call hold keeps when the finish publishes no endpoint (a reply too short for one).
+    runtime::prefix_cache::SnapshotRef latest_snapshot;
+    std::uint32_t latest_frontier = 0;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -353,6 +358,12 @@ public:
     [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const RequestBasePlan& base);
     [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     void hybrid_hold_queue(std::span<const RequestBasePlan* const> queue);
+    // Holds what the last finished request's next turn resumes from until `deadline`, after every
+    // queued request's source (a tool-call hold).
+    void hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline);
+    // Whether the queue holds must be recomputed although the queue and the snapshots did not
+    // change: a tool-call hold was added, served or expired.
+    [[nodiscard]] bool hybrid_holds_stale() const noexcept;
     [[nodiscard]] std::uint64_t hybrid_cache_epoch() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -657,6 +668,19 @@ public:
     std::string hybrid_fingerprint_;
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load
+    // What the last finished lane's next turn resumes from, for a tool-call hold: its endpoint
+    // (an echoing client) and its prompt's last tap (a client re-rendering the reply). Invalid
+    // where none was published.
+    std::array<runtime::prefix_cache::SnapshotRef, 2> hybrid_finished_sources_{};
+    // Tool-call holds: endpoints held after every queued request's source until their deadline,
+    // the earliest deadline first.
+    struct HybridToolHold {
+        std::array<runtime::prefix_cache::SnapshotRef, 2> sources{};
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::vector<HybridToolHold> hybrid_tool_holds_;
+    // Whether the tool-call holds changed since the queue holds were last computed.
+    bool hybrid_tool_holds_changed_ = false;
 
     void create_hybrid_prefix_cache(const StartupObserver& observer);
     // Stages a binding: pins the quoted path and snapshot, makes room by evicting unpinned
@@ -705,6 +729,11 @@ public:
     // moves out of the lane; the snapshot the lane resumed from is superseded once a deeper one
     // exists. The caller then clears the lane.
     void hybrid_finish_lane(SequenceState& sequence, bool endpoint) noexcept;
+    // The publication of hybrid_finish_lane without the release: returns the snapshot now at the
+    // lane's committed frontier (created or an identical existing one), invalid when none was
+    // published, for a tool-call hold.
+    [[nodiscard]] runtime::prefix_cache::SnapshotRef
+    hybrid_publish_endpoint(SequenceState& sequence, bool endpoint) noexcept;
     // Drops the lane's index pins and pending taps. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
     // Supersedes the snapshot the sequence resumed from once it snapshots past it at

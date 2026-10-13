@@ -1,6 +1,7 @@
 #include "models/qwen3_5/state/state_image.h"
 
 #include "core/device.h"
+#include "infernix/ops/state_codec.h"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,16 @@ namespace infernix::models::qwen3_5 {
 namespace {
 
 constexpr std::size_t kStateImageAlignment = 256;
+
+// The packed form of a recurrent Host format; absent for the exact one.
+std::optional<ops::PackedStateFormat> packed_format(RecurrentHostFormat format) {
+    switch (format) {
+    case RecurrentHostFormat::Fp32: return std::nullopt;
+    case RecurrentHostFormat::Fp24: return ops::PackedStateFormat::Fp24;
+    case RecurrentHostFormat::Bf16: return ops::PackedStateFormat::Bf16;
+    }
+    throw std::invalid_argument("StateImage recurrent Host format is invalid");
+}
 
 std::size_t checked_mul(std::size_t left, std::size_t right, const char* label) {
     if (right != 0 && left > std::numeric_limits<std::size_t>::max() / right) {
@@ -86,6 +97,7 @@ bool same_host_layout(const StateImageHostLayout& left,
                       const StateImageHostLayout& right) noexcept {
     return same_linear_spec(left.spec.linear, right.spec.linear) &&
            left.spec.hidden == right.spec.hidden &&
+           left.spec.recurrent_host == right.spec.recurrent_host &&
            same_dflash_spec(left.spec.dflash_local, right.spec.dflash_local) &&
            same_window_spec(left.spec.kv_window, right.spec.kv_window) &&
            same_optional_region(left.kv_window, right.kv_window) &&
@@ -127,7 +139,9 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     host.linear_conv = builder.add(checked_mul(host.linear_conv_layer_bytes, spec.linear.layers,
                                                "StateImage host convolution bytes overflow"),
                                    kStateImageAlignment, "StateImage host convolution");
-    host.linear_recurrent_layer_bytes = recurrent_slot.bytes();
+    const std::optional<ops::PackedStateFormat> packed = packed_format(spec.recurrent_host);
+    host.linear_recurrent_layer_bytes =
+        packed ? ops::packed_state_bytes(recurrent_slot.numel(), *packed) : recurrent_slot.bytes();
     host.linear_recurrent =
         builder.add(checked_mul(host.linear_recurrent_layer_bytes, spec.linear.layers,
                                 "StateImage host recurrent bytes overflow"),
@@ -215,6 +229,15 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
     }
 
     out.host = plan_host_state_image(spec);
+    if (packed_format(spec.recurrent_host)) {
+        if (out.host.linear_recurrent_layer_bytes >
+            static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+            throw std::overflow_error("StateImage packed recurrent layer exceeds int32");
+        }
+        out.recurrent_staging = builder.add_tensor(
+            DType::I8, {static_cast<std::int32_t>(out.host.linear_recurrent_layer_bytes), 2},
+            kStateImageAlignment, "StateImage recurrent Host staging");
+    }
     return out;
 }
 
@@ -291,7 +314,14 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
     if (layout.dflash_local.has_value() != host_layout_.spec.dflash_local.has_value()) {
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
-    StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
+    StateImageSpec device_spec{.linear         = layout.linear.spec,
+                               .hidden         = continuation_hidden_.ne[0],
+                               .recurrent_host = layout.host.spec.recurrent_host};
+    if (layout.recurrent_staging.has_value() !=
+        packed_format(layout.host.spec.recurrent_host).has_value()) {
+        throw std::invalid_argument("StateImage recurrent Host staging is inconsistent");
+    }
+    if (layout.recurrent_staging) { recurrent_staging_ = layout.recurrent_staging->bind(backing); }
     if (layout.kv_window) {
         const std::int32_t extent = layout.kv_window->tags.shape[3];
         if (extent % linear_.slot_count() != 0) {
@@ -489,16 +519,16 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
         const Tensor conv = linear_.conv_slot(part.layer, slot);
         visit(conv.data,
               host_layout_.linear_conv.offset + part.layer * host_layout_.linear_conv_layer_bytes,
-              conv.bytes());
+              conv.bytes(), false);
         const Tensor recurrent = linear_.recurrent_slot(part.layer, slot);
         visit(recurrent.data,
               host_layout_.linear_recurrent.offset +
                   part.layer * host_layout_.linear_recurrent_layer_bytes,
-              recurrent.bytes());
+              recurrent.bytes(), true);
         return;
     }
     const Tensor hidden = continuation_hidden_slot(slot);
-    visit(hidden.data, host_layout_.continuation_hidden.offset, hidden.bytes());
+    visit(hidden.data, host_layout_.continuation_hidden.offset, hidden.bytes(), false);
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
@@ -507,11 +537,11 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
             visit(k.data,
                   host_layout_.dflash_local_k->offset +
                       layer * host_layout_.dflash_local_layer_bytes,
-                  k.bytes());
+                  k.bytes(), false);
             visit(v.data,
                   host_layout_.dflash_local_v->offset +
                       layer * host_layout_.dflash_local_layer_bytes,
-                  v.bytes());
+                  v.bytes(), false);
         }
     }
     for (std::uint32_t layer = 0; kv_window_ && layer < kv_window_layers_; ++layer) {
@@ -520,7 +550,7 @@ void StateImageDevicePool::for_each_host_component(std::int32_t slot, StateImage
             host_layout_.kv_window->offset + layer * host_layout_.kv_window_layer_bytes;
         for (const Tensor& plane :
              {window.k_codes, window.v_codes, window.k_scales, window.v_scales, window.tags}) {
-            visit(plane.data, offset, plane.bytes());
+            visit(plane.data, offset, plane.bytes(), false);
             offset += plane.bytes();
         }
     }
@@ -530,10 +560,15 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                                         cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
-    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
-        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data, offset), device, bytes,
-                                   cudaMemcpyDeviceToHost, stream));
-    });
+    if (packed_format(host_layout_.spec.recurrent_host)) {
+        throw std::logic_error("a packed recurrent StateImage Host form is copied in segments");
+    }
+    for_each_host_component(source,
+                            [&](void* device, std::size_t offset, std::size_t bytes, bool) {
+                                CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data, offset),
+                                                           device, bytes, cudaMemcpyDeviceToHost,
+                                                           stream));
+                            });
 }
 
 void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::int32_t destination,
@@ -541,10 +576,14 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
-    for_each_host_component(destination, [&](void* device, std::size_t offset, std::size_t bytes) {
-        CUDA_CHECK(cudaMemcpyAsync(device, byte_offset(source.data, offset), bytes,
-                                   cudaMemcpyHostToDevice, stream));
-    });
+    if (packed_format(host_layout_.spec.recurrent_host)) {
+        throw std::logic_error("a packed recurrent StateImage Host form is copied in segments");
+    }
+    for_each_host_component(destination,
+                            [&](void* device, std::size_t offset, std::size_t bytes, bool) {
+                                CUDA_CHECK(cudaMemcpyAsync(device, byte_offset(source.data, offset),
+                                                           bytes, cudaMemcpyHostToDevice, stream));
+                            });
 }
 
 namespace {
@@ -581,15 +620,27 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
                                                  cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage segmented D2H source is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
-    for_each_host_component(source, [&](void* device, std::size_t offset, std::size_t bytes) {
-        split_segments(
-            offset, bytes, segment_bytes,
-            [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
-                CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within,
-                                           static_cast<const std::byte*>(device) + done, count,
-                                           cudaMemcpyDeviceToHost, stream));
-            });
-    });
+    const std::optional<ops::PackedStateFormat> packed =
+        packed_format(host_layout_.spec.recurrent_host);
+    for_each_host_component(
+        source, [&](void* device, std::size_t offset, std::size_t bytes, bool recurrent) {
+            const std::byte* from = static_cast<const std::byte*>(device);
+            if (recurrent && packed) {
+                // Packed into the staging buffer, which this stream's next copy reuses only after
+                // this one has left it.
+                const Tensor state(device, DType::FP32, {static_cast<std::int32_t>(bytes / 4U)});
+                std::byte* staging = static_cast<std::byte*>(recurrent_staging_.data);
+                ops::pack_fp32_state(state, staging, *packed, stream);
+                from  = staging;
+                bytes = host_layout_.linear_recurrent_layer_bytes;
+            }
+            split_segments(
+                offset, bytes, segment_bytes,
+                [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
+                    CUDA_CHECK(cudaMemcpyAsync(segments[segment] + within, from + done, count,
+                                               cudaMemcpyDeviceToHost, stream));
+                });
+        });
 }
 
 void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* const> segments,
@@ -611,15 +662,28 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
     validate_slot(destination, slot_count(),
                   "StateImage segmented H2D destination is out of range");
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
+    const std::optional<ops::PackedStateFormat> packed =
+        packed_format(host_layout_.spec.recurrent_host);
     for_each_host_component(
-        destination, part, [&](void* device, std::size_t offset, std::size_t bytes) {
+        destination, part,
+        [&](void* device, std::size_t offset, std::size_t bytes, bool recurrent) {
+            const bool staged = recurrent && packed;
+            // The second staging column: copies from the Host run on their own stream.
+            std::byte* to = staged ? static_cast<std::byte*>(recurrent_staging_.data) +
+                                         host_layout_.linear_recurrent_layer_bytes
+                                   : static_cast<std::byte*>(device);
+            const std::size_t host_bytes =
+                staged ? host_layout_.linear_recurrent_layer_bytes : bytes;
             split_segments(
-                offset, bytes, segment_bytes,
+                offset, host_bytes, segment_bytes,
                 [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(device) + done,
-                                               segments[segment] + within, count,
+                    CUDA_CHECK(cudaMemcpyAsync(to + done, segments[segment] + within, count,
                                                cudaMemcpyHostToDevice, stream));
                 });
+            if (staged) {
+                Tensor state(device, DType::FP32, {static_cast<std::int32_t>(bytes / 4U)});
+                ops::unpack_fp32_state(to, state, *packed, stream);
+            }
         });
 }
 

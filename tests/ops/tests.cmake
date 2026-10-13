@@ -21,6 +21,7 @@ set(infernix_op_tests
   sampling
   scalar
   cast
+  state_codec
   prepare_ragged_prefix
   rows
   scatter

@@ -195,6 +195,12 @@ void Program::hybrid_hold_queue(std::span<const RequestBasePlan* const> queue) {
     impl_->hybrid_hold_queue(queue);
 }
 
+void Program::hybrid_hold_continuation(std::chrono::steady_clock::time_point deadline) {
+    impl_->hybrid_hold_continuation(deadline);
+}
+
+bool Program::hybrid_holds_stale() const noexcept { return impl_->hybrid_holds_stale(); }
+
 std::uint64_t Program::hybrid_cache_epoch() const noexcept { return impl_->hybrid_cache_epoch(); }
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->hybrid_stats(); }

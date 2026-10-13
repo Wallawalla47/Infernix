@@ -841,7 +841,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"held_snapshots", current.hybrid_held_snapshots},
                  {"held_device_evictions", delta(&RuntimeStats::hybrid_held_device_evictions)},
                  {"held_snapshot_losses", delta(&RuntimeStats::hybrid_held_snapshot_losses)},
-                 {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)}};
+                 {"held_host_refusals", delta(&RuntimeStats::hybrid_held_host_refusals)},
+                 {"tool_call_holds", delta(&RuntimeStats::hybrid_tool_call_holds)}};
     }
     return record.dump();
 }
