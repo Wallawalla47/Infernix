@@ -707,8 +707,7 @@ def build_plan(seed=42, scale=1.0):
     pair = ["survey-1", "survey-2"]
     a_steps = [{"op": "request", "cls": "cold_resume", "obs": None, "delay": 0.0},
                {"op": "signal", "name": "A_resumed"},
-               {"op": "wait", "signal": "C_resumed"},
-               {"op": "lockstep"}]
+               {"op": "wait", "signal": "C_resumed"}]
     a_steps += _loop(c, rng, "engine", n(7), 0, copy_at=(), edit_at=(4,))
     a_steps.append({"op": "spawn", "actors": fan1})
     a_steps.append({"op": "request", "cls": "loop", "obs": _report_obs(c, rng, "engine", fan1),
@@ -763,8 +762,7 @@ def build_plan(seed=42, scale=1.0):
     b_steps = [{"op": "wait", "signal": "A_resumed"},
                {"op": "request", "cls": "cold_resume", "obs": None, "delay": 0.0},
                {"op": "signal", "name": "B_resumed"},
-               {"op": "wait", "signal": "C_resumed"},
-               {"op": "lockstep"}]
+               {"op": "wait", "signal": "C_resumed"}]
     b_steps += _loop(c, rng, "python", n(11), 0, copy_at=(8,), extra=b_extra)
     # Two research subagents at once: their long final reports decode together, so every arm
     # has sustained two-request decoding for analyze.py to measure.
@@ -810,8 +808,7 @@ def build_plan(seed=42, scale=1.0):
                      "delay": 0.2}]}
     c_steps = [{"op": "wait", "signal": "B_resumed"},
                {"op": "request", "cls": "cold_resume", "obs": None, "delay": 0.0},
-               {"op": "signal", "name": "C_resumed"},
-               {"op": "lockstep"}]
+               {"op": "signal", "name": "C_resumed"}]
     c_steps += _loop(c, rng, "tests", n(16), 0, copy_at=(4, 13), extra=c_extra)
     c_steps.append({"op": "signal", "name": "C_done"})
     actors.append({"name": "C", "persona": "cc", "area": "tests", "initial": c_hist,
@@ -838,8 +835,82 @@ def build_plan(seed=42, scale=1.0):
                     if k in s:
                         assert s[k] not in seen, "seed collision"
                         seen.add(s[k])
+    assign_send_order(actors)
     return {"seed": seed, "scale": scale, "corpus_commit": c.commit, "personas": P,
             "actors": actors}
+
+
+SEND_OPS = ("request", "side_call", "compact", "retry")
+
+
+def assign_send_order(actors):
+    """Numbers every request of the plan with its place in one global send order (`order`, and
+    `abort_order` for the aborted attempt before it). The order is a function of the plan alone,
+    so every arm and every repeat of a seed sends its requests in the same order, whatever the
+    server's speed; the runner sends each request only after every earlier one has reached the
+    server.
+
+    The order comes from logical rounds. An actor's requests take successive rounds; an actor
+    waiting on a signal continues no earlier than the round after the request that preceded the
+    signal; spawned subagents start in the round after their parent's last request, and the parent
+    continues in the round after its last subagent's last request. Within a round, requests go by
+    the scripted tool and user time before them, then by the actors' order in the plan."""
+    rank = {a["name"]: i for i, a in enumerate(actors)}
+    by_name = {a["name"]: a for a in actors}
+    sends = []  # (round, delay, actor rank, step index, key)
+    signals = {}
+    finished = {}
+    # Per running actor: next step, next free round, and the subagents it is waiting for.
+    running = {a["name"]: {"pc": 0, "round": 0, "subs": None} for a in actors if a.get("top")}
+    while running:
+        progressed = False
+        for name in list(running):
+            st, steps = running[name], by_name[name]["steps"]
+            while st["pc"] < len(steps):
+                s, i = steps[st["pc"]], st["pc"]
+                op = s["op"]
+                if op == "request":
+                    if s.get("abort_after"):
+                        sends.append((st["round"], s.get("delay", 0) + s.get("user_delay", 0),
+                                      rank[name], i, "abort_order"))
+                        st["round"] += 1
+                        sends.append((st["round"], s.get("retry_delay", 3.0), rank[name], i, "order"))
+                    else:
+                        sends.append((st["round"], s.get("delay", 0) + s.get("user_delay", 0),
+                                      rank[name], i, "order"))
+                    st["round"] += 1
+                elif op in SEND_OPS:
+                    sends.append((st["round"], s.get("delay", 0), rank[name], i, "order"))
+                    st["round"] += 1
+                elif op == "signal":
+                    signals[s["name"]] = st["round"]
+                elif op == "wait":
+                    if s["signal"] not in signals:
+                        break
+                    st["round"] = max(st["round"], signals[s["signal"]])
+                elif op == "spawn":
+                    if st["subs"] is None:
+                        st["subs"] = list(s["actors"])
+                        for sub in s["actors"]:
+                            running[sub] = {"pc": 0, "round": st["round"], "subs": None}
+                        progressed = True
+                        break
+                    if any(sub not in finished for sub in st["subs"]):
+                        break
+                    st["round"] = max([st["round"]] + [finished[sub] for sub in st["subs"]])
+                    st["subs"] = None
+                elif op != "clear_old_tool_results":
+                    raise ValueError("unknown op %r" % op)
+                st["pc"] += 1
+                progressed = True
+            if st["pc"] >= len(steps):
+                finished[name] = st["round"]
+                del running[name]
+                progressed = True
+        if not progressed:
+            raise ValueError("plan deadlocks: %s wait forever" % ", ".join(sorted(running)))
+    for position, (_, _, r, i, key) in enumerate(sorted(sends)):
+        actors[r]["steps"][i][key] = position
 
 
 def summarize(plan):

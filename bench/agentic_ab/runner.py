@@ -21,8 +21,9 @@ Sequence:
      each seed runs every arm into <out>/seed-<n> in turn, and analyze.py adds a combined
      report over the seeds in <out>.
 
-The three main sessions run their turns in lock-step rounds (see Rounds), so every arm meets
-the same order of session turns whatever its speed.
+Every request goes out in its place in the plan's fixed send order (see Sequencer and
+workload.assign_send_order), so every arm, and every repeat of a seed, sends the same requests in
+the same order whatever its speed.
 
 Usage: python runner.py [--arms treatment,alt,control] [--seeds 42,43,44] [--ctx N] [--scale F]
                         [--out DIR] [--dry-run]
@@ -414,40 +415,29 @@ def write_strata_log(arm_dir):
 # Client: one closed-loop agent per actor, as an agent client drives the API.
 # ---------------------------------------------------------------------------------------
 
-class Rounds:
-    """A barrier whose parties can join and leave: the main sessions' lock-step turns.
+class Sequencer:
+    """Sends the plan's requests in its fixed global order (workload.assign_send_order).
 
-    A session in lock-step sends its next request only once every other session in lock-step
-    is also ready to send, so each round carries one request per session. A session leaves
-    while it waits on a signal or on its subagents, and when it finishes."""
+    A request waits until every request before it in the order has reached the server, which a
+    streamed request has once its response headers arrive: the server writes them right before it
+    queues the request. A request that will never be sent (an actor that crashed or skipped a
+    step) is released without sending."""
 
     def __init__(self):
         self._cv = threading.Condition()
-        self._parties = 0
-        self._arrived = 0
-        self._round = 0
+        self._next = 0
+        self._released = set()
 
-    def join(self):
+    def await_turn(self, order):
         with self._cv:
-            self._parties += 1
-
-    def leave(self):
-        with self._cv:
-            self._parties -= 1
-            self._advance()
-
-    def await_round(self):
-        with self._cv:
-            current = self._round
-            self._arrived += 1
-            self._advance()
-            while self._round == current:
+            while self._next != order:
                 self._cv.wait()
 
-    def _advance(self):
-        if self._arrived and self._arrived >= self._parties:
-            self._arrived = 0
-            self._round += 1
+    def release(self, order):
+        with self._cv:
+            self._released.add(order)
+            while self._next in self._released:
+                self._next += 1
             self._cv.notify_all()
 
 
@@ -514,7 +504,7 @@ class ArmClient:
         self.client_log = os.path.join(out_dir, "client.jsonl")
         self.write_lock = threading.Lock()
         self.failures = []
-        self.rounds = Rounds()
+        self.sequencer = Sequencer()
 
     def signal(self, name):
         with self.sig_lock:
@@ -526,8 +516,12 @@ class ArmClient:
                 f.write(json.dumps(row) + "\n")
 
     # -- HTTP --------------------------------------------------------------------------
-    def post(self, messages, tools, max_tokens, seed, abort_after=None):
-        body = {"model": self.model_id, "messages": messages, "max_tokens": max_tokens,
+    def post(self, messages, tools, max_tokens, seed, abort_after=None, order=None):
+        """One streamed request. With `order`, it is sent in its place in the plan's send order
+        and releases the next request once the server has it (or once it has failed)."""
+        if order is not None:
+            self.sequencer.await_turn(order)
+        body ={"model": self.model_id, "messages": messages, "max_tokens": max_tokens,
                 "temperature": SAMPLING["temperature"], "top_p": SAMPLING["top_p"],
                 "top_k": SAMPLING["top_k"], "seed": seed, "stream": True,
                 "stream_options": {"include_usage": True}}
@@ -552,6 +546,8 @@ class ArmClient:
                 timer = threading.Timer(abort_after, cut)
                 timer.start()
             resp = conn.getresponse()
+            if order is not None:
+                self.sequencer.release(order)
             if resp.status != 200:
                 r.error = "HTTP %d: %s" % (resp.status, resp.read()[:600].decode("utf-8", "replace"))
                 return r
@@ -593,10 +589,14 @@ class ArmClient:
             if timer:
                 timer.cancel()
             conn.close()
+            if order is not None:
+                self.sequencer.release(order)
         return r
 
-    def request(self, actor, step, messages, tools, max_tokens, seed, cls, abort_after=None):
-        res = self.post(messages, tools, max_tokens, seed, abort_after)
+    def request(self, actor, step, messages, tools, max_tokens, seed, cls, abort_after=None,
+                order=None):
+        res = self.post(messages, tools, max_tokens, seed, abort_after,
+                        step["order"] if order is None else order)
         row = {"arm": self.arm, "actor": actor["name"], "tag": step.get("tag"), "cls": cls,
                "copy": bool(step.get("copy")), "seed": seed, "status": res.status,
                "error": res.error, "finish": res.finish, "usage": res.usage, "timings": res.timings,
@@ -657,14 +657,17 @@ class ArmClient:
             log("actor %s crashed:\n%s" % (actor["name"], traceback.format_exc()))
 
     def _run_actor(self, actor):
-        in_lockstep = [False]
         try:
-            self._run_steps(actor, in_lockstep)
+            self._run_steps(actor)
         finally:
-            if in_lockstep[0]:
-                self.rounds.leave()
+            # Whatever this actor did not send (a crash, a skipped retry) must not hold up the
+            # requests after it in the send order.
+            for step in actor["steps"]:
+                for key in ("order", "abort_order"):
+                    if key in step:
+                        self.sequencer.release(step[key])
 
-    def _run_steps(self, actor, in_lockstep):
+    def _run_steps(self, actor):
         persona = self.personas[actor["persona"]]
         tools = persona["tools"]
         hist = copy.deepcopy(actor["initial"])
@@ -673,29 +676,17 @@ class ArmClient:
         calib = 1.0
         for step in actor["steps"]:
             op = step["op"]
-            # A session in lock-step waits for its round before each request, ahead of the
-            # step's scripted tool/user delay: the delays, identical in every arm, then fix the
-            # order in which the sessions of one round send.
-            if in_lockstep[0] and op in ("request", "retry", "side_call", "compact"):
-                self.rounds.await_round()
-            if op == "lockstep":
-                self.rounds.join()
-                in_lockstep[0] = True
-            elif op == "signal":
+            if op == "signal":
                 self.signal(step["name"]).set()
             elif op == "wait":
-                self.leave_rounds_while(in_lockstep, self.signal(step["signal"]).wait)
+                self.signal(step["signal"]).wait()
             elif op == "spawn":
                 subs = [threading.Thread(target=self.run_actor, args=(self.actors[n],), daemon=True)
                         for n in step["actors"]]
-
-                def run_subagents():
-                    for t in subs:
-                        t.start()
-                    for t in subs:
-                        t.join()
-
-                self.leave_rounds_while(in_lockstep, run_subagents)
+                for t in subs:
+                    t.start()
+                for t in subs:
+                    t.join()
             elif op == "request":
                 self.deliver(hist, last_calls, step.get("obs"), step.get("user"))
                 time.sleep(step.get("delay", 0) + step.get("user_delay", 0))
@@ -703,7 +694,8 @@ class ArmClient:
                 cls = step["cls"]
                 if step.get("abort_after"):
                     self.request(actor, step, hist, tools, AGENT_MAX_TOKENS, step["abort_seed"],
-                                 "aborted", abort_after=step["abort_after"])
+                                 "aborted", abort_after=step["abort_after"],
+                                 order=step["abort_order"])
                     time.sleep(step.get("retry_delay", 3.0))
                     cls = "abort_retry"
                 last_sent = copy.deepcopy(hist)
@@ -722,6 +714,7 @@ class ArmClient:
                 # The user retries the previous turn: the identical prompt is sent again and
                 # the new answer replaces the old one.
                 if last_sent is None:
+                    self.sequencer.release(step["order"])
                     continue
                 time.sleep(step.get("delay", 0))
                 res = self.request(actor, step, last_sent, tools, AGENT_MAX_TOKENS, step["seed"],
@@ -751,17 +744,6 @@ class ArmClient:
                              "cleared": n})
             else:
                 raise ValueError("unknown op %r" % op)
-
-    def leave_rounds_while(self, in_lockstep, blocking):
-        """Runs `blocking` outside the lock-step rounds, so the other sessions keep going."""
-        if not in_lockstep[0]:
-            blocking()
-            return
-        self.rounds.leave()
-        try:
-            blocking()
-        finally:
-            self.rounds.join()
 
     def run(self):
         tops = [a for a in self.plan["actors"] if a.get("top")]

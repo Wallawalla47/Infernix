@@ -68,19 +68,30 @@ answer the model's tool calls by id whatever it asked for, so every arm sees the
 growth. Each request carries a `seed` that is identical in every arm; it also tags the request
 in the serve log.
 
-**Lock-step main sessions.** Once resumed, A, B and C take their turns in rounds: a session
-sends its next request only when every other session in the rounds is also ready to send, and
-within a round the scripted tool and user delays, identical in every arm, set the order. A
-session leaves the rounds while it waits on its subagents or on another session, and when it
-finishes, so the rounds never stall. Without them, a faster build runs one session ahead of the
-others and changes which session's prefix is evicted at the device-KV limit, so the cache rows
-would partly measure speed.
+**Fixed send order.** Every request of a seed has a place in one global send order, computed
+from the plan alone (`workload.assign_send_order`), and the client sends a request only once every
+request before it has reached the server (its streamed response headers have arrived, which the
+server writes right before it queues the request). The order comes from logical rounds: each
+actor's requests take successive rounds, a session waiting on another continues in the round
+after the request it waited for, subagents start in the round after their parent's request and
+the parent continues after its last subagent's, and within a round the scripted tool and user
+times, then the actors' plan order, decide. So the sessions and subagents interleave the same way
+in every arm and every repeat, whatever the build's speed: without it, a faster build runs one
+session ahead of the others, and parallel subagents race to the server, which changes whose
+prefix is prefilled first or evicted at the device-KV limit, so the cache rows would partly
+measure speed. A request waiting for its turn is not yet sent, so its time to first token starts
+when it goes out. A control whose server sends headers only on admission (Strata, if it does)
+would serialize the arm instead of only ordering it.
 
 **Sampling.** Every request sends `temperature 1.0`, `top_p 0.95`, `top_k 20`, as 97 % of the
 production requests did. `AB_TEMPERATURE=0` runs the replay greedily instead: two builds then write
 the same replies for as long as their numerics agree, so their requests see the same conversations
 and queue alike, and time to first token can be compared request by request (the requests whose
-prompts are identical in both arms). It is a regression check, not the production workload.
+prompts are identical in both arms). It is a regression check, not the production workload. With
+more than one lane the numerics depend on which requests share a decode batch, which depends on
+timing, so greedy replays of one build agree (nearly) request for request only with
+`--max-concurrency 1`; a different
+cache-hit length (a different prefill split) also moves near-ties.
 
 What differs between arms is only what should: the model's sampled text (the kernels differ
 numerically, so outputs diverge after a few tokens), and therefore interleaving and queueing.
