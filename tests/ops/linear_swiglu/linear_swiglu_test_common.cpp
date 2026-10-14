@@ -42,6 +42,9 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {8.0e-2, 1.0e-2, 1.2e-1};
     case ActivationCompute::A4:
         return {1.6e-1, 1.0e-2, 1.6e-1};
+    case ActivationCompute::A4Residual:
+        // Tight enough that one term (A4's error) fails it.
+        return {4.0e-2, 1.0e-2, 8.0e-2};
     }
     throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
 }
@@ -239,7 +242,8 @@ void validate_profile(const Profile& profile) {
     }
     const bool invariant = profile.activation_compute == ActivationCompute::A16ColumnInvariant;
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4 && !invariant) ||
+         profile.activation_compute != ActivationCompute::A4 &&
+         profile.activation_compute != ActivationCompute::A4Residual && !invariant) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8 && !invariant) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16)) {
@@ -303,6 +307,7 @@ int run_profile(std::string_view label, const Profile& profile,
     const ops::LinearPolicy policy = [&] {
         switch (profile.activation_compute) {
         case ActivationCompute::A4: return ops::LinearPolicy::AllowA4;
+        case ActivationCompute::A4Residual: return ops::LinearPolicy::AllowA4Residual;
         case ActivationCompute::A8: return ops::LinearPolicy::AllowA8;
         case ActivationCompute::A16ColumnInvariant: return ops::LinearPolicy::A16ColumnInvariant;
         case ActivationCompute::A16: break;

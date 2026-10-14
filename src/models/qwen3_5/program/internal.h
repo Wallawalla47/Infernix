@@ -23,7 +23,8 @@ inline constexpr std::uint32_t kMaximumDFlashDraftTokens = 15;
 // fast path (FastPath::BatchedDecode and those after it) is not selected:
 // column_invariant_decode runs decode and verification projections under
 // LinearPolicy::A16ColumnInvariant (without it, a8_decode and a4_decode let wide rounds of FP8 and
-// NVFP4 projections take the artifact's 8- or 4-bit activations, else they stay at 16 bits);
+// NVFP4 projections take the artifact's 8- or 4-bit activations, and a4_residual_decode the NVFP4
+// MLP projections the A4 residual profile, else they stay at 16 bits);
 // row_invariant_partition sizes
 // every attention row's key partition by that row alone; fixed_speculation verifies the
 // configured chain at a fixed width;
@@ -39,6 +40,7 @@ struct ExecutionSchedule {
     bool column_invariant_decode      = false;
     bool a8_decode                    = true;
     bool a4_decode                    = true;
+    bool a4_residual_decode           = false;
     bool row_invariant_partition      = false;
     bool fixed_speculation            = false;
     bool grid_cache                   = false;

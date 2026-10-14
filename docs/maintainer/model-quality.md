@@ -713,6 +713,7 @@ below (`src/runtime/engine/qwen4_exp_instance.cpp` lists their configurations).
 | `prompt-pv8` | INT8 KV (fast prompt kernel), NVFP4 KV (fast kernel), K8V4, VQ2, K4V2 KV | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4, VQ2 or K4V2 KV |
 | `batched-decode`, `batch-split-attention` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `batched-a8-decode`, `batched-a4-decode` | the same, with 8-bit (FP8) or 4-bit (NVFP4) activations | none (each fails, below) |
+| `batched-a4-residual-decode` | the same, with 4-bit (NVFP4) MLP activations | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `adaptive-speculation` | the same, with speculative decoding | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `free-cache-resume` | the same, with the prefix cache | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
 | `preemption` | request-invariance-capable artifacts | 24 heads, 4-bit activations, with INT8, NVFP4, K8V4 or K4V2 KV |
@@ -743,6 +744,12 @@ the Engine, and each acts only where the artifact can be request-invariant
   rounds are wide enough to take them; DFlash2 with n-gram copies at concurrency 4 verifies 32
   columns, and fails. The 4-bit activations alone add two thirds of the floor at every prompt
   length. Perplexity cannot see either: the NLL excess is negative in every arm.
+- `batched-a4-residual-decode`: with `batched-decode`, wide rounds of the NVFP4 MLP projections
+  (gate/up and down from 9 columns) quantize each column's activations into NVFP4 terms that
+  sum to it, the first being the 4-bit encoding and each later one the NVFP4 encoding of what the
+  earlier ones left (`LinearPolicy::AllowA4Residual`), and multiply every term by the same weight
+  tile into one accumulator. Weight traffic is the 4-bit route's; the activation error is roughly
+  the 4-bit route's raised to the term count.
 - `batch-split-attention`: decode attention sizes a row's key partition from the batch.
 - `adaptive-speculation`: DFlash2 tree tables and controller, and a round's longest n-gram copy,
   set every row's verify width.
@@ -817,6 +824,32 @@ prompt, 256 output tokens, three rounds; the qualified set against the exact rou
 (the 4- and 8-bit activations the old route used there are not qualified); DFlash2 with n-gram
 copies 853 vs 523 tok/s at two requests (+63 %) and 583 vs 329 at four (+77 %). VQ2, BF16 and FP8
 KV were not measured, so they run request-invariant by default.
+
+**`batched-a4-residual-decode`** (2026-10-14, the same artifact, corpus and arms): two NVFP4 terms
+per column, from 9 columns in the MLP. Its op error against the 16-bit oracle is 0.9 % relative L2
+on the [5120, 17408] down projection (one-term A4 6-12 %, A16 0.16 %); the gate/up suite's tiny
+activations put its second term's scales near E4M3's subnormal range, so its error there (1.6-2.2 %)
+does not fall with a third term. The plain arm never reaches 9 columns, so it also re-qualifies
+`batched-decode` after its [5120, 17408] down tile changed (8 K-warps at 5-16 columns, 35.6-51.8
+against 41.6-60.8 us). Every arm passes, jointly with the paths above:
+
+| 27B, KV | Arm | TV excess (bound) / budget | Top-1 excess, points (bound) / budget | KL excess / cap |
+|---|---|---|---|---|
+| INT8 | plain | -2.2e-4 (3.1e-4) / 2.4e-3 | -0.10 (0.01) / 0.22 | -9.1e-4 / 8.6e-3 |
+| INT8 | spec | 4.2e-5 (5.2e-4) / 2.4e-3 | -0.04 (0.06) / 0.22 | -8.3e-4 / 8.6e-3 |
+| NVFP4 | plain | 2.3e-4 (5.5e-4) / 2.9e-3 | +0.09 (0.19) / 0.28 | 1.1e-3 / 8.8e-3 |
+| NVFP4 | spec | 4.7e-4 (7.8e-4) / 2.9e-3 | +0.12 (0.22) / 0.28 | 2.1e-3 / 8.8e-3 |
+| K8V4 | plain | 2.6e-4 (6.3e-4) / 2.7e-3 | -0.04 (0.07) / 0.26 | 2.8e-3 / 8.2e-3 |
+| K8V4 | spec | 4.9e-4 (8.5e-4) / 2.7e-3 | +0.01 (0.13) / 0.26 | 2.8e-3 / 8.2e-3 |
+| K4V2 | plain | 2.4e-4 (6.0e-4) / 2.6e-3 | -0.08 (0.03) / 0.24 | -1.8e-3 / 8.9e-3 |
+| K4V2 | spec | 4.4e-4 (8.1e-4) / 2.6e-3 | -0.08 (0.02) / 0.24 | -1.2e-3 / 8.9e-3 |
+
+Against the spec arms without it, the residual route adds about 2.5e-4 TV excess (a tenth of the
+budget). Speed (INT8 KV, as above, the qualified set with and without it; the old route's 4- and
+8-bit activations for reference): plain decode at eight requests 70.3 tok/s either way (64.7 before
+the down tile, 72.6 on the old route); DFlash2 with n-gram copies 1,787 vs 1,280 tok/s at one request
+(+40 %), 1,217 vs 852 at two (+43 %) and 887 vs 604 at four (+47 %), against the old route's 1,995,
+1,650 and 1,286. Three terms ran 1,696, 1,074 and 783 and were not needed.
 
 **Qualification.** These act only above one request, so the decode gate runs them with
 `--concurrency`, `--kv-tokens` (a short pool), or `--prefix-reuse --warm-tokens` (an off-grid

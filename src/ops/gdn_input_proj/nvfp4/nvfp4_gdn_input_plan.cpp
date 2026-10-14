@@ -19,7 +19,9 @@ enum class Nvfp4GdnInputRoute : std::uint8_t {
 Nvfp4GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("nvfp4 gdn_input_proj: T must be positive"); }
     if (column_invariant(policy)) { return Nvfp4GdnInputRoute::ColumnInvariantA16; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    // The A4 residual profile is registered for the MLP projections only.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a4_residual(policy)) {
         return Nvfp4GdnInputRoute::A16;
     }
     if (allows_a4(policy)) { return Nvfp4GdnInputRoute::A4; }

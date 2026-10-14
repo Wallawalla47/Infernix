@@ -14,6 +14,7 @@ enum class Nvfp4LinearAddRoute : std::uint8_t {
     ColumnInvariantA16,
     A16,
     A4,
+    A4Residual,
 };
 
 Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_rows,
@@ -24,6 +25,11 @@ Nvfp4LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_r
     if (column_invariant(policy)) { return Nvfp4LinearAddRoute::ColumnInvariantA16; }
     if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
         return Nvfp4LinearAddRoute::A16;
+    }
+    if (allows_a4_residual(policy)) {
+        // Two-term K=17408: 37.5 us at 8-14 tokens, against A16's 37.7-38.0 at 8 and 44.4-51.8 at
+        // 9-14 (RTX 5090, cold weights): the residual's error buys time from 9.
+        return tokens >= 9 ? Nvfp4LinearAddRoute::A4Residual : Nvfp4LinearAddRoute::A16;
     }
     if (!allows_a4(policy)) { throw std::invalid_argument("nvfp4 linear_add: unsupported policy"); }
     // With the three-stage A4 tile, K=6144 is ahead of A16 from 8 tokens too: 21.1 us against
@@ -43,9 +49,16 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
         throw std::invalid_argument("nvfp4 linear_add workspace: invalid token interval");
     }
     (void)resolve_route(output_rows, input_rows, policy, min_tokens);
-    return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::A4
-               ? nvfp4_a4_workspace_capacity_bytes(max_tokens, input_rows)
-               : 0;
+    switch (resolve_route(output_rows, input_rows, policy, max_tokens)) {
+    case Nvfp4LinearAddRoute::A4:
+        return nvfp4_a4_workspace_capacity_bytes(max_tokens, input_rows);
+    case Nvfp4LinearAddRoute::A4Residual:
+        return nvfp4_a4_workspace_capacity_bytes(max_tokens, input_rows, kNvfp4A4ResidualTerms);
+    case Nvfp4LinearAddRoute::ColumnInvariantA16:
+    case Nvfp4LinearAddRoute::A16:
+        break;
+    }
+    return 0;
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
@@ -60,7 +73,14 @@ void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& re
         nvfp4_linear_add_a16_launch(x, weight, residual, stream);
         return;
     }
-    auto scope                     = workspace.scope();
+    auto scope = workspace.scope();
+    if (route == Nvfp4LinearAddRoute::A4Residual) {
+        nvfp4_linear_add_a4_residual_launch(
+            x, weight, residual,
+            allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k, kNvfp4A4ResidualTerms),
+            stream);
+        return;
+    }
     const Nvfp4A4Workspace scratch = allocate_nvfp4_a4_workspace(workspace, x.ne[1], weight.k);
     nvfp4_linear_add_a4_launch(x, weight, residual, scratch, stream);
 }

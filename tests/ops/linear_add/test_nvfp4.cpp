@@ -28,6 +28,8 @@ constexpr ReductionCriterion kA16Tolerance{
     2.0 * kBf16UnitRoundoff,
 };
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
+// The A4 residual profile: tight enough that one term (A4's error) fails it.
+constexpr ReductionCriterion kA4ResidualTolerance{2.5e-2, kBf16UnitRoundoff, 5.0e-2};
 
 struct Invocation {
     std::int32_t tokens;
@@ -95,6 +97,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{4, ops::LinearPolicy::A16Only},
         Invocation{5, ops::LinearPolicy::A16Only},
         Invocation{8, ops::LinearPolicy::A16Only},
+        Invocation{12, ops::LinearPolicy::A16Only},
         Invocation{16, ops::LinearPolicy::A16Only},
         Invocation{17, ops::LinearPolicy::A16Only},
         Invocation{24, ops::LinearPolicy::A16Only},
@@ -133,6 +136,19 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         Invocation{1023, ops::LinearPolicy::AllowA4},
         Invocation{1024, ops::LinearPolicy::AllowA4},
         Invocation{1025, ops::LinearPolicy::AllowA4},
+        // The A4 residual profile: A16 below 9 columns, then each residual tile and a ragged
+        // last tile; 128 also replays under a CUDA Graph.
+        Invocation{7, ops::LinearPolicy::AllowA4Residual},
+        Invocation{8, ops::LinearPolicy::AllowA4Residual},
+        Invocation{9, ops::LinearPolicy::AllowA4Residual},
+        Invocation{13, ops::LinearPolicy::AllowA4Residual},
+        Invocation{16, ops::LinearPolicy::AllowA4Residual},
+        Invocation{17, ops::LinearPolicy::AllowA4Residual},
+        Invocation{32, ops::LinearPolicy::AllowA4Residual},
+        Invocation{33, ops::LinearPolicy::AllowA4Residual},
+        Invocation{64, ops::LinearPolicy::AllowA4Residual},
+        Invocation{65, ops::LinearPolicy::AllowA4Residual},
+        Invocation{128, ops::LinearPolicy::AllowA4Residual},
     };
     // The invocation list is what drives the host buffers, so take the bound from it rather than
     // from a literal that silently caps it.
@@ -192,8 +208,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
         }
 
         const bool a4           = invocation.policy == ops::LinearPolicy::AllowA4;
+        const bool a4_residual  = invocation.policy == ops::LinearPolicy::AllowA4Residual;
         const std::string label = "NVFP4 linear_add [" + std::to_string(n) + "," +
-                                  std::to_string(k) + "] " + (a4 ? "A4" : "A16") +
+                                  std::to_string(k) + "] " +
+                                  (a4 ? "A4" : (a4_residual ? "A4 residual" : "A16")) +
                                   " T=" + std::to_string(invocation.tokens);
         if (workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace query/execution high-water mismatch\n";
@@ -225,7 +243,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::uint32_t seed) {
                 expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
-        failures += verify_reduction(label, actual, expected, a4 ? kA4Tolerance : kA16Tolerance);
+        failures += verify_reduction(label, actual, expected,
+                                     a4 ? kA4Tolerance
+                                        : (a4_residual && invocation.tokens >= 9 ? kA4ResidualTolerance
+                                                                                 : kA16Tolerance));
     }
 
     failures += device_activation.verify_guards("NVFP4 linear_add activation");

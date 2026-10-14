@@ -72,4 +72,32 @@ __global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_quantize_kern
     }
 }
 
+// The A4 residual profile's planes (quantize_nvfp4_terms_k16), each row-major like the A4 plane.
+template <class Geometry, int Threads, int Terms>
+__global__ __launch_bounds__(Threads, 512 / Threads) void nvfp4_a4_residual_quantize_kernel(
+    const __nv_bfloat16* __restrict__ input, std::uint8_t* __restrict__ codes,
+    std::uint8_t* __restrict__ scales, std::int32_t tokens, float input_scale_divisor,
+    std::int64_t code_plane, std::int64_t scale_plane) {
+    pdl::enter();
+    constexpr int kGroupsPerRow = Geometry::kInputRows / 16;
+    const int task =
+        static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
+    if (task >= tokens * kGroupsPerRow) { return; }
+    const int token = task / kGroupsPerRow;
+    const int group = task - token * kGroupsPerRow;
+    Nvfp4QuantizedK16 terms[Terms];
+    quantize_nvfp4_terms_k16<Terms>(
+        input + static_cast<std::int64_t>(token) * Geometry::kInputRows + group * 16,
+        input_scale_divisor, terms);
+    const std::int64_t code_offset =
+        static_cast<std::int64_t>(token) * Geometry::kCodeBytesPerRow + group * 8;
+    const std::int64_t scale_offset = static_cast<std::int64_t>(token) * kGroupsPerRow + group;
+#pragma unroll
+    for (int term = 0; term < Terms; ++term) {
+        store_vec(codes + term * code_plane + code_offset,
+                  make_uint2(terms[term].codes_lo, terms[term].codes_hi));
+        scales[term * scale_plane + scale_offset] = terms[term].scale;
+    }
+}
+
 } // namespace infernix::ops::detail

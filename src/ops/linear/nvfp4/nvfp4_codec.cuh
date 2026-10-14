@@ -147,4 +147,64 @@ __device__ __forceinline__ Nvfp4QuantizedK16 quantize_nvfp4_k16(const __nv_bfloa
     return result;
 }
 
+// The A4 residual profile: one K16 group as a sum of NVFP4 terms. The remainder starts at the
+// divisor-scaled input x * input_scale_divisor; each term encodes it like quantize_nvfp4_k16 (an
+// E4M3 scale of max/6, E2M1 codes of value/scale), and the next term encodes what that term's
+// decoded code * scale left. Term 0 is therefore bit-identical to quantize_nvfp4_k16, and every term
+// shares its divisor, so the MMA sums the terms' products into one accumulator under the same alpha.
+template <int Terms>
+__device__ __forceinline__ void quantize_nvfp4_terms_k16(const __nv_bfloat16* source,
+                                                         float input_scale_divisor,
+                                                         Nvfp4QuantizedK16 (&terms)[Terms]) {
+    const uint4 packed0                = load_vec<uint4>(source);
+    const uint4 packed1                = load_vec<uint4>(source + 8);
+    const std::uint32_t represented[8] = {
+        packed0.x, packed0.y, packed0.z, packed0.w, packed1.x, packed1.y, packed1.z, packed1.w,
+    };
+
+    float2 remainder[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        const float2 value = bf16x2_bits_to_float2(represented[pair]);
+        remainder[pair]    = make_float2(__fmul_rn(value.x, input_scale_divisor),
+                                         __fmul_rn(value.y, input_scale_divisor));
+    }
+
+#pragma unroll
+    for (int term = 0; term < Terms; ++term) {
+        float max_abs = 0.0F;
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            max_abs = fmaxf(max_abs, fabsf(remainder[pair].x));
+            max_abs = fmaxf(max_abs, fabsf(remainder[pair].y));
+        }
+        Nvfp4QuantizedK16 quantized{};
+        quantized.scale =
+            __nv_cvt_float_to_fp8(__fdiv_rn(max_abs, 6.0F), __NV_SATFINITE, __NV_E4M3);
+        terms[term] = quantized;
+        // A zero scale encodes zero; the remainder carries on to the next term unchanged.
+        if (quantized.scale == 0) { continue; }
+
+        const float scale = decode_nvfp4_e4m3(quantized.scale);
+        float2 quotients[8];
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            quotients[pair] = make_float2(__fdiv_rn(remainder[pair].x, scale),
+                                          __fdiv_rn(remainder[pair].y, scale));
+        }
+        pack_nvfp4_e2m1x16(quotients, terms[term].codes_lo, terms[term].codes_hi);
+        if (term + 1 == Terms) { break; }
+        // Code * scale is exact in FP32 (two and four significant bits), so each remainder rounds
+        // once, in the subtraction.
+#pragma unroll
+        for (int pair = 0; pair < 8; ++pair) {
+            const std::uint32_t word = pair < 4 ? terms[term].codes_lo : terms[term].codes_hi;
+            const float2 code =
+                decode_nvfp4_e2m1x2(static_cast<std::uint8_t>(word >> (8 * (pair & 3))));
+            remainder[pair].x = __fsub_rn(remainder[pair].x, __fmul_rn(code.x, scale));
+            remainder[pair].y = __fsub_rn(remainder[pair].y, __fmul_rn(code.y, scale));
+        }
+    }
+}
+
 } // namespace infernix::ops::detail

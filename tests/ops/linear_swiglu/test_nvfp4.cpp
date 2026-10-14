@@ -95,6 +95,13 @@ int main() {
         failures += run_profile("LinearSwiGLU NVFP4_A4",
                                 {QType::NVFP4, 34816, 5120, 17408, 1803U, ActivationCompute::A4},
                                 kA4Cases, std::array<std::int32_t, 4>{65, 97, 128, 129});
+        // The residual tiles (16, 32 and 64 columns), their ragged edges, and token slices past
+        // the widest; graph replays regenerate every plane.
+        failures += run_profile(
+            "LinearSwiGLU NVFP4_A4_RESIDUAL",
+            {QType::NVFP4, 34816, 5120, 17408, 1807U, ActivationCompute::A4Residual},
+            std::array{4, 5, 8, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 129},
+            std::array<std::int32_t, 3>{8, 33, 65});
         std::cout << (failures == 0 ? "OK" : "FAIL") << " LinearSwiGLU NVFP4 correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

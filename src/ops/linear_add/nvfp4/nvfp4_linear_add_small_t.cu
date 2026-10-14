@@ -38,7 +38,7 @@ constexpr auto make_launchers(std::index_sequence<Offsets...>) {
 
 template <class Geometry>
 constexpr auto make_launchers() {
-    return make_launchers<Geometry>(std::make_index_sequence<5 - 2 + 1>{});
+    return make_launchers<Geometry>(std::make_index_sequence<4 - 2 + 1>{});
 }
 
 constexpr auto kResidual6144Launchers  = make_launchers<Nvfp4N5120K6144>();

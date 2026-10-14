@@ -76,6 +76,9 @@ bool qwen4_exp_fast_path(FastPath path, const EngineOptions& options) {
     case FastPath::PromptPv8:
     case FastPath::DecodeSplit64:
     case FastPath::BatchedDecode:
+    case FastPath::BatchedA8Decode:
+    case FastPath::BatchedA4Decode:
+    case FastPath::BatchedA4ResidualDecode:
     case FastPath::BatchSplitAttention: return false;
     }
     return false;

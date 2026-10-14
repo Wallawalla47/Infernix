@@ -80,6 +80,12 @@ enum class FastPath : std::uint8_t {
     // With batched-decode, wide decode and verify rounds of NVFP4 projections take the artifact's
     // 4-bit activations (the MLP gate/up from 5 columns, down from 8). Without it they stay at 16 bits.
     BatchedA4Decode,
+    // With batched-decode, decode and verify rounds of 9 or more columns take the A4 residual
+    // profile in the NVFP4 MLP projections where the artifact permits 4-bit activations: each
+    // column as a sum of NVFP4 terms, each encoding what the earlier ones left
+    // (ops::LinearPolicy::AllowA4Residual). batched-a4-decode takes precedence. Without either they
+    // stay at 16 bits.
+    BatchedA4ResidualDecode,
     // Decode attention sizes each row's key partition from the round's batch. Without it a row's
     // partition depends only on its own keys.
     BatchSplitAttention,
@@ -96,10 +102,12 @@ enum class FastPath : std::uint8_t {
     Preemption,
 };
 
-inline constexpr std::array<FastPath, 9> kFastPaths{
-    FastPath::PromptPv8,           FastPath::DecodeSplit64,       FastPath::BatchedDecode,
-    FastPath::BatchedA8Decode,     FastPath::BatchedA4Decode,     FastPath::BatchSplitAttention,
-    FastPath::AdaptiveSpeculation, FastPath::FreeCacheResume,     FastPath::Preemption};
+inline constexpr std::array<FastPath, 10> kFastPaths{
+    FastPath::PromptPv8,           FastPath::DecodeSplit64,
+    FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
+    FastPath::BatchedA4Decode,     FastPath::BatchedA4ResidualDecode,
+    FastPath::BatchSplitAttention, FastPath::AdaptiveSpeculation,
+    FastPath::FreeCacheResume,     FastPath::Preemption};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -108,6 +116,7 @@ inline constexpr std::array<FastPath, 9> kFastPaths{
     case FastPath::BatchedDecode: return "batched-decode";
     case FastPath::BatchedA8Decode: return "batched-a8-decode";
     case FastPath::BatchedA4Decode: return "batched-a4-decode";
+    case FastPath::BatchedA4ResidualDecode: return "batched-a4-residual-decode";
     case FastPath::BatchSplitAttention: return "batch-split-attention";
     case FastPath::AdaptiveSpeculation: return "adaptive-speculation";
     case FastPath::FreeCacheResume: return "free-cache-resume";

@@ -17,14 +17,16 @@
 
 namespace infernix::ops::detail {
 
+// The activation tile holds kTerms planes of kBlockTokens rows each, plane after plane.
 template <class Schedule>
 struct Nvfp4A4SharedStorage {
+    static constexpr int kActivationRows = Schedule::kTerms * Schedule::kBlockTokens;
     alignas(16)
-        std::uint8_t a_codes[Schedule::kStages][Schedule::kBlockTokens * Schedule::kCodeRowBytes];
+        std::uint8_t a_codes[Schedule::kStages][kActivationRows * Schedule::kCodeRowBytes];
     alignas(
         16) std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockRows * Schedule::kCodeRowBytes];
     alignas(16)
-        std::uint32_t a_scale4[Schedule::kStages][Schedule::kBlockTokens * Schedule::kK64PerStage];
+        std::uint32_t a_scale4[Schedule::kStages][kActivationRows * Schedule::kK64PerStage];
     alignas(16)
         std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockRows * Schedule::kK64PerStage * 4];
 };
@@ -38,56 +40,67 @@ __device__ __forceinline__ int nvfp4_a4_swizzled_byte(int row, int logical_byte)
     return physical_segment * 16 + byte_in_segment;
 }
 
+// Shared row r holds plane r / kBlockTokens, token r % kBlockTokens; plane p starts p * code_plane
+// code bytes and p * scale_plane scale bytes into the activation planes.
 template <class Schedule>
 __device__ __forceinline__ void
 stage_nvfp4_a4_activation(const std::uint8_t* __restrict__ x,
                           const std::uint8_t* __restrict__ x_scales, int input_rows,
+                          std::int64_t code_plane, std::int64_t scale_plane,
                           Nvfp4A4SharedStorage<Schedule>& shared, int stage, int k_tile,
                           int token_begin, int active_tokens) {
     const int k              = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    constexpr int kCodeTasks = Schedule::kBlockTokens * Schedule::kSegmentsPerRow;
+    constexpr int kRows      = Nvfp4A4SharedStorage<Schedule>::kActivationRows;
+    constexpr int kCodeTasks = kRows * Schedule::kSegmentsPerRow;
     for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
         const int row             = task / Schedule::kSegmentsPerRow;
         const int logical_segment = task - row * Schedule::kSegmentsPerRow;
-        const int token           = token_begin + row;
+        const int plane           = row / Schedule::kBlockTokens;
+        const int token           = token_begin + row - plane * Schedule::kBlockTokens;
         const bool valid          = token < active_tokens;
         const int source_token    = valid ? token : 0;
         const int physical_byte   = nvfp4_a4_swizzled_byte<Schedule>(row, logical_segment * 16);
         auto* destination = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-        const auto* input = x + static_cast<std::int64_t>(source_token) * (k / 2) +
+        const auto* input = x + plane * code_plane +
+                            static_cast<std::int64_t>(source_token) * (k / 2) +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
         cp_async_zfill<16, Schedule::kActivationCache>(destination, input, valid ? 16 : 0);
     }
 
     if constexpr (Schedule::kK64PerStage <= 4) {
         constexpr int kScaleBytes = Schedule::kK64PerStage * 4;
-        for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockTokens;
-             row += Schedule::kThreads) {
-            const int token        = token_begin + row;
+        for (int row = static_cast<int>(threadIdx.x); row < kRows; row += Schedule::kThreads) {
+            const int plane        = row / Schedule::kBlockTokens;
+            const int token        = token_begin + row - plane * Schedule::kBlockTokens;
             const bool valid       = token < active_tokens;
             const int source_token = valid ? token : 0;
             auto* destination      = &shared.a_scale4[stage][row * Schedule::kK64PerStage];
-            const auto* input = x_scales + (static_cast<std::int64_t>(source_token) * (k / 64) +
-                                            k_tile * Schedule::kK64PerStage) *
-                                               4;
+            const auto* input =
+                x_scales + plane * scale_plane +
+                (static_cast<std::int64_t>(source_token) * (k / 64) +
+                 k_tile * Schedule::kK64PerStage) *
+                    4;
             cp_async_zfill<kScaleBytes>(destination, input, valid ? kScaleBytes : 0);
         }
     } else {
         static_assert((Schedule::kK64PerStage % 4) == 0);
         constexpr int kSegmentsPerRow = Schedule::kK64PerStage / 4;
-        constexpr int kScaleTasks     = Schedule::kBlockTokens * kSegmentsPerRow;
+        constexpr int kScaleTasks     = kRows * kSegmentsPerRow;
         for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks;
              task += Schedule::kThreads) {
             const int row          = task / kSegmentsPerRow;
             const int segment      = task - row * kSegmentsPerRow;
-            const int token        = token_begin + row;
+            const int plane        = row / Schedule::kBlockTokens;
+            const int token        = token_begin + row - plane * Schedule::kBlockTokens;
             const bool valid       = token < active_tokens;
             const int source_token = valid ? token : 0;
             const int local_k64    = segment * 4;
             auto* destination = &shared.a_scale4[stage][row * Schedule::kK64PerStage + local_k64];
-            const auto* input = x_scales + (static_cast<std::int64_t>(source_token) * (k / 64) +
-                                            k_tile * Schedule::kK64PerStage + local_k64) *
-                                               4;
+            const auto* input =
+                x_scales + plane * scale_plane +
+                (static_cast<std::int64_t>(source_token) * (k / 64) +
+                 k_tile * Schedule::kK64PerStage + local_k64) *
+                    4;
             cp_async_zfill<16>(destination, input, valid ? 16 : 0);
         }
     }
@@ -165,8 +178,8 @@ __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_mma_kernel(
     const std::uint8_t* __restrict__ x, const std::uint8_t* __restrict__ x_scales,
     const std::uint8_t* __restrict__ weight_codes, const std::uint8_t* __restrict__ weight_scales,
-    int rows, int input_rows, float alpha, OutputPolicy output, Epilogue epilogue,
-    RowPolicy row_policy, int token_offset, int count) {
+    int rows, int input_rows, std::int64_t code_plane, std::int64_t scale_plane, float alpha,
+    OutputPolicy output, Epilogue epilogue, RowPolicy row_policy, int token_offset, int count) {
     // Streams its weights through the K loop: wait for the producer (the activation quantizer),
     // and let dependents launch only once that loop is done.
     pdl::enter_streaming();
@@ -184,8 +197,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
 #pragma unroll
     for (int stage = 0; stage < Schedule::kStages; ++stage) {
         if (stage < kKTiles) {
-            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, shared, stage, stage, token_begin,
-                                                tokens);
+            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared,
+                                                stage, stage, token_begin, tokens);
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, stage,
                                             row_begin, row_policy, rows, k);
             cp_commit();
@@ -213,23 +226,29 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
 
 #pragma unroll
         for (int local_k64 = 0; local_k64 < Schedule::kK64PerStage; ++local_k64) {
-            unsigned a_fragments[Schedule::kMmaTokens][4];
+            unsigned a_fragments[Schedule::kTerms][Schedule::kMmaTokens][4];
             unsigned b_fragments[Schedule::kMmaRows][2];
-            unsigned a_scales[Schedule::kMmaTokens];
+            unsigned a_scales[Schedule::kTerms][Schedule::kMmaTokens];
             unsigned b_scales[Schedule::kMmaRows];
 
 #pragma unroll
-            for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
-                const int row          = warp_m * Schedule::kWarpTokens + mma_m * 16 + a_row_offset;
-                const int logical_byte = local_k64 * 32 + a_column_byte;
-                const int physical_byte = nvfp4_a4_swizzled_byte<Schedule>(row, logical_byte);
-                const auto* address =
-                    shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-                ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                            a_fragments[mma_m][3], smem_addr(address));
-                const int scale_row = warp_m * Schedule::kWarpTokens + mma_m * 16 + sfa_row;
-                a_scales[mma_m] =
-                    shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
+            for (int term = 0; term < Schedule::kTerms; ++term) {
+#pragma unroll
+                for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
+                    const int plane_row = term * Schedule::kBlockTokens +
+                                          warp_m * Schedule::kWarpTokens + mma_m * 16;
+                    const int row           = plane_row + a_row_offset;
+                    const int logical_byte  = local_k64 * 32 + a_column_byte;
+                    const int physical_byte = nvfp4_a4_swizzled_byte<Schedule>(row, logical_byte);
+                    const auto* address =
+                        shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                    ldmatrix_x4(a_fragments[term][mma_m][0], a_fragments[term][mma_m][1],
+                                a_fragments[term][mma_m][2], a_fragments[term][mma_m][3],
+                                smem_addr(address));
+                    a_scales[term][mma_m] =
+                        shared.a_scale4[stage][(plane_row + sfa_row) * Schedule::kK64PerStage +
+                                               local_k64];
+                }
             }
 
 #pragma unroll
@@ -267,12 +286,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
             for (int mma_m = 0; mma_m < Schedule::kMmaTokens; ++mma_m) {
 #pragma unroll
                 for (int mma_n = 0; mma_n < Schedule::kMmaRows; ++mma_n) {
-                    mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
-                                   accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
-                                   a_fragments[mma_m][0], a_fragments[mma_m][1],
-                                   a_fragments[mma_m][2], a_fragments[mma_m][3],
-                                   b_fragments[mma_n][0], b_fragments[mma_n][1], a_scales[mma_m],
-                                   b_scales[mma_n]);
+#pragma unroll
+                    for (int term = 0; term < Schedule::kTerms; ++term) {
+                        const unsigned(&a)[4] = a_fragments[term][mma_m];
+                        mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0],
+                                       accumulators[mma_m][mma_n][1],
+                                       accumulators[mma_m][mma_n][2],
+                                       accumulators[mma_m][mma_n][3], a[0], a[1], a[2], a[3],
+                                       b_fragments[mma_n][0], b_fragments[mma_n][1],
+                                       a_scales[term][mma_m], b_scales[mma_n]);
+                    }
                 }
             }
         }
@@ -280,8 +303,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
         __syncthreads();
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
-            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, shared, stage, next_k_tile,
-                                                token_begin, tokens);
+            stage_nvfp4_a4_activation<Schedule>(x, x_scales, k, code_plane, scale_plane, shared,
+                                                stage, next_k_tile, token_begin, tokens);
             stage_nvfp4_a4_weight<Schedule>(weight_codes, weight_scales, shared, stage, next_k_tile,
                                             row_begin, row_policy, rows, k);
         }

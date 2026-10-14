@@ -40,7 +40,9 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     // convolution (the batched composition, at every B), so a row's result does not depend on
     // the other rows.
     if (batch_size > 1 || column_invariant(policy)) { return {Nvfp4GdnConvScheduleId::Materialized}; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    // The A4 residual profile is registered for the MLP projections only.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        allows_a4_residual(policy)) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         if (tokens <= 64) { return {Nvfp4GdnConvScheduleId::Materialized}; }

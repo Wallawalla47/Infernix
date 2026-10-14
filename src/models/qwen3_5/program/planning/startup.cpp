@@ -451,7 +451,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             phase == TextPhase::Verify
                 ? parameters.decode_text(plan.execution_schedule.column_invariant_decode,
                                          plan.execution_schedule.a8_decode,
-                                         plan.execution_schedule.a4_decode)
+                                         plan.execution_schedule.a4_decode,
+                                         plan.execution_schedule.a4_residual_decode)
                 : parameters.text;
         for (const auto& block : text.layers) {
             {
@@ -1161,6 +1162,7 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                 !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA8Decode),
             .a4_decode =
                 !fast_paths.invariant_capable || fast_paths.selected(FastPath::BatchedA4Decode),
+            .a4_residual_decode      = fast_paths.selected(FastPath::BatchedA4ResidualDecode),
             .row_invariant_partition = fast_paths.invariant(FastPath::BatchSplitAttention),
             .fixed_speculation       = fast_paths.invariant(FastPath::AdaptiveSpeculation),
             .grid_cache              = fast_paths.invariant(FastPath::FreeCacheResume),

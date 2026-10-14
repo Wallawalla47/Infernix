@@ -15,6 +15,8 @@ enum class ActivationCompute : std::uint8_t {
     A4,
     // A16 compute under LinearPolicy::A16ColumnInvariant: one schedule at every T.
     A16ColumnInvariant,
+    // LinearPolicy::AllowA4Residual: A16 up to 4 columns, then NVFP4 residual terms.
+    A4Residual,
 };
 
 struct Profile {

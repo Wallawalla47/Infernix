@@ -62,7 +62,65 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace wor
     }
 }
 
+// The A4 residual tiles, each column's activations in `Terms` planes. At K=17408 narrow rounds
+// stream 512 K per stage over 160 CTAs, as the A4 route does at up to 8 tokens.
+template <int Terms>
+using ResidualM16N32K512 = Nvfp4A4MmaSchedule<16, 32, 512, 1, 2, 3, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM16N64 = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
+
+template <class Geometry, int Terms>
+void launch_residual_problem(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
+                             std::int32_t tokens, cudaStream_t stream) {
+    if (tokens <= 16) {
+        if constexpr (Geometry::kInputRows == 17408) {
+            launch_gemm<Geometry, ResidualM16N32K512<Terms>>(weight, residual, workspace, tokens,
+                                                             stream);
+        } else {
+            launch_gemm<Geometry, ResidualM16N64<Terms>>(weight, residual, workspace, tokens,
+                                                         stream);
+        }
+    } else if (tokens <= 32) {
+        launch_gemm<Geometry, ResidualM32N64<Terms>>(weight, residual, workspace, tokens, stream);
+    } else {
+        launch_gemm<Geometry, ResidualM64N64<Terms>>(weight, residual, workspace, tokens, stream);
+    }
+}
+
+template <class Geometry>
+void launch_residual_terms(const Weight& weight, Tensor& residual, Nvfp4A4Workspace workspace,
+                           std::int32_t tokens, cudaStream_t stream) {
+    if (workspace.terms != kNvfp4A4ResidualTerms) {
+        throw std::invalid_argument("nvfp4 linear_add A4 residual: unexpected activation planes");
+    }
+    launch_residual_problem<Geometry, kNvfp4A4ResidualTerms>(weight, residual, workspace, tokens,
+                                                             stream);
+}
+
 } // namespace
+
+void nvfp4_linear_add_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& residual,
+                                         Nvfp4A4Workspace workspace, cudaStream_t stream) {
+    const std::int32_t tokens = x.ne[1];
+    launch_nvfp4_a4_quantize(x, weight, workspace, Nvfp4ScaleLayout::RowMajor, stream);
+    switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
+    case Nvfp4GeometryId::N5120K6144:
+        launch_residual_terms<Nvfp4N5120K6144>(weight, residual, workspace, tokens, stream);
+        return;
+    case Nvfp4GeometryId::N5120K17408:
+        launch_residual_terms<Nvfp4N5120K17408>(weight, residual, workspace, tokens, stream);
+        return;
+    case Nvfp4GeometryId::N14336K5120:
+    case Nvfp4GeometryId::N16384K5120:
+    case Nvfp4GeometryId::N34816K5120:
+        break;
+    }
+    throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
+}
 
 void nvfp4_linear_add_a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                 Nvfp4A4Workspace workspace, cudaStream_t stream) {

@@ -47,6 +47,16 @@ constexpr std::array kQualified{
     Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::FreeCacheResume, {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
+    // Two-term A4 residual MLP activations in wide rounds, jointly with the coupling paths above
+    // (DFlash2 with n-gram copies at concurrency 4, 2026-10-14).
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Fp8KeyNvfp4Value}},
+    Qualification{FastPath::BatchedA4ResidualDecode,
+                  {24, ActivationClass::A4, KvCacheStorage::Q4KeyVq2Value}},
     // Preemption with Replay under a two-lane pool at concurrency 8 (2026-10-14).
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::Preemption, {24, ActivationClass::A4, KvCacheStorage::Nvfp4Group16}},
@@ -113,6 +123,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::BatchedA8Decode:
         return invariant_capable && configuration.activations != ActivationClass::A16;
     case FastPath::BatchedA4Decode:
+    case FastPath::BatchedA4ResidualDecode:
         return invariant_capable && configuration.activations == ActivationClass::A4;
     case FastPath::AdaptiveSpeculation:
         return invariant_capable && options.speculative.backend != SpeculativeBackend::None;

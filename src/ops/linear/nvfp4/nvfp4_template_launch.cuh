@@ -101,6 +101,8 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             "NVFP4 A4 MMA requires complete row/K tiles and enough K stages");
     if (p.scale_layout != Nvfp4ScaleLayout::RowMajor)
         throw std::invalid_argument("NVFP4 A4 MMA requires row-major activation scales");
+    if (p.terms != Schedule::kTerms)
+        throw std::invalid_argument("NVFP4 A4 MMA: activation planes do not match the schedule");
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
         const auto launch = [&]<bool Full>() {
@@ -110,8 +112,8 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             CUDA_CHECK(pdl::launch_with(
                 dependency,
                 {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel,
-                p.x, p.x_scales, p.codes, p.scales, p.rows, p.k, p.alpha, output, epilogue, rows,
-                offset, count));
+                p.x, p.x_scales, p.codes, p.scales, p.rows, p.k, p.code_plane, p.scale_plane,
+                p.alpha, output, epilogue, rows, offset, count));
         };
         if (count % Schedule::kBlockTokens == 0)
             launch.template operator()<true>();

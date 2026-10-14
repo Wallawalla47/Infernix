@@ -154,8 +154,11 @@ struct ProposalParameters {
 // included (its fused norm and gating keep one schedule at every width).
 [[nodiscard]] TextParameters column_invariant_text(const TextParameters& text);
 // `text` with each FP8 projection's policy LinearPolicy::A16Only unless `a8`, and each NVFP4
-// projection's unless `a4` (others and the GDN control keep their own).
-[[nodiscard]] TextParameters precision_decode_text(const TextParameters& text, bool a8, bool a4);
+// projection's unless `a4`; with `a4_residual` (and not `a4`) an NVFP4 MLP projection permitted
+// 4-bit activations takes LinearPolicy::AllowA4Residual instead (others and the GDN control keep
+// their own).
+[[nodiscard]] TextParameters precision_decode_text(const TextParameters& text, bool a8, bool a4,
+                                                   bool a4_residual);
 
 // Cold native preparation for the fixed model implementation. This owner is stable before
 // startup sizing, execution, or Graph capture; all weight addresses borrow the source Model.
@@ -175,20 +178,23 @@ public:
     std::optional<TextParameters> invariant_text;
     // `text` for batched decode and verification with each projection class's low-precision
     // activations permitted or not, indexed by precision_index (built with invariant_text): FP8
-    // projections keep their 8-bit permission only with a8, NVFP4 their 4-bit one only with a4.
-    std::array<std::optional<TextParameters>, 3> precision_text;
+    // projections keep their 8-bit permission only with a8, NVFP4 their 4-bit one only with a4,
+    // and with a4_residual (without a4) the NVFP4 MLP projections permitted 4 bits take
+    // LinearPolicy::AllowA4Residual instead.
+    std::array<std::optional<TextParameters>, 6> precision_text;
 
-    [[nodiscard]] static constexpr std::size_t precision_index(bool a8, bool a4) noexcept {
-        return (a8 ? 1U : 0U) + (a4 ? 2U : 0U);
+    [[nodiscard]] static constexpr std::size_t precision_index(bool a8, bool a4,
+                                                               bool a4_residual) noexcept {
+        return (a8 ? 1U : 0U) + 2U * (a4 ? 1U : (a4_residual ? 2U : 0U));
     }
 
     // The parameters decode and verification run with: the column-invariant copy, else the copy
-    // with the selected low-precision permissions (`text` itself when both are).
-    [[nodiscard]] const TextParameters& decode_text(bool column_invariant, bool a8,
-                                                    bool a4) const noexcept {
+    // with the selected low-precision permissions.
+    [[nodiscard]] const TextParameters& decode_text(bool column_invariant, bool a8, bool a4,
+                                                    bool a4_residual) const noexcept {
         if (column_invariant && invariant_text) { return *invariant_text; }
-        const std::size_t index = precision_index(a8, a4);
-        if (index < precision_text.size() && precision_text[index]) { return *precision_text[index]; }
+        const std::size_t index = precision_index(a8, a4, a4_residual);
+        if (precision_text[index]) { return *precision_text[index]; }
         return text;
     }
     std::optional<MtpParameters> mtp;

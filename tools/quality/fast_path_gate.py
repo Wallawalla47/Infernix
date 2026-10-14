@@ -81,8 +81,8 @@ POLICY = Policy()
 
 # fast_path_name of every infernix::FastPath.
 FAST_PATHS = ("prompt-pv8", "decode-split64", "batched-decode", "batched-a8-decode",
-              "batched-a4-decode", "batch-split-attention", "adaptive-speculation",
-              "free-cache-resume", "preemption")
+              "batched-a4-decode", "batched-a4-residual-decode", "batch-split-attention",
+              "adaptive-speculation", "free-cache-resume", "preemption")
 
 
 class MeasurementError(RuntimeError):

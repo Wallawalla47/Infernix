@@ -44,6 +44,7 @@ struct FastPathConfiguration {
     case FastPath::BatchedDecode:
     case FastPath::BatchedA8Decode:
     case FastPath::BatchedA4Decode:
+    case FastPath::BatchedA4ResidualDecode:
     case FastPath::BatchSplitAttention:
     case FastPath::AdaptiveSpeculation:
     case FastPath::FreeCacheResume:

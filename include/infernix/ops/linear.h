@@ -27,11 +27,21 @@ enum class LinearPolicy : std::uint8_t {
     /// t's input and the weight alone, for every T. A projection that does not register such a
     /// route rejects this policy.
     A16ColumnInvariant,
+    /// Admit A16 or an A4 residual profile: NVFP4 activations as a sum of NVFP4 terms, each
+    /// encoding what the earlier ones left, so the activation error is roughly A4's raised to the
+    /// term count. Never one-term A4 or A8. A projection that does not register a residual route
+    /// runs A16; one that does needs the A4 activation divisor (as AllowA4 does).
+    AllowA4Residual,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
-           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant;
+           policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
+           policy == LinearPolicy::AllowA4Residual;
+}
+
+[[nodiscard]] constexpr bool allows_a4_residual(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowA4Residual;
 }
 
 [[nodiscard]] constexpr bool column_invariant(LinearPolicy policy) noexcept {

@@ -63,15 +63,19 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
             return;
         }
     } else {
+        // N=5120 gives these tiles 320 CTAs of 16 rows, so their time is the weight stream each
+        // keeps in flight: 8 K-warps stream 512 K per stage where 4 streamed 256. Measured on RTX
+        // 5090 (cold weights, two interleaved passes): 35.6-38.0 us at 5-8 tokens against 41.6
+        // (SIMT, 5) and 58.5-58.7 (4 K-warps, 6-8), and 44.4-51.8 us at 9-14 against 58.0-60.8.
         if (tokens <= 8) {
             launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 4, 2>, 17408>>(p, output, epilogue,
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, 17408>>(p, output, epilogue,
                                                                             stream);
             return;
         }
         if (tokens <= 16) {
             launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 4, 2>, 17408>>(p, output, epilogue,
+                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, 17408>>(p, output, epilogue,
                                                                              stream);
             return;
         }
@@ -164,7 +168,8 @@ void nvfp4_linear_add_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
         nvfp4_linear_add_decode_launch(x, weight, residual, stream);
         return;
     }
-    if (x.ne[1] <= (weight.k == 6144 ? 2 : 5)) {
+    // At K=17408 the SIMT kernel ties the 8 K-warp tile at 3-4 tokens (34-36 us) and loses at 5.
+    if (x.ne[1] <= (weight.k == 6144 ? 2 : 4)) {
         nvfp4_linear_add_small_t_launch(x, weight, residual, stream);
         return;
     }

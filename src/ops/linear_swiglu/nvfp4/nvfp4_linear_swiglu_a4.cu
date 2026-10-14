@@ -51,7 +51,37 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
     launch_gemm<Schedule>(weight, out, scratch, x.ne[1], stream);
 }
 
+// The A4 residual tiles: the same 64-row weight tiles at two CTAs per SM, each column's activations
+// in `Terms` planes. Narrow rounds take 16-token tiles so the extra planes cost no staging.
+template <int Terms>
+using ResidualM16N64 = Nvfp4A4MmaSchedule<16, 64, 256, 1, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM32N64 = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 3, 2, Cache::cg, Cache::cg, Terms>;
+template <int Terms>
+using ResidualM64N64 = Nvfp4A4MmaSchedule<64, 64, 256, 4, 2, 2, 2, Cache::cg, Cache::cg, Terms>;
+
+template <int Terms>
+void launch_residual(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    auto scope = workspace.scope();
+    const Nvfp4A4Workspace scratch =
+        allocate_nvfp4_a4_workspace(workspace, x.ne[1], Geometry::kInputRows, Terms);
+    launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::RowMajor, stream);
+    if (x.ne[1] <= 16) {
+        launch_gemm<ResidualM16N64<Terms>>(weight, out, scratch, x.ne[1], stream);
+    } else if (x.ne[1] <= 32) {
+        launch_gemm<ResidualM32N64<Terms>>(weight, out, scratch, x.ne[1], stream);
+    } else {
+        launch_gemm<ResidualM64N64<Terms>>(weight, out, scratch, x.ne[1], stream);
+    }
+}
+
 } // namespace
+
+void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                            WorkspaceArena& workspace, cudaStream_t stream) {
+    launch_residual<kNvfp4A4ResidualTerms>(x, weight, out, workspace, stream);
+}
 
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream) {

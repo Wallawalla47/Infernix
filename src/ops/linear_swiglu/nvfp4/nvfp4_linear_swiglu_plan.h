@@ -26,6 +26,9 @@ void nvfp4_linear_swiglu_invariant_launch(const Tensor& x, const Weight& weight,
                                           cudaStream_t stream);
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream);
+// AllowA4Residual: kNvfp4A4ResidualTerms NVFP4 activation planes into one accumulator.
+void nvfp4_linear_swiglu_a4_residual_launch(const Tensor& x, const Weight& weight, Tensor& out,
+                                            WorkspaceArena& workspace, cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,

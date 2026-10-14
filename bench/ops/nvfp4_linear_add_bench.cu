@@ -84,8 +84,10 @@ Options parse_options(int argc, char** argv) {
                 options.policy = ops::LinearPolicy::AllowA4;
             } else if (value == "invariant") {
                 options.policy = ops::LinearPolicy::A16ColumnInvariant;
+            } else if (value == "a4r") {
+                options.policy = ops::LinearPolicy::AllowA4Residual;
             } else {
-                throw std::invalid_argument("--policy must be a16, a4 or invariant");
+                throw std::invalid_argument("--policy must be a16, a4, a4r or invariant");
             }
         } else if (argument == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep"));
@@ -99,7 +101,7 @@ Options parse_options(int argc, char** argv) {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
             std::printf(
-                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4] "
+                "Usage: %s --n 5120 --k 6144|17408 [--policy a16|a4|a4r|invariant] "
                 "[--t-sweep 1,4,...] [--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                 argv[0]);
             std::exit(0);
@@ -120,6 +122,7 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
+    if (policy == ops::LinearPolicy::AllowA4Residual) { return "A4R"; }
     return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
 }
 
